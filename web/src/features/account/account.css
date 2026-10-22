@@ -1,0 +1,153 @@
+/* Route-scoped styles moved from react.css (LUX-835). */
+.lux-account-card { display: flex; align-items: center; gap: 17px; max-width: 640px; padding: 20px; border: 1px solid var(--lux-line-soft); border-radius: 16px; background: var(--lux-surface); }
+
+.lux-account-avatar { display: grid; place-items: center; width: 58px; height: 58px; border-radius: 50%; color: #fff; background: linear-gradient(145deg, #65656a, #25252a); }
+
+.lux-account-card h2 { margin: 0 0 5px; font-size: 1.1rem; }
+
+.lux-account-card p { margin: 0; color: var(--lux-muted); }
+
+.lux-account-list { max-width: 640px; margin: 20px 0 26px; border-top: 1px solid var(--lux-line-soft); }
+
+.lux-account-list div { display: grid; grid-template-columns: 24px 1fr auto; align-items: center; gap: 12px; padding: 16px 0; border-bottom: 1px solid var(--lux-line-soft); color: var(--lux-muted); }
+
+.lux-account-list small { color: var(--lux-subtle); }
+
+/* Account settings */
+.lux-account-page { --lux-settings-line: var(--lux-line-soft); --lux-account-settings-gap: clamp(28px, 5vw, 84px); }
+
+.lux-account-page-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-right: 0; margin-bottom: 42px; }
+
+.lux-account-page-heading h1 { margin: 10px 0 8px; color: var(--lux-text); font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.075em; }
+
+.lux-account-page-heading p { margin: 0; color: var(--lux-muted); }
+
+.lux-account-sync-status { display: inline-flex; align-items: center; gap: 8px; padding: 8px 11px; border: 1px solid var(--lux-settings-line); border-radius: 999px; color: var(--lux-muted); font-size: .72rem; white-space: nowrap; }
+
+.lux-account-sync-status span { width: 6px; height: 6px; border-radius: 50%; background: #76d39a; box-shadow: 0 0 0 4px rgba(118,211,154,.1); }
+
+.lux-account-settings-grid { display: grid; grid-template-columns: 220px minmax(0, 1fr); align-items: start; justify-content: stretch; gap: var(--lux-account-settings-gap); transform: none; }
+
+.lux-account-settings-sidebar { position: sticky; top: 32px; transform: none; }
+
+.lux-account-profile-card { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 9px; padding: 0 10px 26px; border-bottom: 1px solid var(--lux-settings-line); }
+
+.lux-account-profile-card strong, .lux-account-profile-card span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.lux-account-profile-card strong { color: var(--lux-text); font-size: .86rem; }
+
+.lux-account-profile-card span { margin-top: 4px; color: var(--lux-subtle); font-size: .7rem; }
+
+.lux-account-logout-button { gap: 5px; min-width: 0; padding: 0 8px; font-size: .68rem; white-space: nowrap; }
+
+.lux-account-logout-button svg { flex: 0 0 auto; }
+
+.lux-account-settings-nav { display: grid; gap: 4px; padding-top: 18px; }
+
+.lux-account-settings-nav a { display: flex; align-items: center; gap: 10px; min-height: 38px; padding: 0 var(--lux-control-padding-x); border-radius: 8px; color: var(--lux-muted); font-size: .78rem; transition: color .2s ease, background .2s ease; }
+
+.lux-account-settings-nav a:hover, .lux-account-settings-nav a:focus-visible { color: var(--lux-text); background: rgba(255,255,255,.06); }
+
+.lux-account-settings-nav a svg { color: var(--lux-subtle); }
+
+.lux-account-settings-content { display: grid; gap: 0; min-width: 0; }
+
+.lux-account-settings-section { overflow: visible; border: 0; border-radius: 0; background: transparent; }
+
+.lux-account-settings-section + .lux-account-settings-section { margin-top: 28px; border-top: 1px solid var(--lux-settings-line); }
+
+.lux-account-settings-section-heading { display: flex; align-items: center; gap: 12px; padding: 20px 22px; border-bottom: 1px solid var(--lux-settings-line); }
+
+.lux-account-settings-section-heading h2 { margin: 5px 0 0; color: var(--lux-text); font-size: 1.15rem; letter-spacing: -.025em; }
+
+.lux-account-section-icon { display: grid; place-items: center; width: 34px; height: 34px; border: 1px solid var(--lux-settings-line); border-radius: 9px; color: var(--lux-text); background: rgba(255,255,255,.06); }
+
+.lux-account-settings-section-body { padding: 4px 22px 22px; }
+
+.lux-setting-row strong, .lux-setting-block-heading strong, .lux-setting-toggle-row strong, .lux-account-profile-editor strong { display: block; color: var(--lux-text); font-size: .84rem; font-weight: 600; }
+
+.lux-setting-row p, .lux-setting-block-heading p, .lux-setting-toggle-row small, .lux-account-profile-editor p { display: block; margin: 5px 0 0; color: var(--lux-muted); font-size: .74rem; line-height: 1.55; }
+
+.lux-account-playback-threshold { display: flex; flex-wrap: wrap; align-items: center; justify-content: flex-end; gap: 8px; }
+
+.lux-account-playback-threshold > span { flex-basis: 100%; color: var(--lux-subtle); font-size: .7rem; text-align: right; }
+
+.lux-account-library-list { display: grid; gap: 5px; margin-top: 15px; }
+
+.lux-account-library-row { display: grid; grid-template-columns: 18px 29px minmax(0,1fr) auto; align-items: center; gap: 10px; min-height: 57px; padding: 7px 8px; border: 1px solid transparent; border-radius: 9px; background: rgba(255,255,255,.035); cursor: grab; transition: border-color .2s ease, background .2s ease, transform .2s var(--lux-ease); }
+
+.lux-account-library-row:active { cursor: grabbing; }
+
+.lux-account-library-row:hover { border-color: var(--lux-settings-line); background: rgba(255,255,255,.065); transform: translateX(2px); }
+
+.lux-account-library-index { display: grid; place-items: center; width: 29px; height: 29px; border-radius: 7px; color: var(--lux-subtle); background: rgba(255,255,255,.07); font-size: .67rem; font-variant-numeric: tabular-nums; }
+
+.lux-account-library-copy { min-width: 0; }
+
+.lux-account-library-copy strong, .lux-account-library-copy span { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.lux-account-library-copy strong { color: var(--lux-text); font-size: .79rem; font-weight: 550; }
+
+.lux-account-library-copy span { margin-top: 4px; color: var(--lux-subtle); font-size: .68rem; }
+
+.lux-account-library-actions { display: flex; gap: 3px; }
+
+.lux-account-library-actions button { display: grid; place-items: center; width: 28px; height: 28px; padding: 0; border: 1px solid transparent; border-radius: 6px; color: var(--lux-muted); background: transparent; }
+
+.lux-account-library-actions button:hover:not(:disabled), .lux-account-library-actions button:focus-visible { border-color: var(--lux-settings-line); color: var(--lux-text); background: rgba(255,255,255,.08); }
+
+.lux-account-library-actions button:disabled { color: var(--lux-subtle); opacity: .35; }
+
+.lux-account-library-skeleton { height: 57px; border-radius: 9px; background: linear-gradient(100deg, rgba(255,255,255,.04) 25%, rgba(255,255,255,.09) 50%, rgba(255,255,255,.04) 75%); background-size: 200% 100%; animation: lux-shimmer 1.8s ease-in-out infinite; }
+
+.lux-account-empty { margin-top: 15px; padding: 18px; border: 1px dashed var(--lux-settings-line); border-radius: 9px; color: var(--lux-muted); font-size: .76rem; text-align: center; }
+
+.lux-account-profile-editor { display: flex; align-items: center; gap: 15px; padding: 17px 0; }
+
+.lux-account-api-key-panel { display: grid; gap: 13px; padding: 17px 0; }
+
+.lux-account-api-key-panel .lux-setting-block-heading strong { display: inline-flex; align-items: center; gap: 7px; }
+
+.lux-account-api-key-warning { padding: 10px 12px; border-left: 2px solid #d99a47; color: var(--lux-muted); background: rgba(217,154,71,.08); font-size: .72rem; line-height: 1.55; }
+
+.lux-account-api-key-status { margin: 0; color: var(--lux-subtle); font-size: .72rem; }
+
+.lux-account-api-key-value { display: grid; gap: 11px; padding: 13px; border: 1px solid var(--lux-settings-line); border-radius: 9px; background: rgba(255,255,255,.035); }
+
+.lux-account-api-key-value code { overflow-wrap: anywhere; color: var(--lux-text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; line-height: 1.5; }
+
+.lux-account-api-key-actions { display: flex; flex-wrap: wrap; gap: 8px; }
+
+.lux-account-avatar-cropper { display: grid; grid-template-columns: 144px minmax(0, 1fr); align-items: center; gap: 16px; max-width: 570px; margin-top: 15px; padding: 12px; border: 1px solid var(--lux-settings-line); border-radius: 10px; background: rgba(255,255,255,.035); }
+
+.lux-account-avatar-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+
+.lux-account-avatar-actions .lux-upload-button { margin-top: 0; }
+
+.lux-account-form-grid { padding-top: 4px; }
+
+.lux-account-notice { margin: 12px 0 0; color: #f3c788; font-size: .72rem; line-height: 1.5; }
+
+@media (max-width: 720px) {
+  .lux-account-avatar-cropper { grid-template-columns: minmax(0, 1fr); justify-items: center; }
+}
+
+html[data-lux-theme="light"] .lux-account-library-row:hover, html[data-lux-theme="light"] .lux-theme-options button:hover, html[data-lux-theme="light"] .lux-theme-options button.is-selected { background: rgba(28,28,34,.07); }
+
+@media (max-width: 900px) {
+  .lux-account-settings-grid { grid-template-columns: 1fr; gap: 20px; transform: none; }
+  .lux-account-settings-sidebar { position: static; transform: none; }
+  .lux-account-page-heading { margin-right: 0; }
+  .lux-account-profile-card { padding-bottom: 16px; }
+  .lux-account-settings-nav { display: flex; overflow-x: auto; padding: 10px 0 2px; }
+  .lux-account-settings-nav a { flex: 0 0 auto; min-height: var(--lux-button-height-touch); padding: 0 var(--lux-control-padding-x); }
+  .lux-account-library-actions button { width: var(--lux-button-height-touch); min-width: var(--lux-button-height-touch); height: var(--lux-button-height-touch); min-height: var(--lux-button-height-touch); }
+}
+
+@media (max-width: 560px) {
+  .lux-account-page-heading { align-items: flex-start; flex-direction: column; gap: 15px; margin-bottom: 28px; }
+  .lux-account-page-heading h1 { font-size: 2.15rem; }
+  .lux-account-settings-section-heading { padding: 17px; }
+  .lux-account-settings-section-body { padding: 2px 17px 17px; }
+  .lux-account-profile-editor { align-items: flex-start; }
+}

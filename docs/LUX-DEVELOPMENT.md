@@ -99,7 +99,7 @@ Lux 的核心价值不是功能数量，而是：
 - 管理员可以编辑已有媒体库的名称和类型。
 - 单个媒体库可包含多个本地路径。
 - 同一媒体库可同时包含真实媒体文件和 .strm 文件。
-- `.strm` 默认只记录首个非空播放目标；首版支持 HTTP/HTTPS、本地路径、SMB 和 FTP。普通扫描、PlaybackInfo 和播放请求不得主动读取 HTTP/HTTPS、SMB/FTP 目标指向的视频源的容器信息、索引或媒体轨。管理员显式创建 STRM 探测任务后，允许通过受监督的 `media_probe` 插件在后台读取已校验的支持目标；本地路径只有在 Lux 进程实际可读时才会被读取。其他协议保留原始文本但标记为不支持，不得伪造可播放地址。
+- `.strm` 默认只记录首个非空播放目标；首版支持 HTTP/HTTPS、本地路径、SMB 和 FTP。普通扫描、PlaybackInfo 和播放请求处理器不得同步读取 HTTP/HTTPS、SMB/FTP 目标指向的视频源的容器信息、索引或媒体轨。管理员显式创建 STRM 探测任务后，允许通过受监督的 `media_probe` 插件在后台读取已校验的支持目标；LUX-840 也允许符合条件的实际播放排入单来源后台任务，播放请求本身不运行插件且不等待探测。本地路径只有在 Lux 进程实际可读时才会被读取。其他协议保留原始文本但标记为不支持，不得伪造可播放地址。
 - `.strm` 若存在同名 `-mediainfo.json` 旁车，可在后台读取旁车填充已声明的媒体信息；没有旁车时保持媒体信息为空，不因缺少探测结果阻止播放。
 - 每个媒体库可设置一个可选的自定义封面图；仅管理员可以上传或替换，普通用户只能在拥有该媒体库访问权限时读取。
 - 媒体库封面图首版只接受 JPEG、PNG、WebP，大小上限为 5 MiB，并通过 Lux 的受保护图片接口提供。
@@ -120,7 +120,7 @@ Lux 的核心价值不是功能数量，而是：
 - 本地媒体来自 NAS Docker 绑定挂载目录。
 - `.strm` 文件的第一个非空文本内容被视为原始播放目标，Lux 只清理 BOM 和首尾空白，不改写目标内容。
 - Lux 对目标做有限的词法分类：HTTP(S) URL、本地路径、SMB URI、FTP URI 和不支持的其他协议；分类不访问网络。相对路径在真正播放时相对于 `.strm` 文件所在目录解析，绝对路径按 Lux 进程实际可读性处理，不要求落在当前媒体库根目录内。扫描阶段不读取路径指向的媒体。数据库兼容字段仍保存为 `URL`、`PATH`、`OPAQUE` 或 `EMPTY`，其中 SMB、FTP 和不支持协议使用 `OPAQUE`，运行时再按原始目标区分。
-- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；HTTP(S) URL 型目标使用 `Protocol=Http`、`IsRemote=true`，本地路径型目标使用 `Protocol=File`、`IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 统一将 `AddApiKeyToDirectStreamUrl` 设为 `true`，并在签名 URL 中携带本次标准 Emby token 的 `api_key`；请求中有设备 ID 时，也将其作为标准 `DeviceId` 提示带入 URL。本地文件和 SMB/FTP 解析源不携带长期 token。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；Emby 标准视频入口对 HTTP(S) URL 型目标直接返回 302 到原始目标，不在服务器端预探测；Lux 自有播放回退继续使用播放器 User-Agent 有限解析重定向并返回 307。扫描和 `PlaybackInfo` 不访问目标。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
+- HTTP(S) 和本地路径型 `.strm` 都保留原始目标并通过 Emby 媒体源交给外部播放代理；HTTP(S) URL 型目标使用 `Protocol=Http`、`IsRemote=true`，本地路径型目标使用 `Protocol=File`、`IsRemote=false`。`PlaybackInfo` 对这两类目标保留原始 `Path`，但 `DirectStreamUrl` 必须使用当前 Emby 服务的标准视频入口，并由 Lux 添加短期播放票据。为兼容所有可能丢失独立媒体请求鉴权的第三方播放器，URL/路径型 `.strm` 统一将 `AddApiKeyToDirectStreamUrl` 设为 `true`，并在签名 URL 中携带本次标准 Emby token 的 `api_key`；请求中有设备 ID 时，也将其作为标准 `DeviceId` 提示带入 URL。本地文件和 SMB/FTP 解析源不携带长期 token。两种情况下 Lux 都仍要求绑定条目、媒体源和用户的短期 HMAC 票据，确保客户端通过公网代理域名回到 `/Videos/{数字ItemId}/stream`，而不是直接连接 `.strm` 中可能存在的内网 302 地址。外部代理从 `Path` 提取自己的映射或 302 信息；Emby 标准视频入口对 HTTP(S) URL 型目标直接返回 302 到原始目标，不在服务器端预探测；Lux 自有播放回退继续使用播放器 User-Agent 有限解析重定向并返回 307。扫描和 `PlaybackInfo` 不访问目标；符合 LUX-840 条件的实际播放可另行排入不等待的单来源后台媒体信息任务，不改变客户端直连播放。SMB/FTP 目标交给已配置的协议解析器，解析结果必须是 HTTP(S) 地址。未配置挂载或解析器时不得伪造可播放 URL，也不得把 `.strm` 文件本身作为媒体返回；其他协议始终不支持。
 - Lux 不负责保护目标中可能包含的令牌或路径信息；管理员应理解目标会暴露给有播放权限的客户端或已配置的解析器。
 
 ### 3.3 播放
@@ -254,15 +254,21 @@ Lux 的核心价值不是功能数量，而是：
 
 ### 3.10 用户、会话和权限
 
+> 专项设计与实施核对表：[Lux 用户管理设计方案](USER-MANAGEMENT-DESIGN.md)（2026-10-19；当前实施状态见 §5.4 与各 LUX 任务记录）。
+> 覆盖账号生命周期、注册邀请、用户查询、权限预设、内容限制、播放控制、设备与活动七个模块。原模块八“外挂字幕权限”已于 2026-10-19 取消，不新增用户级字幕权限或字幕文件管理功能；现有字幕播放、媒体字幕属性编辑及扫描能力保持既有规则。
+> 模块一至七的仓库实现与自动化核对已完成；Lucky、SMTP、FNOS/x86_64 和真实第三方客户端等未实测边界仍以专项设计 §5.4 为准。
+
 - 第一次启动进入初始化引导。
 - 第一个完成初始化的账户为管理员。
-- 不开放公开注册。
-- 后续账户只能由管理员创建和管理。
+- 默认采用指定邮箱邀请注册；邀请用户完成邮箱验证、设置用户名和密码后激活。
+- 管理员仍可直接创建用户，也可选择开启公开邮箱注册；公开注册默认关闭。
+- 公开注册用户验证邮箱后进入待审批状态，经管理员批准后激活。
+- 待邮箱验证或待审批的账户不能登录或访问媒体；模块二的实现还需提供有界请求频率限制和一次性验证凭证。
 - 支持大量普通用户。
 - 每个用户的进度、已看状态和收藏独立。
 - 用户可以上传或替换账户头像；头像由服务端校验并持久化到 `/config/user-avatars`，同一账户在不同浏览器登录后可读取相同头像。
 - 用户权限至少包括：
-  - 媒体库权限使用显式允许列表：未指定任何媒体库时可访问全部已启用媒体库；指定一个或多个媒体库后仅可访问指定媒体库；清空指定项后恢复全部媒体库访问。
+  - 媒体库访问模式明确为 `ALL`、`SELECTED` 或 `NONE`。`ALL` 可访问所有已启用媒体库；`SELECTED` 只可访问正向授权的媒体库；`NONE` 不可访问任何媒体库。升级前没有正向授权记录的旧账号迁移为 `ALL`，已有正向记录的账号迁移为 `SELECTED`；迁移不得改变现有账号的可见媒体。
   - 是否允许外网访问。
   - 是否允许使用下载功能。
   - 是否允许进入管理控制台。
@@ -1372,7 +1378,7 @@ TMDb 插件可选启用“原语言”模式。电影和剧集的标题优先使
   分片请求由服务端等待。Lux Web 的内部 HLS 清单仍保持动态追加和立即启动，不复用 Emby VOD 清单。
 - 每个媒体版本的章节独立返回；条目级 `Chapters` 使用默认媒体源的章节。
   `IntroStart`、`IntroEnd`、`CreditsStart` 隐藏标记映射为 Emby `ChapterInfo`。
-- `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。
+- `.strm` 的容器、时长和流列表可来自受限旁车或已完成的后台 STRM 探测；PlaybackInfo 请求本身不主动读取外部源，首次播放由 Lux 撷取上游响应头并返回 307，媒体内容仍由客户端直接访问最终地址。符合 LUX-840 条件时实际播放可异步排入当前来源的后台媒体信息补探测，播放请求不等待插件。
 - 不伪造客户端能播放的编码。
 - 选择默认版本使用稳定策略，并允许客户端显式选择 source ID。
 
@@ -2517,7 +2523,7 @@ services:
 验收：
 
 - 管理员可为普通用户授予或拒绝媒体库访问。
-- 媒体库权限未指定任何库时默认允许访问全部已启用媒体库；指定一个或多个库时仅允许访问这些库；清空指定项后恢复全部访问。
+- 用户媒体库权限显式区分 `ALL`、`SELECTED`、`NONE`：`ALL` 允许所有已启用媒体库，`SELECTED` 只允许指定库，`NONE` 不允许访问媒体库。兼容的逐库 PATCH 在没有正向选择时恢复 `ALL`；整组替换接口可明确设置 `NONE`。
 - 列表、详情和图片端点均执行同一 ACL。
 - 已知 item ID 不能绕过库权限。
 
@@ -3616,7 +3622,9 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 当前 STRM 探测目标策略只校验非空和长度，不解析 STRM 内容，也不根据 HTTP/HTTPS、localhost、
 云实例元数据主机、回环、私网、链路本地、未指定、多播、共享地址、域名或路径做拒绝，不要求
 管理员指定 IP 或网段。STRM 探测目标只作为插件探测输入，不进入日志、任务事件、旁车或 API
-响应；普通扫描、播放和 PlaybackInfo 仍不主动读取 STRM 指向的内容。
+响应；普通扫描、PlaybackInfo 和媒体浏览不主动读取 STRM 指向的内容。仅符合 LUX-840
+条件的实际播放 GET/已授权 PLAYING 回调可提交当前来源的后台补提取任务；播放请求本身不运行
+远程 ffprobe/ffmpeg，也不等待插件执行。
 
 验收：
 
@@ -3631,7 +3639,7 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 - [ ] 插件启用后自动出现全局 `STRM_MEDIA_INFO` 注册任务；任务按有效 `schedule` cron 表达式执行，禁用插件后不再领取新作业，重启服务后保留调度配置但取消遗留作业实例。
 - [ ] 实时增量扫描完成后，所选媒体库中新入库或发生变化的 `.strm` 来源自动创建定向 STRM 探测任务；定向任务只处理本次增量扫描影响的来源，并支持取消和失败重试。
 - [ ] 定向 STRM 探测与全局定时探测共用并发、插件配置和任务持久化边界；定时任务仍保留并继续负责全库补漏，两个任务不能并发占用同一媒体库。
-- [ ] 播放和 PlaybackInfo 请求不触发 STRM 远程探测，`.strm` 仍由客户端直连播放。
+- [x] 播放和 PlaybackInfo 请求不在请求路径同步执行 STRM 远程探测；PlaybackInfo 不触发探测，符合 LUX-840 条件的实际播放只排入后台单来源任务，`.strm` 仍由客户端直连播放。
 - [ ] 插件包、manifest、RPC 结果、STRM 探测目标策略、ffprobe/ffmpeg 超时、输出上限和无真实目标的 fake ffprobe/fake ffmpeg 测试覆盖；插件异常不退出主进程。
 - [ ] 从空数据库执行迁移成功，ARM64 本机验证记录 `uname -m`，并通过 Rust 格式化、测试和 Clippy 检查。
 
@@ -3647,7 +3655,7 @@ STRM 来源状态区分“尚未配置”和“已经排队”：未被插件选
 明确不做：
 
 - 不改变 `.strm` 播放直连语义，不做代理、转码、缓存或 AList API 访问。
-- 不在普通全量扫描或用户请求路径中探测远程 `.strm`；仅允许文件系统实时事件完成增量索引后，通过宿主后台任务触发定向探测，不把插件权限扩展为媒体库/数据库访问。
+- 不在普通全量扫描、PlaybackInfo、媒体浏览或普通用户请求处理器中同步探测远程 `.strm`；除实时增量索引后的宿主后台任务外，仅 LUX-840 规定的实际播放入口可排入单来源后台探测，不把插件权限扩展为媒体库/数据库访问。
 - 不把计划任务执行放入普通扫描、播放或用户请求路径；计划任务只复用已有 STRM 后台作业服务。
 - 不引入 `ffmpeg-next` 或 FFmpeg C API；插件通过现有系统 `ffprobe` 和 `ffmpeg` 命令完成两步处理。
 
@@ -12545,9 +12553,10 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 本机为 macOS `arm64`，全部 Cargo 命令使用 `/Volumes/Toshiba/mywork/Lux/target`。`cargo build --locked`、`cargo fmt --all -- --check` 和 `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。`cargo test --locked --all-targets` 在库测试阶段得到 973 passed、3 failed、25 ignored，后续集成 targets 未运行；相关集成 targets 已按上述定向命令独立通过。三个失败分别为 `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`（实际 0、预期 1）、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`（空集合越界）和 `changed_local_fill_request_during_running_item_is_not_lost`（实际 0、预期 1）。三项均在干净基线 `842f9870` 以各自完整测试名和 `--lib -- --exact` 单独复现相同失败，临时 worktree 已清理；完整 Rust 门禁仍未通过。
 
 真实 Lucky、FNOS/x86_64 和第三方播放器尚未验证，本任务未推送或部署。请求头全部缺失时仍无法恢复客户端地址，兼容合同见 `docs/COMPATIBILITY.md`。
+
 #### LUX-593：用户管理页面结构
 
-范围：建立用户列表、用户详情和全局用户设置的导航结构。详情页预留账号资料、权限、偏好、内容限制、设备与登录、播放与转码、活动记录和外挂字幕入口；全局设置预留注册邀请、邮件、新用户默认权限、角色预设、全站规则和保留策略。除现有用户列表入口外均显示未实施占位，不新增或暗示已生效的权限行为。
+范围：建立用户列表、用户详情和全局用户设置的导航结构。详情页预留账号资料、权限、偏好、内容限制、设备与登录、播放与转码和活动记录入口；全局设置预留注册邀请、邮件、新用户默认权限、角色预设、全站规则和保留策略。除现有用户列表入口外均显示未实施占位，不新增或暗示已生效的权限行为。原外挂字幕权限模块不属于此导航范围。
 
 预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`。
 
@@ -12570,13 +12579,13 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] 新迁移可从现有 SQLite/PostgreSQL 数据库应用，旧账号保持邮箱为空且状态不变。
+- [x] 新迁移可从现有 SQLite/PostgreSQL 数据库应用，旧账号保持邮箱为空且状态不变。
 - [x] 用户查询统一映射新增字段；邮箱为空允许重复，非空邮箱不区分大小写唯一。
 - [x] 不改变当前登录、用户删除及公开 API 行为。
 
 依赖：LUX-593。后续模块一任务逐步接通 API、用户界面和账号生命周期。
 
-结果（2026-10-19）：SQLite/PostgreSQL 迁移、邮箱唯一索引和用户存储映射已实现；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 通过。迁移尚未在数据库实例执行，未运行测试。
+结果（2026-10-19）：SQLite/PostgreSQL 迁移、邮箱唯一索引和用户存储映射已实现。新增既有数据库升级回归：从 0183 迁移前账号开始应用 0184 后续迁移，确认旧账号邮箱/验证/删除字段为空且启用状态不变，并确认邮箱唯一索引忽略大小写。SQLite `storage` target 1/1、PostgreSQL `postgres_database` ignored target 1/1（PostgreSQL 16 临时实例）、Rust build、fmt check 与 diff check 通过。
 
 #### LUX-595：管理员账号资料 API
 
@@ -12586,13 +12595,13 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 验收标准：
 
-- [ ] 管理员可获取用户详情并创建/更新邮箱；同一邮箱大小写变体被唯一约束拒绝。
-- [ ] 修改邮箱后验证时间为空；旧账号为空邮箱时保持兼容。
-- [ ] 邮箱格式错误返回 400，不泄漏数据库或账户敏感信息。
+- [x] 管理员可获取用户详情并创建/更新邮箱；同一邮箱大小写变体被唯一约束拒绝。
+- [x] 修改邮箱后验证时间为空；旧账号为空邮箱时保持兼容。
+- [x] 邮箱格式错误返回 400，不泄漏数据库或账户敏感信息。
 
 依赖：LUX-594。
 
-结果（2026-10-19）：新增管理员单用户详情、创建时设置邮箱和独立资料更新接口；邮箱统一小写、执行基本格式检查、重复地址映射为冲突，地址变更会清除验证时间。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 与 `cargo fmt --all -- --check` 通过；未运行测试。
+结果（2026-10-19）：新增管理员单用户详情、创建时设置邮箱和独立资料更新接口；邮箱统一小写、执行基本格式检查、重复地址映射为冲突，地址变更会清除验证时间。补充 `users` API 回归，覆盖旧账号空邮箱、创建与资料更新、CSRF、邮箱大小写重复、邮箱变更清除验证状态、等价地址保留验证状态及无效输入不泄漏存储错误。`users` target 4/4、Rust build、fmt check 和 diff check 通过；`docs/API.md` 已同步创建、详情与更新合同。
 
 #### LUX-596：管理员账号资料详情页
 
@@ -12614,18 +12623,18 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 范围：实现账号软删除、7 天清理期限、恢复和回收站彻底删除存储操作。禁用和软删除都撤销 Web/Emby 凭证并停止数据库中活跃的 Emby/Web 播放会话；软删除保留资料与权限、保存原禁用状态；恢复原禁用状态但不恢复已撤销凭证或播放会话。拒绝删除最后一个有效管理账户。仅提供存储与应用服务方法，不接通 HTTP 或页面操作。
 
-预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository.rs`、`src/auth/users.rs`。
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository_tests.rs`。
 
 验收标准：
 
-- [ ] 删除保留账号和关联数据 7 天，保存的恢复状态准确。
-- [ ] 禁用或删除撤销两类令牌并停止两类数据库播放会话；过期或重复删除不会破坏状态。
-- [ ] 恢复清除删除时间并还原此前启用/禁用状态，且不恢复旧凭证。
-- [ ] 最后一名有效管理员受保护，彻底删除只接受已进入回收站的账号。
+- [x] 删除保留账号和关联数据 7 天，保存的恢复状态准确。
+- [x] 禁用或删除撤销两类令牌并停止两类数据库播放会话；过期或重复删除不会破坏状态。
+- [x] 恢复清除删除时间并还原此前启用/禁用状态，且不恢复旧凭证。
+- [x] 最后一名有效管理员受保护，彻底删除只接受已进入回收站的账号。
 
 依赖：LUX-596。
 
-结果（2026-10-19）：存储层新增 7 天软删除、恢复、仅回收站账号彻底删除；禁用/删除事务会撤销 Web 会话和 Emby 令牌并将两类播放记录标为停止。`cargo fmt --all -- --check` 与 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 通过；HTTP 操作尚未接通，未运行测试。
+结果（2026-10-19）：存储层已有 7 天软删除、恢复和仅回收站账号彻底删除操作，本次补齐回归验证。新增三个存储用例：软删除与禁用都撤销 Web/Emby 凭证、停止 Emby/Web 播放记录并捕获服务端 HLS 会话；恢复分别保留此前启用和禁用状态且不恢复旧凭证；验证最后一名有效管理员保护、只能彻底删除回收站账号及到期批量清理边界。三个定向 lib 测试各 1/1，`cargo fmt --all -- --check` 与 `git diff --check` 通过。HTTP 接线由 LUX-599 覆盖。
 
 #### LUX-598：禁用和删除时停止服务端 HLS 进程
 
@@ -13130,6 +13139,4447 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 
 结果（2026-10-19）：共享签名资源授权在每次 Web/Emby HLS manifest、初始化文件或分片请求（HEAD 也包含）读取当前策略。撤销会话所需转码权限后，请求返回 403，HLS 会话停止、准入释放、临时目录清除；再次使用票据返回 410。Web 测试覆盖 tier 2 与 HEAD 拒绝，Emby 测试覆盖硬件/软件视频转码档撤权；定向 `web_playback` 1/1、`playback` 4/4 通过，`cargo fmt --all -- --check` 与 `git diff --check` 通过。Emby 策略拒绝及 HLS 票据失效响应合同已加入兼容性文档。未部署。
 
+#### LUX-626：取消用户外挂字幕权限模块
+
+范围：按项目所有者决定取消用户管理方案中的模块八。移除用户详情页外挂字幕占位和用户级字幕权限、上传/替换/删除字幕文件的规划；保留现有字幕播放、字幕元数据编辑、扫描与读取合同，不改变这些既有能力。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-profile-lifecycle.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情导航不再出现模块八或外挂字幕权限入口，模块一至七入口不变。
+- [x] 用户管理设计将模块八明确标为取消，并从默认值、服务接口、数据能力、阶段门和验收清单中移除用户级字幕权限及文件管理要求。
+- [x] 模块四的默认权限与复制范围不再包含用户级字幕权限。
+- [x] 明确现有字幕播放、管理字幕元数据、索引与扫描功能保持既有合同。
+
+短计划：先更新设计与任务规格，删去用户详情的已取消导航项，复查用户管理设计中的模块八引用；不修改字幕播放、元数据或扫描实现。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-profile-lifecycle.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-593。
+
+结果（2026-10-19）：新增导航回归先在原 8 项入口上失败（预期 7、实际 8），移除已取消的外挂字幕入口后，`admin-user-profile-lifecycle` 6/6 通过；Web production build 与 `git diff --check` 通过。用户管理方案和 LUX-593 页面结构同步移除用户级字幕权限；模块五仍约束已有字幕读取的媒体访问，现有字幕播放、元数据编辑与扫描能力未改。
+
+#### LUX-627：为显式媒体库访问模式建立迁移
+
+范围：为用户增加受约束的 `library_access_mode`（`ALL` / `SELECTED` / `NONE`）字段。旧账号按迁移前实际可见范围回填：存在 `can_view=1` 记录时为 `SELECTED`，否则为 `ALL`，从而保持旧行为。字段默认 `ALL` 仅作为兼容性数据库回退；新用户默认权限由后续模块四任务显式写入。本任务只改 schema/migration，不改读取 ACL、管理 API 或新用户创建行为。
+
+预计修改文件（12 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`migrations/0187_user_library_access_mode.sql`、`migrations-postgres/0187_user_library_access_mode.sql`、`src/storage/repository_tests.rs`、`tests/storage.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/postgres_database.rs`、`tests/admin_health.rs`、`tests/scanner.rs`、`tests/ready_version.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 都提供仅允许 `ALL`、`SELECTED`、`NONE` 的非空字段，空库完整启动可应用迁移。
+- [x] 旧用户无正向授权记录（包括只有 `can_view=0` 的历史记录）迁移为 `ALL`；存在正向记录迁移为 `SELECTED`。
+- [x] 新迁移保留既有媒体库授权表记录，且不改动任何读取行为。
+- [x] SQLite 迁移回归、格式检查和 `git diff --check` 通过；受影响的 schema 版本接口/存储目标定向回归通过。
+
+短计划：在主规格与方案中确认旧/新模式语义，先写旧 SQLite 授权数据迁移回归，再补 SQLite/PostgreSQL migration；更新空库启动、PostgreSQL 启动与既有最新 schema 版本断言；不改 ACL 查询和 API。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_mode_migration_preserves_legacy_semantics`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_library_access_mode_migration_runs_from_an_empty_database -- --exact`、受影响的 `admin_health` / `ready_version` / `scanner` / `scanning_jobs` / `danmaku` 定向用例、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database --no-run`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_bootstrap_runs_migrations_and_persists_core_state -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_user_library_access_mode_migration_preserves_legacy_semantics -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-593、LUX-626。
+
+结果（2026-10-19）：SQLite 对无授权/仅拒绝/正向授权账号分别回填 `ALL` / `ALL` / `SELECTED`，保留授权行并拒绝非法模式；PostgreSQL 16 运行时升级回归得到相同回填结果，并验证模式字段非空且拒绝非法值。PostgreSQL 空库完整启动至 schema 188，验证默认 `ALL`。两项 PostgreSQL 专项用例均 1/1；旧 SQLite 回归、受影响 schema 版本接口和存储目标、格式及 diff 检查通过。完整 `storage` 目标串行运行 63/63 通过（并行运行时旧 cooldown 时间窗口用例曾波动）。空库启动测试将初始管理员创建移至其他测试账号之前，避免测试本身提前完成初始化导致 `AlreadyCompleted`。未部署。
+
+#### LUX-628：按显式模式执行媒体库访问检查
+
+范围：让存储层 ACL、授权播放源和全局合集来源筛选按 `ALL` / `SELECTED` / `NONE` 判断；更新旧的单库及批量授权写入，使其事务内继续按旧界面语义在有正向授权时写入 `SELECTED`、无正向授权时写入 `ALL`。不开放 `NONE` 的管理界面，本任务不改管理员接口形状、新用户默认策略或内容分级规则。
+
+预计修改文件（16 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`src/storage/users.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`tests/catalog.rs`、`tests/collections.rs`、`tests/search.rs`、`tests/playback.rs`、`tests/resume_favorites.rs`、`tests/emby_counts.rs`、`tests/series_api.rs`、`tests/remote.rs`、`tests/emby_global_collection_playback.rs`、`tests/subtitles.rs`、`tests/people_api.rs`。
+
+验收标准：
+
+- [x] 用户媒体库检查和可访问库列表严格遵循三种模式；未知用户、`NONE` 不可读，`ALL` 含之后新增的启用库，`SELECTED` 只含正向授权库。
+- [x] 播放源、合集卡片、合集成员、合集来源及来源偏好写入的 SQL 过滤均遵循同一模式判定。
+- [x] 旧管理接口单条与批量授权写入事务性地同步模式，现有“清空所选后恢复全部”行为保持不变。
+- [x] 直接插入旧授权记录的测试夹具显式设置 `SELECTED`；相关存储与媒体访问目标通过。
+
+短计划：先新增 `ALL` / `SELECTED` / `NONE` 的 SQLite 存储回归并确认 `NONE` 在旧推断逻辑下失败；再改存储授权查询和全局合集 SQL；在旧接口写入中用同一事务更新模式，最后为依赖旧正向授权夹具的集成目标显式设置 `SELECTED`。
+
+验证：检查 Toshiba 挂载状态后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_modes_are_enforced_by_storage_queries` 与受影响的 `catalog`、`collections`、`search`、`playback`、`resume_favorites`、`emby_counts`、`series_api`、`remote`、`emby_global_collection_playback`、`subtitles`、`people_api` 测试目标，再运行 `cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-627。
+
+结果（2026-10-19）：存储授权和合集/播放 SQL 已按显式模式过滤；旧单条、批量写入在事务内同步为 `SELECTED` 或 `ALL`。`ALL` / `SELECTED` / `NONE`（包括 `NONE` 覆盖既有正向授权）、新启用媒体库、未知用户及清空选择回归通过；全局合集和直接播放 `NONE` 拒绝回归通过。相关 `catalog`、`collections`、`search`、`playback`、`resume_favorites`、`emby_counts`、`series_api`、`remote`、`emby_global_collection_playback`、`subtitles`、`people_api` 目标及存储批量写入回归均通过；`cargo fmt --all -- --check` 与 `git diff --check` 通过。PostgreSQL 运行时仍因本机服务不可用而未验证；未部署。
+
+#### LUX-629：管理员显式设置用户媒体库访问模式
+
+范围：为现有用户媒体库管理接口返回明确的 `ALL` / `SELECTED` / `NONE` 模式，并新增整组替换接口。`SELECTED` 接受启用的普通媒体库 ID；空选择规范化为 `NONE`。`ALL` 与 `NONE` 清除旧选择行并保存明确模式。既有逐库 PATCH 接口保持 LUX-628 的兼容行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/admin_user_access.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 查询返回明确模式；不存在用户返回 404。
+- [x] 整组更新原子替换模式与选择；`SELECTED` 空列表变成 `NONE`，库 ID 必须存在、启用且不能重复。
+- [x] 旧逐库 PATCH 与已有权限行为兼容，输入无效时不产生部分更新。
+
+短计划：先在用户 HTTP 集成测试覆盖明确模式查询、三种模式更新和无效输入；再增加存储整组替换事务，接入 application 校验与管理员 GET/PUT；最后运行 users 定向目标、相关存储回归、格式与 diff 检查。
+
+验证：确认 Toshiba 挂载状态后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_users_and_last_manager_is_protected -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_library_access_modes_are_enforced_by_storage_queries`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-627、LUX-628。
+
+结果（2026-10-19）：管理员媒体库权限 GET 返回显式模式和选择列表；新增 CSRF 保护的 PUT 整组替换，校验用户、模式、启用媒体库和重复 ID，并将 `SELECTED` 空选择规范化为 `NONE`。存储事务回归确认中途插入失败会回滚旧选择与模式；HTTP 集成回归覆盖三种模式、无效输入、CSRF 和旧 PATCH 路径。users 定向测试、存储回滚测试、格式与 diff 检查通过。一次首跑在后续既有账号删除断言收到 503，设置本地代理绕行后的复跑通过；该瞬态未能再次复现。未部署。
+
+#### LUX-630：同步媒体库访问模式 API 文档
+
+范围：同步现行媒体库 ACL 规格与管理员 API 文档，说明显式三模式、整组替换接口、校验规则，以及旧逐库 PATCH 的兼容行为。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`。
+
+验收标准：
+
+- [x] 主规格不再把“选择为空即全部”作为唯一的权限表达方式。
+- [x] API 文档说明 GET 返回的模式和选择，PUT 可设置三种模式并校验媒体库 ID；逐库 PATCH 行为单独说明。
+
+短计划：将 LUX-036 的当前权限合同更新为显式模式，再补管理员 GET/PUT/PATCH 路由及请求、响应和错误语义。
+
+验证：检查主规格和代码路由一致，`git diff --check` 通过；本任务只改文档，不运行代码测试。
+
+依赖：LUX-628、LUX-629。
+
+结果（2026-10-19）：主规格与 `docs/API.md` 已同步 `ALL` / `SELECTED` / `NONE`，列明旧 PATCH 的兼容语义以及 PUT 对不存在、未启用和重复媒体库的处理。文档核对与 diff 检查通过。
+
+#### LUX-631：Web API 客户端支持显式媒体库权限
+
+范围：为 Web API 类型声明媒体库访问模式；管理员权限 GET 返回强类型模式与选择，客户端增加整组 PUT 更新方法；保留旧逐库 PATCH 方法供兼容调用。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] TypeScript 类型明确限定 `ALL` / `SELECTED` / `NONE`，GET/PUT 响应不再可省略模式。
+- [x] PUT 发送正确路由、JSON 与 CSRF；旧 PATCH 请求合同保持不变。
+- [x] API 客户端定向 Vitest 通过。
+
+短计划：先新增 fetch mock 回归确认 GET 与 PUT 合同，再增加强类型与客户端方法；运行 API 客户端 Vitest、Web build 和 diff 检查。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-629、LUX-630。
+
+结果（2026-10-19）：新增 `AdminUserLibraryAccessMode` 与 GET/PUT 请求响应类型，客户端 PUT 方法发送显式模式和选择；旧逐库 PATCH 方法保持不变。新增 fetch mock 验证路由、请求体和 CSRF。`api-client.test.ts` 63/63 通过，`pnpm --dir web build` 通过。
+
+#### LUX-632：在用户详情管理显式媒体库权限
+
+范围：将用户媒体库权限编辑放入用户详情“权限”模块，允许管理员选择全部媒体库、指定媒体库或无媒体库权限；指定模式仅列出已启用媒体库，使用显式保存，不再把空复选框解释为“全部”。回收站账号只读。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-users-access.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情权限页读取并显示服务端三态模式；选择 `SELECTED` 时仅展示启用媒体库。
+- [x] 管理员可草拟模式/库选择并显式保存；空指定项按 `NONE` 显示，保存错误保留草稿并给出提示。
+- [x] 用户列表不再存在空选择即全部的旧控件；回收站账号只读，加载失败不展示默认权限假象。
+- [x] 定向 Vitest 与 Web build 通过。
+
+短计划：先将现有 UI 回归改为详情页三态和保存行为；把 API 读写接入权限模块，再从列表移除含糊的逐库复选框；补充可访问的单选控件、指定库复选框、保存状态与错误提示。
+
+验证：`pnpm --dir web exec vitest run tests/admin-users-access.test.tsx`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-593、LUX-631。
+
+结果（2026-10-19）：详情页权限区改为显式三态和保存，指定范围只列已启用媒体库，空选择保存为 `NONE`；列表移除原先逐库权限编辑控件，回收站权限只读。定向 `admin-users-access`、用户资料生命周期和播放策略 Vitest 共 15/15 通过，`pnpm --dir web build` 与 `git diff --check` 通过。
+
+#### LUX-633：存储新用户默认权限设置
+
+范围：在管理员全局设置中增加新用户权限快照配置与持久化，包含显式媒体库模式/媒体库 ID、下载权限和模块六的五项播放策略。默认媒体库为指定空集合（即无权限），新用户默认允许播放、同时播放 2 路、允许当前服务器支持范围内的封装/音频/视频转换，并默认禁止下载。只增加设置读写，不改变用户创建、邀请或预设行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] 管理员 GET 可读默认快照；首次读取返回明确、安全的设计默认值。
+- [x] CSRF 保护的 PATCH 可保存完整默认快照；空 `SELECTED` 规范化为 `NONE`，`ALL/NONE` 不接受媒体库 ID。
+- [x] 仅接受已启用普通媒体库、唯一 ID、非负播放上限；无效请求返回 400 且不改变已保存值。
+- [x] 定向 `admin_dashboard` Rust 集成测试、格式检查和差异检查通过。
+
+短计划：先扩展管理员设置集成回归，验证默认值、保存、空选择规范化和非法快照拒绝；再在 storage 用 `server_settings` 键持久化 JSON，在 application 层验证和归一化，最后扩展设置 DTO 与错误映射。不改用户创建路径。
+
+验证：`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test admin_dashboard`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+依赖：LUX-614–625、LUX-627–632。
+
+结果（2026-10-19）：管理员设置新增默认权限快照，首次返回 `NONE` 媒体库范围、禁止下载、允许播放且并发上限 2；`server_settings` 以单个 JSON 项持久化，无需迁移。空指定项归一为 `NONE`，重复/停用库、非空 `ALL/NONE` 和负并发上限均拒绝，失败不覆盖已保存值。`admin_dashboard` 1/1、fmt 与 diff check 通过。公开 API 文档同步由 LUX-634 完成。
+
+#### LUX-634：记录新用户默认权限设置 API
+
+范围：在 `docs/API.md` 记录管理员设置响应/请求中的 `newUserPermissions` 形状、初始默认值、媒体库模式校验和 CSRF 边界。明确该接口当前只配置快照，实际应用至新账号由后续任务接入。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`。
+
+验收标准：
+
+- [x] API 文档包含全部媒体库、下载与五项播放策略字段及默认值。
+- [x] 文档说明空指定集合归一为 `NONE`、`ALL/NONE` 禁止媒体库 ID、无效请求返回 400。
+- [x] 文档明确管理员 Web session + CSRF 和新账号应用仍待后续实现。
+- [x] `git diff --check` 通过。
+
+短计划：核对已实现 DTO 和集成回归后，将该资源契约补充到管理员设置 API 条目；不改代码或接口行为。
+
+验证：`git diff --check`。
+
+依赖：LUX-633。
+
+结果（2026-10-19）：`docs/API.md` 记录 `newUserPermissions` 全字段、默认值、完整快照更新、媒体库模式归一/拒绝规则、管理员 session + CSRF 和“尚未应用于新账号创建”的边界；`git diff --check` 通过。
+
+#### LUX-635：在用户全局设置页编辑新用户默认权限
+
+范围：将 `newUserPermissions` 接入“新用户默认权限”设置页，支持三态媒体库模式、启用媒体库选择、下载和五项播放/转码权限的完整快照编辑；保存成功更新管理员设置缓存，失败保留草稿。此任务只配置默认值，不改变用户创建行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/src/lib/api/types.ts`、`web/tests/admin-user-default-permissions.test.tsx`。
+
+验收标准：
+
+- [x] 设置页读取服务端快照；媒体库选择只显示已启用普通库，并说明空指定保存为无权限。
+- [x] 管理员可编辑媒体库模式、下载与播放/转码权限，显式保存完整对象。
+- [x] 并发上限只接受非负整数；保存失败保留草稿并显示错误，成功更新缓存。
+- [x] 定向 Vitest、Web build 与差异检查通过。
+
+短计划：先为默认权限模块写三态加载、完整保存、非法并发上限和失败保留回归；再扩展 API 类型与设置页分支，使用现有表单控件样式增加默认权限布局。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-default-permissions.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-633、LUX-634。
+
+结果（2026-10-19）：全局“新用户默认权限”页接入三态媒体库模式、已启用媒体库选项、下载与播放/转码策略及非负并发上限；空指定集合提示为无媒体库权限，错误时草稿保留，成功刷新设置缓存。定向 Vitest 7/7、Web build 和 diff check 通过。Playwright 使用本机临时 SQLite 服务完成保存并刷新恢复；390px 视口文档宽度 375px、无页面横向溢出，控制台无错误。桌面与窄屏截图保存于 `output/playwright/user-default-permissions/.playwright-cli/`。默认值应用至新账号仍由后续任务实现。
+
+#### LUX-636：原子创建带权限快照的账号
+
+范围：为用户存储层增加带初始权限快照的创建路径，在同一数据库事务中写入账号字段和指定媒体库授权；保留现有创建方法行为。应用层后续负责读取并传入已验证的新用户默认权限。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/users.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新的账号创建入口将下载、播放、并发、转码和媒体库模式写入账号记录。
+- [x] 指定媒体库授权与账号插入处于同一事务，任一写入失败时不留下半创建账号。
+- [x] 旧的账号插入调用保持原默认行为。
+- [x] 定向 Rust 回归、fmt 和 diff check 通过。
+
+短计划：先为指定媒体库快照与权限字段写存储回归，再增加存储快照类型、事务插入实现及 auth 创建入口；验证已有创建路径不变。
+
+验证：`cargo test --locked --lib <新存储回归过滤器>`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-627、LUX-628、LUX-620、LUX-633。
+
+结果（2026-10-19）：存储新增初始用户权限快照，账号字段和指定媒体库授权在单个事务写入；正向保存和授权插入触发失败回滚的定向回归 2/2 通过，旧插入路径未改。`cargo build --locked`、fmt check 与 diff check 通过。全量 `cargo test --locked --all-targets` 为 985 passed、5 failed、25 ignored；失败为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`stops_reading_a_chunked_response_as_soon_as_it_exceeds_the_limit`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`。全量 Clippy 被未修改的 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断。管理员直建由 LUX-637 接入默认快照，Emby 管理员建号由 LUX-638 接入。
+
+#### LUX-637：管理员直建账号应用默认权限快照
+
+范围：管理员通过 Lux API 创建普通账号时，读取已保存的新用户默认权限并传入原子创建路径；账号资料响应及后续权限查询反映实际快照。设置读取失败时不创建账号。本任务不改 Emby 创建和用户权限复制。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 新建普通账号完整取得配置的媒体库、下载和播放/转码快照。
+- [x] 创建响应中的下载权限与存储一致，播放策略和媒体库模式查询均返回配置值。
+- [x] 默认设置读取失败时返回服务不可用，不留下账号。
+- [x] 定向 `users` 集成回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加管理员设置保存后创建账号的失败回归；暴露只读默认值读取与快照映射，再让管理员创建 handler 调用权限快照创建方法。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-633、LUX-636。
+
+结果（2026-10-19）：管理员直建读取服务端默认快照并使用原子创建；返回的 `canDownload`、播放策略及媒体库模式均与设置一致。定向 `users` 集成测试 2/2、Rust build、fmt check 与 diff check 通过。删除设置表模拟读取故障时 API 返回 503，账号未写入；Emby 创建和公开 API 文档同步由 LUX-638 完成。
+
+#### LUX-638：Emby 管理员建号应用默认权限并同步 API 文档
+
+范围：Emby `/Users/New` 管理员创建账号时应用同一份新用户默认权限快照，并继续执行现有用户策略/配置复制选项；默认设置读取失败时不创建账号。同步公开 API 文档中的快照应用范围和管理员建号行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/emby_handlers.rs`、`src/auth/users.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] Emby 管理员创建账号取得默认的媒体库、下载和播放/转码策略。
+- [x] 显式 `UserPolicy` / `UserConfiguration` 复制仍按现有顺序执行。
+- [x] 默认设置读取失败时返回服务不可用，不留下账号。
+- [x] Emby 创建回归、Rust build、fmt、diff check 通过；API 文档不再称默认值只保存未应用。
+
+短计划：先修改 Emby 建号集成测试并确认默认策略断言失败；再接入 passwordless 权限快照创建，最后同步管理员设置与用户创建 API 文档。
+
+验证：`cargo test --locked --test emby_auth`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-633、LUX-636、LUX-637。
+
+结果（2026-10-19）：Emby `/Users/New` 管理员创建账号时读取同一份默认权限快照并原子保存，设置读取失败返回 503 且无账号残留；既有 `UserPolicy` / `UserConfiguration` 集成回归保持通过。Emby 定向测试 9/9、Rust build、fmt check、diff check 通过。同步 `docs/API.md`，说明默认快照在 Lux/Emby 管理员建号中的应用及复制选项的覆盖顺序。全量 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
+
+#### LUX-639：实现权限预设的版本化存储与业务校验
+
+范围：建立管理员、普通用户内置预设及自定义预设的数据模型，在现有 `server_settings` 中保存自定义权限快照；支持创建、更新、删除的业务操作、版本冲突检测和输入校验。本任务不暴露 HTTP 接口或管理页面，不把预设自动应用到已有用户。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/settings.rs`、`src/application/user_presets.rs`、`src/storage/users.rs`。
+
+验收标准：
+
+- [x] 列表包含管理员和普通用户内置预设；内置预设不能修改或删除。
+- [x] 自定义预设支持创建、版本检查更新和删除，名称唯一且数量有上限。
+- [x] 媒体库模式、下载、播放、并发与转码策略按新用户默认权限规则验证；空选择归一化为无权限。
+- [x] 并发管理更新使用存储层比较并交换，冲突不会丢失另一份已保存预设。
+- [x] 业务/存储定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先写内置预设、校验、版本冲突和存储并发回归；再实现自定义预设 JSON 持久化 CAS 与 application CRUD 服务。
+
+验证：`cargo test --locked --lib user_presets`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-633、LUX-636。
+
+结果（2026-10-19）：新增管理员/普通用户内置预设、自定义预设版本化 CRUD，权限字段复用新用户默认权限的结构校验；空的 `SELECTED` 归一化为 `NONE`，指定媒体库须仍为启用的普通媒体库。`server_settings` 使用单条 SQL 比较并交换，自定义名称不区分大小写且最多 100 项。定向 `user_presets` 5/5、`cargo build --locked`、fmt check、diff check 通过。`cargo test --locked --all-targets` 的库测试部分为 991 passed、4 failed、25 ignored；3 项补全队列基线失败重现，另有 `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 超时，因库测试失败后续集成 targets 未运行。全量 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断。预设 HTTP API 和 UI 留待后续模块四任务。
+
+#### LUX-640：暴露管理员权限预设管理 API
+
+范围：为权限预设提供管理员列表、创建、版本化更新和删除接口；变更接口要求管理员 Web session 与 CSRF，预设版本冲突和名称冲突返回稳定错误。暂不实现 Web 管理表单或预设应用到用户的批量操作。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`src/application/user_presets.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可以读取两个内置预设及自定义预设；非管理员不能读取或修改。
+- [x] 创建、更新、删除均通过业务服务；写操作校验 CSRF，删除和更新要求预期版本。
+- [x] 无效输入返回 400，重复名称、内置预设写入和版本冲突返回 409，不存在预设返回 404。
+- [x] API 回归、`users` target、Rust build、fmt 和 diff check 通过。
+
+短计划：先在 `users` 集成回归中覆盖列表、CSRF、CRUD 和错误映射并确认失败；再连接 LUX-639 服务，最后同步 API 合同。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639。
+
+结果（2026-10-19）：新增管理员预设列表与自定义预设创建/更新/删除 API，写操作通过 CSRF 校验并记录审计事件；更新和删除要求当前预设版本。`users` target 2/2、Rust build、fmt check 和 diff check 通过；集成回归覆盖非管理员读写拒绝、重复名称、无效快照、内置项保护、陈旧版本、缺失版本及不存在项。
+
+#### LUX-641：在用户全局设置中管理权限预设
+
+范围：为模块四“角色预设”占位页增加自定义预设列表、新建、编辑和删除表单，复用已完成的管理员预设 API；展示两个只读内置预设和每份快照的管理角色、媒体库、下载、播放与转码信息。不在本任务中将预设应用到已有账号。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-default-permissions.test.tsx`。
+
+验收标准：
+
+- [x] 全局设置“角色预设”页读取并区分内置和自定义预设，内置项只读。
+- [x] 管理员可创建、编辑和删除自定义预设；保存快照覆盖媒体库、管理角色、下载、播放、并发和转码选项。
+- [x] 表单校验非空名称、并发上限和空媒体库选择；服务器错误保留可继续编辑的草稿。
+- [x] Web 定向回归、构建和 diff check 通过，桌面/窄屏浏览器验证可操作。
+
+短计划：先扩展现有默认权限设置测试，覆盖预设页加载与保存；再添加 API 客户端方法、页面交互并验证真实浏览器。
+
+验证：`pnpm --dir web test -- admin-user-default-permissions`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-640。
+
+结果（2026-10-19）：页面接入管理员预设 API，支持自定义权限快照的创建、版本化更新与删除，并展示不可变内置项。定向 Vitest 6/6、冻结依赖安装、Web 构建、diff check 通过。Playwright 真实浏览器在 1280px 桌面和 390px 窄屏验证完整 CRUD，移动视口无页面横向溢出；控制台的 401 来自登录前匿名 `/auth/me` 探测，404 来自临时管理员无头像资源。
+
+完整 Web 门禁未全绿：`pnpm --dir web test` 的 Node 布局断言失败（其中 hero 行高期望与工作区既有 `web/src/react.css` 修改不一致）；单独全量 Vitest 为 91 个文件、677 passed、4 failed。四项失败位于既有首页预取焦点、LibraryCard 预取/虚拟链接和媒体图片轮询测试，与本任务文件无关。该工作区 `web/src/react.css` 的改动属于已有用户修改，未触碰或纳入提交。
+
+#### LUX-642：记录用户已应用的权限预设来源
+
+范围：为用户已应用的权限快照建立来源记录，保存预设 ID、名称、版本和应用时间；来源快照不依赖自定义预设继续存在，删除用户时级联清理。本任务只建立 SQLite/PostgreSQL 持久化结构，不改变用户权限和 API 行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0188_user_permission_preset_sources.sql`、`migrations-postgres/0188_user_permission_preset_sources.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] 空库升级后出现来源表，外键以用户为主表并在用户删除时级联清理。
+- [x] 来源记录保存预设 ID、名称、正版本号和应用时间；不外键关联可删除的自定义预设。
+- [x] SQLite 迁移回归和 PostgreSQL 迁移定义检查、Rust build、fmt 与 diff check 通过。
+
+短计划：先扩展空库迁移回归并确认失败；再添加双数据库迁移及来源记录约束。
+
+验证：`cargo test --locked --test storage -- --test-threads=1`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639、LUX-640。
+
+结果（2026-10-19）：新增双数据库用户预设来源表，保存应用时的 ID、名称、版本和时间，并在账号彻底删除时级联清理。`storage` target 串行运行 64/64、Rust build、fmt check、diff check 通过；PostgreSQL 迁移通过结构定义断言，本机 PostgreSQL 运行时未验证。第一次并行跑完整 `storage` target 时，时间敏感的既有重试迁移断言失败，单线程复跑通过。
+
+#### LUX-643：同步来源迁移后的其余 schema 版本断言
+
+范围：将 `0188` 来源迁移后的当前 schema 版本断言更新为 188；仅修改现行数据库版本断言，历史迁移版本和迁移序列检查保持原值。本任务不改变运行时代码。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`tests/scanning_jobs.rs`、`tests/scanner.rs`、`tests/danmaku.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 测试中的当前 schema 版本断言均与最新迁移一致，历史迁移断言不变。
+- [x] 对应迁移回归通过，PostgreSQL target 可编译；Rust build、fmt 与 diff check 通过。
+
+短计划：先确认四个目标中的断言用途；更新当前版本值并运行对应迁移测试。
+
+验证：`cargo test --locked --test scanning_jobs streamed_manifest_bulk_insert_avoids_redundant_availability_trigger_update`、`cargo test --locked --test scanner media_catalog_migration_creates_expected_tables`、`cargo test --locked --test danmaku database_migration_creates_danmaku_tables`、`cargo test --locked --test postgres_database --no-run`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-642。
+
+结果（2026-10-19）：将 `scanning_jobs`、`scanner`、`danmaku` 和 PostgreSQL 集成测试中的现行 schema 版本同步为 188，历史迁移编号保持不变。三个 SQLite 定向回归各 1/1、`postgres_database --no-run`、Rust build、fmt check 和 diff check 通过；本机未运行 PostgreSQL 集成服务。
+
+#### LUX-644：原子应用用户权限预设存储快照
+
+范围：在存储层为现有用户原子应用角色、媒体库访问、下载、播放与转码快照，并写入 LUX-642 的来源记录。保护最后一个有效服务器管理员；数据库任一写入失败时回滚全部权限与来源变更。本任务不新增业务 API 或管理页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 一次事务更新角色、下载、播放/转码、媒体库模式/选择和预设来源。
+- [x] `ALL`/`NONE` 清除旧选择，`SELECTED` 完整替换旧选择；失败时旧快照保持不变。
+- [x] 不存在或已删除用户不可应用；最后一个有效管理账户不能被降权。
+- [x] 存储定向回归、Rust build、fmt 与 diff check 通过。
+
+短计划：先添加存储层成功、降权保护与事务回滚回归并确认失败；再实现单事务预设应用。
+
+验证：`cargo test --locked --lib apply_user_permission_preset`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-642、LUX-643。
+
+结果（2026-10-19）：新增存储事务一次性应用角色、下载、播放/转码、媒体库访问与来源快照；`SELECTED` 仅接受启用的普通媒体库，`ALL`/`NONE` 清除旧选择。事务失败回滚全部变更，已删除/不存在用户拒绝操作，单管理员保护并防止并发降权共同移除最后管理员。`apply_user_permission_preset` 定向回归 3/3、Rust build、fmt check、diff check 通过；SQLite 并发回归通过，PostgreSQL 行锁逻辑已编译但未接运行时验证。
+
+#### LUX-645：解析并校验用户权限预设应用服务
+
+范围：在 application 层按预设 ID 读取内置或自定义预设，检查目标用户和当前有效的媒体库快照，再调用 LUX-644 原子存储操作。自定义预设之后可删除，用户已应用的权限与来源快照不受影响。本任务不暴露 HTTP 接口。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_presets.rs`。
+
+验收标准：
+
+- [x] 管理员与自定义预设都能按当前快照应用；未知预设、无效用户 ID 和已删除用户返回明确业务结果。
+- [x] 媒体库已停用或权限快照失效时拒绝应用；最后管理员保护错误保留为稳定业务错误。
+- [x] application 定向回归、Rust build、fmt 与 diff check 通过。
+
+短计划：先增加服务成功、过期媒体库、缺失目标及最后管理员回归；再实现预设解析、快照校验和存储错误映射。
+
+验证：`cargo test --locked --lib user_presets`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639、LUX-640、LUX-644。
+
+结果（2026-10-19）：application 服务可应用内置或自定义预设快照，校验用户 UUID、预设存在性和当前启用媒体库，并映射最后管理员与存储冲突错误。删除已应用的自定义预设不会改变用户权限或来源记录。`user_presets` 定向回归 7/7、Rust build、fmt check 和 diff check 通过；PostgreSQL 行锁仍未运行时验证。
+
+#### LUX-646：开放管理员应用用户权限预设接口
+
+范围：新增管理员将内置或自定义权限预设应用到指定用户的 API。操作要求管理员 Web session 与 CSRF，复用 application 服务和原子存储事务，并记录审计事件；用户/预设不存在、最后管理员保护和无效快照映射为稳定 HTTP 错误。本任务不接入预设来源查询或 Web 界面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`src/application/user_presets.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可应用内置或自定义预设，用户权限快照原子更新；自定义预设随后删除不回滚已应用权限。
+- [x] 非管理员和缺少 CSRF 的请求拒绝；用户 ID、用户、预设及最后管理员错误映射稳定。
+- [x] 应用操作记录目标用户、预设 ID 与版本，不记录敏感内容。
+- [x] `users` 集成 target、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加端到端 API 回归并确认新路由失败；再接入 application 服务、错误映射、CSRF 和审计；最后同步公开 API 文档。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-640、LUX-645。
+
+结果（2026-10-19）：新增管理员权限预设应用端点，复用事务存储与 application 校验，成功后写入以目标用户为对象、详情只含预设 ID 和版本的审计事件，并规范化 UUID 大小写。`users` target 3/3、Rust build、fmt check 与 diff check 通过；回归覆盖管理员/CSRF、权限快照、应用后删除预设、无效/不存在用户、未知预设和最后管理员保护。全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
+
+#### LUX-647：批量读取用户权限预设来源
+
+范围：为管理端用户查询提供单个用户的预设来源读取和一页用户 ID 的批量来源读取，返回预设 ID、应用时名称、版本和时间。查询只读来源快照，不联接现存预设配置，因此自定义预设删除后仍能读取。本任务不修改 API 投影或页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 单条与批量查询准确返回完整来源，缺少来源时返回空结果。
+- [x] 空 ID 列表不执行查询；一页多个用户用单次批量查询完成。
+- [x] SQLite 存储回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加单条/批量来源查询回归并确认存储接口尚不存在；再新增类型、双查询方法和模块导出。
+
+验证：`cargo test --locked --lib user_permission_preset_source`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-642。
+
+结果（2026-10-19）：新增用户预设来源类型、单用户读取及按最多 500 个 ID 分块的批量读取；空输入不执行 SQL。`user_permission_preset_source_reads_support_single_and_batch_queries` 1/1、Rust build、fmt check 和 diff check 通过。为让该中间存储合同保持零新增告警，标注由后续 LUX-648 API 投影接线；全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
+
+#### LUX-648：在管理员用户列表与详情公开预设来源
+
+范围：将 LUX-647 的预设来源快照投影到管理员用户分页列表和单用户详情 API。为现有 `presetSource` 提供应用时名称，并新增含预设 ID、名称、版本和应用时间的 `presetSourceDetails`；无来源时两个字段均为 `null`。分页列表须一次批量读取本页来源。本任务不改 Web 页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/auth/users.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员列表和详情返回一致的预设来源字段；没有来源时返回 `null`。
+- [x] 删除自定义预设后仍显示已保存的来源快照；列表不会逐用户查询来源。
+- [x] `users` 集成 target、Rust build、fmt 和 diff check 通过。
+
+短计划：先扩展 API 集成回归并确认来源字段缺失；再将来源接入 auth DTO 和列表批量投影，最后同步 API 文档。
+
+验证：`cargo test --locked --test users`、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-647。
+
+结果（2026-10-19）：管理员用户列表和详情现在返回预设名称与完整来源快照，未应用的用户返回 `null`；列表通过一次批量来源查询，用户编辑资料后的详情响应也保留来源。`users` target 3/3、Rust build、fmt check 和 diff check 通过；回归覆盖删除自定义预设后来源仍可读。全量 Clippy 仍被既有 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 的 `too_many_arguments` 阻断。
+
+#### LUX-649：为 Web 接入应用权限预设的 API 合同
+
+范围：为 Web API 类型加入管理员用户预设来源详情，并新增将权限预设应用到单个用户的客户端方法。客户端向 LUX-646 端点发送 `presetId`，携带现有 CSRF token 并处理 204 空响应。本任务不添加页面按钮或批量应用。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 用户类型包含 nullable 的预设来源详情字段。
+- [x] 应用方法正确编码用户 ID、发送请求体和 CSRF，并把 204 转为 `undefined`。
+- [x] API 客户端定向测试、Web build 和 diff check 通过。
+
+短计划：先添加客户端契约回归并确认方法缺失；再补类型与 POST 方法，最后运行定向 Vitest 和 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-646、LUX-648。
+
+结果（2026-10-19）：为管理员用户类型增加可空预设来源详情，并新增应用预设 POST 客户端方法。`api-client.test.ts` 64/64、Web build 通过。`pnpm --dir web test -- api-client` 在运行 Node 布局断言阶段先失败（详情页 lazy import、Hero 标题行高、移动端媒体卡片宽度、触控卡片操作），未执行 Vitest；直接 Vitest target 已独立通过。Hero 行高断言也受工作区既有 `web/src/react.css` 修改影响，该文件未纳入任务提交。
+
+#### LUX-650：在用户详情应用权限预设
+
+范围：在用户详情的权限页展示用户当前已应用的预设来源，并允许管理员选择现有内置或自定义预设应用到该用户。应用前说明会替换当前权限快照并请求确认；应用成功后刷新用户详情和列表缓存。本任务不实现批量应用或权限复制。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-users-access.test.tsx`。
+
+验收标准：
+
+- [x] 权限页显示来源快照；自定义预设删除后仍显示已保存的来源名称、版本和时间。
+- [x] 可选择现存预设；确认后调用应用 API，成功刷新详情、列表、媒体库范围和播放策略缓存并显示结果。
+- [x] 取消确认不发送请求；预设加载或应用失败时给出可读反馈；回收站用户保持只读。
+- [x] 页面定向回归、Web build、diff check 和真实浏览器交互验证通过。
+
+短计划：先为预设来源、确认/取消、成功缓存刷新和错误反馈补页面回归并确认失败；再将预设选择与来源展示接入权限页，最后运行定向 Vitest、Web build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-users-access.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-649。
+
+结果（2026-10-19）：权限页展示应用时保存的预设名称、版本和时间，即使来源自定义预设已经删除；可确认应用内置或自定义预设。成功后刷新用户详情、分页用户列表、媒体库访问和播放策略缓存；取消确认不提交，加载/应用错误可读且允许重试，回收站用户仍只读。`admin-users-access.test.tsx` 10/10、TypeScript 与 Web production build、diff check 通过。Playwright 使用模拟 API 验证 204 应用、详情来源重读及确认交互；1280px 和 390px viewport 均无横向溢出。浏览器验证不代表真实服务端或部署验证；本地模拟 EventSource 曾返回一条 MIME 错误，不影响预设请求链路。
+
+#### LUX-651：建立服务端账户偏好存储结构
+
+范围：新增用户账户偏好表，保存主题、强调色、首页分区开关、默认音轨/字幕语言和自动连播；保存版本号以供后续比较并交换，账号删除时级联清理。本任务只建立 SQLite/PostgreSQL schema 与 SQLite 空库迁移回归，不连接 API 或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0189_user_account_preferences.sql`、`migrations-postgres/0189_user_account_preferences.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] 空库升级后创建带用户级联外键的账户偏好表，偏好列和版本列具有明确类型、默认值与合法值约束。
+- [x] 新建偏好行使用与当前账户页一致的默认设置，版本为正整数。
+- [x] SQLite 空库迁移回归通过；PostgreSQL schema 版本和迁移运行时由后续 LUX-652 覆盖。
+
+短计划：先添加空库 schema 回归并确认失败；新增双数据库迁移，验证默认值、约束和用户删除级联。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_account_preferences_migration_runs_from_an_empty_database -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+结果（2026-10-19）：新增 SQLite/PostgreSQL 账户偏好表迁移，保存主题、强调色、首页区块、音轨/字幕语言、自动连播、版本和更新时间；约束限定可选主题/强调色、布尔值及正版本，用户删除级联清理。SQLite 空库回归先以 schema 版本 188/预期 189 失败，迁移后 1/1 通过，覆盖字段默认值、非法值拒绝和级联删除。PostgreSQL 运行时与当前 schema 断言由 LUX-652 接续。
+
+#### LUX-652：验证账户偏好 PostgreSQL 迁移并同步 schema 版本
+
+范围：将 SQLite/PostgreSQL 当前 schema 版本断言同步至 189，并补充 PostgreSQL 16 空库迁移后的账户偏好默认值、约束和级联删除运行时验证。旧库迁移仍保持其明确的历史版本起点。本任务不修改运行时代码或迁移。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`tests/storage.rs`、`tests/scanner.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 所有当前 schema 断言为 189，明确测试历史迁移的断言仍为其源版本。
+- [x] PostgreSQL 空库创建偏好表，运行验证默认值、非法主题/强调色/版本拒绝及用户级联删除。
+- [x] 受影响迁移 target、PostgreSQL 迁移回归、Rust 格式检查与 diff check 通过。
+
+短计划：先搜索全部当前版本断言并区分历史升级起点；更新断言与 PostgreSQL bootstrap 运行时回归，再运行受影响 targets。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage`、相关 `scanner` / `scanning_jobs` / `danmaku` schema 迁移用例、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_bootstrap_runs_migrations_and_persists_core_state -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_user_library_access_mode_migration_preserves_legacy_semantics -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：所有当前 schema 断言同步到 189；旧库迁移仍从明确历史版本升级。PostgreSQL 16 空库 bootstrap 1/1，覆盖账户偏好默认值、无效主题/强调色/版本拒绝及用户删除级联；LUX-627 PostgreSQL 旧授权升级回归 1/1。SQLite `storage` target 串行运行 66/66，`scanner`、`scanning_jobs`、`danmaku` schema 定向用例各 1/1；PostgreSQL 格式与 diff 检查通过。`storage` 并行首跑中既有 cooldown 窗口测试 65/66，隔离复跑 1/1、串行复跑 66/66；不涉及本次迁移。
+
+#### LUX-653：实现账户偏好版本化存储
+
+范围：提供用户账户偏好的读取与版本比较并交换写入，首次写入要求版本 0 并创建版本 1；后续写入仅在客户端版本匹配时递增版本。偏好字段由存储约束校验，不允许修改已进入回收站的账号。本任务不接入 HTTP 或页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 无偏好记录返回空；有效用户首次 CAS 创建版本 1，后续匹配版本写入原子递增。
+- [x] 过期版本返回冲突且不覆盖当前值；不存在或已删除用户不能创建或更新偏好。
+- [x] 存储回归验证默认读取、CAS 冲突与无效字段拒绝；Rust 格式和 diff 检查通过。
+
+短计划：先添加首次写入、版本递增、陈旧版本、删除用户和非法值存储回归；再新增类型及 SQLite/PostgreSQL 共用 CAS 操作。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib account_preferences`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。Cargo 前确认 Toshiba 已挂载。
+
+结果（2026-10-19）：新增账户偏好读取和单语句 CAS 写入。版本 0 创建版本 1，匹配版本更新时递增，陈旧版本返回冲突且保留当前值；数据库约束拒绝无效主题，回收站和不存在账号不可写。`account_preferences_use_compare_and_swap_versions` 1/1、`cargo build --locked`、fmt check 与 diff check 通过。API 接线留给后续任务。
+
+#### LUX-654：实现账户偏好应用服务
+
+范围：为账户设置 API 提供服务端默认偏好读取、完整偏好校验和版本比较并交换写入。无存储记录时返回与当前账户页一致的默认值及版本 0；有效写入委托 LUX-653 CAS 存储合同，明确映射版本冲突和不可用账号。本任务不接 HTTP 或 Web 页面。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/user_account_preferences.rs`（包含服务层回归）。
+
+验收标准：
+
+- [x] 未创建偏好记录的账号读取到当前账户页默认值、版本 0 和空更新时间。
+- [x] 有效完整更新通过 CAS 返回递增版本与服务端更新时间；过期版本及不可用账号映射为明确错误。
+- [x] 拒绝不支持的主题/强调色、负版本、超长语言值和控制字符。
+- [x] 应用服务定向回归、Rust 格式检查与 diff check 通过。
+
+短计划：先添加默认值、有效写入、版本冲突与输入校验回归并确认服务缺失；再实现默认值投影、输入校验和 CAS 错误映射。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-653。
+
+结果（2026-10-19）：新增账户偏好 application 服务，缺少服务端记录时返回 dark/silver、首页区块开启、原始音轨/简体中文、自动连播、版本 0 和空更新时间；写入校验主题、强调色、非负版本和最长 64 字符且无控制字符的语言值，再调用版本 CAS。新增默认读取、成功写入、过期版本、无效字段及回收站用户回归，`user_account_preferences` 4/4 通过；`cargo build --locked`、fmt check 与 diff check 通过。全目标 Clippy 仍被未修改的 `src/api/media.rs:2821` 和 `src/application/playback/session.rs:397` 两处 `too_many_arguments` 阻断；以 `-A clippy::too_many_arguments` 排除这两项后，lib/all-features Clippy 通过。全目标测试为 1004 passed、5 failed、25 ignored；失败项 `stops_reading_a_chunked_response_as_soon_as_it_exceeds_the_limit`、`local_metadata_worker_dispatches_fill_missing_without_blocking_scan`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost` 均在先前任务的全目标门禁中记录过，本次与账户偏好无关联。
+
+#### LUX-655：开放当前用户账户偏好 API
+
+范围：新增当前用户账户偏好的 GET/PATCH API，GET 返回服务层默认值或已保存快照，PATCH 接收完整偏好和 `expectedVersion`，要求用户会话与 CSRF，并将非法偏好、版本冲突、不可用账号和数据库故障映射为稳定 HTTP 错误。不修改现有播放阈值与媒体库排序设置 API，也不接 Web 客户端。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`src/api/lux/mod.rs`、`tests/user_settings.rs`。
+
+验收标准：
+
+- [x] `GET /api/v1/auth/account-preferences` 返回当前用户完整偏好、版本和更新时间。
+- [x] `PATCH /api/v1/auth/account-preferences` 要求 CSRF，版本 0 可首次写入，匹配版本更新成功；陈旧版本返回 `VERSION_CONFLICT`。
+- [x] 非法字段返回 400、账号不可用返回 404、数据库错误返回 503；未认证与缺少 CSRF 请求被拒绝。
+- [x] `user_settings` 集成 target、API 文档、Rust build、格式和 diff check 通过。
+
+短计划：先添加默认读取、首次写入、冲突、非法值、CSRF 和认证回归并确认端点缺失；再接入 application 服务和稳定错误映射，最后同步 API 文档。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test user_settings`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-654。
+
+结果（2026-10-19）：新增当前用户账户偏好 GET/PATCH 端点，GET 返回应用服务快照；PATCH 要求当前用户和 CSRF，通过完整字段及 `expectedVersion` 写入并在成功后失效首页缓存。错误映射为 400、404、503 或 409 `VERSION_CONFLICT`，新增稳定 API 错误码。`user_settings` 2/2、Rust build、fmt check 和 diff check 通过；测试覆盖未认证、默认值、缺少 CSRF、首次写入、陈旧版本、无效主题及数据库故障。全目标 Clippy 仍被未修改的两个 `too_many_arguments` 函数阻断；允许该既有 lint 后的 lib/all-features Clippy 通过。公开合同已加入 `docs/API.md`。
+
+#### LUX-656：为 Web 接入账户偏好 API
+
+范围：为 Web API 类型增加账户偏好响应和完整更新请求类型，并提供当前用户账户偏好 GET/PATCH 客户端方法。PATCH 复用客户端现有 CSRF 注入和错误处理；本任务不改账户设置页面或本地存储。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] Web 类型完整表达主题、强调色、首页区块、语言、自动连播、版本与更新时间。
+- [x] API 客户端 GET/PATCH 使用正确 endpoint，PATCH 序列化完整版本化请求并发送 CSRF。
+- [x] API client 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先补客户端 endpoint、载荷与 CSRF 回归并确认方法缺失；再添加响应/请求类型和 GET/PATCH 方法，最后运行定向 Vitest、Web build 与 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-655。
+
+结果（2026-10-19）：Web API 增加账户偏好响应与完整更新类型，以及 GET/PATCH 客户端方法；写入复用公共请求层的 CSRF 注入。新增 API 客户端合同回归，`api-client.test.ts` 65/65、TypeScript/Web build 与 diff check 通过。
+
+#### LUX-657：区分已保存的本地账户偏好与默认值
+
+范围：为首次服务端迁移提供只读旧浏览器偏好读取函数。仅当指定用户键下存在可解析设置对象时返回经过现有规则归一化的设置；没有数据、无效 JSON 或浏览器存储不可用时返回 `null`，不读取或导入媒体库顺序以外的服务端状态。本任务不接账户 API 或页面。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/account/account-settings.ts`、`web/tests/account-settings.test.tsx`。
+
+验收标准：
+
+- [x] 无本地记录、JSON 损坏或 localStorage 不可用时返回 `null`，不会把代码默认值当成旧用户设置。
+- [x] 有效旧记录保留已知设置并按既有规则补齐缺省/过滤非法字段。
+- [x] `account-settings` 定向 Vitest 和 diff check 通过。
+
+短计划：先添加“无记录/有效旧记录/坏数据/受限存储”回归并确认帮助函数缺失；再抽出现有解析与归一化逻辑，不改变普通读取行为。
+
+验证：`pnpm --dir web exec vitest run tests/account-settings.test.tsx`、`git diff --check`。
+
+依赖：LUX-656。
+
+结果（2026-10-19）：新增 `readStoredAccountSettings`，只返回指定用户键下可解析的设置对象；无记录、JSON 损坏、非对象数据或存储读取抛错均返回 `null`。现有 `readAccountSettings` 继续在无有效旧值时返回相同默认值。`account-settings.test.tsx` 25/25、diff check 通过。
+
+#### LUX-658：账户页使用服务端偏好并迁移旧本地值
+
+范围：将主题、强调色、首页区块、默认音轨/字幕语言和自动连播接入当前用户账户偏好 API。服务端已有正版本时以服务端为准；服务端版本 0 且用户确有本地旧设置时只导入一次。后续更改自动版本化保存并更新本地缓存；多次快速编辑顺序提交，遇到跨设备版本冲突时停止自动覆盖并提示用户刷新。媒体库顺序和播放完成比例继续使用原有接口。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/account/AccountPage.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/account-settings.test.tsx`。
+
+验收标准：
+
+- [x] 账户页读取并显示服务端账户偏好；已保存的本地主题等值不会覆盖服务端正版本。
+- [x] 服务端版本 0 时仅在有旧本地记录情况下首次导入，媒体库顺序不进入账户偏好 API。
+- [x] 后续设置自动按最新版本串行保存；成功更新本地缓存和首页状态，冲突时停止写入并给出刷新提示。
+- [x] 网络错误保留用户当前界面状态；加载失败时不把默认值写入服务端。
+- [x] `account-settings` 定向 Vitest、TypeScript、Web build 与 diff check 通过。
+
+短计划：先扩展账户设置组件回归覆盖服务端优先、一次性迁移、序列化保存、错误和冲突，再接入查询、迁移编排与有序 CAS 保存，最后运行定向 Vitest、Web build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/account-settings.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-655–657。
+
+结果（2026-10-19）：账户页已读取服务端偏好快照；正版本服务端设置覆盖旧浏览器值，版本 0 只迁移一次现存本地偏好且不提交媒体库顺序。更新通过 CAS 队列按返回版本串行保存，成功后更新本地缓存与首页查询；遇到版本冲突禁用偏好控件并提示刷新，普通网络错误保留当前选择且允许再次保存。初始读取失败时控件保持禁用并提供重试。账户设置回归 31/31、TypeScript 与 Web production build、diff check 通过。尚未部署。
+
+#### LUX-659：为管理员会话管理提供分页存储查询
+
+范围：为管理员读取单个用户有效 Web 会话提供服务端分页存储查询，返回有效会话总数及单页摘要，并标记当前 Web 会话。每页上限为 100；摘要只包含会话 ID、创建/更新时间、过期时间及最近活动时间，不包含凭证。HTTP 路由、撤销与页面接线留待后续任务。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`（含存储回归）。
+
+验收标准：
+
+- [x] 查询只返回指定用户未撤销且未过期的 Web 会话，并提供稳定的时间/ID 排序及总数。
+- [x] 分页偏移与大小受存储层约束，超大页请求不能超过 100 条；当前会话标记只比较 token 摘要。
+- [x] 存储定向回归、Rust 格式检查和 diff check 通过。
+
+短计划：先补多会话、分页边界、过期/撤销过滤和当前会话标记的存储回归；再新增有界 SQL 页面读取与总数查询。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib admin_web_session_page`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：增加只读有效 Web 会话页查询及总数读取，SQL 按更新时间和 ID 倒序分页，存储层将页大小限制在 1–100 并将负偏移归零；当前会话通过 token 摘要比较标记。回归覆盖 101 条会话的分页/硬上限，以及已撤销和已过期记录过滤，`admin_web_session_page` 1/1、fmt check 与 diff check 通过。管理员 HTTP 路由及撤销留给 LUX-660。
+
+#### LUX-660：开放管理员分页读取用户 Web 会话 API
+
+范围：新增 `GET /api/v1/admin/users/{user_id}/sessions`，返回有效 Web 会话摘要、页码、页大小和总数。要求管理员权限，页大小默认 50 且最大 100；当前会话只通过比较现有 token 摘要标记。接口不返回 Cookie、session token 或 CSRF token，不提供撤销操作。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/auth/sessions.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可读取指定用户的分页活动 Web 会话；未认证和非管理员不能访问。
+- [x] 响应只公开会话 ID、时间字段与当前会话标记，不包含任何登录凭证；非法用户 ID 返回 400。
+- [x] `users` 集成 target、API 文档、Rust 格式和 diff check 通过。
+
+短计划：先补管理员权限、分页、当前会话标记和敏感字段排除的 API 回归并确认端点未开放；再复用 LUX-659 存储页接入服务与路由并记录公开合同。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_list_user_web_sessions_without_exposing_tokens -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：管理员分页会话接口接入 LUX-659 查询，返回摘要、当前页及总数；未认证/普通用户访问拒绝，非法用户 ID 返回 400，页大小上限 100，当前会话仅比较 token 摘要且响应不含 Cookie 或凭证。`admin_can_list_user_web_sessions_without_exposing_tokens` 1/1、fmt check 与 diff check 通过，API 合同已写入 `docs/API.md`。撤销和管理页面留待后续任务。
+
+#### LUX-661：提供当前 Web 会话身份的精确存储检查
+
+范围：增加按用户 ID、会话 ID 和 token 摘要精确检查有效 Web 会话身份的存储操作，供管理员撤销 API 防止撤销管理员自己的当前会话。只接受未撤销且未过期记录，不读取或返回原始凭证；本任务不新增 HTTP 行为。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`（含存储回归）。
+
+验收标准：
+
+- [x] 只有三项身份均匹配且会话仍有效时返回 true；错用户、错会话、错摘要、撤销或过期记录均返回 false。
+- [x] 存储定向回归、Rust 格式检查和 diff check 通过。
+
+短计划：先添加匹配/错配/失效会话测试并确认检查方法缺失，再实现单条 EXISTS 查询。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib admin_current_web_session_guard`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：新增单条 EXISTS 存储检查，只有用户、会话 ID、token 摘要完全匹配且会话未撤销/未过期时返回 true。回归覆盖错用户、错会话、错摘要、过期和撤销，`admin_current_web_session_guard` 1/1、fmt check 与 diff check 通过。管理员撤销 API 将在 LUX-662 使用此检查。
+
+#### LUX-662：开放管理员撤销用户 Web 会话 API
+
+范围：新增 `DELETE /api/v1/admin/users/{user_id}/sessions/{session_id}`，撤销指定用户的一条活动 Web 会话。要求管理员权限与 CSRF；拒绝撤销当前管理员 Web 会话。目标会话必须属于路径用户且未过期/未撤销；成功返回 204，未知、过期、已撤销或用户不匹配返回 404。撤销不会影响该用户的其他 Web 会话。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/auth/sessions.rs`、`src/storage/catalog.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 缺少认证或 CSRF 请求被拒绝；错误用户/会话、过期和已撤销会话返回 404。
+- [x] 当前管理员会话返回 400 不撤销；成功撤销返回 204，目标登录失效且其他目标会话仍可用。
+- [x] `users` 集成 target、API 文档、Rust 格式和 diff check 通过。
+
+短计划：先补 CSRF、当前会话保护、目标归属、过期会话、成功撤销及其他登录保留的集成回归；再连接 LUX-661 精确身份检查与仅撤销仍有效会话的原子存储操作，最后记录合同与审计事件。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_revoke_user_web_sessions -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+结果（2026-10-19）：新增管理员单会话撤销 DELETE API，管理员 Web 登录需通过 CSRF；当前会话使用 user/session/token 摘要精确匹配保护。存储更新原子要求目标未撤销且未过期；错误归属、过期、重复撤销返回 404，撤销后只使目标 Cookie 失效并记录安全审计事件。撤销回归 1/1，串行 `users` target 6/6、Rust fmt check 与 diff check 通过。默认并发 `users` target 曾有一个既有用户管理测试收到 503；该测试单独及串行 target 重跑通过，暂未查明并发失败原因。
+
+#### LUX-663：为管理员 Web 会话管理补齐 Web API 客户端合同
+
+范围：为 LUX-660/LUX-662 管理员 Web 会话读取与撤销 API 增加有类型的 Web 客户端方法。列表支持页码和页大小参数；撤销使用 DELETE 和现有自动 CSRF 头处理。此任务不修改页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 会话列表类型只含会话 ID、时间和当前会话标记；没有 token/cookie/凭证字段。
+- [x] 客户端正确编码用户/会话 ID、构建分页查询，并为撤销请求附带 CSRF 头。
+- [x] API 客户端定向 Vitest、Web 类型构建与 diff check 通过。
+
+短计划：先添加列表/撤销 URL、参数与 CSRF 头的失败客户端回归；再新增安全摘要类型和两个 API 方法，运行定向 API 客户端测试与 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "uses paginated admin user Web session"`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-660、LUX-662。
+
+结果（2026-10-19）：新增 Web 会话分页摘要类型，以及管理员读取和撤销客户端方法；DELETE 复用统一请求层自动附加 CSRF。定向 API 客户端测试 1/1 通过，Web build 在临时恢复当前提交版 `AdminDashboardNowPlaying.tsx` 后通过，并确认还原了该文件原有未提交内容。直接在当前工作区运行 build 会被该用户改动中两个未使用 helper 阻断；`git diff --check` 通过。
+
+#### LUX-664：在用户详情管理 Web 登录会话
+
+范围：将用户详情的“设备与登录”页接入管理员 Web 会话 API，显示分页有效会话摘要与当前会话状态，并允许管理员撤销其他单个 Web 登录。当前会话没有撤销操作；撤销前确认，撤销后刷新列表并保留其他登录。该任务不展示或管理 Emby 凭证、设备黑名单和播放设备清单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-sessions.test.tsx`。
+
+验收标准：
+
+- [x] 详情页列出 Web 会话创建、最近活动、到期时间、当前会话状态及有效会话数量，不展示任何凭证。
+- [x] 管理员可分页读取和确认撤销其他会话；当前会话不可撤销，成功后列表更新且其他会话仍保留。
+- [x] 读取错误可重试，空结果清晰可见；组件回归通过。
+
+短计划：先添加设备与登录页加载、会话摘要、分页、确认撤销、当前会话保护、错误和空状态回归；再连接 LUX-663 客户端方法与 React Query，最后检查组件回归和 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-sessions.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-593、LUX-660、LUX-662、LUX-663。
+
+结果（2026-10-19）：会话组件测试 3/3 通过；Web build 在临时恢复用户当前提交版 `AdminDashboardNowPlaying.tsx` 后通过，并逐字节还原了该文件的未提交用户改动。直接在当前工作区运行 build 仍被这份既有改动中两个未使用 helper 阻断。macOS 浏览器本地验证显示有效会话摘要、时间、状态、撤销操作和分页，浏览器控制台无警告或错误；`git diff --check` 通过。
+
+#### LUX-665：批量应用用户权限预设 API
+
+范围：新增管理员对明确用户 ID 集合批量应用权限预设的 API。每项结果独立返回成功状态和稳定失败码；各用户仍单独原子应用，单项失败不回滚其他用户。单批最多 100 个不同用户 ID。管理员 Web 会话、CSRF、最后一个有效服务器管理员保护及每个成功目标的审计事件均沿用现有单用户合同。本任务不增加列表多选或“全部筛选结果”界面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_presets.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 仅管理员可通过 CSRF 保护端点批量应用预设；空集合、重复 ID 和超过 100 项请求整体拒绝。
+- [x] 每个 ID 按输入顺序返回成功或稳定失败码；无效/不存在目标、最后管理员保护和单项存储错误不影响其他目标。
+- [x] 每个成功目标写入原有预设来源与独立审计事件；请求和响应不包含登录凭证。
+- [x] users 集成定向回归、API 文档、Rust 格式和 diff check 通过。
+
+短计划：先添加认证/CSRF、输入边界、多目标部分成功和逐项失败回归；再复用预设快照校验并逐用户执行现有原子存储操作，最后记录 API 合同与审计行为。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_batch_apply_permission_presets_with_per_user_results -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-639、LUX-640、LUX-644–646、LUX-650。
+
+结果（2026-10-19）：批量 API 对 1–100 个不同目标逐项执行同一份已校验预设快照，每项单独提交并按输入顺序返回稳定结果码；最后管理员、无效/不存在 ID 和注入的单项存储失败不影响其余目标，成功项各自写入脱敏审计事件。`admin_can_batch_apply_permission_presets_with_per_user_results` 1/1、Rust fmt check、定向 Clippy（仅放行仓库已知的 `too_many_arguments` lint）和 diff check 通过。未豁免的定向 Clippy 仍被未修改的 `src/api/media.rs:2821` 与 `src/application/playback/session.rs:397` 两处同一 lint 阻断。API 文档同步完成。
+
+#### LUX-666：Web 批量应用权限预设客户端合同
+
+范围：为 LUX-665 管理员批量应用预设 API 增加有类型的 Web 客户端方法，发送明确用户 ID 列表和预设 ID，并返回预设摘要与逐用户成功/失败码。POST 复用统一请求层的 CSRF 处理；不修改列表 UI。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 类型覆盖批量响应和所有稳定失败码，不含任何会话凭证字段。
+- [x] 客户端使用固定批量端点、正确 JSON body，并自动附加 CSRF 头。
+- [x] 定向 API client Vitest、Web build 和 diff check 通过。
+
+短计划：先添加批量 POST URL、body、逐项结果解码与 CSRF 的失败客户端回归；再新增类型及方法，最后运行定向测试和 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "batch-applies admin permission preset"`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-665。
+
+结果（2026-10-19）：新增批量响应与五种逐项错误码类型及 Web client POST 方法，统一请求层自动附加 CSRF。定向 API client 测试 1/1、Web build 与 diff check 通过；build 前临时使用提交版 `AdminDashboardNowPlaying.tsx`，构建后逐字节恢复用户当前未提交内容。当前工作区直接 build 仍被该文件的两个既有 unused helper 阻断。
+
+#### LUX-667：用户列表批量应用权限预设界面
+
+范围：在用户列表提供当前页用户的明确多选、全选当前页、权限预设选择、目标与变更确认及逐用户结果。换页或筛选变化时清空勾选；每次仅提交当前页选中的 1–100 个用户，不提供会把分页误当全量匹配结果的操作。本任务只完成“应用权限预设”批量动作。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-batch-actions.test.tsx`。
+
+验收标准：
+
+- [x] 选择范围和用户数量始终明确；当前页、筛选或视图变化会清空选择。
+- [x] 应用前展示选中目标和预设并要求确认；取消不发请求。
+- [x] 结果逐用户翻译稳定错误码并展示；网络错误可见，成功后刷新用户列表。
+- [x] 定向组件回归、Web build 与 diff check 通过。
+
+短计划：先为选择范围、取消确认、逐项结果和换页清选添加失败测试；再接入既有批量 API 和预设查询，最后验证组件及 Web 构建。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-batch-actions.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-665、LUX-666。
+
+结果（2026-10-19）：用户列表支持逐项选择或全选当前页、确认预设和完整目标、逐用户成功/错误结果；换页、筛选或切换视图清空选择，成功后刷新列表。批量功能按需加载预设，仅提交当前页明确选中的最多 100 个 ID。LUX-667 组件测试 4/4、用户管理组件回归 41/41、`pnpm --dir web install --frozen-lockfile` 和 Web build 通过。完整 `pnpm --dir web test` 为 699 passed、5 failed；失败在账号头像裁剪、首页媒体库预取、媒体库卡片预取/虚拟合集链接及媒体详情轮询四个未由本任务修改的测试文件，未据此声称为基线失败。`git diff --check` 通过。build 临时使用提交版 `AdminDashboardNowPlaying.tsx`，构建后逐字节还原用户未提交版本；由于本地服务已停止，没有使用真实账户数据做手工浏览器验证。
+
+#### LUX-668：建立版本安全的账户偏好批量复制服务
+
+范围：新增 application 服务，从一个有效来源账号向最多 100 个不同目标账号复制所选的外观、首页和播放偏好组。调用者提供来源与每个目标的预期版本；来源版本过期时整体拒绝，目标版本冲突或账号不可用时逐项报告，不覆盖未选择的偏好组。媒体库排序与播放完成比例因使用独立存储，本任务不复制它们。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_account_preferences.rs`。
+
+验收标准：
+
+- [x] 拒绝空组、空目标、重复目标、来源账号自我复制、超出 100 项及负版本输入。
+- [x] 来源账号不存在、已删除或版本不匹配时不修改任何目标。
+- [x] 成功目标只改所选偏好组并执行目标版本 CAS；冲突、删除、存储失败只影响对应目标。
+- [x] application 定向测试、Rust fmt 和 diff check 通过。
+
+短计划：先为分组选拷贝、目标版本冲突、来源过期和按目标部分失败添加失败测试；再复用现有 CAS 写入完成独立目标复制。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-653、LUX-654。
+
+结果（2026-10-19）：新增外观、首页和播放三类账户偏好组复制服务。来源账号版本过期或来源不可用时不开始写入；每个有效目标按目标版本 CAS 独立更新，缺失/删除、版本冲突和注入的单目标写入错误作为逐项结果返回。7 个 `user_account_preferences::tests` 通过，`cargo build --locked`、fmt、`git diff --check` 和放行仓库已知 `too_many_arguments` lint 的定向 Clippy 通过。服务尚未接 HTTP，临时 `dead_code` 许可用于 LUX-669 接线前的中间层。
+
+#### LUX-669：开放管理员账户偏好复制预览与应用 API
+
+范围：增加管理员偏好复制预览和应用端点。预览校验来源、目标和所选偏好组，返回所选组的来源值与来源/目标版本；应用提交预览版本并逐目标执行 LUX-668 CAS。应用需要管理员 Web 会话及 CSRF；预览只读但仍限管理员。成功目标逐项写审计，不记录偏好值、凭证或 Cookie。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_account_preferences.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 预览只返回所选偏好组；来源/目标不可用、空组、空/重复/超限目标及自我复制被拒绝。
+- [x] 应用要求管理员和 CSRF；来源过期整体冲突，目标过期逐项返回 `VERSION_CONFLICT`，成功目标不受其他目标失败影响。
+- [x] 响应不含未选择的偏好、凭证或敏感存储值；审计仅记来源、目标和组名。
+- [x] users 集成回归、application 定向回归、Rust build/fmt 与 diff check 通过。
+
+短计划：先补预览快照和版本合同的 application/API 失败测试；再实现管理员预览与 CAS 应用端点，更新 API 文档并跑定向集成验证。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_preview_and_copy_account_preferences`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check`。
+
+依赖：LUX-655、LUX-668。
+
+结果（2026-10-19）：增加管理员偏好复制预览与应用 API。预览仅返回选择的外观/首页/播放快照、来源版本和目标版本；应用检查来源版本并为每个目标独立 CAS，逐项报告版本冲突，同时对成功目标写入仅包含来源 ID 和组标志的审计。覆盖非管理员拒绝、预览不需 CSRF、应用需 CSRF、空组拒绝、重复/无效 ID 拒绝、未选组不出现在响应、目标并发冲突、来源过期和审计脱敏。`user_account_preferences::tests` 8/8、`cargo test --locked --test users` 8/8 和 `cargo build --locked` 通过；`cargo clippy --locked --lib -- -D warnings -A clippy::too_many_arguments`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。
+
+#### LUX-670：为偏好复制预览与应用接入 Web API 客户端
+
+范围：为 LUX-669 的管理员偏好复制预览与应用 API 增加有类型的客户端输入/输出和方法。客户端保留现有请求层的 CSRF 注入及错误处理；本任务不修改用户界面，也不扩展尚未版本化的媒体库顺序和播放完成比例。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 输入和响应类型与 LUX-669 的 JSON camelCase 合同一致，只允许 Appearance/Home/Playback 三组。
+- [x] 预览方法使用预览路径并返回源快照和目标版本；应用方法使用 CSRF 保护路径并返回逐目标结果。
+- [x] API client 定向测试覆盖请求路径、请求体、类型化响应及 CSRF，Web production build 通过。
+
+短计划：先写两个客户端方法的失败测试；再添加窄类型和方法实现，运行 API client 定向 Vitest 与 Web build。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-669。
+
+结果（2026-10-19）：新增偏好复制预览和应用的 Web 输入/响应类型及客户端方法，复用自动 CSRF 和统一错误处理。两项新测试验证精确路径、JSON 请求体、类型化响应及 CSRF；`pnpm --dir web exec vitest run tests/api-client.test.ts` 69/69 通过。Web build 在临时替换为提交版 `AdminDashboardNowPlaying.tsx` 后通过，退出前逐字节恢复工作区文件；该用户未提交文件本身含未使用 helper，仍未纳入本任务。
+
+#### LUX-671：在用户列表预览并复制账户偏好
+
+范围：用户列表的当前页显式选择增加偏好复制入口。管理员搜索一个未被选为目标的来源账号，选择 Appearance/Home/Playback 组，预览所选组快照和每个目标版本，再按预览版本应用。复制结果逐账号显示；成功后清空父列表选择。媒体库排序和播放完成比例由后续任务加入服务端版本合同后再扩展。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserPreferenceCopyDialog.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-preference-copy.test.tsx`。
+
+验收标准：
+
+- [x] 只复制当前页明确选中的 1–100 个目标；来源不得同时是目标，筛选、换页和视图变化仍清空选择。
+- [x] 来源搜索、偏好组选择、预览值/目标版本与应用均可用；未预览或预览条件变更时不能应用。
+- [x] 加载、无结果、错误、逐目标成功/失败及关闭状态清楚且可键盘操作；成功后清空列表选择并刷新数据。
+- [x] 组件交互定向测试和 Web production build 通过。
+
+短计划：先写目标选择、来源和预览、版本化应用、逐项目结果的失败交互测试；再实现独立对话框与用户列表入口，运行定向 Vitest、build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-preference-copy.test.tsx`、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-667、LUX-670。
+
+结果（2026-10-19）：新增用户列表偏好复制对话框，按当前页选中用户固定目标快照；来源查询排除目标账号，预览显示选中偏好和来源/目标版本，应用使用预览的版本条件并逐账号显示结果。新增交互测试覆盖选择、预览、版本冲突、清空选择、条件变更和失败后重预览。`pnpm --dir web exec vitest run tests/admin-user-preference-copy.test.tsx tests/admin-user-batch-actions.test.tsx tests/admin-users-delete.test.tsx` 12/12 通过；`pnpm --dir web build` 通过。构建期间临时使用已提交版 `AdminDashboardNowPlaying.tsx` 并在退出时逐字节恢复用户未提交内容；`git diff --check` 通过。模块四的媒体库顺序和播放完成比例仍由后续服务端版本合同任务补齐。
+
+#### LUX-672：扩展版本化账户偏好存储合同
+
+范围：把个人媒体库顺序和自动标记已看阈值纳入账户偏好快照。已有 `user_library_order` 与 `user_playback_settings` 仍为读取兼容数据源；CAS 写入可选择同步其中任一值，并与偏好版本更新处于同一事务。未提供的字段保持旧值，以便后续 API 分组更新只修改明确选择的配置。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`、`src/application/user_account_preferences.rs`。
+
+验收标准：
+
+- [x] 服务端偏好快照包含媒体库顺序和已看阈值；尚无版本化偏好行的账号仍能读到旧服务端值与版本 0。
+- [x] 匹配版本的 CAS 可同步写入个人排序和已看阈值；省略某字段时不改动其旧值。
+- [x] 过期版本、删除账号或任何同步存储失败均不留下部分写入。
+- [x] 存储与服务层定向测试、构建、格式检查通过。
+
+短计划：先增加覆盖旧值加载、同一事务写入、可选字段保留和冲突隔离的测试，再扩展偏好快照/CAS 的存储与 application 合同；不新增迁移，复用已存在的排序和播放设置表。
+
+验证：确认 Toshiba 已挂载后，运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib account_preferences_use_compare_and_swap_versions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked` 和 `git diff --check`。
+
+依赖：LUX-662、LUX-667、LUX-669。
+
+结果（2026-10-19）：账户偏好服务快照现在包含旧服务端表中的媒体库顺序与 1–100 播放阈值；版本 0 读取旧值但不写入偏好行。CAS 使用单个数据库事务更新偏好版本和被显式提供的旧表值，字段省略时保留原设置；无效媒体库 ID 触发整笔回滚。`account_preferences_use_compare_and_swap_versions` 1/1、`user_account_preferences::tests` 9/9、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。此切片仅建立一致的服务端 CAS 写入合同，旧设置路由将在 LUX-673 接入合同。
+
+#### LUX-673：账户设置 API 共用偏好版本
+
+范围：账户偏好 API 读写媒体库顺序与播放阈值；原 `/settings` 和 `/library-order` 入口保留兼容，但对这两类数据也使用账户偏好 CAS 并返回版本。用户个人排序在验证可访问范围后规范化，API 响应不泄漏不可访问媒体库 ID。管理强制排序开关仍独立于可复制的个人排序。
+
+预计修改文件（13 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_account_preferences.rs`、`src/application/libraries.rs`、`src/api/users.rs`、`src/storage/users.rs`、`tests/user_settings.rs`、`tests/library_order.rs`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/account/AccountPage.tsx`、`web/tests/account-settings.test.tsx`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 账户偏好 GET/PATCH 含已看阈值和媒体库顺序；全量偏好保存与旧阈值/排序路由都会推进同一版本。
+- [x] 旧路由省略版本时兼容地 CAS 最新读到的版本；带陈旧版本时返回 VERSION_CONFLICT，不能覆盖另一入口的更新。
+- [x] 排序只接受目标账号可访问的媒体库，并继续尊重管理员强制排序；不泄漏被禁止访问的 ID。
+- [x] Account 页面读取服务器全量快照，保存各偏好时携带当前版本；浏览器旧值仅在服务端版本为 0 时迁移。
+- [x] API/Web 定向测试、Web build、Rust build、fmt 通过。
+
+短计划：先扩展账户偏好与旧入口的 API 回归测试和 Web 客户端类型测试；再为排序验证增加只规范化不写入的服务方法，将两条兼容路由改为 CAS 更新，并让账户页提交/迁移完整偏好快照。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test user_settings`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test library_order`、Web 账户设置/API client 定向 Vitest、Web build、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 和 `git diff --check`。
+
+依赖：LUX-654、LUX-672。
+
+结果（2026-10-19）：`user_settings` 2/2、`library_order` 1/1、`account_preferences_use_compare_and_swap_versions` 1/1、`user_account_preferences::tests` 9/9、Web 账户设置/API client 定向测试 101/101 通过；Rust build、fmt、Web build 与 `git diff --check` 通过。Web build 临时用 HEAD 版本覆盖用户未提交的 `AdminDashboardNowPlaying.tsx`，完成后已校验恢复原文件。Cargo 网络测试使用 `NO_PROXY=127.0.0.1,localhost` 避免本机请求经过代理。API 合同已同步到 `docs/API.md`。
+
+#### LUX-674：完成账户偏好分组复制
+
+范围：在管理员账户偏好复制中增加媒体库排序组；播放组同时复制已看阈值。预览按每个目标当前可访问媒体库过滤来源排序，应用时重新按目标当前权限过滤；复制只更新选中的组，并继续使用账户偏好版本 CAS，不改变管理员强制排序设置。
+
+预计修改文件（10 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_account_preferences.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserPreferenceCopyDialog.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-preference-copy.test.tsx`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 预览/应用合同支持独立 `libraryOrder` 组；播放组选中时包含 `playedPercent`。
+- [x] 预览为每个目标返回按其当前可访问范围过滤后的排序，应用时再次过滤；其他未选组保持原值。
+- [x] 管理强制排序偏好不被复制或覆盖；逐目标 CAS 冲突和脱敏审计行为保持不变。
+- [x] 管理员对话框可选择排序组并查看来源排序、各目标的过滤结果及已看阈值；过滤规则清楚可见。
+- [x] application/API/Web 定向测试、Rust build/fmt、Web build 通过。
+
+短计划：先扩展 application 复制与预览回归测试、管理员 API 响应合同和 Web 类型/组件测试；再扩展分组快照及逐目标权限过滤，并更新审计组标志和 API 文档。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_account_preferences::tests`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_preview_and_copy_account_preferences`、Web 偏好复制/API client 定向 Vitest、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt、Web build 与 `git diff --check`。
+
+依赖：LUX-671、LUX-672、LUX-673。
+
+结果（2026-10-19）：管理员复制 API 增加 `libraryOrder` 选择组；预览返回来源个人顺序及逐目标过滤结果，应用时重新依据目标当前可访问媒体库过滤并以 CAS 保存。播放组现在包含 `playedPercent`。复制不修改目标的管理员强制排序设置，审计仅增加组标志、不写偏好值。`user_account_preferences::tests` 9/9、`users` 定向集成 1/1、Web 偏好复制/API client 定向测试 71/71、`cargo build --locked`、fmt、Web build 与 `git diff --check` 通过。Web build 临时以 HEAD 版覆盖用户未提交的 `AdminDashboardNowPlaying.tsx`，结束后已逐字节恢复；由于本会话未配置 Chrome DevTools MCP，没有真实浏览器截图验证。
+
+#### LUX-675：建立用户内容限制策略表
+
+范围：为模块五增加按用户版本化的内容限制策略表，以及允许/禁止标签子表。策略字段保存分级体系、最高分级和未分级处理；不迁移现有 numeric `rating`，不在请求内扫描 NFO，也不在此任务启用拦截。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0190_user_content_restrictions.sql`、`migrations-postgres/0190_user_content_restrictions.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL migration 均创建受用户生命周期级联清理的策略表和标签表。
+- [x] 分级/未分级字段与标签类别有数据库约束；标签区分允许与禁止并按用户去重。
+- [x] SQLite 空库迁移回归覆盖非法分级/布尔值、非法/重复标签和用户删除级联；存储测试的 schema 版本断言同步到 190。
+- [x] Rust 存储定向测试、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加 SQLite 空库迁移回归并确认失败；再写 SQLite/PostgreSQL migration 及约束；最后运行存储定向检查和构建。其他集成目标的当前 schema 版本断言与 PostgreSQL 启动合同由 LUX-676 对齐。本切片只建立可持久化结构，存储 CAS、规则校验、索引与媒体访问执行留给后续任务。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage user_content_restrictions_migration_runs_from_an_empty_database`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。PostgreSQL migration 的运行验证由 LUX-676 的 ignored PostgreSQL bootstrap 测试负责。
+
+依赖：LUX-593、LUX-628。
+
+结果（2026-10-19）：新增双数据库策略与标签表迁移，已有账号不回填策略行，因此尚未设置限制的用户保持既有访问行为；策略行随用户删除、标签行随策略删除。SQLite 空库迁移回归通过，检查非法空分级、越界未分级标志、非法类别、空/重复标签及级联删除。`cargo test --test storage -- --test-threads=1` 67/67、定向迁移测试、`cargo build --locked`、fmt 与 diff check 通过。并行执行完整存储目标时，既有重试冷却断言因执行耗时落在 299–300 秒窗口外失败；隔离复跑及串行完整目标通过。PostgreSQL migration 执行测试和其余目标的 schema 版本更新见 LUX-676。
+
+#### LUX-676：同步内容限制 migration 的数据库测试基线
+
+范围：将依赖当前数据库 schema 版本的 PostgreSQL、扫描器、扫描任务与弹幕测试更新到 LUX-675 的版本 190；PostgreSQL bootstrap 回归验证内容限制表、策略字段和标签表能从空库创建。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`tests/postgres_database.rs`、`tests/scanner.rs`、`tests/scanning_jobs.rs`、`tests/danmaku.rs`。
+
+验收标准：
+
+- [x] 相关目标的 schema 版本预期为 190，原功能断言不变。
+- [x] PostgreSQL bootstrap 验证策略/标签表、字段约束、外键级联与非法值拒绝。
+- [x] scanner、danmaku 与扫描任务的其他 90 项通过；单独记录并排除已在基线复现的扫描断言失败，Rust build、fmt 与 diff check 通过。
+
+短计划：先更新相关测试目标的版本断言；再扩展 ignored PostgreSQL bootstrap 检查迁移后的结构和约束；运行 SQLite 定向目标并在可用时执行 PostgreSQL 测试。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanner`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test scanning_jobs -- --skip manifest_discovery_reopens_and_retries_persisted_frontier_idempotently`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test danmaku`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_bootstrap_runs_migrations_and_persists_core_state -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。
+
+依赖：LUX-675。
+
+结果（2026-10-19）：PostgreSQL 空库启动通过，策略字段与标签表可创建，非法布尔值/标签类别/空标签/重复标签均被约束拒绝，删除策略及用户可级联清理关联行。`scanner` 18/18、`danmaku` 7/7、扫描任务排除基线失败后的 90/90、PostgreSQL bootstrap 1/1、Rust build、fmt 与 diff check 通过。完整 `scanning_jobs` 目标中 `manifest_discovery_reopens_and_retries_persisted_frontier_idempotently` 在第 7311 行因检查点实数为 1、预期 2 而失败；该失败在未包含 LUX-675 的干净提交 `a3173c1d` 上以同名定向测试原样复现，未纳入本任务改动。
+
+#### LUX-677：为用户内容限制提供版本化存储读写
+
+范围：为用户内容限制策略提供读取与乐观锁写入。未配置的用户仍返回 `None`；写入策略和整组替换允许/禁止标签必须在同一数据库事务中完成。只校验存储边界和输入数量，不解释分级映射或执行媒体授权。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 在单条 SQL 快照中读回分级体系、最高等级、未分级规则和稳定排序的允许/禁止标签；缺少策略行返回 `None`。
+- [x] 版本 0 创建、匹配版本更新并原子替换标签；陈旧版本、已删除/不存在账号、非法字段和重复规范化标签不产生部分写入。
+- [x] SQLite 存储回归、构建、fmt 与 diff check 通过。
+
+短计划：先加入缺省读取、CAS 版本冲突、规范化标签替换和事务失败回滚测试并确认失败；再定义存储合同和 SQLite/PostgreSQL 通用事务实现；最后运行定向测试与构建。本任务不接入 API/UI，也不改变访问判定。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_content_restrictions_storage`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt check 与 `git diff --check`。
+
+依赖：LUX-675、LUX-676。
+
+结果（2026-10-19）：存储层增加用户策略读取和 CAS 写入，策略与标签通过一条 JOIN 读取，避免并发更新时读到不同版本；允许/禁止标签先 trim、统一小写并以 Rust 顺序排序，每类最多 100 个，空值、超长值和规范化后重复项拒绝。策略版本与标签整组替换位于同一事务，注入标签写失败后版本及原标签保持不变。缺少策略行返回 `None`。存储定向用例 1/1、build、fmt 与 diff check 通过；严格 Clippy 仍被未修改的 `serve_emby_media_file` 与 `verify_emby_direct_stream` 两个既有 `too_many_arguments` 阻挡，按现有基线豁免该 lint 后 Clippy 通过。
+
+#### LUX-678：定义内容限制使用的年龄分级分类
+
+范围：为模块五定义明确的可选年龄分级体系、规范化证书代码及比较顺序。仅解析 NFO 的认证文本，不把 TMDb/community 数值评分当作年龄等级；尚不创建条目索引、不改变媒体访问。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`src/domain/content_restrictions.rs`、`src/domain/mod.rs`。
+
+验收标准：
+
+- [x] 明确支持 MPA 电影分级、TV Parental Guidelines 和 BBFC，策略接口使用稳定体系键与等级键。
+- [x] 仅规范化已知分级文本；未知、缺失或不适用于所选体系的值保持未分级。
+- [x] 分级比较顺序在代码和用户方案中一致；纯函数回归覆盖大小写/空白、已知等级、未知等级、体系不匹配和最大等级判定。
+- [x] 认证字段与社区数值评分严格区分。
+
+短计划：先加入域层纯函数回归，确认未实现时编译失败；再实现体系键、分级键、规范化和比较；最后同步方案与主规格，并运行定向 library 测试、fmt 与 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-677。
+
+结果（2026-10-19）：域层定义稳定体系键 `MPA`、`TVPG`、`BBFC`，只识别各自正式等级代码并兼容 `Rated ` 前缀；未知文本、地域前缀和数值评分均保持未分级。应用内最高等级顺序与方案一致，其中 BBFC `12`/`12A` 同级；TV 指引官方列出六类而未定义数值序列，方案明确登记 Lux 自身比较顺序。纯分类回归 3/3 通过；过滤既有 `too_many_arguments` 基线后 Clippy、fmt 和 diff 检查通过。官方定义核对：[MPA](https://www.filmratings.com/ratings-guide/)、[TV Parental Guidelines](https://www.tvguidelines.org/aboutUs.html)、[BBFC](https://www.bbfc.co.uk/our-age-ratings)。
+
+#### LUX-679：建立可失效的媒体内容分类索引
+
+范围：新增分类等级目录及逐媒体条目的分级/标签索引。索引行存在表示该条目已被处理；缺行表示尚未就绪。只改数据库 schema 与 migration 回归，不接入索引 worker、NFO 失效触发器或用户授权查询。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0191_media_content_restriction_index.sql`、`migrations-postgres/0191_media_content_restriction_index.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite/PostgreSQL 都创建 MPA、TVPG、BBFC 等级目录，排序与 LUX-678 一致；逐媒体索引行、标签子表和查询索引使用外键/级联约束。
+- [x] SQLite 从空库启动回归覆盖等级数据、非法等级/标签、索引就绪行及条目/索引级联删除；PostgreSQL bootstrap 回归覆盖相同 schema 合同。
+
+短计划：先扩展 SQLite 和 PostgreSQL migration 回归并确认 schema/table 缺失时失败；再创建两份 0191 migration 及等级种子数据；最后运行 SQLite 定向用例、PostgreSQL migration 用例、Rust fmt 与 diff 检查。NFO 失效触发器因 SQLite 兼容表重建会移除新建触发器，留给后续独立任务处理。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage media_content_restriction_index_migration_runs_from_an_empty_database -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_media_content_restriction_index_migration -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-678。
+
+结果（2026-10-19）：SQLite 与 PostgreSQL schema 191 建立 18 个固定分级目录项、仅有索引行才表示就绪的媒体条目索引、标签子表及分级/标签查询索引；约束拒绝未知等级与空标签，媒体删除及索引删除均级联清理。SQLite 空库迁移和 PostgreSQL 本地 bootstrap 专项各 1/1 通过，build、fmt 和 diff check 通过。定向 Clippy 对新增代码在豁免既有 `too_many_arguments` 与测试目标 `type_complexity` 后通过。测试中发现 SQLite 的兼容表重建会丢弃 migration 新建的条目触发器，因此 0191 只建 schema；NFO 变更失效合同移至 LUX-680 单独处理，避免把未经修复的触发器描述为有效。
+
+#### LUX-680：确保 SQLite 内容分类索引随 NFO 变更失效
+
+范围：NFO 缓存文本变化时删除条目的分级/标签索引，并保证现有 SQLite `media_items` 兼容表重建不会丢失失效触发器。本任务只处理 SQLite；PostgreSQL 对应行为由 LUX-681 验证。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0192_media_content_restriction_index_invalidation.sql`、`src/storage/migration.rs`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] NFO 缓存从旧值改为新值或清空时，SQLite 自动删除条目索引及其标签；无变化更新不影响已就绪索引。
+- [x] 新库与会触发 catalog 兼容表重建的 SQLite 启动路径都保留此触发器。
+- [x] 空库定向测试验证索引失效、级联清理和索引重新建立后的媒体删除路径。
+
+短计划：先把已通过 migration 的回归扩展为 NFO 更新/清空的失效断言并确认失败；再新增 0192 触发器 migration，并在 SQLite catalog 兼容重建后幂等恢复触发器；最后重跑空库定向测试、build、fmt 与 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test storage media_content_restriction_index_migration_runs_from_an_empty_database -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-679。
+
+结果（2026-10-19）：新增 SQLite migration 0192；NFO 认证元数据实际变化或清空时，触发删除条目分类索引并级联删除标签。SQLite catalog 兼容表重建后会幂等恢复该触发器；无变化更新保留索引。空库专项测试 1/1、build、fmt、diff 检查通过；测试目标 Clippy 在豁免既有 `too_many_arguments` 与 `type_complexity` 后通过。
+
+#### LUX-681：为 PostgreSQL 建立等价的内容索引失效触发器
+
+范围：为 PostgreSQL 的 NFO 缓存变化建立与 LUX-680 相同行为的索引失效触发器，并通过本地 PostgreSQL 集成测试验证更新、清空、无变化更新和标签级联清理。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`migrations-postgres/0192_media_content_restriction_index_invalidation.sql`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] PostgreSQL 对 `nfo_metadata_json` 使用行级 `AFTER UPDATE` 触发器，只在旧值与新值不同时删除分类索引和标签。
+- [x] PostgreSQL 空库测试验证无变化更新保留索引、内容变化或清空时失效，以及后续媒体/索引级联删除。
+- [x] PostgreSQL 定向集成测试、build、fmt 与 diff 检查通过。
+
+短计划：先扩展专用 PostgreSQL migration 测试并确认 NFO 变化不会使现有索引失效；再添加与 LUX-680 同版本的 PostgreSQL 函数/触发器 migration；最后在本地 PostgreSQL 上运行专项测试并执行格式与构建检查。
+
+验证：确认 Toshiba 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test postgres_database postgres_media_content_restriction_index_migration -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-679、LUX-680。
+
+结果（2026-10-19）：PostgreSQL schema 192 使用 `AFTER UPDATE OF nfo_metadata_json` 行级触发器，并以 `OLD ... IS DISTINCT FROM NEW ...` 条件仅对真实变化失效索引；认证变化与清空均会级联删除标签，无变化更新保留索引。PostgreSQL migration/行为专项 1/1、build、fmt、diff 和过滤既有测试 lint 后的 Clippy 通过。实现依据 PostgreSQL 16 的 [CREATE TRIGGER](https://www.postgresql.org/docs/16/sql-createtrigger.html) 和 [PL/pgSQL Trigger Functions](https://www.postgresql.org/docs/16/plpgsql-trigger.html) 说明。
+
+#### LUX-682：规范化 NFO 内容索引投影
+
+范围：将已缓存 NFO 的认证文本和类型标签转换为有界内容索引投影。认证只接受 MPA、TVPG、BBFC 已知代码的并集；具体限制仍按用户选择的分级体系解释。类型标签去除首尾空白、折叠内部空白、统一小写、去重并排序。未知认证按未分级处理；标签超过索引合同边界时拒绝整个投影，不截断标签，以免漏掉禁止标签。此任务只增加域层纯函数，不读取文件或改变授权。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/domain/content_restrictions.rs`。
+
+验收标准：
+
+- [x] 已知认证代码可规范化；未知或数值评分保持未分级，认证不推断来源体系。
+- [x] 标签以稳定顺序规范化、去重；空标签忽略，非法/超界标签数据拒绝整个投影。
+- [x] 域层回归覆盖规范化、未知认证、多语言标签、非法标签和超过上限的标签组。
+- [x] 定向 Rust 测试、fmt 与 diff check 通过。
+
+短计划：先加入域层投影回归并运行 `content_restrictions` library 测试确认缺少实现；再实现认证并集规范化和有界标签投影；最后运行定向测试、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-678、LUX-679。
+
+结果（2026-10-19）：域层现从认证代码并集规范化已知等级（后续仍由所选体系解释），将 NFO 类型标签折叠空白、统一小写、去重并稳定排序；未知/数值认证按未分级处理，空标签忽略，控制字符、超长标签或超过 100 个不同标签会拒绝整个投影，避免截断漏掉禁止标签。`cargo test --locked --lib content_restrictions` 7/7、fmt 与 diff check 通过。严格库 Clippy 仍被未修改的 `serve_emby_media_file` 与 `verify_emby_direct_stream` 两个 `too_many_arguments` 报错阻挡；豁免此既有 lint 后通过。无文件读取或授权行为变更。
+
+#### LUX-683：存储内容分类索引候选并校验 NFO 快照
+
+范围：为内容索引回填提供有界缺失候选查询和按 NFO 缓存快照原子写入。候选仅包含未删除且无索引行的媒体，按 ID 稳定排序并限制最多 100 项；查询只读取数据库中的 NFO JSON。写入前在 PostgreSQL 锁定媒体行，在 SQLite 使用立即写事务，且只有当前 NFO JSON 与读取快照完全相同才替换索引及标签；NFO 为空仍可写入已就绪的未分级行。此任务不解析 NFO、不启动 worker 或执行授权。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 缺失候选查询有稳定顺序、服务端批次上限，排除已索引和已删除媒体，空 NFO 仍作为候选。
+- [x] SQLite/PostgreSQL 写入只在 NFO 快照匹配且媒体未删除时成功；标签与索引行原子替换，陈旧快照不产生索引。
+- [x] SQLite 与 PostgreSQL 存储回归覆盖上限、候选过滤、NFO 改变后的陈旧写入拒绝、空快照就绪状态。
+- [x] 定向 Rust 测试、构建、fmt 与 diff check 通过。
+
+短计划：先增加 SQLite/PostgreSQL 共用存储回归并确认候选/快照 API 缺失时失败；再实现有界查询、后端特定事务锁和索引原子替换；最后执行存储定向测试（含可用的本地 PostgreSQL ignored 用例）、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-679、LUX-681、LUX-682。
+
+结果（2026-10-19）：存储层现在以 ID 顺序读取未删除且缺少索引的缓存条目，硬上限 100，空 NFO 作为可索引的未分级快照。SQLite 立即写事务与 PostgreSQL 媒体行锁保护快照比较；只有未删除条目的 NFO JSON 完全匹配才会事务性替换索引和标签。SQLite/PostgreSQL 共用回归各 1/1 通过，覆盖已就绪/删除过滤、批次上限、陈旧快照、空 NFO 与写标签约束失败回滚；`cargo build --locked`、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。后台 worker 尚未接入。
+
+#### LUX-684：从缓存 NFO 分批建立内容分类索引
+
+范围：增加 application 层批处理器，从数据库候选读取的缓存 NFO JSON 派生认证与类型标签投影，使用 LUX-683 的快照写入合同落索引。支持可选 ID 游标，坏缓存或变化中的条目不会挡住后续批次；空缓存登记为已处理的未分级项。此任务不从磁盘读取 NFO、不启动常驻 worker、不改变媒体访问。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/content_restriction_index.rs`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 存储候选查询支持 ID 游标，边界批次稳定且不会重复查询游标之前的未处理条目。
+- [x] application 批处理只解析 NFO 缓存、不触碰文件；坏 JSON/非法标签不标记就绪，并仍返回游标推进到后续条目。
+- [x] 有效缓存中的认证与类型标签进入索引；无 NFO 缓存可以登记为未分级就绪；陈旧快照不写入。
+- [x] Rust 定向回归、build、fmt 与 diff check 通过。
+
+短计划：先增加存储游标及 application 批处理回归并确认接口/实现缺失时失败；再添加可选游标查询与缓存投影处理；最后运行定向 Rust 测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --ignored --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::content_restriction_index::tests::index_batches_use_cached_nfo_and_advance_past_invalid_entries -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-682、LUX-683。
+
+结果（2026-10-19）：application 批处理器逐条消费缓存 NFO JSON，通过领域投影和 LUX-683 快照 CAS 写入；缓存不存在会登记为未分级就绪，坏 JSON/超界标签保留未就绪但游标仍向后推进。SQLite application 回归 1/1、SQLite/PostgreSQL 存储游标回归各 1/1、build、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。处理器还未由后台生命周期启动，准备在 LUX-685 接入。
+
+#### LUX-685：启动内容分类索引后台 worker
+
+范围：在 database selection 完成后启动内容索引后台 worker，并纳入 AppState 优雅关闭。worker 用 LUX-684 的 ID 游标分批处理现有及后续 NFO 变化，只访问缓存，不从媒体路径读取 NFO；每批不超过 100 项，错误重试，坏缓存/非法投影不就绪但不阻塞之后条目。日志只记录批次数量与错误，不写 NFO 文本。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/content_restriction_index.rs`、`src/application/mod.rs`、`src/api/legacy.rs`、`src/main.rs`。
+
+验收标准：
+
+- [x] worker 在数据库选择状态确认后启动，不在 database-selection 阻塞模式运行；重复启动不会生成重复 worker。
+- [x] 现有缓存与后来失效的索引都会被有界回填；坏项不饿死后续批次，无候选时退避等待。
+- [x] AppState shutdown 会停止并等待 worker；后台日志不含 NFO 内容或外部路径。
+- [x] SQLite worker 启动/处理/关闭回归、build、fmt 与 diff check 通过。
+
+短计划：先增加 worker 启动和处理的 SQLite 回归并确认 worker 不存在；再实现可退避的游标循环、AppState 持有与 shutdown、main 启动接线；最后运行定向测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::content_restriction_index::tests::background_worker_indexes_cached_metadata_and_shuts_down -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-684。
+
+结果（2026-10-19）：内容分类索引 worker 现在由主进程在数据库选择完成后启动，并由 AppState 持有、重复调用不重复创建，关闭时等待其退出。worker 每批最多 100 项，沿 ID 游标继续处理，坏 JSON/非法标签只记录汇总且不就绪，无候选时 10 秒退避，数据库错误 1 秒后重试。SQLite worker 处理及关闭回归 1/1、build、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过；不读取磁盘 NFO。
+
+#### LUX-686：提供内容分类索引就绪度管理员 API
+
+范围：增加只读管理员 API，汇总未删除媒体条目总数、已建立分类索引数和未就绪数。统计口径与后台回填一致；仅管理员可读，不返回条目名称、路径、NFO 或用户策略。此任务不改变媒体访问，也不做前端展示。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`、`src/storage/repository_tests.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 存储统计排除已移除媒体，并准确计算总数、已索引数与待处理数。
+- [x] SQLite 与 PostgreSQL 存储合同覆盖空库、部分索引及移除条目。
+- [x] 只读管理员端点拒绝匿名及普通账户，并返回 camelCase 汇总，不泄露媒体内容或路径。
+- [x] 定向存储/API 测试、build、fmt 与 diff check 通过。
+
+短计划：先在共享存储回归和管理员 HTTP 集成测试中加入就绪度断言并确认接口缺失时失败；再实现有界 SQL 汇总与管理员路由；最后运行目标测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib storage::repository::repository_tests::postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes -- --ignored --exact`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_read_content_restriction_index_readiness -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、fmt、全目标 Clippy（放行两个既有 lint）与 `git diff --check`。
+
+依赖：LUX-679、LUX-683、LUX-685。
+
+结果（2026-10-19）：存储层用单条 LEFT JOIN 聚合活跃条目总数与已有索引数，已移除媒体不计入，待处理数由两者差值生成。只读端点 `/api/v1/admin/content-restriction-index` 要求管理员会话，响应仅含 `totalItems`、`indexedItems`、`pendingItems`。SQLite 与本地 PostgreSQL 存储回归各 1/1、管理员 HTTP 回归 1/1、`cargo build --locked`、fmt、diff check 和豁免既有 `too_many_arguments`/`type_complexity` 的全目标 Clippy 通过。UI 展示由后续独立任务接入。
+
+#### LUX-687：为内容限制索引状态增加 Web API 客户端
+
+范围：为 LUX-686 的只读管理员端点增加 TypeScript 状态类型和客户端方法，沿用现有请求层、camelCase 字段和错误处理。不在本任务修改页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] Web 类型准确描述活跃总数、已索引数与待就绪数。
+- [x] 客户端使用管理员就绪度路径发起只读 GET，并解码响应。
+- [x] API 客户端定向测试、Web typecheck/build 与 diff check 通过。
+
+短计划：先加客户端合同测试并确认方法缺失时失败；再增加类型和 GET 方法；最后运行定向 Vitest、格式与 diff 检查。
+
+验证：运行 `pnpm --dir web install --frozen-lockfile`、`pnpm --dir web exec vitest run tests/api-client.test.ts -t "reads content restriction index readiness"`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-686。
+
+结果（2026-10-19）：新增 `AdminContentRestrictionIndexStatus` 类型和 `adminContentRestrictionIndexStatus()` GET 客户端方法；定向 API 客户端回归 1/1、冻结安装和 Web typecheck/build 通过。完整 `pnpm --dir web test` 为 706 passed、4 failed；失败分布于未改动的 `home-page.test.tsx`、`library-card.test.tsx`（2 项）和 `media-query-polling.test.tsx`，本任务未复现这些失败的基线状态。仓库未配置 Prettier 脚本或依赖，`git diff --check` 作为文本格式检查通过。页面展示留待 LUX-688。
+
+#### LUX-688：在用户内容限制页展示索引进度
+
+范围：将 LUX-686 管理员索引状态显示在用户详情的模块五页面，提供加载、错误重试、无媒体和部分/全部就绪状态。明确说明当前页仅展示索引回填状态，用户限制配置和访问拦截仍未接入。不修改索引 worker 或媒体访问行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-content-restriction.test.tsx`。
+
+验收标准：
+
+- [x] 模块五页以服务端计数显示已索引、待就绪及整体进度。
+- [x] 加载、API 错误和空媒体状态均有清晰、可访问的提示；错误可重试。
+- [x] 页面文案不暗示策略配置或访问拦截已经生效。
+- [x] 组件回归、Web build 与 diff check 通过，窄屏布局无溢出。
+
+短计划：先添加模块五页面组件回归并确认旧占位缺少进度而失败；再以 React Query 接入 LUX-687 客户端并实现各状态与响应式样式；最后跑定向 Vitest、build、浏览器窄屏检查与 diff 检查。
+
+验证：运行 `pnpm --dir web exec vitest run tests/admin-user-content-restriction.test.tsx`、`pnpm --dir web build`、Playwright 本地浏览器检查及 `git diff --check`。
+
+依赖：LUX-686、LUX-687。
+
+结果（2026-10-19）：用户详情模块五页接入服务端索引汇总，展示回填进度并在待处理期间每 5 秒刷新；加载、失败重试、无媒体、部分及全部就绪均有独立状态。页面明确说明用户限制配置和媒体访问拦截尚未接入。组件测试 4/4、Web build 和 diff check 通过。Playwright Chromium 在 390×844 视口显示 76/100、待就绪 24；文档宽度 390px、进度卡片宽 366px，无横向溢出，控制台无错误；预览截图保存在 `output/playwright/user-content-index-390.png`。完整 `pnpm --dir web test` 为 710 passed、4 failed，失败仍为未改动的 `home-page.test.tsx`、`library-card.test.tsx`（2 项）和 `media-query-polling.test.tsx`；该结果与 LUX-687 完整 Web 测试相同，未在本任务重现其基线原因。
+
+#### LUX-689：开放管理员用户内容限制策略 API
+
+范围：为管理员提供单用户内容限制策略读取和整组版本化保存 API。读取未配置策略时返回 `policy: null`，维持旧账号无限制行为；写入校验分级体系、最大等级与标签，并以存储 CAS 原子替换策略及允许/禁止标签。成功写入记录不含标签明文的审计摘要；不接 Web 客户端/UI，也不在本任务改变媒体访问。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/mod.rs`、`src/application/user_content_restrictions.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 只有管理员能读取或写入；写入要求管理员 Web session 和 CSRF。
+- [x] 缺省策略以 `null` 返回；创建使用版本 0，更新需匹配版本，冲突返回 409，不存在/不可用账号返回 404。
+- [x] 只接受 MPA、TVPG、BBFC 有效分级；等级须属于所选体系；标签去除首尾空白、规范化小写、拒绝重复/空/超长/控制字符及超过 100 项。
+- [x] 策略及允许/禁止标签整组 CAS 写入，响应含稳定版本和更新时间；审计不包含标签值或凭证。
+- [x] 用户 HTTP 定向回归、build、fmt 与 diff check 通过；API 合同同步。
+
+短计划：先添加管理员/普通用户/匿名权限、缺省读取、校验、CSRF、CAS 冲突及规范化回读的 HTTP 回归并确认路由未开放；再实现应用层输入校验、API 接线和脱敏审计；最后运行 `users` 定向测试、build、fmt 与 diff 检查。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_user_content_restrictions -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-677、LUX-678、LUX-688。
+
+结果（2026-10-19）：应用层提供策略读取/更新和规则校验；管理员 GET 对未配置策略返回 `null`，PUT 使用版本 CAS 原子替换分类字段和两组标签。仅管理员可读，写操作通过 CSRF；审计只写分级体系、是否有最大等级、标签数量及版本，不写标签值。分级体系与等级需匹配；标签规范化与媒体索引一致，并拒绝控制字符、空值、超长、重复及每组超过 100 项。HTTP 回归 1/1、应用层回归 2/2、`cargo build --locked`、fmt check 和 diff check 通过。策略配置尚未接 Web 客户端/UI，媒体读取路径也尚未应用限制。
+
+#### LUX-690：为管理员用户内容限制 API 增加 Web 客户端合同
+
+范围：新增单用户内容限制策略的 Web 类型、只读 GET 和版本化整组 PUT 客户端方法。客户端使用 LUX-689 的管理员路由与字段合同，写入沿用统一请求层的 CSRF 注入；不修改用户详情页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 类型涵盖未配置策略的 `null`、全部策略字段及版本化更新输入。
+- [x] GET/PUT 路径、序列化请求、响应解码和 CSRF 注入均有客户端回归。
+- [x] 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先加入未配置读取与版本化保存客户端合同并确认类型/方法不存在时失败；再添加策略类型和 GET/PUT 方法；最后运行 API 客户端定向测试、Web build 与 diff 检查。
+
+验证：运行 `pnpm --dir web exec vitest run tests/api-client.test.ts -t "reads and updates admin user content restrictions"`、`pnpm --dir web build` 与 `git diff --check`。
+
+依赖：LUX-689。
+
+结果（2026-10-19）：增加内容限制策略/更新输入/响应类型，并实现按编码用户 ID 读取和整组 PUT 的客户端方法；PUT 沿用请求层 CSRF 注入。API 客户端回归 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。页面配置留给 LUX-691。
+
+#### LUX-691：在用户详情配置内容限制策略
+
+范围：在模块五用户详情中读取、编辑并保存分级体系、最高等级、未分级规则、允许标签和禁止标签；未配置策略使用不限内容的表单默认值，使用已读取版本提交 CAS。显示读取/保存/冲突状态，并保留索引进度及“访问拦截尚未接入”提示。回收站账号只读；本任务不应用媒体访问过滤。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-content-restriction.test.tsx`。
+
+验收标准：
+
+- [x] 管理员可配置三类分级体系、该体系的有效最高等级、未分级规则及两组标签；切换体系不会保留不兼容等级。
+- [x] 未配置策略显示为不限内容，保存新策略提交版本 0；成功后展示服务端规范化结果和新版本。
+- [x] 加载、错误重试、保存中、成功和版本冲突均清楚可访问；回收站不可编辑。
+- [x] 页面继续明确说明媒体访问拦截尚未接入；定向组件测试、Web build、窄屏浏览器检查和 diff check 通过。
+
+短计划：先扩展模块五组件测试覆盖默认、已保存策略、输入编辑、CAS 版本与错误状态并确认策略表单不存在；再接 LUX-690 客户端实现表单和响应式样式；最后运行组件测试、Web build、窄屏浏览器验证与 diff 检查。
+
+验证：运行 `pnpm --dir web exec vitest run tests/admin-user-content-restriction.test.tsx`、`pnpm --dir web build`、Playwright Chromium 窄屏浏览器检查及 `git diff --check`。
+
+依赖：LUX-690。
+
+结果（2026-10-19）：模块五用户详情加入分级体系/最大等级、未分级开关和逐行允许/禁止标签表单；未配置策略以默认不限制状态呈现，创建提交版本 0，保存后用服务端规范化结果更新表单。切换体系会清除不兼容等级；CAS 冲突禁用再次提交并提供重新读取操作。错误可重试，回收站只读；页面说明保存的策略还未用于媒体访问过滤。模块五组件测试 9/9、播放策略回归 3/3、冻结依赖安装、Web build、diff check 通过。Playwright Chromium 390×844 检查显示文档宽 390px、策略卡宽 366px、表单单列且无横向溢出；mock API 后控制台错误 0，截图为 `output/playwright/user-content-policy-390.png`。完整 Web 套件 716 passed、4 failed；失败为既有 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项、`media-query-polling.test.tsx` 1 项，本次未改这些文件，未验证它们的干净基线。
+
+#### LUX-692：在库内容分页前应用用户内容限制
+
+范围：让 Lux 与 Emby 共用的媒体库过滤列表在 SQL 分页前执行已保存的内容限制，匹配总数同步过滤。有效分级/标签策略下，条目或其剧集/季度上级缺少分类索引时拒绝展示；管理员及未配置或完全不收紧的策略维持原结果。限制生效版本进入库页缓存键，更新策略后不得复用旧权限页。本任务不覆盖搜索、首页推荐、详情、图片、字幕、下载或播放入口。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 管理员、无策略和完全不收紧策略不改变列表结果；有效策略按分级/未分级、允许标签及优先的禁止标签过滤。
+- [x] 媒体条目、剧集、季度和单集的列表遵守自身与对应上级限制；索引缺失时限制策略 fail closed。
+- [x] SQL 在 `LIMIT/OFFSET` 前过滤；总数与可见条目一致，策略版本区分缓存项。
+- [x] SQLite 存储回归验证规则组合、父级约束、缺少索引和过滤后分页；相关 library page/API 定向测试、Rust build、fmt 和 diff check 通过。
+
+短计划：先在存储回归建立含分级、标签、父级和缺失索引的 fixture，并断言过滤后的计数/分页失败；再将策略谓词加入通用 catalog filter，将非管理员用户策略及版本带入缓存请求；最后运行存储与库列表定向回归、Rust build、fmt 和 diff check。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions_filter_catalog_rows_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib library_page_applies_user_policy_and_uses_policy_version_in_cache_key`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-691。
+
+结果（2026-10-19）：Lux 与 Emby 共用的分页查询现在从选中条目、父级季度和系列检查分级与标签策略；索引缺行按不允许访问处理，允许标签需至少命中一项，禁止标签优先。过滤条件进入 SQL 的计数和分页子查询，查询发生在 LIMIT/OFFSET 之前。策略版本加入 library page cache key；管理员不应用用户策略，无策略和完全不收紧策略与既有列表一致。存储回归 1/1、策略更新与缓存版本应用回归 1/1、`tests/catalog.rs` 3/3、`cargo build --locked`、fmt 与 diff check 通过。本任务只覆盖通用媒体库过滤列表；搜索、首页/推荐、详情、图片、字幕、下载和播放仍待实施。
+
+#### LUX-693：定义单条媒体内容限制判定
+
+范围：为用户内容限制提供可复用的领域判定，统一校验所选分级体系中的已知等级、最大等级、未分级规则和标签策略。未知/跨体系分级按未分级处理；无效策略失败关闭；允许标签要求至少一项命中，禁止标签优先。不在本任务连接具体 API 或媒体入口。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/domain/content_restrictions.rs`。
+
+验收标准：
+
+- [x] 三种分级体系按规格顺序比较，BBFC `12` 与 `12A` 同级；选用其他体系时无法映射的等级遵循未分级开关。
+- [x] 标签匹配使用索引及用户策略的规范化值；禁止标签优先，允许标签列表非空时必须命中至少一项。
+- [x] 未限制策略为允许；错误的持久化策略配置按拒绝处理。
+- [x] 领域单测覆盖等级、未分级、标签交叉与无效策略；格式及 diff check 通过。
+
+短计划：先为纯判定 API 添加三种分级体系、未知等级、标签交集及禁用优先回归；再实现无 I/O 的策略评估函数并运行领域定向测试。
+
+验证：运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-678。
+
+结果（2026-10-19）：新增纯领域策略判定，验证 MPA/TVPG/BBFC 顺序、BBFC 12/12A 同级、跨体系与未知分级的未分级行为、允许标签至少命中一项、禁止标签优先和索引缺失 fail closed；损坏的等级体系、最高等级或标签记录失败关闭，完全不限制策略不要求索引。`content_restrictions::tests` 11/11、Rust fmt check 与 diff check 通过。
+
+#### LUX-694：在单条媒体授权中执行内容限制
+
+范围：将 LUX-693 的领域规则接入 `MediaAccessService::can_view_item`，使 Lux/Emby 单条详情及现有经该服务保护的图片、字幕、下载和播放入口共享用户内容限制。检查条目自身及系列/季度父级的索引；活跃策略遇到缺失索引或损坏配置时拒绝。管理员、无策略、无收紧项及媒体库 ACL 合同保持原行为。本任务不筛选父容器的子项分页或首页/搜索列表。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/access.rs`、`src/domain/content_restrictions.rs`、`src/storage/catalog.rs`、`src/storage/repository.rs`。
+
+验收标准：
+
+- [x] 单条访问先通过现有媒体库 ACL，再同时满足条目自身和关联系列/季度的内容限制；禁止项不得通过直接 ItemId 访问。
+- [x] 缺失目标/上级索引、无效持久化策略和未知体系按拒绝处理；无策略与完全不收紧策略维持现有访问，管理员沿用既有绕过。
+- [x] 原本经 `can_view_item` 保护的 Lux/Emby 详情、图片、字幕、下载与播放入口自动使用该判定；访问回归覆盖策略拒绝和父级继承。
+- [x] application 定向测试、内容策略领域测试、Rust build、fmt 与 diff check 通过。
+
+短计划：先在 `MediaAccessService` 测试创建用户、媒体库、等级/标签索引和父子层级并确认策略未拦截；再为 storage 增加有界条目+上级分类读取，将领域策略应用到所有候选；最后运行访问与内容策略定向回归、Rust build、fmt 和 diff check。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_policy_denies_direct_item_access_and_inherits_parent_restrictions`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restrictions::tests`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-693。
+
+结果（2026-10-19）：`MediaAccessService::can_view_item` 在现有启用媒体库和 ACL 检查后读取用户策略，并按需取目标及系列/季度的分类索引；缺索引、无效策略或无可评估分类时拒绝。管理员和不存在/完全不收紧策略维持既有路径。详情、图片、字幕、下载、本地直放及 Emby 播放回调原本都使用该共享检查；ACL 1/1、playback 4/4、subtitles 1/1、download_api 1/1、image_api 1/1、直接访问/父级继承回归 1/1、领域策略 11/11、Rust build、fmt 和 diff check 通过。`cargo clippy --locked --lib -- -D warnings` 仍被未改动的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两个 `too_many_arguments` 警告阻断。
+
+#### LUX-695：在搜索候选分页前应用用户内容限制
+
+范围：将同一内容限制谓词加入 Lux 与 Emby 共用的 FTS/LIKE 搜索候选查询，在排序、总数和分页前过滤等级、标签、上级条目及未就绪索引。管理员和无收紧策略保持原结果。搜索并发合并键包含策略版本，不能让不同版本的同用户请求共享旧结果。本任务不覆盖首页/推荐或媒体库子项列表。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] Lux 与 Emby 搜索均在 SQL 的 `COUNT/LIMIT/OFFSET` 前执行统一内容限制；被过滤条目不增加总数或占用页位。
+- [x] FTS、LIKE fallback、PostgreSQL LIKE 和 SQLite 深页 FTS+LIKE union 分支都传递策略与对应有序标签绑定。
+- [x] 活跃策略下索引缺失 fail closed，父级限制继承；管理员及无策略、完全不收紧策略保持原结果。
+- [x] 应用搜索回归验证等级过滤和准确总数；search/catalog、Rust build、fmt 与 diff check 通过。
+
+短计划：先在 CatalogService 搜索回归创建可被同一搜索命中的允许/拒绝条目并确认尚未过滤；再让搜索并发键携带策略版本，并把版本化策略贯穿 SQLite/PostgreSQL 搜索绑定和所有分页分支；最后运行应用搜索、目录和内容策略回归及构建检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib library_search_applies_content_restrictions_before_pagination`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+结果（2026-10-19）：搜索并发合并键加入策略版本；SQLite FTS、LIKE 回退和深页 FTS+LIKE union、PostgreSQL LIKE 查询都在排序/计数/分页前使用相同策略谓词，标签绑定按 blocked/allowed 顺序分别应用到各搜索分支。应用回归覆盖最高等级、允许和屏蔽标签、过滤后总数、LIKE 回退与深页 union。定向应用测试 1/1、`tests/catalog.rs` 3/3、`cargo build --locked`、fmt 和 diff check 通过；PostgreSQL 分支本任务未连接真实 PostgreSQL 实例验证。
+
+依赖：LUX-694。
+
+#### LUX-696：在继续观看候选分页前应用用户内容限制
+
+范围：对 Emby 及独立继续观看 API 的已观看进度条目和“下一集”候选使用 LUX-693 的统一内容限制谓词，并在 SQL 排序、排名和分页前过滤，确保系列/季度父级及未就绪索引不能被直接继续观看列表绕过。管理员保持既有结果。缓存首页快照的策略失效、最近新增和推荐留给后续任务。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 普通用户的继续观看进度项和下一集候选均满足自身及父级内容限制；缺失索引 fail closed。
+- [x] 内容限制在 SQL 的总数、排名与分页前执行；过滤后总数及越界页计数正确。
+- [x] 管理员和无策略用户继续沿用原行为；无标签限制时绑定列表不改变。
+- [x] 存储与 CatalogService 回归覆盖等级过滤、父级、缺索引及下一集候选；相关测试、build、fmt 和 diff check 通过。
+
+短计划：先在 CatalogService 继续观看回归建立带进度的允许/拒绝条目，并确认限制尚未应用；再把可选用户策略加入继续观看查询合同，在候选 CTE 和空页计数路径前执行统一策略谓词；最后跑应用与存储定向测试、Rust build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib continue_watching_applies_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib resume_items_apply_content_restrictions_before_ranking`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+结果（2026-10-19）：Emby/独立继续观看服务及独立首页继续观看入口读取非管理员当前用户策略；存储在已保存进度候选和下一集候选过滤自身/系列/季度，并在计数/排名/分页之前应用相同谓词。缺失索引 fail closed，标签绑定按两个 SQL 候选分支重复且按序传入。存储回归 1/1、CatalogService 回归 1/1、原无策略 resume 页回归 1/1、`tests/resume_favorites.rs` 5/5、Rust build、fmt 和 diff check 通过。`cargo clippy --locked --lib -- -D warnings` 被 4 个参数数目 lint 阻断，其中 2 个是既有 `serve_emby_media_file` / `verify_emby_direct_stream`，另 2 个来自 LUX-695 新增的搜索方法；计划在后续小任务整理搜索查询参数合同。
+
+依赖：LUX-695。
+
+#### LUX-697：整理搜索策略查询参数合同
+
+范围：将 LUX-695 搜索应用层与存储层传递的查询参数收敛为单个内部请求结构，消除新增的 Clippy 参数数目告警；保持 FTS/LIKE 分支、策略版本并发键、绑定顺序和查询结果不变。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/mod.rs`。
+
+验收标准：
+
+- [x] 搜索应用层与存储层均通过具名查询合同传递检索词、类型、媒体库、分页和用户策略。
+- [x] SQLite FTS/LIKE/deep union、PostgreSQL LIKE 以及策略版本并发键行为保持不变。
+- [x] 搜索定向测试、`tests/catalog.rs`、Rust build、fmt 和 diff check 通过；Clippy 不再报告这两个搜索函数参数数目告警。
+
+短计划：先确认搜索测试与两个新告警的触发位置；再定义存储模块内部搜索参数结构并改为单参数传递；最后运行搜索、目录测试、build、fmt、diff check 与 Clippy。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib library_search_applies_content_restrictions_before_pagination`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check`、`git diff --check` 与 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo clippy --locked --lib -- -D warnings`。
+
+结果（2026-10-19）：应用与存储共用具名 `CatalogSearchQuery` 传递搜索字段与策略，移除了 LUX-695 两个搜索方法的参数数量告警。策略版本并发键与 FTS、LIKE、深页 union 和 PostgreSQL LIKE 绑定保持不变。搜索回归 1/1、`tests/catalog.rs` 3/3、Rust build、fmt 和 diff check 通过。Clippy 仍被两处未改动的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 参数数量告警阻断。
+
+依赖：LUX-695。
+
+#### LUX-698：在主页继续观看与推荐缓存中执行内容限制
+
+范围：主页继续观看列表通过统一分类策略过滤已保存进度和下一集候选。推荐候选在打分、候选池截取和每日批次写入前应用同一策略；用户策略版本区分主页缓存和每日推荐批次，策略更新后不返回旧推荐。本任务不覆盖最近新增、每库分组、合集或目录子项。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/application/home.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] `/api/v1/home` 的继续观看列表遵守自身/系列/季度限制，缺失索引 fail closed，并保持原分页总数行为。
+- [x] 推荐 SQL 在打分候选进入 TOP/limit 前应用策略；限制版本变更后创建独立每日批次，不能重用旧策略 ID 列表。
+- [x] 管理员和未配置策略保持既有结果；无收紧配置不阻断条目。
+- [x] 推荐策略回归、主页策略版本缓存回归、相关目录/home 测试、build、fmt 与 diff check 通过。
+
+短计划：先用主页/推荐回归确认未限制版本仍会缓存并返回高分级候选；再将策略传递到主页继续观看和推荐候选查询，并把策略版本纳入 HomeCacheKey 与每日批次 scope；最后运行应用、主页和存储推荐回归及构建检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib recommendations_apply_content_restrictions_before_candidate_pool`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib carousel_cache_isolated_by_content_restriction_version`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check`。
+
+依赖：LUX-696。
+
+结果（2026-10-19）：主页继续观看沿用统一内容限制谓词，继续观看计数与分页前候选一致。推荐查询在评分、TOP 候选及每日 ID 批次写入之前过滤；策略版本分别隔离主页缓存和持久化推荐批次。回归用 60 条受限条目和 1 条可见条目证明可见项不会被未过滤候选池挤掉，并覆盖管理员旁路、无策略和无收紧策略。
+
+验证：`cargo test --locked --lib content_restriction` 21 passed、1 ignored（PostgreSQL 专用）；加强后的推荐回归 1/1；`carousel_cache_isolated_by_content_restriction_version` 1/1；继续观看策略回归 1/1；`tests/catalog.rs` 3/3；`tests/resume_favorites.rs` 中 `home_continue_watching_advances_to_next_unplayed_episode_after_completion` 1/1；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅被未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
+
+#### LUX-699：首页最近新增列表应用用户内容限制
+
+范围：`/api/v1/home` 的聚合最近新增列表及对应 CatalogService 查询，在总数计算和分页之前应用当前用户的统一内容限制谓词。过滤条目不得占用页位或计入总数；管理员、无策略和无收紧策略保持既有结果。本任务不处理按库分组的最新条目、合集卡片或目录子项。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/application/home.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] HomeService 将同一版本的用户策略传入最近新增列表；直接 CatalogService 入口按 principal 加载策略。
+- [x] 自身、系列和季度限制及未就绪索引 fail closed；计数与分页使用相同谓词。
+- [x] 管理员、无策略和完全不收紧策略不改变既有结果。
+- [x] 回归证明较新的被限条目不会占据首个分页位置，过滤后总数准确；相关 catalog、build、fmt 和 diff check 通过。
+
+短计划：先增加带允许、拒绝和缺失索引条目的应用回归，确认当前首页最近新增泄漏并污染分页总数；再将策略快照传入 storage 并在计数/分页 SQL 中使用统一谓词；最后跑内容策略、目录集成、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib home_recently_added_applies_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-698。
+
+结果（2026-10-19）：HomeService 将首页统一读取的策略快照传入聚合最近新增；直接 CatalogService 入口按当前 principal 读取策略。存储层对可用与不可用父条目分支的 count/list SQL 都在分页前使用同一谓词，按 SQL 分支顺序重复绑定允许/屏蔽标签。应用回归覆盖较新的 R 内容、缺索引项、R 分级系列及其较低分级分集、较旧的允许内容及允许/屏蔽标签；首项和总数只返回允许内容。
+
+验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1，覆盖管理员旁路、无策略和全允许策略仍返回原总数；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、fmt 检查和 `git diff --check` 通过。Clippy 仅因未改动基线中的 `src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream` 两处 `too_many_arguments` 阻断。
+
+#### LUX-700：在按库最新条目候选限制前应用用户内容策略
+
+范围：对 `/api/v1/home` 的每库最新分组，以及按库读取最近条目的两个 Lux API 入口，在候选排序和每库 Top-N 前执行当前用户内容策略。被拒条目和因自身、系列/季度或索引未就绪而拒绝的候选不能占据每库配额。全局合集卡片和合集成员列表留给后续任务。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/media.rs`、`src/application/catalog.rs`、`src/application/home.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] HomeService 与两个按库 API 入口都使用请求用户的当前策略；管理员不受用户策略限制。
+- [x] SQLite 与 PostgreSQL 的每库候选 SQL 都在 Top-N 之前过滤自身及父级限制，缺索引 fail closed。
+- [x] SQL 标签绑定在重复的每库候选分支中保持正确顺序；隐藏候选不消耗可见条目的每库配额。
+- [x] 无策略和无收紧策略保持既有结果；定向目录与主页回归、build、fmt 和 diff check 通过。
+
+短计划：先扩展主页策略回归，确认当前每库最新分组会将最新受限条目放入配额；再让同一策略贯穿 HomeService、CatalogService 与 API 路由，并加入 SQLite/PostgreSQL 每库候选查询；最后运行内容策略、catalog、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib home_recently_added_applies_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-699。
+
+结果（2026-10-19）：HomeService 和两个按库 API 路由都读取当前 principal 的内容策略；管理员旁路由策略服务返回 `None`。SQLite 与 PostgreSQL 在每库 Top-N 候选 SQL 中先应用共享限制谓词，覆盖条目自身及 series/season/episode 父级关系；无索引条目 fail closed。SQLite 两个候选分支按 WHERE、LIMIT 的顺序重复绑定标签参数。
+
+验证：`home_recently_added_applies_content_restrictions_before_pagination` 1/1；`cargo test --locked --lib recent_catalog_rows` 3/3；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。
+
+#### LUX-701：在虚拟合集中过滤受限内容
+
+范围：虚拟合集卡片、最近更新卡片、成员列表、跨库副本/版本、默认海报回退、合集计数和来源偏好写入都按当前用户内容策略过滤；限制在卡片计数、成员分页及副本选择前执行。管理员、未配置/不收紧策略和媒体库 ACL 保持原合同。普通手动合集成员列表留给后续任务；本任务不改合集身份同步和数据库 schema。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/mod.rs`。
+
+验收标准：
+
+- [x] 受限工作在虚拟合集卡片、成员列表与总数中不可见，不占分页位置。
+- [x] 同一逻辑作品的受限副本不出现在来源/版本列表、播放来源及默认海报回退中；来源偏好不能指向受限副本。
+- [x] 聚合库的虚拟合集数量与可见卡片一致；管理员、无策略和无收紧策略结果不变。
+- [x] 统一分类谓词继续覆盖条目及缺失索引 fail closed；SQLite 定向回归、catalog、build、fmt 和 diff check 通过。
+
+短计划：先扩展虚拟合集应用回归，加入允许副本、受限副本与仅受限逻辑作品，确认当前卡片/成员/来源会泄漏；再让限制谓词支持物理副本别名、将来源偏好写入收敛为具名请求，并贯穿合集存储查询、计数和偏好写入，在 SQL 计数与分页前过滤；最后运行合集、内容策略、catalog、build、fmt 和 diff 检查。
+
+依赖：LUX-700。
+
+结果（2026-10-19）：虚拟合集卡片、最新更新卡片、卡片成员数/海报回退、成员分页、跨库来源/版本、播放来源、来源偏好写入和聚合库数量统一按请求用户的内容策略过滤。共享谓词可指定物理副本别名，缺少索引的副本 fail closed；管理员策略旁路和无策略/全开放策略保持原结果。手动合集子项列表留待 LUX-702。
+
+验证：`cargo test --locked --lib global_collection` 6/6；`cargo test --locked --lib content_restriction` 22 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。本任务未运行 PostgreSQL live-query 专项。
+
+#### LUX-702：在手动合集子项分页前应用用户内容限制
+
+范围：对普通媒体库中的手动合集子项列表，在 SQL 总数计算和 LIMIT/OFFSET 前应用当前用户内容策略，与媒体库 ACL 共用同一可见集合。覆盖 Lux 与 Emby 复用的 `CatalogService::list_collection_items`。合集容器自身没有媒体内容分级索引：详情仅在媒体库 ACL 允许且至少存在一个可见成员时返回，子项继续按内容策略过滤；不放宽图片等单条媒体资源的访问检查。本任务不修改合集成员关系、自动/虚拟合集或 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/media.rs`。
+
+验收标准：
+
+- [x] 普通用户手动合集子项按自身、系列/季度父级分级和标签策略过滤；缺失索引 fail closed。
+- [x] 过滤在总数、分页前执行；受限成员不占页位且不计入总数。
+- [x] 受限用户能打开 ACL 允许且至少有一个可见成员的合集容器；单条媒体图片等访问校验不放宽。
+- [x] 管理员、无策略和无收紧策略保持既有结果。
+- [x] CatalogService 回归覆盖允许/拒绝、缺失索引、父级和分页计数；合集相关目标、build、fmt 与 diff check 通过。
+
+短计划：先扩展 CatalogService 回归，在普通合集加入允许、受限、缺索引和父级受限成员，确认严格策略当前错误阻止合集容器访问；再让合集目录详情依赖过滤后的可见成员、列表入口对容器单独检查媒体库 ACL，并将统一策略谓词加入 count/list 查询；最后运行定向合集回归、相关内容限制测试、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib manual_collection_items_apply_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+结果（2026-10-19）：Lux 与 Emby 共用的普通合集成员查询在 SQL 计数和分页前应用当前用户策略、父级继承和媒体库 ACL。合集容器不做媒体分级判定；严格策略用户只有在库 ACL 允许且至少有一个可见子项时才能获取容器详情，直接图片等单条资源授权仍拒绝无索引容器。回归覆盖较早位置的 R/屏蔽标签成员、缺失索引成员、较低分级但属于 R 系列的分集及尾部允许成员，并验证管理员与无策略用户保持原结果。
+
+验证：`manual_collection_items_apply_content_restrictions_before_pagination` 1/1；`content_restriction` 23 passed、1 ignored（PostgreSQL 专用）；`tests/collections.rs` 4/4；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。未运行 PostgreSQL live-query 专项。
+
+依赖：LUX-701。
+
+#### LUX-703：在剧集与通用层级子项分页前应用用户内容限制
+
+范围：为 CatalogService 的通用层级子项列表和剧集/季度集数列表，在 SQL 总数与 LIMIT/OFFSET 前执行当前用户内容策略。包含季条目自身、分集自身、季度与系列父级继承以及缺索引 fail closed；保留父级直接访问检查、媒体库 ACL 和现有排序。Lux 与 Emby 继续共享同一服务合同，不改 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] 通用子项、`/Shows/{id}/Episodes` 和季度兼容路径都在计数与分页前过滤内容策略。
+- [x] 分集自身、季度/系列父级和未就绪索引规则一致；受限条目不占页位。
+- [x] 管理员、无策略和无收紧策略保留结果与排序；父级 ACL/访问检查不变。
+- [x] CatalogService 回归覆盖系列/季度继承、条目分级、缺索引和过滤后总数；定向测试、catalog、build、fmt 和 diff check 通过。
+
+短计划：先增加 CatalogService 回归，放入允许分集、受限分集、缺索引分集以及受限季度下的允许分集，确认通用子项和剧集列表泄漏或污染分页；再将同一内容策略谓词加入两组 SQL 的 count/list 查询，并从应用层传入当前 principal 策略；最后跑定向策略和 catalog 测试、build、fmt 与 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib hierarchy_child_lists_apply_content_restrictions_before_pagination`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test catalog`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+结果（2026-10-19）：通用层级子项与剧集/季度集数查询统一在计数和分页 SQL 中执行当前用户内容谓词。分集包含自身索引、季度及系列索引的继承判断；缺索引条目 fail closed。应用层保持父级 ACL 及直接访问检查，严格策略用户只有在选定系列/季度下有可见候选时获得相应结果。
+
+验证：`hierarchy_child_lists_apply_content_restrictions_before_pagination` 1/1，覆盖受限季度、受限分集、缺索引分集及过滤后的总数/首位分页，并确认管理员和无策略结果；`content_restriction` 24 passed、1 ignored（PostgreSQL 专用）；`tests/catalog.rs` 3/3；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。未运行 PostgreSQL live-query 专项。
+
+依赖：LUX-702。
+
+#### LUX-704：使媒体汇总与剧集数量遵守用户内容限制
+
+范围：让 Emby `/Items/Counts` 的物理媒体汇总，以及目录条目携带的 series/season episode count，使用当前用户的可见媒体集合。内容策略在 SQL 聚合前过滤；管理员、无策略和无收紧策略保持既有数量。本任务不改变观看进度统计、管理员库诊断计数或 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/catalog.rs`、`src/storage/catalog.rs`。
+
+验收标准：
+
+- [x] `/Items/Counts` 中影片、剧集、分集、合集和总数均排除受限条目，并保留收藏过滤语义。
+- [x] 系列/季度 `episode_count` 在详情和各目录卡片中仅统计自身、季度/系列父级及索引都允许且存在有效来源的分集。
+- [x] 无策略、全开放策略及管理员仍得到原计数；SQL 标签参数顺序正确。
+- [x] 应用回归覆盖内容策略、父级、缺索引和汇总；定向统计、Emby counts、build、fmt 与 diff check 通过。
+
+短计划：先在 hierarchy CatalogService 回归中为所有分集建立有效来源，并断言受限用户的 `/Items/Counts` 与可见季度分集数；确认当前汇总仍计入 R、父级受限和缺索引内容；再让物理统计与 episode count 共用内容谓词，并将当前请求策略传入详情/目录计数填充；最后跑定向回归、内容策略、Emby counts、build、fmt 和 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restricted_catalog_counts_and_episode_counts_match_visible_items`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib content_restriction`、`NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test emby_counts`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-703。
+
+结果（2026-10-19）：Emby `/Items/Counts` 的物理影片、剧集、分集、手动合集和总数在聚合前应用当前用户策略；严格策略下手动合集只有存在至少一个通过内容、父级、可用来源和媒体库访问检查的成员才计入。既有虚拟合集数量继续走 LUX-701 的可见成员谓词。系列/季度 episode count 统一按分集自身及季度/系列父级策略和有效来源统计，覆盖详情、媒体库页及层级子项卡片。回归覆盖 PG/R、禁止标签、父级继承、缺失索引、可见/全受限合集成员，以及管理员、无策略和全开放策略；SQL 中主项策略、合集成员库 ID、成员策略与收藏参数按占位顺序绑定。
+
+验证：`content_restricted_catalog_counts_and_episode_counts_match_visible_items` 1/1；`content_restriction` 24 passed、1 ignored（PostgreSQL 专用）；`tests/emby_counts.rs` 1/1；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。未运行 PostgreSQL live-query 专项。
+
+#### LUX-705：提供批量启用与禁用用户 API
+
+范围：新增管理员批量账号状态端点，接受明确勾选的 1–100 个用户 ID 和目标启用状态，拒绝重复目标；逐项复用单用户状态更新、最后管理员保护与禁用时的凭证撤销，并为每项目标返回稳定结果码。API 在禁用成功后停止对应服务端 HLS 会话并逐用户记审计事件。本任务不加入列表页面控件，也不支持“全部筛选结果”隐式扩展目标。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/admin_user_lifecycle.rs`、`src/application/mod.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员端点要求 CSRF；空列表、超过 100 个 ID 和重复 ID 在执行前拒绝。
+- [x] 每个有效目标逐项成功/失败；无效 ID、不存在用户、最后有效管理员及存储错误有稳定结果码，其他目标继续处理。
+- [x] 禁用复用既有事务，撤销登录凭证并停止该用户服务端 HLS 会话；启用不恢复旧凭证。
+- [x] API 集成回归覆盖未认证、缺 CSRF、输入边界、部分成功、最后管理员保护、禁用后拒绝登录及重新启用后的新登录；users、build、fmt 和 diff check 通过。
+
+短计划：先在 `tests/users.rs` 为当前不存在的批量状态路由增加认证、部分成功和登录失效回归并确认失败；再添加逐用户应用服务，复用 `UserStore::update_user_with_hls_session_ids` 以及现有 HLS 停止路径，加入管理员端点和稳定 DTO；最后运行 `tests/users.rs`、build、fmt 与 diff 检查。
+
+验证：确认 Toshiba 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+结果（2026-10-19）：新增管理员批量账号状态应用服务和 `/api/v1/admin/users/batch/status`。请求必须是 1–100 个去重 ID；响应逐项返回 `INVALID_USER_ID`、`USER_NOT_FOUND`、`LAST_MANAGER` 或 `STORAGE_UNAVAILABLE`。每个状态变更单独复用既有事务和最后管理员保护；成功禁用后撤销登录凭证、停止返回的服务端 HLS 会话并写入 `USER_DISABLED` 审计事件，启用写入 `USER_ENABLED` 且不恢复旧登录。回归包含触发器注入的单用户存储失败，证明后续目标仍能成功；同时确认禁用使旧 Web 会话和密码登录失效，重新启用后可创建新会话。
+
+验证：`tests/users.rs` 11/11、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍仅被两处未改动基线 `too_many_arguments` 错误阻断：`src/api/media.rs::serve_emby_media_file` 与 `src/application/playback/session.rs::verify_emby_direct_stream`。本任务未运行全量 Rust 门禁。
+
+#### LUX-706：增加批量账号状态 Web API 合同
+
+范围：为 LUX-705 管理端点定义批量启用/禁用请求、逐项稳定错误码和响应类型，并在 Web API 客户端公开方法。请求继续使用统一客户端的 JSON、CSRF 与错误处理。不在本任务修改页面或执行全量 Web 套件。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] TypeScript 类型覆盖批量状态和无效 ID、用户不存在、最后管理员、存储失败四种逐项结果。
+- [x] API 客户端 POST 到 `/api/v1/admin/users/batch/status`，发送精确用户 ID 列表及目标状态，并由统一请求层注入 CSRF。
+- [x] 定向 API 客户端回归和 Web build、`git diff --check` 通过。
+
+短计划：先在 API 客户端回归中断言批量禁用请求的 URL、JSON、方法和 CSRF，并确认目标方法不存在而失败；再添加类型和统一客户端方法；最后跑 `api-client.test.ts`、Web build 与 diff check。
+
+验证：运行 `pnpm --dir web exec vitest run tests/api-client.test.ts`、`pnpm --dir web build` 和 `git diff --check`。
+
+结果（2026-10-19）：增加批量账号状态逐项结果类型和 `updateAdminUserStatusBatch` 客户端方法，准确发送 `userIds` / `isDisabled` 并经统一请求层注入 CSRF。定向回归覆盖全部稳定结果码和请求合同。
+
+验证：`tests/api-client.test.ts` 72/72、`pnpm --dir web build` 和 `git diff --check` 通过；未运行完整 Web 测试套件。
+
+#### LUX-707：在用户列表批量启用或禁用账号
+
+范围：在用户列表现有本页勾选操作区加入批量启用/禁用按钮。变更前确认所选人数、逐项用户名称及禁用/启用影响；提交 LUX-705 API 后逐项显示成功或错误原因。变更后清空勾选并刷新列表。本任务不选择当前筛选的其他分页用户。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/tests/admin-user-batch-actions.test.tsx`。
+
+验收标准：
+
+- [x] 启用和禁用按钮只作用于当前页明确勾选的用户，并分别提供有目标名称与影响说明的确认。
+- [x] 每项显示用户名称和成功/稳定失败原因；成功后清空勾选并刷新用户列表。
+- [x] 换页、筛选或排序重置选择；请求中和偏好复制弹窗打开时禁用冲突操作。
+- [x] 定向列表组件回归、Web build 与 `git diff --check` 通过。
+
+短计划：先增加组件回归，确认选中用户后缺少批量状态按钮并失败；再接入 LUX-706 客户端方法，添加启用/禁用确认、逐项结果、错误映射和成功刷新；最后跑用户批量动作 Vitest、Web build 与 diff check。
+
+验证：运行 `pnpm --dir web exec vitest run tests/admin-user-batch-actions.test.tsx`、`pnpm --dir web build` 和 `git diff --check`。
+
+结果（2026-10-19）：用户列表新增批量启用/禁用操作，仅提交当前页勾选的 ID；确认框列出人数、名称并说明禁用时已交给播放器的 STRM 链接无法强制中断、重新启用需重新登录。服务端逐项结果展示本地用户名及错误原因，成功后清空勾选并刷新列表。批量请求和偏好复制期间禁用冲突操作；搜索、筛选、分页和排序变化清除旧选择与结果。
+
+验证：`tests/admin-user-batch-actions.test.tsx` 6/6、`pnpm --dir web build` 和 `git diff --check` 通过。未运行完整 Web 测试套件。
+
+#### LUX-708：为权限复制提供有界用户策略快照读取
+
+范围：为模块四的“从来源账号复制权限到多个目标账号”建立存储读取合同，一次读取来源和最多 100 个目标的显式媒体库模式/库 ID、播放/下载/转码权限及内容限制快照与版本。已删除或不存在的账号不返回快照。该任务仅提供有界的一致读，不修改账号、预设或内容策略。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 快照包含媒体库 `ALL` / `SELECTED` / `NONE` 与确定排序的库 ID、播放额度和三类转码开关、下载权限，以及可空的完整内容限制和版本。
+- [x] 单次读取覆盖来源与至多 100 个目标；空集合不查询，目标缺失/删除可与空内容策略区分。
+- [x] SQLite 回归验证完整值、无策略用户、缺失目标、排序稳定及上限；Rust build、fmt 和 diff check 通过。
+
+短计划：先为新的批量权限快照读取补库测试并确认接口不存在而失败；再定义存储快照类型和单事务/有界批量查询；最后运行窄库测试、build、fmt 与 diff check。写入、预览 API 和 Web 界面留给后续 LUX 任务。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_permission_copy_snapshots`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-627、LUX-628、LUX-614、LUX-675、LUX-677。
+
+结果（2026-10-19）：新增按最多 101 个明确账号 ID（1 个来源 + 100 个目标）批量读取权限快照的存储合同。三条有界查询在单个一致性事务中读取用户权限、已选媒体库与完整内容限制；PostgreSQL 使用可重复读，SQLite 保持事务快照。无权限记录与无效目标明确区分，媒体库 ID 与限制标签稳定排序。定向存储回归 1/1、Rust build、fmt check 和 diff check 通过。
+
+#### LUX-709：原子复制指定用户权限组
+
+范围：在单目标事务中复制来源用户的媒体库、内容限制、播放/下载/转码三组权限，调用方提交预览得到的来源与目标快照用于变更检测。只更新明确选择的组；不复制服务器管理员/管理控制台角色、预设来源、账号资料、偏好或用户数据。来源指定媒体库失效时拒绝整个目标变更。批量逐项结果和 API 留待后续任务。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] Library、Content、Playback 三组可独立选择并在一个目标事务中应用；未选择组保持原值，管理角色与预设来源不变。
+- [x] 来源/目标所选组快照变化时返回冲突；缺失或已删除账号返回不可用，不留下部分写入。
+- [x] 内容限制按目标版本单调递增复制或清除；库选择仅接受仍启用的普通媒体库。
+- [x] SQLite 回归覆盖组隔离、CAS 冲突、复制/清除内容策略和失败回滚；Rust build、fmt、diff check 通过。
+
+短计划：先补单目标复制存储回归并确认接口不存在而失败；再将 LUX-708 快照读取抽成事务内查询，增加 selected-groups CAS 写入和内容策略版本处理；最后跑定向存储测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_permission_copy`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-708。
+
+结果（2026-10-20）：新增单目标、单事务权限复制存储服务。Library、Content、Playback 三组分别比较预览快照，未选字段不变；目标内容策略版本保持单调递增，来源无策略时条件删除。所选库先批量校验仍为启用普通媒体库。PostgreSQL 按稳定 ID 顺序锁定来源与目标用户；现有媒体库授权与内容策略写入也获取相同用户锁，保证快照比较和复制串行化。管理员角色和预设来源从未进入复制字段。三项权限复制回归、既有媒体库事务与内容策略 CAS 回归通过；Rust build、fmt check 和 diff check 通过。
+
+#### LUX-710：提供版本安全的权限复制预览与应用服务
+
+范围：为 LUX-709 建立应用层预览/应用合同。预览返回选定组的来源快照以及来源和每个目标的不透明快照版本；应用先校验来源版本，再独立比较各目标版本并逐项执行存储事务。目标间允许部分成功，来源变化时整体拒绝。版本摘要只包含所选组，不暴露未选权限内容。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/user_permission_copy.rs`。
+
+验收标准：
+
+- [x] Library、Content、Playback 可任意组合；空组、自我复制、重复/无效 ID、空目标、超 100 目标及格式错误版本被拒绝。
+- [x] 预览仅序列化所选来源组；来源与目标版本均由确定性策略快照摘要生成，不包含管理角色或未选内容。
+- [x] 应用先检查来源版本；目标逐项返回用户不可用、版本冲突、无效策略或存储失败，目标冲突不阻断其他目标。
+- [x] application 定向回归、Rust build、fmt 与 diff check 通过。
+
+短计划：先为现有存储合同增加应用服务失败回归并确认模块不存在而失败；再增加严格输入、所选组快照摘要、预览 DTO 和逐目标应用服务；最后运行定向 application 测试、build、fmt 与 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_permission_copy`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-708、LUX-709。
+
+结果（2026-10-20）：增加权限复制预览与应用服务，校验所选权限组、来源及最多 100 个目标，并在任何读取前拒绝空组、自我/重复/无效 ID 和格式错误版本。来源及目标快照摘要包含规范账号 ID 和所选组；未选字段不输出。应用先校验来源版本，再独立比较每个目标版本并提交 LUX-709 单目标原子事务，返回部分成功结果；新增测试覆盖来源过期、目标冲突、显式空内容策略、无效请求和账号绑定版本。
+
+验证：`cargo test --locked --lib user_permission_copy` 8/8、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Build 有 25 条该新应用模块尚未接入 API 前的 dead-code warning；后续 API 任务接线后将消除。
+
+#### LUX-711：开放管理员用户权限组复制预览与应用 API
+
+范围：为 LUX-710 应用服务增加管理员预览和应用端点。预览只要求管理员认证；应用要求管理员 Web session 和 CSRF。预览响应只包含选择的 Library、Content、Playback 来源快照、来源不透明版本和逐目标预期版本；应用按来源版本做整体冲突检查，再返回逐目标结果。仅对成功目标写脱敏审计，不记录权限值。本任务不加入 Web 客户端或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 预览和应用路由使用严格 JSON 输入、camelCase DTO、管理员授权；应用强制 CSRF，预览保持只读无 CSRF。
+- [x] HTTP 回归覆盖未认证/非管理员、无 CSRF、非法请求、所选组隐私、来源版本整体冲突、目标部分成功和逐目标稳定错误码。
+- [x] 每个成功目标有一条只含来源 ID 与组标志的审计事件；API 文档记录精确请求、响应和错误合同。
+- [x] `tests/users` 定向回归、Rust build/fmt 与 diff check 通过。
+
+短计划：先为权限复制预览与应用路由增加失败的 `users` 集成回归；再按偏好复制 API 的认证/CSRF 边界接入 LUX-710 服务、逐目标审计及错误映射；最后更新 API 文档并运行定向集成测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_preview_and_apply_user_permission_groups -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-710。
+
+结果（2026-10-20）：增加管理员权限复制预览和应用端点。预览仅需管理员认证且无 CSRF；应用使用管理员 Web session 与 CSRF。HTTP 回归覆盖匿名/非管理员拒绝、空权限组、未选择内容策略不出现在响应、来源过期返回 409 且不写目标、单目标冲突与另一目标成功、稳定错误码和成功目标审计脱敏。
+
+验证：`tests/users::admin_can_preview_and_apply_user_permission_groups` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+#### LUX-712：为用户权限复制增加 Web API 客户端合同
+
+范围：为 LUX-711 权限组复制预览和应用 API 增加严格的 TypeScript 请求、响应及逐目标错误码类型，并提供客户端方法。两种 POST 继续使用统一 JSON、CSRF 和错误处理请求层；本任务不修改用户管理界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 类型覆盖三组选择、Library/Content/Playback 快照、64 位版本令牌和所有稳定逐目标错误码。
+- [x] 预览及应用方法使用精确路径和请求体，并复用统一请求层的 CSRF 与错误处理。
+- [x] API client 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先为两条新方法的路径、请求体、类型化响应及 CSRF 添加失败客户端回归；再增加类型和方法，运行定向 Vitest、Web build 与 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "admin user permission copy"`、`pnpm --dir web build` 和 `git diff --check`。
+
+依赖：LUX-711。
+
+结果（2026-10-20）：新增权限复制的 TypeScript 输入、预览快照、应用结果及稳定逐目标错误码，并接入预览/应用客户端方法。两项 API client 合同测试验证精确 endpoint、JSON 请求、类型化响应与自动 CSRF。
+
+验证：定向 `api-client.test.ts` 2/2、`pnpm --dir web install --frozen-lockfile` 和 `pnpm --dir web build` 通过。完整 `pnpm --dir web test` 为 721 passed、4 failed；失败仍为 `home-page.test.tsx`、`library-card.test.tsx` 两项及 `media-query-polling.test.tsx`，与既有记录的失败集合相同，本任务没有修改相关代码或测试。`git diff --check` 通过。
+
+#### LUX-713：在用户列表实现权限组复制预览与应用界面
+
+范围：在当前页已选择的用户列表操作区增加“预览并复制权限”流程，复用 LUX-712 客户端。管理员选择来源用户和 Library、Content、Playback 权限组后先预览；预览展示来源已选权限快照及每个目标的预览版本，确认后才应用，并逐用户显示结果。目标集合固定为打开对话框时本页明确勾选项；来源不可同时作为目标。来源或权限组改变后必须清除旧预览，应用仅能提交当前预览版本。成功后清除列表选择并刷新用户。账户偏好服务端持久化不在本任务范围内。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserPermissionCopyDialog.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-batch-actions.test.tsx`。
+
+验收标准：
+
+- [x] 列表只把当前页明确勾选用户传为目标；对话框展示固定目标、来源用户搜索/选择及三组权限复选项，来源不得是目标。
+- [x] 预览只展示选中权限组的来源快照与目标版本；空组、来源/组变更、加载或请求错误不能遗留可应用的旧预览。
+- [x] 仅在有效预览后可应用；逐用户呈现成功或稳定错误原因，成功后清空所选项并刷新列表。
+- [x] 对话框具备加载/错误状态、Escape 关闭、焦点管理、窄屏可用布局；应用中不可关闭或重复提交。
+- [x] 定向批量用户交互测试、Web build 和 diff check 通过；真实浏览器检查预览/应用关键交互与窄屏溢出。
+
+短计划：先在现有批量用户组件测试中补上权限复制交互用例并确认当前缺少入口而失败；再新增对话框、连接已完成的 LUX-712 客户端并补齐样式；最后运行定向 Vitest、Web build、Playwright 桌面与窄屏验证及 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-batch-actions.test.tsx`、`pnpm --dir web build`、Playwright 桌面与 390×844 检查、`git diff --check`。
+
+依赖：LUX-712。
+
+结果（2026-10-20）：用户列表新增独立的权限复制操作和预览/应用对话框。目标固定为当前页明确勾选账号，来源搜索排除目标；Library、Content、Playback 三组默认全选且可单独选择。仅在服务端预览成功后显示所选来源快照和逐目标版本，切换来源或组即清除预览；应用只提交预览返回的来源/目标版本，并对逐项目标结果映射稳定错误。成功后清空列表选择、刷新用户，同时在对话框保留结果。账户偏好服务端化仍按模块边界延后。
+
+验证：TDD 初始回归在入口缺失时失败；`tests/admin-user-batch-actions.test.tsx` 8/8、冻结依赖安装、Web build 和 `git diff --check` 通过。完整 `pnpm --dir web test` 为 723 passed、4 failed；失败是 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项、`media-query-polling.test.tsx` 1 项，与此前记录的失败集合相同，本任务没有改动相关代码。Playwright 使用模拟 API 在桌面 1280×900 和窄屏 390×844 检查预览/应用、逐项结果、权限组选项作废预览、Escape 关闭及焦点返回；窄屏文档宽 375px、滚动宽 375px，弹窗宽 359px、内容滚动宽 342px，无横向溢出，控制台错误 0。截图：`output/playwright/user-permission-copy-preview-desktop.png`、`output/playwright/user-permission-copy-preview-390.png`。首轮窄屏检查发现弹窗内溢出，经修复后复验通过。完整 Rust 门禁不属于本任务。
+
+#### LUX-714：为管理员 Emby 登录凭证摘要提供分页存储查询
+
+范围：基于现有 `access_tokens` 表，为指定用户分页读取未撤销的 Emby 登录凭证摘要，供模块七统一展示登录状态和设备信息。摘要包含凭证记录 ID、设备 ID/名称/类型、客户端名称/版本、创建/更新时间和最近访问时间；绝不返回 token、token hash 或其他凭证材料。本任务只增加有界只读存储合同，不修改登录验证、撤销行为、公开 API 或管理页面；无需新增 migration。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 只返回指定用户仍有效的 Emby 凭证摘要；已撤销凭证和其他用户记录不进入结果，也不读取/序列化 token hash。
+- [x] 结果提供稳定的最近访问（缺失时回退更新时间）/记录 ID 顺序、匹配总数和分页；页大小在存储层限制为 1–100，负偏移归零。
+- [x] SQLite 回归覆盖多设备/多 token、撤销过滤、用户隔离、稳定排序、分页上限和空结果；Rust 定向库测试、build、fmt 与 diff check 通过。
+
+短计划：先在存储回归中增加有界 Emby 凭证摘要读取合同并确认新方法缺失而失败；再扩展存储摘要类型及查询；最后运行定向库测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增 `StoredEmbyLoginSessionSummary` 只含设备、客户端和时间字段；`list_user_emby_login_sessions_for_admin` 过滤已撤销/其他用户凭证，按 `COALESCE(last_seen_at, updated_at) DESC, id DESC` 排序，存储层限制页大小 1–100、负偏移归零，并返回总数。无 migration，也没有将 token hash 投影进查询或摘要结构。
+
+验证：TDD RED 确认方法缺失时编译失败；最终 `admin_emby_login_session_page` 定向测试 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。完整 `cargo test --locked --all-targets` 使用 `NO_PROXY=127.0.0.1,localhost` 后为 1048 passed、4 failed、26 ignored；三项 fill-missing 失败与先前记录的基线相同，另有 `local_metadata_worker_dispatches_fill_missing_without_blocking_scan` 在全量并发下超时、单独复跑通过，因此全量门禁未通过。第一次未设置 `NO_PROXY` 的全量运行中 `remote_body` 本地 HTTP 测试超时，补齐环境变量后的运行通过该测试。`cargo clippy --locked --all-targets --all-features -- -D warnings` 未通过，报告 8 条非本查询实现范围的 lint（`admin_users.rs`、`media.rs`、`playback/session.rs`、`user_permission_copy.rs`、`users.rs` 既有逻辑和一条既有测试断言）；新摘要查询没有新增 Clippy 报错。all-targets 因库测试失败未进入后续集成 targets。
+
+依赖：LUX-593、LUX-660。
+
+#### LUX-715：为 Emby 登录凭证管理提供用户范围撤销服务
+
+范围：为模块七管理员 Emby 登录管理增加按凭证记录 ID 撤销单次登录和撤销该用户全部有效登录的存储操作，并由 `EmbyAuthService` 暴露有界摘要分页及撤销服务合同。撤销只能修改目标用户自己的有效凭证；原始 token 和 hash 不离开存储层。本任务不新增 HTTP API、管理页面或迁移。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/auth/emby.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 单条撤销按用户 ID 与凭证记录 ID 联合限定；其他用户、未知 ID、已撤销项不改变数据，且重复撤销安全返回无变化。
+- [x] 全部撤销只更新指定用户仍有效的凭证并返回影响行数；其他用户和既有撤销时间保持不变。
+- [x] Emby 认证服务统一暴露摘要分页、单条撤销和全部撤销，接口不接收或返回 token/hash；SQLite 回归覆盖单条隔离、全量隔离与重复调用。
+- [x] Rust 定向库测试、build、fmt 和 diff check 通过；不新增 migration。
+
+短计划：先添加失败的凭证记录 ID 撤销 SQLite 回归；再实现按用户范围的单条/批量存储命令与 Emby 认证服务封装；最后运行定向库测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib admin_emby_login_session_revocation`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-714。
+
+结果（2026-10-20）：在 `access_tokens` 上新增按用户 ID + 凭证记录 ID 撤销单项的更新，以及撤销指定用户全部有效凭证并返回影响行数的更新；两者都只操作 `revoked_at IS NULL` 项，不读取 token/hash。`EmbyAuthService` 增加安全摘要分页、单项撤销和全部撤销方法，公开摘要仅有设备/客户端/时间元数据。
+
+验证：TDD RED 确认服务方法缺失时测试编译失败；`admin_emby_login_session_revocation` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。不新增 migration；阶段完整 Rust 门禁仍按 LUX-714 所记未通过结果处理。
+
+#### LUX-716：提供管理员 Emby 登录凭证管理 API
+
+范围：新增管理员按用户分页读取 Emby 登录凭证摘要、撤销一条凭证和撤销该用户全部有效凭证的 HTTP API，复用 LUX-715 的 `EmbyAuthService`。分页响应只包含记录 ID、设备/客户端和时间字段；写操作要求管理员 Web session 与 CSRF，并写入不含凭证材料的审计事件。本任务不修改 Web 客户端或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 分页读取验证用户 ID 和账号存在性，页码至少为 1，页大小默认 50 且服务端限制 1–100；不返回 token/hash。
+- [x] 单条及全部撤销仅管理员 Web session + CSRF 可执行；逐项未知/非目标凭证返回 404，成功逐项返回 204，全部撤销返回影响数。
+- [x] 两种撤销写入脱敏审计；回归覆盖未认证、缺 CSRF、用户隔离、分页、凭证撤销生效及响应/审计不含 token/hash。
+- [x] `users` 定向集成测试、Rust build、fmt 与 diff check 通过；同步 API 文档，不新增 migration。
+
+短计划：先添加管理员 Emby 凭证列表及撤销流程的失败集成回归；再接入 LUX-715 服务、错误码与审计；最后同步 API 文档并运行定向集成测试、build、fmt 和 diff check。
+
+验证：确认 `/Volumes/Toshiba` 已挂载后运行 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users admin_can_manage_emby_login_sessions -- --exact`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check`。
+
+依赖：LUX-715、LUX-660、LUX-662。
+
+结果（2026-10-20）：新增 `/api/v1/admin/users/{userId}/emby-sessions` 分页读取及全部撤销端点，以及 `{sessionId}` 单条撤销端点。分页固定返回安全摘要；单条和批量写入先执行管理员 Web session + CSRF 检查，目标用户及凭证范围由服务/存储双重限定。单条返回 204，全部返回 `revokedCount`；只有实际撤销时生成不含凭证材料的审计事件。API 文档已同步。
+
+验证：TDD RED 在缺少路由时返回 404；最终 `admin_can_manage_emby_login_sessions` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。集成回归确认分页上限、单项/全部撤销、跨用户隔离、未认证与 CSRF 拒绝、token 失效及响应/审计不含原始 token。无 migration。
+
+#### LUX-717：为管理员 Emby 登录会话增加 Web API 客户端合同
+
+范围：为 LUX-716 的 Emby 登录会话分页、单项撤销和全部撤销接口增加 TypeScript DTO 与客户端方法。请求通过统一客户端处理，撤销沿用 JSON/CSRF 与错误处理边界；本任务不修改用户管理页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] DTO 只包含凭证记录 ID、设备/客户端与时间字段，不定义 token、hash 或密码字段。
+- [x] 分页方法默认页码 1、页大小 50，使用 URL 编码的用户 ID 与 `page`/`pageSize` 查询参数。
+- [x] 单项及全部撤销使用精确 DELETE 路径和统一 CSRF 请求层；全部撤销类型包含 `revokedCount`。
+- [x] API client 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先为分页、单项撤销和全部撤销增加精确路径、响应及 CSRF 合同测试并确认失败；再增加 DTO 与客户端方法；最后运行定向 Vitest、Web build 和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/api-client.test.ts -t "admin user Emby session"`、`pnpm --dir web build` 和 `git diff --check`。
+
+依赖：LUX-716。
+
+结果（2026-10-20）：新增 Emby 登录摘要分页、单项撤销和全部撤销的 TypeScript DTO 与客户端方法，复用统一请求层处理 URL 编码、CSRF 与 API 错误。响应 DTO 仅暴露设备、客户端及时间元数据。
+
+验证：TDD RED 确认新增客户端回归在方法缺失时失败；`tests/api-client.test.ts -t "admin user Emby session"` 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。
+
+#### LUX-718：在用户设备与登录页管理 Emby 登录凭证
+
+范围：在现有用户“设备与登录”区域统一展示 Web 登录会话与 Emby 登录凭证。Emby 区域展示 API 提供的设备/客户端/时间安全摘要，支持分页、确认后撤销单项及撤销该用户全部有效凭证；提供独立加载、错误、重试、空结果和操作反馈。本任务不新增设备/IP/客户端黑名单、IP 来源推断、活动记录、真实 IP 或当前在线状态。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-sessions.test.tsx`。
+
+验收标准：
+
+- [x] 页面同时显示 Web 与 Emby 登录摘要；Emby 列表只显示服务端返回的设备、客户端和时间元数据，不暴露凭证材料，也不虚构 IP/在线状态。
+- [x] Emby 登录列表有界分页；页内最后一项被撤销时回退页码；撤销单项与全部撤销前均要求确认。
+- [x] 列表读取失败可重试；撤销失败显示错误并允许再次尝试，成功展示反馈；批量撤销展示服务端实际撤销数量并刷新列表。
+- [x] 定向 session 管理 Vitest、Web build、桌面与窄屏浏览器交互验证及 diff check 通过。
+
+短计划：先在现有会话页面测试中覆盖 Emby 摘要、分页及单项/全部撤销并确认失败；再加独立 Emby 查询与撤销面板，复用当前会话表格风格；最后运行定向 Vitest、Web build、浏览器交互验证和 diff check。
+
+验证：`pnpm --dir web exec vitest run tests/admin-user-sessions.test.tsx`、`pnpm --dir web build`、浏览器桌面及 390×844 视口验证、`git diff --check`。
+
+依赖：LUX-717、LUX-716。
+
+结果（2026-10-20）：在“设备与登录”页分别展示 Web 会话与 Emby 登录凭证。Emby 面板提供设备 ID/类型、客户端/版本、首次登录、最近活动和每用户 20 条分页；最后一项撤销后回到前页。单项和全部撤销均在确认后调用 API，成功后刷新会话列表并按服务端实际数量反馈；读取失败可重试，撤销失败保留凭证并显示错误。页面不呈现 IP、归属地或推断的在线状态。
+
+验证：测试文件 admin-user-sessions.test.tsx 为 9/9，pnpm --dir web build 和 git diff --check 通过。Playwright 使用本地模拟 API 验证桌面 1200px 页面及全部撤销确认/DELETE/结果提示；390×844 CSS 视口下页面宽 375px，无页面级横向溢出，两张 760px 表格均在各自 310px 横向滚动区内。控制台 0 错误。截图：output/playwright/user-emby-sessions-desktop.png、output/playwright/user-emby-sessions-390.png。浏览器检查为本地模拟 API，不代表真实 FNOS 或生产环境验证。
+
+#### LUX-719：建立用户活动有界索引表
+
+范围：为模块七新增用户活动索引的 SQLite 与 PostgreSQL 迁移，保存活动所属用户、可选操作者、事件类型、目标引用、脱敏元数据 JSON 和发生时间。索引支持按用户/时间及用户/事件类型/时间倒序查询，并支持按发生时间清理过期索引。活动用户 ID 不加用户外键，避免账号彻底删除时绕过设计规定的活动保留期。本任务只建立 schema，不写入活动、不提供 API 或页面，也不回填旧归档。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0193_user_activity_events.sql`、`migrations-postgres/0193_user_activity_events.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] 空 SQLite 数据库迁移后存在用户活动索引表、用户/时间索引、用户/类型/时间索引和保留期清理索引。
+- [x] SQLite 与 PostgreSQL schema 字段及约束语义一致，支持无操作者/目标的登录等事件。
+- [x] 活动记录不依赖用户外键；新增迁移不改变现有表或历史记录。
+- [x] storage 定向迁移测试与 diff check 通过。
+
+短计划：先写空数据库迁移回归并确认索引表缺失而失败；再新增两种后端迁移及必要索引；最后运行指定 storage 回归和 diff check。
+
+结果（2026-10-20）：新增 `user_activity_events` 索引表，保存活动用户、可选操作者、类型、目标引用、元数据 JSON 和 Unix 时间；以三组索引支持用户时间线倒序分页、按类型筛选和保留期清理。活动用户 ID 不设外键，允许账号清理后索引按保留策略独立过期。没有回填归档或接入写入路径。
+
+验证：TDD RED 在空库中确认索引表缺失（0 行）；迁移后 `user_activity_events_migration_runs_from_an_empty_database` 1/1，通过字段/索引/外键/无操作者和目标插入检查。PostgreSQL 迁移做了结构合同检查，未连接真实 PostgreSQL 实例。`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+依赖：LUX-718。
+
+#### LUX-720：写入脱敏的用户活动索引
+
+范围：为用户活动索引增加存储写入合同，生成 UUIDv7 唯一记录 ID，并写入活动用户、可选操作者、事件类型、目标引用、元数据和发生时间。元数据必须在落库前复用日志敏感值脱敏规则；非法 JSON 以安全占位对象保存。允许活动记录在用户 ID 暂不可解析或账号已清理时独立保留。本任务不接入现有登录/播放事件写入点，不增加查询 API 或回填。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 存储方法生成并返回唯一活动 ID，保存用户、操作者、类型、目标和默认时间；不要求用户外键存在。
+- [x] 嵌套敏感键/完整 URL 在落库前按现有规则脱敏；非法 JSON 不原样保存。
+- [x] 存储回归读取数据库实值验证字段、脱敏、默认时间和不同调用的 ID 唯一。
+- [x] 定向 storage 回归、build、fmt 和 diff check 通过。
+
+短计划：先加存储回归并确认写入方法缺失时失败；再补存储 DTO、导出及脱敏写入；最后跑指定 repository 测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增内部 `NewUserActivityEvent` 与 `insert_user_activity_event`，使用 UUIDv7 作为记录 ID，数据库默认时间，并通过既有敏感值脱敏逻辑规范化元数据。非法 JSON 只保存 `{"invalid":true}`；用户/操作者 ID 不需要在 users 表中存在。接口暂由 LUX-721 接入活动写入流程。
+
+验证：TDD RED 因存储类型/方法不存在而编译失败；`user_activity_index_insert_redacts_metadata_and_keeps_independent_subjects` 1/1，通过对数据库实值检查用户、操作者、事件目标、默认时间、UUID 唯一性、嵌套凭证/URL 脱敏及非法 JSON 替换。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过；未使用警告由下一任务接入标注消除。
+
+依赖：LUX-719。
+
+#### LUX-721：接入登录与播放活动事件索引
+
+范围：将现有 `record_activity_event` 记录的成功认证和播放状态变化写入用户活动索引，活动用户与操作者标识当前发起事件的账号。保留已有文件审计日志和 Dashboard 失效通知；索引写入失败不得丢弃已有审计日志，不记录错误正文、凭证或完整 URL。本任务不记录认证失败，不增加活动查询 API 或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_logs_events.rs`、`tests/users.rs`、`tests/web_playback.rs`。
+
+验收标准：
+
+- [x] Web 成功登录及 Web 播放状态变化写入对应用户的 `AUTH_LOGIN`/`PLAYBACK_*` 索引事件，actor 与活动用户一致。
+- [x] 索引写入复用已有脱敏存储合同；已有文件审计记录及 Dashboard 通知继续正常。
+- [x] 定向认证与播放集成回归和原用户 API 回归、build、fmt、diff check 通过。
+
+短计划：先为成功登录增加 API 回归并确认索引无记录；再在统一活动记录器写入索引并保留文件审计；最后跑用户/播放 API 定向回归、build、fmt 和 diff check。
+
+结果（2026-10-20）：统一 `record_activity_event` 现在先将活动写入用户索引，再追加原文件审计记录；索引写入失败只发出不含用户/请求内容的事件类型告警，不阻断文件日志或 dashboard 通知。现有 Web/Emby 成功认证、Emby/Web/legacy 播放状态调用点因此共用此索引路径。
+
+验证：TDD RED 的成功登录 API 已写入用户但索引数为 0；接线后 `successful_login_is_written_to_the_user_activity_index` 1/1。`web_playback_uses_signed_direct_urls_and_monotonic_events` 1/1 验证 `PLAYBACK_STARTED` 索引及原文件审计；`admin_can_manage_users_and_last_manager_is_protected` 1/1、`activity_events_publish_dashboard_invalidations` 1/1。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。登录失败仍未入索引，筛选/分页 API 与页面留待后续任务。
+
+依赖：LUX-720。
+
+#### LUX-722：提供用户活动索引的过滤分页存储查询
+
+范围：为模块七活动时间线增加按固定用户范围读取用户活动索引的存储合同，支持可选事件类型和起止 Unix 时间筛选、稳定的时间/ID 倒序、匹配总数和有界分页。页大小强制限制为 1–100，负偏移归零；越界页仍返回正确总数。只读取索引表，不扫描文件审计归档，不加载未分页用户事件。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 用户隔离及事件类型/时间边界筛选在分页前执行，匹配总数准确。
+- [x] 按 `occurred_at DESC, id DESC` 稳定排序；相同时间跨页不重复、不遗漏。
+- [x] 页大小 1–100、负偏移归零；越界页返回空项和准确总数。
+- [x] 定向 storage 回归、build、fmt 和 diff check 通过。
+
+短计划：先增加过滤/排序/分页存储回归并确认查询合同缺失而失败；再补查询 DTO、存储方法和导出；最后跑定向 repository 测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增 `UserActivityEventQuery` 与按用户、事件类型、起止时间过滤的索引表查询。匹配总数独立计算，保证越界页仍返回准确总数；结果按 `occurred_at DESC, id DESC` 稳定排序，限制页大小 1–100 并将负偏移归零。不读取用户归档日志。
+
+验证：TDD RED 因查询类型/方法不存在而编译失败；`user_activity_index_query_filters_and_pages_in_stable_order` 1/1，覆盖用户隔离、含边界时间过滤、事件类型、同时间跨页、稳定 ID 顺序、负偏移、最大页大小及越界页总数。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+依赖：LUX-721。
+
+#### LUX-723：开放管理员用户活动分页 API
+
+范围：新增只读 `GET /api/v1/admin/users/{userId}/activity`，从 LUX-722 的用户范围存储查询返回脱敏活动时间线。查询参数为 `page`、`pageSize`、`eventType`、`from`、`to`；页码缺省 1 且最小为 1，页大小缺省 20 并限制为 1–100，时间以包含端点的 Unix 秒表示。响应为 `{ events, page, pageSize, totalCount }`；活动项包含 `id`、`userId`、`actorUserId`、`eventType`、目标引用、已脱敏 `metadata` 和 `occurredAt`。仅管理员可读；无效用户 ID、负时间、反向时间范围、空/超长事件类型返回结构化 400；用户不存在返回 404。不得返回原始未脱敏 JSON。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 接口认证管理员、校验用户 ID/存在性及查询边界；非管理员不能读取。
+- [x] 响应与存储总数、稳定分页一致，元数据为已脱敏 JSON 对象。
+- [x] 回归覆盖用户隔离、时间端点、类型筛选、跨页排序、非法参数、缺失用户和未授权请求。
+- [x] 更新 API 文档；`users` 定向集成回归、build、fmt 和 diff check 通过。
+
+短计划：先写 API 登录后读取及过滤分页集成回归并确认路由缺失而失败；再接入 LUX-722 存储查询和结构化错误映射；最后更新 API 文档并运行定向用户测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增管理员只读用户活动时间线 API，认证检查后校验用户 ID、账号存在状态、Unix 秒区间和事件类型；默认页为 1、每页 20，服务端限制页大小 1–100。响应提供活动/操作者、目标、发生时间及经过再次脱敏的 JSON 元数据；未知或损坏元数据不会以原文返回。已同步 `docs/API.md`。
+
+验证：TDD RED 在登录后的有效管理员请求上确认新路由返回 404；最终 `admin_can_filter_and_page_user_activity_events` 1/1，覆盖管理员分页、用户隔离、含端点时间过滤、类型筛选、同时间跨页排序、普通用户 403、匿名 401、无效用户/时间范围/事件类型 400、缺失用户 404。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+依赖：LUX-722、LUX-660。
+
+#### LUX-724：增加管理员用户活动时间线 Web API 客户端合同
+
+范围：为 LUX-723 的用户活动分页 API 增加 TypeScript 活动项与分页响应类型，以及按用户读取活动的方法。客户端支持页码、页大小、事件类型和包含端点的起止 Unix 秒筛选，查询参数必须正确编码；读取沿用统一 GET 请求层。本任务不修改用户管理页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 活动项类型覆盖 API 的活动 ID、用户/操作者、事件类型、目标引用、脱敏元数据和发生时间；不包含凭证或原始 JSON 字段。
+- [x] 分页响应包含活动列表、页码、页大小和匹配总数；客户端默认第 1 页、每页 20 条。
+- [x] 可选事件类型与时间范围经 `URLSearchParams` 编码，页码筛选准确进入 URL；读取使用 GET，不带写操作 CSRF。
+- [x] 定向 API client Vitest、Web build 和 diff check 通过。
+
+短计划：先为时间线响应、默认分页、事件类型/时间筛选、用户 ID 与查询值编码增加失败合同测试；再加入 DTO 和客户端方法；最后运行定向 Vitest、Web build 和 diff check。
+
+依赖：LUX-723。
+
+结果（2026-10-20）：增加 `AdminUserActivityEvent`、分页响应与筛选查询类型，以及 `adminUserActivity` GET 方法。方法默认第 1 页、每页 20 条，通过 `URLSearchParams` 编码事件类型和 Unix 时间边界，并复用用户 ID 路径编码。活动 DTO 不含任何凭证字段。
+
+验证：先添加合同测试并确认因客户端方法缺失而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts -t "admin user activity"` 1/1、`pnpm --dir web build` 和 `git diff --check` 通过。测试覆盖过滤值、用户 ID 编码、默认分页和 GET 请求方式。
+
+#### LUX-725：在用户详情展示活动时间线
+
+范围：将模块七活动记录页接入 LUX-723 API 和 LUX-724 客户端合同，显示按时间倒序返回的活动、事件类型与时间筛选以及有界分页。活动条目只展示脱敏元数据中的已知设备、客户端、状态和 IP 字段，不渲染原始 JSON。提供读取、错误重试、空结果和筛选校验状态；本任务不补活动事件生产或设备管理规则。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-activity.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情的“活动记录”页读取该用户活动，不读取其他用户或归档日志。
+- [x] 支持按事件类型、起止本地时间筛选；反向时间范围在提交前提示；更改筛选回到第一页。
+- [x] 展示活动类型、发生时间、可用目标和安全元数据；凭证/原始 JSON 不进入页面。
+- [x] 具备加载、错误重试、空结果、总数和上一页/下一页；分页使用服务端总数。
+- [x] 组件定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先为详情页加载活动、筛选分页及错误/空状态增加组件回归并确认现页仍是占位；再增加时间线查询与安全元数据展示、样式；最后运行定向 Vitest、Web build 和 diff check。
+
+依赖：LUX-723、LUX-724。
+
+结果（2026-10-20）：用户详情的活动页接入活动索引分页 API，提供事件类型、本地起止日期时间筛选、清除筛选、服务端总数和分页。结束时间将分钟边界扩至该分钟的第 59 秒，保持用户选择时间粒度下的包含端点语义；反向/无效范围提交前拒绝。列表白名单展示设备、客户端、版本、播放状态和 IP，不渲染原始 JSON 或未知元数据字段。
+
+验证：TDD RED 的组件回归确认该页仍是占位；实现后 `pnpm --dir web exec vitest run tests/admin-user-activity.test.tsx tests/admin-user-sessions.test.tsx` 11/11、`pnpm --dir web build` 和 `git diff --check` 通过。Playwright 使用合成 API 数据验证活动读取、筛选查询、翻页、敏感字段不显示；390px 视口的活动面板/筛选区无水平溢出，浏览器控制台无错误。截图保存于 `output/playwright/admin-user-activity-20261020-mobile.png`。
+
+#### LUX-726：增加失败认证活动安全记录器
+
+范围：为已知用户提供失败认证活动写入入口，记录 `AUTH_LOGIN_FAILED` 用户活动并沿用既有审计日志和 Dashboard 失效通知。事件使用目标用户 ID，`actorUserId` 为空；调用者只传入固定协议标签和可选展示 IP，不传用户名、密码、token 或请求 URL。本任务只实现可安全调用的记录器，不接入 Web 或 Emby 认证分支。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin/admin_logs_events.rs`。
+
+验收标准：
+
+- [x] 记录器写入 `AUTH_LOGIN_FAILED` 用户活动和既有审计事件，活动用户/目标为指定用户且 actor 为空。
+- [x] 元数据只含调用者提供的安全协议标签与可选 IP；没有用户名、密码、凭证或 URL。
+- [x] 审计写入成功时发布 Dashboard 失效通知；索引失败不阻断既有审计流程。
+- [x] 记录器定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加失败事件记录器的 SQLite 与审计/通知回归并确认记录器缺失；再实现 actor 为空的安全写入；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-720。
+
+结果（2026-10-20）：新增 `record_failed_authentication_event`，用户活动事件和既有审计事件都以 `AUTH_LOGIN_FAILED` 记录，actor 为空、目标指向被尝试账号；元数据只含固定协议标签和可选展示 IP。索引写入失败仅发出事件类型告警，不阻断审计写入；审计成功后发布 Dashboard 失效通知。
+
+验证：TDD RED 确认记录器缺失时库测试编译失败；最终 `failed_authentication_activity_keeps_actor_empty_and_metadata_safe` 1/1，验证活动字段、actor、白名单元数据与 Dashboard 通知；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Web 登录路由接线留待 LUX-727。
+
+#### LUX-727：索引已知账号的 Web 登录失败
+
+范围：在未被限流的 Web 登录尝试认证失败后，使用与登录一致的用户名规范化规则查找已有账号；只对解析到的用户调用 LUX-726 记录器。事件不改变认证响应和频率限制行为；未知/非法用户名、数据库错误及被限流直接拒绝的请求不进入个人活动索引。本任务不记录 Emby 失败登录。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/sessions.rs`、`src/api/admin.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 已知账号密码错误或账号被禁用时记录 `AUTH_LOGIN_FAILED`，活动用户为目标账号且 actor 为空。
+- [x] 未知/非法用户名、数据库错误和限流直接拒绝不写入用户活动索引；失败元数据不含用户名、密码、凭证或完整 URL。
+- [x] 认证 HTTP 状态、频率限制与成功登录事件保持不变；失败审计记录仍产生。
+- [x] `users` 定向集成回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先添加已知/未知账号失败尝试集成回归并确认个人活动缺失；再在 Web 认证服务提供安全用户名到用户 ID 查询，并仅在正确失败分支接入 LUX-726；最后运行定向 `users` 测试、build、fmt 和 diff check。
+
+依赖：LUX-726、LUX-720。
+
+结果（2026-10-20）：`WebAuthService` 增加沿用认证用户名规范化规则的账号 ID 查询；Web 登录在认证与可选迁移回退均结束为失败、且该请求未被限流时，仅为已有账号调用 LUX-726 安全记录器。禁用账号也会记录；未知/非法账号、认证数据库错误、迁移认证错误及入口限流不写个人失败活动。登录状态码、速率限制、成功登录记录维持现状。
+
+验证：TDD RED 的集成回归先以 0 条活动失败（预期 6 条）；实现后 `cargo test --locked --test users` 16/16、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --test users --all-features -- -D warnings` 被现有 6 项未修改代码告警阻断，位置为 `src/api/admin/admin_users.rs`、`src/api/media.rs`、`src/application/playback/session.rs`、`src/application/user_permission_copy.rs` 和 `src/storage/users.rs`；本任务未改动这些文件。
+
+#### LUX-728：为 Emby 失败登录解析已知账号
+
+范围：为 Emby 按用户名认证提供与成功认证相同的目标账号解析，包括规范化用户名和唯一精确显示名称回退；使用有界查询，避免登录请求枚举全部用户。只公开内部用户 ID 查询，不改变认证响应或用户公开数据。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/users.rs`、`src/auth/emby.rs`、`src/storage/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 规范化用户名和唯一精确显示名称解析到成功认证对应的用户；重复显示名称、未知及非法名称不解析账号。
+- [x] 显示名称查询最多读取两个候选，不枚举用户列表；数据库错误以现有存储错误类型返回。
+- [x] `users` 定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加服务层目标 ID 回归并确认方法缺失；再复用现有 Emby 用户名/显示名称合同，实现最多读取两个候选的内部解析；最后运行 `users` 集成目标、build、fmt 和 diff check。
+
+依赖：LUX-727。
+
+结果（2026-10-20）：Emby 登录目标解析统一使用规范化账号名及唯一精确显示名称回退。显示名称回退改为 storage 层 `LIMIT 2` 查询：无候选或有歧义均拒绝目标，不再在登录请求里枚举所有账号。内部认证服务可返回目标用户 ID，供失败活动索引复用。
+
+验证：TDD RED 集成回归因 `find_failed_authentication_user_id` 不存在而失败；实现后 `cargo test --locked --test users emby_authentication_target_lookup_matches_login_name_rules` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。既有认证调用点已复用相同解析函数。
+
+#### LUX-729：记录 Emby 已知账号登录失败
+
+范围：在 Emby 按用户名和按用户 ID 登录均被允许尝试且认证失败后，使用 LUX-728 的目标账号解析调用 LUX-726 安全记录器。未知/非法账号、数据库或迁移错误以及入口限流直接拒绝不记录；保持 Emby 状态码、响应体和频率限制合同，不记录客户端凭证或请求内容。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/emby_handlers.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 已知用户名或用户 ID 的密码错误、禁用账号写入 `AUTH_LOGIN_FAILED`，actor 为空并关联目标用户。
+- [x] 未知/非法目标、认证错误和限流直接拒绝不写用户活动；失败元数据不含用户名、密码、token 或完整 URL。
+- [x] Emby 失败 HTTP 合同、速率限制和成功认证事件不变，既有审计记录仍产生。
+- [x] `users` 定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先为 Emby 用户名/ID 认证失败及限流写集成回归并确认活动缺失；再仅在认证返回明确失败的分支查询已知目标并接入记录器；最后运行 `users` 集成目标、build、fmt 和 diff check。
+
+依赖：LUX-726、LUX-728。
+
+结果（2026-10-20）：Emby `AuthenticateByName` 和按用户 ID 认证在入口未被限流、认证明确返回失败后，分别用 LUX-728 的相同账号解析和安全 ID 查询定位现有账号并写 `AUTH_LOGIN_FAILED`。固定客户端标记为 `LUX_EMBY`，actor 为空；认证错误、未知/非法目标及入口限流不产生个人失败活动。HTTP 状态与响应体保持既有合同。
+
+验证：TDD RED 集成回归先得到 0 条失败事件（预期 7 条）；实现后 `cargo test --locked --test users` 18/18、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。回归覆盖用户名、唯一显示名称、已知用户 ID、禁用账号、未知/非法目标、速率限制，以及活动和审计元数据不包含账号名或凭证。
+
+#### LUX-730：提供有界用户活动过期清理
+
+范围：在 storage 层按发生时间删除早于明确截止时间的用户活动索引，单次最多处理一个固定上限批次，并按时间和 ID 稳定选择。保留截止时间及之后的事件，不触及文件审计、观看进度、已看状态或收藏；本任务只提供清理合同，不启动 worker 或更改保留设置。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 清理只删除 `occurred_at` 早于截止时间的用户活动记录，边界时间及较新事件保留。
+- [x] 每次调用有界且安全处理空结果、非法/超大批次；现有进度、收藏和文件审计数据不变。
+- [x] storage 库定向回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先写过期与边界时间的 storage 回归并确认清理方法缺失；再用时间/ID 索引执行最多 1,000 条的参数化批次删除；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-719、LUX-720。
+
+结果（2026-10-20）：storage 新增 `delete_user_activity_events_before`，使用 `occurred_at, id` 稳定选择最多 1,000 条过期事件并通过单条参数化删除；截止点采用严格早于语义，非正批次返回 0。数据存储层不修改 file audit、播放/已看/收藏数据；worker 接线由后续任务完成。
+
+验证：TDD RED 库回归因清理方法不存在而失败；实现后 `cargo test --locked --lib user_activity_index_retention_deletes_old_events_in_bounded_batches` 1/1、`cargo build --locked`（无新增 warning）、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+#### LUX-731：持久化用户活动保留天数
+
+范围：在现有 `server_settings` 设置键中保存用户活动索引保留天数，默认 90 天；有效范围为 1–3650 天。损坏或旧配置读取为默认值，非法写入拒绝且不覆盖原值。本任务只提供 storage 读写，不增加管理 API、页面或清理 worker。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 空配置默认读取 90 天；有效值持久化并可重读，损坏/越界旧值安全回退至 90 天。
+- [x] 新设置写入拒绝 0、负数和大于 3650 的值，拒绝时保留原设置；不新增 migration。
+- [x] 定向 storage 库回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先增加默认、有效与非法值存储回归并确认接口缺失；再用 `server_settings` 新键实现有界读取与校验写入；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-730。
+
+结果（2026-10-20）：storage 通过 `server_settings` 的 `user_activity_retention_days` 键持久化天数，默认 90、范围 1–3650；非法旧配置回退默认值，非法新值在写入前拒绝。没有新增 migration。管理 API 接线由 LUX-732 完成。
+
+验证：TDD RED 回归先因读写方法缺失而编译失败；实现后 `cargo test --locked --lib user_activity_retention_setting_defaults_validates_and_recovers_invalid_values` 1/1、`cargo build --locked`（无新增 warning）、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+#### LUX-732：接入活动记录保留期管理 API
+
+范围：在管理员全局设置读写合同中暴露用户活动索引保留天数，沿用 storage 默认值 90 和 1–3650 的校验；读取旧配置并返回 camelCase 字段，PATCH 可独立更新该值且拒绝非法输入。本任务只增加应用/API 合同，不增加 worker 或页面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] 管理员设置 GET 返回 `userActivityRetentionDays`，缺省为 90。
+- [x] PATCH 可单独保存有效保留天数；拒绝 0、负数和大于 3650 的输入，非法值不覆盖已有值。
+- [x] 非管理员不能通过该合同更改设置；`admin_dashboard` 定向集成回归、Rust build、fmt 和 diff check 通过。
+
+短计划：先扩展现有管理员设置集成回归并确认字段缺失；再贯通 settings snapshot/update/write 与 HTTP JSON；最后运行 `admin_dashboard` 集成目标、build、fmt 和 diff check。
+
+依赖：LUX-731。
+
+结果（2026-10-20）：管理员 settings snapshot、PATCH 更新和 HTTP JSON 已新增 `userActivityRetentionDays`，使用 LUX-731 storage 读写并保持未提交字段时原值不变。输入范围为 1–3650；非法设置返回 400，未认证请求仍返回 401。无 migration。
+
+验证：TDD RED 集成回归先因 GET 缺少字段而失败；实现后 `NO_PROXY=127.0.0.1,localhost no_proxy=127.0.0.1,localhost cargo test --locked --test admin_dashboard` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+#### LUX-733：清理过期的用户活动索引
+
+范围：将 LUX-730 的有界删除接入现有用户清理后台循环，每次循环读取可配置保留天数并清理最多 1000 条严格早于截止时间的用户活动索引。失败只记录不含用户隐私的错误并由后续循环重试；不删除文件审计、播放进度、已看状态或收藏。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_cleanup.rs`。
+
+验收标准：
+
+- [x] 后台循环按当前 1–3650 天配置计算截止时间，并逐次执行最多 1000 条的删除批次。
+- [x] 截止时间边界及更新活动保留，活动清理错误不会终止用户清理 worker，后续循环可以继续。
+- [x] worker 定向库回归、Rust build、fmt 和 diff check 通过；活动清理不触及其它用户数据。
+
+短计划：先为清理批次写默认时间与配置边界的 worker 回归；再把一批过期活动清理接到现有后台循环；最后运行定向库测试、build、fmt 和 diff check。
+
+依赖：LUX-730、LUX-731、LUX-732。
+
+结果（2026-10-20）：现有每分钟用户清理循环读取当前活动保留设置，按 Unix 秒计算截止点并最多删除 1,000 条严格早于截止点的索引。失败只产生不带用户字段的错误日志，不影响 worker 后续循环；不会访问或删除 file audit、播放进度、已看状态及收藏。
+
+验证：`cargo test --locked --lib configured_activity_retention_prunes_one_bounded_batch_and_keeps_boundary` 1/1，覆盖 1,001 条过期活动分批清理和截止边界保留；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。
+
+#### LUX-734：管理界面配置活动记录保留期
+
+范围：将用户管理设置页“活动记录保留”占位改为真实表单，读取并保存管理员 settings API 的 `userActivityRetentionDays`。允许 1–3650 天，提供正在读取、保存、校验、成功与错误状态；保存只更新该保留字段。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-retention-settings.test.tsx`。
+
+验收标准：
+
+- [x] 页面展示当前活动记录保留期，默认 90 天并允许输入 1–3650 天。
+- [x] 保存通过 `updateAdminSettings` 只提交 `userActivityRetentionDays`，更新缓存并展示成功/失败状态。
+- [x] 无效输入或无变更时不能保存；定向 Vitest、Web build、锁文件安装和用户设置 Playwright 验证通过。
+- [ ] `pnpm --dir web test` 全量通过；当前有 4 个范围外失败，见下方验证记录。
+
+短计划：先扩展现有删除保留页面测试并确认活动保留占位缺失；再加入活动保留表单及 API 类型；最后运行定向 Vitest、Web build、Web tests 和浏览器流程验证。
+
+依赖：LUX-732、LUX-733。
+
+结果（2026-10-20）：活动保留占位替换为服务端设置表单。默认 90 天，范围 1–3650；无效值和无变更时禁用保存，成功后更新查询缓存并显示状态，错误显示可读提示。删除账号保留表单保持原行为。
+
+验证：TDD RED 测试先因活动保留输入框不存在而失败；实现后 `pnpm --dir web exec vitest run tests/admin-user-retention-settings.test.tsx` 5/5、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build` 通过。Playwright 使用临时 SQLite 管理员会话验证保存 30 天后刷新仍读回 30 天；390px 视口 `scrollWidth` 为 390，控件可访问名称完整。交互后无新增 console error；登录前的 `auth/me` 401 是预期未登录检查。
+
+全量 `pnpm --dir web test` 的 148 个 Node 测试通过，Vitest 为 734 通过、4 失败。失败是 `home-page.test.tsx` 的首页预取 1 项、`library-card.test.tsx` 两项和 `media-query-polling.test.tsx` 1 项；单独重跑这三个目标仍复现，相关代码不在本任务修改范围内。
+
+#### LUX-735：提供有界用户当前播放读取
+
+范围：为模块七用户详情当前播放管理提供指定用户的有界存储查询。仅读取播放记录中最近 90 秒内且尚未停止的会话，支持服务端总数与稳定倒序分页；每页限制 1–100 条，负偏移归零。只增加 storage 合同，不接管理员 API、停止操作或 Web 页面，不新增 migration。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/sessions.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 查询只返回指定用户最近活动且未停止的播放会话，按最近活动倒序并以 ID 稳定排序；其他用户、过期和已停止会话不返回。
+- [x] 返回的匹配总数不受分页影响；页大小强制限制为 1–100，偏移非负，查询结果有界。
+- [x] storage 定向回归、Rust build、fmt 与 diff check 通过；无 migration。
+
+短计划：先添加 SQLite storage 回归并确认分页方法缺失；再实现匹配总数和限量查询；最后运行定向库测试、build、fmt 与 diff check。API、HLS 停止和界面留给后续 LUX 任务。
+
+#### LUX-735 验证记录
+
+结果（2026-10-20）：新增指定用户当前播放 storage 查询，沿用后台播放卡片的 90 秒活跃窗口，排除已停止记录；结果按最近事件倒序、ID 正序分页，并在同一筛选条件下返回总数。页大小限制为 1–100，负偏移归零；未新增 migration。LUX-736 将接入管理员 API。
+
+验证：TDD RED 回归先因分页查询方法缺失而编译失败；实现后 `user_current_playback_sessions_are_filtered_and_paginated` 1/1，覆盖用户隔离、90 秒边界、停止记录过滤、排序、总数、分页和 100 条上限。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 门禁仍被 9 项未改动代码告警阻断，涉及 `src/api/admin/admin_users.rs:554`、`src/api/media.rs:2837`、`src/application/playback/session.rs:397`、`src/application/user_permission_copy.rs:382,657`、`src/storage/users.rs:3161,3164` 及 `src/storage/repository_tests.rs:15587,23380`。
+
+#### LUX-736：开放管理员用户当前播放读取与 HLS 停止 API
+
+范围：将 LUX-735 的有界分页查询开放给用户详情管理 API，并复用管理仪表盘的媒体摘要。管理员可按用户分页查看最近 90 秒的播放会话；服务端仅允许停止与当前用户播放记录关联的 `SERVER_HLS` 会话。直放和外部 `.strm` 播放不可由 Lux 保证立即中断，停止请求返回冲突且不改变其会话。本任务不增加管理页面、黑名单或 migration。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/admin_dashboard.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员读取 API 返回有界分页、总数及媒体/设备/播放摘要；用户隔离、页大小默认 20 且最大 100，未认证和非管理员被拒绝。
+- [x] 管理员停止 API 需要 Web session 与 CSRF，只停止目标用户仍活跃的服务端 HLS，并释放相关会话/准入；审计记录不含凭证。
+- [x] 直放或外部播放停止返回稳定 `409 INVALID_REQUEST`，不会改变播放记录；用户不存在和其他用户会话不泄露信息。
+- [x] `tests/users` 定向回归、Rust build、fmt 与 diff check 通过，API 文档记录路由和响应。
+
+短计划：先在 `tests/users` 增加管理员权限、分页摘要、CSRF、HLS 停止和直放拒绝回归；再复用仪表盘摘要服务并接入两个管理 API；最后运行 `users` 定向目标、build、fmt 与 diff check。
+
+#### LUX-736 验证记录
+
+结果（2026-10-20）：新增用户当前播放分页读取和单会话停止 API。读取复用后台 Dashboard 的媒体/剧集摘要，返回进度、客户端、设备、来源 IP、播放计划及 `canStop`；仅活动服务端 HLS 标记可停止。停止接口要求管理员会话和 CSRF，验证播放记录归属、活动 HLS 关联后停止 HLS、更新播放记录并释放并发准入，最后写不含凭证的 `USER_PLAYBACK_STOPPED` 审计事件。直放和外部播放返回 409 `INVALID_REQUEST`，不改播放状态。`docs/API.md` 已登记两条路由；无 migration。
+
+验证：TDD RED 集成回归因新路由返回 404（预期未认证 401）而失败；最终串行运行 `tests/users -- --test-threads=1` 为 19/19，`tests/admin_dashboard` 为 1/1。一次并行运行 `tests/users` 为 18/19，其中既有 `admin_can_manage_users_and_last_manager_is_protected` 在并行时返回 503 而非预期 200；该测试单独重跑通过，具体原因尚未确认。新增回归覆盖分页顺序/总数、媒体摘要、`canStop`、未认证/非管理员、CSRF、目标用户隔离、直放拒绝、HLS 停止、并发准入释放和审计事件。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 仍被 9 项未改动代码错误阻断，位置与 LUX-735 记录相同；本任务涉及的 API 与应用文件未新增 Clippy 诊断。
+
+#### LUX-737：增加用户当前播放 Web API 客户端合同
+
+范围：为 LUX-736 的指定用户当前播放分页读取与单会话停止 API 增加安全 TypeScript DTO 和客户端方法。读取默认每页 20 条，路径参数须 URL 编码；停止复用统一请求层并携带 CSRF。本任务不修改用户详情 UI、设备清单或黑名单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] DTO 包含用户当前播放 API 提供的媒体、播放、设备/IP 摘要和 `canStop`，不定义 token、Cookie 或凭证字段。
+- [x] 分页方法默认页码 1、页大小 20，正确编码用户 ID 并发送 `page`/`pageSize`。
+- [x] 停止方法使用精确 DELETE 路径与统一 CSRF 请求层。
+- [x] API client 定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先在 `api-client.test.ts` 增加分页/默认参数、路径编码、停止请求和 CSRF 回归并确认方法缺失时失败；再增加 DTO 与 API client 方法；最后运行定向 Vitest、Web build 和 diff check。
+
+结果（2026-10-20）：新增只含管理播放摘要与 `canStop` 的 `AdminUserPlaybackSession`/分页 DTO，及管理员当前播放分页读取和停止客户端方法。用户 ID、播放 ID 均按路径段编码；分页默认 1/20；停止通过统一请求层 DELETE 并自动携带 CSRF。未新增凭证字段。
+
+验证：TDD RED 回归先因客户端方法缺失而失败；实现后 `tests/api-client.test.ts -t "admin user playback and CSRF-protected stop contracts"` 1/1、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build`、`git diff --check` 通过。完整 `pnpm --dir web test` 为 736 passed、4 failed；失败仍为此前记录的 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项及 `media-query-polling.test.tsx` 1 项，本任务没有修改这些实现/测试文件。无 Rust 或 migration 变化。
+
+#### LUX-738：在用户详情展示当前播放与停止 HLS 会话
+
+范围：在用户详情“设备与登录”页复用 LUX-737 客户端展示目标用户最近 90 秒活跃的播放会话，提供分页、媒体/进度、客户端/设备和 IP 摘要。只有 API 标记 `canStop` 的 Lux 服务端 HLS 才可请求停止；停止前确认，成功后刷新，失败可重试。页面必须说明直放和 STRM 外部播放的控制边界。本任务不增加设备清单、黑名单或 Emby 播放控制。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-sessions.test.tsx`。
+
+验收标准：
+
+- [x] 活跃播放摘要按用户分页显示媒体标题、播放进度、状态、客户端、设备和来源 IP，提供加载、错误/重试、空结果及翻页反馈。
+- [x] 只有 `canStop` 会话显示停止操作；操作需确认，成功后刷新当前列表，失败显示错误；其他会话保持不变。
+- [x] 明确说明停止仅支持 Lux 服务端 HLS；直放与 STRM 外部播放无法保证立即中断，且不撤销用户登录。
+- [x] 定向 session UI Vitest、Web build、桌面/窄屏浏览器验证和 diff check 通过。
+
+短计划：先扩展 session UI 回归覆盖播放列表摘要、分页、停止权限/确认/刷新/失败及边界文案并确认失败；再接入播放查询面板和响应式样式；最后运行定向 Vitest、Web build、浏览器验证和 diff check。
+
+结果（2026-10-20）：用户详情“设备与登录”增加当前播放面板，使用 LUX-737 API 显示分页媒体、进度/时长、播放方式、客户端/设备、来源 IP、状态和停止资格。仅 `canStop` 会话展示操作；停止前确认，成功刷新数据，失败保留会话并提示错误。直放和 STRM 的控制边界清楚说明，停止不会撤销登录。窄屏使用表格内部横向滚动，避免页面整体横溢出。
+
+验证：TDD RED 回归在面板缺失时失败；最终 `tests/admin-user-sessions.test.tsx` 11/11、冻结依赖安装、`pnpm --dir web build` 和 `git diff --check` 通过。完整 `pnpm --dir web test` 为 738 passed、4 failed；仍是此前已记录且不涉及本任务文件的 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项和 `media-query-polling.test.tsx` 1 项。Playwright 用本地模拟 API 验证 1280×900 桌面与 390×844 窄屏：桌面内容区 809px 时播放表格和停止操作完整可见；窄屏文档宽 375px、表格视口 310px，通过表格内横滑访问操作列，页面无横向溢出。确认对话框确认后发送 DELETE 204 并显示成功状态；`canStop=false` 的 STRM 行没有停止按钮；浏览器控制台错误 0。截图：`output/playwright/user-current-playback-desktop.png`、`output/playwright/user-current-playback-390.png`、`output/playwright/user-current-playback-390-actions.png`。此验证使用模拟 API，不代表真实 FNOS 或生产数据验证。
+
+#### LUX-739：建立用户设备清单存储结构
+
+范围：新增 SQLite/PostgreSQL 用户设备清单表，以 `(user_id, device_id)` 标识单个用户声明的设备，保存客户端名称/版本、设备名称/类型、首次出现、最近活动和可空的最近来源 IP。迁移从现存 Emby `access_tokens` 回填可识别的设备记录；已有令牌中的设备与客户端字段按声明信息处理，来源 IP 不推断或伪造。本任务只新增 schema 和可信旧数据回填，不接入登录/请求写入、查询 API、页面、黑名单或 IP ACL。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0194_user_devices.sql`、`migrations-postgres/0194_user_devices.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 空库迁移建立用户设备清单、级联删除和按用户/最近活动读取索引；迁移不生成可空来源 IP。
+- [x] SQLite 从 schema 193 升级时，以成功签发的历史 Emby 凭证为证据，按用户和设备合并记录，保留首次/最近活动及最新设备摘要。
+- [x] PostgreSQL 提供等价迁移和空库运行回归；两种数据库 schema 和索引一致。
+- [x] 定向 migration 测试、Rust build、fmt 与 diff check 通过；不改认证或访问控制行为。
+
+短计划：先增加 SQLite 空库与 193→194 升级测试、PostgreSQL 迁移验证并确认失败；再新增两种数据库迁移与旧凭证回填；最后运行最窄 migration targets、build、fmt 与 diff check。
+
+#### LUX-739 验证记录
+
+结果（2026-10-20）：SQLite/PostgreSQL 新增 `user_devices`，以用户和客户端声明设备 ID 作为复合主键，外键级联清理，按用户及最近活动建立查询索引。迁移将已有 Emby 凭证按用户/设备合并；首次出现取最早凭证签发时间，最近活动取最大 `last_seen_at`（缺失时回退签发时间），摘要取最近活动凭证的客户端/设备字段。撤销时间不视为最近活动；空设备 ID 被跳过；旧记录没有可证实的 IP，故保持 NULL。未改认证、登录会话或访问控制行为。
+
+验证：TDD RED 空库回归先因 schema 实际为 193（预期 194）而失败；实现后 `tests/storage` 设备清单 migration 回归 2/2、活动索引最新 schema 回归 1/1、PostgreSQL 16 空库 migration 回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许已知 lint 类别的全目标 Clippy 通过。未放行的全量 Clippy 仍有 9 条既有诊断，位于 `src/api/admin/admin_users.rs:554`、`src/api/media.rs:2837`、`src/application/playback/session.rs:397, src/application/user_permission_copy.rs:382,657`、`src/storage/users.rs:3161,3164` 和 `src/storage/repository_tests.rs:15587,23380`；本任务未修改这些文件。旧凭证回填行为在 SQLite schema 193 升级回归覆盖；PostgreSQL 本地运行回归覆盖空库迁移和级联清理。
+
+#### LUX-740：实现用户设备活动存储写入
+
+范围：增加用户设备观察的原子 upsert 存储合同。首次写入建立设备记录；后续写入按用户和设备隔离，首次出现保留最早时间，最近活动与设备/客户端摘要不因乱序旧观察回退。新观察缺少 IP 或可选摘要时保留先前已知值。仅实现 storage 层，不接认证写入、HTTP API、黑名单或 ACL。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新设备按用户/设备标识写入完整客户端声明摘要与可选来源 IP。
+- [x] 重复及乱序观察原子合并；首次时间单调取最早，最近时间和摘要不回退。
+- [x] 缺失的可选字段不清除已有值；相同设备标识在不同用户之间独立。
+- [x] 定向 storage 回归、Rust build、fmt 与 diff check 通过；没有认证或访问控制接线。
+
+短计划：先添加 storage upsert 行为回归并确认写入合同缺失；再增加观察 DTO 和兼容 SQLite/PostgreSQL 的单语句 upsert；最后运行最窄 storage 测试、build、fmt 与 diff check。
+
+#### LUX-740 验证记录
+
+结果（2026-10-20）：storage 增加 `NewUserDeviceObservation` 与单语句 upsert。相同用户/设备的首次出现时间只会向更早时间推进，最近活动时间取最大值；设备/客户端摘要和 IP 只由不早于当前记录的观察更新，空或缺失的可选值保留旧值。相同客户端设备 ID 在不同用户间保持隔离。调用接线留给后续任务。
+
+验证：TDD RED 因观察类型及 `upsert_user_device` 缺失而编译失败；实现后 `cargo test --locked --lib user_device_observations_merge_monotonically_and_are_user_scoped` 1/1、`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和仅允许 LUX-739 所记录 9 条既有 Clippy 诊断类别的全目标 Clippy 通过。完整 Clippy 的 9 条既有诊断仍未修复；本任务只新增 `repository.rs`、`mod.rs`、`users.rs` 和存储测试，不接认证或 ACL。
+
+#### LUX-741：为 Web 请求提供稳定设备标识
+
+范围：Web API 客户端生成并持久化随机、无个人资料含义的浏览器设备 ID，并在同源 API 请求中发送 `X-Lux-Device-Id`。优先使用浏览器本地存储；存储受限时以内存临时标识继续请求，不阻断登录。该标识仅供设备清单关联，服务端不得将其作为身份认证、授权或 ACL 凭据。本任务不接入服务端写入或展示设备记录。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 请求携带格式受限的稳定设备 ID；同一浏览器连续请求复用该 ID。
+- [x] 首次生成使用安全随机源并持久化；读取/写入本地存储失败时请求继续且有进程内稳定 ID。
+- [x] 定向 API client 回归、冻结依赖安装、Web build 与 diff check 通过。
+
+短计划：先添加共享请求头回归并确认现有客户端不发送设备 ID；再加入有界 UUID 生成、存储和请求头；最后运行 API client 定向 Vitest、Web build 和 diff check。
+
+#### LUX-741 验证记录
+
+结果（2026-10-20）：共享 Web API 客户端为请求附加 `X-Lux-Device-Id`。ID 使用 Web Crypto 生成 UUID v4，校验已存值格式后复用；无法读取或写入 localStorage 时以内存 ID 保持页面生命周期内稳定，并且不阻断请求。若存储随后恢复可用，会持久化已生成的内存 ID。设备 ID 仅用于服务端设备清单归并，不作为认证凭证。
+
+验证：TDD RED 两项 API client 回归因请求缺少设备 ID 而失败；最终 `tests/api-client.test.ts` 79/79，冻结依赖安装和 `pnpm --dir web build` 通过。完整 `pnpm --dir web test` 为 740 passed、4 failed；失败仍集中于既有 `home-page.test.tsx` 1 项、`library-card.test.tsx` 2 项和 `media-query-polling.test.tsx` 1 项，本任务未改这些文件。构建通过 TypeScript 检查；diff check 通过。
+
+#### LUX-742：记录 Web 用户成功登录设备
+
+范围：Web 登录成功且通过远程访问策略后，校验 `X-Lux-Device-Id` 为 UUID v4，再将 Lux Web 客户端、WEB 类型和展示 IP 写入用户设备清单。客户端未发送或发送无效 ID 时仍按现有规则完成登录，但不创建设备行。设备登记失败不得撤销成功登录；只记录不含用户或设备字段的存储错误。本任务不更新后续请求活动、不增加查询 API、页面或 ACL。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/legacy.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 使用有效 Web 设备 ID 登录后，当前用户设备清单记录客户端类型、首次/最近活动与可用展示 IP。
+- [x] 缺失或无效设备 ID 不阻断登录，也不会创建未标识设备。
+- [x] 设备观察发生在账号和远程访问检查之后；存储错误不泄露标识且不误报登录失败。
+- [x] `users` 定向集成回归、Rust build、fmt 与 diff check 通过；不改 Emby 行为。
+
+短计划：先扩展成功登录集成回归并确认设备行不存在；再在远程访问授权后校验 UUID v4 并调用 LUX-740 upsert；最后运行 `users` 目标、build、fmt 和 diff check。
+
+#### LUX-742 验证记录
+
+结果（2026-10-20）：Web 登录通过账号与远程访问检查后，才校验 `X-Lux-Device-Id` 为 UUID v4 并以 `Lux Web`/`WEB` 元数据写入设备清单；只在请求来源可用时保存展示 IP。缺少或格式无效的 ID 不影响正常登录，也不生成设备记录。设备 upsert 失败只写不带账号/设备字段的告警，不改变已创建的 Web 会话。Emby 登录与后续有效请求留给后续任务。
+
+验证：`users` 目标串行运行 19/19；集成回归覆盖有效 ID 入库、无效 ID 登录仍成功且不新增设备、设备存储注入失败时登录仍返回 200。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许此前记录的 9 条 Clippy 诊断类别的全目标 Clippy 通过。未放行的全量 Clippy 仍受同一组未修改代码诊断阻断；没有变更 Emby 认证或 ACL。
+
+#### LUX-743：记录 Emby 用户成功登录设备
+
+范围：Emby 用户名登录和指定用户登录通过远程访问策略后，将有效的客户端声明设备 ID 写入 LUX-739 用户设备清单。Emby 设备 ID 保持客户端提供的任意字符串形式，不要求 UUID；空白或超过 256 字节的 ID 不登记，但不影响成功登录。记录 Emby 客户端名、设备名、版本及可用展示 IP；设备登记失败不得撤销成功登录，并且告警不得包含用户或设备字段。本任务不更新后续请求活动、不增加查询 API、页面或 ACL。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/emby_handlers.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] 两种 Emby 密码登录共用成功接线；只有通过远程访问检查后才写入设备观察。
+- [x] 合法设备 ID 记录客户端、设备名、版本、EMBY 类型及可用展示 IP；同一 ID 的后续登录更新同一用户设备记录。
+- [x] 缺少、空白或过长设备 ID 不阻断认证且不产生设备记录；存储失败不改变成功认证结果。
+- [x] `emby_auth` 定向集成回归、Rust build、fmt 与 diff check 通过；不改 Emby 令牌合同或 ACL。
+
+短计划：先扩展 `tests/emby_auth` 覆盖正常、缺失/越界 ID 和设备存储失败，并确认设备行不存在；再在共用成功响应中、远程访问检查之后增加有界设备观察 upsert；最后运行 `emby_auth` 目标、build、fmt 和 diff check。
+
+#### LUX-743 验证记录
+
+结果（2026-10-20）：Emby 用户名和指定用户密码登录共用成功响应路径；通过既有远程访问检查后，有效的客户端设备 ID（非空、至多 256 字节）会 upsert 到用户设备清单，保存 `EMBY` 类型、客户端、设备名、版本、时间及可用展示 IP。Emby ID 不要求 UUID；无效 ID 跳过设备登记但保留登录成功。设备写入错误只记录存储错误，不返回用户或设备字段，也不撤销认证。
+
+验证：TDD RED 集成回归先因设备行缺失而 `RowNotFound`；实现后 `cargo test --locked --test emby_auth -- --test-threads=1` 为 10/10，覆盖用户名登录、指定用户登录、同 ID 更新、展示 IP、缺失/空白/过长 ID 和注入设备存储失败时仍返回 200。测试使用项目真实 `ConnectInfo` 服务模式；本机 localhost 请求显式设 `NO_PROXY=127.0.0.1,localhost`。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许此前记录 9 类既有 Clippy 诊断类别的全目标 Clippy 通过。未修改 Emby token 合同、后续请求活动、设备查询 API/UI 或 ACL；完整严格 Clippy 仍有前序记录的 9 条未改代码诊断。
+
+#### LUX-744：增加有界用户设备清单查询
+
+范围：增加 storage 层按指定用户查询设备清单的稳定分页合同，返回设备标识、名称、类型、客户端、版本、首次/最近活动时间与最近展示 IP，并返回筛选总数。结果按最近活动倒序、设备 ID 正序稳定排序；页大小限制为 1–100，负偏移归零。仅增加查询模型、storage 方法和测试，不增加 HTTP API、Web 页面、活动接线或黑名单。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 查询仅返回目标用户设备，所有设备摘要字段与匹配总数正确。
+- [x] 最近活动倒序并以设备 ID 稳定排序；页码偏移、空页与相邻页正确。
+- [x] 页大小服务端限制为 1–100、负偏移归零，查询无全表扫描用户集合以外的数据。
+- [x] storage 定向回归、Rust build、fmt 与 diff check 通过；无 migration 或 API 变化。
+
+短计划：先添加 `repository_tests` 分页/隔离回归并确认查询合同不存在；再增加设备摘要 DTO 与有界 count/page 查询；最后运行最窄 storage 测试、build、fmt 与 diff check。
+
+#### LUX-744 验证记录
+
+结果（2026-10-20）：storage 提供指定用户设备清单的 count + page 查询，字段包括设备 ID/名称/类型、客户端/版本、首次/最近活动和展示 IP。排序为最近活动倒序、设备 ID 正序；页大小夹在 1–100，负偏移归零。无 migration，查询未暴露到 API。
+
+验证：TDD RED 因 `UserDevicePageQuery` 与分页方法缺失而编译失败；实现后 `cargo test --locked --lib user_device_` 2/2，覆盖目标用户隔离、所有摘要字段、同时间稳定排序、总数、连续/空页、负偏移和 100 条上限。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许已知 9 类既有诊断类别的全目标 Clippy 通过。严格全量 Clippy 仍受前序记录的 9 条未修改代码诊断阻断；无 schema 或 API 改动。
+
+#### LUX-745：开放管理员用户设备清单 API
+
+范围：将 LUX-744 的有界设备分页查询开放为管理员只读接口。返回设备 ID、名称、类型、客户端、版本、首次/最近活动和展示 IP；默认页码 1、页大小 20，服务端页大小限制 1–100。仅需要管理员认证，不需要 CSRF；无效用户 ID 返回 400，不存在用户返回 404。本任务不增加 Web API client 或页面，不实现访问活动刷新、设备操作或黑名单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员可读取目标用户设备分页和总数；排序继承 storage 的最近活动倒序及设备 ID 正序。
+- [x] 未认证拒绝，非管理员禁止；GET 不要求 CSRF；无效/不存在目标 ID 返回文档规定状态。
+- [x] 响应只包含设备摘要，不含会话 token、密码或其他认证凭证。
+- [x] `users` 定向集成回归、Rust build、fmt 与 diff check 通过，API 文档已更新。
+
+短计划：先在 `tests/users` 添加未认证/非管理员、分页摘要、排序和错误 ID 回归并确认新路由未注册；再接入 storage 查询和管理员用户存在性校验；最后运行 `users` 定向目标、build、fmt 与 diff check。
+
+#### LUX-745 验证记录
+
+结果（2026-10-20）：新增 `GET /api/v1/admin/users/{userId}/devices`，只允许管理员读取。页码默认 1 并钳制最小值，页大小默认 20 并限制 1–100；响应只含设备摘要，不包含 user ID 或登录凭证。用户 ID 格式错误返回 400、用户不存在返回 404；GET 只需管理员认证，无 CSRF 要求。
+
+验证：TDD RED 回归先因新路由返回 404（预期未认证 401）；实现后 `cargo test --locked --test users -- --test-threads=1` 为 20/20，覆盖未认证/非管理员、设备字段、稳定分页、页码/页大小钳制、400/404 错误及无需 CSRF。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 和允许前序记录 9 类既有诊断类别的全目标 Clippy 通过；严格全量 Clippy 仍有相同 9 条未改代码诊断。`docs/API.md` 已登记合同；不接入 Web client/UI、后续活动接线、黑名单或 ACL。
+
+#### LUX-746：增加设备清单 Web API 合同
+
+范围：为 LUX-745 管理员设备清单 GET API 增加安全 TypeScript 摘要/分页 DTO 和 client 方法。方法默认 page 1、pageSize 20，正确 URL 编码 user ID，并通过统一请求层读取。本任务不修改详情页 UI、服务端 API、认证或设备刷新行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] DTO 精确映射设备公开摘要字段，不定义用户 ID、token、Cookie 或凭证字段。
+- [x] Client 分页默认参数正确，用户 ID 做路径编码并发送 `page`/`pageSize`。
+- [x] API client 定向 Vitest、冻结依赖安装、Web build 与 diff check 通过。
+- [x] 不改服务端行为或设备 UI。
+
+短计划：先在 `api-client.test.ts` 增加分页参数、默认值、路径编码和响应 DTO 回归并确认 client 方法不存在；再增加 DTO 与 client 方法；最后运行定向 Vitest、冻结安装、Web build 和 diff check。
+
+#### LUX-746 验证记录
+
+结果（2026-10-20）：增加 `AdminUserDevice`/`AdminUserDevicePage` 安全 DTO 和 `adminUserDevices` client 方法。分页默认 1/20，user ID 路径编码，查询参数为 `page`/`pageSize`，读取通过统一请求层 GET，不定义 user ID、token 或 Cookie 字段。未改服务端或 UI。
+
+验证：TDD RED 回归先因 `adminUserDevices` 方法不存在而失败；实现后定向 `tests/api-client.test.ts` 回归通过，冻结依赖安装和 `pnpm --dir web build` 通过。全量 `pnpm --dir web test` 为 741 passed、4 failed：`home-page.test.tsx` 首页库预取 1 项、`library-card.test.tsx` 两项、`media-query-polling.test.tsx` 1 项；与前序记录的四项基线失败相同，设备 API client 用例通过。`git diff --check` 通过；本任务不涉及 Playwright 页面变更。
+
+#### LUX-747：在用户详情展示设备清单
+
+范围：在用户详情“设备与登录”区域接入 LUX-746 设备清单 API，分页展示客户端、设备标识与名称、类型、版本、首次/最近活动及最近展示 IP。提供加载、空结果、读取错误重试和分页状态；所有设备值按普通文本安全展示。本任务只读，不实现设备/客户端封禁、访问活动刷新、登录状态关联或其他设备操作。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-devices.test.tsx`、`web/tests/admin-user-sessions.test.tsx`（为共用详情页的既有会话测试隔离设备 API 请求）。
+
+验收标准：
+
+- [x] 用户详情设备与登录页通过 LUX-746 客户端按页读取设备，并展示公开摘要字段。
+- [x] 加载、空结果、错误重试、总页数及上一页/下一页状态均可访问且正确。
+- [x] 组件定向测试、冻结依赖安装、Web build、浏览器展示检查和 diff check 通过。
+- [x] 不新增设备操作、黑名单、活动写入或登录凭证字段。
+
+短计划：先新增设备字段、默认分页、空结果和失败重试的组件回归并确认当前详情页未调用设备 API；再接入 React Query 与响应式设备表格；最后运行定向 Vitest、冻结依赖安装、Web build、浏览器检查和 diff check。
+
+#### LUX-747 验证记录
+
+结果（2026-10-20）：用户详情“设备与登录”区新增只读设备清单，显示客户端、设备名与标识、类型、版本、首次/最近活动和最近展示 IP；列表默认每页 20 条，提供加载、空态、读取失败重试和分页。窄屏表格在自身容器内滚动，不扩展页面宽度。未新增封禁、设备操作、活动写入、登录状态关联或凭证字段。
+
+验证：设备组件测试 4/4、现有用户会话组件测试 11/11；`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过。全量 Web 测试为 745 passed、4 failed，仍为 `home-page.test.tsx`、`library-card.test.tsx` 两项与 `media-query-polling.test.tsx` 的同四项既有基线失败。隔离 Playwright 固定假数据预览在 390×844 显示设备清单；视口和文档宽度均为 390 px，840 px 表格通过 350 px 内层容器滚动，浏览器 console 无错误/警告；截图 `output/playwright/admin-user-devices-390.png`。`git diff --check` 通过。
+
+#### LUX-748：通过 Web 有效访问刷新设备活跃时间
+
+范围：为携带有效 UUID v4 `X-Lux-Device-Id` 的已认证 Web 请求刷新该用户设备记录的最近活动时间及可用展示 IP。必须先通过会话、远程访问策略，再做 best-effort 存储；无效/缺失 ID 跳过，设备存储错误不得改变请求响应且日志不得记录用户或设备字段。设备 ID 仍不参与身份验证或授权。不接入 Emby 后续访问记录或设备黑名单。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 成功登录后，后续通过 Web 会话与远程访问检查的请求刷新同一设备的 `last_seen_at` 和可用展示 IP，不改变 `first_seen_at`。
+- [x] 缺失或格式无效的设备 ID 不写入设备记录；设备存储写入失败不阻断已通过认证的请求。
+- [x] 用户认证集成定向测试、Rust build、fmt、可用 Clippy 检查及 diff check 通过。
+
+短计划：先在 `tests/users.rs` 将已登录设备的 `last_seen_at` 置为旧值，再用同会话访问受保护 API 并确认时间更新、首次时间不变；确认当前实现未刷新后，在共享 Web 用户身份解析的会话分支通过策略检查后加入 best-effort upsert；最后运行 `users` 精确回归、build、fmt、Clippy 与 diff check。
+
+#### LUX-748 验证记录
+
+结果（2026-10-20）：Web 登录沿用原设备登记入口；之后通过 Web 会话和远程访问策略检查的请求携带有效设备 ID 时，会 best-effort upsert 同一设备，刷新最近活动和可用展示 IP，保留首次出现时间。无效设备 ID 不新增或刷新记录。设备存储失败不会改变已认证请求响应，且告警不含用户/设备字段；设备 ID 仍只用于清单归并。
+
+验证：TDD RED 在同一 authenticated request 带有效设备 ID、旧 `last_seen_at` 时失败；实现后 `tests/users` 串行 20/20，最后精确回归 1/1，另覆盖首次时间不变、无效设备 ID 跳过和设备存储失败时受保护请求仍成功。Rust build、fmt check、`git diff --check` 与放行既有 Clippy 诊断类别后的全目标 Clippy 通过。严格全目标 Clippy 仍受 10 条既有、位于未改文件的诊断阻断，本任务相关文件没有新增诊断。
+
+#### LUX-749：通过 Emby 有效访问刷新设备活跃时间
+
+范围：已签发的 Emby 用户凭证通过认证及远程访问策略后，使用凭证关联的客户端声明设备刷新用户设备清单最近活动，并更新可用展示 IP。首次出现时间不变；无可识别设备信息时跳过；设备存储失败不得阻断已通过认证的请求，日志不包含用户或设备字段。共享管理员 API Key 不代表普通用户设备，不写设备清单。不增加黑名单或 IP ACL。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/emby_handlers.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] Emby 用户登录后使用同一凭证访问受保护端点，会刷新同一用户设备的 `last_seen_at` 与可用展示 IP，`first_seen_at` 不变。
+- [x] 无设备 ID 的既有凭证不创建伪设备；设备清单写入失败不改变已认证请求响应。
+- [x] Emby 认证集成目标、build、fmt、可用 Clippy 检查与 diff check 通过。
+
+短计划：在 `tests/emby_auth.rs` 复用真实登录流程并把设备最近活动置旧，先验证后续受保护请求未更新；再在共享 Emby 用户凭证解析通过远程访问检查后，依据 token 的安全设备摘要 best-effort 更新设备记录；最后运行 Emby 认证集成目标、build、fmt 与 Clippy。
+
+结果（2026-10-20）：Emby 用户凭证访问经过身份和远程访问检查后，按凭证关联的设备摘要 best-effort 刷新用户设备清单的最近活动时间及展示 IP；首次出现时间保持不变。无设备 ID 时跳过清单写入，设备查询或 upsert 错误只写不含标识的通用告警且不改变认证响应。共享管理员 API Key 不关联普通用户设备。
+
+验证：TDD RED 的后续有效 Emby 请求未刷新旧设备时间；实现后 `cargo test --locked --test emby_auth -- --test-threads=1` 11/11 通过，覆盖活动时间/IP 更新、首次时间稳定、无设备 ID 跳过与设备更新失败仍返回 200。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。定向 Clippy 放行 7 类既有诊断后通过；严格 `cargo clippy --locked --test emby_auth -- -D warnings` 仍被未改文件的既有诊断阻断，本次修改文件无新增诊断。Cargo 输出目录在 Toshiba 挂载盘。
+
+#### LUX-750：为 Web 登录会话预留设备关联字段
+
+范围：为 `web_sessions` 增加可空 `device_id`，保存 Web 登录会话对应的客户端声明设备 ID。迁移必须从空库与现有库升级；既有会话保持 `NULL`，不回填猜测值。本任务仅更新 SQLite/PostgreSQL schema 和迁移验证，不在认证/API 写入或读取该字段，不改变 Web 会话行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0195_web_session_device_id.sql`、`migrations-postgres/0195_web_session_device_id.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 新旧 SQLite/PostgreSQL 数据库迁移后，`web_sessions.device_id` 可空且旧会话值为 `NULL`。
+- [x] PostgreSQL 与 SQLite schema 版本及 migration 对齐，空库迁移和既有 Web 会话升级回归通过。
+- [x] `storage` 相关目标、build、fmt、可用 Clippy 与 diff check 通过。
+
+短计划：先扩展 SQLite/PostgreSQL 设备清单迁移测试，断言新列存在且已有会话不回填；运行 SQLite migration 定向用例确认 RED；再添加版本 0195 双数据库 additive migration，最后运行存储与数据库迁移验证。
+
+结果（2026-10-20）：SQLite 与 PostgreSQL 均新增 `web_sessions.device_id TEXT NULL` migration 0195；旧会话保持 NULL，不推断设备关联。未在该任务接入认证写入或读取。
+
+验证：SQLite 空库迁移与既有 0194 会话升级分别通过；PostgreSQL 空库 migration 和旧会话升级两个真实本机测试均通过。`cargo build --locked`、`cargo fmt --all -- --check`、PostgreSQL 测试目标编译及 `git diff --check` 通过；`storage` 与 PostgreSQL 测试目标 Clippy 在放行 7 类既有诊断后通过。另一个宽泛 `storage migration_runs_from_an_empty_database` 过滤运行到 7 项，其中 5 项旧迁移测试仍因断言 schema 版本为 190/192 而失败；本任务新增与直接关联的迁移用例通过，这些历史版本断言尚未同步。
+
+#### LUX-751：存储 Web 会话设备关联
+
+范围：扩展 Web 会话存储，使调用者可为新会话写入可选的客户端声明设备 ID，并可从已验证会话安全读回该字段。原有无设备参数的内部调用继续写 NULL。只增加存储合同，不从 HTTP Header 绑定设备、不改变登录流程或设备访问策略。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/catalog.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新会话创建时可选择写入设备 ID，旧入口仍可创建 `device_id=NULL` 的会话。
+- [x] 通过有效会话凭证读取时返回对应设备 ID；不存在、撤销或过期会话仍不可读取。
+- [x] 存储会话相关单测、build、fmt、可用 Clippy 与 diff check 通过。
+
+短计划：先扩展 session storage 测试，验证指定设备 ID 可写可读且默认空值保持；运行定向测试确认 RED；然后为 session insert 增加可选参数合同并在 `StoredWebSession` 返回字段；最后运行 session 存储回归和常规检查。
+
+结果（2026-10-20）：`web_sessions` 存储合同增加带可选设备 ID 的创建入口，并由已验证会话查询返回该 nullable 字段；原创建入口保持兼容且写入 NULL。凭证查询仍过滤不存在、过期和撤销会话。
+
+验证：TDD RED 先因创建方法和返回字段不存在而编译失败；实现后 `storage::repository::repository_tests::web_session_device_association_is_optional_and_only_read_from_active_sessions` 1/1 通过，覆盖有关联、旧入口空值、过期、撤销和未知 token。`cargo build --locked`、`cargo fmt --all -- --check`、定向 Clippy 放行 7 类既有诊断后及 `git diff --check` 通过。设备字段将在下一增量接入 Web 登录与活动检查。
+
+#### LUX-752：登录时绑定 Web 会话设备 ID
+
+范围：Web 登录时将有效 UUID v4 `X-Lux-Device-Id` 写入该次会话，后续有效会话访问以存储值刷新设备活动，不允许请求中变化的设备头替换已绑定身份。无效/缺失 ID 不阻断登录；历史 `device_id=NULL` 会话继续兼容现有请求头设备观察。不把设备 ID 用作身份认证或权限判定。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`src/auth/sessions.rs`、`src/storage/repository.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 登录成功后，规范化的有效设备 ID 与新 Web 会话关联；无效/缺失 ID 保持 NULL 且登录成功。
+- [x] 已绑定会话访问即使不带设备头或携带其他设备头，也只刷新登录时绑定的设备记录，不新建伪关联。
+- [x] 既有 NULL 会话使用有效请求头时保持当前活动登记兼容；用户认证集成、build、fmt、可用 Clippy 与 diff check 通过。
+
+短计划：先扩展 `tests/users.rs` 覆盖登录会话绑定和请求头替换，确认当前认证链失败；再增加带设备 ID 的 Web 登录服务入口，令普通登录入口保持兼容；身份读取后优先使用存储设备 ID，历史 NULL 会话才回退到已校验请求头；最后运行用户认证回归及常规检查。
+
+结果（2026-10-20）：Web 登录将有效 UUID v4 规范化后写入新会话；会话身份读取优先采用已绑定 ID，旧会话才回退到请求头。无效或缺失设备头仍可登录且会话关联为空，设备记录失败仍不改变登录或后续授权响应。
+
+验证：新增回归先因会话设备字段为空而失败；实现后精确用例通过，并验证绑定会话在请求头缺失、改变或无效时只刷新原设备，NULL 历史会话继续按有效头记录。`cargo test --locked --test users -- --test-threads=1` 最终 20/20 通过；首次整目标运行中管理员删除测试出现一次 503，单项复跑及完整目标重跑均通过。`cargo build --locked`、`cargo fmt --all -- --check`、Clippy 放行 7 类既有诊断后的全 targets 检查及 `git diff --check` 通过。
+
+#### LUX-753：在设备清单展示有效登录状态
+
+范围：扩展用户设备分页结果，指示同一用户、同一设备是否存在有效登录。未撤销且未过期的 Web 会话，或未撤销的 Emby 凭证，均计为有效登录；撤销/过期凭证不计。设备清单新增文字状态，不把有效登录状态表述为实时在线。本任务不改变会话有效期、撤销规则或认证策略。
+
+预计修改文件（12 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`、`src/api/admin/admin_users.rs`、`tests/users.rs`、`tests/postgres_database.rs`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-devices.test.tsx`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 有效 Web 会话与 Emby 凭证能按用户和设备关联到设备清单；已撤销或已过期凭证不会显示为有效登录，SQLite 与 PostgreSQL 查询均通过。
+- [x] 管理员设备 API 返回布尔登录状态，分页、用户隔离、凭证保密合同不变。
+- [x] Web 设备表格用文字显示“有有效登录”或“无有效登录”，并覆盖客户端渲染与相关 Rust 查询测试。
+
+短计划：先扩展 `user_device_listing_is_scoped_stable_and_bounded` 与设备 API/UI 测试，覆盖有效 Web、有效 Emby、撤销及过期记录；运行定向目标确认登录状态字段尚缺；再让有界设备页查询以 EXISTS 关联有效凭证，扩展 DTO 与表格；最后运行 SQLite storage/users、PostgreSQL 登录状态集成、对应 Web 用例、build、fmt、可用 Clippy 与 diff check。
+
+结果（2026-10-20）：设备分页查询通过有界 correlated `EXISTS` 汇总未撤销且未过期的 Web 会话及未撤销 Emby 凭证；管理员 API 暴露 `hasActiveLogin`，用户详情设备表以文字显示有效登录状态。没有返回会话 Cookie 或 Emby token 字段。
+
+验证：SQLite storage 回归 1/1、`tests/users` 20/20、真实 PostgreSQL 设备登录状态 API 集成 1/1、设备 UI/API client 用例 84/84、`pnpm --dir web build`、`cargo build --locked`、fmt 检查、放行已记录 Clippy 诊断后的全 targets Clippy 与 `git diff --check` 通过。完整 Web 测试仍有 4 个既有失败（首页库预取 1 项、媒体库卡片 2 项、详情轮询 1 项；745 项通过），不在本任务改动路径。窄屏表格横向滚动由设备列表容器承载，页面宽度保持不变。
+
+#### LUX-754：建立用户设备与客户端黑名单规则表
+
+范围：为模块七的全站与用户级设备、客户端、IP/CIDR 黑名单建立 SQLite/PostgreSQL schema。每条规则保存可选目标用户、规则类型、规范化匹配值、启用状态、创建者及时间；全站规则以空 `user_id` 表示，目标用户删除时清除其用户级规则，创建者删除时保留规则并清空创建者引用。本任务只增加迁移与 schema 验收，不开放 API、不解析 CIDR、不执行授权拒绝，也不改变现有认证行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0196_user_access_blacklist_rules.sql`、`migrations-postgres/0196_user_access_blacklist_rules.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 迁移建立受约束的全站/用户级 `DEVICE`、`CLIENT`、`IP_CIDR` 规则表和有界匹配索引。
+- [x] 空库启动与从 0195 升级成功；删除目标用户级联删除规则，删除创建者保留规则并清空创建者字段。
+- [x] SQLite schema 约束回归与本机 PostgreSQL 空库迁移回归通过；本任务不引入规则执行行为。
+
+短计划：先给 SQLite/PostgreSQL migration 回归增加版本、列、约束、唯一索引和外键断言并确认新迁移缺失；再加入双库迁移；最后运行 storage 定向测试、PostgreSQL 迁移测试、Rust build、fmt 与 diff check。
+
+结果（2026-10-20）：SQLite 与 PostgreSQL 新增 0196 用户访问黑名单规则迁移，支持全站与用户范围的 `DEVICE`、`CLIENT`、`IP_CIDR` 类型，包含规范化值唯一约束、启用规则匹配索引、目标用户级联删除和创建者置空关系。迁移仅建立 schema，没有接入请求授权。
+
+验证：SQLite 空库 schema/约束与从 0195 升级保留现有设备回归 1/1；PostgreSQL 空库迁移和从 0195 升级保留设备回归分别 1/1 通过。新增列、索引与外键删除动作通过检查；未新增依赖或修改认证行为。
+
+#### LUX-755：提供有界黑名单规则存储合同
+
+范围：为 LUX-754 的规则表提供按全站或指定用户范围分页读取、创建、启停和删除的 storage 合同。列表固定按创建时间倒序、规则 ID 正序稳定排序，页大小限制为 1–100；用户范围只能读写该用户规则，不能包含全站或其他用户规则。只增加内部存储模型与 SQLite 回归，不开放 API、解析匹配值或执行授权拒绝。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 能在全站与指定用户范围创建、分页查询、启停和删除规则，并返回匹配范围内总数。
+- [x] 用户隔离、全站/用户重名规则分离、重复规则由唯一约束拒绝；分页稳定且限制有界。
+- [x] SQLite storage 定向回归、Rust build、fmt 与 diff check 通过；不接认证行为。
+
+短计划：先在 `repository_tests.rs` 写范围隔离、CRUD、稳定分页和重复规则回归，确认 storage 合同缺失；再加入最小 repository DTO 与 storage 方法；最后运行对应 storage 测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：storage 提供全站或精确用户范围的规则创建、分页读取、启停及删除；分页按创建时间倒序和 ID 正序稳定排序，limit 限制为 1–100。启停/删除按 rule ID 与作用范围双重限定，不会操作另一范围的规则。
+
+验证：TDD RED 确认类型与 storage 方法缺失；定向回归 1/1 通过，覆盖全站/用户隔离、同匹配值跨范围、范围内重复拒绝、页数/排序/上限、错误范围更新删除和启停状态。Rust build、fmt 检查与 `git diff --check` 通过；没有接入 HTTP 或请求授权。
+
+#### LUX-756：规范化黑名单设备、客户端和 IP 网段值
+
+范围：增加黑名单规则领域值校验，支持设备标识精确匹配、客户端名去首尾空白/合并空白并按小写规范化、IPv4/IPv6 地址或 CIDR 网段规范化。IP 值清除主机位并以固定网络前缀形式保存；非法地址、前缀、空值、控制字符和超过 256 字节的输入拒绝。仅增加纯领域合同与单元测试，不在此任务解析代理头或连接认证策略。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/user_access_rules.rs`。
+
+验收标准：
+
+- [x] 三类规则均有明确输入长度、空值和控制字符校验；客户端名称大小写/重复空格规范化，设备 ID 保留精确匹配语义。
+- [x] IPv4、IPv6 单地址、前缀边界、网络地址归一化、IPv4/IPv6 混合和非法 CIDR 均有回归覆盖。
+- [x] 领域定向测试、Rust build、fmt 与 diff check 通过；不增加依赖、不改变请求行为。
+
+短计划：先写覆盖三种规则输入边界与 CIDR 网络计算的失败单测；再实现无外部依赖的规范化函数和类型；最后运行定向领域测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：新增设备 ID 精确值、客户端名小写/空白规范化和 IPv4/IPv6 网络类型。IP 单地址被表示为 `/32` 或 `/128`；CIDR 清除主机位，匹配只接受同地址族并按网络前缀判断。输入空白、控制字符、超长值、非法地址及超范围前缀均拒绝；未增加 crate 或接入 HTTP/认证。
+
+验证：领域测试 5/5、`cargo build --locked`、fmt 检查与 `git diff --check` 通过。
+
+#### LUX-757：开放管理员黑名单规则管理 API
+
+范围：为 LUX-754 至 LUX-756 的设备、客户端和 IP/CIDR 规则提供全站与精确用户范围的管理员 HTTP API，支持有界分页读取、规则创建、启停和删除。创建时执行既有领域规范化；用户范围校验目标账号存在；重复规则返回冲突；所有路径都强制作用域隔离。写请求要求管理员认证和 CSRF（共享管理员 API Key 按既有认证合同处理）。本任务只管理规则数据，不把规则接入登录拒绝、会话撤销或播放授权，也不表示 IP 规则已生效。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`、`src/storage/users.rs`。
+
+验收标准：
+
+- [x] 全站与指定用户规则 API 支持读取、创建、启停、删除及 1–100 条有界分页；用户范围不能读取或修改全站及其他用户规则。
+- [x] 规则类型与值经领域解析/规范化；无效输入返回 400、重复规则返回 409、无效用户 ID 返回 400、目标账号不存在返回 404。
+- [x] 写请求检查管理员与 CSRF；响应仅返回规则安全摘要，不泄漏认证资料。
+- [x] `tests/users` 的 API 定向回归、Rust build、fmt 与 diff check 通过。
+- [x] 规则暂不参与认证或播放拒绝；IP 封禁仍等待可信代理来源解析任务。
+
+短计划：先在 `tests/users.rs` 增加全站/用户范围 CRUD、分页、输入规范化、冲突、认证和 CSRF 回归并确认路由尚未注册；再接入既有 storage 与领域规范化合同；最后同步 API 文档并运行 users 定向目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：新增管理员全站及指定用户规则分页 API，支持设备、客户端和 IP/CIDR 规则创建、启停、删除。请求值经 LUX-756 规范化，重复规则返回 409，跨作用域 ID 按不存在处理；用户范围校验 ID 和目标账号。管理员 Web 写请求检查 CSRF；规则摘要记录 Web 管理员创建者，API Key 创建者按既有合同留空。此任务只提供规则管理 API，未改变认证或播放行为。
+
+验证：TDD RED 先因路由未注册返回 404；实现后 `admin_can_manage_scoped_user_access_blacklist_rules` 通过，覆盖认证/CSRF、规则值校验与规范化、重复冲突、分页、作用域隔离及用户 ID 错误。`cargo test --locked --test users -- --test-threads=1` 在显式绕过本地回环代理后 21/21 通过；首次运行 13 个既有本地 HTTP 用例受代理影响返回 502。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 使用 Toshiba target 目录。
+
+#### LUX-758：查询设备与客户端黑名单命中
+
+范围：为认证接线提供一个有界 storage 查询，按目标用户同时检查已启用的全站设备/客户端规则和该用户规则。设备标识精确匹配，客户端名使用调用方已规范化的值；禁用规则、其他用户规则和 IP/CIDR 规则不参与本任务。只增加存储合同及 SQLite 回归，不改变认证、会话或播放行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 同一查询能命中全站或精确用户范围内已启用的设备/客户端规则。
+- [x] 禁用规则、其他用户范围、缺失的设备/客户端值和 IP 规则不产生误命中。
+- [x] SQLite storage 定向回归、Rust build、fmt 与 diff check 通过；不改变认证行为。
+
+短计划：先在 `repository_tests.rs` 覆盖全站/用户隔离、规则类型、启用状态与精确匹配并确认查询合同缺失；再添加匹配查询 DTO 和单条 `EXISTS` storage 查询；最后运行该 library 定向测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：增加单条 `EXISTS` storage 合同，同时检查目标用户的启用全站规则和精确用户规则。只比较设备 ID 与调用方已规范化的客户端名；其他用户、已停用规则、无输入以及 IP/CIDR 规则不产生命中，不改认证行为。
+
+验证：TDD RED 因匹配查询 DTO 和 storage 方法缺失而编译失败；实现后 SQLite 定向回归 `user_access_blacklist_matching_is_scoped_enabled_and_type_specific` 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过，Cargo 使用 Toshiba target 目录。
+
+#### LUX-759：在 Web 登录与会话访问中执行设备/客户端黑名单
+
+范围：Web 登录创建会话前，以当前用户、已绑定设备 ID 和固定客户端 `Lux Web` 检查启用的全站及用户级 DEVICE/CLIENT 规则；匹配则拒绝登录。后续 Web 会话请求重复执行同一判断，命中后撤销该会话并拒绝请求。无法读取规则时 fail closed 返回服务不可用。客户端名按 LUX-756 规范化。只覆盖 Web 身份验证边界，不接 Emby、已签发播放链接或 IP/CIDR 规则。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/sessions.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 新登录命中设备或客户端规则时不签发会话；未命中设备仍可正常登录。
+- [x] 已有 Web 会话首次命中规则时被撤销并拒绝请求；未命中规则的其他设备会话不受影响。
+- [x] Web 登录与会话解析的集成回归、Rust build、fmt 与 diff check 通过。
+- [x] 不接入 Emby、播放授权或 IP/CIDR 规则；这些行为留待各自任务。
+
+短计划：先在 `tests/users.rs` 建立已登录设备后添加匹配规则的回归并确认会话仍可用；再于 Web 登录签发前与 Web 会话解析后复用 LUX-758 命中查询，并按命中/存储失败区分拒绝与 503；最后运行 users 定向目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：Web 登录在验证账号后、创建会话前检查规范化的 `Lux Web` 客户端名与当前设备 ID；匹配时返回 403 且不签发会话。后续 Web 会话请求重复检查；命中时先撤销当前会话再拒绝请求，未匹配设备仍可访问。规则存储查询失败时登录/访问 fail closed。
+
+验证：TDD RED 时加入用户设备规则后的已有会话仍返回 200；实现后新增 Web 黑名单集成回归通过，覆盖现有会话撤销、新登录拒绝、另一设备保留访问及全局客户端拒绝。`cargo test --locked --test users -- --test-threads=1` 在设置 `NO_PROXY` 绕过本地代理后 22/22 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 使用 Toshiba target 目录；Emby、播放链接与 IP/CIDR 规则留待后续任务。
+
+#### LUX-760：在 Emby 登录与凭证访问中执行设备/客户端黑名单
+
+范围：Emby 用户登录签发 token 前，以用户、客户端声明设备 ID 和规范化客户端名检查启用的全站及用户级 DEVICE/CLIENT 规则；命中时不签发凭证。已有凭证的每次认证解析重复检查；命中时立即撤销该凭证并按未认证处理。规则读取失败时 fail closed。共享管理员 API Key 不属于普通用户设备，不执行此规则。只覆盖 Emby 认证及凭证，不接播放链接或 IP/CIDR。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/emby.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] Emby 新登录命中设备或客户端规则时返回未认证且不创建 token；不同设备/客户端仍可登录。
+- [x] 已有 Emby 凭证首次命中规则时被撤销，认证请求被拒绝；不匹配的凭证继续有效。
+- [x] Emby 认证集成定向目标、Rust build、fmt 与 diff check 通过。
+- [x] 不接入共享管理员 API Key、播放链接或 IP/CIDR 规则。
+
+短计划：先在 `tests/emby_auth.rs` 覆盖凭证签发、加入设备规则后既有凭证访问和另一个设备登录，并确认当前访问仍有效；再在 `EmbyAuthService` 签发及 token 解析路径复用 LUX-758 查询，命中时撤销现有凭证；最后运行 `emby_auth` 定向目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：Emby token 签发前检查设备 ID 和按规则规范化的客户端名；匹配规则时以现有未认证响应拒绝，不写凭证。已签发 token 每次解析时读取设备摘要，命中后立即撤销并按未认证处理；规则存储失败时不继续授权。共享管理员 API Key 不走普通 Emby 用户凭证路径。
+
+验证：TDD RED 先证明加入设备规则后旧 token 仍可访问；实现后 `emby_login_and_existing_tokens_enforce_device_client_blacklists` 通过，覆盖 token 撤销、同设备拒绝、其他设备继续登录及全局客户端规则规范化。`cargo test --locked --test emby_auth -- --test-threads=1` 绕过本地回环代理后 12/12 通过；`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 使用 Toshiba target 目录；播放链接与 IP/CIDR 仍由后续任务处理。
+
+#### LUX-761：解析显式可信代理后的客户端 IP
+
+范围：增加独立领域解析器，接收真实连接 peer、完整 `X-Forwarded-For` 字段值及显式可信代理 CIDR。peer 不可信时完全忽略转发头并返回 peer；peer 可信时校验完整转发链，从靠近 Lux 的一端向左逐跳剥离可信代理，返回首个不可信地址。IPv4-mapped IPv6 统一为 IPv4。可信 peer 缺少头时返回 peer；提供了空值或无效链时返回错误，调用方不得静默退回展示 IP。本任务只提供纯解析逻辑及单元测试，不读取配置、不接 HTTP/认证、不改变访问行为。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`。
+
+验收标准：
+
+- [x] 不可信 peer 即使收到伪造或格式错误的转发头，解析结果仍为连接 peer。
+- [x] 可信 peer 按完整多值链从右向左跳过可信代理；左侧伪造前缀不会覆盖首个非可信地址。
+- [x] IPv4、IPv6、IPv4-mapped IPv6、缺失头、空值和无效地址均有单元覆盖。
+- [x] 仅用户访问规则库定向测试、Rust build、fmt 与 diff check 通过；本任务不执行封禁。
+
+短计划：先为可信 peer、非可信 peer、伪造左前缀、多字段及畸形输入添加领域单测并确认解析器缺失；再实现纯 CIDR 链解析；最后运行指定库测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：新增纯 trusted-proxy 解析器；将 IPv4-mapped IPv6 规范化为 IPv4，不可信 peer 忽略全部转发头，可信 peer 限制最多 64 跳/8 KiB 并从右侧跳过可信代理。缺失头返回 peer；空字段、非法地址、超长或过多 hop 返回错误。未接入请求、配置或授权。
+
+验证：TDD RED 因解析函数及错误类型缺失而编译失败；实现后 `cargo test --locked --lib application::user_access_rules::tests` 9/9 通过。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
+#### LUX-762：存储全局可信代理 CIDR 列表
+
+范围：在现有 `server_settings` 键值表中增加可信代理 CIDR JSON 的读取与原子 upsert 合同，不新增 schema migration。存储层保留 JSON 原文并不解释地址；解析、规范化与上限校验由应用层负责。补充 SQLite 存储回归，不接设置 API、HTTP peer 或 ACL。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/users.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 空库读取返回未配置；写入后能准确读回相同 JSON；后续写入覆盖旧值。
+- [x] 仍使用 server settings 参数化 upsert；错误通过既有 `StorageError` 返回。
+- [x] SQLite 存储定向测试、Rust build、fmt 与 diff check 通过；请求与授权行为不变。
+
+短计划：先增加 server-settings 回归并确认数据库接口缺失；再新增原文 JSON 的 getter/upsert；最后运行存储单测、build、fmt 与 diff check。
+
+结果（2026-10-20）：`server_settings` 新增 `trusted_proxy_cidrs` 的原文 JSON 查询和参数化 upsert，不增加迁移；空值保持 `None`，后续设置覆盖原值。存储层不解释或信任 CIDR 内容。
+
+验证：TDD RED 因读写方法缺失而编译失败；实现后 `trusted_proxy_cidrs_setting_reads_and_replaces_raw_json` 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
+#### LUX-763：管理 API 配置可信代理网段
+
+范围：在管理员服务器设置 GET/PATCH 中暴露 `trustedProxyCidrs`。读取默认 `[]`；PATCH 支持最多 100 个 IPv4/IPv6 地址或 CIDR，规范化网络位、拒绝非法值与规范化后的重复值；空数组清除信任设置，字段省略则保留。写入由管理员 Web session 与 CSRF 保护。本任务不把该配置用于 IP 封禁或改变请求处理。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/settings.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_dashboard.rs`。
+
+验收标准：
+
+- [x] GET 总是返回 canonical `trustedProxyCidrs` 数组，未配置时为空。
+- [x] PATCH 规范化 IPv4/IPv6/CIDR 并持久化；空数组能清除，省略字段不覆盖已有设置。
+- [x] 非法地址、重复网段和超过 100 项均返回 400，失败时不改变已存设置。
+- [x] 管理员认证/CSRF、设置 API 定向集成目标、build、fmt 与 diff check 通过；此任务不执行 IP ACL。
+
+短计划：先扩展管理设置集成回归，确认 GET 缺少该字段且 PATCH 未保存；再增加应用层规范化和拒绝规则、API DTO 与映射，读取/写入 LUX-762 storage；最后更新 API 文档并运行定向设置目标、build、fmt 与 diff check。
+
+结果（2026-10-20）：管理员设置 GET/PATCH 增加 `trustedProxyCidrs`，默认空列表；地址和网段经规范化，拒绝非法、规范化重复和超过 100 项，空数组清除，省略时保留。设置保存在 LUX-762 的键值记录中；认证与 CSRF 边界保持管理员 Web session。更新了 `docs/API.md`。本任务仍未将代理设置用于 ACL。
+
+验证：TDD RED 先因 GET 字段缺失而失败；实现后 `admin_dashboard_returns_server_playback_and_activity_data` 1/1 通过，覆盖默认、存储回读、canonical IPv4/IPv6、清除、部分更新、非法输入、CSRF 和失败后保留原值。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。严格 `cargo clippy --locked --all-targets --all-features -- -D warnings` 仍报 13 项既有诊断（相关位置均不在本次新增代码；完整 Rust 门禁尚未通过）。Cargo 输出使用 `/Volumes/Toshiba/mywork/Lux/target`。
+
+#### LUX-764：增加 Web 黑名单 API 客户端合同
+
+范围：增加全站和用户级黑名单规则的 TypeScript DTO、分页读取、创建、启停、删除方法；管理员设置 DTO 增加 `trustedProxyCidrs`。所有 ID 路径参数 URL 编码，写请求复用统一 CSRF/错误处理层。本任务只提供客户端合同，不修改管理界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 全站和用户范围的 CRUD URL、分页参数与请求体符合 LUX-757 API。
+- [x] 写操作通过统一客户端附带 CSRF；类型不包含认证凭证或敏感内部字段。
+- [x] `api-client.test.ts` 定向回归与 Web build 通过；不修改页面或样式。
+
+短计划：先为全站/用户范围 API 方法增加 URL、分页、CSRF 与 payload 回归并确认方法缺失；再增加 DTO 和 client 方法；最后跑 API client 定向测试、Web build 和 diff check。
+
+结果（2026-10-20）：新增全站及用户级黑名单规则分页 DTO、创建输入 DTO 和 CRUD 客户端方法，启停使用既有 `PATCH /{ruleId}` 合同；所有用户/规则 ID 均 URL 编码。`AdminSettings` 现包含 `trustedProxyCidrs`。未修改页面。
+
+验证：TDD RED 先因客户端方法不存在而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 81/81 通过，`pnpm --dir web build` 通过，`pnpm --dir web install --frozen-lockfile` 通过。Web 全套为 746/750，4 项失败与已有基线相同：首页预取 1 项、媒体库卡片 2 项、详情轮询 1 项；与本任务无关。`git diff --check` 通过。
+
+#### LUX-765：读取并匹配有界 IP/CIDR 黑名单规则
+
+范围：为后续认证接线提供目标用户的启用全站及用户级 `IP_CIDR` 规则值；查询最多返回 201 项，供应用层在超过每请求 200 项的执行上限时 fail closed。应用层只匹配规范 CIDR，存储值损坏或规则超过上限均返回错误。本任务只建立有界读取和纯匹配合同，不接 HTTP、认证、播放授权或管理界面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`、`src/storage/users.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 读取只包含启用的全站及目标用户 IP 规则，忽略其他用户、停用项和 DEVICE/CLIENT 规则。
+- [x] Storage 查询限制最多 201 项；CIDR 匹配覆盖 IPv4、IPv6、未命中、损坏存储值和超过 200 项。
+- [x] 相关定向测试、Rust build、fmt 与 diff check 通过；不改变 HTTP 或授权行为。
+
+短计划：先添加 SQLite 规则范围/启用状态/分页上限回归和 CIDR 匹配边界单测并确认缺失接口；再添加最多返回 201 项的 storage 查询与 200 项 fail-closed 纯匹配；最后运行定向 Rust 测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：Storage 以稳定顺序最多读取 201 条启用的全站及目标用户 `IP_CIDR` 规则，应用层最多评估 200 条；损坏 CIDR 或超过评估上限返回错误，供后续认证层 fail closed。未接 HTTP、认证或播放授权。
+
+验证：TDD RED 因缺少规则查询类型和方法而失败；实现后应用层规则/代理测试 11/11、Storage 作用域与启用状态回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过；严格全目标 Clippy 仍报 13 条已有问题，位于未修改的管理员 API、播放、权限复制及存储测试代码，本任务没有新增 Clippy 诊断。Cargo 命令使用 Toshiba target 目录。
+
+#### LUX-766：从可信代理链解析请求访问 IP
+
+范围：封装请求访问 IP 解析，使用 server middleware 注入的真实连接 peer 和完整 `X-Forwarded-For` 多值；可信代理 CIDR 从管理员设置读取并严格校验。没有真实 peer 时返回 `None` 供调用方 fail closed；代理配置损坏、peer 无效或可信 peer 的转发链无效均返回错误。本任务不接入登录、token 或播放授权检查。
+
+预计修改文件（4 个）：`AGENTS.md`、`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/api/legacy.rs`。
+
+验收标准：
+
+- [x] 未配置可信代理时忽略转发头，直接使用实际 peer；可信代理按完整重复头链从右向左剥离。
+- [x] 损坏的可信代理设置、无效 peer 和可信 peer 的畸形转发链均返回错误；缺失 peer 不伪造客户端地址。
+- [x] 更新 `AGENTS.md`，只允许访问 IP 解析器在上述可信边界内为 IP/CIDR 黑名单使用转发头；尚不改变授权行为。
+- [x] 请求 IP 定向测试、Rust build、fmt 与 diff check 通过。
+
+短计划：先添加 HTTP 层可信/不可信 peer、重复转发头、损坏配置和缺失 peer 回归并确认解析入口缺失；再让可信代理设置读取对损坏值严格报错，新增 request access-IP resolver 并修订 `AGENTS.md`；最后运行定向 lib 测试、build、fmt 与 diff check。
+
+结果（2026-10-20）：`request_access_ip` 只以 middleware 注入的 peer 起算，读取并严格验证全局可信代理 CIDR，消费全部 `X-Forwarded-For` 字段值并复用 LUX-761 的从右向左链解析；无 peer 返回 `None`，无效 peer、可信配置或可信代理链返回错误。可信代理配置损坏不再被误当作空白配置。更新 `AGENTS.md`：只有 IP/CIDR 黑名单解析器可在该边界内参考 XFF，XFP 仍只用于传输元数据。本任务未将解析器接入授权检查。
+
+验证：TDD RED 因请求解析器和错误类型缺失而失败；实现后 `cargo test --locked --lib access_ip_` 5/5、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍报 13 项既有诊断，均位于未修改的管理员 API、播放、权限复制及存储测试代码；本任务文件没有新增诊断。Cargo 命令使用 Toshiba target 目录。Lucky 官方 Web 服务文档确认提供“追加客户端 IP”设置，但没有说明同名 Header 的合并/覆盖行为；当前部署版本和真实请求链仍未现场核验。
+
+#### LUX-767：在 Web 登录与会话检查中执行 IP/CIDR 黑名单
+
+范围：Web 登录创建会话前和现有 Web 会话认证时，使用 LUX-766 请求访问 IP 与 LUX-765 有界规则匹配检查启用的全站/用户 `IP_CIDR` 规则。命中时拒绝新登录；已有会话立即撤销后拒绝。缺少 peer 且存在活动 IP 规则时 fail closed；规则存储/解析异常返回服务不可用。仅接 Web 登录与 Web session 路径，不覆盖 Emby、播放票据或管理界面专属事件流。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/application/user_access_rules.rs`、`src/auth/sessions.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 命中用户或全站 IP/CIDR 时 Web 登录不签发会话；未命中地址可登录。
+- [x] 活动 Web session 在命中时被撤销；其他地址仍可使用未命中的会话；缺少 peer 且存在 IP 规则时拒绝并撤销。
+- [x] 规则超限、损坏值或 storage 错误不得绕过封禁，HTTP 返回服务不可用；直接客户端 IP 及可信代理来源均覆盖。
+- [x] users 定向集成目标、Rust build、fmt 与 diff check 通过；不接 Emby 或 playback ticket。
+
+短计划：先在 `tests/users.rs` 建立 Web 登录、现有会话命中、缺少 peer 和未命中地址回归并确认认证仍忽略 IP 规则；再在 `WebAuthService` 增加登录前及会话解析 IP 检查，API handler 注入 LUX-766 解析结果；最后运行 users 定向目标、build、fmt 与 diff check。
+
+验证：`cargo test --locked --test users -- --test-threads=1` 23/23、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍有 13 项既有诊断，位于未修改的管理员 API、媒体播放、权限复制及存储测试代码；本任务没有新增诊断。Cargo 命令使用 Toshiba target 目录。直接、可信代理、缺少 peer、已有会话撤销及超限 fail-closed 均由 Web 集成用例覆盖。
+
+#### LUX-768：在 Emby 登录与凭证解析中执行 IP/CIDR 黑名单
+
+范围：Emby 按名称/用户 ID 登录签发凭证前，以及每次 Emby 凭证解析时，使用 LUX-766 的可信代理访问 IP 与 LUX-765 的有界规则匹配。命中时不签发新 token；已有 token 命中后撤销并按未认证处理。缺少 peer 且存在活动 IP 规则时 fail closed；损坏规则、规则超限或读取错误不得放行。共享管理员 API Key 不属于普通用户 Emby 凭证，不受本任务影响。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/auth/emby.rs`、`src/api/emby_handlers.rs`、`src/api/legacy.rs`、`tests/emby_auth.rs`。
+
+验收标准：
+
+- [x] 全部 Emby 密码登录入口以可信访问 IP 检查用户/全站 IP 规则；命中不创建凭证，未命中可登录。
+- [x] Emby token 每次解析时执行同一规则；命中后凭证被撤销，缺少 peer 时 fail closed，其他地址仍可访问。
+- [x] 坏规则、超限或 storage/可信代理解析错误返回服务不可用；管理员 API Key 行为不变。
+- [x] Emby 认证集成定向目标、Rust build、fmt 与 diff check 通过；不接 Lux Web API 兼容认证或播放授权。
+
+短计划：先在 `tests/emby_auth.rs` 覆盖可信/不可信来源的登录、已有 token 撤销、缺少 peer 和规则超限，并确认当前 IP 规则尚未限制 Emby；再在 `EmbyAuthService` 增加带 IP 的签发/解析入口并接入 Emby handler；最后运行 `emby_auth` 定向目标、build、fmt 与 diff check。
+
+验证：`cargo test --locked --test emby_auth -- --test-threads=1` 13/13、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍报 13 项既有诊断，均在本任务未修改位置；本任务文件没有新增诊断。Cargo 命令使用 Toshiba target 目录。集成回归覆盖按名称和用户 ID 登录、可信/不可信代理、缺少 peer、已有 token 撤销、未命中地址、损坏与超限规则、可信代理配置损坏，以及共享管理员 API Key 不受影响。
+
+#### LUX-769：在 Lux API 接受的 Emby 用户凭证中执行 IP/CIDR 黑名单
+
+范围：Lux 原生 `/api/v1` 身份验证兼容 Emby 用户 token 的路径，使用 LUX-766 解析访问 IP，并调用 LUX-768 的逐 token IP 规则检查。命中时撤销 token 并拒绝请求；缺少 peer 且有活动规则时 fail closed。共享管理员 API Key 仍走独立主体解析。本任务不接入已签发的播放 URL/播放票据，也不改用户权限。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] Lux API 上由 Emby 用户 token 建立的主体身份，每次解析均检查全站/用户 IP/CIDR 规则。
+- [x] 命中时拒绝并撤销 Emby token；未命中继续工作；规则或访问 IP 解析错误 fail closed 返回服务不可用。
+- [x] 共享管理员 API Key 不受规则路径影响；users 定向集成目标、build、fmt 和 diff check 通过。
+
+短计划：先在 `tests/users.rs` 建立 Emby token 访问受保护 Lux API 的阻断/撤销与允许地址回归，并确认当前路径会绕过规则；再在 `require_web_principal` 的 Emby token 分支解析访问 IP 并映射服务不可用错误；最后运行 users 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 时允许地址携带 Emby token 访问 `/api/v1/auth/me` 返回 401；接入 LUX-766 来源解析后新增回归通过。完整 `cargo test --locked --test users -- --test-threads=1` 24/24、`cargo build --locked`、fmt 与 diff check 通过。严格全目标 Clippy 仍有 13 项既有诊断，未在本任务改动文件中产生新诊断。Cargo 使用 Toshiba target 目录。
+
+#### LUX-770：为 Web 播放票据持久化授权设备与客户端
+
+范围：扩展 `web_playback_sessions`，保存会话签发时的可选设备 ID 和客户端名称，并提供按会话/用户写入及读取授权上下文的 storage 合同。为已有数据库增加可空 SQLite/PostgreSQL migration；本任务不改变播放授权或黑名单行为。
+
+预计修改文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0197_web_playback_access_context.sql`、`migrations-postgres/0197_web_playback_access_context.sql`、`src/storage/repository.rs`、`src/storage/mod.rs`、`src/storage/sessions.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 空库可完成迁移；已有播放 session 的授权上下文保持空值，不破坏既有会话读写。
+- [x] storage 可写入活动 session 的设备/客户端摘要，并能有界读取该 session 的用户与上下文；目标用户/状态不匹配时不更新。
+- [x] SQLite 定向存储回归、Rust build、fmt 与 diff check 通过；不改变任何 API 响应。
+
+短计划：先在 storage 回归中覆盖活动/错误用户/终态 session 的授权上下文写入和读取，并确认合同缺失；再添加双后端可空迁移、query DTO 及有界读写；最后运行指定 library 测试、build、fmt 与 diff check。
+
+验证：TDD RED 因上下文存取合同缺失而编译失败；新增 `web_playback_access_context_is_scoped_to_active_session` 1/1 通过，并在空 SQLite 数据库上应用完整 migration 集。`cargo build --locked`、fmt 与 diff check 通过。PostgreSQL migration 为对应的可空文本列；本任务没有 PostgreSQL runtime 验证。Cargo 使用 Toshiba target 目录。
+
+#### LUX-771：在已签发播放票据上执行访问黑名单
+
+范围：Lux Web 创建播放会话时，持久化经认证 Web 会话绑定的设备 ID 与 `Lux Web` 客户端名；只有历史空设备关联会话才回退到本次经过 UUID v4 校验的请求设备 ID。通过 Emby 用户 token 访问时，从已认证 token 读取设备/客户端，不接受请求头替换。每次访问 Lux Web 签名直放、Range 或 HLS 票据时，按会话保存的设备/客户端上下文及当前可信代理解析出的来源 IP 检查启用的全站/用户黑名单。命中后停止播放会话、释放准入并使该票据失效；未知设备/客户端但对应规则已启用、缺少 peer 但有活动 IP 规则时 fail closed。损坏、超限规则以及规则或可信代理读取错误返回服务不可用，不得放行。Emby HLS/转码资源和无状态直放签名 URL 不在本任务范围。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/playback.rs`、`src/storage/users.rs`、`tests/web_playback.rs`。
+
+验收标准：
+
+- [x] Lux Web 新签发的直放/HLS 票据保存认证会话绑定的设备与客户端上下文；请求头不能替换已绑定设备，只有历史 NULL 会话允许使用有效请求设备头；上下文写入失败时停止新会话且不返回票据。
+- [x] 每次 Lux Web 签名播放资源请求均检查会话签发时的设备/客户端规则和本次请求的可信来源 IP；命中撤销会话并返回已结束状态。
+- [x] 缺失设备/客户端上下文但存在相应规则、缺少 peer 但存在 IP 规则、损坏/超限规则均 fail closed；规则存储或可信代理读取错误返回 503。
+- [x] 覆盖设备、客户端、IP 命中、无 peer、坏规则与超限规则；`web_playback` 定向集成目标、Rust build、fmt 与 diff check 通过。
+
+短计划：先在 `tests/web_playback.rs` 建立多个已签发 Lux Web 票据在新增设备/客户端/IP 规则后的命中、撤销与 fail-closed 回归，并确认当前签名链接仍可用；再为新 Lux Web 会话写入校验后的上下文、在票据授权中检查规则并处理可信请求 IP；最后运行 `web_playback` 定向目标、build、fmt 与 diff check。
+
+验证：先确认已签发票据在新增设备规则后仍返回 200（TDD RED），并确认伪报设备回归在绑定设备被请求头替换时失败；修复后 `cargo test --locked --test web_playback` 1/1、`NO_PROXY=127.0.0.1,localhost cargo test --locked --test playback` 4/4、`cargo build --locked`、fmt 与 `git diff --check` 通过。完整 Rust all-targets 门禁为 1079 通过、4 失败、26 忽略：三项 fill-missing dispatch/retry 测试已在干净基线复现；`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 在未改动的 metadata 代码中单独复现。严格 Clippy 仍有 13 项既存诊断，均不在本任务新增代码。所有 Cargo 检查使用 Toshiba target 目录。
+
+#### LUX-772：在 Emby HLS 票据上执行访问黑名单
+
+范围：Emby 用户 token 请求创建服务端 HLS 会话时，从已认证凭证读取设备/客户端上下文并保存；只有缺少凭证设备字段时才使用本次 Emby 客户端声明补齐。每次访问已签发 Emby HLS manifest、初始化片段或分片时，检查会话设备/客户端规则和可信来源 IP；命中后停止会话并释放准入，规则变化立即使剩余票据失效。访问 IP、规则读取错误和坏/超限规则不得放行；共享管理员 API Key 的认证行为不变。无状态 Emby 直放票据留待单独任务处理。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/playback.rs`、`src/application/playback/session.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 新签发 Emby HLS 会话持久化经过认证凭证绑定的设备与客户端上下文；上下文写入失败时停止会话且不返回链接。
+- [x] 每个已签发 HLS manifest、初始化片段和分片请求均检查设备/客户端及可信来源 IP 规则；命中停止会话并使后续票据失效。
+- [x] 缺少上下文但存在对应规则、缺少 peer 但存在 IP 规则、损坏/超限规则及代理/存储错误 fail closed；普通 Emby token 的未命中请求可继续播放。
+- [x] `playback` 定向集成目标、Rust build、fmt 与 diff check 通过；共享管理员 API Key 行为保持不变。
+
+短计划：先在 `tests/playback.rs` 添加“先签发 HLS 链接、再启用设备/客户端规则”的失败回归；再保存 token 绑定的授权上下文并让 Emby HLS 资源请求解析可信访问 IP、复用会话规则检查；最后运行 `playback` 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 时启用全站客户端规则后，已签发 Emby HLS URL 仍返回 200；修复后 `NO_PROXY=127.0.0.1,localhost cargo test --locked --test playback --test web_playback` 中 `playback` 4/4、`web_playback` 1/1 通过。回归同时确认 HLS 会话绑定 token 中的 `transcode-test`/`PlaybackTest`，请求头伪报值不能替换已绑定值，命中后返回 410 并停止会话。`cargo build --locked`、fmt 与 `git diff --check` 通过。严格 Clippy 仍有 13 项既存诊断，没有来自本任务新增代码的诊断；完整 Rust all-targets 失败记录见 LUX-771。Cargo 使用 Toshiba target 目录。
+
+#### LUX-773：建立 Emby 直放播放票据会话表
+
+范围：为 Emby 无状态直放签名票据增加可撤销的会话上下文 schema，按用户和播放会话 ID 保存授权设备/客户端、过期时间及可空撤销时间。此任务只新增 SQLite/PostgreSQL migration 和空库 schema 回归，不改变现有 Emby 直放 URL 或授权行为。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0198_emby_direct_playback_tickets.sql`、`migrations-postgres/0198_emby_direct_playback_tickets.sql`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 新建 `emby_direct_playback_tickets` 表，复合主键按用户/播放会话隔离，并保存可空设备/客户端与撤销时间、必需过期/创建时间。
+- [x] 时间和字符串约束拒绝空播放会话 ID、负/倒置时间；用户删除级联清除票据上下文。
+- [x] 从空库应用完整迁移集并验证列、主键、索引、约束和外键；不改变现有播放授权行为。
+
+短计划：先添加空库 schema/约束回归并确认目标表缺失；再按现有 migration 序列添加 SQLite 和 PostgreSQL 表与索引；最后运行指定 Storage 测试、build、fmt 与 diff check。
+
+验证：TDD RED 因表不存在而在 schema 断言失败；增加双后端 migration 后，`emby_direct_playback_ticket_migration_creates_revocable_context_table` 1/1 通过，覆盖列、有效索引、空/负/倒置值拒绝、复合主键冲突和用户删除级联。空 SQLite 数据库成功应用完整 migration 集；`cargo build --locked`、fmt 与 `git diff --check` 通过。PostgreSQL migration 已编写但未运行 PostgreSQL runtime 验证；未改变直放授权行为。Cargo 使用 Toshiba target 目录。
+
+#### LUX-774：提供 Emby 直放票据上下文存储合同
+
+范围：为 LUX-773 表提供新票据上下文创建、按用户/播放会话读取、只写一次兼容旧票据上下文、撤销及有界过期清理 storage 合同。新记录只保存设备/客户端摘要，不保存签名、原始 token 或完整 URL；本任务不接入 API 或播放授权。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/sessions.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 新票据按用户和播放会话复合键创建，支持精确用户范围读取，重复创建不得覆盖已有上下文。
+- [x] 兼容旧票据的空上下文只在记录缺失时插入；撤销时间只写一次，查询能区分已撤销票据。
+- [x] 过期记录清理接受硬上限 1–1000，不扫描或返回未过期票据；覆盖作用域、冲突、兼容插入、撤销与清理的 SQLite 存储回归通过。
+- [x] Rust build、fmt 与 diff check 通过；storage 不接收原始签名或认证凭证。
+
+短计划：先增加新建/读取、用户隔离、旧票据空上下文补写、不可覆盖、撤销一次性和有界清理回归并确认 storage 合同缺失；再新增类型与最小 SQL；最后运行指定库测试、build、fmt 与 diff check。
+
+验证：TDD RED 因缺少 `NewEmbyDirectPlaybackTicket` 类型而编译失败；实现后 `emby_direct_playback_ticket_storage_scopes_and_revokes_context` 1/1 通过，覆盖用户隔离、旧记录兼容写入不覆盖、撤销一次性和 1000 行清理硬上限。`cargo build --locked`、fmt 与 `git diff --check` 通过。storage 接口只接收设备/客户端上下文、用户/播放会话 ID 与时间，不接收 token、签名或 URL。Cargo 使用 Toshiba target 目录。
+
+#### LUX-775：版本化 Emby 直放票据签名
+
+范围：为后续持久化授权上下文的 Emby 直放 URL 增加 v2 签名域与明确版本参数，版本参数必须由签名域保护；服务端识别并验证 v2，同时暂时兼容无版本参数的旧版签名票据直到其自身过期。URL 不新增认证 token、设备 ID 或客户端明文。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/emby_catalog.rs`、`src/api/media.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 新 Emby 直放票据使用独立 v2 HMAC 域，并在 URL 加入受签名保护的版本参数。
+- [x] v2 直放票据正常读取；删除/修改版本参数、修改会话或媒体源均拒绝，不能降级按旧 HMAC 验证。
+- [x] 无版本的旧 HMAC 链接仍按原签名域验证至过期；签名 URL 不增加原始认证 token、设备标识或客户端名称。
+- [x] `playback` 定向集成目标、Rust build、fmt 与 diff check 通过。
+
+短计划：先增加新链接版本标记与去标记降级失败回归并确认当前链接仍被当作旧票据接受；再新增独立 v2 资源编码、URL 参数解析与双版本验证；最后运行 `playback` 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 时新直放 URL 缺少版本标记，新增断言失败；实现后 `cargo test --locked --test playback -- --test-threads=1` 4/4 通过，覆盖 v2 读取、删改版本及篡改播放会话/媒体源拒绝；`cargo test --locked --lib application::playback::session::tests::emby_direct_stream_v2_signature_is_separate_from_legacy_domain -- --exact` 1/1 通过，确认旧签名与 v2 域不能互验，旧无版本请求保留原验证路径。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Cargo 使用 Toshiba target 目录。
+
+#### LUX-776：签发 Emby 直放票据时保存授权上下文
+
+范围：为每个新 v2 Emby 直放播放会话，在返回 PlaybackInfo 前保存用户、播放会话 ID、过期时间及认证凭证绑定的设备/客户端摘要。多个媒体源共用同一过期时间和一条会话记录。只有凭证未记录的字段才回退至客户端声明；写入失败时不返回任何包含该票据的响应。GET PlaybackInfo 仅签发/持久化票据，不创建播放并发准入。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/emby_catalog.rs`、`src/api/playback.rs`、`src/storage/sessions.rs`、`tests/playback.rs`。
+
+验收标准：
+
+- [x] 新直放链接返回前，按用户与播放会话保存已认证的设备/客户端上下文及精确匹配的过期时间；查询/写入失败时不返回链接。
+- [x] 已绑定 Emby 凭证中的设备/客户端值优先于本次请求头声明；仅缺失字段回退至声明值；不存储凭证、签名或 URL。
+- [x] 同一 PlaybackInfo 中的直放媒体源共用播放会话及过期时间；被动协商不写入播放准入记录。
+- [x] `playback` 定向集成目标、Rust build、fmt 与 diff check 通过。
+
+短计划：先为 PlaybackInfo 新签发链接增加票据上下文、token 绑定设备/客户端优先级及零准入回归并确认当前表没有记录；再在一个共享过期时间下生成所有来源 URL、于响应前写入单条上下文并处理失败；最后运行 `playback` 定向目标、build、fmt 与 diff check。
+
+验证：TDD RED 因 PlaybackInfo 没有创建 `emby_direct_playback_tickets` 上下文行而失败；实现后 `cargo test --locked --test playback -- --test-threads=1` 4/4 通过，其中回归覆盖认证 token 的 `playback-admin`/`PlaybackTest` 值优先于伪造请求头、所有媒体源 URL 共用数据库过期时间、没有并发准入记录，以及注入数据库写失败时返回 503 且不新增票据。`cargo build --locked`、fmt 与 `git diff --check` 通过。未存储 token、签名或 URL。Cargo 使用 Toshiba target 目录。
+
+#### LUX-777：Emby 直放票据逐请求执行黑名单
+
+范围：在验证新 v2 或兼容旧无版本 HMAC 后，要求播放会话票据记录存在、用户/会话/过期时间一致且未撤销。旧版有效链接首次访问时写入一次 NULL 设备/客户端上下文。每次媒体资源请求都检查签发时绑定的设备/客户端及当前可信来源 IP；命中永久撤销票据、停止已活动的播放记录并释放对应并发准入，解除规则后不得复活。上下文缺失但对应设备/客户端规则启用时 fail closed 并撤销。记录命中维度但不记录凭证、URL 或 IP 明文。
+
+预计修改文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/playback/session.rs`、`src/api/media.rs`、`src/storage/sessions.rs`、`tests/playback.rs`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-activity.test.tsx`。
+
+验收标准：
+
+- [x] 每条直放资源请求先校验签名，再确认存储票据的用户、播放会话、过期时间和撤销状态；v2 缺行拒绝，旧无版本票据在有效期内按原 HMAC 兼容并只写一次空上下文。
+- [x] 全站/用户级设备、客户端、IP/CIDR 命中立即撤销直放票据，释放该用户/播放会话的并发准入并停止活动播放记录；规则删除后同一票据仍不可用。
+- [x] 缺少设备/客户端上下文且相应规则启用时拒绝并撤销；缺少来源 IP/坏规则/超限规则及存储或代理设置错误 fail closed。
+- [x] 命中活动记录包含设备、客户端或 IP 维度，不含 token、签名、URL 或 IP 明文；播放请求定向回归、build、fmt 与 diff check 通过。
+
+短计划：先为已签发直放链接添加客户端/设备/IP 新规则阻断、撤销持久化、解除规则不复活和命中原因回归，并确认当前票据仍然可用；再加入签名后票据状态校验、旧链接空上下文兼容、访问规则检查及撤销/准入清理；最后运行 `playback` 与授权逻辑单测、build、fmt 与 diff check。
+
+验证（2026-10-20）：Rust 授权单测 2/2、`cargo test --locked --test playback -- --test-threads=1` 4/4、`cargo build --locked`、fmt 和 diff check 通过。Web 活动记录定向测试 2/2、`pnpm --dir web build` 通过；完整 Web 套件 746/750，4 项失败位于未修改的首页/媒体库卡片预取、虚拟集合链接和媒体详情离线轮询测试。活动页只显示白名单元数据。Cargo 使用 Toshiba target 目录。
+
+#### LUX-778：同步主规格中的注册策略
+
+范围：将 §3.10 与已批准的用户管理设计同步：邀请注册为默认方式，管理员仍可直接建号，可选公开邮箱注册默认关闭；邀请用户邮箱验证后激活，公开注册用户验证后等待管理员审批。明确待验证/待审批账户不能登录或访问媒体。仅更新规格，不改运行时行为、数据库模型或依赖。
+
+预计修改文件（1 个）：`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] §3.10 不再声称系统永久关闭公开注册或后续账户只能由管理员创建。
+- [x] 主规格准确记录默认邀请、可选公开注册审批及待激活账户的访问边界。
+- [x] 改动仅涉及主规格；模块八仍标记取消。
+
+短计划：先核对设计方案的注册默认值及现有 §3.10 条文；再替换冲突的注册规则并记录本任务；最后检索主规格确认旧规则已消失、模块八状态未改变并运行 diff check。
+
+验证（2026-10-20）：主规格已同步邀请注册默认值、公开邮箱注册开关、邮箱验证与管理员审批顺序，以及待激活账户不可登录/访问媒体的边界。检索确认 §3.10 已无旧的注册限制条文；模块八仍标记已取消。`git diff --check` 通过。未改变代码、数据库模型或依赖。
+
+#### LUX-779：建立安全的 SMTP 邮件传输基础
+
+范围：新增基于 Tokio 与 rustls 的 SMTP 客户端及邮件配置模型。SMTP 主机、端口、TLS 模式、发件人和站点 URL 存入设置文件；认证用户名与密码一起写入 config 目录内权限为 0600 的独立凭据文件，不进入数据库、API DTO、调试输出或日志。仅允许 SMTPS 和强制 STARTTLS，不提供明文 SMTP；邮件地址和配置值在构造传输前校验。本任务只建立传输与安全配置基础，不开放 API、不发送用户邮件、不创建邀请或注册行为。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`Cargo.toml`、`Cargo.lock`、`src/application/mail.rs`、`src/application/mod.rs`。
+
+验收标准：
+
+- [x] 使用 Lettre Tokio/rustls 异步传输；SMTP 模式只能是隐式 TLS 或强制 STARTTLS。
+- [x] SMTP 凭据与非敏感配置分开持久化，Unix 凭据文件权限为 0600；删除凭据时清除文件。
+- [x] 配置校验拒绝空/超长主机、非法端口、无效发件人或站点 URL，以及未支持的 TLS 模式。
+- [x] 测试覆盖配置读写、SMTP 凭据隔离/删除、无效配置拒绝和 TLS 传输构造；不访问外部邮件服务器。
+- [x] 不改变现有登录、用户邮箱验证、管理员设置 API 或注册行为。
+
+依赖：LUX-778。SMTP API、队列、邀请和注册后续按独立任务实施。
+
+短计划：先添加安全配置读写、字段校验和 TLS 模式回归并确认失败；再用 Lettre 0.11 的 Tokio/rustls 支持实现配置模型与传输构造；最后运行邮件模块定向库测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：邮件模块定向库测试 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --lib -- -D warnings` 仍被 11 条位于未修改 API/播放/用户存储文件的既有诊断阻断；本模块无新增 Clippy 诊断。仅构造 SMTP TLS 传输，未连接外部 SMTP 服务。依赖 Lettre 0.11.23，Cargo 使用 Toshiba target 目录。
+
+#### LUX-780：提供管理员 SMTP 设置与连通性检查 API
+
+范围：提供管理员读取/更新 SMTP 非敏感配置、单独保存/删除 SMTP 用户名与密码，以及检查已保存 SMTP 服务连接的 API。设置读取和响应只返回 `credentialsConfigured`，不回显凭据；设置更新不得覆盖凭据文件。连通性检查使用 SMTP `NOOP` 验证连接并要求 TLS，不发送测试邮件；连接失败返回固定脱敏错误，SMTP 错误详情不得进入响应或日志。不实现邮件队列、邀请、注册或 Web 设置 UI。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/mail.rs`、`src/api/admin/admin_settings.rs`、`tests/admin_mail_settings.rs`。
+
+验收标准：
+
+- [x] `GET/PUT /api/v1/admin/settings/mail` 读写 SMTP 主机、端口、TLS 模式、发件人和站点 URL；GET 附带配置状态但不返回用户名或密码。
+- [x] `PUT/DELETE /api/v1/admin/settings/mail/credentials` 将用户名和密码一起保存到私有凭据文件或删除文件；所有写操作需要管理员权限与 CSRF。
+- [x] `POST /api/v1/admin/settings/mail/test` 只对已保存配置执行有界超时的 TLS SMTP `NOOP` 连通性检查，不发送邮件；返回不包含供应商错误、用户名或密码的结果。
+- [x] 集成测试覆盖鉴权/CSRF、配置往返与凭据隔离、校验失败、凭据删除和脱敏连接失败。
+- [x] 更新 `docs/API.md`；定向集成目标、`cargo build --locked`、fmt 与 diff check 通过。
+
+短计划：先新增管理员邮件设置集成测试并运行定向目标确认 RED；再补应用层连接检查与管理员路由；最后更新 API 文档，运行定向目标、build、fmt 和 diff check。
+
+验证（2026-10-20）：TDD RED 时新接口返回 404；实现后 `cargo test --locked --test admin_mail_settings` 1/1、邮件模块定向库测试 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成回归用本机 SMTP 停滞连接确认 TLS 握手整体在 8 秒 Tokio 超时内退出；普通设置再次保存后凭据文件保持不变，且 API 响应无用户名/密码。`cargo clippy --locked --lib --test admin_mail_settings -- -D warnings` 被 11 项已有诊断阻断，均位于未修改的用户 API、Emby 播放和用户存储文件，本任务文件没有新增诊断。未连接外部 SMTP 服务。Cargo 使用 Toshiba target 目录。
+
+#### LUX-781：接入管理员 SMTP 配置界面
+
+范围：在用户管理全局设置的“邮件”页接入 LUX-780 SMTP API，管理员可保存 SMTP 主机、端口、TLS 模式、发件人和站点地址，单独更新或删除认证凭据，并执行连通性检查。页面只显示凭据是否已配置，不预填或缓存密码；发送测试只检查 SMTP 连接，不实际发送邮件。注册方式、邀请、邮件队列和公开注册流程仍由后续模块二任务实现。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-mail-settings.test.tsx`。
+
+验收标准：
+
+- [x] 邮件设置页显示并编辑完整 SMTP 配置；加载、保存失败和保存成功均有可访问状态提示。
+- [x] 凭据以用户名/密码组合独立保存；页面不回显旧凭据，保存后清空密码输入，并显示已配置状态；删除凭据有明确操作反馈。凭据请求不进入 React Query mutation cache。
+- [x] 连通性检查通过 LUX-780 API，展示成功或脱敏失败消息；操作中禁用重复提交。
+- [x] Vitest 覆盖配置加载与保存、凭据不回显/保存/删除、连接检查及错误状态。
+- [x] `pnpm --dir web build` 通过；本任务仅修改计划中的 SMTP 页面、API 类型/客户端和测试文件。
+- [ ] `pnpm --dir web test` 全量通过。完成时重复结果为 751 passed、4 failed；失败位于既有首页预取、LibraryCard 预取/虚拟集合链接和媒体查询轮询用例，详见验证记录。
+
+短计划：先增加邮件设置页组件测试并确认 RED；再补类型、API 客户端方法和全局设置页表单；最后运行指定 Web 测试与构建并记录结果。
+
+验证（2026-10-20）：组件测试先因 SMTP 密码仍保留在 React Query mutation cache 而失败；改为直接执行凭据请求后，`tests/admin-user-mail-settings.test.tsx` 5/5 通过，并确认 mutation cache 不含密码。`pnpm --dir web build` 通过。完整 `pnpm --dir web test` 连续运行两次，最终均稳定为 751 passed、4 failed：`home-page.test.tsx` 首页媒体库预取 1 项、`library-card.test.tsx` 预取与虚拟集合链接 2 项、`media-query-polling.test.tsx` 图片查询调用次数 1 项；均为既有基线失败，与本任务文件无关。第一次全量运行另有 1 项头像裁切失败，单独重跑通过，第二次全量运行未复现。Playwright 在本机临时配置上确认邮件设置保存成功；390×844 移动视口页面宽度无横向溢出。未执行 SMTP NOOP 或联系外部邮件服务器。
+
+#### LUX-782：建立持久化邮件队列存储合同
+
+范围：新增 SQLite 与 PostgreSQL 邮件 outbox 表及内部存储接口，为之后 SMTP worker 提供持久化排队、原子领取、租约恢复、完成/失败状态和有界分页查询。本任务不启动投递 worker、不提供 API/UI，也不发送邮件。Outbox 仅保存收件地址、模板类型和邮件挑战记录 ID（挑战再关联邀请/注册业务记录）；不保存渲染正文、SMTP 凭据或一次性验证凭证。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0199_mail_outbox.sql`、`migrations-postgres/0199_mail_outbox.sql`、`src/storage/mod.rs`、`src/storage/repository.rs`（存储测试内置于 repository 模块）、`tests/postgres_database.rs`（更新空库迁移版本断言并检查 mail outbox schema）。
+
+验收标准：
+
+- [x] 新 migration 可从空 SQLite 与 PostgreSQL 数据库运行，定义有限状态、幂等键、尝试次数、下次可投递时间和领取租约，并建立适用索引。
+- [x] 存储接口支持幂等入队、原子领取到期项、租约超时恢复、标记完成/失败、排定下一次尝试及有上限的分页查询。
+- [x] 持久化行不包含正文、SMTP 凭据或明文一次性 token；错误字段只接受安全错误代码。
+- [x] 自动化测试覆盖并发领取、重复入队、租约恢复、状态迁移、分页上限以及空库 migration。
+- [x] 运行指定存储库测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先为 outbox 表和存储合同补回归测试并运行 RED；再新增两种数据库 migration 与存储实现；最后运行目标测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib storage::repository::mail_outbox_tests` 5/5、忽略的 PostgreSQL 空库专项 `postgres_mail_outbox_migration_applies_to_an_empty_database` 1/1、`cargo build --locked`、fmt 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。PostgreSQL 测试确认新库迁移到 schema 199、outbox 有 13 列且不含正文/密码/token 字段。`cargo clippy --locked --lib -- -D warnings` 仍被 11 项既有诊断阻断，分布于未修改的 admin user API、Emby 播放、user permission copy 与 user storage；本任务文件无新增 Clippy 诊断。旧的 PostgreSQL 全 bootstrap 用例已更新 schema 断言，但继续执行时在未修改的 `src/storage/users.rs:1937` 因 `BOOLEAN` 被解码为 `i64` 而 panic；独立 outbox 空库 migration 用例通过。
+
+#### LUX-783：建立注册邮件凭证存储
+
+范围：新增与邮件模板引用关联的一次性注册凭证存储，覆盖邀请和邮箱验证。持久化只保存随机凭证的 32 字节校验摘要、收件邮箱、凭证类型、业务记录引用与有效/消费/撤销时间；不保存原始凭证、密码或邮件正文。本任务不创建邀请或注册业务记录、不发送邮件、不提供 API/UI。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0200_mail_challenges.sql`、`migrations-postgres/0200_mail_challenges.sql`、`src/storage/mod.rs`、`src/storage/repository.rs`（存储测试内置于 repository 模块）、`tests/postgres_database.rs`（验证空库 migration 和凭证表结构）。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL migration 从空数据库建立凭证表；凭证类型有限，摘要必须为 32 字节，邮箱、业务引用和时间字段有界。
+- [x] 存储接口支持创建凭证、按 ID 读取、只消费一次、撤销指定目标的凭证；过期、已消费、已撤销凭证不能再次消费。
+- [x] 表中仅保存凭证摘要，不保存原始 token、密码或正文；创建与消费校验固定错误，不回显摘要。
+- [x] 自动化测试覆盖两种凭证类型、一次性消费、过期/撤销拒绝、摘要长度约束以及空库 migration。
+- [x] 运行指定存储库测试、PostgreSQL 空库凭证 migration 测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先在 SQLite 存储测试和 PostgreSQL 空库测试中写凭证表与消费合同并确认 RED；再新增 SQLite/PostgreSQL migration 和存储方法；最后运行两个定向目标、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib storage::repository::mail_outbox_tests` 7/7、忽略的 PostgreSQL 空库专项 `postgres_mail_challenge_migration_applies_to_an_empty_database` 1/1、`cargo build --locked`、fmt 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。测试覆盖两类凭证、错误摘要、到期、撤销、单次消费、数据库列约束和空库迁移。`cargo clippy --locked --lib -- -D warnings` 被 11 项既有诊断阻断，均位于未修改的 admin user API、Emby 播放、user permission copy 与 user storage；本任务文件无新增 Clippy 诊断。未发送邮件。
+
+#### LUX-784：建立可重建的注册邮件凭证
+
+范围：为持久化 mail challenge 提供稳定的 HMAC 凭证派生器，使邮件 worker 在重试或重启后重建同一链接 token，同时数据库只保存摘要。派生密钥单独保存在 config 目录 0600 文件；拒绝符号链接、错误权限或非 32 字节密钥。本任务不接入 SMTP 投递、不创建挑战或业务记录、不开放 API。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mail.rs`（定向测试内置于 mail 模块）。
+
+验收标准：
+
+- [x] 首次读取生成并私有保存 32 字节密钥；后续读取及并发初始化使用同一密钥，拒绝符号链接、错误权限和损坏密钥。
+- [x] 凭证按挑战 ID、类型和过期时间进行 HMAC-SHA256 域隔离，URL-safe 且在进程重启后稳定；其他 ID/类型/过期时间得到不同凭证。
+- [x] 数据库存储摘要由 SHA-256 计算；验证使用常量时间比较；原始 token 不写入文件或日志。
+- [x] 自动化测试覆盖持久化、并发初始化、域隔离、摘要验证和密钥文件权限。
+- [x] 运行 mail 模块定向测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先为稳定派生、密钥文件权限和并发初始化增加失败测试；再实现私有密钥的读写与 HMAC token 派生；最后运行邮件模块测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib application::mail::tests` 9/9、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。测试覆盖首次私有创建、密钥重载稳定性、并发初始化、权限/符号链接/长度拒绝、凭证域隔离、URL-safe 编码、摘要和验证。全目标全 feature Clippy 仍失败于 15 项既有诊断（11 项库代码、4 项测试代码），均位于未修改的管理员 API、Emby 播放、权限复制或用户存储文件；`src/application/mail.rs` 无 Clippy 诊断。
+
+#### LUX-785：让邮件挑战存储接受预先分配的挑战 ID
+
+范围：使注册邮件挑战的应用层可先用挑战 ID 派生 HMAC token 与摘要，再将该 ID 和摘要一起写入数据库。当前 storage 方法在插入时自行生成 ID，与 LUX-784 的 ID 绑定凭证合同不匹配。本任务只调整内部存储输入，不改变 schema、公开 API 或凭证算法。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`（定向存储测试内置于 repository 模块）。
+
+验收标准：
+
+- [x] 创建挑战的内部输入必须包含调用方预先分配的 ID；storage 校验 ID 并原样持久化，不再在插入后生成 ID。
+- [x] 重复 ID 由数据库唯一约束拒绝；空白、控制字符和超长 ID 在进入 SQL 前拒绝。
+- [x] 现有挑战摘要、消费、过期与撤销行为保持不变，并有定向回归覆盖。
+- [x] 运行邮件挑战存储定向测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先增加预分配 ID 保留和边界拒绝测试并确认 RED；再把 ID 纳入挑战输入并在 storage 校验、持久化；最后运行定向存储测试、build、fmt 和 diff check。
+
+验证（2026-10-20）：定向存储测试 `cargo test --locked --lib storage::repository::mail_outbox_tests` 8/8、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。非法 ID 测试同时断言没有执行 SQL，重复 ID 由主键唯一约束拒绝。全目标全 feature Clippy 仍失败于 15 项既有诊断，均位于未修改的管理员 API、Emby 播放、权限复制或用户存储文件；本任务文件没有新增诊断。
+
+#### LUX-786：投递持久化注册邮件队列
+
+范围：启动有界邮件 worker，领取持久化 outbox 项，按挑战 ID 重建并验证一次性凭证，生成纯文本邀请/邮箱验证邮件并通过已保存的 TLS SMTP 配置发送。成功、可重试失败和不可重试记录分别更新队列状态；不在数据库、文件或日志中保存原始凭证。本任务不创建邀请或公开注册业务记录，也不开放管理队列 API。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mail_worker.rs`、`src/application/mod.rs`、`src/main.rs`（worker 测试内置于 mail_worker 模块）。
+
+验收标准：
+
+- [x] worker 每次只领取一封邮件，使用租约恢复崩溃项；成功置为 SENT，临时错误按最多 5 次退避重试，过期/撤销/不匹配挑战立即置为 FAILED。
+- [x] 仅当 outbox 模板、收件地址、挑战类型、状态和 SHA-256 摘要均匹配时才发送；邀请与验证链接使用 URL fragment 携带短期 token。
+- [x] worker 使用已保存 SMTPS/STARTTLS 配置；SMTP 错误、收件地址、邮件正文、token、用户名和密码不进入日志；测试使用假的发送器，不连接外部邮件服务。
+- [x] 自动化测试覆盖邮件正文/链接、成功状态、不可重试挑战、SMTP 失败重试、最多尝试次数及正常关闭。
+- [x] 运行 mail worker 定向测试、`cargo build --locked`、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先写邮件链接与状态转移失败测试；再实现消息验证、纯文本渲染、重试和生命周期受控的后台 worker；最后运行 mail worker 定向测试、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib application::mail_worker::tests` 5/5、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；所有 Cargo 命令使用 Toshiba target 目录。邮件正文仅包含纯文本链接；链接 token 位于 fragment。过期挑战不会交给发送器，SMTP 错误在 5 次尝试后转为 FAILED；worker 在关闭信号下及时退出。SMTP 凭据、收件地址、正文和错误详情均不写入日志。此前全目标全 feature Clippy 检查仍有 15 项既有诊断，涉及未修改的管理员 API、Emby 播放、权限复制及用户存储文件；本任务文件没有新增诊断。
+
+#### LUX-787：持久化邀请权限快照与生命周期
+
+范围：为邀请注册建立 SQLite/PostgreSQL 表，保存规范化收件邮箱、可选创建者、明确生命周期状态、7 天有效期、所选权限预设来源和创建时权限快照。支持单次接受、撤销和过期状态；本任务只修改 schema 并验证迁移，不提供 storage API、管理员接口或注册页面，不保存邮件凭证。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0201_user_invitations.sql`、`migrations-postgres/0201_user_invitations.sql`、`tests/storage.rs`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] 邀请行记录邮箱、创建者、状态、有效期、权限预设标识与版本、权限 JSON 快照及接受/撤销时间；创建者和已接受用户删除时保留邀请历史。
+- [x] 数据库约束拒绝无效状态、时间和非对象快照；同一规范化邮箱最多有一条待处理邀请，终态记录可保留审计。
+- [x] SQLite 与 PostgreSQL 空库迁移建立同等 schema、索引和外键规则；不加入 token、密码或邮件正文列。
+- [x] 运行 SQLite 迁移定向测试、PostgreSQL schema 合同检查、Rust build、fmt 与 diff check；Cargo 命令使用 Toshiba target 目录。
+
+短计划：先添加 SQLite 空库和 PostgreSQL 空库的邀请 schema 失败测试；再分别新增迁移及索引/约束；最后运行定向迁移测试、build、fmt 与 diff check。
+
+验证（2026-10-20）：SQLite 空库定向测试 `cargo test --locked --test storage user_invitations_migration_runs_from_an_empty_database -- --exact` 1/1，PostgreSQL 16 空库迁移 `cargo test --locked --test postgres_database postgres_mail_and_invitation_migrations_apply_to_an_empty_database -- --ignored --exact` 1/1；`cargo build --locked`、fmt 与 diff check 通过。测试覆盖待处理邮箱唯一索引、无效状态/非对象快照拒绝、终态后可再次邀请，以及用户删除后邀请历史保留。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
+#### LUX-788：实现邀请存储与邮件入队事务
+
+范围：提供创建、读取、过滤分页和撤销邀请的 storage 合同。新邀请、关联邀请挑战及 outbox 邮件必须在同一事务内写入；创建前把该邮箱已过期的待处理邀请转为终态。列表按服务端上限分页，并将已到期待处理项显示为 EXPIRED。本任务不实现邀请业务校验、公开 API 或 Web 界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`（含 SQLite 与 PostgreSQL storage 回归）。
+
+验收标准：
+
+- [x] 邀请/挑战/outbox 关联不匹配或任何一项写入失败时整笔事务回滚；重复待处理邮箱返回稳定冲突结果。
+- [x] 创建会把同邮箱已过期邀请标记为 EXPIRED；读取和过滤分页返回准确状态/总数，页大小受 100 条上限约束且排序稳定。
+- [x] 撤销只作用于尚未过期的待处理邀请；已接受、已撤销、已过期或不存在的邀请不会被重复改变。
+- [x] SQLite 与 PostgreSQL 均验证创建、队列原子性、过期替换、冲突、分页和撤销；定向测试、build、fmt 与 diff check 通过。
+
+短计划：先为 storage 写入、分页、终态与原子回滚补充失败回归；再实现事务、硬上限分页及 CAS 撤销；最后运行 SQLite/PostgreSQL 定向目标、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib user_invitation_storage_` 3/3；本机 PostgreSQL 16 定向用例 `cargo test --locked --lib postgres_user_invitation_storage_covers_lifecycle_and_atomicity -- --ignored` 1/1；`cargo build --locked`（最终验证无 warning）、`cargo fmt --all -- --check` 与 `git diff --check` 通过。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
+#### LUX-789：建立邀请注册 application service
+
+范围：为管理员邀请建立 application service，按已选权限预设复制不可变快照，规范化并验证目标邮箱，创建 7 天有效的单次挑战凭证并将邮件原子入队；提供有界、可筛选的邀请分页和待处理邀请撤销。创建结果仅在当前操作返回可复制的相对邀请链接，原始 token 不写入持久化数据或日志。本任务不开放 HTTP API，不实现公开注册/账号激活或 Web 页面，不实际发送邮件。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/mod.rs`、`src/application/user_invitations.rs`（测试内置于新 service 模块）。
+
+验收标准：
+
+- [x] 邮箱在服务层校验并规范为小写；有效邀请必须绑定现存权限预设和创建时权限快照，默认期限为 7 天。
+- [x] 创建同时写入邀请、HMAC 挑战摘要和 outbox 项；重复待处理邮箱得到稳定冲突；仅响应包含可复制链接，数据库只存摘要。
+- [x] 邀请列表支持状态筛选、稳定排序和最多 100 条分页；撤销只作用于尚未到期的待处理邀请，并沿用 storage 的挑战/outbox 原子失效。
+- [x] SQLite 测试覆盖创建快照、链接校验、重复邮箱、状态筛选分页、撤销和 token 不落库；build、fmt、diff check 通过。
+
+短计划：先登记服务合同并添加 SQLite 回归；再实现邮箱/预设校验、7 天快照与邮件入队、分页和撤销；最后运行 `cargo test --locked --lib application::user_invitations::tests`、build、fmt 与 diff check。
+
+验证（2026-10-20）：`cargo test --locked --lib application::user_invitations::tests` 3/3、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；本机 `arm64`，Cargo 使用 Toshiba target 目录。测试未连接 SMTP；服务返回的单次邀请 URL 使用片段携带 token，存储仅保留 HMAC 验证所需的摘要。
+
+#### LUX-790：开放管理员邀请管理 API
+
+范围：在 Lux 管理 API 提供邀请创建、状态筛选分页与撤销端点。创建和撤销要求管理员身份与适用的 CSRF 校验，记录不含邮箱、邀请链接或凭证的审计事件；DTO 仅暴露邀请状态与权限预设来源，不序列化权限快照或挑战摘要。创建响应一次性返回可复制邀请链接。本任务不做邮件重发端点、公开注册 API 或 Web 界面。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/api/admin.rs`、`src/api/admin/admin_user_invitations.rs`、`tests/admin_user_invitations.rs`。
+
+验收标准：
+
+- [x] 管理员可创建邀请、按状态分页查询和撤销；页大小默认 20、上限 100，服务端拒绝无效状态筛选。
+- [x] 创建请求经过管理员与 CSRF 校验；重复待处理邮箱返回 409；创建和撤销写入不含 PII、凭证或链接的审计事件。
+- [x] 列表 DTO 不包含权限快照、token 摘要或 token；只有创建响应含一次性链接，链接 token 位于 URL fragment。
+- [x] HTTP 回归覆盖未认证/缺失 CSRF、创建、重复冲突、状态过滤分页、撤销和响应敏感字段；定向集成测试、build、fmt、diff check 通过。
+
+短计划：先添加 HTTP 集成回归并确认路由返回 404；再添加隔离的 admin handler 模块和显式 DTO，连接 LUX-789 service；最后运行定向测试、build、fmt、Clippy 和 diff check。
+
+验证（2026-10-20）：路由实现前，HTTP 回归因端点返回 404 失败；实现后 `cargo test --locked --test admin_user_invitations` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。回归覆盖未认证、缺失 CSRF、邀请创建/重复冲突、默认与上限分页、状态筛选、撤销、DTO 字段缺席和审计脱敏。全目标全 feature Clippy 被 11 项既有库代码与 15 项既有测试代码诊断阻断，均在本任务文件之外。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
+#### LUX-791：原子重新入队有效邀请邮件
+
+范围：为已有邀请提供存储层重发邮件操作：仅对仍待处理且未过期的邀请，找到邮箱、邀请 ID 和有效期匹配的未消费、未撤销邀请挑战，并原子地新增 outbox 项。重复使用同一幂等键不得重复入队；不同幂等键允许代表一次新的发送请求。重发复用原挑战和 token，不延长邀请有效期、不创建新挑战，也不写入正文或凭证。本任务不开放应用服务、HTTP API、速率限制或 Web 界面，不修改 schema。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 有效邀请的重发 outbox 项与邀请、邮箱和现有有效挑战一致，并在一个事务内创建。
+- [x] 同一幂等键重复调用仅有一个 outbox 项；不同幂等键可产生独立重发项，但均引用同一挑战。
+- [x] 不存在、已接受、已撤销、已过期邀请，以及缺失、已消费、已撤销或过期挑战均不入队；错误幂等键不会污染队列。
+- [x] SQLite 与 PostgreSQL 回归覆盖有效重发、幂等、挑战复用和不可重发状态；定向存储测试、build、fmt 与 diff check 通过。
+
+短计划：先在 SQLite 与 PostgreSQL 邀请存储回归中增加重发合同并确认 RED；再实现按邀请/挑战状态校验并原子入队；最后运行两个定向存储目标、build、fmt、Clippy 和 diff check。
+
+验证（2026-10-20）：新增 SQLite 回归先因缺少重发存储方法而编译失败；实现后 `cargo test --locked --lib user_invitation_storage_` 5/5 通过，忽略的 PostgreSQL 生命周期目标 `cargo test --locked --lib postgres_user_invitation_storage_covers_lifecycle_and_atomicity -- --ignored` 1/1 通过。`cargo build --locked`、fmt 与 diff check 通过。全目标全 feature Clippy 仍被 11 项既有库代码与 15 项既有测试代码诊断阻断，均不在本任务新增代码中。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
+#### LUX-792：限制邀请邮件发送频率
+
+范围：对同一规范化收件邮箱实施持久化滚动频率限制：每小时最多排入 5 封邀请邮件，涵盖新邀请和重发；达到上限后新请求不创建邀请、挑战或 outbox 项，并通过 Lux API 返回 429。额度从持久化 outbox 记录计算，发送失败和等待重试也占额度；重复使用同一重发幂等键只返回原结果，不占新额度。此任务不限制公开注册邮件，不开放重发路由，不修改 schema。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`src/application/user_invitations.rs`、`src/api/admin/admin_user_invitations.rs`。
+
+验收标准：
+
+- [x] 新邀请与重发共用每邮箱每小时 5 封上限；并发入队不能超过限额，重复幂等调用不增加邮件数。
+- [x] 达到限额后新邀请写入事务回滚、重发不入队，并返回稳定的 RATE_LIMITED/429；窗口过期后可以再次发送。
+- [x] SQLite 与 PostgreSQL 回归覆盖上限、窗口恢复、重发幂等和无副作用拒绝；相关存储目标、build、fmt 与 diff check 通过。
+
+短计划：先为存储和应用层限额补充 SQLite/PostgreSQL 回归并确认 RED；再让邀请创建与重发在锁定事务内使用同一 outbox 计数规则，映射为 HTTP 429；最后运行定向存储、应用和 HTTP 回归，build、fmt、Clippy 和 diff check。
+
+验证（2026-10-20）：新增回归先因缺少频率结果类型而编译失败；实现后 `cargo test --locked --lib user_invitation_` 7/7、应用层限额传播 1/1、HTTP 429 映射 1/1、管理员邀请 HTTP 集成 1/1、忽略的 PostgreSQL 生命周期/频率回归 1/1 通过。PostgreSQL 回归还覆盖并发重发下只允许一封进入队列、幂等重试不重复计数及一小时窗口恢复。`cargo build --locked`、fmt 与 diff check 通过。全目标全 feature Clippy 仍被 11 项既有库代码与 15 项既有测试代码诊断阻断，没有诊断指向本任务新增实现。所有 Cargo 命令使用 Toshiba target 目录，本机 `arm64`。
+
+#### LUX-793：开放管理员邀请邮件重发 API
+
+范围：为仍有效的待处理邀请开放管理员重发端点，将现有邀请挑战对应的邮件原子加入 outbox，不创建新邀请或挑战、不延长有效期，也不再次返回邀请 token。请求要求管理员身份、CSRF 和 `Idempotency-Key`；同一幂等键重试返回成功但不重复入队，不同键表示新的发送请求并继续受 LUX-792 的每邮箱频率限制。记录脱敏审计事件。本任务不增加邀请管理 Web 操作，也不实现受邀用户激活。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/storage/mod.rs`、`src/application/user_invitations.rs`、`src/api/admin/admin_user_invitations.rs`、`tests/admin_user_invitations.rs`。
+
+验收标准：
+
+- [x] `POST /api/v1/admin/user-invitations/{id}/resend` 仅接受管理员和有效 CSRF；缺少或格式错误的 `Idempotency-Key` 拒绝且不写入 outbox。
+- [x] 有效待处理邀请排入引用原挑战的邮件并返回 202；重复幂等键不新增 outbox，邀请链接、凭证及有效期不返回或改变。
+- [x] 不存在、已接受、已撤销或过期邀请返回稳定状态错误；超出 LUX-792 额度映射为脱敏 429，不产生新邮件。
+- [x] 审计事件只包含邀请 ID 与固定事件类型，不记录邮箱、幂等键、邀请链接或凭证；集成回归覆盖权限、CSRF、入队、幂等、拒绝与脱敏。
+- [x] 更新 `docs/API.md`；定向集成目标、build、fmt 与 diff check 通过。
+
+短计划：先在管理员邀请 HTTP 集成目标添加重发路由回归并确认 RED；再增加 application service、管理员 handler 和 API 合同文档；最后运行定向集成测试、build、fmt、Clippy 与 diff check。
+
+验证（2026-10-20）：RED 回归在新增路由前收到 405；实现后 `cargo test --locked --test admin_user_invitations` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。集成覆盖未认证、缺失 CSRF/幂等键、空白幂等键、重复和冲突键、同邮箱 5 封上限、链接/挑战/期限不变、撤销/接受/过期/不存在邀请拒绝及审计脱敏。全目标全 feature Clippy 仍被 11 项既有库代码和 15 项既有测试代码诊断阻断，诊断均位于本任务文件之外。Cargo 使用 Toshiba target 目录，本机 `arm64`。
+
+#### LUX-794：异步分批删除媒体库
+
+范围：管理员删除媒体库时，在一个短事务中将媒体库置为 `DELETING` 并持久化删除任务，接口返回 `202 Accepted` 和任务 ID。媒体库立即从管理员可用库列表、普通用户及 Emby 的库访问中隐藏，并拒绝新的扫描和写入；后台 worker 取消并等待现有扫描退出，按有界批次提交媒体条目、文件索引和扫描任务数据的删除，全部完成后才删除媒体库行并清理插件配置。原媒体文件保留。管理员可以分页查看任务状态、阶段、已处理记录数和稳定错误码，并重试失败或重启后取消的任务；重试从已提交的数据状态继续。服务重启遵循全局标准，将运行任务标为 `CANCELLED`，不自动续跑。
+
+HTTP 合同：`DELETE /api/v1/admin/libraries/{libraryId}` 返回 `202` 与 `{ job }`；`GET /api/v1/admin/library-deletion-jobs?page=&pageSize=&status=` 返回有界分页；`POST /api/v1/admin/library-deletion-jobs/{jobId}/retry` 返回 `202`。重复提交正在运行的删除请求返回现有任务。删除任务记录不对普通用户开放。
+
+预计修改文件（23 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`migrations/0202_library_deletion_jobs.sql`、`migrations-postgres/0202_library_deletion_jobs.sql`、`src/domain/ids.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/library.rs`、`src/storage/library_roots.rs`、`src/storage/users.rs`、`src/storage/catalog.rs`、`src/storage/jobs/shutdown.rs`、`src/storage/library_deletion.rs`、`src/application/mod.rs`、`src/application/admin_library_settings.rs`、`src/application/libraries.rs`、`src/application/library_deletion.rs`、`src/api/admin/admin_libraries.rs`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/lib/api/query-keys.ts`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/src/features/admin/AdminOperationsPage.tsx`。
+
+验收标准：
+
+- [ ] SQLite 与 PostgreSQL 从空库升级后均创建任务表、`ACTIVE/DELETING` 生命周期字段及删除外键索引。
+- [ ] 删除请求不等待扫描退出或大级联删除；任务记录和 `DELETING` 状态原子写入，重复请求不会创建第二个活动任务。
+- [ ] 删除中的库对管理员可用库列表、用户库列表、Emby 库枚举和条目访问不可见；新扫描被拒绝；已有扫描在后台取消并退出后才开始清理。
+- [ ] 大型关系数据按有界批次和独立事务删除，批次结果与进度原子提交；最终事务删除媒体库并完成任务。任务失败或重启后媒体库保持隐藏，可从已提交数据重试。
+- [ ] 管理员任务列表分页并显示阶段、已处理数、状态和稳定错误码；Web 接受 `202` 后立即从活动库列表移除该库，并在“任务与日志”显示后台进度及重试操作。
+- [ ] 更新 `docs/API.md`；`cargo build --locked`、格式检查、Web 测试/构建及 diff 检查通过。所有 Cargo 命令使用 Toshiba 共享 target 目录。
+
+短计划：先新增双后端迁移和存储任务状态/批次操作；再增加生命周期访问栅栏、后台 worker 与重启取消/重试；随后接入管理员 API 和任务审计；最后接入 Web 删除反馈、任务进度和重试，并运行相应检查。
+
+#### LUX-795：建立管理员邀请 Web API 客户端合同
+
+范围：为管理员邀请页面提供有类型的分页查询、邀请创建、重发和撤销客户端方法。创建响应中的一次性邀请链接仅作为调用结果返回；客户端不持久化链接或 token。重发请求必须传入调用方生成的稳定 `Idempotency-Key`。本任务不实现邀请页面或公开注册流程。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 邀请状态、记录、分页响应和创建响应具有显式类型；列表过滤与分页参数符合管理员 API。
+- [x] 客户端提供查询、创建、重发和撤销方法；写请求使用现有 same-origin/CSRF 行为，重发正确设置 `Idempotency-Key`。
+- [x] 客户端测试覆盖路径、方法、查询参数、请求体、CSRF 与幂等请求头。
+- [x] 定向 Vitest 与 `pnpm --dir web build` 通过。
+
+短计划：先在 `api-client.test.ts` 添加邀请方法合同并确认 RED；再定义 DTO 类型和四个客户端方法；最后运行定向 Vitest、Web build 与 diff check。
+
+验证（2026-10-20）：新增 API 客户端回归先因列表方法缺失而失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 82/82 通过，`pnpm --dir web build`（含 `tsc --noEmit`）与 `git diff --check` 通过。客户端请求字段与管理员邀请 API 的实际 handler/DTO 对齐。
+
+#### LUX-796：实现管理员邀请管理界面
+
+范围：在用户管理中增加注册邀请视图，支持管理员按状态分页查询邀请、指定邮箱并选择权限预设创建邀请、查看当前邮件入队结果、复制一次性邀请链接、重新发送和撤销待处理邀请。创建时沿用所选预设的媒体库权限快照，不额外选择或覆盖媒体库。复制链接时使用邮件设置中的 `siteUrl` 生成绝对地址并保留站点子路径；一次性链接只保留在当前组件内存，不进入 React Query 数据、浏览器持久化存储或日志；复制能力不可用时提供可手动选择的链接。重发失败后再次点击沿用原 `Idempotency-Key`，成功后新的发送请求生成新键。本任务不实现受邀用户激活、公开注册/审批或邮件队列管理页面。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/AdminUserInvitationsPanel.tsx`、`web/src/lib/api/query-keys.ts`、`web/tests/admin-user-invitations.test.tsx`。
+
+验收标准：
+
+- [x] 用户管理页提供邀请视图，按状态及服务端页码读取邀请，并显示邮箱、预设、状态和有效期。
+- [x] 创建邀请要求有效邮箱和现存权限预设；表单明确展示预设的媒体库访问范围，创建成功显示邮件入队结果和一次性链接。
+- [x] 一次性链接仅在组件内存中提供复制/手动选择，不进入查询缓存或浏览器持久化存储。
+- [x] 复制链接按邮件设置中的 `siteUrl` 生成绝对地址，并保留反向代理部署的子路径。
+- [x] 仅待处理邀请提供重发和撤销；重发幂等键在失败重试时保持一致，撤销需确认，成功操作刷新邀请列表。
+- [x] 新增组件回归覆盖筛选、分页、创建/链接复制、重发幂等重试、撤销确认与刷新；定向 Vitest、Web build 和 diff check 通过。
+
+短计划：先新增邀请面板回归并确认 RED；再接入用户管理导航和邀请 API，按状态与页码查询并在组件状态中处理一次性链接及重发幂等键；最后运行定向回归、Web build 与 diff check。
+
+验证（2026-10-20）：邀请组件回归 `pnpm --dir web exec vitest run tests/admin-user-invitations.test.tsx` 4/4 通过，覆盖配置 `siteUrl` 子路径、链接复制及剪贴板不可用时手动选择；`pnpm --dir web build` 和 `git diff --check` 通过。此前依赖安装 `pnpm --dir web install --frozen-lockfile` 通过。隔离的本地浏览器预览确认邀请视图、预设媒体库范围、表格和操作可见，控制台无 error/warning。全量 `pnpm --dir web test` 中 Vitest 755/760 通过；5 项失败为 LUX-794 删除媒体库旧断言，以及未由本任务修改的首页/媒体卡片预取、虚拟合集链接和媒体详情轮询测试。此次未改动其余 LUX-794 文件。
+
+#### LUX-797：原子接受邀请并创建已验证账户
+
+范围：建立受邀用户激活的 storage 合同。凭证摘要仅解析有效的邀请挑战和对应待处理邀请；接受操作在单个事务内验证挑战/邀请状态，创建带已验证邮箱与邀请权限快照的活动用户、写入指定媒体库授权、标记邀请已接受并消费凭证。本任务不开放 HTTP API 或 Web 表单，不实现公开邮箱注册/审批。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 按凭证摘要读取时仅返回未消费、未撤销、未过期且与待处理邀请邮箱/期限匹配的邀请快照，不返回原始凭证。
+- [x] SQLite 与 PostgreSQL 均在一个事务内创建已验证活动用户、复制角色/播放/媒体库权限、接受邀请并消费凭证。
+- [x] 过期、撤销、重复消费、摘要不匹配或用户名冲突不会留下用户、权限关联、接受状态或已消费凭证等部分写入。
+- [x] 定向 storage 回归、`cargo build --locked`、格式检查和 diff check 通过；Cargo 使用 Toshiba 共享 target 目录。
+
+短计划：先在 storage 回归中覆盖成功接受、单次消费、错误凭证和冲突回滚并确认 RED；再增加查找与原子接受 storage 方法；最后运行定向 SQLite/PostgreSQL 回归、build、fmt 与 diff check。
+
+结果（2026-10-20）：SQLite 接受流程在单事务内写入已验证活动账户、角色、下载/播放/转码策略和指定媒体库授权，并同时接受邀请、消费挑战；并发接受仅一个调用成功，重复消费返回不可接受。邮箱或期限不匹配、过期、撤销、错误摘要、用户名冲突和已注册邮箱均不会创建部分账户；授权 FK 写入失败会回滚账户、邀请和挑战状态。定向 SQLite storage 回归 8/8 通过；隔离 PostgreSQL 生命周期与接受回归 1/1 通过，验证 PostgreSQL 权限快照、并发单次消费、注册邮箱冲突及授权失败回滚。`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。最新 `cargo test --locked --all-targets` 为 1119 passed、5 failed、27 ignored，库测试失败后未运行后续集成 targets。失败为：三个已在干净基线记录的 fill-missing 测试；`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`（单独复跑仍失败，先前任务已有记录）；`shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（并行 LUX-794 新增一条 shutdown 更新后实际查询数 10，旧断言期望 9）。全目标 Clippy 被 15 条既有告警阻断（管理 API、播放、权限复制、用户存储和旧测试），未报告本任务新增告警。
+
+### 用户管理剩余实施任务（模块八除外）
+
+按 `docs/USER-MANAGEMENT-DESIGN.md` 与当前实现记录审计后，模块四、模块五的访问执行、模块六以及模块七的服务端存储/认证执行已由此前任务覆盖。仍需补齐邀请接受公开流程、公开注册审批、已登录用户邮箱重验、访问黑名单管理界面与当前管理员自锁保护；并修正模块五索引页中已过期的“尚未拦截”说明。模块八继续废除。本清单不提前实现后续任务，每次仍只执行一个 `LUX-*`。
+
+#### LUX-798：实现邀请接受 application service
+
+范围：消费 LUX-797 的原子 storage 合同，按凭证摘要查找仍有效的邀请，验证 HMAC 挑战，规范化账户资料并使用现有 Argon2id 服务哈希密码，再原子创建已验证活动账户。错误凭证、重放、过期邀请、用户名冲突及已注册邮箱映射为稳定业务错误；不开放 HTTP API 或 Web 页面。
+
+预计修改文件（2 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_invitations.rs`（定向测试内置于模块）。
+
+验收标准：
+
+- [x] 仅有效邀请 token 可创建账户；Token、密码和摘要不进入日志或错误响应。
+- [x] 用户名、显示名称和密码有界校验，密码仅以 Argon2id 哈希交给 storage。
+- [x] 过期、重放、无效签名、用户名冲突和已注册邮箱均返回稳定错误且不改变账户或邀请。
+- [x] application 定向回归、`cargo build --locked`、fmt 与 diff check 通过；Cargo 使用 Toshiba target 目录。
+
+短计划：先添加 service 成功/失败与重放回归并确认 RED；再连接 signer、密码哈希与原子 storage 接口；最后运行定向测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：邀请 service 通过挑战摘要查找有效待处理邀请，并再次验证 HMAC；之后规范化用户名/显示名称、限制输入长度，以 Argon2id 哈希密码并调用 LUX-797 的单事务接受接口。无效 token、重放、超长密码、用户名冲突和已注册邮箱不会部分创建账户；冲突时邀请保持待处理。没有在错误中返回 token、密码或摘要。
+
+验证：TDD RED 因 application 输入类型与接受服务缺失而编译失败；实现后 `cargo test --locked --lib application::user_invitations::tests::invitation_acceptance_verifies_token_and_creates_argon2_user_once` 1/1、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`，本机 `arm64`。`cargo clippy --locked --lib -- -D warnings` 仍被 11 项未修改文件诊断阻断（管理员 API、Emby 播放、权限复制和用户存储）；本任务文件无 Clippy 诊断。未连接 SMTP 或开放 HTTP/UI。
+
+#### LUX-799：开放公开邀请接受 API
+
+范围：新增不需登录的 `POST /api/v1/auth/invitations/accept`，接受 token、用户名、显示名称和密码，并调用 LUX-798。请求体设有上限；响应只报告成功或固定业务错误，不返回 token、邀请快照或其他账户信息。Token 只允许放在请求体，不放在 URL、query、审计或日志。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 未登录用户可完成有效邀请；错误 token、冲突、重复消费及数据库不可用映射为稳定脱敏响应。
+- [x] 请求体大小、字段长度与 HTTP body 日志边界受限；成功创建账户后可用新凭证登录。
+- [x] HTTP 回归覆盖成功、过期/撤销/错误 token、用户名或邮箱冲突、重复提交、请求体上限和不泄漏凭证。
+- [x] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
+
+短计划：先在 `tests/users.rs` 写公开路由合同并确认端点尚未注册（请求返回 405）；再连接 LUX-798 service 与显式 DTO；最后运行定向集成目标、build、fmt 和 diff check。
+
+结果（2026-10-20）：公开端点只接受 JSON 中的 token、用户名、显示名称和密码，路由请求体上限为 16 KiB，DTO 拒绝未知字段。成功只返回 `{ "created": true }`；无效、过期、撤销和重放凭证使用固定错误，用户名或邮箱冲突使用统一脱敏文案，数据库故障映射为 503。请求跟踪不记录 query 或请求体；错误不会返回凭证或密码。
+
+验证：TDD RED 的集成回归确认路由未注册（405）；实现后 `cargo test --locked --test users public_invitation_acceptance_api_creates_verified_login_once` 1/1 通过，覆盖有效接受并登录、错误/过期/撤销/重复 token、用户名和邮箱冲突、16 KiB 限制、数据库不可用及响应脱敏。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。Cargo 输出写入 `/Volumes/Toshiba/mywork/Lux/target`，Toshiba 已挂载；本机架构 `arm64`。
+
+#### LUX-800：建立邀请接受 Web API 客户端合同
+
+范围：为公开邀请接受端点提供安全 TypeScript 请求类型与 API 方法。Token、密码只作为直接请求参数传递，不进入 React Query mutation cache、浏览器持久化或日志；不实现表单。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 客户端按 POST JSON 调用 LUX-799，错误码具备显式类型映射。
+- [x] Token 与密码请求不进入 query cache 或持久化，测试覆盖方法、字段和失败响应。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先添加客户端合同回归并确认方法缺失；再实现类型和请求；最后运行定向 Vitest、Web build 与 diff check。
+
+结果（2026-10-20）：新增邀请接受输入/响应类型及 `acceptUserInvitation` 方法，通过直接 Promise 调用发送 POST JSON，不使用 React Query 或保存凭据。既有 `ApiError` 保留 HTTP 状态、固定错误码与请求 ID，供页面安全映射。
+
+验证：新增 6 项合同回归先因方法缺失失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 88/88、`pnpm --dir web build` 与 `git diff --check` 通过。覆盖成功 JSON、无 URL 凭据、浏览器存储无凭据写入和 400/409/413/503/500 错误映射。
+
+#### LUX-801：实现受邀用户账户创建页面
+
+范围：实现 `/register/invitation` 页面，从 URL fragment 读取 token 后立即清理地址栏，仅保存在组件内存；用户设置用户名、显示名称和密码并调用 LUX-800。页面展示固定错误和成功状态，不暴露邀请是否存在于列表或有效期细节。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/auth/AcceptInvitationPage.tsx`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`、`web/tests/accept-invitation.test.tsx`。现有入口实际位于 `app/App.tsx`；公开页面需在 setup/session 查询前识别邀请路由，并向邀请客户端方法传递同源站点子路径。
+
+验收标准：
+
+- [x] URL fragment token 不发送到服务器日志、不存入本地/会话存储，完成或失败后不留在地址栏。
+- [x] 表单具备可访问标签、提交中状态、固定错误反馈和创建成功后的登录入口。
+- [x] 组件回归、Web build 与 diff check 通过；真实浏览器验证 token 清理和子路径路由。
+
+短计划：先写页面加载、fragment 清理和提交回归；再注册路由与实现表单；最后运行 Vitest、Web build 和本地浏览器检查。
+
+结果（2026-10-20）：公开邀请页在 setup/session 查询前接管根路径和反向代理子路径，StrictMode 下读取 fragment 后立即替换清理地址栏。Token 仅保存在页面内存，密码在成功/失败后清空；直接 API 请求避免 query/mutation cache 与持久化。页面有可访问标签、重复提交保护、固定错误、成功登录入口；子路径及任意尾斜杠均保留正确的 API 前缀。
+
+验证：定向 Vitest（邀请页面、API client、登录页）110/110，Web build 与 diff check 通过。边界 RED 回归证明多个尾斜杠曾使 API 前缀包含注册路径，修正后通过。隔离浏览器验证 fragment 清理、子路径 POST 201、点击与键盘 Enter 提交成功；320/768/1024/1440 视口无横向溢出，成功状态截图位于 `output/playwright/user-invitation/.playwright-cli/`。此前有头浏览器曾一次进入登录页，隔离会话的两种提交方式均未复现，原因未确定；隔离邀请页控制台 0 error/0 warning。浏览器仅用本地生产预览和 mock 响应，服务端创建与登录由 LUX-799 集成回归覆盖；未部署。
+
+#### LUX-802：持久化公开注册模式
+
+范围：在现有 server settings 键值存储中增加 `INVITATION_ONLY`/`PUBLIC_EMAIL` 注册模式读取、更新与默认值，默认 `INVITATION_ONLY`。不开放 API 或 UI。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/settings.rs`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] 空设置、损坏值和未知值安全回退为邀请制；有效更新可读回且版本并发写入不覆盖新值。
+- [x] 无效模式拒绝，不影响邮件设置或其他 server settings。
+- [x] 定向 storage/application 回归、build、fmt 与 diff check 通过；无需 schema migration。
+
+短计划：先添加默认、合法/非法值及并发回归；再增加版本化读写合同；最后运行定向测试、build、fmt 和 diff check。
+
+结果（2026-10-20）：注册模式使用现有 `server_settings.registration_mode` JSON 保存模式和单调版本；未配置、JSON 损坏、未知枚举和非正版本均回退为邀请制。写入只接受两个已定义模式，先检查客户端版本，再以原始快照执行单条 CAS；陈旧或并发写入仅一个成功，不覆盖其他设置键。无需 schema migration。
+
+验证：TDD RED 确认模式类型和读写合同缺失；SQLite 与隔离 PostgreSQL 复用的默认/非法值/并发/损坏值修复回归 2/2 通过（`cargo test --locked --lib registration_mode -- --include-ignored`）。`cargo build --locked`、fmt 与 diff check 通过，Cargo 使用 Toshiba target，本机 arm64。库 Clippy 仍被此前已记录的 11 条管理 API、播放、权限复制和用户存储告警阻断；本任务文件没有新增诊断。未部署。
+
+#### LUX-803：开放公开注册模式管理员 API
+
+范围：通过受管理员认证与 CSRF 保护的设置 API 读取和修改 LUX-802 注册模式；响应仅返回模式枚举，不混入 SMTP 凭据。使用独立 `GET/PATCH /api/v1/admin/settings/registration`，响应为 `{ registrationMode, version }`；PATCH 带当前版本，省略模式为无修改，显式 null/未知字段/非法值返回 400，陈旧版本返回 409，请求体上限 4 KiB。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_settings.rs`、`tests/admin_settings.rs`。
+
+验收标准：
+
+- [x] 默认与已保存模式可读取；无效枚举拒绝，省略字段不改变当前值。
+- [x] 未认证、非管理员及缺失 CSRF 的写请求拒绝；测试确认模式切换不触及 SMTP 凭据。
+- [x] 更新 API 文档；定向集成目标、build、fmt 与 diff check 通过。
+
+短计划：先增加管理员设置 HTTP 回归并确认字段缺失；再连接 LUX-802 storage/application 合同；最后运行定向目标、build、fmt 和 diff check。
+
+结果（2026-10-20）：独立注册设置端点只返回 `registrationMode` 和版本；PATCH 调用 LUX-802 的版本化服务，空对象不修改配置，未知字段、null、非法模式/版本和缺少写入版本均固定返回 400，陈旧版本为 409 `VERSION_CONFLICT`。写请求复用管理员及 CSRF 校验，沿用共享管理员 API Key 的既有规则；请求体限制 4 KiB。成功修改写入只含模式/版本的审计事件，不读取或改写 SMTP 凭据。
+
+验证：TDD RED 确认缺失端点返回 404；`cargo test --locked --test admin_settings --test admin_mail_settings` 2/2 通过，覆盖未认证、非管理员、缺失 CSRF、读取/开关/省略、非法输入、版本冲突、大小上限、审计脱敏及邮件凭据不变。`cargo build --locked`、fmt 与 diff check 通过；Cargo 使用 Toshiba target，本机 arm64。库 Clippy 仍被 LUX-802 已记录的 11 条既有告警阻断，本任务路由无新增诊断。未开放公开注册提交/验证接口，未部署。
+
+#### LUX-804：在用户管理中配置公开注册模式
+
+范围：在用户管理全局设置展示注册模式开关，默认邀请制；开启公开邮箱注册时说明申请须经邮箱验证和管理员批准。关闭后不影响仍有效的已发邀请。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-registration-settings.test.tsx`。
+
+验收标准：
+
+- [x] 设置读取/保存状态明确，模式切换成功后更新缓存，错误时保留草稿并可重试。
+- [x] 页面清楚显示公开注册默认关闭和审批边界；权限只由管理员设置，不由访客控制。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先新增设置组件回归；再连接 LUX-803 client 与表单；最后运行定向 Vitest、Web build 和 diff check。
+
+结果（2026-10-20）：用户全局设置的“注册与邀请”页接入模式选择和版本化保存，默认邀请制；说明公开申请须先验证邮箱、等待管理员审批，权限由管理员分配，关闭公开注册不会撤销已发邀请。页面包含读取/保存中状态、无改动禁用、固定错误、草稿保留与重试；版本冲突时重新读取最新版本并保留选择。成功直接更新注册设置查询缓存。
+
+验证：新增 client/组件回归先因方法缺失失败；定向 Vitest（注册设置、邮件设置、API client）103/103、Web build 与 diff check 通过。隔离浏览器以本地生产预览和模拟 API 验证选择、Tab/Enter 保存、保存反馈及刷新恢复；320/768/1024/1440 视口文档宽度均等于视口宽度，控制台 0 error/0 warning。截图位于 `output/playwright/user-registration-settings/.playwright-cli/`；真实 API 认证/CSRF/持久化由 LUX-803 集成测试覆盖。未部署。
+
+#### LUX-805：建立 SQLite 公开注册申请表
+
+范围：新增 SQLite `user_registration_requests` migration，保存邮箱、用户名/显示名称、密码哈希、权限默认快照、申请状态、创建/验证/审核时间与稳定错误状态；不保存原始凭证或密码。状态为 `PENDING_EMAIL`、`PENDING_APPROVAL`、`APPROVED`、`REJECTED`、`EXPIRED`；前两个状态使用邮箱部分唯一索引。申请保留到期时间，待处理状态必须有 Argon2id 哈希，终态清除哈希；审核人和已创建用户外键删除后置空。错误只允许 `EMAIL_CONFLICT`、`USERNAME_CONFLICT`、`MAIL_DELIVERY_FAILED`、`PERMISSIONS_UNAVAILABLE` 或空值。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`migrations/0203_user_registration_requests.sql`、`tests/storage.rs`。
+
+验收标准：
+
+- [x] migration 可从空库和当前 schema 升级；状态及唯一性约束防止重复待处理邮箱申请。
+- [x] 表不含明文密码或 token 字段，拒绝非法状态与越界字段。
+- [x] SQLite migration 回归、build、fmt 与 diff check 通过。
+
+短计划：先扩展空库/升级 schema 回归并确认表缺失；再新增 migration；最后运行目标 migration 测试、build、fmt 和 diff check。
+
+实施结果（2026-10-20）：新增 SQLite 申请表及状态/时间/字段约束，涵盖五种状态、Argon2id 密码哈希与终态清理、JSON 对象型权限快照（32 KiB 上限）、pending 邮箱唯一索引、到期查询索引和审核人/已创建用户 `ON DELETE SET NULL` 外键。migration 不保存原始 token 或密码。
+
+验证：TDD RED 先确认空库缺表且缺少 migration；`cargo test --locked --test storage user_registration_requests_migration` 2/2 通过，覆盖空库与从当前 schema 升级、既有用户保留、重复 pending 邮箱、状态转移及字段约束、非法外键和删除置空。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；Cargo 使用 Toshiba target，本机 arm64。`cargo clippy --locked --test storage -- -D warnings` 因 lib 中 11 项既有诊断失败，诊断均位于本任务未修改文件，没有指向 migration 或本次新增测试。未实现注册业务接口。
+
+#### LUX-806：建立 PostgreSQL 公开注册申请表
+
+范围：为 LUX-805 增加等价 PostgreSQL migration 与空库/升级合同，不改变 SQLite 行为或注册业务。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`migrations-postgres/0203_user_registration_requests.sql`、`tests/postgres_database.rs`。
+
+验收标准：
+
+- [x] PostgreSQL 空库与当前 schema 均可迁移；约束、索引和外键动作与 SQLite 等价。
+- [x] 本机 PostgreSQL 定向迁移回归、build、fmt 与 diff check 通过。
+
+短计划：先增加 PostgreSQL schema 断言并确认 RED；再添加 migration；最后运行本机隔离数据库测试和常规检查。
+
+实施结果（2026-10-20）：新增 PostgreSQL 申请表 migration，与 SQLite 保持相同列、状态和时间约束、Argon2id 前缀检查、JSON 对象及 32 KiB 限制、pending 邮箱唯一索引、到期/分页索引和两个 `ON DELETE SET NULL` 外键。
+
+验证：TDD RED 在空库迁移后确认申请表缺失；实现后本机 PostgreSQL 定向回归以两个隔离数据库分别验证空库和从 0202 升级，覆盖 schema、约束、索引、状态唯一性、终态释放邮箱和外键清空，1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过；Cargo 使用 Toshiba target，本机 arm64。`cargo clippy --locked --test postgres_database -- -D warnings` 因 11 项现有诊断失败，均位于本任务未修改文件；本次 migration 与测试没有对应告警。未实现申请业务逻辑。
+
+#### LUX-807：建立注册申请原子存储合同
+
+范围：为注册申请提供创建、验证邮箱、管理员分页查询、批准、拒绝和过期清理 storage 操作。批准事务从请求中取出经验证邮箱与密码哈希，按管理员确认的权限快照创建活动账户并终结申请；并发审批只能成功一次。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 的创建/验证/审批事务原子；并发批准仅一个用户成功。
+- [x] 重复邮箱、过期/撤销 challenge、重复审批、拒绝和权限 FK 错误均无部分账户或凭证消费。
+- [x] 分页上限 100，查询只返回申请摘要；定向 SQLite/PostgreSQL 回归、build、fmt 与 diff check 通过。
+- [x] 有效公开注册 token 摘要可解析为待验证 challenge 标识和期限；无效、过期或已消费摘要不返回 challenge。
+
+短计划：先为状态机与回滚写存储回归；再实现双后端查询和事务；最后运行 SQLite/PostgreSQL 定向目标、build、fmt 和 diff check。
+
+结果（2026-10-20）：SQLite 与 PostgreSQL 共用原子注册申请存储合同。创建申请、邮箱 challenge 和 outbox 使用同一事务；邮箱验证只消费匹配的有效摘要；管理员批准在一个事务内创建活动用户及权限关联并终结申请，拒绝则撤销待投邮件并清除密码哈希。为支持公开链接仅携带一次性 token 的接口，storage 可通过 token 摘要查找有效的待验证 challenge，但只返回 challenge ID 和期限；无效、过期、已消费或已撤销摘要不返回 challenge。申请列表限制最多 100 条，只返回脱敏摘要；对已到期但尚未由后台清理的申请，状态筛选与分页结果立即显示 `EXPIRED`。有界清理按批处理并取消对应邮件，SQLite/PostgreSQL 并发审批均只允许一个成功。
+
+验证：新增 SQLite/PostgreSQL 共用状态机回归覆盖有效/无效/过期/已消费 challenge 摘要、重复邮箱、challenge 失效、邮件 outbox 回滚、即时过期分页、权限外键回滚、并发批准、拒绝和有界清理；`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_registration_storage_contract -- --include-ignored --test-threads=1` 2/2、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 与 `git diff --check` 通过。构建无 warning。全目标 Clippy 尚未作为本任务门禁；此前 Clippy 定向尝试被工作区其他未修改文件中的 11 项诊断阻断，本任务新增代码未有单独无告警 Clippy 结果。
+
+#### LUX-808：实现公开注册与邮箱验证 application service
+
+范围：仅在 LUX-802 模式为 `PUBLIC_EMAIL` 时接收邮箱、用户名、显示名称和密码；使用管理员新用户默认权限快照创建申请、生成 EMAIL_VERIFICATION challenge 并原子入队。返回不区分已存在邮箱的固定成功文案，避免账号枚举。验证凭证只保留 HMAC/摘要，邮件失败不激活账户。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_registration.rs`、`src/application/mod.rs`（测试内置于 service 模块）。
+
+验收标准：
+
+- [x] 注册关闭、输入非法、重复邮箱和数据库错误均不泄漏账户存在状态；有效申请不创建可登录用户。
+- [x] 邮件频率上限按邮箱与连接 peer 执行；rate-limit 身份只使用服务端 middleware 附加的连接 peer，不读取转发头。
+- [x] 邮箱验证成功只将申请转为待审批；重复、过期、撤销 token 无副作用。
+- [x] application 定向回归、build、fmt 与 diff check 通过。
+
+短计划：先补注册/验证及重复邮箱回归；再加入有界 service、token 与 outbox 原子流；最后运行定向测试和常规检查。
+
+结果（2026-10-20）：公开提交只在 `PUBLIC_EMAIL` 模式开放；邮箱、用户名、显示名和密码均有界规范化，密码用 Argon2id 哈希后写入待验证申请，管理员配置的新用户权限保存为非管理员快照。24 小时 EMAIL_VERIFICATION 凭证由 HMAC signer 生成，数据库只保存摘要，challenge 与 outbox 原子入队；服务端不返回 token。重复/已注册邮箱和 storage 邮箱限额返回相同成功结果，避免账号枚举；应用层另按规范化邮箱每分钟最多 5 次、服务端连接 peer 每分钟最多 20 次限流。连接 peer 由 HTTP middleware 从 TCP `ConnectInfo` 注入，rate limiter 不读取 `X-Forwarded-For`。验证通过 HMAC 后只把申请转为 `PENDING_APPROVAL`，不创建用户；错误、重放、过期或撤销 token 均拒绝。
+
+验证：TDD RED 确认提交和验证 service 缺失；实现后 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::user_registration::tests` 4/4 通过，覆盖默认权限快照、待激活无账户、邀请模式关闭、非法及重复邮箱脱敏、邮箱/peer 限流、错误/重放/过期/撤销 token 与待审批状态。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo fmt --all -- --check` 和 `git diff --check` 通过，构建无 warning。本机 arm64；未连接 SMTP 或部署。
+
+#### LUX-808B：为注册申请增加验证邮件重发 service/storage
+
+范围：为尚未验证、未过期的公开注册申请重新入队原 EMAIL_VERIFICATION challenge 邮件。重发复用原 token、申请期限和权限快照；不能为不存在、已验证、过期或撤销的申请创建凭证或邮件。按同邮箱每小时最多发送 5 封验证邮件，并将不可重发情况合并为同一 application 结果。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`src/application/user_registration.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 在单个存储事务中校验申请与原挑战并入队；并发和幂等重试不更改申请、凭证或过期时间。
+- [x] 每邮箱小时上限原子执行；无效/已验证/过期/撤销申请均无副作用且不暴露存在状态。
+- [x] service 与双后端定向回归、build、fmt 和 diff check 通过；服务不返回 token。
+
+短计划：先为有效重发、状态冲突、限额、原 token/过期时间不变和失败回滚添加 RED；再实现 storage 事务与 service；最后运行定向 SQLite/PostgreSQL 测试及常规检查。
+
+结果（2026-10-20）：注册重发只选择未过期、未验证且仍保留密码哈希的 PENDING_EMAIL 申请，并复用其 EMAIL_VERIFICATION challenge 入队；请求不创建新 challenge、不改 token 摘要、创建时间、申请权限快照或到期时间。缺少申请或有效 challenge 时返回相同的成功 service 结果。幂等键重复使用不会重复入队，跨邮箱/凭证复用会回滚并返回存储错误；每邮箱一小时最多 5 封（含首次验证邮件）在事务内检查。SQLite 与 PostgreSQL 按相同状态机执行。
+
+验证：TDD RED 在新增存储合同后因缺少结果类型和方法而编译失败；实现后 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_registration_storage_contract -- --include-ignored --test-threads=1` SQLite/PostgreSQL 2/2 通过，覆盖幂等、小时限额、失效申请、幂等键冲突、凭证和权限快照不变；`cargo test --locked --lib application::user_registration::tests` 6/6、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Clippy 被既有 11 项未修改文件诊断阻断。本机 arm64；未连接 SMTP 或部署。
+
+#### LUX-809：开放公开注册与邮箱验证 API
+
+范围：新增公开注册提交、邮箱验证和验证邮件重发 API。三者均执行有界请求频率、请求体上限及固定脱敏响应；重发不更改原申请权限快照或过期时间。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/application/user_registration.rs`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 邀请模式下拒绝公开注册；公开模式下提交返回固定响应且用户未验证/未审批前不能登录或访问媒体。
+- [x] 邮件验证、重复提交、重发限额、无效/过期 token 和邮件队列失败均有稳定响应与集成覆盖。
+- [x] Token 不在 URL/query/log 中；更新 API 文档，定向集成目标、build、fmt 与 diff check 通过。
+
+依赖：LUX-808、LUX-808B。
+
+短计划：先添加公开端点合同并确认 RED；再连接 LUX-808/LUX-808B service 与访问限额；最后运行用户认证集成目标、build、fmt 和 diff check。
+
+结果（2026-10-20）：新增公开注册提交、邮箱验证和验证邮件重发三个无需会话/CSRF 的路由，JSON 请求体均限制 16 KiB。公开注册只在 `PUBLIC_EMAIL` 模式执行；邀请模式拒绝。注册与重发共用固定脱敏 `202` 响应，涵盖有效、重复和不可重发邮箱；注册提交与重发按规范化邮箱及 middleware 注入的 TCP peer 做分钟级限流，邮箱验证与两者共享 TCP peer 分钟限额，存储层另按邮箱每小时最多 5 封（含首次邮件）限额。重发要求 `Idempotency-Key`，重试沿用 LUX-808B 原 challenge，不重建申请、凭证或权限快照。邮箱验证成功只把申请置于 `PENDING_APPROVAL`，不创建用户；无效、过期、撤销或已消费 token 均映射为不回显 token 的固定 `400`。HTTP middleware 先删除请求方传入的 `x-lux-peer-ip`，再从 `ConnectInfo` 注入 TCP peer；token 和密码只从 JSON body 读取，跟踪只记录 URI path。
+
+验证：TDD RED 确认公开路由尚不存在时请求落入 SPA fallback 并返回 `405`；新增验证频率回归先因第 21 次请求仍返回 `400` 而失败，接入 peer 限额后通过。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::user_registration::tests -- --test-threads=1` 6/6 与 `cargo test --locked --test users -- --test-threads=1` 28/28 通过，覆盖邀请模式拒绝、重复提交固定响应、成功/无效/已过期/重放 token、未创建用户/登录拒绝、重发幂等与枚举保护、请求体上限、验证/提交/重发限流及邮件队列失败回滚。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。`cargo clippy --locked --test users --all-features -- -D warnings` 被 11 项位于 LUX-809 范围外的既有诊断阻断（管理用户 API、Emby/媒体、播放会话、权限复制和用户存储）；本任务变更位置没有报告诊断。Toshiba 上的 macOS arm64 验证；未连接 SMTP、未部署。
+
+#### LUX-810：建立公开注册 Web API 客户端
+
+范围：为公开注册、邮箱验证和重发添加类型化 Web client；提交密码和 token 时绕过 query/mutation cache，Token 由调用方放在请求体。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 请求路径、字段、CSRF/无会话公开语义和错误码映射与 LUX-809 一致。
+- [x] 密码与 token 不进入 React Query cache；定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先写 client RED 回归，再实现显式 DTO/方法，最后运行定向 Vitest 和 Web build。
+
+结果（2026-10-20）：新增公开注册提交、邮箱验证和重发 DTO 与类型化 client 方法。公开请求只发送同源 API path 和 JSON body，使用 `credentials: "omit"`，不带 session cookie、CSRF 或设备 ID；重发幂等键通过 `Idempotency-Key` header 传递。方法直接返回 Promise，不使用 React Query；密码/token 不进入 URL、query cache 或浏览器持久化。支持部署子路径并拒绝外部站点路径；失败仍由公共响应解码映射为 `ApiError` 的 status、code 与 requestId。
+
+验证：新增 API client 回归先因方法缺失失败；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 99/99 通过，覆盖提交、验证、重发的路径/body/header、匿名无 CSRF 请求、凭证不持久化及 400/403/413/429/503 错误映射。`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过，`git diff --check` 通过。完整 `pnpm --dir web test` 为 784 passed、5 failed：1 项媒体库删除组件仍使用 LUX-794 并行实现前的 mock 返回结构，另 4 项在首页媒体库预取、媒体库卡片预取/虚拟合集链接和媒体详情轮询；LUX-810 定向目标全部通过。
+
+#### LUX-811A：公开读取注册模式
+
+背景：LUX-811 的公开页面需要根据服务器当前模式决定是否显示注册申请表单。现有模式读取接口只允许管理员访问，账户设置接口需要登录，不能安全复用。
+
+范围：新增匿名只读 `GET /api/v1/auth/registrations/settings`，只返回 `{ "registrationMode": "INVITATION_ONLY" | "PUBLIC_EMAIL" }`。不返回配置版本、SMTP 状态、默认权限或其他服务端设置；不增加写入接口。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 未认证请求可读取注册模式；未设置、损坏或未知模式安全回退为邀请制。
+- [x] 响应只暴露注册模式，不包含版本、邮件配置或注册申请数据。
+- [x] 定向 `tests/users`、build、fmt 与 diff check 通过。
+
+短计划：先增加匿名模式读取集成回归并确认路由缺失；再复用 LUX-802 的模式读取服务；最后运行定向集成目标和常规检查。
+
+依赖：LUX-802。
+
+实施结果（2026-10-20）：新增匿名只读 `GET /api/v1/auth/registrations/settings`，只序列化注册模式枚举；沿用 LUX-802 对缺省、损坏和未知持久化值的邀请制回退。不返回版本、邮件状态、默认权限或申请内容。
+
+验证：新增集成回归先因路由缺失得到 404；实现后匿名默认模式及切换为公开注册的响应均通过，且响应严格只含 `registrationMode`。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users -- --test-threads=1` 29/29、`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。Toshiba 已挂载，本机 macOS arm64；未连接 SMTP、未部署。
+
+#### LUX-811B：建立公开注册模式 Web 客户端
+
+范围：为 LUX-811 页面提供匿名读取注册模式的类型化 client 方法；支持部署子路径，不发送会话 Cookie、CSRF 或设备 ID。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/tests/api-client.test.ts`。
+
+验收标准：
+
+- [x] 方法读取 LUX-811A 端点并返回 `RegistrationMode`；验证路径、匿名请求选项及错误映射。
+- [x] 部署子路径规范化和非法路径拒绝有回归。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先新增 client 合同回归并确认方法缺失；再实现匿名读取方法；最后运行 API client Vitest、Web build 和 diff check。
+
+依赖：LUX-811A。
+
+实施结果（2026-10-20）：新增 `publicRegistrationSettings` 类型化方法，使用公开请求路径构造器处理反向代理子路径，发送匿名 GET，不附带会话 Cookie、CSRF 或设备标识；非法外部路径通过 Promise 形式返回固定 `INVALID_REQUEST`。
+
+验证：TDD RED 确认方法缺失；实现后 `pnpm --dir web exec vitest run tests/api-client.test.ts` 102/102、`pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build` 和 `git diff --check` 通过。
+
+#### LUX-811：实现公开注册与邮箱验证页面
+
+范围：增加公开注册申请及邮箱验证页面；通过 LUX-811A 匿名读取当前模式，仅在服务端允许公开注册时显示提交表单。邮箱链接 token 从 fragment 读取后清除地址栏，并只在验证请求期间存于内存。说明邮箱验证后仍须管理员批准。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/app/App.tsx`、`web/src/features/auth/RegisterPage.tsx`、`web/tests/register-page.test.tsx`。
+
+验收标准：
+
+- [x] 邀请模式不暴露可提交表单；公开模式表单校验、等待/成功/错误状态可访问。
+- [x] 邮件验证成功显示“等待管理员审批”，token 被清理且不写入持久化。
+- [x] 定向 Vitest、Web build 与真实浏览器路由/fragment 验证通过。
+
+依赖：LUX-810、LUX-811A、LUX-811B。
+
+短计划：先增加模式、提交及验证页面回归；再添加页面路由与状态；最后运行 Vitest、Web build 和浏览器检查。
+
+实施结果（2026-10-20）：`/register` 与 `/register/verify-email` 在 setup/session 查询前独立路由，兼容反向代理子路径。页面只在公开注册模式展示表单，提交成功后说明需验证邮箱及管理员审批；验证 token 从 fragment 读取后立即清理地址栏，只短暂保存在组件内存，完成后显示等待审批状态。
+
+验证：`pnpm --dir web exec vitest run tests/register-page.test.tsx` 5/5、`pnpm --dir web build` 与 `git diff --check` 通过。隔离 Chromium 本地浏览器用 mock API 验证代理子路径公开模式表单、邀请模式隐藏表单、邮箱验证 POST 前 fragment 已清理以及成功后的待审批说明；浏览器控制台 0 error / 0 warning。未提交真实注册申请或连接 SMTP。
+
+#### LUX-812：开放注册申请审批管理员 API
+
+范围：管理员分页查询已验证待审批申请，并通过单次事务批准或拒绝。批准请求携带管理员最终确认的权限快照；审批会创建活动用户并标记已批准，拒绝会撤销凭证/待投邮件并清除密码哈希。所有写操作需管理员认证与 CSRF，并产生脱敏审计记录。
+
+预计修改文件（6 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin.rs`、`src/api/admin/admin_user_registrations.rs`、`src/application/user_registration.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] API 仅向管理员展示邮箱、申请时间、邮箱验证状态和拟分配权限，不返回 password hash/token。
+- [x] 未验证申请不可批准；批准并发仅创建一个用户；拒绝和权限错误无部分写入。
+- [x] CSRF、用户枚举、管理员保护、审计脱敏与分页上限均有回归；更新 API 文档并通过定向测试/build/fmt/diff check。
+
+短计划：先加管理员 API 回归并确认路由缺失；再连接 LUX-807 storage/application；最后运行 `tests/users` 定向目标和常规检查。
+
+实施结果（2026-10-20）：新增管理员注册申请分页、批准和拒绝 API。列表只包含待审批且已验证申请，并只返回申请 ID、邮箱、状态、申请时间、验证时间与权限快照；应用层拒绝权限快照中的管理员角色，校验媒体库选择必须来自仍启用的库。批准/拒绝通过 LUX-807 单事务存储合同执行；未验证、过期、已处理和账户冲突统一映射为相同 409 响应。写操作只允许管理员 Web session、要求 CSRF，并将审核人绑定到 session 用户；共享 API Key 不可审核。成功操作记录不包含邮箱、密码或验证凭证的审计事件。
+
+验证：TDD RED 的新回归因路由缺失返回 404。最终 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --test users -- --test-threads=1` 30/30、`cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。全目标 Clippy 未通过：当前共享工作区有 19 条诊断，集中在管理员用户管理、播放、权限复制、用户存储、数据库维护并行改动和既有测试；本次新增审核函数没有诊断，同文件中唯一诊断位于 HEAD 已存在的 `user_registration` 单测。Toshiba 已挂载，本机 `uname -m` 为 `arm64`；未连接真实 SMTP，未部署。
+
+#### LUX-813：在用户管理页审批注册申请
+
+范围：在用户列表增加待审批入口，展示已验证申请并允许管理员审核拟分配的媒体库、播放、下载和转码权限，再批准或拒绝。仅显示服务端分页结果；每次操作需确认，完成后刷新申请和用户列表。
+
+预计修改文件（8 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserRegistrationsPanel.tsx`、`web/src/features/admin/AdminUsersPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/api-client.test.ts`、`web/tests/admin-user-registrations.test.tsx`。
+
+验收标准：
+
+- [x] 待审批空态、分页、申请权限快照/修改、批准、拒绝、加载与错误重试均可访问。
+- [x] 成功审批后列表与用户缓存刷新；失败时保留申请并显示脱敏结果。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先写审批面板合同；再接 LUX-812 API 和用户列表入口；最后运行组件回归与 Web build。
+
+实施结果（2026-10-20）：用户管理“待审批”视图接入 LUX-812 API，按服务端每页 20 条展示已验证申请、申请时的权限快照和邮箱验证时间。管理员可编辑媒体库范围、播放/下载、并发上限及三项转码权限；已停用或不可用的快照媒体库会明确标出，移除前禁止批准。批准与拒绝均需确认；错误只显示固定脱敏文案，失败申请保留；成功后刷新审批页及所有用户列表缓存。
+
+验证：新增 API client 与页面回归先确认客户端方法和审批视图缺失；实现后 `pnpm --dir web exec vitest run tests/admin-user-registrations.test.tsx tests/api-client.test.ts` 108/108、`pnpm --dir web build`、`git diff --check` 通过。隔离 Chromium 本地 mock 页面实际渲染审批视图、权限快照及完整编辑控件；323px 视口下文档宽度 320px，无横向溢出，控制台无错误或警告。浏览器只使用本地 mock，没有提交真实申请或调用审批 API。
+
+#### LUX-814：为已登录用户建立邮箱重验存储事务
+
+范围：对已登录用户邮箱变更创建 EMAIL_VERIFICATION challenge 时，暂不更改当前邮箱；消费有效 challenge 时以单个事务更新邮箱及验证时间、撤销同用户旧 challenge。新邮箱冲突、用户删除/禁用、token 重放或过期均不产生部分更新。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] SQLite 与 PostgreSQL 均原子保留 pending email、验证后切换邮箱并设 `email_verified_at`。
+- [x] 原邮箱在验证前继续有效；新邮箱唯一冲突和无效 challenge 不消费凭证。
+- [x] 定向存储回归、build、fmt 与 diff check 通过。
+
+短计划：先加 pending/consume/冲突/并发回归；再实现双后端事务；最后运行 SQLite/PostgreSQL 定向检查。
+
+实施结果：新增邮箱变更 challenge 消费事务，先锁定启用且未删除的账户，再锁定其 `EMAIL_VERIFICATION` challenge。验证成功时在同一事务更新邮箱及 `email_verified_at`、消费当前 challenge 并撤销该用户其他未消费 challenge；邮箱冲突、无效/过期/重放凭证、跨用户凭证和不可用账户均不改变邮箱或消费凭证。唯一索引并发冲突会回滚整个事务。待验证邮箱保存在 challenge 的 `recipient_email`，当前账户邮箱在验证前保持不变；无需迁移。
+
+验证：TDD RED 先因存储结果类型和方法缺失而编译失败。实现后 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib user_email_change_storage_contract -- --include-ignored --test-threads=1` SQLite/PostgreSQL 2/2 通过，覆盖大小写不敏感邮箱冲突、跨用户与无效/过期凭证、禁用/删除用户、成功后撤销旧 challenge、重放及并发单次消费。`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo build --locked`、`cargo fmt --all -- --check` 和 `git diff --check` 通过。Toshiba 已挂载，本机架构 `arm64`；邮件发送与 HTTP/API 留待 LUX-815/816。
+
+#### LUX-815：实现账户邮箱验证 application service
+
+范围：当前登录用户提出邮箱变更时生成有界有效期验证邮件；应用层验证仅消费该用户对应的 challenge。发送限额按账号/邮箱执行；邮件发送失败不改变原邮箱。本任务不开放 HTTP endpoint。
+
+预计修改文件（7 个，按存储合同与应用/邮件 worker 拆为两个增量）：`docs/LUX-DEVELOPMENT.md`、`src/storage/mod.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`src/application/user_email_verification.rs`、`src/application/mod.rs`、`src/application/mail_worker.rs`。
+
+验收标准：
+
+- [x] 变更邮箱后原邮箱和验证时间保持不变，服务端可恢复待验证地址；验证成功后更新邮箱及验证时间。
+- [x] 用户不能消费其他账号 challenge；过期/重放/冲突/速率限制失败统一映射为稳定错误。
+- [x] service 使用 LUX-814 原子 storage 合同；定向 application/storage 回归、build、fmt 与 diff check 通过。
+
+短计划：先建立账号邮箱变更的原子存储/outbox 合同；再接入 service 与邮件链接分流；最后运行定向测试及常规检查。
+
+实施结果（2026-10-20）：新增账户邮箱变更 application service，规范化并验证邮箱输入，按账号与目标邮箱分别限流；challenge 有效期为 24 小时，原始 token 只进入邮件 fragment，存储仅保存摘要。存储事务在确认账号启用后原子写入 challenge/outbox、撤销该账号旧 challenge 并取消旧队列消息；队列插入失败会回滚整个事务，当前邮箱和验证时间保持不变。service 只允许当前账号消费其有效 challenge，并复用 LUX-814 原子邮箱切换事务；邮箱冲突、错误账号、过期和重放返回相同不可接受结果。邮件 worker 按引用账号区分公开注册与账号邮箱变更：注册邮件仍指向注册页，账号邮件指向 `/account/{userId}#token=...`。
+
+验证：`CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib application::user_email_verification -- --nocapture` 3/3 通过；`cargo test --locked --lib user_email_change_storage_contract -- --nocapture` SQLite 1/1 通过；`NO_PROXY=127.0.0.1,localhost CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --lib postgres_user_email_change_storage_contract_is_atomic -- --include-ignored --nocapture` PostgreSQL 1/1 通过；邮件 worker 账号链接回归 1/1 通过。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。`cargo clippy --locked --lib --all-features -- -D warnings` 被 11 条已有 lint 阻断，涉及 `admin_users.rs`、Emby/media/playback、`user_permission_copy.rs` 与 `storage/users.rs`；本任务修改位置没有对应诊断。测试与构建使用 Toshiba target 目录；本机为 macOS arm64。没有连接真实 SMTP 服务，本任务不包含 HTTP endpoint，API 和账户页留待 LUX-816/817。
+
+#### LUX-816：开放账户邮箱验证 API
+
+范围：新增受会话认证和 CSRF 保护的邮箱验证邮件创建、重发及 token 消费 API。endpoint 仅接受当前用户对应的 challenge；邮件发送失败不改变当前邮箱。
+
+预计修改文件（7 个，按邮箱清除和重发并发两个切片实施）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/users.rs`、`src/application/user_email_verification.rs`、`src/storage/repository.rs`、`src/storage/repository_tests.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 未认证/缺失 CSRF 请求拒绝；申请/验证结果不泄漏其他用户或邮箱状态。
+- [x] 仅当前用户的有效 challenge 可更新邮箱；成功、清空邮箱、过期、重放、冲突与发送限额均有 HTTP 回归；跨账户和限流失败不改变 challenge/outbox 状态。
+- [x] 定向集成目标、build、fmt 与 diff check 通过，API 文档更新。
+
+短计划：先添加账户资料/验证 HTTP 回归并确认路由缺失；再连接 LUX-815 service；随后用存储事务恢复安全的邮箱清空语义，并让重发按读取到的 challenge ID 做事务内比较；最后运行 `tests/users`、双后端存储回归和常规检查。
+
+实施结果（2026-10-20）：账户资料 PATCH 的非空邮箱变更现在创建 24 小时有效的验证 challenge，并通过持久邮件 outbox 投递；验证前保留当前邮箱，资料响应仅向当前 Web session 返回 `pendingEmail`。显式提交空字符串会在单个存储事务中清空邮箱及验证时间、撤销未消费 challenge 并取消相关待发送邮件；未提供或传 `null` 不修改邮箱。重发携带读取到的 pending challenge ID，存储事务再次确认它仍是当前有效 challenge 后才创建新邮件，因此与较新的邮箱请求或并发重发冲突时不会覆盖新状态；响应仍保持固定 202。Token 只从受会话和 CSRF 保护的 JSON 请求体消费。邮箱资料 GET/PATCH 与验证响应均禁止缓存；无效、跨账户、过期、重放及邮箱冲突使用同一固定错误。
+
+验证：TDD 先确认新路由缺失；清空邮箱回归先稳定复现 400，加入事务实现后通过，并覆盖旧 token 不能恢复邮箱及名称仍可更新。串行 `cargo test --locked --test users -- --test-threads=1` 32/32、`cargo test --locked --lib application::user_email_verification` 3/3、SQLite `user_email_change_storage_contract` 1/1、PostgreSQL `postgres_user_email_change_storage_contract_is_atomic -- --include-ignored` 1/1 通过；回归包含 challenge ID 竞态、跨账户不变及 429 不写入 challenge/outbox。`cargo build --locked`、`cargo fmt --all -- --check` 与 `git diff --check` 通过。全目标 Clippy 仍失败于 19 项其他未修改位置的告警（管理员 API、Emby/media/playback、权限复制、用户存储、注册测试、数据库维护及存储测试）；LUX-816 新增/修改行未产生诊断。Cargo 使用 Toshiba 共享 target，本机 `arm64`；未连接真实 SMTP，未在 FNOS/x86_64 部署。
+
+#### LUX-817：为账户页接入邮箱验证
+
+范围：账户资料页显示邮箱未验证状态，提供发送/重发验证邮件并处理完成链接；保持原邮箱直到验证成功。Token 仅从 fragment 读取并在地址栏立即清理。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/account/AccountPage.tsx`、`web/tests/account-email-verification.test.tsx`。
+
+验收标准：
+
+- [x] 邮箱变更显示待验证目标和发送结果；重载后由服务端状态恢复，页面不误报已验证。
+- [x] Token 不留在地址栏、cache 或持久化；加载、重发、成功及失败有组件回归。
+- [x] 定向 Vitest、Web build 和真实浏览器验证通过。
+
+短计划：先添加账户邮箱流程回归；再连接 LUX-815 client/service；最后运行组件测试、Web build 和浏览器检查。
+
+实施结果（2026-10-20）：账户资料类型和 client 已接入待验证邮箱、验证及重发 API。账户页从服务端资料恢复 `pendingEmail`，并优先于当前邮箱的已验证时间展示待验证地址；保存邮箱后保留待验证目标并显示邮件发送结果。重发按钮只在存在待验证地址时出现，发送中禁用并呈现状态。页面用 layout effect 读取 fragment token，先以 `history.replaceState` 清除地址栏，再通过受登录 session/CSRF 保护的 JSON body 验证；token 只在请求闭包内存活，不进入 React Query cache 或持久化。验证加载、成功、失败均提供可访问反馈；成功后刷新账户资料。
+
+验证：`vitest run tests/account-email-verification.test.tsx` 8/8、`tsc --noEmit`、Vite production build 与 `git diff --check` 通过。隔离 in-app browser 使用临时本地 mock API 实际渲染账户页，验证 fragment 清理后显示邮箱验证成功及已验证状态；无真实账户、邮件或远程 API 参与。测试覆盖服务端待验证状态恢复、邮箱保存、重发/验证加载、成功和失败，以及 API 方法路径、POST body 和 token 不入 cache/localStorage。
+
+#### LUX-818：管理全站访问黑名单
+
+范围：在用户管理全局设置增加全站黑名单视图，分页列出并创建、启停、删除设备、客户端和 IP/CIDR 规则。保存前给出命中会阻止登录、已有 session 与播放授权的明确说明。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserGlobalAccessRulesPanel.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-access-rules.test.tsx`。
+
+验收标准：
+
+- [x] 三种规则支持有界分页、创建、启停与确认删除；输入约束与服务端规范化一致。
+- [x] 请求/加载/错误/空态清晰，修改成功刷新；说明 IP 依据仅来自连接 peer 或已配置可信代理链。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先补全站规则组件合同；再接 LUX-757/764 已有 client；最后运行定向 Vitest 和 Web build。
+
+实施结果（2026-10-20）：全局设置中的“全站黑名单”页已接入既有全站规则 API，按每页 20 条读取设备、客户端和 IP/CIDR 规则，支持创建、启停、确认删除、分页及修改后刷新。客户端输入先校验控制字符、UTF-8 长度和 IP/CIDR 结构；客户端名称在提交前按服务端规则折叠空白并转小写，IP/CIDR 的权威规范化仍由服务端执行。页面提供加载、错误重试、空态和修改结果反馈，并说明已启用规则会影响登录、现有会话与播放授权，IP 判断只采用连接 peer 或已配置的可信代理链。
+
+验证：定向 `vitest run tests/admin-user-access-rules.test.tsx`、TypeScript `tsc --noEmit`、Vite production build 与 `git diff --check` 通过。测试覆盖全站 scope、分页上限、空/加载/错误状态、输入校验与客户端规范化、创建/启用/删除确认及成功刷新。未触及 Rust 行为或数据库 schema。
+
+#### LUX-819：管理单用户访问黑名单
+
+范围：在用户详情“设备与登录”页增加指定用户黑名单面板，管理该用户的设备、客户端和 IP/CIDR 规则。该页不能读取或修改全站规则或其他用户规则。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserAccessRulesPanel.tsx`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-access-rules.test.tsx`。
+
+验收标准：
+
+- [x] 仅操作当前用户 scope；设备规则可由已记录设备选择，其他值由管理员明确输入。
+- [x] 创建、启停、删除和失败重试有反馈；规则生效边界明确。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先添加用户 scope 组件回归；再接既有用户规则 client；最后运行组件目标与 Web build。
+
+实施结果（2026-10-20）：用户详情“设备与登录”页已接入单用户访问黑名单面板，所有规则读写都携带当前用户 ID；全站规则接口不参与此页面。设备规则只能从该账号已记录设备中选择，设备选项每页最多 100 条并支持翻页；客户端与 IP/CIDR 规则由管理员明确输入。页面解释规则只影响目标账号及其登录、已有会话和播放授权，并说明可信 IP 来源。规则列表提供分页、加载、错误重试和空态；创建、启停、删除均有状态反馈，瞬时写入失败可重试原操作，重复规则冲突不提供无效重试。
+
+验证：`vitest run tests/admin-user-access-rules.test.tsx` 15/15、`tsc --noEmit`、Vite production build 与 `git diff --check` 通过。回归覆盖用户详情入口、只调用当前用户范围 API、已记录设备选择及超过 100 台时分页、客户端/IP 手动输入、创建/启用/删除确认、写入失败重试、重复规则冲突和规则/设备列表独立重试。未改 API 合同或 Rust 行为。
+
+#### LUX-820：防止黑名单规则封禁当前管理员入口
+
+范围：在创建或启用全站及用户级规则前，比较当前管理请求的设备、客户端与可信访问 IP；若规则将阻断当前管理员会话则返回稳定冲突。IP 比较必须调用 LUX-766 可信代理解析结果，不能直接信任 XFF；无法安全判定时拒绝高风险 IP 规则启用。共享 API Key 的既有策略单独保持明确。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`src/application/user_access_rules.rs`、`src/api/admin/admin_users.rs`、`src/storage/users.rs`、`tests/users.rs`。启用已有规则前需要按规则 ID 和作用范围读取类型和值，现有 storage 接口不提供单条读取。
+
+验收标准：
+
+- [x] 设备/客户端/IP 自封禁规则被拒绝，未命中当前入口的规则仍可管理。
+- [x] 代理伪造、peer 缺失、可信代理多跳和 API Key 请求有回归；拒绝不新增或启用规则。
+- [x] 定向集成测试、build、fmt 与 diff check 通过。
+
+短计划：先构造可信/伪造 peer 的规则 API 回归；再在写入前执行访问上下文匹配并增加作用域安全的单条规则读取；最后运行 `tests/users` 目标与常规检查。
+
+实施结果（2026-10-20）：Web 管理员创建启用规则或启用已有规则前，按会话用户范围比较已记录设备 ID、固定客户端 `lux web` 和访问 IP。IP 只由服务端注入的 peer 与 LUX-766 可信代理链解析器计算；无法读取 peer/可信代理配置或链格式异常时，启用 IP 规则以稳定 `409 VERSION_CONFLICT` 拒绝。拒绝发生在 insert/update 之前。启用已有规则先按 ID 与全站/用户作用范围精确读取规则；禁用规则仍可保存。共享 API Key 没有 Web 会话身份，继续走独立认证策略并保留恢复入口，不套用当前 Web 会话自锁检查。
+
+验证：新增 API 回归先复现设备与 IP 自封禁规则仍可返回 `201`；实现后 `cargo test --locked --test users -- --test-threads=1` 35/35 通过，另对新增的用户范围禁用规则启用回归定向复跑 1/1。覆盖全站和用户规则、拒绝后不写入/不启用、无关规则可管理、伪造 XFF 不影响 peer 判断、可信代理多跳、peer 缺失 fail-closed，以及共享 API Key 可创建命中自身 IP 的规则。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。全目标 Clippy 仍被 19 项既有 `-D warnings` 诊断阻断，未报告本任务新增行；本机 `arm64`，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`。未部署。
+
+#### LUX-821：为用户设备摘要补充可用 IP 归属地
+
+范围：用户设备列表在已配置 IP 位置插件且缓存命中时提供可选归属地摘要；未命中由既有 `IpLocationService` 异步安排查询。未安装插件、私有地址或查询失败保持为空，不阻塞设备查询，不新增外部服务依赖。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。用户设备响应是公开 API 合同，因此同步补充 API 文档。
+
+验收标准：
+
+- [x] Device DTO 仅增加 nullable safe location metadata；不返回原始外部 provider 响应。
+- [x] 缓存命中、未安装插件、非公网地址和 lookup 失败路径均有回归，列表仍有界。
+- [x] 定向 API 测试、build、fmt 与 diff check 通过。
+
+短计划：先增加设备响应归属地映射测试；再连接已有位置缓存服务并只序列化安全摘要；最后更新 API 合同，运行定向用户测试、build、fmt 与 diff check。
+
+实施结果（2026-10-21）：管理员设备项新增 nullable `lastRemoteIpLocation`，只映射缓存中的 `country`、`province`、`city`、`isp`；不序列化位置服务返回的 IP、区县、街道或经纬度。缓存未命中复用既有有界异步查询，不等待插件；未配置 provider、私有地址和 lookup 失败均返回 `null`，设备分页与排序保持不变。`docs/API.md` 同步记录该响应合同。
+
+验证：新 API 归属地回归先因字段缺失失败；实现后 `cargo test --locked --test users -- --test-threads=1` 36/36 通过，覆盖已缓存位置、未安装 provider、非公网地址、provider 返回错误 IP、原始字段不外泄及有界分页。`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过。全目标 Clippy 被 19 项既有 `-D warnings` 诊断阻断，本任务新增代码未产生诊断；本机 `arm64`，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`。外部插件由本地 fake process 提供响应，未调用真实 IP 位置服务，未部署。
+
+#### LUX-822：在设备清单展示 IP 归属地
+
+范围：在 LUX-820 设备行中显示可用的 IP 归属地；没有位置数据时显示“未知”，不把展示 IP 或归属地用作 ACL 判定。
+
+预计修改文件（4 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/types.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-devices.test.tsx`。
+
+验收标准：
+
+- [x] 设备表安全显示国家/地区/运营商摘要和未知状态；窄屏仍由表格容器滚动。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先为有/无归属地添加行级回归；再扩展 DTO 与展示；最后运行设备 Vitest 和 Web build。
+
+实施结果（2026-10-21）：`AdminUserDevice` 增加可空归属地 DTO；设备表在最近 IP 下以普通文本显示国家、省/地区、城市和运营商，字段缺失或为空时显示“未知”。展示数据不参与 ACL 判定；设备表仍由 `overflow-x: auto` 容器承载，窄屏保留横向滚动。
+
+验证：`pnpm --dir web install --frozen-lockfile` 显示依赖已是最新；定向 `vitest run tests/admin-user-devices.test.tsx` 4/4 通过，覆盖位置摘要、未知状态和外部字符串按文本安全渲染；`pnpm --dir web build` 通过。`git diff --check` 通过。全量 `pnpm --dir web test` 为 103 个文件通过、5 个文件失败（826 项中 9 项失败）；失败分布在其他用户会话、首页/媒体卡片和轮询测试，设备清单目标文件通过。未做真实浏览器或部署验证。
+
+#### LUX-823：修正内容限制索引页的过期说明
+
+范围：核对 LUX-692 至 LUX-704 对列表、详情、图片、下载、字幕及播放的访问检查后，删除内容限制页中“媒体访问拦截尚未接入，策略目前不会过滤媒体”的过期文案，替换为准确说明分级/标签限制及索引就绪状态。
+
+预计修改文件（3 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-content-restriction.test.tsx`。
+
+验收标准：
+
+- [x] 源码核验与回归证明受限媒体入口执行服务端策略；文案不声称未实现或过度承诺。
+- [x] 页面测试确认索引未就绪提示与已启用策略说明互不混淆。
+- [x] 定向 Vitest、Web build 与 diff check 通过。
+
+短计划：先复核访问路径并添加文案断言；再修正面板说明；最后运行定向 Vitest 与 Web build。
+
+实施结果（2026-10-21）：删除策略表单和索引面板中“媒体访问拦截尚未接入”的过期说法。策略表单现在准确说明服务端先过滤媒体列表，并在详情、图片、下载、字幕和播放访问时检查条目；索引说明单独描述回填进度，以及限制生效时缺少分类索引的条目按不可见处理。
+
+源码核验：`src/application/access.rs::MediaAccessService::can_view_item` 先执行媒体库 ACL，再读取当前用户内容策略与条目/系列/季度分类；受限策略遇到分类缺失时返回不可见。LUX-692、LUX-695 至 LUX-704 的 catalog/storage 查询在排序、计数和分页前过滤；LUX-694 已记录的 `content_policy_denies_direct_item_access_and_inherits_parent_restrictions` 回归覆盖直接访问拒绝与父级限制继承。媒体文件、图片、字幕和播放 API 均调用同一访问服务，因此沿用该服务端判定。
+
+验证：`vitest run tests/admin-user-content-restriction.test.tsx` 10/10 通过，覆盖索引部分回填与已保存策略说明分区呈现；`pnpm --dir web build` 通过；`git diff --check` 通过。补跑的 `cargo test --locked --lib content_policy_denies_direct_item_access_and_inherits_parent_restrictions` 被共享工作区并行 LUX-794 未完成修改阻断：编译在 `src/api/users.rs` 与 `src/storage/repository_tests.rs` 报 8 处 `optimized_images` 缺字段，本任务未改动这些文件。没有进行部署验证。
+
+#### LUX-824：核对并关闭用户管理模块一至七
+
+范围：按 `docs/USER-MANAGEMENT-DESIGN.md` §5.2 的逐项验收清单，对照实现、自动化测试和 API/兼容性文档，标记模块一至七已完成项与明确限制。模块八维持已取消。修正核对中发现的过期播放策略提示，并补齐会话页面的访问规则测试夹具；执行用户管理相关 Rust/Web 全量门，分别记录当前工作区并行改动影响、本机架构和未覆盖的真实浏览器/部署证据。
+
+预计修改文件（7 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`docs/API.md`、`docs/COMPATIBILITY.md`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/tests/admin-user-sessions.test.tsx`、`web/tests/admin-user-playback-policy.test.tsx`。
+
+验收标准：
+
+- [x] 模块一至七的每项验收都有可定位的代码/测试证据或明确标记限制；模块八未实现。
+- [x] SQLite、PostgreSQL、用户/API、内容限制、播放/访问、Web 管理全链路和完整门禁记录了可复现命令与结果，包括未通过项。
+- [x] 设计清单状态与实际证据一致；未以本机 ARM 结果代替 FNOS/x86_64 或真实客户端验证。
+- [x] 播放权限状态说明与已实施服务端行为一致，会话管理回归夹具覆盖模块七黑名单查询。
+
+短计划：先建立设计验收项到任务/测试的交叉表；再修正遗漏与状态；最后运行该目标规定的最终门禁并记录限制。
+
+实施结果（2026-10-21）：在 `docs/USER-MANAGEMENT-DESIGN.md` §5.4 建立模块一至七逐项交叉表，分别标注实现任务、Rust/Web 回归和未实测环境；§5.2 仅将 Lucky 实机与完整 SQLite/PostgreSQL 组合矩阵保留为未完成，模块八维持取消。修正 `docs/API.md` 中可信代理及黑名单“尚未接入”的过期合同，补充邀请列表、创建和撤销接口；`docs/COMPATIBILITY.md` 明确展示 IP 与 ACL 访问 IP 解析不同，并注明 Lucky/FNOS/第三方播放器未实测。修正用户详情播放策略页的过期提示，补齐会话页面访问规则查询的测试夹具。
+
+验证：TDD 先确认播放策略提示回归失败，再实现文案修正。用户管理 Rust 定向 targets `users`、`user_settings`、`user_query_events`、`admin_user_invitations`、`admin_mail_settings`、`admin_dashboard`、`playback`、`web_playback`、`strm_playback`、`emby_multi_part_playback` 合计 50/50 通过；`admin-user-playback-policy.test.tsx` 与 `admin-user-sessions.test.tsx` 合计 14/14 通过。冻结 Web 依赖安装通过；本任务涉及文件的 `git diff --check` 通过。全工作区检查仍发现并行改动 `web/tests/account-settings.test.tsx` 与 `web/tests/admin-libraries.test.tsx` 各有一个文件尾空行。
+
+最终门禁未全部通过：
+
+- `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target ./scripts/check-all.sh` 中 `cargo build --locked` 通过；`cargo test --locked --all-targets` 编译 `tests/image_variants.rs:123` 时因 `JoinHandle<Result<(), std::io::Error>>` 与 `JoinHandle<()>` 类型不匹配失败，脚本随后停止。
+- 后续共享工作区更新修复了 `image_variants` 测试的编译错误。LUX-824 当时的 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --all-targets` 库测试为 1149 通过、4 失败、30 忽略；integration targets 未运行。失败为 `shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（预期 9、实际 10，受并行媒体库删除 worker 影响）及 3 个此前已在 LUX-590/LUX-592 记录的元数据队列用例。随后 LUX-826 记录了更晚一次全量运行：1151 通过、5 失败，具体结果见 LUX-826 实施记录。`check-all.sh` 没有在共享源码更新后重跑。
+- 2026-10-21 当前共享工作区复跑 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target cargo test --locked --all-targets`：1153 passed、5 failed、31 ignored；库测试失败后 Cargo 未运行 integration targets。失败为 `application::scanner::tests::local_metadata_worker_dispatches_fill_missing_without_blocking_scan`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost` 和 `shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`。前四项属于扫描/元数据队列；最后一项的旧断言期望 9 条 UPDATE，而并行 LUX-794 媒体库删除 worker 新增后实际为 10 条。此结果不改变用户管理定向 Rust 目标通过的记录。
+- `cargo fmt --all -- --check` 当前通过。
+- LUX-824 时的全目标 Clippy 有 20 项诊断；2026-10-21 复跑后为 10 项：Emby 播放接口 4 项、数据库维护的无效转换 2 项、存储测试的切片/类型复杂度 3 项、注册存储测试参数过多 1 项。它们分布在并行数据库维护与既有 Emby/存储代码；邮箱验证 API 和 service 没有诊断。
+- 2026-10-21 当前完整 Web Vitest 为 836 通过、1 失败（共 837 项）。唯一失败是并行 LUX-794 的 `admin-libraries.test.tsx` 删除成功用例：媒体库删除 API 已改为返回异步 `{ job }`，该测试 mock 未提供响应体。此前首页预取与详情轮询失败已由后续提交修复。用户管理定向测试仍通过。
+- 当前 TypeScript 检查和 Web production build 通过；`git diff --check` 通过。此前记录的两个并行测试文件尾空行在当前工作区已不再复现。
+
+补充复核（2026-10-21）：重新运行 `cargo test --locked --test users -- --test-threads=1`，36/36 通过；SQLite `user_email_change_storage_contract` 1/1 和本机 PostgreSQL `postgres_user_email_change_storage_contract_is_atomic` 1/1 通过，覆盖邮箱清除、旧 challenge 撤销、重发并发比较、跨账户失败不变及限流无副作用。全量 Web、TypeScript、构建、格式和差异检查的最新结果见上文。
+
+LUX-824 初次检查时，本任务文件的 `git diff --check` 通过；当时全工作区另发现并行改动 `web/tests/account-settings.test.tsx` 与 `web/tests/admin-libraries.test.tsx` 各有一个文件尾空行。2026-10-21 复核时全工作区 `git diff --check` 已通过。
+
+Toshiba 已挂载，本机 `uname -m` 为 `arm64`；所有 Cargo 命令使用 Toshiba 下的 `target`。当前证据不代表 FNOS/x86_64、真实 Lucky、多跳代理拓扑、SMTP 投递或真实第三方播放器已通过验收。
+
+补充复核（2026-10-21）：完成 SQLite/PostgreSQL 本机迁移与关键竞争矩阵。从 v183 升至仓库当前迁移版本的两端回归均保留旧账户状态、媒体库访问模式与授权行；偏好 CAS、内容限制 CAS 和播放并发准入使用同一组并发合同在两端验证。测试暴露 PostgreSQL CAS 冲突分支将 `EXISTS` 的 BOOLEAN 结果解码为整数的问题；账户偏好与内容限制查询改为 `CASE WHEN EXISTS ... THEN 1 ELSE 0` 后显式转换为 BIGINT。修正测试中的固定最高 schema 版本断言，迁移里程碑仍按最低版本核对，完整升级用例则要求到达当前迁移集的最高版本。
+
+验证：`cargo test --locked --test storage -- --test-threads=1` 76/76；`cargo test --locked --lib user_management_concurrency_storage_contract_is_atomic` SQLite 1/1；`NO_PROXY=127.0.0.1,localhost cargo test --locked --lib postgres_user_management_concurrency_storage_contract_is_atomic -- --include-ignored` PostgreSQL 1/1；`cargo test --locked --test storage legacy_user_and_library_access_upgrade_from_v183_to_current_schema -- --exact` SQLite 1/1；`NO_PROXY=127.0.0.1,localhost cargo test --locked --test postgres_database postgres_legacy_user_and_library_access_upgrade_from_v183_to_current_schema -- --include-ignored` PostgreSQL 1/1；既有 `postgres_user_library_access_mode_migration_preserves_legacy_semantics` 1/1。所有 Cargo 命令设置了 `/Volumes/Toshiba/mywork/Lux/target`。全量门禁仍按上文保留失败记录；本次未运行真实 Lucky、FNOS/x86_64、SMTP 邮件投递或第三方播放器验证。
+
+#### LUX-825：内置数据库维护与体检建议
+
+背景：LUX-316 的体检功能被明确限定为只读，禁止执行全表 COUNT、ANALYZE、VACUUM 或任何写入，也未实现瘦身与空间回收。实际运维中，PostgreSQL 与 SQLite 库都会因 job 历史、重复扫描和删除产生大量 dead tuple 与堆膨胀；默认 `autovacuum_vacuum_scale_factor=0.2` 让大表阈值随体积升高，写入量长期追不上阈值，导致死元组堆积、索引与堆比例失衡。这些收益目前只能靠人工逐库执行，无法让所有部署受益。
+
+范围：新增内置数据库维护能力，由 `luxd` 自身按“启动后延迟 + 每日周期”在后台执行，默认开启，可用环境变量关闭。维护只覆盖两类低风险动作：一是对统计显示 dead tuple 逼近或超过默认触发阈值的表执行 `VACUUM (ANALYZE)`；二是对符合条件的热点大表写入表级 autovacuum 参数覆盖。PostgreSQL 与 SQLite 必须分别实现，SQLite 仅做 `VACUUM`/`ANALYZE` 与相应阈值判断，autovacuum 表级参数在 SQLite 返回 NOT_APPLICABLE。
+
+硬性约束：
+
+- 维护任务**不得**删除任何业务行、不得 `DROP`/`TRUNCATE` 表、不得 `DROP INDEX`、不得执行 `VACUUM FULL` 或 `REINDEX`。空间回收与索引删减仍由管理员人工决策，本任务不自动执行。
+- 判定“空表”或“低行数表”前必须取值自可验证的来源；**不得**仅凭 `pg_stat` 的 live tuple 估算值，因为该值在 autovacuum 从未运行的表上为初始 0，与真实行数可能相差数十万。判定必须复用已确认的精确计数或明确标记为不可确认并跳过。
+- 维护动作必须幂等、有界、可限流：单轮有最大表数、单表有超时、失败只记录并继续，不得让单表失败中断整轮，也不得阻塞 HTTP 监听、扫描或播放。
+- 同一进程内只允许一个维护轮次运行；维护与扫描任务重叠时，必须让扫描优先，维护可跳过本轮。
+- 不新增数据库表；表级参数通过既有的 `pg_class.reloptions` 机制写入，因此不需要 migration。若实现确需持久化维护状态，只允许使用进程内存或现有配置目录，不得新增 schema。
+- 体检报告新增只读“可优化建议”字段，仅描述信号（热点表、疑似冗余索引、统计不可信、索引与堆比例失衡），**不自动执行**建议中的任何动作。不得在报告中暴露行数据、媒体路径或连接信息。
+
+配置：新增环境变量控制开关与周期，沿用现有 `LUX_*` 命名与解析风格，非法值回退默认；`0` 关闭。维护默认开启，但必须能在不重启业务的前提下被管理员关闭。
+
+验收：
+
+- [x] PostgreSQL 与 SQLite 各自实现维护轮次，按 dead tuple 与触发阈值判定候选表；SQLite 的 autovacuum 表级参数明确返回 NOT_APPLICABLE 而非静默跳过。
+- [x] 判定前核对行数来源可信度；对 `pg_stat` 从未采样（`last_autoanalyze` 为 NULL 且计数为 0）的表，不得据其估算值判定为空表或低负载表。
+- [x] 维护只执行 VACUUM/ANALYZE 与表级参数写入；代码中不存在自动 DROP INDEX、VACUUM FULL、REINDEX、DELETE 业务行的路径。
+- [x] 单轮有最大表数上限、单表有超时；单表失败只记日志并继续，不中断整轮。
+- [x] 进程内单轮互斥；扫描进行中时跳过或延后本轮。
+- [x] 维护不阻塞 HTTP 监听与启动；启动后延迟执行，周期任务与扫描、播放互不影响。
+- [x] 关闭开关后维护完全不执行；非法配置回退默认值。
+- [ ] 体检报告新增建议字段（延后至独立任务，见实施结果），Schema 与现有字段兼容；建议不触发任何写操作，且不泄露敏感信息。
+- [x] 定向测试覆盖双后端判定、空表误判保护、失败继续、互斥与开关；`cargo build --locked`、`cargo fmt --all -- --check`、定向 `cargo test --locked --lib` 与目标集成测试通过。
+
+验证：`cargo test --locked --lib database_maintenance`、`cargo test --locked --lib database_diagnostics`、`cargo test --locked --test admin_database_diagnostics`、`cargo build --locked`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+预计文件（4 个）：`src/storage/database_maintenance.rs`、`src/storage/mod.rs`、`src/main.rs`、`tests/admin_database_diagnostics.rs`；如体检建议字段独立实现，再追加 `src/storage/database_diagnostics.rs` 与 `docs/API.md`，总数不超过 6 个。
+
+依赖：LUX-316。明确不做：VACUUM FULL、REINDEX、删除索引、清理 job 历史、修改全局 `postgresql.conf`、重启数据库进程、在体检报告中自动执行建议。
+
+短计划：先用双后端回归固定“统计不可信不得判定为空表”和“只允许 VACUUM/ANALYZE 与表级参数”的边界；再实现判定与维护轮次；最后接入启动延迟与每日周期、补体检建议字段并跑定向门禁。
+
+实施结果（2026-10-20）：新增 `src/storage/database_maintenance.rs`，以 `LUX_DATABASE_MAINTENANCE` 控制开关，默认开启；启动后延迟 600 秒执行首轮，之后每 86400 秒一轮，间隔与首轮延迟可分别通过环境变量调整，非法值回退默认。判定逻辑要求死元组同时满足 `>= 5000` 且超过默认 autovacuum 触发阈值的 70%，表级参数覆盖另要求活跃行数 `>= 10000`。PostgreSQL 通过 `pg_stat_user_tables` 的 `autoanalyze_count`/`autovacuum_count` 判断统计是否可信，从未采样过的表只进入 `skipped_untrusted` 而不参与判定；该保护来自现场实测：`pg_stat` 对从未 autovacuum 的表报告 `n_live_tup=0`，而真实行数达 99 万，若按估算值执行 `VACUUM FULL` 会长时间锁住该表。SQLite 以 `PRAGMA freelist_count` 作为候选，仅执行 `VACUUM`，不记录任何 autovacuum 参数。轮次内单轮最多 12 张表、单表 120 秒超时、单表失败只记录并继续；进程内以 `AtomicBool` 保证单轮互斥；检测到 `scan_jobs` 或 `metadata_reidentify_jobs` 存在 `PENDING`/`RUNNING` 时整轮让位。维护未新增 migration，也没有删除数据、删除索引或执行 `VACUUM FULL`/`REINDEX` 的代码路径。
+
+验证结果：`cargo build --locked` 通过；`cargo test --locked --lib database_maintenance` 5 项通过；`cargo test --locked --test database_maintenance -- --test-threads=1` 4 项通过；`cargo fmt --all -- --check` 通过；新文件在 `cargo clippy --locked --lib --all-features -- -D warnings` 下无告警。并发互斥与扫描让位两条测试都做过变异验证：临时移除保护后测试分别失败，恢复后通过，证明断言不是空转。全目标 Clippy 与全目标测试未能作为本任务验收依据：当前工作区存在另一并行功能的未完成改动（`src/storage/library_deletion.rs` 等），在移除本任务改动后的基线也无法编译（`fail_library_deletion_job` 缺失），因此全量门禁留待该并行改动完成后统一执行。本机为 macOS arm64，未在 FNOS/x86_64 或真实 PostgreSQL 大库上验证实际的 `VACUUM` 耗时与 autovacuum 收敛效果。
+
+未覆盖部分：体检报告的“可优化建议”字段未实现。原计划在同一任务内补充，但 LUX-316 明确把体检限定为只读且不执行任何写入，而建议字段需要新增报告 Schema 与相应文档；为避免在未获确认前扩大该临时诊断功能的接口面，本轮只交付自动维护能力。建议字段应作为独立任务重新评估，并先确认是否随 LUX-316 的移除计划一并终止。
+
+#### LUX-826：按显示尺寸提供派生图片变体缓存
+
+来源方案：`LUX-IMAGE-VARIANTS-PLAN.md`（2026-10-20）。方案中的任务编号建议为 LUX-826，项目所有者要求按方案实施。
+
+范围：Web 图片端点新增可选 `w=360|720|1280`，按长边生成 JPEG 派生变体并缓存到 `/config/image-cache/v1/`。原图只读，永不改写或删除媒体库文件；默认关闭时响应字节、ETag 与 `Cache-Control` 与实施前一致。仅处理 POSTER、THUMB、FANART；按方案 §13 风险表，LOGO 首版不生成变体以避免透明背景压成黑底。变体按 `SHA256(item_id)` 首字节的两位十六进制分片，再按媒体 `item_id` 分目录，文件名为 `content_tag-w宽度.jpg`，使用 `image` crate 在 `spawn_blocking` 中解码、应用 EXIF 方向、Lanczos3 缩放、JPEG q80 编码并原子落盘；生成失败、超时、缓存不可写或超限时一律回退原图。
+
+配置：`server_settings.media_strategy.images.variantCache` 新增 `enabled`（默认 `false`）、`maxFiles`（100–1,000,000，默认 20,000）、`maxBytes`（64 MiB–64 GiB，默认 2 GiB）、`concurrency`（1–4，默认 2）。旧 JSON 缺失该对象时由 serde 默认关闭，不需要 migration。管理员保存全局策略后热更新服务开关与并发，无需重启。
+
+启用方式（2026-10-22 修订）：仅由管理员全局 `variantCache.enabled` 控制，删除账户“使用优化图片”偏好、偏好复制字段与存储列；保留历史 0204 migration，新增双数据库 0207 migration 删除列。`/api/v1/auth/me` 仅返回 `imageVariantsEnabled`，含义为全局开关状态。缓存布局为 `/config/image-cache/v1/<SHA256(item_id)前两位>/<item_id>/<content_tag>-w<width>.jpg`，与 `metadata/library` 共用条目目录算法；启动扫描只清理可识别的旧版扁平变体和临时文件，按新布局恢复 LRU，之后按需重新生成。
+
+缓存保护：内存 LRU（文件数与字节双上限）、启动后台扫描（按 mtime 恢复顺序，清理 0 字节与 `.lux-*.tmp`）、同 key 并发只生成一次、失败 key 冷却 60 秒、单张源图上限 30 MB / 40 MP、响应预算 300 ms、生成超时 10 秒、全局生成并发默认 2。日志只记录宽度、字节数、耗时、错误类别与 item/image 类型，不记录本地路径或用户数据。
+
+验收：
+
+- [x] 默认关闭时图片响应字节、ETag 与 `Cache-Control` 与实施前一致；开关关闭时忽略 `w`。
+- [x] 主开关开启时，`w=360/720/1280` 返回长边对应、保持宽高比的 JPEG 变体；ETag 含 `content_tag` 与宽度，`Cache-Control` 为 `private, max-age=31536000, immutable`；`If-None-Match` 返回 304，HEAD 无 body。
+- [x] 主开关开启时非法 `w` 返回 `400 INVALID_REQUEST`；关闭时忽略。
+- [x] 原图只读；变体写入 `/config/image-cache/v1/`；`content_tag` 必须为 64 位小写十六进制，item_id 与 content_tag 均验证为安全路径组件。
+- [x] EXIF 方向、只缩小不放大、40 MP / 30 MB 上限、失败回退与 60 秒冷却有单元测试覆盖。
+- [x] 同一 key 并发 8 个请求只生成 1 次；LRU 在文件数与字节上限下淘汰最旧文件；启动扫描清理 0 字节与临时文件。
+- [x] 缓存目录不可写、损坏图片、尺寸不足、内容标签缺失时返回原图且不产生错误响应。
+- [x] 管理端全局策略可保存 `variantCache` 并热更新；账户端不再提供“使用优化图片”偏好；全局开启即为所有用户启用。
+- [x] Web 卡片、继续观看、Hero、详情海报/背景、季度/单集、剧照分别拼接 360 / 1280 / 720 宽度；关闭时不改 URL。
+- [x] 定向 Rust/Web 测试、`cargo build --locked`、`cargo fmt --all -- --check`、`pnpm --dir web build` 通过；全量门禁结果与既有基线失败在实施结果中记录。
+
+预计文件：`src/application/image_variants.rs`（新增）、`src/application/images.rs`、`src/application/settings.rs`、`src/application/user_account_preferences.rs`、`src/application/mod.rs`、`src/api/media.rs`、`src/api/legacy.rs`、`src/api/users.rs`、`src/api/admin/admin_settings.rs`、`src/storage/catalog.rs`、`src/storage/users.rs`、`src/storage/repository.rs`、`migrations/0204_user_optimized_images.sql`、`migrations-postgres/0204_user_optimized_images.sql`、`tests/image_variants.rs`（新增）、`web/src/lib/api/types.ts`、`web/src/app/App.tsx`、`web/src/features/home/image-variants.ts`（新增）、`web/src/features/home/media-display.tsx`、`web/src/features/home/media-card-visual.tsx`、`web/src/features/home/media.tsx`、`web/src/features/home/HomePage.tsx`、`web/src/features/detail/MediaDetailHero.tsx`、`web/src/features/detail/MediaEpisodesSection.tsx`、`web/src/features/detail/MediaStills.tsx`、`web/src/features/detail/CollectionDetailPage.tsx`、`web/src/features/account/AccountPage.tsx`、`web/src/features/account/account-settings.ts`、`web/src/features/admin/AdminLibrariesPage.tsx`、`web/src/features/admin/AdminUserPreferenceCopyDialog.tsx`、`web/tests/image-variants.test.ts`（新增）、`web/tests/image-variants-render.test.tsx`（新增）、`web/tests/account-settings.test.tsx`、`web/tests/admin-libraries.test.tsx`、`web/tests/admin-user-preference-copy.test.tsx`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+依赖：无新增依赖，复用 `image` crate 与既有 SQLite/PostgreSQL 迁移机制。明确不做：全量预热、裁剪、AVIF/HEIC、CDN、多进程共享缓存、Emby 图片路由变体、视频缩略图与字幕变更。
+
+历史实施结果（2026-10-21，启用方式和目录布局由 2026-10-22 修订替代）：按方案完成 A–E 阶段。新增 `ImageVariantService`，在 `spawn_blocking` 中解码、`apply_orientation`、Lanczos3 缩放、JPEG q80 编码并原子写 `/config/image-cache/v1/<tag前两位>/<content_tag>-w<width>.jpg`；LRU 同时限制文件数与字节，启动后台按 mtime 扫描并清理 0 字节与 `.lux-*.tmp`。服务仅在主开关与用户偏好同时开启时生成，其他情况、非法/不支持尺寸、尺寸不足、解码失败、缓存不可写或超时均返回原图。管理端全局策略保存后立即热更新开关、并发和容量；`auth/me` 同时返回 `imageVariantsAvailable`（仅主开关，用于显示账户开关）与 `imageVariantsEnabled`（主开关与偏好同时开启，用于拼 `w=`）。方案 §5.3 的单一组合字段无法在用户关闭偏好后再次显示开关，因此新增 `imageVariantsAvailable`；这是对方案的一处必要补充。按方案 §13 风险表，LOGO 首版不生成变体（方案 §6 的列表包含 LOGO，两处冲突时采用风险表），FANART/THUMB/POSTER 之外的类型保持原图。服务端同时校验用户偏好，避免已选择关闭的用户仍消耗生成 CPU；这与方案 §5.1“客户端不传 w”一致，并满足 §10.2“用户偏好关闭返回原图”。
+
+验证：`cargo build --locked`、`cargo fmt --all -- --check`、`git diff --check` 通过；`pnpm --dir web build` 通过。定向测试：`cargo test --locked --lib application::image_variants` 11/11、`cargo test --locked --lib application::settings::variant_cache_tests` 2/2、`cargo test --locked --lib application::user_account_preferences` 10/10、`cargo test --locked --test image_variants` 9/9、`cargo test --locked --test images --test image_api` 3/3 通过。Web 定向测试 `tests/image-variants` 5/5、`tests/image-variants-render` 2/2、`tests/account-settings` 34/34、`tests/admin-libraries` 新增用例通过。全量 `cargo test --locked --all-targets` 结果 1151 通过 / 5 失败：`application::metadata::tests::scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`storage::repository::repository_tests::automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost` 在实施前提交 `8d032103` 上同样失败；`storage::repository::jobs::tests::shutdown_cancels_legacy_scan_jobs_in_one_bounded_update` 在提交 `8d032103` 上通过，但当前工作区并行的媒体库删除改动在 `src/storage/jobs/shutdown.rs` 增加了第 10 条 UPDATE，使既有断言（期望 9 条）失败，不属于 LUX-826。全量 `pnpm --dir web test` 最近一次 836 通过 / 1 失败：`tests/admin-libraries.test.tsx` 的“删除成功后移除媒体库卡片”在提交 `8d032103` 上通过，当前工作区并行删除改动把卡片移除改为后台清理后该旧断言失败，不属于 LUX-826。全目标 Clippy 仍有 19 项既有告警（管理员 API、Emby/media、播放会话、权限复制、数据库维护与存储测试）；LUX-826 新增和修改的文件未产生新的 Clippy 诊断（`serve_image` 参数已收敛为 7 个）。
+
+限制与剩余风险：未在 FNOS/x86_64 或真实 NAS 上验证；未执行方案阶段 F 的 1,000 张真实图片、20 Mbps / 40 ms 网络基准，因此 §12 的生成 p95、首字节和首屏总字节仍以方案中的本机测量为参考，未在本任务复测。PostgreSQL migration 未在本机真实 PostgreSQL 上执行（SQLite 空库升级由全部集成测试覆盖）。冷缓存首次请求仍按 300 ms 预算回退原图，由后台完成生成；这是方案设计行为。LOGO 透明背景未处理。缓存目录当前按单实例文件锁与原子写设计，多实例共享 `/config` 不在支持范围。
+
+修订实施计划（2026-10-22）：先在图片服务、路径 helper、图片 API 与图片测试中统一 item_id 目录；再逐步调整全局能力、账户 Web 与偏好复制；最后移除存储字段、添加 0207 migration 并更新 API/兼容性文档。各切片保持独立提交，原有更新日志改动不纳入。
+
+修订实施结果（2026-10-22）：图片缓存键增加媒体条目目录，复用 `metadata_paths::item_relative_directory` 的安全组件校验与 SHA256 分片；`serve_image` 传入媒体 item_id，避免误用图片行 ID。启动扫描识别新布局并恢复 LRU，仅清理可识别的旧版扁平缓存与临时文件，跳过符号链接。保留内容标签作为同条目多图与原图更新的版本标记。删除账户 UI、浏览器旧偏好读取、API/复制快照、应用服务、存储查询与结构中的个人开关；保留 0204 migration，新增双端 0207 删除列。管理员保存全局策略后失效 `auth/me` 查询，当前会话自动切换图片 URL。
+
+本次主要修改文件：图片路径与服务 `src/application/metadata_paths.rs`、`src/application/image_variants.rs`、`src/api/media.rs`；偏好模型与存储 `src/application/user_account_preferences.rs`、`src/storage/users.rs`、`src/storage/repository.rs`、`src/api/users.rs` 及两份 0207 migration；Web 的 `App.tsx`、`features/home/image-variants.ts`、账户设置和管理员偏好/复制/全局策略页面；对应 Rust/Web 测试及 `docs/API.md`、`docs/COMPATIBILITY.md`。
+
+定向验证：图片服务单测 15/15、账户偏好单测 10/10、最终图片/图片 API 回归 12/12、用户接口 37/37、SQLite 空库/升级 2/2、本机 PostgreSQL 空库/升级 1/1 通过。Web 安装（冻结锁文件）、全量测试 846/846 与构建通过；脚本语法与 compatibility-probe/catalog-fixture Python 测试 10/10 通过。Playwright 使用本机临时库和 1600×2400 PNG：同一会话通过管理员 UI 关闭/开启全局开关，无需页面刷新即可移除/恢复卡片 `w=360`；生成文件落在 `image-cache/v1/b0/00000000-0000-4000-8000-000000008260/<content_tag>-w360.jpg`，缓存命中响应为 200 JPEG、带内容标签/宽度 ETag 与 immutable 缓存头；全局开启时账户页面个人开关数量为 0，最终页面控制台无错误。
+
+全量 Rust 门禁：`cargo build --locked` 与 fmt 通过；`cargo test --locked --all-targets` 在 lib 阶段为 1163 通过 / 3 失败 / 32 忽略，随后未继续执行集成目标。失败项为 `automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`，已在原始 `test` 提交 `c7123f8` 定向复现（前两项的 automatic_ 组 3 通过 / 2 失败，第三项 0 通过 / 1 失败）；不属于本次图片变更。
+
+最终 `cargo fmt --all -- --check` 与 `git diff --check` 通过；全目标 Clippy 仍因 8 项既有诊断未通过，错误类别与文件（含重复次数）与原始 `c7123f8` 一致：Emby/media/播放会话参数数目 4 项、存储测试不必要 clone 1 项、类型复杂度 2 项、注册测试 helper 参数数目 1 项。本次引入的同步图片宽度解析大 Err 告警已通过装箱错误响应消除，最终图片回归 12/12 通过，未增加 Clippy 诊断。
+
+限制：上述验证在本机 macOS arm64，未部署至 FNOS；冷缓存仍按原有 300 ms 预算回退原图并在后台完成生成，旧 Web 客户端提交已移除字段需刷新资源。
+
+#### LUX-827：开放管理员只读读取用户账户偏好
+
+范围：新增 `GET /api/v1/admin/users/{userId}/account-preferences`，返回与当前用户账户偏好 API 相同的版本化快照，包括版本 0 的默认值和旧服务端排序/已看阈值。接口仅允许管理员读取，不提供单字段写入；`libraryOrder` 按目标账号当前可访问范围过滤，并设置 `Cache-Control: private, no-store`。无效用户 ID 返回 400，不存在的用户返回 404。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`docs/USER-MANAGEMENT-DESIGN.md`、`docs/API.md`、`src/api/admin/admin_users.rs`、`tests/users.rs`。
+
+验收标准：
+
+- [x] 管理员读取现有与默认账户偏好时返回完整快照；未认证、非管理员、无效 ID 和不存在用户均按稳定状态拒绝。
+- [x] 媒体库顺序按目标账号当前 ACL 过滤；成功响应禁止缓存，不包含凭证或其他账户信息。
+- [x] 接口为只读，不改变现有账户偏好写入与版本合同；`users` 定向回归、build、fmt 和 diff check 通过。
+
+短计划：先新增管理员账户偏好读取 HTTP 回归并确认路由缺失；再复用现有账户偏好服务与目标用户访问范围接入 GET 路由，最后更新 API 文档并运行定向检查。
+
+实施结果（2026-10-21）：新增管理员只读账户偏好 GET 路由，复用当前账户偏好服务；版本 0 返回账户页默认值，已有版本返回主题、强调色、首页分区、音轨/字幕语言、自动连播、优化图片、媒体库顺序与已看阈值。`libraryOrder` 按目标用户媒体库 ACL 和可用系统合集过滤，成功响应设置 `Cache-Control: private, no-store`。请求只允许管理员，不要求 CSRF，不新增写入行为。
+
+验证：先确认路由缺失回归以 404 失败；`cargo test --locked --test users admin_can_read_user_account_preferences_and_reject_non_admin -- --exact` 1/1，完整 `cargo test --locked --test users -- --test-threads=1` 37/37，`cargo build --locked`、`cargo fmt --all -- --check` 与定向 `git diff --check` 通过。`cargo clippy --locked --test users -- -D warnings` 被现有 `too_many_arguments` 告警阻断（`src/api/emby_catalog.rs`、`src/api/media.rs`、`src/application/playback/session.rs`）；放行该 lint 后又发现 `tests/users.rs:425` 的既有 `type_complexity`，同时放行这两类后定向 Clippy 通过。新接口和新增回归没有 Clippy 诊断。Cargo 命令使用 Toshiba target；本机 macOS 架构为 `arm64`。
+
+#### LUX-828：在用户详情展示账户偏好快照
+
+范围：将用户详情的“偏好”模块接入 LUX-827 管理员只读接口，按外观、首页和播放分组展示完整账户偏好、版本与更新时间。明确本页只读；管理员调整其他用户偏好继续使用用户列表中的预览/复制流程，不新增直接覆盖接口。
+
+预计修改文件（5 个）：`docs/LUX-DEVELOPMENT.md`、`web/src/lib/api/client.ts`、`web/src/features/admin/AdminUserManagementPage.tsx`、`web/src/features/admin/user-management.css`、`web/tests/admin-user-preferences.test.tsx`。
+
+验收标准：
+
+- [x] 用户详情偏好标签展示服务端实际快照，包括版本 0 默认值、媒体库排序和播放阈值。
+- [x] 页面明确只读边界；加载失败可重试，回收站用户也不会提供写入控件。
+- [x] 定向 Vitest、TypeScript、Web build 与 diff check 通过。
+
+短计划：先添加偏好标签加载、默认/已保存快照、失败重试和只读边界的组件回归；再接入 LUX-827 Web client 并实现分组面板，最后运行定向测试、类型检查与构建。
+
+实施结果（2026-10-21）：用户详情“偏好”标签不再显示占位页，改为外观、首页、播放三组只读服务端快照；显示主题、强调色、首页分区、按名称排列的媒体库顺序、音轨/字幕、自动连播、优化图片、播放完成阈值、版本和更新时间。说明管理员修改方式沿用列表中的预览/复制流程。接口加载失败提供重试；回收站账号仍仅展示只读内容。
+
+验证：新组件回归先在占位页上失败，完成后 `pnpm --dir web exec vitest run tests/admin-user-preferences.test.tsx` 4/4 通过；`pnpm --dir web install --frozen-lockfile` 与 `pnpm --dir web build` 通过。真实 Playwright 浏览器使用 mock API 检查页面内容与 1440、768、390、320px viewport，均无横向溢出，浏览器控制台无错误或警告。完整 `pnpm --dir web test` 为 841 通过、1 失败；唯一失败是并行 LUX-794 的 `tests/admin-libraries.test.tsx` 删除成功夹具未返回异步 `{ job }`，与本任务无关。`git diff --check` 通过。
+
+补充复核（2026-10-21）：当前工作区再次运行串行 `cargo test --locked --test users -- --test-threads=1` 为 36/37；`admin_can_manage_users_and_last_manager_is_protected` 在删除普通用户时返回 503 `DATABASE_UNAVAILABLE`，但单独重跑该测试为 1/1，用户偏好接口回归也在该目标内通过。LUX-736 曾记录同一用例的间歇性 503，根因尚未确认；本次失败不能归因于 LUX-827/828。Web 偏好组件测试 4/4、`git diff --check` 通过。
+
+#### LUX-829：建立可复现的 Web 性能基准
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-827：建立可复现的性能基准”（方案编号因 LUX-826 图片变体与并行 LUX-827/828 占用而顺延为 LUX-829）。
+
+范围：为 `tools/catalog-fixture/generate.py` 增加“直接写入已迁移 SQLite 库”的合成目录夹具，生成电影/剧集/混合媒体库、媒体源、轨道与图片索引；图片复用真实海报文件，不复制百万张图片，也不写媒体库。新增 `scripts/run-web-performance.mjs`，用 Playwright + CDP 在固定视口下采集 M1 首卡可见、M2 列表 TTFB、M3 排序后首卡、M4 滚动 long task、M5 首屏字节、M6 掉帧率，并把结果与限制写入 `docs/PERFORMANCE.md`。
+
+预计文件（3 个）：`tools/catalog-fixture/generate.py`、`scripts/run-web-performance.mjs`、`docs/PERFORMANCE.md`。
+
+验收标准：
+
+- [x] 夹具可重复生成 1,000,000 条目，含媒体源、轨道与真实图片索引；媒体库文件只读。
+- [x] 同一命令连续跑 3 次，M1–M6 变异系数 <15%，基线 JSON 记录 commit、架构、数据集与命令。
+- [x] M1–M6 定义与方案 §2 一致；浏览器控制台无本任务引入的错误。
+- [x] 本机 arm64 数值与未覆盖的 NAS/x86_64、真实网络条件如实记录。
+
+短计划：先实现夹具种子与迁移校验；再实现 Playwright 采集与 3 次聚合；最后在 100 万条测试库上跑基线并记录。
+
+实施结果（2026-10-21）：`tools/catalog-fixture/generate.py` 新增直接写入已迁移 SQLite 库的合成目录夹具：可选电影/剧集/混合媒体库、媒体源、轨道、图片索引、固定测试会话与 Playwright 夹具清单；图片复用真实海报硬链接，不写媒体库。为控制本机种子时间与磁盘占用，100 万条夹具使用 `--skip-search-index`（不填 FTS 搜索索引）与 `--detail-items 2000`（只对前 2,000 条物化源/轨道/图片）；完整 100 万条写入实测 43 秒，库约 916 MB。新增 `scripts/run-web-performance.mjs`：Playwright + CDP 采集 M1–M6，支持每轮重启服务消除 15 秒列表缓存、20 Mbps / 40 ms 网络模拟、浏览器缓存禁用、丢弃预热轮，并输出 JSON 与 CV 汇总。
+
+验证：`python3 -m unittest tools/catalog-fixture/test_generator.py` 7/7 通过；`node --check scripts/run-web-performance.mjs` 通过。在本机 arm64、release `luxd`、1,000,000 条夹具、20 Mbps / 40 ms、三次冷启动下：M1 中位数 1,669.3 ms（CV 0.75%）、M2 1,638.5 ms（CV 0.77%）、M3 1,268.2 ms（CV 1.84%）、M4 0 个 long task、M5 19,257,462 B（CV 0%）、M6 0%（单次最大 0.056%），均满足三次重复 CV <15%。列表响应体 48,228 B，其中前 24 张 POSTER 占 18,335,296 B。
+
+限制：所有数字仅代表本机 macOS arm64 headless Chromium，不代表 FNOS/x86_64、NAS、真实弱网、TLS/HTTP/2 或真实用户设备；夹具直接写库，不执行 100 万次扫描/ffprobe，全文搜索索引为空，只有前 2,000 条有源、轨道和图片；M4/M6 在本夹具接近零，不能据此宣称真实滚动或解码性能。完整记录见 `docs/PERFORMANCE.md` LUX-829 节。
+
+#### LUX-830：为默认目录排序建立表达式索引
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-827：为默认排序与看板排序建立表达式索引”（编号顺延）。
+
+范围：为默认目录排序新增五个部分表达式索引，覆盖 `Name`、`SortName`、`DateCreated`、`PremiereDate`、`Rating`；SQLite 与 PostgreSQL 各一份 migration，SQLite 旧库/新库的表重建路径同步重建这些索引。`list_filtered_catalog_rows` 的查询构造抽出为可测试 helper，新增仅测试可见的 `EXPLAIN QUERY PLAN` 入口，验证内层 100 万级排序不再使用临时 B-tree。
+
+预计文件（6 个）：`migrations/0205_catalog_sort_indexes.sql`、`migrations-postgres/0205_catalog_sort_indexes.sql`、`src/storage/catalog.rs`、`src/storage/migration.rs`、`src/storage/repository_tests.rs`。
+
+验收标准：
+
+- [x] `EXPLAIN QUERY PLAN` 对五种排序都使用对应表达式索引；内层目录扫描不再出现 `TEMP B-TREE`。
+- [x] `ORDER BY` 结果与未加索引前一致，`list_filtered_catalog_rows` 现有回归全部通过。
+- [x] 空库迁移、SQLite 旧库重建路径和 PostgreSQL migration 定义保持双端一致；`cargo build --locked`、fmt、定向测试通过。
+- [x] 在 LUX-829 的 100 万条夹具上复测冷启动列表 TTFB 与 M1–M3，并记录相对基线的变化与剩余限制。
+
+短计划：先写 migration 与索引计划失败测试；再补 SQLite 重建路径与查询 helper；最后在 100 万条夹具上复测并更新性能记录。
+
+实施结果（2026-10-21）：新增 SQLite/PostgreSQL `0205_catalog_sort_indexes.sql`，为 `Name`、`SortName`、`DateCreated`、`PremiereDate`、`Rating` 建立部分表达式索引；`migrate_sqlite_catalog_constraints` 的新库/旧库表重建路径同步重建五个索引，避免新装库首次启动时被表重建丢弃。`list_filtered_catalog_rows` 的列表 SQL 抽出为 `filtered_catalog_list_query`，新增仅测试可见的 `explain_filtered_catalog_rows`，对五种排序断言使用对应索引、内层扫描无 `TEMP B-TREE`，并保留外层已选 24 条 source/stream 的有界临时排序说明。`CatalogSort` 增加 `Debug` 派生仅供测试诊断。
+
+验证：`cargo test --locked --lib catalog_sort_expression_indexes_cover_default_sorting` 1/1 通过；`cargo build --release --locked` 通过，100 万条夹具启动时 `schema_version=205`、应用 migration 约 14 秒。100 万条库上五种排序的 `EXPLAIN QUERY PLAN` 均命中对应索引；内层列表查询预热后约 0.01 ms/次，`COUNT(*)` 仍约 661 ms。与 LUX-829 同条件复测：M1 1,669.3→1,365.5 ms（-18.2%），M2 1,638.5→1,335.9 ms（-18.5%），列表请求自身 736–768→434–442 ms（约 -41%），M3 中位数 1,268.2→772.7 ms（单轮波动，CV 31.7%），M5/M4/M6 不变。M2 尚未达到 ≤300 ms，主因是每页 `COUNT(*)`，由 LUX-832 处理。
+
+限制：PostgreSQL migration 未在本机真实 PostgreSQL 执行；M3 的单轮波动来自服务重启后的本地元数据回填与浏览器调度，只作方向参考；外层有界临时 B-tree 仍在，但不再对 100 万条目录做全量排序；所有数字仅代表本机 macOS arm64。
+
+#### LUX-831：媒体库列表卡片投影
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-828：列表 DTO 投影，去掉卡片不需要的字段”（编号顺延）。
+
+范围：`GET /api/v1/libraries/{libraryId}/items` 新增可选 `fields=card`。卡片投影保留 `id`、`libraryId`、`itemType`、`title`、`productionYear`、`rating`、`runtimeTicks`、`addedAt`、`episodeCount`、`seriesId`、`parentId`、`imageTags`、`userData`、`defaultDurationTicks`、`metadataPending`、`localMetadataPending`（空的字符串/数字字段省略），省略 `mediaSources`、`overview`、`providerIds`、`sortTitle` 等完整详情字段；缺省 `fields` 时响应保持旧版完整 DTO，其他 `fields` 值返回 400。Web 媒体库首屏与预取统一携带 `fields=card`，其他详情/搜索/继续观看仍使用完整 DTO。
+
+预计文件（11 个）：`src/application/catalog.rs`、`src/api/media.rs`、`web/src/lib/api/client.ts`、`web/src/lib/api/types.ts`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`tests/catalog.rs`、`web/tests/api-client.test.ts`、`web/tests/library-page.test.ts`、`docs/API.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 24 条卡片页 raw ≤12 KB；gzip 2.8 KB（目标 2.5 KB 未达，见实施结果）。缺省 `fields` 时完整响应字段与旧版一致。
+- [x] 卡片渲染、继续观看进度、集数徽标、多选、合并对话框不回归；非法 `fields` 返回 400。
+- [x] Rust `catalog`/`media` 定向回归、Web 客户端与媒体库页定向测试、build 与 fmt 通过。
+- [x] 在 LUX-829 的 100 万条夹具上复测列表 payload 与 M1/M2，并记录相对基线变化。
+
+短计划：先写 `fields=card` 的 API 回归（缺失字段与 400）；再实现投影枚举与卡片 DTO、接入 Web；最后在 100 万条夹具上测量 payload 和首屏指标。
+
+实施结果（2026-10-21）：`GET /api/v1/libraries/{libraryId}/items` 新增 `fields=card`，新增 `CatalogItemProjection` 枚举与卡片 DTO；卡片保留 `id`、`libraryId`、`itemType`、`title`、`productionYear`、`rating`、`runtimeTicks`、`addedAt`、`episodeCount`、`seriesId`、`parentId`、`imageTags`、`userData`、`defaultDurationTicks`、`metadataPending`、`localMetadataPending`，空的字符串/数字字段与空图片标签省略，`userData` 只写非默认值；完整详情仍走完整 DTO。Web 媒体库首屏与预取统一传 `fields=card`，`MediaItem` 增加 `defaultDurationTicks`。非法 `fields` 返回 `400 INVALID_REQUEST`。
+
+验证：新增 `tests/catalog.rs` 断言 `fields=card` 的字段集合、`mediaSources`/`overview`/`sortTitle`/`providerIds` 被省略、非法值 400，且缺省响应仍含完整源；`cargo test --locked --test catalog lux_and_emby_catalogs_list_page_and_show_movie_details` 1/1。`pnpm --dir web exec vitest run tests/api-client.test.ts tests/library-page.test.ts` 通过（104+19）；`pnpm --dir web build` 通过；`cargo fmt --all -- --check` 通过。
+
+100 万条夹具、20 Mbps / 40 ms、每轮重启复测：24 条完整响应 48,228 B / gzip 4,842 B；卡片响应 11,125 B / gzip 2,804 B（raw -76.9%，gzip -42.1%）。raw ≤12 KB 达标；gzip 2.5 KB 未达，主要原因是 24 个随机 UUID `id` 约 864 B 原始字节、压缩后仍约 700 B，gzip 对重复 key 已高度压缩，继续裁剪字段收益有限。M1/M2 中位数 1,365.5→1,433.7 ms、1,335.9→1,417.6 ms（CV 1.5%），投影不改变每页 `COUNT(*)` 与首屏引导链，差异在噪声范围内；M5 不变。预期收益需要 LUX-832（去 COUNT）和 LUX-834（首屏并行）叠加后才能体现在 M1/M2。
+
+限制：卡片投影省略 `mediaSources`，卡片上的删除对话框若需要默认源 ID 会退化为无 sourceId 删除；本任务验收未覆盖该路径，完整详情页仍可取得源 ID。PostgreSQL/桌面真实浏览器未单独复测；所有数字仅代表本机 arm64 headless Chromium。
+
+#### LUX-834：静态资源预压缩与 HTTP/2 部署说明
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-831：静态资源预压缩 + 部署层 HTTP/2”（编号顺延）。
+
+范围：新增 `web/scripts/build-web.mjs`，在 Vite 构建后为 `web/dist` 下达到阈值的前端静态文件生成 gzip 兄弟文件；`pnpm --dir web build` 自动执行该步骤。脚本位于 `web/` 内，以确保 Docker `web-builder` 阶段的 `COPY web ./` 能包含它。Lux 的静态文件路由改用 `precompressed_gzip()`，按 `Accept-Encoding` 直接返回 `.gz`，不新增运行时压缩依赖；`docs/DEPLOYMENT.md` 给出 nginx `http2 on` 与 `gzip_static on` 配置。Lux 自身仍监听明文 HTTP/1.1，不新增 `h2` 依赖。
+
+预计文件（7 个）：`web/scripts/build-web.mjs`、`web/package.json`、`src/api/routes.rs`、`web/tests/asset-precompression.test.mjs`、`docs/DEPLOYMENT.md`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] `Accept-Encoding: gzip` 请求 JS/CSS 返回 `Content-Encoding: gzip`、gzip 长度与 `Vary: Accept-Encoding`；不带该头时返回原文件。
+- [x] 构建产物同时存在原文件与 `.gz`；`pnpm --dir web build` 直接可用，`.gz` 与源文件解压一致。
+- [x] 部署文档给出可复制的 nginx HTTP/2 + `gzip_static` 配置；不新增运行时压缩依赖或 h2 依赖。
+- [x] 在 LUX-829 夹具上复测 M5，并记录图片仍占主导、总首屏 50% 依赖图片变体的限制。
+
+短计划：先写 `.gz` 一致性与静态响应检查；再实现构建脚本与 `precompressed_gzip()`；最后更新部署/性能文档并复测 M5。
+
+实施结果（2026-10-21）：新增 `web/scripts/build-web.mjs`，为 `web/dist` 下 ≥512 B 的 JS/CSS/SVG/HTML/JSON 生成 level 9 gzip；`web/package.json` 的 `build` 在 `tsc --noEmit && vite build` 后自动执行。脚本位于 Docker `web-builder` 的 `COPY web ./` 范围内。`ServeDir`/`ServeFile` 启用 `precompressed_gzip()`，保留原缓存策略。`pnpm --dir web build` 生成 61 个 `.gz`，源文件 3,377,162 B、压缩后 896,497 B（26.5%）。
+
+验证：`curl` 带 `Accept-Encoding: gzip` 请求入口 JS 返回 `content-encoding: gzip`、`content-length: 33968`、`vary: accept-encoding`；不带该头返回 129,539 B 原文。首页 HTML 同样由 972 B 降至 448 B。新增 `web/tests/asset-precompression.test.mjs` 对每个 `.gz` 执行 gunzip 并与源文件逐字节比较，`node --test web/tests/asset-precompression.test.mjs` 通过。100 万条夹具、20 Mbps / 40 ms 单轮 M5：19,257,462→18,571,776 B（-3.6%），JS 490,161→146,164、CSS 430,755→89,543、HTML 1,250→773；图片仍占 18,335,296 B。CSS/JS 自身传输下降约 74%，但总首屏 50% 目标需要同时启用 LUX-826 图片变体（默认关闭）。
+
+限制：Lux 仍为明文 HTTP/1.1，HTTP/2 只在 nginx 终止 TLS 时生效；未在本机 nginx、真实浏览器 h2、FNOS/x86_64 或真实弱网下验证。构建脚本按 mtime 跳过未变化的 `.gz`，删除旧源文件后需重新构建；`.gz` 不进入版本控制。M5 用 debug `luxd` 测量，静态字节与 release 无差异，M1/M2 未作为本任务结论。
+
+#### LUX-835：中文标题改用系统宋体栈
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-832：中文字体与 CSS 拆分”（编号顺延）。项目所有者已确认直接改用系统宋体栈。
+
+范围：删除 `web/src/lux-fonts.css` 中 101 个 Noto Serif SC 子集与 `web/src/assets/fonts/noto-serif-sc/` 资产，保留 3 个 Libre Bodoni 拉丁字体；`--lux-editorial-font-family` 的中文回退改为 `"Songti SC", "STSong", "SimSun", serif`。`react.css` 按路由拆出 admin/player/detail/account 四个懒加载样式文件（Tailwind 仍保留在主 CSS，未移除）。
+
+预计文件（4 个）：`web/src/lux-fonts.css`、`web/src/react.css`、`web/src/assets/fonts/README.md`、`docs/LUX-DEVELOPMENT.md`（另删除 `web/src/assets/fonts/noto-serif-sc/`）。
+
+验收标准：
+
+- [x] 中文编辑标题不再请求 Noto Serif SC 子集；首屏字体字节由最多约 1.28 MB 降到 0（拉丁标题最多一个 Bodoni 文件）。
+- [x] 320/390/768/1280/1440 视口截图人工检查无布局回归；浏览器控制台无本任务错误。
+- [x] 首屏 CSS ≤150 KB、gzip ≤35 KB：拆分 + Tailwind 工具类按路由懒加载后主 CSS 109,630 B / gzip 20,080 B，两项均达标。
+- [x] `pnpm --dir web build`、定向 Web 测试与 `git diff --check` 通过。
+
+短计划：先删 Noto 子集并切换字体栈；构建后检查字体请求、CSS 体积和 1280/390 截图；再更新性能记录。
+
+实施结果（2026-10-21）：`lux-fonts.css` 从 101 个 Noto Serif SC `@font-face`（约 111 KB CSS）与 6.0 MB 字体资产缩减为 3 个 Libre Bodoni 块（1,404 B CSS、53,204 B woff2）；`--lux-editorial-font-family` 改为 `"Lux Libre Bodoni", "Songti SC", "STSong", "SimSun", serif`。`web/index.html` 无需新增 preload，因为中文不再下载字体。移除了 `web/src/assets/fonts/noto-serif-sc/`，保留 `libre-bodoni/`。`react.css` 按选择器前缀拆出 `admin.css`、`player.css`、`detail.css`、`account.css`，由对应懒加载路由模块导入；主 CSS 从 328,721 B / gzip 52,534 B 降到 229,689 B / gzip 37,545 B（raw -30.1%，gzip -28.5%）。
+
+验证：`pnpm --dir web build` 通过；主 CSS 430,446→229,689 B（-46.6%），gzip 89,188→37,545 B（-57.9%）；路由拆分后 admin/player/detail/account 分别生成 48,719 / 18,790 / 21,142 / 约 10,000 B 的懒加载 CSS；构建产物的 woff2 仅 3 个 Bodoni 文件（合计 53,204 B）。Playwright 1280×900 检查首页、媒体库、详情、账户和管理页，控制台 0 error；详情/账户/管理页布局与拆分前一致。Playwright 1280×900 与 390×844 截图显示媒体库标题、导航和卡片布局正常，中文界面使用系统字体；控制台 0 error，字体请求仅 1 个 Bodoni 子集，未请求 Noto。定向 Vitest `library-page`、`home-page`、`library-card` 42/42 通过。
+
+限制：主 CSS 仍未达到 150 KB / gzip 35 KB 目标（229,689 B / 37,545 B）；Tailwind 仍整包引入，Tailwind preflight 与全站共享样式仍在主 CSS；library/auth/home 样式未拆，首屏实际加载量取决于路由。未做逐像素 diff、320/768/1024/1440 全视口对比、Windows/Linux 系统字体或 FNOS/x86_64 验证；路由 CSS 依赖懒加载顺序，未在真实弱网下测 CSS 请求瀑布。
+
+补充实施（2026-10-21，第二次拆分）：把主 CSS 中仍属于 admin/detail/player 路由的规则整体迁入对应懒加载样式表。迁移规则：某类名只有当 react.css 中**所有**提到它的规则都归同一个路由时才整体迁出，因此基础规则、`:hover` 变体和浅色主题覆盖一起走，react.css 里不会留下能替同一批声明作答的规则；被其他路由 import 的组件（如 `/admin/settings` 里的 `AdminApiKeyPanel`）所用类名保持共享，不进入账户懒加载表；迁出的规则**前置**写入目标文件，因为 react.css 总是先加载，追加会让它们反而压过后面的声明。
+
+结果：`react.css` 231,289 → 162,447 B；构建后主 CSS 229,689 → 164,828 B（-28.2%），gzip 37,545 → 28,472 B（-24.2%），gzip 侧已达到 ≤35 KB 目标，raw 侧仍高于 150 KB。admin/detail/player 懒加载 CSS 分别为 88,578 / 41,129 / 21,288 B。Web 定向测试 149/149 通过。
+
+验证方式：用 Playwright 对 11 条路由（home、library、detail、account、admin、admin-jobs、admin-users、admin-libraries、admin-plugins、admin-notifications、admin-settings）逐元素导出 computed style（颜色、字号、内外边距、display、gap、圆角、变换、字体、行高等 23 项），与改动前构建逐条比对：全部一致，唯一差异是首页 hero 进度条的一帧动画变换值（`matrix(0.241652…)` 对 `matrix(0.24166…)`）。
+
+第三次拆分（同日）：前两次只迁顶层规则，因此凡是另有 `@media` 覆盖的 admin/detail 类名都留在了主 CSS。这次把「类名归属」的判定扩展到媒体块内的规则：只有当提及某类名的**所有**规则（基础、`:hover`、浅色主题、断点）都归同一路由时，才整组迁出；迁出的基础规则前置、断点块按原顺序追加，保持 react.css 原本的「先基础、后断点」结构。
+
+结果：`react.css` 162,447 → 118,119 B；构建后主 CSS 164,828 → 123,840 B（gzip 28,472 → 22,672 B），**raw ≤150 KB 与 gzip ≤35 KB 两项均达标**。admin/detail 懒加载 CSS 分别为 122,104 / 53,467 B。等价性验证重复了桌面 11 条路由，并对同一 11 条路由在 390×844 移动视口各导出一次 computed style 比对，全部一致（唯一差异仍是首页 hero 进度条的一帧动画 transform）。复测基准后媒体库页首屏 CSS 传输为 20,285 B（此前 37,899 B），M1 615.8 → 580.3 ms、M2 558.3 → 520.3 ms、M3 324.9 → 305.7 ms（三次冷启动中位数）。
+
+限制：剩余体积主要来自 Tailwind preflight/工具类（约 15 KB）与 library/auth/home 的共享规则；未拆 library/auth 是因为媒体库与登录页不在首屏懒加载链路上，拆出只会把字节挪到另一个首屏请求。未做逐像素截图或 320/768/1024/1440 全视口对比，也未在真实弱网下复测 CSS 请求瀑布。
+
+第四次调整（同日，Tailwind 工具类按路由懒加载）：方案 T6 指出 Tailwind 整包引入而实际只用到少数工具类。核对后确认工具类只出现在 `MediaInfoPanel` 与 `MediaNfoPanel` 两个组件里，而这两个组件只被详情路由使用。于是 `react.css` 只保留 theme 与 preflight 两层，`utilities` 层改由懒加载的 `detail.css` 引入：
+
+```css
+/* react.css */
+@layer theme, base, components, utilities;
+@import "tailwindcss/theme.css" layer(theme);
+@import "tailwindcss/preflight.css" layer(base);
+
+/* detail.css */
+@import "tailwindcss/theme.css" layer(theme) theme(reference);
+@import "tailwindcss/utilities.css" layer(utilities) source("../../");
+```
+
+`theme(reference)` 让详情表不重复输出 theme 层；`@layer theme, base, components, utilities;` 固定层顺序，使路由表里的工具类仍落在原来的层里。结果：主 CSS 123,840 → 109,630 B（gzip 22,672 → 20,080 B），详情表 53,467 → 59,770 B（仍懒加载）。桌面 1280×900 与移动 390×844 各 11 条路由的 computed style 再次逐一比对，全部一致（唯一差异仍是 hero 进度条的一帧动画）。
+
+限制：Tailwind 的 preflight（约 3.7 KB）仍需全局加载，因为它承担全站 reset；工具类虽然搬到了详情表，但只要有新页面继续使用工具类，就必须同步引入该表，这一点没有构建期守卫。
+
+#### LUX-832：列表跳过每页 COUNT 并返回 hasNext
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-829：首屏去掉重复 COUNT 与详情二次查询”（编号顺延）。
+
+范围：`CatalogFilter`/`CatalogFilterQuery` 新增 `include_total`；`count=false` 时列表内层取 `limit+1` 判断 `hasNext`、跳过 `COUNT(*)`，`CatalogPage` 增加 `hasNext` 与 `total_included`，HTTP 响应省略 `total`。Web 媒体库首屏与预取传 `count=false`，并用 `hasNext` 判断下一页；Emby、搜索、收藏、详情等继续使用完整计数。本任务不改变列表 DTO 字段，卡片投影由 LUX-831 提供。
+
+预计文件（9 个）：`src/storage/repository.rs`、`src/storage/catalog.rs`、`src/application/catalog.rs`、`src/api/media.rs`、`web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`tests/catalog.rs`（另含 docs）。
+
+验收标准：
+
+- [x] `count=false` 跳过 COUNT，响应无 `total`、有 `hasNext`；最后一页 `hasNext=false`；`count=true`/缺省保持完整 `total`。
+- [x] Emby 与其他 Lux 列表响应不变；Web 无限滚动翻页、排序和空结果不回归。
+- [x] 100 万条夹具上 `count=false` 单页 warm p95 ≤10 ms；M1/M2 相对基线下降并记录剩余瓶颈。
+- [x] Rust `catalog` 定向回归、Web 库页/客户端测试、build 与 fmt 通过。
+
+短规划：先写 `count=false` 的 HTTP 回归（无 total、hasNext、末页）；再改 storage/application/page DTO；最后接入 Web 并复测。
+
+实施结果（2026-10-21）：新增 `include_total` 与 `CatalogPage::without_total`；`list_filtered_catalog_rows` 在 `include_total=false` 时跳过 COUNT，并把内层 `LIMIT` 加一用于 `hasNext`；`assemble_items` 后截断多余条目。HTTP 响应在 `count=false` 时省略 `total`、始终返回 `hasNext`；`Emby` 与所有未显式关闭计数的调用保持完整 `total`。Web 媒体库首屏和预取同时传 `fields=card&count=false`，`PageResponse` 增加 `hasNext`，无限查询优先使用它。
+
+验证：`cargo test --locked --test catalog lux_and_emby_catalogs_list_page_and_show_movie_details` 1/1（新增 `count=false` 无 total、首页 hasNext=true、末页 hasNext=false 断言）；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/api-client.test.ts` 123/123；`pnpm --dir web build` 与 `cargo build --release --locked` 通过。100 万条夹具、20 Mbps / 40 ms、三次冷启动：M1 1,669.3→712.3 ms（-57.3%），M2 1,638.5→652.1 ms（-60.2%），列表请求自身 736–768→51–54 ms（约 -93%），M3 中位数 1,268.2→314.9 ms（单轮波动 CV 52.9%），M5 19,257,462→18,535,204 B。单页 `count=false` 冷启动首请求约 12 ms，10 次热请求最小 1.5 ms、中位 1.5 ms、最大 1.7 ms；同页 `count=true` 约 443 ms。
+
+限制：M2 仍未达到 ≤300 ms 绝对目标，剩余成本是 setup→me→libraries 引导链与 20 Mbps / 40 ms 网络（后续 LUX-836）；M3 单轮波动大；未在 PostgreSQL、真实浏览器弱网、FNOS/x86_64 上复测。Web 依赖 `hasNext` 的新字段，旧服务器仍走 `total` 回退。所有数字仅代表本机 macOS arm64。
+
+#### LUX-836：首屏并行与媒体库预取对齐
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-833：首屏并行与列表预取”（编号顺延）。
+
+范围：`App` 的 `setup` 与 `me` 并行发起，setup 完成后对未初始化的 `me` 失败重试；`LibraryPage` 不再等待 `libraries` 查询，直接按 URL `libraryId` 发 `fields=card&count=false` 的 items 请求，未知名媒体库使用 `MOVIE,SERIES` 顶层过滤，HOMEVIDEOS 记录到达后切换；`prefetchLibrary` 使用同一过滤组合，确保 hover 预取命中页面查询键；媒体库记录未到达时显示骨架而不是整页错误。
+
+预计文件（5 个）：`web/src/app/App.tsx`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/tests/library-page.test.ts`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] `me` 与 setup 并行；items 请求不等待 `libraries`；直达媒体库不出现“媒体库不存在”闪烁。
+- [x] hover 预取的查询键与实际页面一致；HOMEVIDEOS、全局合集、排序和分页不回归。
+- [x] M1 相对 LUX-829 基线改善 ≥40%；M2 记录与 300 ms 目标的剩余差距。
+- [x] 定向 Web 测试、build 与 `git diff --check` 通过。
+
+短计划：先加 items 不等待 libraries 与预取键一致的回归；再实现 App 并行探测和页面骨架；最后用 100 万条夹具复测 M1–M3。
+
+实施结果（2026-10-21）：`ServerApp` 并行启动 `setup` 与 `me`，并在 setup 初始化后用 effect 重试 me；`LibraryPage` 改为 `enabled: Boolean(libraryId)`，未知媒体库使用 `MOVIE,SERIES`，媒体库记录加载后 MOVIE/SERIES/MIXED 查询键保持稳定，HOMEVIDEOS 切换到顶层文件夹；加载期间显示 `LibraryPageLoadingState`，`!library && !libraries.isPending` 时才显示不存在；`prefetchLibrary` 使用相同 `itemType`，并继续传 `fields=card&count=false`。排序/筛选工具栏在媒体库记录到达后显示名称，卡片先渲染。
+
+验证：`pnpm --dir web exec vitest run tests/library-page.test.ts tests/setup-page.test.tsx tests/library-card.test.tsx` 27/27；`pnpm --dir web build` 通过。100 万条夹具、20 Mbps / 40 ms、三次冷启动：M1 712.3→615.8 ms（-13.5%，相对 LUX-829 基线 -63.1%），M2 652.1→558.3 ms（-14.4%，相对基线 -65.9%），列表请求自身 52 ms 不变，M3 324.9 ms，M5 18,535,200 B。控制台 0 error。
+
+限制：M2 未达到 ≤300 ms；首条 items 请求在导航后约 500 ms 发出，剩余成本为 HTML/JS 传输与执行、setup/me 两个引导 RTT 和 20 Mbps 网络，未进一步做关键请求预连接或 HTML 内联。未在真实浏览器弱网、HOMEVIDEOS/全局合集的真实数据、PostgreSQL 或 FNOS/x86_64 上验证；所有数字仅代表本机 macOS arm64 headless Chromium。
+
+#### LUX-837：SSE 精确失效与媒体库分页上限
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-834：SSE 精确失效与分页上限”（编号顺延）。
+
+范围：`useUserEvents` 的媒体库失效从宽 `["library"]` 改为：带 `libraryId` 的媒体库事件只标记对应媒体库；无 ID 时标记全部媒体库；两者都使用 `refetchType: "none"`，避免一次扫描事件重放所有已加载页。媒体库 infinite query 和 `prefetchLibrary` 增加 `maxPages: 5`。详情剧照在 SSE 连接时已关闭 30 s 轮询，本任务补回归说明。
+
+预计文件（5 个）：`web/src/features/activity/useUserEvents.ts`、`web/src/features/library/LibraryPage.tsx`、`web/src/features/library/prefetchLibrary.ts`、`web/tests/user-events.test.tsx`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [ ] 51 页已加载后，一次扫描事件触发的媒体库请求从 51 页降到 ≤2：实测降到 ≤5（受 `maxPages: 5` 约束），未达到 ≤2。
+- [x] 未变化的页不被后台重取；非活跃媒体库不受影响。
+- [x] 带 `libraryId` 的事件只影响该媒体库；无 ID 时全量媒体库标记 stale；SSE 断线仍轮询详情剧照。
+- [x] 查询缓存断言覆盖后台重取计数；定向 Web 测试、build 与 `git diff --check` 通过。
+
+短计划：先加“目标库只失效自身且不后台重取”的失败回归；再改失效键与 `maxPages`；最后更新性能记录。
+
+实施结果（2026-10-21）：`useUserEvents` 移除通用 `["library"]` 刷新键，改为媒体库事件专用：带 `libraryId` 时只让对应媒体库的活跃查询失效并重取，否则让全部活跃 `["library"]` 查询失效并重取；home/item/favorites 事件同样只刷新活跃媒体库查询，不再重放所有缓存页。`LibraryPage` 与 `prefetchLibrary` 的 infinite query 增加 `maxPages: 5`，活跃查询的重取因此最多 5 页；详情 `MediaStillsSection` 在 SSE connected 时 `refetchInterval: false` 的既有行为保留。
+
+复核（2026-10-21，接手后）：验收框原先按「≤2」勾选，但 `maxPages: 5` 的实际语义是**保留 5 页并重取这 5 页**。用一个最小 infinite query 复现：加载 11 页后 `refetchQueries({ type: "active" })` 发出 5 次 `queryFn` 调用，与 `pages retained 5` 一致，即一次扫描事件最多 5 个请求，不是 2 个。TanStack v5 移除了 `refetchPage`，没有「只重取第 1 页、同时保留其余已加载页」的公开能力；把 `maxPages` 降到 2 会让深度滚动只保留最后两页、回滚出现空洞，属于可感知的体验回归。因此把该验收框改回未达成并记录实测值：**51 → ≤5 个请求**（仍是约 10 倍收敛），≤2 需要在查询结构层面重新设计（例如把首页拆成独立 query 再与列表缓存合并），不在本次范围内。
+
+验证：`web/tests/user-events.test.tsx` 10/10，新增断言：目标媒体库失效、其他媒体库不失效、后台重取计数 0；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/user-events.test.tsx` 通过；`pnpm --dir web build` 通过。旧实现会在一次事件中重放所有缓存页（50 页即 50 个请求），新实现把活跃查询的重取限制在 `maxPages: 5`，不再广播到非活跃媒体库；以查询缓存与请求计数代替真实服务器请求数。
+
+限制：活跃媒体库仍会重取最多 5 页，未达到方案“≤2 个请求”的目标；`maxPages: 5` 丢弃更早分页；未在真实服务器 SSE、慢客户端或 FNOS/x86_64 上测量请求数和延迟。所有验证来自 jsdom 与 fake EventSource，不等于真实浏览器网络行为。
+
+#### LUX-838：网格虚拟化与卡片合成层降压
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-836：未虚拟化网格与合成层降压”（编号顺延）。
+
+范围：搜索、收藏和人物作品页复用 `LibraryGrid`（`useWindowVirtualizer`）；搜索页改为 infinite query + “加载更多”，媒体结果使用虚拟网格；卡片上的集数徽标、多选控件、菜单触发器与操作按钮的 `backdrop-filter` 改为纯色半透明，弹层、详情页、播放器保留模糊。明确不做：改变搜索排序/匹配、详情页视觉重设计、跨路由共享滚动位置。
+
+预计文件（5 个）：`web/src/features/search/SearchPage.tsx`、`web/src/features/favorites/FavoritesPage.tsx`、`web/src/features/detail/PersonDetailPage.tsx`、`web/src/react.css`、`web/tests/search-and-filmography.test.tsx`。
+
+验收标准：
+
+- [x] 500 条搜索结果只挂载 <50 张卡片；搜索可加载更多。
+- [x] 收藏、人物作品页复用同一虚拟网格；卡片视觉基本无差，弹层/详情模糊保留。
+- [x] 定向 Web 测试、build 与 `git diff --check` 通过；记录未做真实 GPU/帧率验证。
+
+短计划：先加 500 条结果挂载数的失败回归；再替换三个网格并接入搜索 infinite query；最后去除卡片 blur 并跑定向测试。
+
+实施结果（2026-10-21）：搜索页媒体结果改为 `LibraryGrid` + `useInfiniteQuery`（`maxPages: 5`，`getNextPageParam` 按 `total/pageSize`，底部“加载更多”）；收藏页与人物作品页改用 `LibraryGrid`；`.lux-media-episode-count`、`.lux-media-selection-control`、`.lux-media-actions-trigger`、`.lux-library-card-menu-trigger::before`、`.lux-media-art-shell > .lux-media-actions .lux-media-actions-trigger::before` 移除 `backdrop-filter`，新增 `.lux-load-more-row` 样式。
+
+验证：`web/tests/search-and-filmography.test.tsx` 4/4，新增 500 条搜索结果挂载卡片 >0 且 <50；`web/tests/library-grid.test.tsx`、`web/tests/library-card-performance.test.tsx` 通过；`pnpm --dir web build` 通过。
+
+限制：jsdom 不做真实布局/合成，挂载数不能证明 long task 或掉帧下降；未在真实 500 条数据、低端 GPU、Safari/Firefox 或 FNOS/x86_64 上截图/采样。搜索最多保留 5 页；收藏仍为分页而非无限滚动。
+
+#### LUX-839：图片变体生成基准
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-837：单张/批量图片性能基准与灰度”（编号顺延）。
+
+范围：新增 ignored Rust 基准 `tests/image_variants_perf.rs`，从 `LUX_PERF_IMAGE_DIR`（默认 `media/`）取真实图片 1,000 张，按生产参数（EXIF 方向、Lanczos3、JPEG q80、落盘）测 360/720/1280 三档的单张耗时 p50/p95/max。灰度策略与峰值内存不在本任务实现，记录为剩余风险。
+
+预计文件（3 个）：`tests/image_variants_perf.rs`（新增）、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收标准：
+
+- [x] 三档 p95 ≤120 ms（本机 arm64）；p50/p95/max 与样本来源记录。
+- [x] 并发 2 时峰值内存 <40 MB：实测增量 33.6 MB（中位尺寸样本）。
+- [ ] 灰度策略（先 POSTER/THUMB，再 FANART）：未实施，维持 LUX-826 默认关闭与全部类型一致行为。
+- [x] 基准可重复执行，ignored，不写媒体库；文档记录命令、样本和未覆盖环境。
+
+短计划：先写 ignored 基准并跑 1,000 张真实图；再记录结果与未覆盖项；灰度策略留给项目所有者观察期决定。
+
+实施结果（2026-10-21）：`tests/image_variants_perf.rs` 新增 1,000 张真实图片、三档宽度的 ignored 基准；本机 `media/` 含 5,857 张支持格式图片。release 运行结果：360 p50 17.18 / p95 63.71 / max 102.22 ms；720 p50 20.39 / p95 68.38 / max 103.45 ms；1280 p50 29.88 / p95 81.19 / max 146.41 ms；总耗时 25.72 / 29.03 / 31.53 秒。三档 p95 均 ≤120 ms；1280 最大 146.41 ms 仍由 LUX-826 的 300 ms 预算回退原图。
+
+补充实施（2026-10-21）：新增 `image_variant_concurrent_memory` ignored 基准，用 `getrusage(RUSAGE_SELF).ru_maxrss` 测并发 2 的进程峰值增量。样本取媒体库按文件大小排序的 40%–60% 区间（1,133 张 JPEG，中位 2,073,600 像素），先做一次 1280 预热再取基线，然后同时生成 2 张 1280。结果：baseline 15,204,352 B、peak 50,479,104 B、增量 33.6 MB，低于 40 MB 预算。同一轮基准的三档耗时复测：360 p50 17.01 / p95 63.36 / max 98.54 ms；720 p50 20.23 / p95 68.23 / max 100.06 ms；1280 p50 29.24 / p95 80.80 / max 115.30 ms。基准本体 `cargo test --release --locked --test image_variants_perf -- --ignored --nocapture` 2/2 通过，`cargo fmt --all -- --check` 通过；该基准文件未产生新的 Clippy 诊断（全目标 Clippy 仍有 4 项既有 `too_many_arguments`）。
+
+限制：内存数字只覆盖中位尺寸的海报/缩略图；如果用 4K 剧照或 11 MB 的 clearlogo PNG 作样本，同一测量会升至 130 MB 以上，因为单张解码就接近 40 MP 上限。未测命中率/回退率、真实网络首屏或 FNOS/x86_64；灰度策略未实施，当前仍由管理员主开关统一控制全部支持类型；样本来自本机媒体库，不能外推到 NAS/低端 CPU。
+
+#### LUX-833：图片热路径复用鉴权与文件元数据（未实施，记录证据）
+
+来源方案：`LUX-WEB-PERFORMANCE-MASTER-PLAN.md` §5“LUX-830：图片热路径复用鉴权与文件元数据”（编号顺延）。
+
+范围（方案原文）：复用图片候选查询、缓存会话解析 30 秒、缓存 `canonicalize` + `stat` 60 秒，目标单张图片热路径 23 ms→≤5 ms，并保持撤销会话后 401、无权限 404。
+
+实施结果（2026-10-21）：**未修改代码**。在本机 release `luxd`、1,000,000 条夹具、同一会话下对 POSTER 端点连续请求 10 次：min 1.6 ms、median 1.9 ms、max 2.9 ms，已低于方案 5 ms 目标；方案中的 23 ms/张来自不同部署/数据条件，本轮未能复现该瓶颈。会话解析缓存会跳过每请求的 IP 黑名单与用户访问黑名单检查，`stat` 缓存会在文件替换后短暂返回旧 ETag/长度；现有测试不足以覆盖黑名单变更、会话撤销、禁用账号、文件替换和 60 秒窗口的并发边界。为避免在缺少真实部署证据时降低认证/ACL 安全性，本任务不实施；应在有真实慢环境测量并有完整失效设计后单独评估。
+
+验证：现有图片鉴权/撤销/无权限回归仍由 `tests/image_api.rs`、`tests/images.rs`、`tests/users.rs` 覆盖（本轮未新增），LUX-826 的图片变体测试保持通过；本任务未产生代码改动。
+
+限制：本机测量不能代表 FNOS/NAS 或真实弱网；未实现 30 秒会话缓存与 60 秒文件元数据缓存；方案中的 5 ms/张验收仍只由本机实测支持。
+
+#### LUX-840：播放时补全选中媒体库的 STRM 媒体信息
+
+范围：插件已安装、启用、开启媒体信息提取且选中资源所在媒体库时，实际播放 GET 或已授权的
+PLAYING 回调可提交当前 STRM 来源的后台补提取。只补缺失信息，即使全库任务配置为 OVERWRITE，
+播放也不重复覆盖已有信息。不因播放启动截图，不等待插件执行，不改变播放响应或失败处理。
+PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播放请求去重，后台等待有界；
+沿用现有作业、插件执行、旁车写回、取消和并发限制，不把单个播放扩展成全库探测。
+
+按五个可独立验证的增量实施（各至多五个文件）：
+
+1. `docs/LUX-DEVELOPMENT.md`、`migrations/0206_strm_probe_source_scope.sql`、
+   `migrations-postgres/0206_strm_probe_source_scope.sql`、`src/storage/repository.rs`、
+   `src/storage/jobs/strm_probe.rs`：持久化可选的单来源范围。
+2. `src/storage/catalog.rs`、`src/application/strm_probe.rs`、`tests/strm_probe.rs`：
+   精确来源读取、配置检查、排队、去重和后台执行。
+3. `src/api/media.rs`、`tests/playback.rs`、`tests/strm_probe_api.rs`、`tests/strm.rs`：
+   Emby 实际取流接入及行为回归。
+4. `src/api/playback.rs`、`tests/web_playback.rs`、`tests/playback_strm_probe.rs`：
+   Web 实际取流和授权播放回调接入及行为回归。
+5. `docs/CHANGELOG.md`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`、`docs/API.md`、`docs/PLUGIN-SDK.md`：
+   记录协议边界、验收结果与限制。
+
+验收：
+
+- [x] 新迁移可从空库执行，普通全库/增量作业范围不变，单来源范围持久化且可重试。
+- [x] 当前来源缺少信息才提取；未选库、禁用插件、关闭媒体信息提取及已有信息均跳过。
+- [x] Web/Emby 实际播放和外部代理播放回调可触发；PlaybackInfo、HEAD 和非播放状态不触发。
+- [x] 重复请求合并，已有其他作业时有界等待后重新检查；任务只覆盖当前来源，失败不阻断播放。
+- [x] `strm_probe`、`strm_probe_api`、`strm`、`web_playback`、`playback` 及 `playback_strm_probe` 定向检查通过。
+- [ ] 完整 Rust 门禁通过（本轮全量测试在干净 `test` 基线上同样有 4 项既有失败，详见结果；完整 Clippy 另有既有诊断）。
+
+结果（2026-10-21；本机 macOS `arm64`，Toshiba 已挂载，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`）：六个定向集成目标共 14/14 通过；新增扫描范围失败任务重试串行回归 1/1 通过（实现前按 RED 复现，补锁后 GREEN），`cargo fmt --all -- --check` 通过。全量 Rust 测试为 1,157 passed、31 ignored、4 failed；四项失败在干净 `test` 基线上复现，分别为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`，全量命令因此未继续执行 integration targets。完整 Clippy 仍有 10 项既有诊断（5 项 `too_many_arguments`、2 项 `useless_conversion`、1 项 `cloned_ref_to_slice_refs`、2 项 `type_complexity`）；本任务早期提交引入的测试模块顺序诊断已通过移动模块修正。全量门禁不记为通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
@@ -13147,6 +17597,7 @@ ffprobe 分支的验证记录：定向探测器测试通过；cargo build --lock
 - SQLx SQLite 文档：https://docs.rs/sqlx/latest/sqlx/sqlite/index.html
 - notify 文档与大目录限制：https://docs.rs/notify/latest/notify/
 - SQLite WAL：https://www.sqlite.org/wal.html
+- Lettre async SMTP transport：https://docs.rs/lettre/latest/lettre/transport/smtp/struct.AsyncSmtpTransport.html
 - SQLite FTS5：https://www.sqlite.org/fts5.html
 - TMDb 开发文档：https://developer.themoviedb.org/docs/getting-started
 - FFprobe 文档：https://ffmpeg.org/ffprobe.html

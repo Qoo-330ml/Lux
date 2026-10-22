@@ -363,6 +363,10 @@ async fn emby_global_collection_views_children_counts_and_mutations_are_scoped()
     .bind(visible_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     sqlx::query(
         "INSERT INTO user_library_access (user_id, library_id, can_view)
          VALUES (?, ?, 1)",
@@ -371,6 +375,10 @@ async fn emby_global_collection_views_children_counts_and_mutations_are_scoped()
     .bind(empty_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(isolated_user.id.to_string())
+        .execute(database.pool())
+        .await?;
 
     for (item_id, library_id, title) in [
         (

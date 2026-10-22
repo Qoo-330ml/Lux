@@ -4,7 +4,7 @@
 
 ## Docker Compose
 
-生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放数据库选择文件、内置 SQLite（如使用）、插件、服务配置和按 UTC 日期滚动的 `logs/lux.YYYY-MM-DD.log`；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
+生产环境需要分别持久化 `/config` 和 `/media`。`/config` 存放数据库选择文件、内置 SQLite（如使用）、插件、服务配置和按 UTC 日期滚动的 `logs/lux.YYYY-MM-DD.log`；启用“按显示尺寸提供图片”后，派生的图片变体存放在 `/config/image-cache/v1/`，属于可删除、可重建的运行缓存，不需要纳入备份，也不会改写 `/media` 中的原图；`/media` 存放媒体及需要回写的 NFO/图片。媒体挂载必须读写，因为 NFO 和图片写回需要写权限：
 
 ```bash
 mkdir -p config media
@@ -101,6 +101,8 @@ LUX_BACKGROUND_CPU_BUDGET 为扫描准备、指纹、后台 NFO/图片计算、f
 
 LUX_SCAN_CONCURRENCY 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；LUX_PROBE_CONCURRENCY 和 LUX_FFMPEG_CONCURRENCY 独立限制 ffprobe、ffmpeg 子进程，LUX_BACKGROUND_CPU_BUDGET 再对列出的后台 CPU 工作做共享准入。LUX_SCAN_CONCURRENCY 范围为 1–1024，LUX_PROBE_CONCURRENCY 范围为 1–512，LUX_FFMPEG_CONCURRENCY 范围为 1–4。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路；资源自适应仍可能在 CPU、内存、前台延迟或存储延迟较高时降低实际扫描并发，SQLite 批量入库保持单写者。
 
+LUX_DATABASE_MAINTENANCE 控制内置数据库维护，默认开启；设为 `0`、`false`、`off` 或 `no` 可完全关闭。维护在启动后延迟执行一次，之后按每 24 小时一轮在后台运行，并且只在没有扫描或元数据任务运行时才开始；检测到活动任务则跳过本轮。它只做两类低风险动作：对死元组达到判定阈值的表执行 `VACUUM (ANALYZE)`，以及对满足条件的热点大表写入表级 `autovacuum_*` 参数。它不会删除业务数据、删除索引、执行 `VACUUM FULL` 或 `REINDEX`，也不会修改全局 `postgresql.conf` 或重启数据库进程。SQLite 后端只执行 `VACUUM`，autovacuum 参数对它不适用。LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS 调整轮次间隔（`0` 表示停用周期任务），LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS 调整启动后的首次延迟；非法值回退默认。若运行 PostgreSQL 的容器使用较小的 `/dev/shm`，并行索引清理可能因共享内存不足失败，此时可对该容器设置 `shm_size`。
+
 修改 Compose 中的该变量后需要重新创建容器，单纯执行 `docker restart lux` 不会更新容器环境变量：
 
 ```bash
@@ -129,6 +131,8 @@ IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；�
 ```nginx
 server {
     listen 443 ssl;
+    http2 on;
+    gzip_static on;
     server_name lux.example.internal;
 
     ssl_certificate     /etc/letsencrypt/live/lux.example.internal/fullchain.pem;
@@ -151,6 +155,8 @@ server {
     }
 }
 ```
+
+Lux 已为 `web/dist` 下的 JS/CSS/SVG/HTML 生成并直接服务 `.gz` 预压缩文件（`content-encoding: gzip`、`vary: accept-encoding`）；`gzip_static on` 只让 nginx 复用这些文件，不会在运行时重新压缩。HTTP/2 由 nginx 终止 TLS 时提供，`luxd` 自身仍监听明文 HTTP/1.1。
 
 代理应保留 `206`、`Content-Range`、`Content-Length`、`Accept-Ranges` 和 `ETag`。不能把媒体流改成缓存整文件的代理模式。
 

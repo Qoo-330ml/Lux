@@ -1261,11 +1261,17 @@ pub(super) async fn emby_create_user(
             .user_copy_options
             .as_deref()
             .is_some_and(|options| has_emby_copy_option(options, "UserConfiguration"));
+    let default_permissions =
+        match crate::application::settings::read_new_user_permissions(database).await {
+            Ok(permissions) => permissions,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     let mut created = match users
-        .create_user_without_password(
+        .create_user_without_password_with_permission_snapshot(
             name,
             name,
             copy_policy && source.as_ref().is_some_and(|user| user.is_admin),
+            default_permissions.stored_snapshot(),
         )
         .await
     {
@@ -2116,9 +2122,13 @@ pub(super) async fn emby_authenticate(
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let client_ip = match super::request_access_ip(&headers, &state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let device = emby_device_info_from_headers(&headers);
     match auth
-        .authenticate(&request.username, &request.password, &device)
+        .authenticate_with_ip(&request.username, &request.password, &device, client_ip)
         .await
     {
         Ok(Some(result)) => {
@@ -2126,7 +2136,23 @@ pub(super) async fn emby_authenticate(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            if let Ok(Some(user_id)) = auth
+                .find_failed_authentication_user_id(&request.username)
+                .await
+            {
+                record_failed_authentication_event(
+                    state.database.as_ref(),
+                    &state.admin_events,
+                    &user_id,
+                    "LUX_EMBY",
+                    request_client_ip(&headers, &state.remote_access),
+                )
+                .await;
+            }
             StatusCode::UNAUTHORIZED.into_response()
+        }
+        Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -2149,9 +2175,13 @@ pub(super) async fn emby_authenticate_user_id(
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    let client_ip = match super::request_access_ip(&headers, &state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let device = emby_device_info_from_headers(&headers);
     match auth
-        .authenticate_user_id(&user_id, &request.password, &device)
+        .authenticate_user_id_with_ip(&user_id, &request.password, &device, client_ip)
         .await
     {
         Ok(Some(result)) => {
@@ -2159,7 +2189,20 @@ pub(super) async fn emby_authenticate_user_id(
         }
         Ok(None) => {
             state.login_rate_limiter.record_failure(&login_key).await;
+            if let Ok(Some(user)) = auth.user_by_id(&user_id).await {
+                record_failed_authentication_event(
+                    state.database.as_ref(),
+                    &state.admin_events,
+                    &user.id.to_string(),
+                    "LUX_EMBY",
+                    request_client_ip(&headers, &state.remote_access),
+                )
+                .await;
+            }
             StatusCode::UNAUTHORIZED.into_response()
+        }
+        Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
         }
         Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
@@ -2182,6 +2225,30 @@ async fn emby_authentication_success_response(
     }
     state.login_rate_limiter.record_success(login_key).await;
     let user_id = result.user.id.to_string();
+    if let Some(device_id) = bounded_emby_device_field(&result.device.device_id) {
+        if let Some(database) = state.database.as_ref() {
+            let device_name = bounded_emby_device_field(&result.device.device);
+            let client_name = bounded_emby_device_field(&result.device.client);
+            let client_version = bounded_emby_device_field(&result.device.version);
+            let remote_ip = request_client_ip(headers, &state.remote_access);
+            let seen_at = super::playback::current_unix_timestamp();
+            if let Err(error) = database
+                .upsert_user_device(NewUserDeviceObservation {
+                    user_id: &user_id,
+                    device_id: &device_id,
+                    device_name: device_name.as_deref(),
+                    device_type: Some("EMBY"),
+                    client_name: client_name.as_deref().unwrap_or("Unknown"),
+                    client_version: client_version.as_deref(),
+                    last_remote_ip: remote_ip.as_deref(),
+                    seen_at,
+                })
+                .await
+            {
+                tracing::warn!(%error, "failed to update Emby user device inventory");
+            }
+        }
+    }
     record_activity_event(
         state.database.as_ref(),
         &state.admin_events,
@@ -2212,6 +2279,12 @@ async fn emby_authentication_success_response(
         "ServerId": state.server_id
     }))
     .into_response()
+}
+
+fn bounded_emby_device_field(value: &str) -> Option<String> {
+    let value = value.trim();
+    (!value.is_empty() && value.len() <= 256 && !value.chars().any(char::is_control))
+        .then(|| value.to_owned())
 }
 
 fn parse_emby_authenticate_user_request(
@@ -2348,13 +2421,17 @@ pub(super) async fn resolve_emby_user_with_auth(
     headers: &HeaderMap,
     query: &EmbyTokenQuery,
     auth: &EmbyAuthService,
+    client_ip: Option<std::net::IpAddr>,
 ) -> Result<UserRecord, StatusCode> {
     let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    match auth.resolve_token(&token).await {
+    match auth.resolve_token_with_ip(&token, client_ip).await {
         Ok(Some(user)) => Ok(user),
         Ok(None) => Err(StatusCode::UNAUTHORIZED),
+        Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+            Err(StatusCode::SERVICE_UNAVAILABLE)
+        }
         Err(_) => Err(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }
@@ -2475,13 +2552,19 @@ pub(super) async fn require_emby_user_with_query(
     let Some(auth) = state.emby_auth.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
-    let user = resolve_emby_user_with_auth(headers, query, auth).await?;
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let user = resolve_emby_user_with_auth(headers, query, auth, client_ip).await?;
     if state.remote_access.is_remote(
         header_str(headers, "x-lux-peer-ip"),
         header_str(headers, "x-forwarded-for"),
     ) && !user.can_remote_access
     {
         return Err(StatusCode::FORBIDDEN);
+    }
+    if let Some(token) = emby_token_from_headers(headers).or_else(|| query.api_key.clone()) {
+        record_emby_device_access(headers, state, auth, &token, &user.id.to_string()).await;
     }
     Ok(user)
 }
@@ -2523,9 +2606,15 @@ pub(super) async fn require_emby_principal_with_query(
     let principal = if let Some(principal) = principal {
         principal
     } else {
-        match auth.resolve_token(&token).await {
+        let client_ip = super::request_access_ip(headers, state)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        match auth.resolve_token_with_ip(&token, client_ip).await {
             Ok(Some(user)) => crate::auth::users::AuthenticationPrincipal::User(user),
             Ok(None) => return Err(StatusCode::UNAUTHORIZED),
+            Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
+                return Err(StatusCode::SERVICE_UNAVAILABLE);
+            }
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
     };
@@ -2536,7 +2625,53 @@ pub(super) async fn require_emby_principal_with_query(
     {
         return Err(StatusCode::FORBIDDEN);
     }
+    if let Some(user) = principal.user() {
+        record_emby_device_access(headers, state, auth, &token, &user.id.to_string()).await;
+    }
     Ok(principal)
+}
+
+async fn record_emby_device_access(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &EmbyAuthService,
+    token: &str,
+    user_id: &str,
+) {
+    let Some(database) = state.database.as_ref() else {
+        return;
+    };
+    let device = match auth.device_info(token).await {
+        Ok(Some(device)) => device,
+        Ok(None) => return,
+        Err(_) => {
+            tracing::warn!("failed to read Emby device for user activity");
+            return;
+        }
+    };
+    let Some(device_id) = bounded_emby_device_field(&device.device_id) else {
+        return;
+    };
+    let device_name = bounded_emby_device_field(&device.device);
+    let client_name = bounded_emby_device_field(&device.client);
+    let client_version = bounded_emby_device_field(&device.version);
+    let last_remote_ip = request_client_ip(headers, &state.remote_access);
+    if database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id,
+            device_id: &device_id,
+            device_name: device_name.as_deref(),
+            device_type: Some("EMBY"),
+            client_name: client_name.as_deref().unwrap_or("Unknown"),
+            client_version: client_version.as_deref(),
+            last_remote_ip: last_remote_ip.as_deref(),
+            seen_at: super::playback::current_unix_timestamp(),
+        })
+        .await
+        .is_err()
+    {
+        tracing::warn!("failed to update Emby user device activity");
+    }
 }
 
 pub(super) fn emby_access_principal(

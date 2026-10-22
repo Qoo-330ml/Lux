@@ -1,5 +1,7 @@
 import type { ItemImage } from "../../lib/api/types";
 import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
+import { stillImageUrl } from "../home/media-display";
+import { useImageVariants } from "../home/image-variants";
 
 const stillImageTypeOrder: Record<string, number> = {
   FANART: 0,
@@ -8,6 +10,7 @@ const stillImageTypeOrder: Record<string, number> = {
 };
 
 export function MediaStills({ images, title }: { images: ItemImage[]; title: string }) {
+  const { enabled } = useImageVariants();
   const stills = images
     .filter((image) => Object.hasOwn(stillImageTypeOrder, image.imageType.trim().toUpperCase()))
     .sort((left, right) => {
@@ -34,7 +37,7 @@ export function MediaStills({ images, title }: { images: ItemImage[]; title: str
           {stills.map((image, index) => (
             <li className="lux-media-stills-card" key={image.id}>
               <img
-                src={image.url}
+                src={stillImageUrl(image.url, enabled ? 720 : undefined)}
                 alt={`${title} 剧照 ${index + 1}`}
                 loading="lazy"
                 decoding="async"

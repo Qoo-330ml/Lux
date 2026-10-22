@@ -1,13 +1,182 @@
 mod repository;
+
+pub(crate) struct CatalogSearchQuery<'a> {
+    pub(crate) query: &'a str,
+    pub(crate) like_query: &'a str,
+    pub(crate) item_types: &'a [String],
+    pub(crate) library_ids: Option<&'a [String]>,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+    pub(crate) content_restrictions: Option<&'a repository::UserContentRestrictions>,
+}
+
 // LUX-564 lands the cache foundation before S3a adds its first production caller.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod sql_templates;
+
+// LUX-684 consumes this bound and candidate contract in the background index worker.
+#[allow(dead_code)]
+pub(crate) const CONTENT_RESTRICTION_INDEX_BATCH_LIMIT: usize = 100;
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct MediaContentRestrictionIndexCandidate {
+    pub(crate) item_id: String,
+    pub(crate) nfo_metadata_json: Option<String>,
+}
+
+pub(crate) struct GlobalCollectionSourcePreference<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) is_admin: bool,
+    pub(crate) collection_item_id: &'a str,
+    pub(crate) work_item_id: &'a str,
+    pub(crate) source_item_id: &'a str,
+    pub(crate) media_source_id: Option<&'a str>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum MetadataAutoMatchPolicy {
     UseLibrarySetting,
     Enabled,
     Disabled,
+}
+
+// Registration settings are consumed by LUX-803's administrator API.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(crate) enum RegistrationMode {
+    InvitationOnly,
+    PublicEmail,
+}
+
+#[allow(dead_code)]
+pub(crate) struct StoredRegistrationMode {
+    pub(crate) mode: RegistrationMode,
+    pub(crate) version: i64,
+    raw_value: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationStatus {
+    PendingEmail,
+    PendingApproval,
+    Approved,
+    Rejected,
+    Expired,
+}
+
+impl UserRegistrationStatus {
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            Self::PendingEmail => "PENDING_EMAIL",
+            Self::PendingApproval => "PENDING_APPROVAL",
+            Self::Approved => "APPROVED",
+            Self::Rejected => "REJECTED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "PENDING_EMAIL" => Ok(Self::PendingEmail),
+            "PENDING_APPROVAL" => Ok(Self::PendingApproval),
+            "APPROVED" => Ok(Self::Approved),
+            "REJECTED" => Ok(Self::Rejected),
+            "EXPIRED" => Ok(Self::Expired),
+            _ => Err(StorageError::Serialization(
+                "unknown user registration status".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewUserRegistrationRequest<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) username_normalized: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) password_hash: &'a str,
+    pub(crate) permission_snapshot_json: &'a str,
+    pub(crate) expires_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationCreateResult {
+    Created,
+    AlreadyExists,
+    RateLimited,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationResendResult {
+    Queued,
+    NotResendable,
+    RateLimited,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationVerifyResult {
+    Verified,
+    NotAcceptable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserEmailChangeVerifyResult {
+    Verified,
+    NotAcceptable,
+    EmailConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserEmailChangeCreateResult {
+    Created,
+    NotAcceptable,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationApproveResult {
+    Approved(String),
+    NotReviewable,
+    EmailConflict,
+    UsernameConflict,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserRegistrationRejectResult {
+    Rejected,
+    NotReviewable,
+}
+
+#[allow(dead_code)] // LUX-812 maps this redacted summary to the administrator API.
+pub(crate) struct StoredUserRegistrationRequest {
+    pub(crate) id: String,
+    pub(crate) recipient_email: String,
+    pub(crate) username_normalized: String,
+    pub(crate) display_name: String,
+    pub(crate) status: UserRegistrationStatus,
+    pub(crate) permission_snapshot_json: String,
+    pub(crate) expires_at: i64,
+    pub(crate) email_verified_at: Option<i64>,
+    pub(crate) reviewed_at: Option<i64>,
+    pub(crate) reviewed_by_user_id: Option<String>,
+    pub(crate) approved_user_id: Option<String>,
+    pub(crate) last_error_code: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)] // LUX-812 maps this bounded storage result to the administrator API.
+pub(crate) struct UserRegistrationRequestPage {
+    pub(crate) requests: Vec<StoredUserRegistrationRequest>,
+    pub(crate) page_size: i64,
+    pub(crate) total_count: i64,
+}
+
+#[allow(dead_code)] // LUX-808 resolves a submitted verification token to its challenge.
+pub(crate) struct StoredUserRegistrationChallenge {
+    pub(crate) id: String,
+    pub(crate) expires_at: i64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -17,6 +186,84 @@ pub(crate) struct UserPlaybackPolicy {
     pub(crate) allow_remux: bool,
     pub(crate) allow_audio_transcode: bool,
     pub(crate) allow_video_transcode: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserPermissionCopySnapshot {
+    pub(crate) library_access_mode: String,
+    pub(crate) library_ids: Vec<String>,
+    pub(crate) can_download: bool,
+    pub(crate) playback_policy: UserPlaybackPolicy,
+    pub(crate) content_restrictions: Option<repository::UserContentRestrictions>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct UserPermissionCopyGroups {
+    pub(crate) library: bool,
+    pub(crate) content: bool,
+    pub(crate) playback: bool,
+}
+
+impl UserPermissionCopyGroups {
+    pub(crate) fn is_empty(self) -> bool {
+        !self.library && !self.content && !self.playback
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserPermissionCopyResult {
+    Updated,
+    Conflict,
+    UserUnavailable,
+    InvalidSnapshot,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewStoredUserPermissions<'a> {
+    pub(crate) library_access_mode: &'a str,
+    pub(crate) library_ids: &'a [String],
+    pub(crate) can_download: bool,
+    pub(crate) can_play: bool,
+    pub(crate) max_simultaneous_playbacks: i64,
+    pub(crate) allow_remux: bool,
+    pub(crate) allow_audio_transcode: bool,
+    pub(crate) allow_video_transcode: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUserInvitationAcceptance {
+    pub(crate) invitation_id: String,
+    pub(crate) challenge_id: String,
+    pub(crate) recipient_email: String,
+    pub(crate) expires_at: i64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewInvitationUserAccount<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) username_normalized: &'a str,
+    pub(crate) display_name: &'a str,
+    pub(crate) password_hash: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserInvitationAcceptResult {
+    Accepted,
+    NotAcceptable,
+    UsernameTaken,
+    EmailAlreadyRegistered,
+}
+
+// LUX-645 consumes this contract in the preset application service.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ApplyUserPermissionPreset<'a> {
+    pub(crate) preset_id: &'a str,
+    pub(crate) preset_name: &'a str,
+    pub(crate) preset_version: i64,
+    pub(crate) is_admin: bool,
+    pub(crate) can_manage_server: bool,
+    pub(crate) permissions: NewStoredUserPermissions<'a>,
 }
 
 // LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
@@ -587,29 +834,35 @@ pub use repository::{
 #[allow(unused_imports)]
 pub(crate) use repository::{
     AdminUserSortField, AdminUserStatusFilter, CatalogFilterQuery, CatalogSort,
-    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate, DEFAULT_PLAYED_PERCENT,
-    DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult, EmbyMigrationHandledItemBatch,
-    EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch, EmbyMigrationItemPageBatch,
-    EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
+    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
+    DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    DEFAULT_PLAYED_PERCENT, DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult,
+    EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
+    EmbyMigrationItemPageBatch, EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
     EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
     FilesystemEntryUpdate, ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata,
-    LibrarySettingsUpdate, LocalNfoDefaultsRepair, MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE,
-    ManifestDeltaBatchCommit, ManifestDeltaBatchCommitResult, ManifestDiscoveryCommitResult,
-    ManifestExistingFileUpdate, ManifestPostprocessingTargetBatchResult,
-    ManifestPostprocessingTargetPage, MediaInfoChapterUpdate, MediaMetadataUpdate,
-    MediaProbeUpdate, MediaStreamUpdate, MetadataCapabilityResult, MetadataImageAttemptUpdate,
-    MetadataImageUnavailable, MigrationMediaIdentityLookup, MigrationPersonIdentityLookup,
-    NewAccessToken, NewAuditEvent, NewChapterDetectionJob, NewChapterDetectionJobItem,
-    NewCollection, NewDanmakuMatchJob, NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing,
+    LibraryDeletionBatch, LibrarySettingsUpdate, LocalNfoDefaultsRepair,
+    MANIFEST_POSTPROCESSING_TARGET_PAGE_SIZE, MailChallengeKind, MailDeliveryErrorCode,
+    MailOutboxPage, MailOutboxStatus, MailOutboxTemplateKind, MaintenanceCandidate,
+    MaintenanceReport, ManifestDeltaBatchCommit, ManifestDeltaBatchCommitResult,
+    ManifestDiscoveryCommitResult, ManifestExistingFileUpdate,
+    ManifestPostprocessingTargetBatchResult, ManifestPostprocessingTargetPage,
+    MediaInfoChapterUpdate, MediaMetadataUpdate, MediaProbeUpdate, MediaStreamUpdate,
+    MetadataCapabilityResult, MetadataImageAttemptUpdate, MetadataImageUnavailable,
+    MigrationMediaIdentityLookup, MigrationPersonIdentityLookup, NewAccessToken, NewAuditEvent,
+    NewChapterDetectionJob, NewChapterDetectionJobItem, NewCollection, NewDanmakuMatchJob,
+    NewDanmakuTrack, NewDeviceAccessToken, NewDevicePairing, NewEmbyDirectPlaybackTicket,
     NewEmbyMigrationJob, NewEpisodeFile, NewFilesystemEntry, NewHierarchyItem, NewLibrary,
-    NewLibraryRoot, NewMediaChapterMarker, NewMediaItem, NewMediaSource, NewMetadataCandidate,
-    NewMovieFile, NewNotificationDestination, NewNotificationEvent, NewPersonCredit,
-    NewPlaybackEvent, NewScanLocalMetadataBatch, NewScanManifest, NewScanManifestDelta,
-    NewScanManifestDiscoveryChunk, NewScanManifestEntry, NewScanManifestFilesystemEntry,
-    NewScanManifestIndexedFile, NewScanManifestPositiveIndex, NewScanManifestRoot,
-    NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry, NewScanManifestUnresolvedFile,
-    NewStoredUser, NewStrmProbeJob, NewWebPlaybackEvent, NewWebPlaybackSession,
+    NewLibraryRoot, NewMailChallenge, NewMailOutboxMessage, NewMediaChapterMarker, NewMediaItem,
+    NewMediaSource, NewMetadataCandidate, NewMovieFile, NewNotificationDestination,
+    NewNotificationEvent, NewPersonCredit, NewPlaybackEvent, NewScanLocalMetadataBatch,
+    NewScanManifest, NewScanManifestDelta, NewScanManifestDiscoveryChunk, NewScanManifestEntry,
+    NewScanManifestFilesystemEntry, NewScanManifestIndexedFile, NewScanManifestPositiveIndex,
+    NewScanManifestRoot, NewScanManifestSeenFilesystemEntry, NewScanManifestSidecarEntry,
+    NewScanManifestUnresolvedFile, NewStoredUser, NewStrmProbeJob, NewUserAccessBlacklistRule,
+    NewUserAccountPreferences, NewUserActivityEvent, NewUserContentRestrictions,
+    NewUserDeviceObservation, NewUserInvitation, NewWebPlaybackEvent, NewWebPlaybackSession,
     PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, ReconciliationBatchCommit,
     ReconciliationBatchCommitResult, ResumeItemsQuery, ScanFingerprintMigrationCommit,
     ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate, StoredAccessTokenDevice,
@@ -618,25 +871,26 @@ pub(crate) use repository::{
     StoredCatalogItemCounts, StoredCatalogRow, StoredChapterDetectionItem,
     StoredChapterDetectionJob, StoredChapterDetectionSource, StoredChapterDetectionSourceState,
     StoredCollectionRefresh, StoredDanmakuMatchItem, StoredDanmakuMatchJob, StoredDanmakuSource,
-    StoredDownloadSource, StoredEmbyCollection, StoredEmbyMigrationImportRecord,
-    StoredEmbyMigrationItemMatch, StoredEmbyMigrationJob, StoredEmbyMigrationPersonFavorite,
-    StoredEmbyMigrationSource, StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink,
-    StoredEpisodeIdentityCandidate, StoredExternalSubtitle, StoredFilesystemEntry,
-    StoredFolderScanPath, StoredGlobalCollection, StoredGlobalCollectionSource,
-    StoredImageIdentity, StoredItemImage, StoredItemImageCandidate, StoredItemImagePathConflict,
-    StoredItemMetadataCompleteness, StoredItemScanPath, StoredItemSourceLocator,
-    StoredJobActivityItem, StoredLibrary, StoredLibraryCoverJob, StoredLibraryIdentity,
-    StoredLibraryPipelineActivity, StoredLibraryPipelineActivityPage, StoredLibraryPoster,
-    StoredLibraryRoot, StoredLibraryScraper, StoredMediaChapter, StoredMediaItem,
-    StoredMediaItemKind, StoredMediaMerge, StoredMediaMetadata, StoredMediaSourcePath,
-    StoredMediaWritebackContext, StoredMetadataCandidate, StoredMetadataCapabilityAttempt,
-    StoredMetadataImageAttempt, StoredMetadataReidentifyItem, StoredMetadataReidentifyJob,
-    StoredMigrationMediaIdentity, StoredMigrationPersonIdentity, StoredMovieIdentity,
-    StoredNotificationDelivery, StoredNotificationDestination, StoredPersonCredit,
-    StoredPersonIdentityMove, StoredPersonIndexRebuildJob, StoredPersonMatchCandidate,
-    StoredPipelineStageActivity, StoredPipelineStageKind, StoredPipelineStatusCounts,
-    StoredPlaybackHistoryEvent, StoredPlaybackSession, StoredPlaybackSource,
-    StoredReconciliationScanEntry, StoredScanFingerprintMigrationCandidate,
+    StoredDownloadSource, StoredEmbyCollection, StoredEmbyDirectPlaybackTicket,
+    StoredEmbyLoginSessionSummary, StoredEmbyMigrationImportRecord, StoredEmbyMigrationItemMatch,
+    StoredEmbyMigrationJob, StoredEmbyMigrationPersonFavorite, StoredEmbyMigrationSource,
+    StoredEmbyMigrationUserBinding, StoredEmbyMigrationUserLink, StoredEpisodeIdentityCandidate,
+    StoredExternalSubtitle, StoredFilesystemEntry, StoredFolderScanPath, StoredGlobalCollection,
+    StoredGlobalCollectionSource, StoredImageIdentity, StoredItemImage, StoredItemImageCandidate,
+    StoredItemImagePathConflict, StoredItemMetadataCompleteness, StoredItemScanPath,
+    StoredItemSourceLocator, StoredJobActivityItem, StoredLibrary, StoredLibraryCoverJob,
+    StoredLibraryDeletionJob, StoredLibraryIdentity, StoredLibraryPipelineActivity,
+    StoredLibraryPipelineActivityPage, StoredLibraryPoster, StoredLibraryRoot,
+    StoredLibraryScraper, StoredMailChallenge, StoredMailOutboxMessage, StoredMediaChapter,
+    StoredMediaItem, StoredMediaItemKind, StoredMediaMerge, StoredMediaMetadata,
+    StoredMediaSourcePath, StoredMediaWritebackContext, StoredMetadataCandidate,
+    StoredMetadataCapabilityAttempt, StoredMetadataImageAttempt, StoredMetadataReidentifyItem,
+    StoredMetadataReidentifyJob, StoredMigrationMediaIdentity, StoredMigrationPersonIdentity,
+    StoredMovieIdentity, StoredNotificationDelivery, StoredNotificationDestination,
+    StoredPersonCredit, StoredPersonIdentityMove, StoredPersonIndexRebuildJob,
+    StoredPersonMatchCandidate, StoredPipelineStageActivity, StoredPipelineStageKind,
+    StoredPipelineStatusCounts, StoredPlaybackHistoryEvent, StoredPlaybackSession,
+    StoredPlaybackSource, StoredReconciliationScanEntry, StoredScanFingerprintMigrationCandidate,
     StoredScanFingerprintMigrationCursor, StoredScanJob, StoredScanJobCounts,
     StoredScanJobMetadataPage, StoredScanJobMetadataSources, StoredScanJobPath,
     StoredScanJobRetryState, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
@@ -646,9 +900,15 @@ pub(crate) use repository::{
     StoredScanManifestPostprocessingState, StoredScanManifestRemovalCandidate,
     StoredScheduledTaskConfig, StoredScheduledTaskPlan, StoredScheduledTaskPlanLibrary,
     StoredSeriesMetadataSource, StoredStrmMediaSource, StoredStrmProbeJob, StoredSubtitleStream,
-    StoredThumbnailScraperRetry, StoredThumbnailSource, StoredUser, StoredUserItemState,
-    StoredWebPlaybackSession, StoredWebSession, StoredWebSessionSummary,
-    UpdateNotificationDestination, UpdateUser, WebPlaybackEventClaim,
+    StoredThumbnailScraperRetry, StoredThumbnailSource, StoredUser, StoredUserAccessBlacklistRule,
+    StoredUserActivityEvent, StoredUserDevice, StoredUserInvitation, StoredUserItemState,
+    StoredUserPermissionPresetSource, StoredWebPlaybackAccessContext, StoredWebPlaybackSession,
+    StoredWebSession, StoredWebSessionSummary, UpdateNotificationDestination, UpdateUser,
+    UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+    UserAccessBlacklistRulePageQuery, UserAccessBlacklistRuleScope, UserAccountPreferences,
+    UserAccountPreferencesCasResult, UserActivityEventQuery, UserContentRestrictions,
+    UserContentRestrictionsCasResult, UserDevicePageQuery, UserInvitationCreateResult,
+    UserInvitationPage, UserInvitationResendResult, UserInvitationStatus, WebPlaybackEventClaim,
     WebPlaybackTranscodingDetails, is_lite_manifest_discovery, movie_parent_folder_identity,
     recommendation_batch_key_at,
 };

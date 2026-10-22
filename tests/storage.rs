@@ -8,6 +8,753 @@ use luxd::{
     library::LibraryKind,
     storage::Database,
 };
+use sqlx::{
+    migrate::Migrator,
+    sqlite::{SqliteConnectOptions, SqlitePoolOptions},
+};
+
+fn latest_migration_version(directory: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+    let mut latest_version = None;
+    for entry in fs::read_dir(migration_dir)? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|stem| stem.split('_').next())
+            .and_then(|version| version.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        latest_version = Some(latest_version.map_or(version, |latest: i64| latest.max(version)));
+    }
+    latest_version.ok_or_else(|| "migration directory contains no numbered SQL files".into())
+}
+
+#[tokio::test]
+async fn user_activity_events_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert!(database.schema_version().await? >= 196);
+
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'user_activity_events'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(table_count, 1);
+
+    let required_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('user_activity_events')
+         WHERE name IN (
+             'id', 'user_id', 'actor_user_id', 'event_type', 'target_type',
+             'target_id', 'metadata_json', 'occurred_at'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(required_columns, 8);
+
+    for index_name in [
+        "idx_user_activity_events_user_time",
+        "idx_user_activity_events_user_type_time",
+        "idx_user_activity_events_retention",
+    ] {
+        let index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .bind(index_name)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(index_count, 1, "missing index {index_name}");
+    }
+
+    let foreign_key_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('user_activity_events')")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(foreign_key_count, 0);
+
+    sqlx::query(
+        "INSERT INTO user_activity_events (id, user_id, event_type)
+         VALUES ('activity-migration-login', 'deleted-user', 'AUTH_LOGIN')",
+    )
+    .execute(database.pool())
+    .await?;
+    let (actor_user_id, target_id, occurred_at): (Option<String>, Option<String>, i64) =
+        sqlx::query_as(
+            "SELECT actor_user_id, target_id, occurred_at
+             FROM user_activity_events WHERE id = 'activity-migration-login'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(actor_user_id, None);
+    assert_eq!(target_id, None);
+    assert!(occurred_at > 0);
+
+    let postgres_migration = include_str!("../migrations-postgres/0193_user_activity_events.sql");
+    assert!(postgres_migration.contains("user_id TEXT NOT NULL"));
+    assert!(postgres_migration.contains("actor_user_id TEXT"));
+    assert!(postgres_migration.contains("occurred_at BIGINT NOT NULL"));
+    assert!(postgres_migration.contains("idx_user_activity_events_user_time"));
+    assert!(postgres_migration.contains("idx_user_activity_events_user_type_time"));
+    assert!(postgres_migration.contains("idx_user_activity_events_retention"));
+    assert!(!postgres_migration.contains("REFERENCES users"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitations_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert!(database.schema_version().await? >= 201);
+
+    let column_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_table_info('user_invitations')")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(column_count, 14);
+    let foreign_key_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM pragma_foreign_key_list('user_invitations')")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(foreign_key_count, 2);
+    let delete_set_null_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_invitations')
+         WHERE \"table\" = 'users' AND on_delete = 'SET NULL'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(delete_set_null_count, 2);
+    let pending_email_index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'ux_user_invitations_pending_email' AND sql LIKE '%UNIQUE%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(pending_email_index, 1);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('invitation-owner', 'invitation-owner', 'Owner', 'test-hash'),
+                ('invitation-user', 'invitation-user', 'Invited', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    let invite_insert = "INSERT INTO user_invitations (
+            id, recipient_email, created_by_user_id, accepted_user_id, status,
+            preset_id, preset_name, preset_version, permission_snapshot_json,
+            expires_at, accepted_at, revoked_at, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)";
+    let insert_invitation = |id: &'static str, status: &'static str| {
+        sqlx::query(invite_insert)
+            .bind(id)
+            .bind("invitee@example.test")
+            .bind("invitation-owner")
+            .bind(if status == "ACCEPTED" {
+                Some("invitation-user")
+            } else {
+                None
+            })
+            .bind(status)
+            .bind("viewer")
+            .bind("Viewer")
+            .bind(1_i64)
+            .bind("{}")
+            .bind(10_000_i64)
+            .bind(if status == "ACCEPTED" {
+                Some(20_i64)
+            } else {
+                None
+            })
+            .bind(None::<i64>)
+            .bind(1_i64)
+            .bind(1_i64)
+    };
+    insert_invitation("invitation-pending", "PENDING")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        insert_invitation("invitation-duplicate", "PENDING")
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query(invite_insert)
+            .bind("invitation-invalid")
+            .bind("bad@example.test")
+            .bind("invitation-owner")
+            .bind(None::<&str>)
+            .bind("UNKNOWN")
+            .bind("viewer")
+            .bind("Viewer")
+            .bind(1_i64)
+            .bind("[]")
+            .bind(10_000_i64)
+            .bind(None::<i64>)
+            .bind(None::<i64>)
+            .bind(1_i64)
+            .bind(1_i64)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+
+    sqlx::query(
+        "UPDATE user_invitations
+         SET status = 'ACCEPTED', accepted_user_id = 'invitation-user', accepted_at = 20
+         WHERE id = 'invitation-pending'",
+    )
+    .execute(database.pool())
+    .await?;
+    insert_invitation("invitation-next", "PENDING")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id IN ('invitation-owner', 'invitation-user')")
+        .execute(database.pool())
+        .await?;
+    let preserved_links: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT created_by_user_id, accepted_user_id FROM user_invitations
+         WHERE id = 'invitation-pending'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preserved_links, (None, None));
+
+    let postgres_migration = fs::read_to_string("migrations-postgres/0201_user_invitations.sql")?;
+    assert!(postgres_migration.contains("permission_snapshot_json TEXT NOT NULL"));
+    assert!(postgres_migration.contains("ON DELETE SET NULL"));
+    assert!(postgres_migration.contains("ux_user_invitations_pending_email"));
+    assert!(!postgres_migration.contains("token"));
+    assert!(!postgres_migration.contains("password"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_inventory_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert!(database.schema_version().await? >= 196);
+
+    let session_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('web_sessions') WHERE name = 'device_id'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(session_columns, 1);
+
+    let required_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('user_devices')
+         WHERE name IN (
+             'user_id', 'device_id', 'device_name', 'device_type', 'client_name',
+             'client_version', 'first_seen_at', 'last_seen_at', 'last_remote_ip'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(required_columns, 9);
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_user_devices_user_activity'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 1);
+
+    let foreign_key_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_devices')
+         WHERE \"table\" = 'users' AND on_delete = 'CASCADE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(foreign_key_count, 1);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('device-owner', 'device-owner', 'Device Owner', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES ('legacy-session', 'device-owner', x'01', x'02', unixepoch() + 3600)",
+    )
+    .execute(database.pool())
+    .await?;
+    let legacy_device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(legacy_device_id, None);
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('device-owner', 'browser-device', 'Lux Web', 10, 20)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'device-owner'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_devices: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = 'device-owner'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cascaded_devices, 0);
+
+    let postgres_migration = fs::read_to_string(
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres/0194_user_devices.sql"),
+    )?;
+    for expected in [
+        "CREATE TABLE user_devices",
+        "REFERENCES users(id) ON DELETE CASCADE",
+        "idx_user_devices_user_activity",
+        "INSERT INTO user_devices",
+        "last_remote_ip",
+    ] {
+        assert!(postgres_migration.contains(expected), "missing {expected}");
+    }
+    assert_eq!(
+        include_str!("../migrations/0195_web_session_device_id.sql"),
+        include_str!("../migrations-postgres/0195_web_session_device_id.sql")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_access_blacklist_rules_migration_runs_from_empty_and_existing_databases()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    assert!(database.schema_version().await? >= 196);
+
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('user_access_blacklist_rules')
+         WHERE name IN (
+             'id', 'user_id', 'rule_type', 'match_value', 'is_enabled',
+             'created_by', 'created_at', 'updated_at'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 8);
+    for index_name in [
+        "idx_user_access_blacklist_global_active",
+        "idx_user_access_blacklist_user_active",
+        "uq_user_access_blacklist_global_value",
+        "uq_user_access_blacklist_user_value",
+    ] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?",
+        )
+        .bind(index_name)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(count, 1, "missing index {index_name}");
+    }
+    let foreign_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_access_blacklist_rules')
+         WHERE \"table\" = 'users'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(foreign_keys, 2);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('blacklist-owner', 'blacklist-owner', 'Blacklist Owner', 'test-hash'),
+                ('blacklist-admin', 'blacklist-admin', 'Blacklist Admin', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, created_by
+         ) VALUES ('user-device-rule', 'blacklist-owner', 'DEVICE', 'blocked-device', 'blacklist-admin'),
+                  ('global-client-rule', NULL, 'CLIENT', 'infuse', 'blacklist-admin'),
+                  ('global-ip-rule', NULL, 'IP_CIDR', '192.0.2.0/24', 'blacklist-admin')",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+             id, rule_type, match_value, created_by
+         ) VALUES ('duplicate-global-rule', 'CLIENT', 'infuse', 'blacklist-admin')",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+             id, rule_type, match_value, created_by
+         ) VALUES ('invalid-kind-rule', 'OPERATING_SYSTEM', 'macos', 'blacklist-admin')",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    sqlx::query("DELETE FROM users WHERE id = 'blacklist-owner'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'blacklist-admin'")
+        .execute(database.pool())
+        .await?;
+    let (user_scoped_rules, global_rules, attributed_rules): (i64, i64, i64) = sqlx::query_as(
+        "SELECT
+             SUM(CASE WHEN user_id IS NOT NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN user_id IS NULL THEN 1 ELSE 0 END),
+             SUM(CASE WHEN created_by IS NOT NULL THEN 1 ELSE 0 END)
+         FROM user_access_blacklist_rules",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(user_scoped_rules, 0);
+    assert_eq!(global_rules, 2);
+    assert_eq!(attributed_rules, 0);
+
+    let migration_dir = temp_dir.path().join("migrations-v195");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid migration filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 195 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let legacy_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(temp_dir.path().join("upgrade-v195.db"))
+                .create_if_missing(true),
+        )
+        .await?;
+    Migrator::new(migration_dir.clone())
+        .await?
+        .run(&legacy_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-owner', 'legacy-owner', 'Legacy Owner', 'test-hash')",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('legacy-owner', 'legacy-device', 'Lux Web', 10, 20)",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    fs::copy(
+        source_dir.join("0196_user_access_blacklist_rules.sql"),
+        migration_dir.join("0196_user_access_blacklist_rules.sql"),
+    )?;
+    Migrator::new(migration_dir)
+        .await?
+        .run(&legacy_pool)
+        .await?;
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&legacy_pool)
+        .await?;
+    let preserved_devices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_devices WHERE user_id = 'legacy-owner' AND device_id = 'legacy-device'",
+    )
+    .fetch_one(&legacy_pool)
+    .await?;
+    assert_eq!(version, 196);
+    assert_eq!(preserved_devices, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn web_session_device_id_migration_preserves_existing_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("migrations-v194");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid migration filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 194 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-session-owner', 'legacy-session-owner', 'Legacy Session', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES (
+             'legacy-session', 'legacy-session-owner', x'01', x'02', unixepoch() + 3600
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    fs::copy(
+        source_dir.join("0195_web_session_device_id.sql"),
+        migration_dir.join("0195_web_session_device_id.sql"),
+    )?;
+    Migrator::new(migration_dir).await?.run(&pool).await?;
+
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(&pool)
+            .await?;
+    let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(device_id, None);
+    assert_eq!(version, 195);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_inventory_migration_backfills_legacy_emby_device_evidence()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let migration_dir = temp_dir.path().join("migrations");
+    fs::create_dir(&migration_dir)?;
+    let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    for entry in fs::read_dir(&source_dir)? {
+        let source = entry?.path();
+        let version = source
+            .file_name()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split_once('_'))
+            .map(|(version, _)| version.parse::<i64>())
+            .transpose()?;
+        if version.is_some_and(|version| version <= 193) {
+            fs::copy(
+                &source,
+                migration_dir.join(source.file_name().ok_or("missing migration filename")?),
+            )?;
+        }
+    }
+
+    let database_path = temp_dir.path().join("devices-upgrade.db");
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true),
+        )
+        .await?;
+    Migrator::new(migration_dir.clone())
+        .await?
+        .run(&pool)
+        .await?;
+    let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(schema_version, 193);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('device-owner', 'device-owner', 'Device Owner', 'test-hash'),
+                ('other-owner', 'other-owner', 'Other Owner', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    for (
+        id,
+        token_hash,
+        user_id,
+        device_id,
+        client_name,
+        device_name,
+        version,
+        created_at,
+        last_seen_at,
+        revoked_at,
+    ) in [
+        (
+            "token-old",
+            vec![1_u8],
+            "device-owner",
+            "shared-device",
+            "Old Client",
+            "Old Name",
+            "1.0",
+            100_i64,
+            Some(120_i64),
+            None,
+        ),
+        (
+            "token-latest",
+            vec![2_u8],
+            "device-owner",
+            "shared-device",
+            "Current Client",
+            "Current Name",
+            "2.0",
+            110_i64,
+            Some(150_i64),
+            None,
+        ),
+        (
+            "token-revoked",
+            vec![3_u8],
+            "device-owner",
+            "shared-device",
+            "Revoked Client",
+            "Revoked Name",
+            "0.9",
+            90_i64,
+            Some(95_i64),
+            Some(300_i64),
+        ),
+        (
+            "token-other-user",
+            vec![4_u8],
+            "other-owner",
+            "shared-device",
+            "Other Client",
+            "Other Device",
+            "3.0",
+            200_i64,
+            Some(220_i64),
+            None,
+        ),
+        (
+            "token-empty-device",
+            vec![5_u8],
+            "device-owner",
+            "",
+            "Unknown Client",
+            "Unknown Device",
+            "0.1",
+            50_i64,
+            Some(60_i64),
+            None,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                 id, token_hash, user_id, device_id, client_name, device_name,
+                 client_version, created_at, updated_at, last_seen_at, revoked_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(device_id)
+        .bind(client_name)
+        .bind(device_name)
+        .bind(version)
+        .bind(created_at)
+        .bind(created_at + 10)
+        .bind(last_seen_at)
+        .bind(revoked_at)
+        .execute(&pool)
+        .await?;
+    }
+
+    fs::copy(
+        source_dir.join("0194_user_devices.sql"),
+        migration_dir.join("0194_user_devices.sql"),
+    )?;
+    Migrator::new(migration_dir).await?.run(&pool).await?;
+
+    let (
+        device_name,
+        device_type,
+        client_name,
+        client_version,
+        first_seen_at,
+        last_seen_at,
+        last_remote_ip,
+    ): (
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT device_name, device_type, client_name, client_version,
+                first_seen_at, last_seen_at, last_remote_ip
+         FROM user_devices WHERE user_id = 'device-owner' AND device_id = 'shared-device'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(device_name.as_deref(), Some("Current Name"));
+    assert_eq!(device_type, None);
+    assert_eq!(client_name, "Current Client");
+    assert_eq!(client_version.as_deref(), Some("2.0"));
+    assert_eq!(first_seen_at, 90);
+    assert_eq!(last_seen_at, 150);
+    assert_eq!(last_remote_ip, None);
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_devices")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(rows, 2);
+    pool.close().await;
+    Ok(())
+}
 
 #[tokio::test]
 async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
@@ -18,7 +765,7 @@ async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 183);
+    assert!(database.schema_version().await? >= 190);
 
     let processed_media_column: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM pragma_table_info('scan_jobs')
@@ -100,6 +847,632 @@ async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
 }
 
 #[tokio::test]
+async fn user_library_access_mode_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+
+    assert!(database.schema_version().await? >= 190);
+    let (not_null, default_value): (i64, Option<String>) = sqlx::query_as(
+        "SELECT \"notnull\", dflt_value FROM pragma_table_info('users')
+         WHERE name = 'library_access_mode'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(not_null, 1);
+    assert_eq!(default_value.as_deref(), Some("'ALL'"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_account_preferences_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert!(database.schema_version().await? >= 190);
+
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'user_account_preferences'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(table_count, 1);
+    let owner_cascade_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_account_preferences')
+         WHERE \"table\" = 'users' AND on_delete = 'CASCADE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(owner_cascade_count, 1);
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('account-preferences-owner', 'account-preferences-owner', 'Preferences', 'hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_account_preferences (user_id)
+         VALUES ('account-preferences-owner')",
+    )
+    .execute(database.pool())
+    .await?;
+    let defaults: (String, String, i64, i64, String, String, i64, i64) = sqlx::query_as(
+        "SELECT theme, accent_color, show_media_libraries, show_continue_watching,
+                audio_language, subtitle_language, auto_play_next_episode, version
+         FROM user_account_preferences WHERE user_id = 'account-preferences-owner'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        defaults,
+        (
+            "dark".to_owned(),
+            "silver".to_owned(),
+            1,
+            1,
+            "原始音轨".to_owned(),
+            "简体中文".to_owned(),
+            1,
+            1,
+        )
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET theme = 'sepia'
+             WHERE user_id = 'account-preferences-owner'",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET accent_color = 'ultraviolet'
+             WHERE user_id = 'account-preferences-owner'",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET version = 0
+             WHERE user_id = 'account-preferences-owner'",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    sqlx::query("DELETE FROM users WHERE id = 'account-preferences-owner'")
+        .execute(database.pool())
+        .await?;
+    let remaining_preferences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_account_preferences
+         WHERE user_id = 'account-preferences-owner'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_preferences, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_content_restrictions_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert!(database.schema_version().await? >= 190);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('content-restriction-user', 'content-restriction-user', 'Content Restriction', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ('content-restriction-user', 'MPAA', 'PG-13', 0)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ('content-restriction-user', 'ALLOW', 'family'),
+                ('content-restriction-user', 'BLOCK', 'horror')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('invalid-rating-system', 'invalid-rating-system', 'Invalid Rating', 'test'),
+                ('invalid-unrated-flag', 'invalid-unrated-flag', 'Invalid Unrated', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    for invalid in [
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ('invalid-rating-system', '   ', NULL, 0)",
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ('invalid-unrated-flag', 'MPAA', NULL, 2)",
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ('content-restriction-user', 'NEUTRAL', 'other')",
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ('content-restriction-user', 'ALLOW', '   ')",
+    ] {
+        assert!(sqlx::query(invalid).execute(database.pool()).await.is_err());
+    }
+    assert!(
+        sqlx::query(
+            "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+             VALUES ('content-restriction-user', 'ALLOW', 'family')",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    let postgres_migration =
+        include_str!("../migrations-postgres/0190_user_content_restrictions.sql");
+    assert!(postgres_migration.contains("CREATE TABLE user_content_restrictions"));
+    assert!(postgres_migration.contains("CREATE TABLE user_content_restriction_tags"));
+    assert!(postgres_migration.contains("ON DELETE CASCADE"));
+
+    sqlx::query("DELETE FROM users WHERE id = 'content-restriction-user'")
+        .execute(database.pool())
+        .await?;
+    let remaining_policy_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restrictions
+         WHERE user_id = 'content-restriction-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let remaining_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restriction_tags
+         WHERE user_id = 'content-restriction-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_policy_rows, 0);
+    assert_eq!(remaining_tag_rows, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_content_restriction_index_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert!(database.schema_version().await? >= 192);
+
+    let levels: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT rating_system, rating_code, rating_order
+         FROM content_rating_levels ORDER BY rating_system, rating_order, rating_code",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(levels.len(), 18);
+    assert_eq!(
+        levels,
+        [
+            ("BBFC".to_owned(), "U".to_owned(), 0),
+            ("BBFC".to_owned(), "PG".to_owned(), 1),
+            ("BBFC".to_owned(), "12".to_owned(), 2),
+            ("BBFC".to_owned(), "12A".to_owned(), 2),
+            ("BBFC".to_owned(), "15".to_owned(), 3),
+            ("BBFC".to_owned(), "18".to_owned(), 4),
+            ("BBFC".to_owned(), "R18".to_owned(), 5),
+            ("MPA".to_owned(), "G".to_owned(), 0),
+            ("MPA".to_owned(), "PG".to_owned(), 1),
+            ("MPA".to_owned(), "PG-13".to_owned(), 2),
+            ("MPA".to_owned(), "R".to_owned(), 3),
+            ("MPA".to_owned(), "NC-17".to_owned(), 4),
+            ("TVPG".to_owned(), "TV-Y".to_owned(), 0),
+            ("TVPG".to_owned(), "TV-G".to_owned(), 1),
+            ("TVPG".to_owned(), "TV-Y7".to_owned(), 2),
+            ("TVPG".to_owned(), "TV-PG".to_owned(), 3),
+            ("TVPG".to_owned(), "TV-14".to_owned(), 4),
+            ("TVPG".to_owned(), "TV-MA".to_owned(), 5),
+        ]
+    );
+    let restriction_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name IN (
+             'idx_media_content_restriction_index_certification',
+             'idx_media_content_restriction_tags_tag'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_indexes, 2);
+    assert!(
+        sqlx::query(
+            "INSERT INTO content_rating_levels (rating_system, rating_code, rating_order)
+             VALUES ('MPA', 'UNKNOWN', 5)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('restriction-index-library', 'Restrictions', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items
+            (id, library_id, item_type, title, sort_title, identification_status, nfo_metadata_json)
+         VALUES ('restriction-index-item', 'restriction-index-library', 'MOVIE',
+                 'Restriction', 'restriction', 'LOCAL_CONFIRMED', '{\"certification\":\"PG-13\"}')",
+    )
+    .execute(database.pool())
+    .await?;
+    let unindexed_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unindexed_rows, 0, "no row means the item is not ready");
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', 'PG-13')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('restriction-index-item', '   ')",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = nfo_metadata_json
+         WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let unchanged_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        unchanged_index_rows, 1,
+        "unchanged NFO keeps the index ready"
+    );
+
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = '{\"certification\":\"R\"}'
+         WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let invalidated_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let invalidated_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(invalidated_index_rows, 0);
+    assert_eq!(invalidated_tag_rows, 0);
+
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', 'R')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = NULL WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let cleared_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        cleared_index_rows, 0,
+        "clearing NFO removes the indexed row"
+    );
+
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', NULL)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'restriction-index-item'")
+        .execute(database.pool())
+        .await?;
+    let stale_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let stale_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_index_rows, 0, "media deletion cascades to the index");
+    assert_eq!(stale_tag_rows, 0, "index deletion cascades to indexed tags");
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_user_and_library_access_upgrade_from_v183_to_current_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    fs::create_dir_all(&config_dir)?;
+    let migration_prefix = temp_dir.path().join("migrations-before-account-profile");
+    fs::create_dir(&migration_prefix)?;
+    for entry in fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split('_').next())
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if version <= 183 {
+            let file_name = path.file_name().ok_or("migration has no file name")?;
+            fs::copy(&path, migration_prefix.join(file_name))?;
+        }
+    }
+
+    let database_path = config_dir.join("lux.db");
+    let legacy_pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&database_path)
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await?;
+    Migrator::new(migration_prefix.as_path())
+        .await?
+        .run(&legacy_pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash, is_disabled)
+         VALUES ('legacy-enabled', 'legacy-enabled', 'Legacy Enabled', 'hash', 0),
+                ('legacy-disabled', 'legacy-disabled', 'Legacy Disabled', 'hash', 1),
+                ('legacy-denials-only', 'legacy-denials-only', 'Legacy Denials', 'hash', 0),
+                ('legacy-selected', 'legacy-selected', 'Legacy Selected', 'hash', 0)",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind)
+         VALUES ('legacy-library', 'Legacy Library', 'MOVIE')",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES ('legacy-denials-only', 'legacy-library', 0),
+                ('legacy-selected', 'legacy-library', 1)",
+    )
+    .execute(&legacy_pool)
+    .await?;
+    legacy_pool.close().await;
+
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir,
+    })
+    .await?;
+    assert_eq!(
+        database.schema_version().await?,
+        latest_migration_version("migrations")?
+    );
+    let users: Vec<(String, Option<String>, Option<i64>, Option<i64>, i64, i64)> = sqlx::query_as(
+        "SELECT id, email, email_verified_at, deletion_purge_at,
+                is_disabled, is_disabled_before_delete
+         FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(users.len(), 4);
+    assert_eq!(
+        users[0],
+        ("legacy-denials-only".to_owned(), None, None, None, 0, 0)
+    );
+    assert_eq!(
+        users[1],
+        ("legacy-disabled".to_owned(), None, None, None, 1, 0)
+    );
+    assert_eq!(
+        users[2],
+        ("legacy-enabled".to_owned(), None, None, None, 0, 0)
+    );
+    assert_eq!(
+        users[3],
+        ("legacy-selected".to_owned(), None, None, None, 0, 0)
+    );
+
+    let legacy_access_modes: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        legacy_access_modes,
+        [
+            ("legacy-denials-only".to_owned(), "ALL".to_owned()),
+            ("legacy-disabled".to_owned(), "ALL".to_owned()),
+            ("legacy-enabled".to_owned(), "ALL".to_owned()),
+            ("legacy-selected".to_owned(), "SELECTED".to_owned()),
+        ]
+    );
+    let legacy_access_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT user_id, library_id, can_view FROM user_library_access
+         WHERE user_id LIKE 'legacy-%' ORDER BY user_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        legacy_access_rows,
+        [
+            (
+                "legacy-denials-only".to_owned(),
+                "legacy-library".to_owned(),
+                0
+            ),
+            ("legacy-selected".to_owned(), "legacy-library".to_owned(), 1),
+        ]
+    );
+
+    sqlx::query("UPDATE users SET email = 'legacy@example.com' WHERE id = 'legacy-enabled'")
+        .execute(database.pool())
+        .await?;
+    let duplicate_email =
+        sqlx::query("UPDATE users SET email = 'LEGACY@example.com' WHERE id = 'legacy-disabled'")
+            .execute(database.pool())
+            .await;
+    assert!(
+        duplicate_email.is_err(),
+        "email uniqueness must ignore case"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_permission_preset_source_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+
+    assert!(database.schema_version().await? >= 190);
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('user_permission_preset_sources')
+         WHERE name IN ('user_id', 'preset_id', 'preset_name', 'preset_version', 'applied_at')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 5);
+    let preset_foreign_key: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_foreign_key_list('user_permission_preset_sources')
+         WHERE \"table\" = 'users' AND \"from\" = 'user_id' AND on_delete = 'CASCADE'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preset_foreign_key, 1);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('preset-source-user', 'preset-source-user', 'Preset Source', 'hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_permission_preset_sources
+         (user_id, preset_id, preset_name, preset_version)
+         VALUES ('preset-source-user', 'custom-id', 'Family', 2)",
+    )
+    .execute(database.pool())
+    .await?;
+    let source: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT preset_id, preset_name, preset_version, applied_at
+         FROM user_permission_preset_sources WHERE user_id = 'preset-source-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source.0, "custom-id");
+    assert_eq!(source.1, "Family");
+    assert_eq!(source.2, 2);
+    assert!(source.3 > 0);
+
+    sqlx::query("DELETE FROM users WHERE id = 'preset-source-user'")
+        .execute(database.pool())
+        .await?;
+    let remaining_sources: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_permission_preset_sources
+         WHERE user_id = 'preset-source-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_sources, 0);
+
+    let postgres_migration =
+        fs::read_to_string("migrations-postgres/0188_user_permission_preset_sources.sql")?;
+    assert!(postgres_migration.contains("user_permission_preset_sources"));
+    assert!(postgres_migration.contains("REFERENCES users(id) ON DELETE CASCADE"));
+    assert!(
+        postgres_migration.contains("preset_version BIGINT NOT NULL CHECK (preset_version > 0)")
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn global_movie_collection_storage_is_migrated_from_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -108,7 +1481,7 @@ async fn global_movie_collection_storage_is_migrated_from_an_empty_database()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
 
     let system_library: (String, String) = sqlx::query_as(
         "SELECT kind, system_kind FROM libraries
@@ -595,7 +1968,7 @@ async fn sqlite_upgrade_accepts_the_original_applied_timestamp_migration_checksu
     pool.close().await;
 
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     let preserved_checksum: Vec<u8> =
         sqlx::query_scalar("SELECT checksum FROM _sqlx_migrations WHERE version = 126")
             .fetch_one(database.pool())
@@ -1515,7 +2888,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
 
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     assert!(config_dir.join("lux.db").is_file());
 
     let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
@@ -1535,7 +2908,7 @@ async fn empty_config_dir_runs_migrations_and_configures_sqlite()
     database.close().await;
 
     let second_database = Database::connect(&config).await?;
-    assert_eq!(second_database.schema_version().await?, 181);
+    assert!(second_database.schema_version().await? >= 190);
     second_database.close().await;
     Ok(())
 }
@@ -1620,7 +2993,7 @@ async fn sqlite_fill_request_snapshot_migration_preserves_queued_jobs()
     old_pool.close().await;
 
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     let job_state: (String, i64, i64) = sqlx::query_as(
         "SELECT status, processed_count, total_count
          FROM metadata_reidentify_jobs WHERE id = 'snapshot-job'",
@@ -1769,7 +3142,7 @@ async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
     old_pool.close().await;
 
     let database = Database::connect(&config).await?;
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     let jobs: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT jobs.id, jobs.status, jobs.processed_count, jobs.total_count,
                 items.automatic_retry_count, items.automatic_retry_consumed
@@ -1914,7 +3287,7 @@ async fn progressive_scan_metadata_schema_is_created_for_new_sqlite_databases()
     let schema_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(schema_version, 181);
+    assert!(schema_version >= 190);
     for table in ["scan_local_metadata_batches", "item_metadata_completeness"] {
         let table_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
@@ -2275,7 +3648,7 @@ async fn progressive_scan_policy_survives_sqlite_catalog_rebuild()
         vec![("rebuild-off".to_owned(), 0), ("rebuild-on".to_owned(), 1)]
     );
     let schema_version = database.schema_version().await?;
-    assert_eq!(schema_version, 181);
+    assert!(schema_version >= 190);
     database.close().await;
     Ok(())
 }
@@ -2623,7 +3996,7 @@ async fn full_scan_manifest_schema_is_created_for_sqlite() -> Result<(), Box<dyn
     .fetch_one(database.pool())
     .await?;
     assert_eq!(manifest_resume_state, 1);
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
 
     database.close().await;
     Ok(())
@@ -3317,7 +4690,7 @@ async fn scan_indexes_keep_only_required_rows_and_lookup_order()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(external_stream_index, 0);
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     Ok(())
 }
 
@@ -3489,7 +4862,7 @@ async fn scan_job_targets_schema_is_available_from_an_empty_database()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(table_name, "scan_job_targets");
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     Ok(())
 }
 
@@ -3576,7 +4949,7 @@ async fn emby_migration_migration_creates_state_and_history_tables()
         .await?;
         assert_eq!(exists, 1, "missing migration table {table}");
     }
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     database.close().await;
     Ok(())
 }
@@ -3708,7 +5081,7 @@ async fn media_chapter_migration_creates_source_scoped_table()
     };
     let database = Database::connect(&config).await?;
 
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     let table_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'media_chapters'",
     )
@@ -3890,7 +5263,7 @@ async fn sqlite_write_probe_succeeds_and_only_persists_reserved_marker()
     let database = Database::connect(&config).await?;
 
     database.probe_write().await?;
-    assert_eq!(database.schema_version().await?, 181);
+    assert!(database.schema_version().await? >= 190);
     let probe_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = '__lux_write_probe__'")
             .fetch_one(database.pool())
@@ -4124,7 +5497,258 @@ async fn resume_visibility_upgrade_preserves_existing_playback_state()
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 181);
+    assert_eq!(version, latest_migration_version("migrations")?);
     pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_registration_requests_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(temp.path().join("registration-empty.db"))
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await?;
+    Migrator::new(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations"))
+        .await?
+        .run(&pool)
+        .await?;
+    assert_sqlite_registration_request_schema(&pool).await?;
+    pool.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_registration_requests_migration_upgrades_existing_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let selected = temp.path().join("migrations");
+    fs::create_dir(&selected)?;
+    for entry in fs::read_dir(&source)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid filename")?
+            .split('_')
+            .next()
+            .ok_or("missing version")?
+            .parse()?;
+        if version <= 202 {
+            fs::copy(entry.path(), selected.join(filename))?;
+        }
+    }
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(temp.path().join("registration-upgrade.db"))
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await?;
+    Migrator::new(selected.clone()).await?.run(&pool).await?;
+    sqlx::query("INSERT INTO users (id, username_normalized, display_name, password_hash) VALUES ('preserved-registration-owner', 'preserved-registration-owner', 'Preserved', 'test-hash')").execute(&pool).await?;
+    fs::copy(
+        source.join("0203_user_registration_requests.sql"),
+        selected.join("0203_user_registration_requests.sql"),
+    )?;
+    Migrator::new(selected).await?.run(&pool).await?;
+    assert_sqlite_registration_request_schema(&pool).await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT display_name FROM users WHERE id = 'preserved-registration-owner'"
+        )
+        .fetch_one(&pool)
+        .await?,
+        "Preserved"
+    );
+    pool.close().await;
+    Ok(())
+}
+
+async fn assert_sqlite_registration_request_schema(
+    pool: &sqlx::SqlitePool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let columns: Vec<String> =
+        sqlx::query_scalar("SELECT name FROM pragma_table_info('user_registration_requests')")
+            .fetch_all(pool)
+            .await?;
+    assert_eq!(columns.len(), 15);
+    assert!(
+        !columns
+            .iter()
+            .any(|column| column.contains("token") || column == "password")
+    );
+    for column in [
+        "recipient_email",
+        "username_normalized",
+        "display_name",
+        "password_hash",
+        "permission_snapshot_json",
+        "status",
+        "expires_at",
+        "email_verified_at",
+        "reviewed_at",
+        "reviewed_by_user_id",
+        "approved_user_id",
+        "last_error_code",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            columns.iter().any(|existing| existing == column),
+            "missing {column}"
+        );
+    }
+    for name in [
+        "ux_user_registration_requests_pending_email",
+        "idx_user_registration_requests_status_created",
+        "idx_user_registration_requests_expiry",
+    ] {
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?"
+            )
+            .bind(name)
+            .fetch_one(pool)
+            .await?,
+            1
+        );
+    }
+    sqlx::query("INSERT INTO users (id, username_normalized, display_name, password_hash) VALUES ('registration-reviewer', 'registration-reviewer', 'Reviewer', 'test-hash')").execute(pool).await?;
+    let insert = "INSERT INTO user_registration_requests (id, recipient_email, username_normalized, display_name, password_hash, permission_snapshot_json, expires_at, created_at, updated_at) VALUES (?, 'registration@example.test', 'registration-user', 'Registration User', '$argon2id$test-hash', '{}', 20, 10, 10)";
+    sqlx::query(insert)
+        .bind("registration-main")
+        .execute(pool)
+        .await?;
+    assert!(
+        sqlx::query(insert)
+            .bind("registration-duplicate")
+            .execute(pool)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT status FROM user_registration_requests WHERE id = 'registration-main'"
+        )
+        .fetch_one(pool)
+        .await?,
+        "PENDING_EMAIL"
+    );
+    for (query, value) in [
+        (
+            "UPDATE user_registration_requests SET id = ? WHERE id = 'registration-main'",
+            "x".repeat(129),
+        ),
+        (
+            "UPDATE user_registration_requests SET username_normalized = ? WHERE id = 'registration-main'",
+            " ".to_owned(),
+        ),
+        (
+            "UPDATE user_registration_requests SET password_hash = ? WHERE id = 'registration-main'",
+            "$ARGON2ID$test-hash".to_owned(),
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = ? WHERE id = 'registration-main'",
+            format!(r#"{{"x":"{}"}}"#, "界".repeat(12_000)),
+        ),
+        (
+            "UPDATE user_registration_requests SET recipient_email = ? WHERE id = 'registration-main'",
+            "x".repeat(255),
+        ),
+        (
+            "UPDATE user_registration_requests SET recipient_email = ? WHERE id = 'registration-main'",
+            "UPPER@example.test".to_owned(),
+        ),
+        (
+            "UPDATE user_registration_requests SET username_normalized = ? WHERE id = 'registration-main'",
+            "x".repeat(129),
+        ),
+        (
+            "UPDATE user_registration_requests SET display_name = ? WHERE id = 'registration-main'",
+            "x".repeat(129),
+        ),
+        (
+            "UPDATE user_registration_requests SET password_hash = ? WHERE id = 'registration-main'",
+            "plaintext".to_owned(),
+        ),
+        (
+            "UPDATE user_registration_requests SET password_hash = ? WHERE id = 'registration-main'",
+            format!("$argon2id${}", "x".repeat(2048)),
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = ? WHERE id = 'registration-main'",
+            "invalid".to_owned(),
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = ? WHERE id = 'registration-main'",
+            "[]".to_owned(),
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = ? WHERE id = 'registration-main'",
+            format!(r#"{{"x":"{}"}}"#, "x".repeat(32768)),
+        ),
+        (
+            "UPDATE user_registration_requests SET status = ? WHERE id = 'registration-main'",
+            "ACTIVE".to_owned(),
+        ),
+        (
+            "UPDATE user_registration_requests SET last_error_code = ? WHERE id = 'registration-main'",
+            "arbitrary private error".to_owned(),
+        ),
+    ] {
+        assert!(
+            sqlx::query(query).bind(&value).execute(pool).await.is_err(),
+            "accepted invalid update: {query}"
+        );
+    }
+    for query in [
+        "UPDATE user_registration_requests SET password_hash = NULL WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET expires_at = 10 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET updated_at = 9 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET email_verified_at = 9 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'PENDING_APPROVAL' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'APPROVED', reviewed_at = 12, password_hash = NULL WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET reviewed_by_user_id = 'unknown' WHERE id = 'registration-main'",
+    ] {
+        assert!(
+            sqlx::query(query).execute(pool).await.is_err(),
+            "accepted invalid transition: {query}"
+        );
+    }
+    sqlx::query("UPDATE user_registration_requests SET status = 'PENDING_APPROVAL', email_verified_at = 11, updated_at = 11 WHERE id = 'registration-main'").execute(pool).await?;
+    assert!(
+        sqlx::query(insert)
+            .bind("registration-approval-duplicate")
+            .execute(pool)
+            .await
+            .is_err()
+    );
+    sqlx::query("UPDATE user_registration_requests SET status = 'REJECTED', reviewed_at = 12, updated_at = 12, reviewed_by_user_id = 'registration-reviewer', password_hash = NULL WHERE id = 'registration-main'").execute(pool).await?;
+    sqlx::query(insert)
+        .bind("registration-next")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE user_registration_requests SET status = 'APPROVED', email_verified_at = 11, reviewed_at = 12, updated_at = 12, reviewed_by_user_id = 'registration-reviewer', approved_user_id = 'registration-reviewer', password_hash = NULL WHERE id = 'registration-next'").execute(pool).await?;
+    assert!(sqlx::query("UPDATE user_registration_requests SET approved_user_id = 'unknown' WHERE id = 'registration-next'").execute(pool).await.is_err());
+    sqlx::query(insert)
+        .bind("registration-expired")
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE user_registration_requests SET status = 'EXPIRED', password_hash = NULL, updated_at = 21 WHERE id = 'registration-expired'").execute(pool).await?;
+    sqlx::query("DELETE FROM users WHERE id = 'registration-reviewer'")
+        .execute(pool)
+        .await?;
+    let (reviewer, approved, password): (Option<String>, Option<String>, Option<String>) = sqlx::query_as("SELECT reviewed_by_user_id, approved_user_id, password_hash FROM user_registration_requests WHERE id = 'registration-next'").fetch_one(pool).await?;
+    assert_eq!((reviewer, approved, password), (None, None, None));
     Ok(())
 }

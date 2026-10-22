@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { readFileSync } from "node:fs";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 
 test("hero carousel controls share a flexible row and stay at its right edge", () => {
   const actionRowRule = stylesheet.match(/\.lux-hero-action-row\s*\{([^}]*)\}/)?.[1] ?? "";

@@ -131,6 +131,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Err(error) => error!(%error, "one-time database lifecycle cleanup failed"),
     }
     database.spawn_removed_media_item_purge();
+    database.spawn_database_maintenance();
     let cancelled_jobs = database.cancel_incomplete_jobs_for_shutdown().await?;
     if cancelled_jobs > 0 {
         info!(
@@ -154,12 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if explicit_database_configuration.is_none() && !legacy_sqlite_database {
         app_state = app_state.require_database_selection();
     }
+    app_state.start_content_restriction_index_worker();
     app_state.rebuild_people_index().await;
     app_state.start_local_metadata_worker().await;
     app_state.resume_interrupted_metadata_scraping();
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker();
+    let mail_worker = luxd::application::mail_worker::MailDeliveryWorker::start(
+        database.clone(),
+        config.config_dir.clone(),
+    );
     // A large existing library can contain hundreds of thousands of episodes.
     // Repairing their legacy identities is a one-time background operation and
     // must not block the HTTP listener from becoming available.
@@ -204,6 +210,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     .await;
     let _ = shutdown_tx.send(true);
     let _ = discovery_task.await;
+    mail_worker.shutdown().await;
     serve_result?;
     let shutdown_reason = *control_tx.borrow();
     if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {

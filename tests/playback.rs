@@ -10,7 +10,11 @@ use luxd::{
 };
 use reqwest::header::{AUTHORIZATION, CONTENT_LENGTH, CONTENT_RANGE, CONTENT_TYPE, RANGE};
 use serde_json::{Value, json};
+use sqlx::Row;
 use tokio::net::TcpListener;
+
+#[path = "playback_strm_probe.rs"]
+mod playback_strm_probe;
 
 fn emby_public_id(id: &str) -> String {
     uuid::Uuid::parse_str(id)
@@ -51,6 +55,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     let media_path = root.join("Range.Movie.2024.mkv");
@@ -97,7 +105,13 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
-    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let server = tokio::spawn(async move {
+        axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await
+    });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::new();
     let login = client
@@ -130,6 +144,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
 
     let playback_info = client
         .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .header(
+            "X-Emby-Authorization",
+            r#"Emby Client="SpoofedPlaybackClient", Device="Unknown", DeviceId="spoofed-device", Version="99""#,
+        )
         .query(&[("api_key", token.as_str())])
         .send()
         .await?;
@@ -143,6 +161,42 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     );
     assert_eq!(playback_body["MediaSources"][0]["Quality"], Value::Null);
     assert_eq!(playback_body["MediaSources"][1]["Quality"], "2160p");
+    let direct_play_session_id = playback_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing direct playback session ID")?;
+    let direct_ticket_context = sqlx::query(
+        "SELECT authorization_device_id, authorization_client_name, expires_at
+         FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .fetch_optional(database.pool())
+    .await?;
+    let direct_ticket_context =
+        direct_ticket_context.ok_or("missing persisted direct playback ticket context")?;
+    assert_eq!(
+        direct_ticket_context
+            .get::<Option<String>, _>("authorization_device_id")
+            .as_deref(),
+        Some("playback-admin")
+    );
+    assert_eq!(
+        direct_ticket_context
+            .get::<Option<String>, _>("authorization_client_name")
+            .as_deref(),
+        Some("PlaybackTest")
+    );
+    let direct_ticket_expires_at = direct_ticket_context.get::<i64, _>("expires_at");
+    let direct_playback_admission_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(direct_playback_admission_count, 0);
     assert_eq!(playback_body["MediaSources"][0]["SupportsDirectPlay"], true);
     assert_eq!(
         playback_body["MediaSources"][0]["SupportsDirectStream"],
@@ -159,10 +213,20 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         "/Videos/{emby_item_id}/stream.mkv?MediaSourceId={source_id}"
     )));
     assert!(generic_direct_url.contains("&PlaySessionId="));
+    assert!(generic_direct_url.contains("&luxPlaybackTicketVersion=2"));
     assert!(generic_direct_url.contains("&static=true"));
     assert!(generic_direct_url.contains("&UserId="));
     assert!(generic_direct_url.contains("&luxPlayback"));
+    assert!(
+        generic_direct_url.contains(&format!("&luxPlaybackExpires={direct_ticket_expires_at}&"))
+    );
     assert!(!generic_direct_url.contains(&token));
+    let second_direct_url = playback_body["MediaSources"][1]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing second direct stream URL")?;
+    assert!(
+        second_direct_url.contains(&format!("&luxPlaybackExpires={direct_ticket_expires_at}&"))
+    );
     assert_eq!(
         playback_body["MediaSources"][0]["AddApiKeyToDirectStreamUrl"],
         false
@@ -174,6 +238,218 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await?;
     assert_eq!(generic_stream.status(), reqwest::StatusCode::OK);
     assert_eq!(generic_stream.bytes().await?.as_ref(), b"0123456789");
+    sqlx::query(
+        "INSERT INTO playback_sessions (
+             id, user_id, item_id, media_source_id, play_session_id, device_id, client, state
+         ) VALUES (?, ?, ?, ?, ?, 'playback-admin', 'PlaybackTest', 'PLAYING')
+         ON CONFLICT(user_id, play_session_id) DO UPDATE SET
+             state = 'PLAYING', last_event_at = unixepoch()",
+    )
+    .bind(uuid::Uuid::now_v7().to_string())
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .bind(&source_id)
+    .bind(direct_play_session_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by
+         ) VALUES ('direct-ticket-client-rule', NULL, 'CLIENT', 'playbacktest', 1, ?)",
+    )
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let blacklisted_direct_stream = client
+        .get(format!("{base_url}{generic_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        blacklisted_direct_stream.status(),
+        reqwest::StatusCode::GONE
+    );
+    let stopped_playback_state: String = sqlx::query_scalar(
+        "SELECT state FROM playback_sessions
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stopped_playback_state, "STOPPED");
+    let direct_ticket_revoked_at: Option<i64> = sqlx::query_scalar(
+        "SELECT revoked_at FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(direct_ticket_revoked_at.is_some());
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("direct-ticket-client-rule")
+        .execute(database.pool())
+        .await?;
+    let revoked_direct_stream = client
+        .get(format!("{base_url}{generic_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(revoked_direct_stream.status(), reqwest::StatusCode::GONE);
+    let blacklist_hit_metadata: String = sqlx::query_scalar(
+        "SELECT metadata_json FROM user_activity_events
+         WHERE user_id = ? AND event_type = 'USER_ACCESS_BLACKLIST_HIT'
+         ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(admin.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert!(blacklist_hit_metadata.contains("CLIENT"));
+    assert!(!blacklist_hit_metadata.contains("PlaybackTest"));
+    assert!(!blacklist_hit_metadata.contains(&token));
+    sqlx::query(
+        "DELETE FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .execute(database.pool())
+    .await?;
+    let missing_v2_ticket_stream = client
+        .get(format!("{base_url}{generic_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_v2_ticket_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let admission_state: Option<String> = sqlx::query_scalar(
+        "SELECT state FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(direct_play_session_id)
+    .fetch_optional(database.pool())
+    .await?;
+    assert_eq!(admission_state.as_deref(), Some("RELEASED"));
+
+    let device_ticket_response = client
+        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(device_ticket_response.status(), reqwest::StatusCode::OK);
+    let device_ticket_body = device_ticket_response.json::<Value>().await?;
+    let device_play_session_id = device_ticket_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing device ticket session ID")?;
+    let device_direct_url = device_ticket_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing device direct URL")?;
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by
+         ) VALUES ('direct-ticket-device-rule', NULL, 'DEVICE', 'playback-admin', 1, ?)",
+    )
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let blacklisted_device_stream = client
+        .get(format!("{base_url}{device_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        blacklisted_device_stream.status(),
+        reqwest::StatusCode::GONE
+    );
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("direct-ticket-device-rule")
+        .execute(database.pool())
+        .await?;
+    let revoked_device_stream = client
+        .get(format!("{base_url}{device_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(revoked_device_stream.status(), reqwest::StatusCode::GONE);
+    let device_ticket_revoked_at: Option<i64> = sqlx::query_scalar(
+        "SELECT revoked_at FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(device_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(device_ticket_revoked_at.is_some());
+
+    let ip_ticket_response = client
+        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(ip_ticket_response.status(), reqwest::StatusCode::OK);
+    let ip_ticket_body = ip_ticket_response.json::<Value>().await?;
+    let ip_play_session_id = ip_ticket_body["PlaySessionId"]
+        .as_str()
+        .ok_or("missing IP ticket session ID")?;
+    let ip_direct_url = ip_ticket_body["MediaSources"][0]["DirectStreamUrl"]
+        .as_str()
+        .ok_or("missing IP direct URL")?;
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by
+         ) VALUES ('direct-ticket-ip-rule', NULL, 'IP_CIDR', '127.0.0.0/8', 1, ?)",
+    )
+    .bind(admin.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let blacklisted_ip_stream = client
+        .get(format!("{base_url}{ip_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(blacklisted_ip_stream.status(), reqwest::StatusCode::GONE);
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("direct-ticket-ip-rule")
+        .execute(database.pool())
+        .await?;
+    let revoked_ip_stream = client
+        .get(format!("{base_url}{ip_direct_url}"))
+        .send()
+        .await?;
+    assert_eq!(revoked_ip_stream.status(), reqwest::StatusCode::GONE);
+    let ip_ticket_revoked_at: Option<i64> = sqlx::query_scalar(
+        "SELECT revoked_at FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND play_session_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind(ip_play_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert!(ip_ticket_revoked_at.is_some());
+
+    let without_ticket_version = generic_direct_url
+        .split_once("&luxPlaybackTicketVersion=")
+        .and_then(|(prefix, rest)| {
+            rest.split_once('&')
+                .map(|(_, suffix)| format!("{prefix}&{suffix}"))
+        })
+        .ok_or("direct URL has no playback ticket version")?;
+    let downgraded_stream = client
+        .get(format!("{base_url}{without_ticket_version}"))
+        .send()
+        .await?;
+    assert_eq!(
+        downgraded_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let changed_ticket_version =
+        generic_direct_url.replace("luxPlaybackTicketVersion=2", "luxPlaybackTicketVersion=1");
+    let changed_version_stream = client
+        .get(format!("{base_url}{changed_ticket_version}"))
+        .send()
+        .await?;
+    assert_eq!(
+        changed_version_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
     let tampered_play_session =
         generic_direct_url.replacen("PlaySessionId=", "PlaySessionId=forged-", 1);
     let tampered_play_session_stream = client
@@ -182,6 +458,19 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await?;
     assert_eq!(
         tampered_play_session_stream.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+    let tampered_media_source = generic_direct_url.replacen(
+        &format!("MediaSourceId={source_id}"),
+        "MediaSourceId=forged-source",
+        1,
+    );
+    let tampered_media_source_stream = client
+        .get(format!("{base_url}{tampered_media_source}"))
+        .send()
+        .await?;
+    assert_eq!(
+        tampered_media_source_stream.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
     let without_play_session = generic_direct_url
@@ -199,6 +488,36 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         missing_play_session_stream.status(),
         reqwest::StatusCode::UNAUTHORIZED
     );
+    let prior_direct_ticket_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM emby_direct_playback_tickets WHERE user_id = ?")
+            .bind(admin.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_emby_direct_playback_ticket_insert
+         BEFORE INSERT ON emby_direct_playback_tickets
+         BEGIN SELECT RAISE(ABORT, 'injected ticket write failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let failed_ticket_response = client
+        .get(format!("{base_url}/Items/{item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(
+        failed_ticket_response.status(),
+        reqwest::StatusCode::SERVICE_UNAVAILABLE
+    );
+    let direct_ticket_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM emby_direct_playback_tickets WHERE user_id = ?")
+            .bind(admin.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(direct_ticket_count, prior_direct_ticket_count);
+    sqlx::query("DROP TRIGGER fail_emby_direct_playback_ticket_insert")
+        .execute(database.pool())
+        .await?;
     let yamby_playback = client
         .get(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
         .header(
@@ -372,6 +691,20 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .send()
         .await?;
     assert_eq!(denied.status(), reqwest::StatusCode::NOT_FOUND);
+
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let denied_with_none_mode = client
+        .get(&stream_url)
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(
+        denied_with_none_mode.status(),
+        reqwest::StatusCode::NOT_FOUND
+    );
 
     let outside = temp_dir.path().join("outside.mkv");
     tokio::fs::write(&outside, b"outside").await?;
@@ -2031,6 +2364,68 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
             .join(session_id)
             .exists()
     );
+
+    let blacklisted_hls_ticket = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .header(
+            "X-Emby-Authorization",
+            "Emby Client=SpoofedClient,Device=Other,DeviceId=spoofed-device,Version=9",
+        )
+        .json(&json!({
+            "MediaSourceId": source_id,
+            "EnableDirectStream": false,
+            "EnableTranscoding": true,
+            "AllowVideoStreamCopy": false,
+            "AllowAudioStreamCopy": false
+        }))
+        .send()
+        .await?;
+    assert_eq!(blacklisted_hls_ticket.status(), reqwest::StatusCode::OK);
+    let blacklisted_hls_ticket = blacklisted_hls_ticket.json::<Value>().await?;
+    let blacklisted_hls_url = blacklisted_hls_ticket["MediaSources"][0]["TranscodingUrl"]
+        .as_str()
+        .ok_or("missing blacklist HLS URL")?;
+    let blacklisted_hls_session_id = blacklisted_hls_ticket["PlaySessionId"]
+        .as_str()
+        .and_then(|play_session_id| play_session_id.strip_prefix("lux-emby:"))
+        .ok_or("missing blacklist HLS session")?;
+    let authorization_context: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT authorization_device_id, authorization_client_name
+         FROM web_playback_sessions WHERE id = ?",
+    )
+    .bind(blacklisted_hls_session_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(authorization_context.0.as_deref(), Some("transcode-test"));
+    assert_eq!(authorization_context.1.as_deref(), Some("PlaybackTest"));
+    sqlx::query(
+        "INSERT INTO user_access_blacklist_rules (
+             id, user_id, rule_type, match_value, is_enabled, created_by
+         ) VALUES ('playback-emby-hls-client-rule', NULL, 'CLIENT', 'playbacktest', 1, ?)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    let blocked_hls_manifest = client
+        .get(format!("{base_url}{blacklisted_hls_url}"))
+        .send()
+        .await?;
+    assert_eq!(
+        blocked_hls_manifest.status(),
+        reqwest::StatusCode::GONE,
+        "a newly added client rule must revoke an already issued Emby HLS URL"
+    );
+    let blocked_hls_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+            .bind(blacklisted_hls_session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(blocked_hls_state, "STOPPED");
+    sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+        .bind("playback-emby-hls-client-rule")
+        .execute(database.pool())
+        .await?;
 
     sqlx::query(
         "UPDATE users SET allow_remux = 0, allow_audio_transcode = 0,

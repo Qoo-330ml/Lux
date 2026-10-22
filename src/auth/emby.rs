@@ -1,14 +1,23 @@
+use std::net::IpAddr;
+
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    application::user_access_rules::{
+        MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST, UserAccessBlacklistRuleType,
+        ip_blacklist_rules_match_address, normalize_user_access_blacklist_value,
+    },
     auth::{
         password::PasswordError,
         users::{UserRecord, UserStore, UserStoreError},
     },
     domain::ids::UserId,
-    storage::{Database, NewAccessToken, StorageError},
+    storage::{
+        Database, NewAccessToken, StorageError, StoredEmbyLoginSessionSummary,
+        UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+    },
 };
 
 #[derive(Clone)]
@@ -65,6 +74,17 @@ impl EmbyAuthService {
         password: &str,
         device: &EmbyDeviceInfo,
     ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
+        self.authenticate_with_ip(username, password, device, None)
+            .await
+    }
+
+    pub async fn authenticate_with_ip(
+        &self,
+        username: &str,
+        password: &str,
+        device: &EmbyDeviceInfo,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
         let Some(user) = self
             .users
             .authenticate_emby_name(username, password)
@@ -72,7 +92,17 @@ impl EmbyAuthService {
         else {
             return Ok(None);
         };
-        self.create_access_token(user, device).await.map(Some)
+        self.create_access_token(user, device, client_ip).await
+    }
+
+    pub async fn find_failed_authentication_user_id(
+        &self,
+        username: &str,
+    ) -> Result<Option<String>, EmbyAuthError> {
+        Ok(self
+            .users
+            .find_emby_authentication_target_id(username)
+            .await?)
     }
 
     pub async fn authenticate_user_id(
@@ -81,17 +111,41 @@ impl EmbyAuthService {
         password: &str,
         device: &EmbyDeviceInfo,
     ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
+        self.authenticate_user_id_with_ip(user_id, password, device, None)
+            .await
+    }
+
+    pub async fn authenticate_user_id_with_ip(
+        &self,
+        user_id: &str,
+        password: &str,
+        device: &EmbyDeviceInfo,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
         let Some(user) = self.users.authenticate_by_id(user_id, password).await? else {
             return Ok(None);
         };
-        self.create_access_token(user, device).await.map(Some)
+        self.create_access_token(user, device, client_ip).await
     }
 
     async fn create_access_token(
         &self,
         user: UserRecord,
         device: &EmbyDeviceInfo,
-    ) -> Result<EmbyAuthResult, EmbyAuthError> {
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<EmbyAuthResult>, EmbyAuthError> {
+        if self
+            .user_access_blacklist_matches(&user.id.to_string(), device)
+            .await?
+        {
+            return Ok(None);
+        }
+        if self
+            .is_user_ip_blacklisted(&user.id.to_string(), client_ip)
+            .await?
+        {
+            return Ok(None);
+        }
         let token = generate_token()?;
         let token_id = UserId::new().to_string();
         let token_hash = hash_token(&token);
@@ -108,12 +162,63 @@ impl EmbyAuthService {
                 device_type: None,
             })
             .await?;
-        Ok(EmbyAuthResult {
+        Ok(Some(EmbyAuthResult {
             token,
             session_id: token_id,
             user: user.clone(),
             device: device.clone(),
-        })
+        }))
+    }
+
+    async fn user_access_blacklist_matches(
+        &self,
+        user_id: &str,
+        device: &EmbyDeviceInfo,
+    ) -> Result<bool, EmbyAuthError> {
+        let device_id = normalize_user_access_blacklist_value(
+            UserAccessBlacklistRuleType::Device,
+            &device.device_id,
+        )
+        .ok();
+        let client_name = normalize_user_access_blacklist_value(
+            UserAccessBlacklistRuleType::Client,
+            &device.client,
+        )
+        .ok();
+        Ok(self
+            .database
+            .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                user_id,
+                device_id: device_id.as_deref(),
+                client_name: client_name.as_deref(),
+            })
+            .await?)
+    }
+
+    async fn is_user_ip_blacklisted(
+        &self,
+        user_id: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<bool, EmbyAuthError> {
+        let rules = self
+            .database
+            .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+                user_id,
+                limit: MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST as i64 + 1,
+            })
+            .await
+            .map_err(|_| EmbyAuthError::AccessRulesUnavailable)?;
+        if rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+            return Err(EmbyAuthError::AccessRulesUnavailable);
+        }
+        if rules.is_empty() {
+            return Ok(false);
+        }
+        let Some(client_ip) = client_ip else {
+            return Ok(true);
+        };
+        ip_blacklist_rules_match_address(client_ip, &rules)
+            .map_err(|_| EmbyAuthError::AccessRulesUnavailable)
     }
 
     pub async fn logout(&self, token: &str) -> Result<(), EmbyAuthError> {
@@ -121,6 +226,46 @@ impl EmbyAuthService {
             .revoke_access_token(&hash_token(token))
             .await?;
         Ok(())
+    }
+
+    pub async fn list_admin_login_sessions(
+        &self,
+        user_id: &str,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<(Vec<EmbyLoginSessionSummary>, i64), EmbyAuthError> {
+        let (sessions, total_count) = self
+            .database
+            .list_user_emby_login_sessions_for_admin(user_id, page_size, offset)
+            .await?;
+        Ok((
+            sessions
+                .into_iter()
+                .map(EmbyLoginSessionSummary::from)
+                .collect(),
+            total_count,
+        ))
+    }
+
+    pub async fn revoke_admin_login_session(
+        &self,
+        user_id: &str,
+        session_id: &str,
+    ) -> Result<bool, EmbyAuthError> {
+        Ok(self
+            .database
+            .revoke_user_emby_login_session_for_admin(user_id, session_id)
+            .await?)
+    }
+
+    pub async fn revoke_all_admin_login_sessions(
+        &self,
+        user_id: &str,
+    ) -> Result<u64, EmbyAuthError> {
+        Ok(self
+            .database
+            .revoke_all_user_emby_login_sessions_for_admin(user_id)
+            .await?)
     }
 
     pub async fn verify_token(&self, token: &str) -> Result<bool, EmbyAuthError> {
@@ -145,6 +290,14 @@ impl EmbyAuthService {
     }
 
     pub async fn resolve_token(&self, token: &str) -> Result<Option<UserRecord>, EmbyAuthError> {
+        self.resolve_token_with_ip(token, None).await
+    }
+
+    pub async fn resolve_token_with_ip(
+        &self,
+        token: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<UserRecord>, EmbyAuthError> {
         let token_hash = hash_token(token);
         self.database.touch_access_token(&token_hash).await?;
         let Some(stored) = self.database.find_user_by_access_token(&token_hash).await? else {
@@ -153,7 +306,48 @@ impl EmbyAuthService {
         if stored.is_disabled {
             return Ok(None);
         }
+        if self.is_user_ip_blacklisted(&stored.id, client_ip).await? {
+            self.database.revoke_access_token(&token_hash).await?;
+            return Ok(None);
+        }
+        if let Some(device) = self.device_info(token).await?
+            && self
+                .user_access_blacklist_matches(&stored.id, &device)
+                .await?
+        {
+            self.database.revoke_access_token(&token_hash).await?;
+            return Ok(None);
+        }
         user_record(stored).map(Some)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EmbyLoginSessionSummary {
+    pub id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub device_type: Option<String>,
+    pub client_name: String,
+    pub client_version: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub last_seen_at: Option<i64>,
+}
+
+impl From<StoredEmbyLoginSessionSummary> for EmbyLoginSessionSummary {
+    fn from(session: StoredEmbyLoginSessionSummary) -> Self {
+        Self {
+            id: session.id,
+            device_id: session.device_id,
+            device_name: session.device_name,
+            device_type: session.device_type,
+            client_name: session.client_name,
+            client_version: session.client_version,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            last_seen_at: session.last_seen_at,
+        }
     }
 }
 
@@ -232,6 +426,7 @@ fn hash_token(token: &str) -> Vec<u8> {
 
 #[derive(Debug)]
 pub enum EmbyAuthError {
+    AccessRulesUnavailable,
     InvalidUserId(String),
     Password(PasswordError),
     Storage(StorageError),
@@ -260,6 +455,7 @@ impl From<UserStoreError> for EmbyAuthError {
 impl std::fmt::Display for EmbyAuthError {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::AccessRulesUnavailable => formatter.write_str("access rules are unavailable"),
             Self::InvalidUserId(error) => write!(formatter, "stored user ID is invalid: {error}"),
             Self::Password(error) => error.fmt(formatter),
             Self::Storage(error) => error.fmt(formatter),
@@ -275,7 +471,9 @@ impl std::error::Error for EmbyAuthError {
             Self::Password(error) => Some(error),
             Self::Storage(error) => Some(error),
             Self::UserStore(error) => Some(error),
-            Self::InvalidUserId(_) | Self::TokenGeneration(_) => None,
+            Self::AccessRulesUnavailable | Self::InvalidUserId(_) | Self::TokenGeneration(_) => {
+                None
+            }
         }
     }
 }

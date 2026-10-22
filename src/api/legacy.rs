@@ -60,11 +60,13 @@ use crate::{
         },
         chapter_detector::{ChapterDetectionError, ChapterDetectionService},
         collections::{CollectionError, CollectionService, GlobalCollectionSyncWorker},
+        content_restriction_index::ContentRestrictionIndexWorker,
         database_diagnostics::DatabaseDiagnosticsService,
         directory_browser::{DirectoryBrowserError, list_directories},
         emby_migration_service::{
             CreateMigrationRequest, EmbyMigrationService, EmbyMigrationServiceError,
         },
+        image_variants::ImageVariantService,
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
             ImageWriteService, normalize_image_type, read_image_dimensions,
@@ -113,8 +115,9 @@ use crate::{
     },
     security::{DevicePairingRateLimiter, LoginRateLimiter},
     storage::{
-        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent, PersonListOptions,
-        PersonSort, StorageError, StoredPlaybackSession, WebPlaybackEventClaim,
+        DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent,
+        NewUserDeviceObservation, PersonListOptions, PersonSort, StorageError,
+        StoredPlaybackSession, WebPlaybackEventClaim,
     },
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -164,6 +167,7 @@ pub struct AppState {
     catalog: Option<CatalogService>,
     home: Option<HomeService>,
     images: Option<ImageService>,
+    image_variants: Option<Arc<ImageVariantService>>,
     image_writes: Option<ImageWriteService>,
     image_candidates: Option<ImageCandidateService>,
     library_covers: Option<LibraryCoverService>,
@@ -191,6 +195,7 @@ pub struct AppState {
     scraper: Option<ScraperProvider>,
     collections: Option<CollectionService>,
     global_collection_sync_worker: Option<GlobalCollectionSyncWorker>,
+    content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     user_avatars: Option<UserAvatarService>,
@@ -212,6 +217,9 @@ impl AppState {
     }
 
     pub async fn shutdown_background_workers_checked(&self) -> Result<(), String> {
+        if let Some(worker) = &self.content_restriction_index_worker {
+            worker.shutdown().await;
+        }
         crate::application::probe::shutdown_probe_runtime()
             .await
             .map_err(|error| error.to_string())?;
@@ -250,6 +258,25 @@ impl AppState {
         let log_store = LogStore::new(&config_dir);
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();
+        let image_variants = Some(Arc::new(ImageVariantService::new(
+            &config.config_dir,
+            crate::application::settings::ImageVariantCacheSettings::default(),
+        )));
+        if let Some(service) = image_variants.as_ref()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let service = Arc::clone(service);
+            let settings_database = database.clone();
+            handle.spawn(async move {
+                if let Ok(settings) =
+                    crate::application::settings::read_media_strategy_settings(&settings_database)
+                        .await
+                {
+                    service.apply_initial_settings(settings.images.variant_cache);
+                }
+                service.startup_scan();
+            });
+        }
         let database_setup = Some(DatabaseSetupService::new(
             config.clone(),
             database.backend(),
@@ -416,6 +443,7 @@ impl AppState {
                 access.clone(),
                 config.config_dir.clone(),
             )),
+            image_variants,
             image_writes,
             image_candidates,
             library_covers: library_covers.clone(),
@@ -452,6 +480,7 @@ impl AppState {
             scraper: Some(scraper),
             collections,
             global_collection_sync_worker,
+            content_restriction_index_worker: None,
             people: Some(people),
             local_nfo: Some(local_nfo),
             user_avatars,
@@ -619,6 +648,16 @@ impl AppState {
             && let Err(error) = scan_jobs.start_local_metadata_outbox_worker().await
         {
             tracing::error!(%error, "failed to start the local metadata outbox worker");
+        }
+    }
+
+    pub fn start_content_restriction_index_worker(&mut self) {
+        if self.database_selection_required || self.content_restriction_index_worker.is_some() {
+            return;
+        }
+        if let Some(database) = &self.database {
+            self.content_restriction_index_worker =
+                Some(ContentRestrictionIndexWorker::start(database.clone()));
         }
     }
 
@@ -1041,6 +1080,51 @@ fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option
             header_str(headers, "forwarded"),
         )
         .map(|address| address.to_string())
+}
+
+async fn request_access_ip(
+    headers: &HeaderMap,
+    state: &AppState,
+) -> Result<Option<std::net::IpAddr>, AccessIpResolutionError> {
+    let Some(peer_value) = header_str(headers, "x-lux-peer-ip") else {
+        return Ok(None);
+    };
+    let peer = peer_value
+        .parse::<std::net::IpAddr>()
+        .map_err(|_| AccessIpResolutionError::InvalidPeerAddress)?;
+    let database = state
+        .database
+        .as_ref()
+        .ok_or(AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
+    let trusted_proxy_values = crate::application::settings::read_trusted_proxy_cidrs(database)
+        .await
+        .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
+    let trusted_proxies = trusted_proxy_values
+        .iter()
+        .map(|value| {
+            crate::application::user_access_rules::IpCidr::parse(value)
+                .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let forwarded_for_values = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|value| value.to_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
+        peer,
+        &forwarded_for_values,
+        &trusted_proxies,
+    )
+    .map(Some)
+    .map_err(|_| AccessIpResolutionError::MalformedForwardedFor)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AccessIpResolutionError {
+    InvalidPeerAddress,
+    TrustedProxySettingsUnavailable,
+    MalformedForwardedFor,
 }
 
 fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
@@ -1579,19 +1663,20 @@ mod tests {
     use std::time::Duration;
 
     use super::{
-        CatalogSort, EmbyItemDetailWorkPlan, FilmlyImageCompatMode, MediaStrategySettings,
-        MetadataCandidateFailureKind, build_cookie, catalog_filter_from_emby, emby_collection_type,
-        emby_internal_id, emby_item_detail_work_plan, emby_media_source_json,
-        emby_media_source_json_with_resolver, emby_media_source_stream_url_parts,
-        emby_media_stream_item_id, emby_media_stream_json, emby_playback_info_item_id,
-        emby_public_id, emby_single_id_lookup, emby_source_needs_strm_resolver,
-        filmly_image_compat_mode_from_env_value, is_catalog_aggregation_path,
-        is_emby_legacy_strm_path, is_emby_media_stream_segment, is_emby_playback_callback_path,
-        is_emby_subtitle_path, is_emby_transcoding_path, is_emby_video_path, is_filmly_user_agent,
-        is_registered_emby_video_path, lux_catalog_source_json, metadata_candidate_error,
-        metadata_candidate_failure_kind, normalize_strm_http_location, playback_client_label,
-        playback_identifier_prefix, record_activity_event, safe_trace_path,
-        secure_cookie_for_request, validate_media_strategy,
+        AccessIpResolutionError, AppState, CatalogSort, EmbyItemDetailWorkPlan,
+        FilmlyImageCompatMode, MediaStrategySettings, MetadataCandidateFailureKind, build_cookie,
+        catalog_filter_from_emby, emby_collection_type, emby_internal_id,
+        emby_item_detail_work_plan, emby_media_source_json, emby_media_source_json_with_resolver,
+        emby_media_source_stream_url_parts, emby_media_stream_item_id, emby_media_stream_json,
+        emby_playback_info_item_id, emby_public_id, emby_single_id_lookup,
+        emby_source_needs_strm_resolver, filmly_image_compat_mode_from_env_value,
+        is_catalog_aggregation_path, is_emby_legacy_strm_path, is_emby_media_stream_segment,
+        is_emby_playback_callback_path, is_emby_subtitle_path, is_emby_transcoding_path,
+        is_emby_video_path, is_filmly_user_agent, is_registered_emby_video_path,
+        lux_catalog_source_json, metadata_candidate_error, metadata_candidate_failure_kind,
+        normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
+        record_activity_event, request_access_ip, safe_trace_path, secure_cookie_for_request,
+        validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -1841,6 +1926,111 @@ mod tests {
         headers.insert("x-forwarded-proto", HeaderValue::from_static("https"));
 
         assert!(secure_cookie_for_request(&headers, &RemoteAccessPolicy));
+    }
+
+    async fn access_ip_test_database()
+    -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        })
+        .await?;
+        Ok((temp, database))
+    }
+
+    #[tokio::test]
+    async fn access_ip_ignores_forwarding_from_untrusted_peers()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        let state = AppState {
+            database: Some(database),
+            ..AppState::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("203.0.113.9"));
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.7, invalid"),
+        );
+
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("203.0.113.9".parse()?))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_walks_repeated_forwarding_values_from_trusted_peer()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        let state = AppState {
+            database: Some(database),
+            ..AppState::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.append(
+            "x-forwarded-for",
+            HeaderValue::from_static("192.0.2.66, 198.51.100.24"),
+        );
+        headers.append("x-forwarded-for", HeaderValue::from_static("10.0.0.8"));
+
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("198.51.100.24".parse()?))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_fails_closed_for_malformed_trusted_chain_or_settings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        let state = AppState {
+            database: Some(database.clone()),
+            ..AppState::default()
+        };
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.insert(
+            "x-forwarded-for",
+            HeaderValue::from_static("198.51.100.1, invalid"),
+        );
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Err(AccessIpResolutionError::MalformedForwardedFor)
+        );
+
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("not-an-ip"));
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Err(AccessIpResolutionError::InvalidPeerAddress)
+        );
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        database.set_trusted_proxy_cidrs_json("not-json").await?;
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_returns_none_without_attached_peer_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let state = AppState::default();
+        let headers = HeaderMap::new();
+
+        assert_eq!(request_access_ip(&headers, &state).await, Ok(None));
+        Ok(())
     }
 
     #[test]

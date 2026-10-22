@@ -38,12 +38,40 @@ export type LuxUser = {
 
 export type UserPlaybackSettings = {
   playedPercent: number;
+  preferencesVersion?: number;
   useAdminLibraryOrder?: boolean;
   libraryOrderForced?: boolean;
 };
 
+export type UserPlaybackSettingsUpdate = Partial<Pick<UserPlaybackSettings, "playedPercent" | "useAdminLibraryOrder">> & {
+  expectedVersion?: number;
+};
+
+export type AccountPreferences = {
+  theme: "light" | "dark";
+  accentColor: "silver" | "berry" | "ocean" | "amber" | "mint";
+  showMediaLibraries: boolean;
+  showContinueWatching: boolean;
+  audioLanguage: string;
+  subtitleLanguage: string;
+  autoPlayNextEpisode: boolean;
+  libraryOrder: string[];
+  playedPercent: number;
+  version: number;
+  updatedAt: number | null;
+};
+
+export type AccountPreferencesUpdate = Omit<AccountPreferences, "version" | "updatedAt"> & {
+  expectedVersion: number;
+};
+
 export type UserLibraryOrder = {
   libraryOrder: string[];
+  preferencesVersion?: number;
+};
+
+export type UserLibraryOrderUpdate = Pick<UserLibraryOrder, "libraryOrder"> & {
+  expectedVersion?: number;
 };
 
 export type UserPasswordChangeInput = {
@@ -54,11 +82,58 @@ export type UserPasswordChangeInput = {
 export type AuthSession = {
   user: LuxUser;
   serverName?: string | null;
+  /** The administrator global image variant switch is on. */
+  imageVariantsEnabled?: boolean;
+};
+
+export type UserInvitationAcceptanceInput = {
+  token: string;
+  username: string;
+  displayName?: string;
+  password: string;
+};
+
+export type UserInvitationAcceptanceResponse = {
+  created: true;
+};
+
+export type PublicUserRegistrationInput = {
+  email: string;
+  username: string;
+  displayName?: string;
+  password: string;
+};
+
+export type PublicUserRegistrationResponse = {
+  accepted: true;
+  message: string;
+};
+
+export type PublicUserRegistrationEmailVerificationInput = {
+  token: string;
+};
+
+export type PublicUserRegistrationEmailVerificationResponse = {
+  verified: true;
+  status: "PENDING_APPROVAL";
+};
+
+export type PublicUserRegistrationResendInput = {
+  email: string;
 };
 
 export type AccountProfile = LuxUser & {
   email?: string | null;
   emailVerifiedAt?: number | null;
+  pendingEmail?: string | null;
+};
+
+export type AccountEmailVerificationResponse = {
+  verified: true;
+};
+
+export type AccountEmailVerificationResendResponse = {
+  accepted: true;
 };
 
 export type LoginBackgroundSource = "STATIC" | "RECENTLY_ADDED" | `PLUGIN:${string}`;
@@ -228,6 +303,7 @@ export type MediaItem = {
   seasonCount?: number | null;
   episodeCount?: number | null;
   runtimeTicks?: number | null;
+  defaultDurationTicks?: number | null;
   addedAt?: number | null;
   imageTags?: ImageTags;
   userData?: UserData;
@@ -333,6 +409,7 @@ export type PageResponse<T> = {
   page?: number;
   pageSize?: number;
   total?: number;
+  hasNext?: boolean;
 };
 
 export type AdminMetadataBatchConfirmation = {
@@ -430,6 +507,27 @@ export type AdminLibrary = Library & {
   probeConcurrency?: number;
   lastScanAt?: string | null;
   roots: AdminRoot[];
+};
+
+export type AdminLibraryDeletionJob = {
+  id: string;
+  libraryId: string;
+  libraryName: string;
+  status: "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED";
+  stage: string;
+  processedCount: number;
+  errorCode?: string | null;
+  createdAt: number;
+  updatedAt: number;
+  startedAt?: number | null;
+  finishedAt?: number | null;
+};
+
+export type AdminLibraryDeletionJobsPage = {
+  jobs: AdminLibraryDeletionJob[];
+  page: number;
+  pageSize: number;
+  total: number;
 };
 
 export type AdminLibraryScraperRole = "PRIMARY" | "SUPPLEMENT" | "BACKUP" | "BOTH" | string;
@@ -545,6 +643,159 @@ export type AdminUser = LuxUser & {
   lastActivityAt?: number | null;
   currentPlaybackCount?: number;
   presetSource?: string | null;
+  presetSourceDetails?: AdminUserPermissionPresetSourceDetails | null;
+};
+
+export type AdminUserWebSession = {
+  id: string;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+  lastSeenAt: number | null;
+  isCurrent: boolean;
+};
+
+export type AdminUserWebSessionPage = {
+  sessions: AdminUserWebSession[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserEmbySession = {
+  id: string;
+  deviceId: string;
+  deviceName: string;
+  deviceType: string | null;
+  clientName: string;
+  clientVersion: string;
+  createdAt: number;
+  updatedAt: number;
+  lastSeenAt: number | null;
+};
+
+export type AdminUserEmbySessionPage = {
+  sessions: AdminUserEmbySession[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserEmbySessionRevokeAllResponse = {
+  revokedCount: number;
+};
+
+export type AdminUserDeviceIpLocation = {
+  country: string | null;
+  province: string | null;
+  city: string | null;
+  isp: string | null;
+};
+
+export type AdminUserDevice = {
+  deviceId: string;
+  hasActiveLogin: boolean;
+  deviceName: string | null;
+  deviceType: string | null;
+  clientName: string;
+  clientVersion: string | null;
+  firstSeenAt: number;
+  lastSeenAt: number;
+  lastRemoteIp: string | null;
+  lastRemoteIpLocation: AdminUserDeviceIpLocation | null;
+};
+
+export type AdminUserDevicePage = {
+  devices: AdminUserDevice[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserAccessBlacklistRuleType = "DEVICE" | "CLIENT" | "IP_CIDR";
+
+export type AdminUserAccessBlacklistRule = {
+  id: string;
+  userId: string | null;
+  ruleType: AdminUserAccessBlacklistRuleType;
+  matchValue: string;
+  isEnabled: boolean;
+  createdBy: string | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type AdminUserAccessBlacklistRulesPage = {
+  rules: AdminUserAccessBlacklistRule[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type CreateAdminUserAccessBlacklistRuleInput = {
+  ruleType: AdminUserAccessBlacklistRuleType;
+  matchValue: string;
+  isEnabled?: boolean;
+};
+
+export type AdminUserActivityEvent = {
+  id: string;
+  userId: string;
+  actorUserId: string | null;
+  eventType: string;
+  targetType: string | null;
+  targetId: string | null;
+  metadata: Record<string, unknown>;
+  occurredAt: number;
+};
+
+export type AdminUserActivityPage = {
+  events: AdminUserActivityEvent[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserActivityQuery = {
+  page?: number;
+  pageSize?: number;
+  eventType?: string;
+  from?: number;
+  to?: number;
+};
+
+export type AdminContentRestrictionIndexStatus = {
+  totalItems: number;
+  indexedItems: number;
+  pendingItems: number;
+};
+
+export type AdminUserContentRestrictionPolicy = {
+  ratingSystem: "MPA" | "TVPG" | "BBFC";
+  maximumRating: string | null;
+  allowUnrated: boolean;
+  allowedTags: string[];
+  blockedTags: string[];
+  version: number;
+  updatedAt: number;
+};
+
+export type AdminUserContentRestrictionUpdateInput = Omit<
+  AdminUserContentRestrictionPolicy,
+  "version" | "updatedAt"
+> & {
+  expectedVersion: number;
+};
+
+export type AdminUserContentRestrictionsResponse = {
+  policy: AdminUserContentRestrictionPolicy | null;
+};
+
+export type AdminUserPermissionPresetSourceDetails = {
+  id: string;
+  name: string;
+  version: number;
+  appliedAt: number;
 };
 
 export type AdminUserPlaybackPolicy = {
@@ -553,6 +804,103 @@ export type AdminUserPlaybackPolicy = {
   allowRemux: boolean;
   allowAudioTranscode: boolean;
   allowVideoTranscode: boolean;
+};
+
+export type AdminUserLibraryAccessMode = "ALL" | "SELECTED" | "NONE";
+
+export type AdminUserLibraryAccess = {
+  libraryAccessMode: AdminUserLibraryAccessMode;
+  libraryIds: string[];
+};
+
+export type AdminUserLibraryAccessUpdateResult = AdminUserLibraryAccess & {
+  userId: string;
+};
+
+export type AdminUserInvitationStatus = "PENDING" | "ACCEPTED" | "REVOKED" | "EXPIRED";
+
+export type AdminUserInvitation = {
+  id: string;
+  recipientEmail: string;
+  createdByUserId: string | null;
+  acceptedUserId: string | null;
+  status: AdminUserInvitationStatus;
+  presetId: string;
+  presetName: string;
+  presetVersion: number;
+  expiresAt: number;
+  acceptedAt: number | null;
+  revokedAt: number | null;
+  createdAt: number;
+  updatedAt: number;
+};
+
+export type AdminUserInvitationStatusFilter = "all" | "pending" | "accepted" | "revoked" | "expired";
+
+export type AdminUserInvitationListQuery = {
+  page?: number;
+  pageSize?: number;
+  status?: AdminUserInvitationStatusFilter;
+};
+
+export type AdminUserInvitationPage = {
+  invitations: AdminUserInvitation[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type CreateAdminUserInvitationInput = {
+  recipientEmail: string;
+  presetId: string;
+};
+
+export type CreateAdminUserInvitationResponse = {
+  invitation: AdminUserInvitation;
+  invitationUrl: string;
+  emailQueued: boolean;
+};
+
+export type ResendAdminUserInvitationResponse = {
+  emailQueued: boolean;
+};
+
+export type RevokeAdminUserInvitationResponse = {
+  revoked: boolean;
+};
+
+export type AdminUserRegistration = {
+  id: string;
+  recipientEmail: string;
+  status: "PENDING_APPROVAL";
+  createdAt: number;
+  emailVerifiedAt: number;
+  permissions: NewUserPermissions;
+};
+
+export type AdminUserRegistrationListQuery = {
+  page?: number;
+  pageSize?: number;
+};
+
+export type AdminUserRegistrationPage = {
+  requests: AdminUserRegistration[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
+export type AdminUserRegistrationApprovalInput = {
+  permissions: NewUserPermissions;
+};
+
+export type AdminUserRegistrationApprovalResponse = {
+  approved: true;
+  userId: string;
+};
+
+export type AdminUserRegistrationRejectionResponse = {
+  rejected: true;
 };
 
 export type AdminUserListStatus = "all" | "active" | "disabled" | "deleted";
@@ -782,6 +1130,18 @@ export type AdminPlaybackSession = {
   output?: AdminPlaybackOutput | null;
   source?: AdminPlaybackSource | null;
 };
+
+export type AdminUserPlaybackSession = AdminPlaybackSession & {
+  canStop: boolean;
+};
+
+export type AdminUserPlaybackSessionPage = {
+  sessions: AdminUserPlaybackSession[];
+  page: number;
+  pageSize: number;
+  totalCount: number;
+};
+
 export type AdminPlaybackOutput = {
   container?: string | null;
   videoCodec?: string | null;
@@ -1103,6 +1463,9 @@ export type AdminSettings = {
   resumeMinTicks: number;
   forceAdminLibraryOrder?: boolean;
   userDeletionGraceDays?: number;
+  userActivityRetentionDays?: number;
+  trustedProxyCidrs?: string[];
+  newUserPermissions?: NewUserPermissions;
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;
@@ -1137,6 +1500,220 @@ export type AdminSettingsPatch = Partial<AdminSettings> & {
   networkProxyUrl?: string | null;
 };
 
+export type RegistrationMode = "INVITATION_ONLY" | "PUBLIC_EMAIL";
+
+export type AdminRegistrationSettings = {
+  registrationMode: RegistrationMode;
+  version: number;
+};
+
+export type SmtpTlsMode = "SMTPS" | "STARTTLS";
+
+export type MailSettings = {
+  host: string;
+  port: number;
+  tlsMode: SmtpTlsMode;
+  senderName: string;
+  senderEmail: string;
+  siteUrl: string;
+};
+
+export type AdminMailSettingsResponse = {
+  configured: boolean;
+  credentialsConfigured: boolean;
+  settings: MailSettings | null;
+};
+
+export type SmtpCredentialsInput = {
+  username: string;
+  password: string;
+};
+
+export type NewUserPermissions = {
+  libraryAccessMode: AdminUserLibraryAccessMode;
+  libraryIds: string[];
+  canDownload: boolean;
+  canPlay: boolean;
+  maxSimultaneousPlaybacks: number;
+  allowRemux: boolean;
+  allowAudioTranscode: boolean;
+  allowVideoTranscode: boolean;
+};
+
+export type AdminUserPermissionPreset = {
+  id: string;
+  name: string;
+  description: string | null;
+  version: number;
+  isBuiltin: boolean;
+  isAdmin: boolean;
+  canManageServer: boolean;
+  permissions: NewUserPermissions;
+};
+
+export type AdminUserPermissionPresetInput = {
+  name: string;
+  description: string | null;
+  isAdmin: boolean;
+  canManageServer: boolean;
+  permissions: NewUserPermissions;
+};
+
+export type AdminUserPermissionPresetBatchErrorCode =
+  | "INVALID_USER_ID"
+  | "USER_NOT_FOUND"
+  | "LAST_MANAGER"
+  | "INVALID_SNAPSHOT"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminUserPermissionPresetBatchResponse = {
+  preset: {
+    id: string;
+    name: string;
+    version: number;
+  };
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminUserPermissionPresetBatchErrorCode | null;
+  }>;
+};
+
+export type AdminUserStatusBatchErrorCode =
+  | "INVALID_USER_ID"
+  | "USER_NOT_FOUND"
+  | "LAST_MANAGER"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminUserStatusBatchResponse = {
+  isDisabled: boolean;
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminUserStatusBatchErrorCode | null;
+  }>;
+};
+
+export type AdminAccountPreferenceCopyGroups = {
+  appearance: boolean;
+  home: boolean;
+  playback: boolean;
+  libraryOrder: boolean;
+};
+
+export type AdminAccountPreferenceCopyPreviewInput = {
+  sourceUserId: string;
+  targetUserIds: string[];
+  groups: AdminAccountPreferenceCopyGroups;
+};
+
+export type AdminAccountPreferenceCopyApplyInput = {
+  sourceUserId: string;
+  sourceExpectedVersion: number;
+  targets: Array<{ userId: string; expectedVersion: number }>;
+  groups: AdminAccountPreferenceCopyGroups;
+};
+
+export type AdminAccountPreferenceCopyPreview = {
+  sourceUserId: string;
+  sourceVersion: number;
+  sourceSnapshot: {
+    appearance?: { theme: string; accentColor: string };
+    home?: { showMediaLibraries: boolean; showContinueWatching: boolean };
+    playback?: {
+      audioLanguage: string;
+      subtitleLanguage: string;
+      autoPlayNextEpisode: boolean;
+      playedPercent: number;
+    };
+    libraryOrder?: string[];
+  };
+  targets: Array<{ userId: string; expectedVersion: number; libraryOrder?: string[] }>;
+  groups: AdminAccountPreferenceCopyGroups;
+};
+
+export type AdminAccountPreferenceCopyErrorCode =
+  | "USER_UNAVAILABLE"
+  | "VERSION_CONFLICT"
+  | "INVALID_PREFERENCES"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminAccountPreferenceCopyBatchResponse = {
+  sourceUserId: string;
+  sourceVersion: number;
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminAccountPreferenceCopyErrorCode | null;
+  }>;
+};
+
+export type AdminUserPermissionCopyGroups = {
+  library: boolean;
+  content: boolean;
+  playback: boolean;
+};
+
+export type AdminUserPermissionCopyPreviewInput = {
+  sourceUserId: string;
+  targetUserIds: string[];
+  groups: AdminUserPermissionCopyGroups;
+};
+
+export type AdminUserPermissionCopyApplyInput = {
+  sourceUserId: string;
+  sourceVersion: string;
+  targets: Array<{ userId: string; expectedVersion: string }>;
+  groups: AdminUserPermissionCopyGroups;
+};
+
+export type AdminUserPermissionCopySnapshot = {
+  library?: {
+    accessMode: AdminUserLibraryAccessMode;
+    libraryIds: string[];
+  };
+  content?: {
+    ratingSystem: string;
+    maximumRating: string | null;
+    allowUnrated: boolean;
+    allowedTags: string[];
+    blockedTags: string[];
+    version: number;
+  } | null;
+  playback?: {
+    canDownload: boolean;
+    canPlay: boolean;
+    maxSimultaneousPlaybacks: number;
+    allowRemux: boolean;
+    allowAudioTranscode: boolean;
+    allowVideoTranscode: boolean;
+  };
+};
+
+export type AdminUserPermissionCopyPreview = {
+  sourceUserId: string;
+  sourceVersion: string;
+  sourceSnapshot: AdminUserPermissionCopySnapshot;
+  targets: Array<{ userId: string; expectedVersion: string }>;
+  groups: AdminUserPermissionCopyGroups;
+};
+
+export type AdminUserPermissionCopyErrorCode =
+  | "USER_UNAVAILABLE"
+  | "VERSION_CONFLICT"
+  | "INVALID_SNAPSHOT"
+  | "STORAGE_UNAVAILABLE";
+
+export type AdminUserPermissionCopyBatchResponse = {
+  sourceUserId: string;
+  sourceVersion: string;
+  results: Array<{
+    userId: string;
+    success: boolean;
+    errorCode: AdminUserPermissionCopyErrorCode | null;
+  }>;
+};
+
 export type MediaStrategySettings = {
   metadataLanguage: string;
   imageLanguage: string;
@@ -1147,6 +1724,13 @@ export type MediaStrategySettings = {
   applyScope: "NEW_CONTENT" | "SELECTED_CONTENT" | "ALL_CONTENT" | string;
   images: MediaImageStrategySettings;
   subtitles: MediaSubtitleStrategySettings;
+};
+
+export type MediaImageVariantCacheSettings = {
+  enabled: boolean;
+  maxFiles: number;
+  maxBytes: number;
+  concurrency: number;
 };
 
 export type MediaImageStrategySettings = {
@@ -1161,6 +1745,7 @@ export type MediaImageStrategySettings = {
   writeToMetadata: boolean;
   maxBackdropCount: number;
   minDownloadWidth: number;
+  variantCache?: MediaImageVariantCacheSettings;
 };
 
 export type MediaSubtitleStrategySettings = {

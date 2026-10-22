@@ -1,5 +1,13 @@
 use super::*;
 
+const MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER: &str =
+    "CREATE TRIGGER IF NOT EXISTS trg_media_items_content_restriction_index_invalidate_nfo
+     AFTER UPDATE OF nfo_metadata_json ON media_items
+     WHEN OLD.nfo_metadata_json IS NOT NEW.nfo_metadata_json
+     BEGIN
+         DELETE FROM media_content_restriction_index WHERE item_id = NEW.id;
+     END";
+
 pub(super) async fn migrate_sqlite_catalog_constraints(
     pool: &AnyPool,
     path: &Path,
@@ -69,6 +77,13 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             path: path.to_path_buf(),
             source,
         })?;
+        sqlx::query(MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER)
+            .execute(&mut *connection)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: path.to_path_buf(),
+                source,
+            })?;
         return Ok(());
     }
 
@@ -112,7 +127,9 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 realtime_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 0 CHECK (realtime_metadata_auto_match_enabled IN (0, 1)),
                 scan_missing_metadata_auto_match_enabled INTEGER NOT NULL DEFAULT 1 CHECK (scan_missing_metadata_auto_match_enabled IN (0, 1)),
                 chapter_source_id TEXT,
-                system_kind TEXT CHECK (system_kind IS NULL OR system_kind = 'COLLECTIONS')
+                system_kind TEXT CHECK (system_kind IS NULL OR system_kind = 'COLLECTIONS'),
+                deletion_state TEXT NOT NULL DEFAULT 'ACTIVE'
+                    CHECK (deletion_state IN ('ACTIVE', 'DELETING'))
             )",
             "INSERT INTO libraries_new (
                 id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
@@ -120,7 +137,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
                 realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
-                chapter_source_id, system_kind
+                chapter_source_id, system_kind, deletion_state
              )
              SELECT
                 id, name, kind, is_enabled, realtime_watch_enabled, incremental_schedule,
@@ -128,7 +145,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 last_scan_at, created_at, updated_at, scraper_id, cover_image_path,
                 cover_image_content_type, cover_image_size, cover_image_tag, media_strategy_json,
                 realtime_metadata_auto_match_enabled, scan_missing_metadata_auto_match_enabled,
-                chapter_source_id, system_kind
+                chapter_source_id, system_kind, deletion_state
              FROM libraries",
             "DROP TABLE libraries",
             "ALTER TABLE libraries_new RENAME TO libraries",
@@ -147,6 +164,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_update",
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_delete",
             "DROP TRIGGER IF EXISTS trg_filesystem_entries_availability_update",
+            "DROP TRIGGER IF EXISTS trg_media_items_content_restriction_index_invalidate_nfo",
             "CREATE TABLE media_items_new (
                 id TEXT PRIMARY KEY NOT NULL,
                 library_id TEXT NOT NULL REFERENCES libraries(id) ON DELETE CASCADE,
@@ -246,6 +264,33 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
              WHERE removed_at IS NULL",
             "CREATE INDEX idx_media_items_updated_at
              ON media_items(updated_at, id)",
+            "CREATE INDEX idx_media_items_library_name_sort
+             ON media_items(library_id, LOWER(title), id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_sortname_sort
+             ON media_items(library_id, LOWER(sort_title), id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_added_sort
+             ON media_items(library_id, added_at DESC, LOWER(title), id)
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_premiere_sort
+             ON media_items(
+                 library_id,
+                 (CASE WHEN NULLIF(premiere_date, '') IS NULL AND production_year IS NULL THEN 1 ELSE 0 END),
+                 (COALESCE(NULLIF(premiere_date, ''), CAST(production_year AS TEXT) || '-01-01')) DESC,
+                 LOWER(title),
+                 id
+             )
+             WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_library_rating_sort
+             ON media_items(
+                 library_id,
+                 (CASE WHEN rating IS NULL THEN 1 ELSE 0 END) ASC,
+                 rating DESC,
+                 LOWER(title),
+                 id
+             )
+             WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
                 INSERT INTO media_search_map (item_id) VALUES (NEW.id);
                 INSERT INTO media_search (rowid, item_id, title, sort_title, original_title, aliases)
@@ -447,6 +492,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                      generation = collection_sync_outbox.generation + 1,
                      updated_at = excluded.updated_at;
              END",
+            MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER,
         ];
         for statement in statements {
             sqlx::query(statement)

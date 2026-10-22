@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const styles = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const styles = allStyles;
 
 test("primary page headings stay within the compact type scale", () => {
   assert.match(styles, /\.lux-hero-title\s*\{[^}]*font-size: clamp\(2\.75rem, 5\.5vw, 5rem\)/);

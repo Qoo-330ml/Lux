@@ -1,4 +1,4 @@
-use std::{env, fs};
+use std::{env, ffi::OsStr, fs, path::Path};
 
 use luxd::{
     application::{
@@ -23,8 +23,29 @@ use luxd::{
     storage::Database,
 };
 use serde_json::json;
-use sqlx::postgres::PgPoolOptions;
+use sqlx::{migrate::Migrator, postgres::PgPoolOptions};
 use uuid::Uuid;
+
+fn latest_migration_version(directory: &str) -> Result<i64, Box<dyn std::error::Error>> {
+    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join(directory);
+    let mut latest_version = None;
+    for entry in fs::read_dir(migration_dir)? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|stem| stem.split('_').next())
+            .and_then(|version| version.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        latest_version = Some(latest_version.map_or(version, |latest: i64| latest.max(version)));
+    }
+    latest_version.ok_or_else(|| "migration directory contains no numbered SQL files".into())
+}
 
 fn postgres_connection(database: String) -> PostgresConnection {
     PostgresConnection {
@@ -109,6 +130,687 @@ async fn advance_postgres_manifest_to_applying(
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_media_content_restriction_index_migration()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let level_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM content_rating_levels")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(level_count, 18);
+    let tv_levels: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT rating_code, rating_order FROM content_rating_levels
+         WHERE rating_system = 'TVPG' ORDER BY rating_order",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        tv_levels,
+        [
+            ("TV-Y".to_owned(), 0),
+            ("TV-G".to_owned(), 1),
+            ("TV-Y7".to_owned(), 2),
+            ("TV-PG".to_owned(), 3),
+            ("TV-14".to_owned(), 4),
+            ("TV-MA".to_owned(), 5),
+        ]
+    );
+    let restriction_indexes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema() AND indexname IN (
+             'idx_media_content_restriction_index_certification',
+             'idx_media_content_restriction_tags_tag'
+         )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_indexes, 2);
+    assert!(
+        sqlx::query(
+            "INSERT INTO content_rating_levels (rating_system, rating_code, rating_order)
+             VALUES ('MPA', 'UNKNOWN', 5)",
+        )
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('restriction-index-library', 'Restrictions', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items
+            (id, library_id, item_type, title, sort_title, identification_status, nfo_metadata_json)
+         VALUES ('restriction-index-item', 'restriction-index-library', 'MOVIE',
+                 'Restriction', 'restriction', 'LOCAL_CONFIRMED', '{\"certification\":\"PG-13\"}')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', 'PG-13')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = nfo_metadata_json
+         WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let unchanged_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(unchanged_index_rows, 1);
+
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = '{\"certification\":\"R\"}'
+         WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let changed_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let changed_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(changed_index_rows, 0);
+    assert_eq!(changed_tag_rows, 0);
+
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', 'R')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET nfo_metadata_json = NULL WHERE id = 'restriction-index-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let cleared_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let cleared_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cleared_index_rows, 0);
+    assert_eq!(cleared_tag_rows, 0);
+
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('restriction-index-item', NULL)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_tags (item_id, tag)
+         VALUES ('restriction-index-item', 'family')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM media_items WHERE id = 'restriction-index-item'")
+        .execute(database.pool())
+        .await?;
+
+    let stale_index_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_index
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let stale_tag_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_content_restriction_tags
+         WHERE item_id = 'restriction-index-item'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stale_index_rows, 0);
+    assert_eq!(stale_tag_rows, 0);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    assert!(database.schema_version().await? >= 196);
+
+    let session_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'web_sessions'
+           AND column_name = 'device_id'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(session_columns, 1);
+
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'user_devices'
+           AND column_name IN (
+               'user_id', 'device_id', 'device_name', 'device_type', 'client_name',
+               'client_version', 'first_seen_at', 'last_seen_at', 'last_remote_ip'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 9);
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_user_devices_user_activity'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 1);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('device-owner', 'device-owner', 'Device Owner', 'test-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES (
+             'legacy-session', 'device-owner', decode('01', 'hex'),
+             decode('02', 'hex'), 9999999999
+         )",
+    )
+    .execute(database.pool())
+    .await?;
+    let legacy_device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(legacy_device_id, None);
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('device-owner', 'browser-device', 'Lux Web', 10, 20)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'device-owner'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_devices: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE user_id = 'device-owner'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cascaded_devices, 0);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_access_blacklist_rules_migration_runs_from_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    assert!(database.schema_version().await? >= 196);
+
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_access_blacklist_rules'
+           AND column_name IN (
+               'id', 'user_id', 'rule_type', 'match_value', 'is_enabled',
+               'created_by', 'created_at', 'updated_at'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 8);
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname IN (
+               'idx_user_access_blacklist_global_active',
+               'idx_user_access_blacklist_user_active',
+               'uq_user_access_blacklist_global_value',
+               'uq_user_access_blacklist_user_value'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 4);
+    let (target_delete_action, creator_delete_action): (String, String) = sqlx::query_as(
+        "SELECT
+             (SELECT confdeltype::TEXT FROM pg_constraint
+              WHERE conrelid = 'user_access_blacklist_rules'::regclass
+                AND conname = 'user_access_blacklist_rules_user_id_fkey'),
+             (SELECT confdeltype::TEXT FROM pg_constraint
+              WHERE conrelid = 'user_access_blacklist_rules'::regclass
+                AND conname = 'user_access_blacklist_rules_created_by_fkey')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(target_delete_action, "c");
+    assert_eq!(creator_delete_action, "n");
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_access_blacklist_rules_migration_upgrades_v195_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let migration_dir = temp_dir.path().join("migrations-v195");
+    fs::create_dir(&migration_dir)?;
+    let source_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version = filename
+            .to_str()
+            .and_then(|name| name.split_once('_'))
+            .ok_or("invalid migration filename")?
+            .0
+            .parse::<i64>()?;
+        if version <= 195 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let old_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(old_version, 195);
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-blacklist-owner', 'legacy-blacklist-owner', 'Legacy Owner', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_devices (
+             user_id, device_id, client_name, first_seen_at, last_seen_at
+         ) VALUES ('legacy-blacklist-owner', 'legacy-device', 'Lux Web', 10, 20)",
+    )
+    .execute(&pool)
+    .await?;
+    fs::copy(
+        source_dir.join("0196_user_access_blacklist_rules.sql"),
+        migration_dir.join("0196_user_access_blacklist_rules.sql"),
+    )?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    let new_version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
+        .fetch_one(&pool)
+        .await?;
+    let preserved_devices: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_devices
+         WHERE user_id = 'legacy-blacklist-owner' AND device_id = 'legacy-device'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(new_version, 196);
+    assert_eq!(preserved_devices, 1);
+
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_device_listing_correlates_active_web_and_emby_logins()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("pg-admin", "Postgres Admin", "admin password")
+        .await?;
+    let target = luxd::auth::users::UserStore::new(database.clone())?
+        .create_user(
+            "pg-device-target",
+            "Device Target",
+            "target password",
+            false,
+        )
+        .await?;
+    let user_id = target.id.to_string();
+    for device_id in ["web-device", "emby-device", "inactive-device"] {
+        sqlx::query(
+            "INSERT INTO user_devices (
+                 user_id, device_id, client_name, first_seen_at, last_seen_at
+             ) VALUES ($1, $2, 'Test Client', 10, 20)",
+        )
+        .bind(&user_id)
+        .bind(device_id)
+        .execute(database.pool())
+        .await?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_secs() as i64;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at, device_id
+         ) VALUES ('pg-active-web-session', $1, decode('31', 'hex'), decode('41', 'hex'), $2, 'web-device'),
+                  ('pg-expired-web-session', $1, decode('32', 'hex'), decode('42', 'hex'), $3, 'inactive-device')",
+    )
+    .bind(&user_id)
+    .bind(now + 3600)
+    .bind(now - 1)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens (
+             id, token_hash, user_id, device_id, client_name, device_name,
+             client_version, created_at, updated_at, revoked_at
+         ) VALUES ('pg-active-emby-token', decode('51', 'hex'), $1, 'emby-device', 'Emby', 'TV', '1.0', $2, $2, NULL),
+                  ('pg-revoked-emby-token', decode('52', 'hex'), $1, 'inactive-device', 'Emby', 'TV', '1.0', $2, $2, $3)",
+    )
+    .bind(&user_id)
+    .bind(now)
+    .bind(now)
+    .execute(database.pool())
+    .await?;
+
+    let app = luxd::api::app_with_state(luxd::api::AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        luxd::auth::emby::EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder().no_proxy().build()?;
+    let login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({ "username": "pg-admin", "password": "admin password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session_cookie = login
+        .headers()
+        .get_all(reqwest::header::SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let pair = value.split(';').next()?;
+            pair.starts_with("lux_session=").then(|| pair.to_owned())
+        })
+        .ok_or("missing Web session cookie")?;
+    let response = client
+        .get(format!(
+            "http://{address}/api/v1/admin/users/{user_id}/devices"
+        ))
+        .header(reqwest::header::COOKIE, session_cookie)
+        .send()
+        .await?;
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let body: serde_json::Value = response.json().await?;
+    let devices = body["devices"].as_array().ok_or("missing devices")?;
+    for (device_id, expected) in [
+        ("web-device", true),
+        ("emby-device", true),
+        ("inactive-device", false),
+    ] {
+        let device = devices
+            .iter()
+            .find(|device| device["deviceId"] == device_id)
+            .ok_or("missing test device")?;
+        assert_eq!(device["hasActiveLogin"], expected);
+    }
+
+    server.abort();
+    let _ = server.await;
+    drop(client);
+    database.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_web_session_device_id_migration_preserves_existing_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let migration_dir = temp_dir.path().join("migrations-v194");
+    fs::create_dir(&migration_dir)?;
+    let source_dir =
+        std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version = filename
+            .to_str()
+            .and_then(|name| name.split_once('_'))
+            .ok_or("invalid migration filename")?
+            .0
+            .parse::<i64>()?;
+        if version <= 194 {
+            fs::copy(entry.path(), migration_dir.join(filename))?;
+        }
+    }
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await?;
+    Migrator::new(migration_dir.as_path())
+        .await?
+        .run(&pool)
+        .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('legacy-session-owner', 'legacy-session-owner', 'Legacy Session', 'test-hash')",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at
+         ) VALUES (
+             'legacy-session', 'legacy-session-owner', decode('01', 'hex'),
+             decode('02', 'hex'), 9999999999
+         )",
+    )
+    .execute(&pool)
+    .await?;
+    pool.close().await;
+
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    let device_id: Option<String> =
+        sqlx::query_scalar("SELECT device_id FROM web_sessions WHERE id = 'legacy-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(device_id, None);
+    assert!(database.schema_version().await? >= 196);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_mail_and_invitation_migrations_apply_to_an_empty_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        if database.schema_version().await? < 201 {
+            return Err("invitation migration was not applied".into());
+        }
+        let column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_outbox'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if column_count != 13 {
+            return Err("unexpected mail outbox schema".into());
+        }
+        let sensitive_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_outbox'
+               AND column_name IN ('body', 'html_body', 'text_body', 'payload', 'token', 'password')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if sensitive_column_count != 0 {
+            return Err("mail outbox schema contains a sensitive payload column".into());
+        }
+        let challenge_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_challenges'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if challenge_column_count != 9 {
+            return Err("unexpected mail challenge schema".into());
+        }
+        let sensitive_challenge_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'mail_challenges'
+               AND column_name IN ('token', 'raw_token', 'body', 'password')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if sensitive_challenge_column_count != 0 {
+            return Err("mail challenge schema contains raw credential data".into());
+        }
+        let invitation_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'user_invitations'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_column_count != 14 {
+            return Err("unexpected invitation schema".into());
+        }
+        let invitation_sensitive_column_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM information_schema.columns
+             WHERE table_schema = current_schema() AND table_name = 'user_invitations'
+               AND column_name IN ('token', 'raw_token', 'password', 'body', 'html_body', 'text_body')",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_sensitive_column_count != 0 {
+            return Err("invitation schema contains sensitive material".into());
+        }
+        let invitation_unique_index_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_indexes
+             WHERE schemaname = current_schema()
+               AND indexname = 'ux_user_invitations_pending_email'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_unique_index_count != 1 {
+            return Err("invitation pending-email uniqueness index is missing".into());
+        }
+        let invitation_set_null_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM pg_constraint
+             WHERE conrelid = 'user_invitations'::regclass AND contype = 'f' AND confdeltype = 'n'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if invitation_set_null_count != 2 {
+            return Err("invitation history foreign keys must preserve rows".into());
+        }
+        database.close().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -135,21 +837,235 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
     assert_eq!(database.backend(), luxd::config::DatabaseBackend::Postgres);
-    assert_eq!(database.schema_version().await?, 186);
+    assert!(database.schema_version().await? >= 200);
+    let mail_outbox_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'mail_outbox'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(mail_outbox_column_count, 13);
+    let sensitive_mail_outbox_column_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'mail_outbox'
+           AND column_name IN ('body', 'html_body', 'text_body', 'payload', 'token', 'password')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(sensitive_mail_outbox_column_count, 0);
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("postgres-admin", "PostgreSQL Admin", "test-password")
+        .await?;
+    let postgres_admin_id: String =
+        sqlx::query_scalar("SELECT id FROM users WHERE username_normalized = 'postgres-admin'")
+            .fetch_one(database.pool())
+            .await?;
+    let restriction_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_content_restrictions'
+           AND column_name IN (
+               'user_id', 'rating_system', 'maximum_rating', 'allow_unrated',
+               'version', 'updated_at'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_columns, 6);
+    let restriction_tag_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_content_restriction_tags'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(restriction_tag_table, 1);
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ($1, 'MPAA', 'PG-13', 0)",
+    )
+    .bind(&postgres_admin_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'ALLOW', 'family'), ($1, 'BLOCK', 'horror')",
+    )
+    .bind(&postgres_admin_id)
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query("UPDATE user_content_restrictions SET allow_unrated = 2 WHERE user_id = $1",)
+            .bind(&postgres_admin_id)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    for invalid_tag in [
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'NEUTRAL', 'other')",
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'ALLOW', '   ')",
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ($1, 'ALLOW', 'family')",
+    ] {
+        assert!(
+            sqlx::query(invalid_tag)
+                .bind(&postgres_admin_id)
+                .execute(database.pool())
+                .await
+                .is_err()
+        );
+    }
+    let preference_columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_account_preferences'
+           AND column_name IN (
+               'user_id', 'theme', 'accent_color', 'show_media_libraries',
+               'show_continue_watching', 'audio_language', 'subtitle_language',
+               'auto_play_next_episode', 'version', 'updated_at'
+           )",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(preference_columns, 10);
+    sqlx::query("INSERT INTO user_account_preferences (user_id) VALUES ($1)")
+        .bind(&postgres_admin_id)
+        .execute(database.pool())
+        .await?;
+    let preference_defaults: (String, String, i64, i64, String, String, i64, i64) = sqlx::query_as(
+        "SELECT theme, accent_color, show_media_libraries, show_continue_watching,
+                    audio_language, subtitle_language, auto_play_next_episode, version
+             FROM user_account_preferences WHERE user_id = $1",
+    )
+    .bind(&postgres_admin_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        preference_defaults,
+        (
+            "dark".to_owned(),
+            "silver".to_owned(),
+            1,
+            1,
+            "原始音轨".to_owned(),
+            "简体中文".to_owned(),
+            1,
+            1,
+        )
+    );
+    assert!(
+        sqlx::query("UPDATE user_account_preferences SET theme = 'sepia' WHERE user_id = $1",)
+            .bind(&postgres_admin_id)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "UPDATE user_account_preferences SET accent_color = 'ultraviolet' WHERE user_id = $1",
+        )
+        .bind(&postgres_admin_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query("UPDATE user_account_preferences SET version = 0 WHERE user_id = $1",)
+            .bind(&postgres_admin_id)
+            .execute(database.pool())
+            .await
+            .is_err()
+    );
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('postgres-pref-cascade', 'postgres-pref-cascade', 'Cascade', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_account_preferences (user_id)
+         VALUES ('postgres-pref-cascade')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ('postgres-pref-cascade', 'MPAA', NULL, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ('postgres-pref-cascade', 'BLOCK', 'horror')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM user_content_restrictions WHERE user_id = 'postgres-pref-cascade'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_restriction_tags: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restriction_tags
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cascaded_restriction_tags, 0);
+    sqlx::query(
+        "INSERT INTO user_content_restrictions
+            (user_id, rating_system, maximum_rating, allow_unrated)
+         VALUES ('postgres-pref-cascade', 'MPAA', NULL, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_content_restriction_tags (user_id, tag_kind, tag)
+         VALUES ('postgres-pref-cascade', 'BLOCK', 'horror')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM users WHERE id = 'postgres-pref-cascade'")
+        .execute(database.pool())
+        .await?;
+    let cascaded_preferences: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_account_preferences
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cascaded_preferences, 0);
+    let cascaded_restrictions: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restrictions
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let cascaded_user_tags: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_content_restriction_tags
+         WHERE user_id = 'postgres-pref-cascade'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cascaded_restrictions, 0);
+    assert_eq!(cascaded_user_tags, 0);
     sqlx::query(
         "INSERT INTO users (id, username_normalized, display_name, password_hash)
          VALUES ('playback-policy-user', 'playback-policy-user', 'Playback Policy', 'test')",
     )
     .execute(database.pool())
     .await?;
-    let playback_policy: (i64, i64, i64, i64, i64) = sqlx::query_as(
+    let playback_policy: (i64, i64, i64, i64, i64, String) = sqlx::query_as(
         "SELECT can_play, max_simultaneous_playbacks, allow_remux,
-                allow_audio_transcode, allow_video_transcode
+                allow_audio_transcode, allow_video_transcode, library_access_mode
          FROM users WHERE id = 'playback-policy-user'",
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(playback_policy, (1, 0, 1, 1, 1));
+    assert_eq!(playback_policy, (1, 0, 1, 1, 1, "ALL".to_owned()));
     let playback_admission_columns: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM information_schema.columns
          WHERE table_schema = current_schema()
@@ -584,10 +1500,6 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .await?;
     assert_eq!(external_stream_index_count, 0);
 
-    let setup = SetupService::new(database.clone())?;
-    setup
-        .complete("postgres-admin", "PostgreSQL Admin", "test-password")
-        .await?;
     let auth = WebAuthService::new(database.clone())?;
     let login = auth
         .login("postgres-admin", "test-password")
@@ -791,6 +1703,265 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_legacy_user_and_library_access_upgrade_from_v183_to_current_schema()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let migration_prefix = temp_dir
+        .path()
+        .join("postgres-migrations-before-account-profile");
+    fs::create_dir(&migration_prefix)?;
+    for entry in fs::read_dir(Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres"))? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split('_').next())
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if version <= 183 {
+            let file_name = path.file_name().ok_or("migration has no file name")?;
+            fs::copy(&path, migration_prefix.join(file_name))?;
+        }
+    }
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        Migrator::new(migration_prefix.as_path())
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash, is_disabled)
+             VALUES ('legacy-enabled', 'legacy-enabled', 'Legacy Enabled', 'hash', 0),
+                    ('legacy-disabled', 'legacy-disabled', 'Legacy Disabled', 'hash', 1),
+                    ('legacy-denials-only', 'legacy-denials-only', 'Legacy Denials', 'hash', 0),
+                    ('legacy-selected', 'legacy-selected', 'Legacy Selected', 'hash', 0)",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind)
+             VALUES ('legacy-library', 'Legacy Library', 'MOVIE')",
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES ('legacy-denials-only', 'legacy-library', 0),
+                    ('legacy-selected', 'legacy-library', 1)",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        assert_eq!(
+            database.schema_version().await?,
+            latest_migration_version("migrations-postgres")?
+        );
+        let users: Vec<(String, Option<String>, Option<i64>, Option<i64>, i64, i64)> =
+            sqlx::query_as(
+                "SELECT id, email, email_verified_at, deletion_purge_at,
+                        is_disabled, is_disabled_before_delete
+                 FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+            )
+            .fetch_all(database.pool())
+            .await?;
+        assert_eq!(
+            users[0],
+            ("legacy-denials-only".to_owned(), None, None, None, 0, 0)
+        );
+        assert_eq!(
+            users[1],
+            ("legacy-disabled".to_owned(), None, None, None, 1, 0)
+        );
+        assert_eq!(
+            users[2],
+            ("legacy-enabled".to_owned(), None, None, None, 0, 0)
+        );
+        assert_eq!(
+            users[3],
+            ("legacy-selected".to_owned(), None, None, None, 0, 0)
+        );
+        assert_eq!(users.len(), 4);
+
+        let legacy_access_modes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            legacy_access_modes,
+            [
+                ("legacy-denials-only".to_owned(), "ALL".to_owned()),
+                ("legacy-disabled".to_owned(), "ALL".to_owned()),
+                ("legacy-enabled".to_owned(), "ALL".to_owned()),
+                ("legacy-selected".to_owned(), "SELECTED".to_owned()),
+            ]
+        );
+        let legacy_access_rows: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT user_id, library_id, can_view FROM user_library_access
+             WHERE user_id LIKE 'legacy-%' ORDER BY user_id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            legacy_access_rows,
+            [
+                (
+                    "legacy-denials-only".to_owned(),
+                    "legacy-library".to_owned(),
+                    0
+                ),
+                ("legacy-selected".to_owned(), "legacy-library".to_owned(), 1),
+            ]
+        );
+
+        sqlx::query("UPDATE users SET email = 'legacy@example.com' WHERE id = 'legacy-enabled'")
+            .execute(database.pool())
+            .await?;
+        let duplicate_email = sqlx::query(
+            "UPDATE users SET email = 'LEGACY@example.com' WHERE id = 'legacy-disabled'",
+        )
+        .execute(database.pool())
+        .await;
+        assert!(
+            duplicate_email.is_err(),
+            "email uniqueness must ignore case"
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_library_access_mode_migration_preserves_legacy_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let migration_prefix = temp_dir
+        .path()
+        .join("postgres-migrations-before-library-access-mode");
+    fs::create_dir(&migration_prefix)?;
+    for entry in fs::read_dir("migrations-postgres")? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|name| name.split('_').next())
+            .and_then(|value| value.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        if version <= 186 {
+            let file_name = path.file_name().ok_or("migration has no file name")?;
+            fs::copy(&path, migration_prefix.join(file_name))?;
+        }
+    }
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let result = async {
+        let database_url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(&database_url)
+            .await?;
+        Migrator::new(migration_prefix.as_path())
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::raw_sql(
+            "INSERT INTO libraries (id, name, kind)
+             VALUES ('access-library', 'Access library', 'MOVIE');
+             INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('legacy-all', 'legacy-all', 'Legacy All', 'hash'),
+                    ('legacy-denials-only', 'legacy-denials-only', 'Legacy Denials', 'hash'),
+                    ('legacy-selected', 'legacy-selected', 'Legacy Selected', 'hash');
+             INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES ('legacy-denials-only', 'access-library', 0),
+                    ('legacy-selected', 'access-library', 1);",
+        )
+        .execute(&pool)
+        .await?;
+        pool.close().await;
+
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        assert!(database.schema_version().await? >= 190);
+        let modes: Vec<(String, String)> = sqlx::query_as(
+            "SELECT id, library_access_mode FROM users WHERE id LIKE 'legacy-%' ORDER BY id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            modes,
+            [
+                ("legacy-all".to_owned(), "ALL".to_owned()),
+                ("legacy-denials-only".to_owned(), "ALL".to_owned()),
+                ("legacy-selected".to_owned(), "SELECTED".to_owned()),
+            ]
+        );
+        let preserved_grant_rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT user_id, can_view FROM user_library_access
+             WHERE user_id LIKE 'legacy-%' ORDER BY user_id",
+        )
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(
+            preserved_grant_rows,
+            [
+                ("legacy-denials-only".to_owned(), 0),
+                ("legacy-selected".to_owned(), 1),
+            ]
+        );
+        assert!(
+            sqlx::query(
+                "UPDATE users SET library_access_mode = 'INVALID' WHERE id = 'legacy-all'",
+            )
+            .execute(database.pool())
+            .await
+            .is_err(),
+            "PostgreSQL must reject modes outside the supported values"
+        );
+        assert!(
+            sqlx::query("UPDATE users SET library_access_mode = NULL WHERE id = 'legacy-all'")
+                .execute(database.pool())
+                .await
+                .is_err(),
+            "PostgreSQL mode must remain non-null"
+        );
+        database.close().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_merged_into_partial_index_preserves_set_null_behavior()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -975,7 +2146,7 @@ async fn postgres_person_match_decisions_migrate_and_restore_snapshots()
                     ),
                 ]
             );
-            assert_eq!(database.schema_version().await?, 182);
+            assert!(database.schema_version().await? >= 190);
             let preserved_history: Vec<(i64, Vec<u8>)> = sqlx::query_as(
                 "SELECT version, checksum FROM _sqlx_migrations
                  WHERE version <= $1 ORDER BY version",
@@ -1104,7 +2275,7 @@ async fn postgres_upgrade_from_deployed_migration_160_preserves_history()
         migration_pool.close().await;
 
         let upgraded_database = Database::connect_with_configuration(&config, &connection).await?;
-        assert_eq!(upgraded_database.schema_version().await?, 182);
+        assert!(upgraded_database.schema_version().await? >= 190);
         let legacy_dispatch_source: String = sqlx::query_scalar(
             "SELECT dispatch_source FROM metadata_reidentify_jobs
              WHERE id = 'legacy-dispatch-source'",
@@ -1225,7 +2396,7 @@ async fn postgres_upgrade_recovers_legacy_scan_and_completes_manifest_scan()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 182);
+    assert!(database.schema_version().await? >= 190);
     let migrated_manifest: (String, Option<String>, i64, i64) = sqlx::query_as(
         "SELECT state, resume_state, observed_file_count, add_count
          FROM scan_manifests WHERE id = 'existing-manifest'",
@@ -2600,7 +3771,7 @@ async fn postgres_homevideos_video_type_migration_preserves_existing_data()
     migration_pool.close().await;
 
     let database = Database::connect_with_configuration(&config, &connection).await?;
-    assert_eq!(database.schema_version().await?, 182);
+    assert!(database.schema_version().await? >= 190);
     let existing_library_kind: String =
         sqlx::query_scalar("SELECT kind FROM libraries WHERE id = $1")
             .bind(&library_id)
@@ -2969,8 +4140,355 @@ async fn postgres_resume_visibility_upgrade_preserves_existing_playback_state()
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 182);
+    assert_eq!(version, 187);
     pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_registration_requests_migration_runs_from_empty_and_upgrades_existing_database()
+-> Result<(), Box<dyn std::error::Error>> {
+    let source_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+
+    let (configuration, database_name) = create_postgres_test_database().await?;
+    let empty_migration_dir = source_dir.clone();
+    let empty_result = tokio::spawn(async move {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(
+                &configuration
+                    .postgres_url()?
+                    .ok_or("missing PostgreSQL URL")?,
+            )
+            .await?;
+        Migrator::new(empty_migration_dir).await?.run(&pool).await?;
+        assert_postgres_registration_request_schema(&pool).await?;
+        pool.close().await;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    if let Err(error) = empty_result? {
+        return Err(error.to_string().into());
+    }
+
+    let temp = tempfile::tempdir()?;
+    let old_migration_dir = temp.path().join("migrations-through-0202");
+    fs::create_dir(&old_migration_dir)?;
+    for entry in fs::read_dir(&source_dir)? {
+        let entry = entry?;
+        let filename = entry.file_name();
+        let version: i64 = filename
+            .to_str()
+            .ok_or("invalid filename")?
+            .split('_')
+            .next()
+            .ok_or("missing migration version")?
+            .parse()?;
+        if version <= 202 {
+            fs::copy(entry.path(), old_migration_dir.join(filename))?;
+        }
+    }
+
+    let (configuration, database_name) = create_postgres_test_database().await?;
+    let upgrade_source_dir = source_dir.clone();
+    let upgrade_migration_dir = old_migration_dir.clone();
+    let upgrade_result = tokio::spawn(async move {
+        let pool = PgPoolOptions::new()
+            .max_connections(1)
+            .connect(
+                &configuration
+                    .postgres_url()?
+                    .ok_or("missing PostgreSQL URL")?,
+            )
+            .await?;
+        Migrator::new(upgrade_migration_dir)
+            .await?
+            .run(&pool)
+            .await?;
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('preserved-registration-owner', 'preserved-registration-owner', 'Preserved', 'test-hash')",
+        )
+        .execute(&pool)
+        .await?;
+        Migrator::new(upgrade_source_dir)
+            .await?
+            .run(&pool)
+            .await?;
+        assert_postgres_registration_request_schema(&pool).await?;
+        let preserved_name: String = sqlx::query_scalar(
+            "SELECT display_name FROM users WHERE id = 'preserved-registration-owner'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(preserved_name, "Preserved");
+        pool.close().await;
+        Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    drop_postgres_test_database(&database_name).await?;
+    if let Err(error) = upgrade_result? {
+        return Err(error.to_string().into());
+    }
+    Ok(())
+}
+
+async fn assert_postgres_registration_request_schema(
+    pool: &sqlx::PgPool,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT column_name FROM information_schema.columns
+         WHERE table_schema = current_schema() AND table_name = 'user_registration_requests'
+         ORDER BY ordinal_position",
+    )
+    .fetch_all(pool)
+    .await?;
+    assert_eq!(columns.len(), 15);
+    for column in [
+        "id",
+        "recipient_email",
+        "username_normalized",
+        "display_name",
+        "password_hash",
+        "permission_snapshot_json",
+        "status",
+        "expires_at",
+        "email_verified_at",
+        "reviewed_at",
+        "reviewed_by_user_id",
+        "approved_user_id",
+        "last_error_code",
+        "created_at",
+        "updated_at",
+    ] {
+        assert!(
+            columns.iter().any(|existing| existing == column),
+            "missing {column}"
+        );
+    }
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes WHERE schemaname = current_schema()
+         AND indexname IN (
+             'ux_user_registration_requests_pending_email',
+             'idx_user_registration_requests_status_created',
+             'idx_user_registration_requests_expiry'
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(index_count, 3);
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('registration-reviewer', 'registration-reviewer', 'Reviewer', 'test-hash')",
+    )
+    .execute(pool)
+    .await?;
+    let insert = "INSERT INTO user_registration_requests (
+        id, recipient_email, username_normalized, display_name, password_hash,
+        permission_snapshot_json, expires_at, created_at, updated_at
+    ) VALUES ($1, 'registration@example.test', 'registration-user', 'Registration User',
+        '$argon2id$test-hash', '{}', 20, 10, 10)";
+    sqlx::query(insert)
+        .bind("registration-main")
+        .execute(pool)
+        .await?;
+    assert!(
+        sqlx::query(insert)
+            .bind("registration-duplicate")
+            .execute(pool)
+            .await
+            .is_err()
+    );
+    for (query, value) in [
+        (
+            "UPDATE user_registration_requests SET recipient_email = $1 WHERE id = 'registration-main'",
+            "UPPER@example.test",
+        ),
+        (
+            "UPDATE user_registration_requests SET password_hash = $1 WHERE id = 'registration-main'",
+            "plaintext",
+        ),
+        (
+            "UPDATE user_registration_requests SET password_hash = $1 WHERE id = 'registration-main'",
+            "$ARGON2ID$test-hash",
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = $1 WHERE id = 'registration-main'",
+            "[]",
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = $1 WHERE id = 'registration-main'",
+            "not-json",
+        ),
+        (
+            "UPDATE user_registration_requests SET permission_snapshot_json = $1 WHERE id = 'registration-main'",
+            &format!(r#"{{"x":"{}"}}"#, "界".repeat(12_000)),
+        ),
+    ] {
+        assert!(
+            sqlx::query(query).bind(value).execute(pool).await.is_err(),
+            "accepted invalid update: {query}"
+        );
+    }
+    for query in [
+        "UPDATE user_registration_requests SET id = repeat('x', 129) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET recipient_email = repeat('x', 255) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET recipient_email = ' registration@example.test' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET username_normalized = repeat('x', 129) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET display_name = repeat('x', 129) WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'UNKNOWN' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'PENDING_APPROVAL' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET status = 'REJECTED' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET password_hash = NULL WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET expires_at = 10 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET updated_at = 9 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET email_verified_at = 9 WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET reviewed_by_user_id = 'unknown' WHERE id = 'registration-main'",
+        "UPDATE user_registration_requests SET last_error_code = 'private error' WHERE id = 'registration-main'",
+    ] {
+        assert!(
+            sqlx::query(query).execute(pool).await.is_err(),
+            "accepted invalid transition: {query}"
+        );
+    }
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'PENDING_APPROVAL', email_verified_at = 11, updated_at = 11
+         WHERE id = 'registration-main'",
+    )
+    .execute(pool)
+    .await?;
+    assert!(
+        sqlx::query(insert)
+            .bind("registration-approval-duplicate")
+            .execute(pool)
+            .await
+            .is_err()
+    );
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'REJECTED', reviewed_at = 12, updated_at = 12,
+             reviewed_by_user_id = 'registration-reviewer', password_hash = NULL
+         WHERE id = 'registration-main'",
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query(insert)
+        .bind("registration-next")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'APPROVED', email_verified_at = 11, reviewed_at = 12, updated_at = 12,
+             reviewed_by_user_id = 'registration-reviewer', approved_user_id = 'registration-reviewer',
+             password_hash = NULL
+         WHERE id = 'registration-next'",
+    )
+    .execute(pool)
+    .await?;
+    assert!(
+        sqlx::query(
+            "UPDATE user_registration_requests SET approved_user_id = 'unknown'
+             WHERE id = 'registration-next'",
+        )
+        .execute(pool)
+        .await
+        .is_err()
+    );
+    sqlx::query("DELETE FROM users WHERE id = 'registration-reviewer'")
+        .execute(pool)
+        .await?;
+    let cleared_user_refs: (Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT reviewed_by_user_id, approved_user_id
+         FROM user_registration_requests WHERE id = 'registration-next'",
+    )
+    .fetch_one(pool)
+    .await?;
+    assert_eq!(cleared_user_refs, (None, None));
+    sqlx::query(insert)
+        .bind("registration-expired")
+        .execute(pool)
+        .await?;
+    sqlx::query(
+        "UPDATE user_registration_requests
+         SET status = 'EXPIRED', updated_at = 21, password_hash = NULL
+         WHERE id = 'registration-expired'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_removes_personal_image_preference_without_changing_other_preferences()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    let migrator = sqlx::migrate!("./migrations-postgres");
+    let old = Migrator::with_migrations(
+        migrator
+            .iter()
+            .filter(|m| m.version <= 206)
+            .cloned()
+            .collect(),
+    );
+    old.run(&pool).await?;
+    sqlx::raw_sql(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+        VALUES ('image-user', 'image-user', 'Images', 'test');
+        INSERT INTO user_account_preferences (user_id, theme, accent_color, auto_play_next_episode,
+            optimized_images, version, updated_at)
+        VALUES ('image-user', 'light', 'ocean', 0, 1, 7, 1234);",
+    )
+    .execute(&pool)
+    .await?;
+    migrator.run(&pool).await?;
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'user_account_preferences'
+        AND column_name = 'optimized_images'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(columns, 0);
+    let values: (String, String, i64, i64, i64) = sqlx::query_as(
+        "SELECT theme, accent_color, auto_play_next_episode, version, updated_at
+         FROM user_account_preferences WHERE user_id = 'image-user'",
+    )
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(values, ("light".into(), "ocean".into(), 0, 7, 1234));
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
+
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        },
+        &connection,
+    )
+    .await?;
+    let columns: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.columns
+        WHERE table_schema = 'public' AND table_name = 'user_account_preferences'
+        AND column_name = 'optimized_images'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(columns, 0);
+    database.pool().close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }

@@ -3,13 +3,14 @@ import { dirname, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import test from "node:test";
 import assert from "node:assert/strict";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
 const appPath = resolve(dirname(fileURLToPath(import.meta.url)), "../src/app/App.tsx");
 const appSource = await readFile(appPath, "utf8");
 const adminLayoutPath = resolve(dirname(fileURLToPath(import.meta.url)), "../src/features/admin/AdminLayout.tsx");
 const adminLayoutSource = await readFile(adminLayoutPath, "utf8");
 const stylesPath = resolve(dirname(fileURLToPath(import.meta.url)), "../src/react.css");
-const stylesSource = await readFile(stylesPath, "utf8");
+const stylesSource = allStyles;
 const viteConfigPath = resolve(dirname(fileURLToPath(import.meta.url)), "../vite.config.ts");
 const viteConfigSource = await readFile(viteConfigPath, "utf8");
 

@@ -46,6 +46,13 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     let library = libraries
         .create_library("Shows", LibraryKind::Series, false)
         .await?;
+    let disabled_library = libraries
+        .create_library("Disabled", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(disabled_library.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Shows");
     let season_dir = root.join("九门/Season 01");
     tokio::fs::create_dir_all(&season_dir).await?;
@@ -86,6 +93,15 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(2))
         .build()?;
+    let unauthenticated_retention_update = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .json(&json!({ "userActivityRetentionDays": 30 }))
+        .send()
+        .await?;
+    assert_eq!(
+        unauthenticated_retention_update.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -177,6 +193,213 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .json()
         .await?;
     assert_eq!(initial_settings["userDeletionGraceDays"], 7);
+    assert_eq!(initial_settings["userActivityRetentionDays"], 90);
+    assert_eq!(
+        initial_settings["newUserPermissions"]["libraryAccessMode"],
+        "NONE"
+    );
+    assert_eq!(
+        initial_settings["newUserPermissions"]["libraryIds"],
+        json!([])
+    );
+    assert_eq!(
+        initial_settings["newUserPermissions"]["maxSimultaneousPlaybacks"],
+        2
+    );
+    assert_eq!(initial_settings["trustedProxyCidrs"], json!([]));
+
+    let missing_csrf_proxy_update = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .json(&json!({ "trustedProxyCidrs": ["10.0.0.0/8"] }))
+        .send()
+        .await?;
+    assert_eq!(
+        missing_csrf_proxy_update.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    let trusted_proxy_update = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({
+            "trustedProxyCidrs": ["10.1.2.3/8", "2001:db8::1/32"]
+        }))
+        .send()
+        .await?;
+    assert_eq!(trusted_proxy_update.status(), reqwest::StatusCode::OK);
+    let trusted_proxy_body: Value = trusted_proxy_update.json().await?;
+    let canonical_trusted_proxies = json!(["10.0.0.0/8", "2001:db8::/32"]);
+    assert_eq!(
+        trusted_proxy_body["trustedProxyCidrs"],
+        canonical_trusted_proxies
+    );
+
+    let excessive_cidrs = (0..101)
+        .map(|octet| format!("192.0.2.{octet}/32"))
+        .collect::<Vec<_>>();
+    for invalid_trusted_proxies in [
+        json!(["not-an-ip"]),
+        json!(["10.0.0.0/8", "10.2.3.4/8"]),
+        json!(excessive_cidrs),
+    ] {
+        let rejected = client
+            .patch(format!("{base_url}/api/v1/admin/settings"))
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf_cookie)
+            .json(&json!({ "trustedProxyCidrs": invalid_trusted_proxies }))
+            .send()
+            .await?;
+        assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    }
+    let preserved_trusted_proxies: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        preserved_trusted_proxies["trustedProxyCidrs"],
+        canonical_trusted_proxies
+    );
+
+    let selected_defaults = json!({
+        "libraryAccessMode": "SELECTED",
+        "libraryIds": [library.id.to_string()],
+        "canDownload": true,
+        "canPlay": false,
+        "maxSimultaneousPlaybacks": 4,
+        "allowRemux": false,
+        "allowAudioTranscode": false,
+        "allowVideoTranscode": true,
+    });
+    let updated_defaults = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({ "newUserPermissions": selected_defaults }))
+        .send()
+        .await?;
+    assert_eq!(updated_defaults.status(), reqwest::StatusCode::OK);
+    let updated_defaults_body: Value = updated_defaults.json().await?;
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["libraryAccessMode"],
+        "SELECTED"
+    );
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["libraryIds"],
+        json!([library.id.to_string()])
+    );
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["canDownload"],
+        true
+    );
+    assert_eq!(
+        updated_defaults_body["newUserPermissions"]["maxSimultaneousPlaybacks"],
+        4
+    );
+
+    for invalid_defaults in [
+        json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": -1,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+        json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [disabled_library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 2,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+        json!({
+            "libraryAccessMode": "ALL",
+            "libraryIds": [library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 2,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+        json!({
+            "libraryAccessMode": "SELECTED",
+            "libraryIds": [library.id.to_string(), library.id.to_string()],
+            "canDownload": true,
+            "canPlay": true,
+            "maxSimultaneousPlaybacks": 2,
+            "allowRemux": true,
+            "allowAudioTranscode": true,
+            "allowVideoTranscode": true,
+        }),
+    ] {
+        let invalid_defaults_response = client
+            .patch(format!("{base_url}/api/v1/admin/settings"))
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf_cookie)
+            .json(&json!({ "newUserPermissions": invalid_defaults }))
+            .send()
+            .await?;
+        assert_eq!(
+            invalid_defaults_response.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+    }
+
+    let defaults_after_rejection: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        defaults_after_rejection["newUserPermissions"]["libraryAccessMode"],
+        "SELECTED"
+    );
+    assert_eq!(
+        defaults_after_rejection["newUserPermissions"]["libraryIds"],
+        json!([library.id.to_string()])
+    );
+
+    let empty_selection = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({
+            "newUserPermissions": {
+                "libraryAccessMode": "SELECTED",
+                "libraryIds": [],
+                "canDownload": false,
+                "canPlay": true,
+                "maxSimultaneousPlaybacks": 2,
+                "allowRemux": true,
+                "allowAudioTranscode": true,
+                "allowVideoTranscode": true,
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(empty_selection.status(), reqwest::StatusCode::OK);
+    let empty_selection_body: Value = empty_selection.json().await?;
+    assert_eq!(
+        empty_selection_body["newUserPermissions"]["libraryAccessMode"],
+        "NONE"
+    );
+    assert_eq!(
+        empty_selection_body["newUserPermissions"]["libraryIds"],
+        json!([])
+    );
 
     let settings = client
         .patch(format!("{base_url}/api/v1/admin/settings"))
@@ -188,6 +411,21 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(settings.status(), reqwest::StatusCode::OK);
     let settings_body: Value = settings.json().await?;
     assert_eq!(settings_body["userDeletionGraceDays"], 30);
+    assert_eq!(
+        settings_body["trustedProxyCidrs"],
+        canonical_trusted_proxies
+    );
+
+    let cleared_trusted_proxies = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({ "trustedProxyCidrs": [] }))
+        .send()
+        .await?;
+    assert_eq!(cleared_trusted_proxies.status(), reqwest::StatusCode::OK);
+    let cleared_trusted_proxy_body: Value = cleared_trusted_proxies.json().await?;
+    assert_eq!(cleared_trusted_proxy_body["trustedProxyCidrs"], json!([]));
 
     for invalid_days in [0, 3_651] {
         let invalid_retention = client
@@ -208,6 +446,42 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .json()
         .await?;
     assert_eq!(settings_after_rejection["userDeletionGraceDays"], 30);
+
+    let activity_retention = client
+        .patch(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf_cookie)
+        .json(&json!({ "userActivityRetentionDays": 180 }))
+        .send()
+        .await?;
+    assert_eq!(activity_retention.status(), reqwest::StatusCode::OK);
+    let activity_retention_body: Value = activity_retention.json().await?;
+    assert_eq!(activity_retention_body["userActivityRetentionDays"], 180);
+
+    for invalid_days in [0, -1, 3_651] {
+        let invalid_activity_retention = client
+            .patch(format!("{base_url}/api/v1/admin/settings"))
+            .header(COOKIE, &cookies)
+            .header("X-CSRF-Token", &csrf_cookie)
+            .json(&json!({ "userActivityRetentionDays": invalid_days }))
+            .send()
+            .await?;
+        assert_eq!(
+            invalid_activity_retention.status(),
+            reqwest::StatusCode::BAD_REQUEST
+        );
+    }
+    let activity_retention_after_rejection: Value = client
+        .get(format!("{base_url}/api/v1/admin/settings"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json()
+        .await?;
+    assert_eq!(
+        activity_retention_after_rejection["userActivityRetentionDays"],
+        180
+    );
 
     for _ in 0..24 {
         let repeated_login = client

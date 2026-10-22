@@ -56,6 +56,15 @@ describe("AdminUserDetailPage account lifecycle", () => {
     });
   });
 
+  it("explains how users verify an email changed by an administrator", async () => {
+    renderDetail(makeUser());
+    await waitForUser();
+
+    const profileText = container.querySelector(".lux-admin-user-profile-form")?.textContent ?? "";
+    expect(profileText).toContain("管理员修改邮箱会清除验证状态；用户可在账户设置保存当前邮箱以发送验证邮件。");
+    expect(profileText).not.toContain("验证流程将在邮件功能中接入");
+  });
+
   it("uses the configured retention period when confirming account deletion", async () => {
     const queryClient = renderDetail(makeUser(), 14);
     const remove = vi.spyOn(api, "deleteAdminUser").mockResolvedValue({
@@ -104,6 +113,21 @@ describe("AdminUserDetailPage account lifecycle", () => {
     act(() => findButton("彻底删除").click());
     expect(confirm).toHaveBeenCalledWith("彻底删除“观众”将永久删除账号、头像、权限设置、偏好、播放记录和设备关联，媒体文件不受影响，且无法恢复。确定继续吗？");
     expect(purge).not.toHaveBeenCalled();
+  });
+
+  it("groups the user detail into five sections without spec module labels", async () => {
+    renderDetail(makeUser());
+    await waitForUser();
+
+    const sections = [...container.querySelectorAll<HTMLButtonElement>(".lux-users-segments button")];
+    const sectionLabels = sections.map((section) => section.textContent ?? "").join(" ");
+    expect(sections).toHaveLength(5);
+    expect(sectionLabels).toContain("概览");
+    expect(sectionLabels).toContain("访问权限");
+    expect(sectionLabels).toContain("设备与访问");
+    expect(sectionLabels).toContain("活动记录");
+    expect(sectionLabels).toContain("偏好");
+    expect(sectionLabels).not.toContain("模块");
   });
 
   function renderDetail(user: AdminUser, userDeletionGraceDays = 7) {

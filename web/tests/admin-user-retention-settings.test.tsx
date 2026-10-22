@@ -11,7 +11,7 @@ import type { AdminSettings } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
-describe("AdminUserSettingsPage deletion retention", () => {
+describe("AdminUserSettingsPage retention settings", () => {
   let container: HTMLDivElement;
   let root: Root;
 
@@ -29,7 +29,8 @@ describe("AdminUserSettingsPage deletion retention", () => {
     const input = findInput();
     expect(input.value).toBe("30");
     expect(container.textContent).toContain("只影响之后移入回收站的账号");
-    expect(container.textContent).toContain("活动记录保留将在模块七接入");
+    expect(container.querySelector('input[aria-label="活动记录保留天数"]')).toBeTruthy();
+    expect(findActivityInput().value).toBe("90");
 
     await act(async () => {
       changeInput(input, "14");
@@ -67,8 +68,49 @@ describe("AdminUserSettingsPage deletion retention", () => {
     expect(findInput().disabled).toBe(false);
   });
 
-  function renderPage(userDeletionGraceDays: number | undefined) {
-    vi.spyOn(api, "adminSettings").mockResolvedValue(settings(userDeletionGraceDays));
+  it("loads and saves the configured activity retention period", async () => {
+    const queryClient = renderPage(30, 120);
+    const update = vi.spyOn(api, "updateAdminSettings").mockResolvedValue(settings(30, 60));
+    await waitForActivityInput();
+
+    const input = findActivityInput();
+    expect(input.value).toBe("120");
+    const saveButton = findButton("保存活动保留期限");
+    expect(saveButton.disabled).toBe(true);
+    await act(async () => {
+      changeInput(input, "0");
+    });
+    expect(saveButton.disabled).toBe(true);
+    await act(async () => {
+      changeInput(input, "3651");
+    });
+    expect(saveButton.disabled).toBe(true);
+    await act(async () => {
+      changeInput(input, "60");
+      saveButton.click();
+      await vi.waitFor(() => expect(update).toHaveBeenCalledWith({ userActivityRetentionDays: 60 }));
+    });
+
+    expect(container.querySelector('[role="status"]')?.textContent).toBe("活动记录保留期限已保存。");
+    expect(queryClient.getQueryData<AdminSettings>(["admin", "settings"])?.userActivityRetentionDays).toBe(60);
+  });
+
+  it("keeps the activity retention form available and reports save failures", async () => {
+    renderPage(7, 90);
+    const update = vi.spyOn(api, "updateAdminSettings").mockRejectedValue(new Error("网络错误"));
+    await waitForActivityInput();
+
+    await act(async () => {
+      changeInput(findActivityInput(), "91");
+      findButton("保存活动保留期限").click();
+      await vi.waitFor(() => expect(update).toHaveBeenCalledWith({ userActivityRetentionDays: 91 }));
+      await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("网络错误"));
+    });
+    expect(findActivityInput().disabled).toBe(false);
+  });
+
+  function renderPage(userDeletionGraceDays: number | undefined, userActivityRetentionDays?: number) {
+    vi.spyOn(api, "adminSettings").mockResolvedValue(settings(userDeletionGraceDays, userActivityRetentionDays));
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -89,8 +131,20 @@ describe("AdminUserSettingsPage deletion retention", () => {
     });
   }
 
+  async function waitForActivityInput() {
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector('input[aria-label="活动记录保留天数"]')).toBeTruthy());
+    });
+  }
+
   function findInput() {
     const input = container.querySelector<HTMLInputElement>('input[aria-label="删除账号保留天数"]');
+    expect(input).toBeTruthy();
+    return input!;
+  }
+
+  function findActivityInput() {
+    const input = container.querySelector<HTMLInputElement>('input[aria-label="活动记录保留天数"]');
     expect(input).toBeTruthy();
     return input!;
   }
@@ -108,6 +162,6 @@ describe("AdminUserSettingsPage deletion retention", () => {
   }
 });
 
-function settings(userDeletionGraceDays?: number): AdminSettings {
-  return { userDeletionGraceDays } as AdminSettings;
+function settings(userDeletionGraceDays?: number, userActivityRetentionDays?: number): AdminSettings {
+  return { userDeletionGraceDays, userActivityRetentionDays } as AdminSettings;
 }

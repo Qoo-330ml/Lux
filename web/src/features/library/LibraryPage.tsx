@@ -150,7 +150,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
   const folderPath = isHomeVideos ? homeVideoFolderPath(searchParams.get("folderPath")) : [];
   const parentId = isHomeVideos ? folderPath.at(-1)?.id ?? "root" : undefined;
   const showMetadataPending = libraries.data?.showMetadataPending ?? true;
-  const itemTypes = isGlobalCollectionLibrary ? "BOX_SET" : libraryItemTypeFilter(library?.kind);
+  // Until the library record arrives, fetch the top-level movie/series set. The
+  // same filter is safe for MOVIE/SERIES/MIXED libraries, so the key does not
+  // change again once the record loads; HOMEVIDEOS switches after the record.
+  const itemTypes = isGlobalCollectionLibrary
+    ? "BOX_SET"
+    : library?.kind === "HOMEVIDEOS"
+      ? undefined
+      : "MOVIE,SERIES";
   const confirmMetadata = useMutation({
     mutationFn: () => api.confirmAdminMetadata([...selectedIds]),
     onSuccess: (result) => {
@@ -210,13 +217,17 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     queryFn: ({ pageParam }) => api.libraryItems(libraryId, pageParam, itemTypes, {
       sortBy,
       sortOrder,
+      fields: "card",
+      count: false,
       ...(metadataStatus ? { metadataStatus } : {}),
       ...(parentId ? { parentId } : {}),
     }),
     initialPageParam: 1,
-    enabled: Boolean(libraryId && library),
+    maxPages: 5,
+    enabled: Boolean(libraryId),
     getNextPageParam: (lastPage) => {
       const page = lastPage.page ?? 1;
+      if (typeof lastPage.hasNext === "boolean") return lastPage.hasNext ? page + 1 : undefined;
       const pageSize = lastPage.pageSize ?? 24;
       const total = lastPage.total ?? 0;
       return page * pageSize < total ? page + 1 : undefined;
@@ -234,13 +245,14 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
     return () => observer.disconnect();
   }, [pages.fetchNextPage, pages.hasNextPage, pages.isFetchingNextPage]);
 
-  if (libraries.isPending) return <LibraryPageLoadingState />;
   if (pages.error && !pages.data) return <section className="lux-page-state"><h1>媒体库加载失败</h1><p>{pages.error.message}</p></section>;
-  if (!library) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
-  if (pages.isPending) return <LibraryPageLoadingState libraryName={library.name} />;
+  if (!library && !libraries.isPending) return <section className="lux-page-state"><h1>媒体库不存在</h1><p>这个媒体库可能已被删除或你没有访问权限。</p></section>;
+  if (pages.isPending) return <LibraryPageLoadingState libraryName={library?.name} />;
 
   const loadedItems = pages.data?.pages.flatMap((page) => page.items ?? []) ?? [];
-  const total = pages.data?.pages[0]?.total ?? 0;
+  const total = pages.data?.pages[0]?.total;
+  const loadedCountLabel = (unit: string) =>
+    total != null ? `${total} ${unit}` : `已加载 ${loadedItems.length} ${unit}`;
   const sortOptions = [
     { value: "Name", label: "标题" },
     { value: "DateCreated", label: "最近添加" },
@@ -305,7 +317,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       {isHomeVideos && folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
       <div className="lux-page-heading">
         <h1>{library?.name || "媒体库"}</h1>
-        <p>{metadataStatus ? `${total} 项待确认内容` : isGlobalCollectionLibrary ? `${total} 个系列 · 按默认上映顺序` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${total} 项内容` : `${total} 项内容`}</p>
+        <p>{metadataStatus ? loadedCountLabel("项待确认内容") : isGlobalCollectionLibrary ? `${loadedCountLabel("个系列")} · 按默认上映顺序` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${loadedCountLabel("项内容")}` : loadedCountLabel("项内容")}</p>
       </div>
       {!isGlobalCollectionLibrary ? <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
         <button
@@ -407,7 +419,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           <button className="lux-button lux-button-secondary" type="button" onClick={() => void pages.fetchNextPage()}>重试</button>
         </p>
       ) : null}
-      {!pages.hasNextPage && loadedItems.length ? <p className="lux-muted-copy" role="status">已加载全部 {total} 项</p> : null}
+      {!pages.hasNextPage && loadedItems.length ? <p className="lux-muted-copy" role="status">已加载全部 {total ?? loadedItems.length} 项</p> : null}
     </section>
   );
 }

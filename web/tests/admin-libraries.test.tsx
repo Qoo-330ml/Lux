@@ -8,7 +8,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AdminLibrariesPage } from "../src/features/admin/AdminLibrariesPage";
 import { api } from "../src/lib/api/client";
-import type { AdminPlugin } from "../src/lib/api/types";
+import type { AdminLibraryDeletionJob, AdminPlugin } from "../src/lib/api/types";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -29,6 +30,20 @@ const library = {
     isAvailable: true,
     isWritable: true,
   }],
+};
+
+const acceptedDeletionJob: AdminLibraryDeletionJob = {
+  id: "deletion-job-1",
+  libraryId: library.id,
+  libraryName: library.name,
+  status: "PENDING",
+  stage: "CANCELLING_SCANS",
+  processedCount: 0,
+  errorCode: null,
+  createdAt: 1,
+  updatedAt: 1,
+  startedAt: null,
+  finishedAt: null,
 };
 
 const configuredScraper: AdminPlugin = {
@@ -335,7 +350,7 @@ describe("AdminLibrariesPage library cards", () => {
     expect(rootForm?.querySelector("[aria-label='添加新媒体库路径']")).toBeNull();
     expect(rootInput?.parentElement).toBe(rootForm);
     expect(browseButton?.parentElement).toBe(rootForm);
-    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    const stylesheet = allStyles;
     expect(stylesheet).toContain(".lux-library-root-form { display: grid; grid-template-columns: minmax(0, 1fr) 40px; gap: 8px; margin-top: 14px; }");
   });
 
@@ -363,7 +378,7 @@ describe("AdminLibrariesPage library cards", () => {
 
     const form = container.querySelector<HTMLFormElement>(".lux-library-create-dialog form");
     expect(form).toBeTruthy();
-    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    const stylesheet = allStyles;
     expect(stylesheet).toContain(".lux-library-create-dialog > .lux-library-dialog-form { min-height: 0; overflow-y: auto; }");
   });
 
@@ -516,11 +531,23 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.textContent).toContain("01每日更新");
   });
 
-  it("removes a library card after the delete request succeeds", async () => {
+  it("removes a library card after the deletion job is accepted", async () => {
     let listedLibraries = [library];
     vi.mocked(api.adminLibraries).mockImplementation(async () => ({ libraries: listedLibraries }));
     const deleteLibrary = vi.spyOn(api, "deleteAdminLibrary").mockImplementation(async (libraryId) => {
       listedLibraries = listedLibraries.filter((item) => item.id !== libraryId);
+      return {
+        job: {
+          id: "deletion-job-1",
+          libraryId,
+          libraryName: library.name,
+          status: "PENDING",
+          stage: "QUEUED",
+          processedCount: 0,
+          createdAt: 1,
+          updatedAt: 1,
+        },
+      };
     });
     const nativeConfirm = vi.spyOn(window, "confirm").mockReturnValue(true);
     await renderPage();
@@ -539,6 +566,7 @@ describe("AdminLibrariesPage library cards", () => {
     expect(container.querySelector(".lux-admin-library-card")).toBeNull();
     expect(nativeConfirm).not.toHaveBeenCalled();
     expect(container.textContent).toContain("还没有媒体库");
+    expect(container.textContent).toContain("正在后台清理");
   });
 
   it("starts metadata refresh from the library actions menu", async () => {
@@ -921,7 +949,7 @@ describe("AdminLibrariesPage library cards", () => {
   });
 
   it("keeps scraper row actions inline and the clear action readable", () => {
-    const stylesheet = readFileSync(`${process.cwd()}/src/react.css`, "utf8");
+    const stylesheet = allStyles;
 
     expect(stylesheet).toMatch(/\.lux-admin-scraper-actions\s*\{[^}]*display:\s*flex;[^}]*align-items:\s*center;/s);
     expect(stylesheet).toMatch(/\.lux-admin-scraper-field\s+\.lux-admin-scraper-clear\s*\{[^}]*width:\s*auto;[^}]*min-height:\s*32px;[^}]*white-space:\s*nowrap;/s);
@@ -1113,5 +1141,66 @@ describe("AdminLibrariesPage library cards", () => {
         images: expect.objectContaining({ thumbnailScrapingMode: "NONE" }),
       }),
     }));
+  });
+
+  it("saves the experimental display-sized image variant cache", async () => {
+    const invalidate = vi.spyOn(QueryClient.prototype, "invalidateQueries");
+    const updateSettings = vi.spyOn(api, "updateAdminSettings").mockResolvedValue({
+      resumePlayedPercent: 90,
+      resumeMinTicks: 1_200_000_000,
+      mediaStrategy: {
+        metadataLanguage: "zh-CN",
+        imageLanguage: "zh-CN",
+        region: "CN",
+        scraperId: null,
+        applyScope: "NEW_CONTENT",
+        images: {
+          poster: true,
+          artwork: false,
+          banner: false,
+          logo: true,
+          thumbnail: true,
+          thumbnailScrapingMode: "SCRAPER_FIRST",
+          disc: false,
+          wallpaper: false,
+          writeToMetadata: false,
+          maxBackdropCount: 1,
+          minDownloadWidth: 1280,
+          variantCache: { enabled: true, maxFiles: 20000, maxBytes: 2147483648, concurrency: 2 },
+        },
+        subtitles: { autoDownload: false, languages: ["zh-CN"], forcedOnly: false, hearingImpaired: false },
+      },
+    });
+    await renderPage();
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("[role='tab']")]
+        .find((button) => button.textContent?.includes("高级"))
+        ?.click();
+    });
+    const toggle = [...container.querySelectorAll<HTMLLabelElement>(".lux-library-strategy-toggle")]
+      .find((label) => label.textContent?.includes("按显示尺寸提供图片"))
+      ?.querySelector<HTMLInputElement>("input");
+    expect(toggle).toBeTruthy();
+    await act(async () => toggle?.click());
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("保存全局策略"))
+        ?.click();
+    });
+
+    expect(updateSettings).toHaveBeenCalledWith(expect.objectContaining({
+      mediaStrategy: expect.objectContaining({
+        images: expect.objectContaining({
+          variantCache: expect.objectContaining({
+            enabled: true,
+            maxFiles: 20000,
+            maxBytes: 2147483648,
+            concurrency: 2,
+          }),
+        }),
+      }),
+    }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["me"] });
   });
 });

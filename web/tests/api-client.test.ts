@@ -30,22 +30,31 @@ function installCookieDocument(initialCookie: string) {
 function installLocalStorage(initialValue: string | null) {
   const storageDescriptor = Object.getOwnPropertyDescriptor(globalThis, "localStorage");
   let value = initialValue;
+  let deviceId: string | null = null;
+  const writes: string[] = [];
   Object.defineProperty(globalThis, "localStorage", {
     configurable: true,
     value: {
       getItem(key: string) {
-        return key === "lux_csrf_token" ? value : null;
+        if (key === "lux_csrf_token") return value;
+        if (key === "lux_device_id") return deviceId;
+        return null;
       },
       setItem(key: string, nextValue: string) {
+        writes.push(`${key}=${nextValue}`);
         if (key === "lux_csrf_token") value = nextValue;
+        if (key === "lux_device_id") deviceId = nextValue;
       },
       removeItem(key: string) {
         if (key === "lux_csrf_token") value = null;
+        if (key === "lux_device_id") deviceId = null;
       },
     },
   });
   return {
     current: () => value,
+    deviceId: () => deviceId,
+    writes: () => writes,
     restore: () => {
       if (storageDescriptor) {
         Object.defineProperty(globalThis, "localStorage", storageDescriptor);
@@ -118,6 +127,152 @@ describe("LuxApiClient", () => {
     expect(path).toBe("/api/v1/setup/status");
     expect(options?.credentials).toBe("same-origin");
     expect((options?.headers as Headers).get("Accept")).toBe("application/json");
+  });
+
+  it("sends and persists one random device ID across API requests", async () => {
+    const storage = installLocalStorage(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    try {
+      const client = new LuxApiClient();
+      await client.request("/api/v1/device-probe");
+      const firstId = (fetchMock.mock.calls[0]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+
+      expect(firstId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      expect(storage.deviceId()).toBe(firstId);
+
+      await client.request("/api/v1/second-device-probe");
+      const secondId = (fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+      expect(secondId).toBe(firstId);
+    } finally {
+      storage.restore();
+    }
+  });
+
+  it("continues requests with one temporary device ID when browser storage is blocked", async () => {
+    const restoreClientState = installBlockedClientState();
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ ok: true }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      }),
+    );
+
+    try {
+      const client = new LuxApiClient();
+      await client.request("/api/v1/device-probe");
+      await client.request("/api/v1/second-device-probe");
+      const firstId = (fetchMock.mock.calls[0]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+      const secondId = (fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-Lux-Device-Id");
+
+      expect(firstId).toMatch(
+        /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+      );
+      expect(secondId).toBe(firstId);
+    } finally {
+      restoreClientState();
+    }
+  });
+
+  it("reads content restriction index readiness from the admin endpoint", async () => {
+    const status = { totalItems: 12, indexedItems: 10, pendingItems: 2 };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(status), { status: 200 }),
+    );
+
+    await expect(new LuxApiClient().adminContentRestrictionIndexStatus()).resolves.toEqual(status);
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/api/v1/admin/content-restriction-index");
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+  });
+
+  it("reads and updates admin user content restrictions", async () => {
+    const input = {
+      expectedVersion: 0,
+      ratingSystem: "MPA" as const,
+      maximumRating: "PG-13",
+      allowUnrated: false,
+      allowedTags: ["action"],
+      blockedTags: ["horror"],
+    };
+    const policy = {
+      ratingSystem: input.ratingSystem,
+      maximumRating: input.maximumRating,
+      allowUnrated: input.allowUnrated,
+      allowedTags: input.allowedTags,
+      blockedTags: input.blockedTags,
+      version: 1,
+      updatedAt: 1_792_382_400,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
+      expect(String(request)).toBe("/api/v1/admin/users/user%2F1/content-restrictions");
+      if (init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual(input);
+        expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(JSON.stringify({ policy }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ policy: null }), { status: 200 });
+    });
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserContentRestrictions("user/1")).resolves.toEqual({ policy: null });
+      await expect(client.updateAdminUserContentRestrictions("user/1", input)).resolves.toEqual({ policy });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("reads and replaces explicit admin library access modes", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      expect(String(input)).toBe("/api/v1/admin/users/user-1/libraries");
+      if (init?.method === "PUT") {
+        expect(JSON.parse(String(init.body))).toEqual({
+          libraryAccessMode: "NONE",
+          libraryIds: [],
+        });
+        expect((init.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+        return new Response(JSON.stringify({
+          userId: "user-1",
+          libraryAccessMode: "NONE",
+          libraryIds: [],
+        }), { status: 200 });
+      }
+      expect(init?.method).toBeUndefined();
+      return new Response(JSON.stringify({
+        libraryAccessMode: "SELECTED",
+        libraryIds: ["library-1"],
+      }), { status: 200 });
+    });
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserLibraryAccess("user-1")).resolves.toEqual({
+        libraryAccessMode: "SELECTED",
+        libraryIds: ["library-1"],
+      });
+      await expect(client.updateAdminUserLibraryAccess("user-1", {
+        libraryAccessMode: "NONE",
+        libraryIds: [],
+      })).resolves.toEqual({
+        userId: "user-1",
+        libraryAccessMode: "NONE",
+        libraryIds: [],
+      });
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    } finally {
+      cookie.restore();
+    }
   });
 
   it("aborts each homepage section request at its 15-second deadline", async () => {
@@ -300,6 +455,480 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
   });
 
+  it("uses paginated admin user Web session and CSRF-protected revoke contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sessions: [{
+          id: "session-1",
+          createdAt: 10,
+          updatedAt: 20,
+          expiresAt: 30,
+          lastSeenAt: 15,
+          isCurrent: false,
+        }],
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserWebSessions("user/1", 2, 10)).resolves.toMatchObject({
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+        sessions: [{ id: "session-1", isCurrent: false }],
+      });
+      await expect(client.revokeAdminUserWebSession("user/1", "session/1")).resolves.toBeUndefined();
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/sessions?page=2&pageSize=10",
+      );
+      expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[1]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/sessions/session%2F1",
+      );
+      expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("uses paginated admin user Emby session and CSRF-protected revoke contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sessions: [{
+          id: "credential-1",
+          deviceId: "device-1",
+          deviceName: "Living Room",
+          deviceType: "TV",
+          clientName: "Infuse",
+          clientVersion: "8.1",
+          createdAt: 10,
+          updatedAt: 20,
+          lastSeenAt: null,
+        }],
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ revokedCount: 3 }), { status: 200 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserEmbySessions("user/1", 2, 10)).resolves.toMatchObject({
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+        sessions: [{ id: "credential-1", deviceId: "device-1", lastSeenAt: null }],
+      });
+      await expect(client.revokeAdminUserEmbySession("user/1", "credential/1")).resolves.toBeUndefined();
+      await expect(client.revokeAllAdminUserEmbySessions("user/1")).resolves.toEqual({ revokedCount: 3 });
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/emby-sessions?page=2&pageSize=10",
+      );
+      expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[1]?.[0]).toBe(
+        "/api/v1/admin/users/user%2F1/emby-sessions/credential%2F1",
+      );
+      expect(fetchMock.mock.calls[1]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      expect(fetchMock.mock.calls[2]?.[0]).toBe("/api/v1/admin/users/user%2F1/emby-sessions");
+      expect(fetchMock.mock.calls[2]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[2]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("reads paginated admin user activity with encoded filters", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        events: [{
+          id: "event-1",
+          userId: "user-1",
+          actorUserId: "user-1",
+          eventType: "AUTH_LOGIN",
+          targetType: null,
+          targetId: null,
+          metadata: { remoteIp: "192.0.2.1" },
+          occurredAt: 1_500,
+        }],
+        page: 2,
+        pageSize: 10,
+        totalCount: 11,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ events: [], page: 1, pageSize: 20, totalCount: 0 }), { status: 200 }));
+    const client = new LuxApiClient();
+
+    await expect(client.adminUserActivity("user /1", {
+      page: 2,
+      pageSize: 10,
+      eventType: "AUTH LOGIN",
+      from: 1_000,
+      to: 2_000,
+    })).resolves.toMatchObject({
+      events: [{ id: "event-1", eventType: "AUTH_LOGIN", metadata: { remoteIp: "192.0.2.1" } }],
+      page: 2,
+      pageSize: 10,
+      totalCount: 11,
+    });
+    await expect(client.adminUserActivity("user-2")).resolves.toMatchObject({ page: 1, pageSize: 20 });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/users/user%20%2F1/activity?page=2&pageSize=10&eventType=AUTH+LOGIN&from=1000&to=2000",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+    expect(fetchMock.mock.calls[1]?.[0]).toBe("/api/v1/admin/users/user-2/activity?page=1&pageSize=20");
+    expect(fetchMock.mock.calls[1]?.[1]?.method).toBeUndefined();
+  });
+
+  it("uses paginated admin user playback and CSRF-protected stop contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        sessions: [{
+          id: "playback-1",
+          userId: "user-1",
+          userName: "Viewer",
+          itemId: "item-1",
+          title: "Example Movie",
+          itemType: "MOVIE",
+          posterAvailable: true,
+          positionTicks: 100,
+          durationTicks: 1000,
+          state: "PLAYING",
+          isPaused: false,
+          lastEventAt: 1_500,
+          client: "Lux Web",
+          clientVersion: "1.0",
+          deviceName: "Living Room",
+          deviceType: "Browser",
+          remoteIp: "192.0.2.1",
+          playbackPlan: "SERVER_HLS",
+          canStop: true,
+        }],
+        page: 3,
+        pageSize: 10,
+        totalCount: 21,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ sessions: [], page: 1, pageSize: 20, totalCount: 0 }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(null, { status: 204 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserPlaybackSessions("user /1", 3, 10)).resolves.toMatchObject({
+        sessions: [{ id: "playback-1", deviceName: "Living Room", remoteIp: "192.0.2.1", canStop: true }],
+        page: 3,
+        pageSize: 10,
+        totalCount: 21,
+      });
+      await expect(client.adminUserPlaybackSessions("user-2")).resolves.toMatchObject({
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      });
+      await expect(client.stopAdminUserPlaybackSession("user /1", "playback/1")).resolves.toBeUndefined();
+
+      expect(fetchMock.mock.calls[0]?.[0]).toBe(
+        "/api/v1/admin/users/user%20%2F1/playback-sessions?page=3&pageSize=10",
+      );
+      expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[1]?.[0]).toBe(
+        "/api/v1/admin/users/user-2/playback-sessions?page=1&pageSize=20",
+      );
+      expect(fetchMock.mock.calls[1]?.[1]?.method).toBeUndefined();
+      expect(fetchMock.mock.calls[2]?.[0]).toBe(
+        "/api/v1/admin/users/user%20%2F1/playback-sessions/playback%2F1",
+      );
+      expect(fetchMock.mock.calls[2]?.[1]?.method).toBe("DELETE");
+      expect((fetchMock.mock.calls[2]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("lists admin user devices with paginated safe summary contracts", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        devices: [{
+          deviceId: "device-1",
+          hasActiveLogin: true,
+          deviceName: "Living Room",
+          deviceType: "EMBY",
+          clientName: "Infuse",
+          clientVersion: "1.2.3",
+          firstSeenAt: 100,
+          lastSeenAt: 200,
+          lastRemoteIp: "192.0.2.10",
+        }],
+        page: 2,
+        pageSize: 5,
+        totalCount: 6,
+      }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        devices: [],
+        page: 1,
+        pageSize: 20,
+        totalCount: 0,
+      }), { status: 200 }));
+
+    const client = new LuxApiClient();
+    await expect(client.adminUserDevices("user /1", 2, 5)).resolves.toMatchObject({
+      devices: [{ deviceId: "device-1", hasActiveLogin: true, clientName: "Infuse", lastSeenAt: 200 }],
+      page: 2,
+      pageSize: 5,
+      totalCount: 6,
+    });
+    await expect(client.adminUserDevices("user-2")).resolves.toMatchObject({
+      devices: [],
+      page: 1,
+      pageSize: 20,
+      totalCount: 0,
+    });
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/users/user%20%2F1/devices?page=2&pageSize=5",
+    );
+    expect(fetchMock.mock.calls[0]?.[1]?.method).toBeUndefined();
+    expect(fetchMock.mock.calls[1]?.[0]).toBe(
+      "/api/v1/admin/users/user-2/devices?page=1&pageSize=20",
+    );
+    expect(fetchMock.mock.calls[1]?.[1]?.method).toBeUndefined();
+  });
+
+  it("applies an admin user permission preset with the CSRF-protected empty response contract", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(
+        new LuxApiClient().applyAdminUserPermissionPreset("user/1", "preset-1"),
+      ).resolves.toBeUndefined();
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/user%2F1/permission-preset");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify({ presetId: "preset-1" }));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("batch-applies admin permission preset and returns per-user results", async () => {
+    const batchResult = {
+      preset: { id: "preset-1", name: "家庭用户", version: 3 },
+      results: [
+        { userId: "user-1", success: true, errorCode: null },
+        { userId: "user-2", success: false, errorCode: "LAST_MANAGER" },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(batchResult), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(
+        new LuxApiClient().applyAdminUserPermissionPresetBatch(["user-1", "user-2"], "preset/1"),
+      ).resolves.toEqual(batchResult);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/batch/permission-preset");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify({ userIds: ["user-1", "user-2"], presetId: "preset/1" }));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("updates admin user status in a batch with the CSRF-protected per-user result contract", async () => {
+    const statusResult = {
+      isDisabled: true,
+      results: [
+        { userId: "user-1", success: true, errorCode: null },
+        { userId: "bad-id", success: false, errorCode: "INVALID_USER_ID" },
+        { userId: "missing-user", success: false, errorCode: "USER_NOT_FOUND" },
+        { userId: "last-admin", success: false, errorCode: "LAST_MANAGER" },
+        { userId: "storage-failure", success: false, errorCode: "STORAGE_UNAVAILABLE" },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(statusResult), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(
+        new LuxApiClient().updateAdminUserStatusBatch(["user-1", "user-2"], true),
+      ).resolves.toEqual(statusResult);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/batch/status");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify({ userIds: ["user-1", "user-2"], isDisabled: true }));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("previews selected admin account preference groups with source and target versions", async () => {
+    const request = {
+      sourceUserId: "source-1",
+      targetUserIds: ["user-1", "user-2"],
+      groups: { appearance: true, home: false, playback: true, libraryOrder: true },
+    };
+    const preview = {
+      sourceUserId: "source-1",
+      sourceVersion: 4,
+      sourceSnapshot: {
+        appearance: { theme: "dark", accentColor: "berry" },
+        playback: {
+          audioLanguage: "Japanese",
+          subtitleLanguage: "English",
+          autoPlayNextEpisode: false,
+          playedPercent: 80,
+        },
+        libraryOrder: ["movies", "series"],
+      },
+      targets: [
+        { userId: "user-1", expectedVersion: 2, libraryOrder: ["movies"] },
+        { userId: "user-2", expectedVersion: 0, libraryOrder: ["movies", "series"] },
+      ],
+      groups: request.groups,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(preview), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(new LuxApiClient().previewAdminAccountPreferencesCopy(request)).resolves.toEqual(preview);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/account-preferences/copy/preview");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify(request));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("applies the reviewed admin account preference copy and returns per-target results", async () => {
+    const request = {
+      sourceUserId: "source-1",
+      sourceExpectedVersion: 4,
+      targets: [{ userId: "user-1", expectedVersion: 2 }],
+      groups: { appearance: true, home: false, playback: false, libraryOrder: true },
+    };
+    const result = {
+      sourceUserId: "source-1",
+      sourceVersion: 4,
+      results: [
+        { userId: "user-1", success: true, errorCode: null },
+        { userId: "user-2", success: false, errorCode: "VERSION_CONFLICT" },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(result), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(new LuxApiClient().copyAdminAccountPreferences(request)).resolves.toEqual(result);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/account-preferences/copy");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify(request));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("previews admin user permission copy with selected groups and opaque versions", async () => {
+    const request = {
+      sourceUserId: "source-1",
+      targetUserIds: ["user-1", "user-2"],
+      groups: { library: true, content: true, playback: false },
+    };
+    const preview = {
+      sourceUserId: "source-1",
+      sourceVersion: "a".repeat(64),
+      sourceSnapshot: {
+        library: { accessMode: "SELECTED", libraryIds: ["library-1"] },
+        content: null,
+      },
+      targets: [
+        { userId: "user-1", expectedVersion: "b".repeat(64) },
+        { userId: "user-2", expectedVersion: "c".repeat(64) },
+      ],
+      groups: request.groups,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(preview), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(new LuxApiClient().previewAdminUserPermissionCopy(request)).resolves.toEqual(preview);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/permission-copy/preview");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify(request));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("applies reviewed admin user permission copy and returns per-target outcomes", async () => {
+    const request = {
+      sourceUserId: "source-1",
+      sourceVersion: "a".repeat(64),
+      targets: [
+        { userId: "user-1", expectedVersion: "b".repeat(64) },
+        { userId: "user-2", expectedVersion: "c".repeat(64) },
+      ],
+      groups: { library: false, content: false, playback: true },
+    };
+    const result = {
+      sourceUserId: "source-1",
+      sourceVersion: request.sourceVersion,
+      results: [
+        { userId: "user-1", success: true, errorCode: null },
+        { userId: "user-2", success: false, errorCode: "VERSION_CONFLICT" },
+      ],
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify(result), { status: 200 }),
+    );
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(new LuxApiClient().copyAdminUserPermissionGroups(request)).resolves.toEqual(result);
+
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/admin/users/permission-copy");
+      expect(options?.method).toBe("POST");
+      expect(options?.body).toBe(JSON.stringify(request));
+      expect((options?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("uses the session-only password change contract", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null, { status: 204 }));
 
@@ -383,15 +1012,40 @@ describe("LuxApiClient", () => {
     } satisfies Partial<ApiError>);
   });
 
-  it("reads and updates the current user's playback threshold", async () => {
-    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
-      if (!init?.method) {
-        return new Response(JSON.stringify({ playedPercent: 95 }), { status: 200 });
-      }
-      expect(String(input)).toBe("/api/v1/auth/settings");
+  it("reads and updates versioned account preferences with CSRF", async () => {
+    const defaults = {
+      theme: "dark",
+      accentColor: "silver",
+      showMediaLibraries: true,
+      showContinueWatching: true,
+      audioLanguage: "原始音轨",
+      subtitleLanguage: "简体中文",
+      autoPlayNextEpisode: true,
+      libraryOrder: [],
+      playedPercent: 95,
+      version: 0,
+      updatedAt: null,
+    };
+    const input = {
+      expectedVersion: 0,
+      theme: "light" as const,
+      accentColor: "berry" as const,
+      showMediaLibraries: false,
+      showContinueWatching: true,
+      audioLanguage: "日本語",
+      subtitleLanguage: "关闭",
+      autoPlayNextEpisode: false,
+      libraryOrder: [],
+      playedPercent: 95,
+    };
+    const saved = { ...input, version: 1, updatedAt: 1_792_382_400 };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
+      expect(String(request)).toBe("/api/v1/auth/account-preferences");
+      if (!init?.method) return new Response(JSON.stringify(defaults), { status: 200 });
+
       expect(init.method).toBe("PATCH");
-      expect(JSON.parse(String(init.body))).toEqual({ playedPercent: 80 });
-      return new Response(JSON.stringify({ playedPercent: 80 }), { status: 200 });
+      expect(JSON.parse(String(init.body))).toEqual(input);
+      return new Response(JSON.stringify(saved), { status: 200 });
     });
     Object.defineProperty(globalThis, "document", {
       configurable: true,
@@ -399,20 +1053,44 @@ describe("LuxApiClient", () => {
     });
 
     const client = new LuxApiClient();
-    await expect(client.userSettings()).resolves.toEqual({ playedPercent: 95 });
-    await expect(client.updateUserSettings({ playedPercent: 80 })).resolves.toEqual({ playedPercent: 80 });
+    await expect(client.accountPreferences()).resolves.toEqual(defaults);
+    await expect(client.updateAccountPreferences(input)).resolves.toEqual(saved);
+    expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+  });
+
+  it("reads and updates the current user's playback threshold", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      if (!init?.method) {
+        return new Response(JSON.stringify({ playedPercent: 95, preferencesVersion: 0 }), { status: 200 });
+      }
+      expect(String(input)).toBe("/api/v1/auth/settings");
+      expect(init.method).toBe("PATCH");
+      expect(JSON.parse(String(init.body))).toEqual({ playedPercent: 80, expectedVersion: 0 });
+      return new Response(JSON.stringify({ playedPercent: 80, preferencesVersion: 1 }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.userSettings()).resolves.toEqual({ playedPercent: 95, preferencesVersion: 0 });
+    await expect(client.updateUserSettings({ playedPercent: 80, expectedVersion: 0 })).resolves.toEqual({
+      playedPercent: 80,
+      preferencesVersion: 1,
+    });
     expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
   });
 
   it("reads and updates the current user's library order", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       if (!init?.method) {
-        return new Response(JSON.stringify({ libraryOrder: ["movies", "series"] }), { status: 200 });
+        return new Response(JSON.stringify({ libraryOrder: ["movies", "series"], preferencesVersion: 3 }), { status: 200 });
       }
       expect(String(input)).toBe("/api/v1/auth/library-order");
       expect(init.method).toBe("PATCH");
-      expect(JSON.parse(String(init.body))).toEqual({ libraryOrder: ["series", "movies"] });
-      return new Response(JSON.stringify({ libraryOrder: ["series", "movies"] }), { status: 200 });
+      expect(JSON.parse(String(init.body))).toEqual({ libraryOrder: ["series", "movies"], expectedVersion: 3 });
+      return new Response(JSON.stringify({ libraryOrder: ["series", "movies"], preferencesVersion: 4 }), { status: 200 });
     });
     Object.defineProperty(globalThis, "document", {
       configurable: true,
@@ -420,9 +1098,10 @@ describe("LuxApiClient", () => {
     });
 
     const client = new LuxApiClient();
-    await expect(client.libraryOrder()).resolves.toEqual({ libraryOrder: ["movies", "series"] });
-    await expect(client.updateLibraryOrder({ libraryOrder: ["series", "movies"] })).resolves.toEqual({
+    await expect(client.libraryOrder()).resolves.toEqual({ libraryOrder: ["movies", "series"], preferencesVersion: 3 });
+    await expect(client.updateLibraryOrder({ libraryOrder: ["series", "movies"], expectedVersion: 3 })).resolves.toEqual({
       libraryOrder: ["series", "movies"],
+      preferencesVersion: 4,
     });
     expect((fetchMock.mock.calls[1]?.[1]?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
   });
@@ -500,6 +1179,22 @@ describe("LuxApiClient", () => {
 
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "/api/v1/libraries/movie-library/items?page=1&pageSize=24&itemType=MOVIE&sortBy=CommunityRating&sortOrder=Descending",
+    );
+  });
+
+  it("requests the card projection for library grids", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ items: [], total: 0 }), { status: 200 }),
+    );
+
+    await new LuxApiClient().libraryItems("movie-library", 2, "MOVIE", {
+      sortBy: "Name",
+      sortOrder: "Ascending",
+      fields: "card",
+    });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/libraries/movie-library/items?page=2&pageSize=24&itemType=MOVIE&sortBy=Name&sortOrder=Ascending&fields=card",
     );
   });
 
@@ -1117,6 +1812,77 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledOnce();
   });
 
+  it("lists and manages global and user access blacklist rules through scoped APIs", async () => {
+    const rule = {
+      id: "rule/1",
+      userId: null,
+      ruleType: "CLIENT",
+      matchValue: "test client",
+      isEnabled: true,
+      createdBy: "admin-1",
+      createdAt: 1_700_000_000,
+      updatedAt: 1_700_000_000,
+    };
+    const page = { rules: [rule], page: 2, pageSize: 25, totalCount: 26 };
+    const expectedRequests = [
+      ["GET", "/api/v1/admin/access-blacklist/global?page=2&pageSize=25"],
+      ["POST", "/api/v1/admin/access-blacklist/global"],
+      ["PATCH", "/api/v1/admin/access-blacklist/global/rule%2F1"],
+      ["DELETE", "/api/v1/admin/access-blacklist/global/rule%2F1"],
+      ["GET", "/api/v1/admin/users/user%2F1/access-blacklist?page=2&pageSize=25"],
+      ["POST", "/api/v1/admin/users/user%2F1/access-blacklist"],
+      ["PATCH", "/api/v1/admin/users/user%2F1/access-blacklist/rule%2F1"],
+      ["DELETE", "/api/v1/admin/users/user%2F1/access-blacklist/rule%2F1"],
+    ];
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+      const [method, path] = expectedRequests.shift() ?? [];
+      expect(String(input)).toBe(path);
+      expect(init?.method ?? "GET").toBe(method);
+      if (method !== "GET") {
+        expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      }
+      if (method === "POST") {
+        expect(JSON.parse(String(init?.body))).toEqual({
+          ruleType: "CLIENT",
+          matchValue: " Test Client ",
+          isEnabled: true,
+        });
+      }
+      if (method === "PATCH") {
+        expect(JSON.parse(String(init?.body))).toEqual({ isEnabled: false });
+        return new Response(JSON.stringify({ id: rule.id, isEnabled: false }), { status: 200 });
+      }
+      if (method === "DELETE") return new Response(null, { status: 204 });
+      if (method === "POST") return new Response(JSON.stringify(rule), { status: 201 });
+      return new Response(JSON.stringify(page), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+
+    const client = new LuxApiClient();
+    await expect(client.adminGlobalAccessBlacklistRules(2, 25)).resolves.toEqual(page);
+    await client.createAdminGlobalAccessBlacklistRule({
+      ruleType: "CLIENT",
+      matchValue: " Test Client ",
+      isEnabled: true,
+    });
+    await client.setAdminGlobalAccessBlacklistRuleEnabled(rule.id, false);
+    await client.deleteAdminGlobalAccessBlacklistRule(rule.id);
+    await expect(client.adminUserAccessBlacklistRules("user/1", 2, 25)).resolves.toEqual(page);
+    await client.createAdminUserAccessBlacklistRule("user/1", {
+      ruleType: "CLIENT",
+      matchValue: " Test Client ",
+      isEnabled: true,
+    });
+    await client.setAdminUserAccessBlacklistRuleEnabled("user/1", rule.id, false);
+    await client.deleteAdminUserAccessBlacklistRule("user/1", rule.id);
+
+    expect(expectedRequests).toEqual([]);
+    expect(fetchMock).toHaveBeenCalledTimes(8);
+  });
+
   it("exposes the paginated plugin catalog and installs a store plugin with CSRF", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);
@@ -1178,6 +1944,202 @@ describe("LuxApiClient", () => {
     await expect(new LuxApiClient().login("admin", "password")).resolves.toEqual({
       id: "admin-1",
       canManageServer: true,
+    });
+  });
+
+  it("posts invitation credentials only in the JSON body without persisting them", async () => {
+    const input = {
+      token: "invitation-secret",
+      username: "invited-user",
+      displayName: "Invited User",
+      password: "invited-user-password",
+    };
+    const storage = installLocalStorage(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ created: true }), { status: 201 }),
+    );
+    try {
+      await expect(new LuxApiClient().acceptUserInvitation(input)).resolves.toEqual({ created: true });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      expect(path).toBe("/api/v1/auth/invitations/accept");
+      expect(options?.method).toBe("POST");
+      expect(JSON.parse(String(options?.body))).toEqual(input);
+      expect((options?.headers as Headers).get("Content-Type")).toBe("application/json");
+      expect(storage.writes().join("\n")).not.toContain(input.token);
+      expect(storage.writes().join("\n")).not.toContain(input.password);
+    } finally {
+      storage.restore();
+    }
+  });
+
+  it.each([
+    [400, "INVALID_REQUEST"],
+    [409, "INVALID_REQUEST"],
+    [413, "INVALID_REQUEST"],
+    [503, "DATABASE_UNAVAILABLE"],
+    [500, "INTERNAL"],
+  ])("maps invitation acceptance HTTP %i to a structured error", async (status, code) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      error: { code, message: "邀请暂时无法处理", requestId: "invitation-request" },
+    }), { status }));
+    await expect(new LuxApiClient().acceptUserInvitation({
+      token: "invitation-secret",
+      username: "invited-user",
+      password: "invited-user-password",
+    })).rejects.toMatchObject({ name: "ApiError", code, status, requestId: "invitation-request" });
+  });
+
+  it("preserves the invitation deployment path in its API request", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ created: true }), { status: 201 }),
+    );
+    await new LuxApiClient().acceptUserInvitation({ token: "token", username: "user", password: "password" }, "/proxy/lux/");
+    expect(fetchMock.mock.calls[0]?.[0]).toBe("/proxy/lux/api/v1/auth/invitations/accept");
+  });
+
+  it.each(["//other.example.test", "https://other.example.test"])("rejects an external invitation deployment path %s", async (sitePath) => {
+    const fetchMock = vi.spyOn(globalThis, "fetch");
+    await expect(new LuxApiClient().acceptUserInvitation({ token: "token", username: "user", password: "password" }, sitePath))
+      .rejects.toMatchObject({ code: "INVALID_REQUEST", status: 400 });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("submits public registration as anonymous JSON without caching credentials", async () => {
+    const input = {
+      email: "applicant@example.test",
+      username: "applicant",
+      displayName: "Public Applicant",
+      password: "applicant-password",
+    };
+    const storage = installLocalStorage(null);
+    const cookie = installCookieDocument("");
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        accepted: true,
+        message: "若申请符合条件，我们会发送邮件",
+      }), { status: 202 }),
+    );
+    try {
+      await expect(new LuxApiClient().submitPublicUserRegistration(input, "/proxy/lux/"))
+        .resolves.toEqual({ accepted: true, message: "若申请符合条件，我们会发送邮件" });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      const headers = options?.headers as Headers;
+      expect(path).toBe("/proxy/lux/api/v1/auth/registrations");
+      expect(options?.method).toBe("POST");
+      expect(options?.credentials).toBe("omit");
+      expect(options?.body).toBe(JSON.stringify(input));
+      expect(headers.get("Content-Type")).toBe("application/json");
+      expect(headers.has("X-CSRF-Token")).toBe(false);
+      expect(storage.writes().join("\n")).not.toContain(input.password);
+      expect(storage.writes().join("\n")).not.toContain(input.email);
+      expect(cookie.current()).toBe("");
+    } finally {
+      storage.restore();
+      cookie.restore();
+    }
+  });
+
+  it("reads the public registration mode anonymously with its deployment path", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ registrationMode: "PUBLIC_EMAIL" }), { status: 200 }),
+    );
+    const storage = installLocalStorage(null);
+    const cookie = installCookieDocument("lux_csrf=csrf-secret");
+    try {
+      await expect(new LuxApiClient().publicRegistrationSettings("/proxy/lux/"))
+        .resolves.toEqual({ registrationMode: "PUBLIC_EMAIL" });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      const headers = options?.headers as Headers;
+      expect(path).toBe("/proxy/lux/api/v1/auth/registrations/settings");
+      expect(options?.method).toBeUndefined();
+      expect(options?.credentials).toBe("omit");
+      expect(headers.has("X-CSRF-Token")).toBe(false);
+      expect(headers.has("X-Lux-Device-Id")).toBe(false);
+      expect(storage.writes()).toHaveLength(0);
+      expect(cookie.current()).toBe("lux_csrf=csrf-secret");
+    } finally {
+      storage.restore();
+      cookie.restore();
+    }
+  });
+
+  it.each(["//other.example.test", "https://other.example.test"])(
+    "rejects an external public registration settings path %s",
+    async (sitePath) => {
+      const fetchMock = vi.spyOn(globalThis, "fetch");
+      await expect(new LuxApiClient().publicRegistrationSettings(sitePath))
+        .rejects.toMatchObject({ code: "INVALID_REQUEST", status: 400 });
+      expect(fetchMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("verifies public registration with a body-only token and no session", async () => {
+    const token = "email-verification-secret";
+    const storage = installLocalStorage(null);
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ verified: true, status: "PENDING_APPROVAL" }), { status: 200 }),
+    );
+    try {
+      await expect(new LuxApiClient().verifyPublicUserRegistrationEmail({ token }, "/proxy/lux"))
+        .resolves.toEqual({ verified: true, status: "PENDING_APPROVAL" });
+      const [path, options] = fetchMock.mock.calls[0] ?? [];
+      const headers = options?.headers as Headers;
+      expect(path).toBe("/proxy/lux/api/v1/auth/registrations/verify-email");
+      expect(options?.method).toBe("POST");
+      expect(options?.credentials).toBe("omit");
+      expect(options?.body).toBe(JSON.stringify({ token }));
+      expect(String(path)).not.toContain(token);
+      expect(headers.has("X-CSRF-Token")).toBe(false);
+      expect(storage.writes().join("\n")).not.toContain(token);
+    } finally {
+      storage.restore();
+    }
+  });
+
+  it("resends a registration email with its idempotency key in an anonymous JSON request", async () => {
+    const input = { email: "applicant@example.test" };
+    const idempotencyKey = "registration-resend-attempt-1";
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({
+        accepted: true,
+        message: "若申请符合条件，我们会发送邮件",
+      }), { status: 202 }),
+    );
+
+    await expect(new LuxApiClient().resendPublicUserRegistrationEmail(
+      input,
+      idempotencyKey,
+      "/proxy/lux",
+    )).resolves.toEqual({ accepted: true, message: "若申请符合条件，我们会发送邮件" });
+    const [path, options] = fetchMock.mock.calls[0] ?? [];
+    const headers = options?.headers as Headers;
+    expect(path).toBe("/proxy/lux/api/v1/auth/registrations/resend");
+    expect(options?.method).toBe("POST");
+    expect(options?.credentials).toBe("omit");
+    expect(options?.body).toBe(JSON.stringify(input));
+    expect(headers.get("Idempotency-Key")).toBe(idempotencyKey);
+    expect(String(path)).not.toContain(idempotencyKey);
+  });
+
+  it.each([
+    [400, "INVALID_REQUEST"],
+    [403, "PERMISSION_DENIED"],
+    [413, "INVALID_REQUEST"],
+    [429, "RATE_LIMITED"],
+    [503, "DATABASE_UNAVAILABLE"],
+  ])("maps public registration HTTP %i to a structured error", async (status, code) => {
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(JSON.stringify({
+      error: { code, message: "注册请求无效或已失效", requestId: "registration-request" },
+    }), { status }));
+    await expect(new LuxApiClient().submitPublicUserRegistration({
+      email: "applicant@example.test",
+      username: "applicant",
+      password: "applicant-password",
+    })).rejects.toMatchObject({
+      name: "ApiError",
+      code,
+      status,
+      requestId: "registration-request",
     });
   });
 
@@ -1562,5 +2524,134 @@ describe("LuxApiClient", () => {
     expect(fetchMock.mock.calls[0]?.[0]).toBe(
       "/api/v1/items/item-1/danmaku?sourceId=source%20%2F%204k",
     );
+  });
+
+  it("sends admin invitation list and lifecycle requests through the typed API client", async () => {
+    const invitation = {
+      id: "invitation-1",
+      recipientEmail: "person@example.test",
+      createdByUserId: "admin-1",
+      acceptedUserId: null,
+      status: "PENDING",
+      presetId: "builtin-user",
+      presetName: "普通用户",
+      presetVersion: 1,
+      expiresAt: 1_800_000_000,
+      acceptedAt: null,
+      revokedAt: null,
+      createdAt: 1_790_000_000,
+      updatedAt: 1_790_000_000,
+    };
+    const page = { invitations: [invitation], page: 2, pageSize: 50, totalCount: 61 };
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify(page), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({
+        invitation,
+        invitationUrl: "/register/invitation#token=one-time-token",
+        emailQueued: true,
+      }), { status: 201 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ emailQueued: true }), { status: 202 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ revoked: true }), { status: 200 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserInvitations({ page: 2, pageSize: 50, status: "pending" }))
+        .resolves.toEqual(page);
+      const [listPath, listOptions] = fetchMock.mock.calls[0] ?? [];
+      const listUrl = new URL(String(listPath), "https://lux.example.test");
+      expect(listUrl.pathname).toBe("/api/v1/admin/user-invitations");
+      expect(listUrl.searchParams.get("page")).toBe("2");
+      expect(listUrl.searchParams.get("pageSize")).toBe("50");
+      expect(listUrl.searchParams.get("status")).toBe("pending");
+      expect(listOptions?.method).toBeUndefined();
+
+      const createInput = { recipientEmail: "person@example.test", presetId: "builtin-user" };
+      await expect(client.createAdminUserInvitation(createInput)).resolves.toMatchObject({
+        invitation,
+        emailQueued: true,
+      });
+      const [createPath, createOptions] = fetchMock.mock.calls[1] ?? [];
+      expect(createPath).toBe("/api/v1/admin/user-invitations");
+      expect(createOptions?.method).toBe("POST");
+      expect(JSON.parse(String(createOptions?.body))).toEqual(createInput);
+      expect((createOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+
+      await expect(client.resendAdminUserInvitation("invitation/1", "retry-key-1"))
+        .resolves.toEqual({ emailQueued: true });
+      const [resendPath, resendOptions] = fetchMock.mock.calls[2] ?? [];
+      expect(resendPath).toBe("/api/v1/admin/user-invitations/invitation%2F1/resend");
+      expect(resendOptions?.method).toBe("POST");
+      expect((resendOptions?.headers as Headers).get("Idempotency-Key")).toBe("retry-key-1");
+      expect((resendOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+
+      await client.revokeAdminUserInvitation("invitation/1");
+      const [revokePath, revokeOptions] = fetchMock.mock.calls[3] ?? [];
+      expect(revokePath).toBe("/api/v1/admin/user-invitations/invitation%2F1/revoke");
+      expect(revokeOptions?.method).toBe("POST");
+      expect((revokeOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      expect(fetchMock).toHaveBeenCalledTimes(4);
+    } finally {
+      cookie.restore();
+    }
+  });
+
+  it("sends admin registration review list, approval, and rejection through the typed API client", async () => {
+    const permissions = {
+      libraryAccessMode: "SELECTED",
+      libraryIds: ["library-1"],
+      canDownload: false,
+      canPlay: true,
+      maxSimultaneousPlaybacks: 2,
+      allowRemux: true,
+      allowAudioTranscode: true,
+      allowVideoTranscode: false,
+    };
+    const page = {
+      requests: [{
+        id: "registration/1",
+        recipientEmail: "person@example.test",
+        status: "PENDING_APPROVAL",
+        createdAt: 1_790_000_000,
+        emailVerifiedAt: 1_790_000_100,
+        permissions,
+      }],
+      page: 1,
+      pageSize: 20,
+      totalCount: 1,
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch")
+      .mockResolvedValueOnce(new Response(JSON.stringify(page), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ approved: true, userId: "user-1" }), { status: 200 }))
+      .mockResolvedValueOnce(new Response(JSON.stringify({ rejected: true }), { status: 200 }));
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      const client = new LuxApiClient();
+      await expect(client.adminUserRegistrations({ page: 1, pageSize: 20 })).resolves.toEqual(page);
+      const [listPath, listOptions] = fetchMock.mock.calls[0] ?? [];
+      const listUrl = new URL(String(listPath), "https://lux.example.test");
+      expect(listUrl.pathname).toBe("/api/v1/admin/user-registrations");
+      expect(listUrl.searchParams.get("page")).toBe("1");
+      expect(listUrl.searchParams.get("pageSize")).toBe("20");
+      expect(listOptions?.method).toBeUndefined();
+
+      await expect(client.approveAdminUserRegistration("registration/1", { permissions }))
+        .resolves.toEqual({ approved: true, userId: "user-1" });
+      const [approvePath, approveOptions] = fetchMock.mock.calls[1] ?? [];
+      expect(approvePath).toBe("/api/v1/admin/user-registrations/registration%2F1/approve");
+      expect(approveOptions?.method).toBe("POST");
+      expect(JSON.parse(String(approveOptions?.body))).toEqual({ permissions });
+      expect((approveOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+
+      await expect(client.rejectAdminUserRegistration("registration/1")).resolves.toEqual({ rejected: true });
+      const [rejectPath, rejectOptions] = fetchMock.mock.calls[2] ?? [];
+      expect(rejectPath).toBe("/api/v1/admin/user-registrations/registration%2F1/reject");
+      expect(rejectOptions?.method).toBe("POST");
+      expect((rejectOptions?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      expect(fetchMock).toHaveBeenCalledTimes(3);
+    } finally {
+      cookie.restore();
+    }
   });
 });

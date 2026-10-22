@@ -1,5 +1,38 @@
 # Lux 客户端兼容性矩阵
 
+## LUX-826 图片缓存与全局开关修订（2026-10-22）
+
+- 图片变体改为 `/config/image-cache/v1/<SHA256(item_id)前两位>/<item_id>/<content_tag>-w<width>.jpg`，与 `metadata/library` 共用条目分片算法。`content_tag` 保留以区分多图和原图更新；URL、ETag、尺寸规则与原图回退保持原有合同。
+- 启动扫描仅清理旧版 `<content_tag前两位>/<content_tag>-w<width>.jpg` 变体与缓存临时文件；新布局恢复 LRU，旧变体按需重新生成。媒体目录与 metadata 原图不受影响。
+- 管理员全局 `variantCache.enabled` 开启即对所有已认证用户生效；不再提供用户优化图片偏好。Web 保存全局策略后刷新 `auth/me`，当前页面无需手动刷新。
+- `auth/me` 删除 `imageVariantsAvailable`，保留全局语义的 `imageVariantsEnabled`。账户偏好与复制快照删除 `optimizedImages`；旧客户端 PATCH 此字段按未知字段返回 400，需刷新 Web 资源。
+- 新增 SQLite/PostgreSQL `0207_remove_user_optimized_images.sql` 删除存储列，保留其他偏好、CAS 版本和时间戳；历史 0204 migration 不修改。数据库升级后回退旧程序应使用升级前备份，以同时恢复列与迁移记录。
+
+## LUX-758 PostgreSQL 黑名单查询与登录修复（2026-10-21）
+
+设备/客户端黑名单的命中结果及启用规则摘要统一通过 `CASE` 和 `CAST(... AS BIGINT)` 返回
+0/1。PostgreSQL 的裸 `EXISTS` 返回 `BOOLEAN`，原实现按 `i64` 读取时会 panic，导致正常
+Web 登录在空黑名单下也无法完成；相同查询还用于 Emby 身份验证和播放票据检查。
+三处结果解码改用 `try_get`，解码错误通过 storage 错误返回，调用方继续按原有规则拒绝授权。
+
+本机 macOS `arm64` / PostgreSQL 16 回归先复现 `users.rs:1976` 的 `matched` 类型解码
+panic，修复后正常登录和命中全局客户端规则后的拒绝均通过。同一组 SQLite/PostgreSQL
+storage 断言覆盖全局/用户范围、启用状态、设备/客户端精确匹配、IP 规则隔离，以及启用规则
+摘要的四种布尔组合。定向 library 回归 3/3 通过，PostgreSQL 使用独立临时测试库。
+`users`、`web_auth`、`emby_auth`、`web_playback` 四个 HTTP 集成目标共 55/55 通过。
+PostgreSQL 定向命令为 `cargo test --locked --lib postgres_user_access_blacklist_queries_and_web_login_are_portable -- --ignored`。
+
+Rust build、fmt 与 diff check 通过。完整 Rust 检查未全绿：`cargo test --locked --all-targets -- --test-threads=1`
+在 library 阶段为 1158 通过、4 失败、32 忽略，后续 integration targets 未继续执行。四项失败为
+`scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、
+`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、
+`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、
+`changed_local_fill_request_during_running_item_is_not_lost`；均在干净基线 `bcc7d3f3` 逐项复现。
+全目标/全特性 Clippy 报告 `emby_catalog.rs`、`media.rs`、`playback/session.rs` 中四处
+`too_many_arguments`，相同错误也在该基线复现。这些元数据/播放函数问题未纳入本次登录修复。
+
+线上容器仍需更新到包含本修复的构建并进行部署后验证。
+
 ## LUX-616 管理员用户播放策略 API（2026-10-19）
 
 管理员可通过 `GET /api/v1/admin/users/{userId}/playback-policy` 读取用户的 `canPlay`、
@@ -10,19 +43,22 @@
 
 ## LUX-592 反向代理客户端 IP（2026-10-19）
 
-播放会话和登录/播放活动的客户端 IP 按有效 `X-Forwarded-For`、`X-Real-IP`、
+播放会话、设备和登录/播放活动中展示的客户端 IP 按有效 `X-Forwarded-For`、`X-Real-IP`、
 `Forwarded` 顺序回退。`X-Forwarded-For` 沿用首个地址规则；`X-Real-IP` 接受单个
 IPv4/IPv6；`Forwarded` 按 [RFC 7239](https://www.rfc-editor.org/rfc/rfc7239.html)
 读取首个代理元素中的 `for`，支持引号、大小写不敏感参数名、IPv6 方括号和可选端口。
-`unknown`、混淆节点、重复 `for` 或异常地址不作为客户端 IP；首个元素不可用时不采用后续代理 IP。
+`unknown`、混淆节点、重复 `for` 或异常地址不作为展示 IP；首个元素不可用时不采用后续代理 IP。
 
-转发头全部缺失或无效时不把连接对端 IP 当作真实客户端 IP；既有会话仍沿用已记录的地址。
-这些地址继续仅用于展示和活动元数据，账号认证、媒体库 ACL、限流和 `X-Forwarded-Proto`
-的 HTTPS 判断保持原有行为。反代需要实际传递上述 IP 请求头之一；本功能无法恢复未传递的客户端地址。
+访问控制使用独立的可信来源解析：从服务端中间件附加的连接对端地址开始，只有对端属于管理员配置的
+`trustedProxyCidrs` 时才解析完整 `X-Forwarded-For` 链，并从右向左跳过可信代理。未配置可信代理或连接对端不可信时，
+转发头不改变 ACL 使用的 IP；`X-Real-IP`、`Forwarded` 和 `X-Forwarded-Proto` 不参与 IP 黑名单判定。
+因此展示的 `remoteIp` 与 IP/CIDR 封禁所用访问 IP 可能不同，显示为真实地址本身不能证明黑名单已命中。
+反向代理未传递可验证的对端/转发链时，Lux 无法恢复未提供的客户端地址。
 
 自动化验证范围：本机 ARM64/SQLite，真实回环 HTTP 的根路径及 `/emby` 播放回调、
-数据库 `playback_sessions.remote_ip` 和 `/Sessions` 的 `RemoteEndPoint`。真实 Lucky、
-FNOS/x86_64 及第三方播放器部署验证待进行；Rust 检查结果见开发规格 LUX-592。
+数据库 `playback_sessions.remote_ip` 和 `/Sessions` 的 `RemoteEndPoint`；可信代理链、伪造头和 IP 黑名单另有解析/认证/播放回归，
+具体见开发规格 LUX-592、LUX-761–772、LUX-818–820。真实 Lucky、FNOS/x86_64 及第三方播放器部署验证仍未进行；
+本机结果不能替代目标反向代理拓扑的验收。
 
 ## LUX-146 STRM 媒体源探测状态
 
@@ -1208,3 +1244,11 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 | 浏览器与部署 | 本轮模块六以 API / HLS 服务端策略为改动面，使用定向 Web/播放协议测试验证；未验证真实 HLS 播放器、第三方客户端、FNOS 或 NAS/x86_64，也未推送或部署。 |
 
 因此模块六的定向实现与本机服务端检查已记录；Rust 全量测试、Clippy 和 Web 静态门禁仍未全部通过。未进入模块七或后续阶段。
+
+## LUX-840：STRM 播放时后台补全媒体信息（2026-10-21）
+
+仅当 `org.lux.strm-media-info` 已安装并启用、媒体信息提取已开启、来源所在媒体库已启用且被插件选中、来源仍缺少媒体信息时，Lux 才为当前 STRM 来源排入后台补提取。该来源作业不继承全库 `OVERWRITE`，不触发截图；已有作业时按有界等待策略重新检查，重复播放请求按来源去重。探测和插件失败不改变播放请求结果，播放入口不等待插件执行。
+
+可触发入口为已授权的 Web/Emby 实际播放 GET，以及已授权的 Emby `PLAYING` 回调；PlaybackInfo、HEAD、浏览详情、暂停和停止回调不触发。播放只排队当前来源，不扩展为全库扫描。单来源范围由 SQLite/PostgreSQL 迁移持久化，普通全库与扫描增量任务范围保持不变。
+
+本机 macOS `arm64` 服务端验证：`playback` 5/5、`playback_strm_probe` 1/1、`strm` 1/1、`strm_probe` 4/4、`strm_probe_api` 2/2、`web_playback` 1/1；另有扫描范围重试锁回归 1/1。完整 Rust 门禁的 4 个失败已在干净 `test` 基线上复现，完整 Clippy 尚有既有诊断；未验证 FNOS/NAS、真实远程媒体服务器或第三方播放器，因此不代表部署环境链路已验证。

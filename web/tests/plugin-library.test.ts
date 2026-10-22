@@ -10,9 +10,10 @@ import { MemoryRouter } from "react-router-dom";
 import { AdminPluginsPage, pluginCategoryLabel } from "../src/features/admin/AdminPluginsPage";
 import { api } from "../src/lib/api/client";
 import type { AdminPlugin } from "../src/lib/api/types";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
 const pluginLibraryCss = readFileSync(resolve(process.cwd(), "src/features/admin/plugin-library.css"), "utf8");
-const reactCss = readFileSync(resolve(process.cwd(), "src/react.css"), "utf8");
+const reactCss = allStyles;
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 

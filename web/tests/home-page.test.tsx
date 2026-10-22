@@ -776,14 +776,14 @@ describe("HomePage shelves", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const libraryLink = container.querySelector<HTMLAnchorElement>(".lux-library-card-link");
+    const libraryLink = container.querySelector<HTMLAnchorElement>(".lux-library-card-copy-link");
     expect(libraryLink).not.toBeNull();
     await act(async () => {
       libraryLink?.focus();
     });
 
     expect(prefetch).toHaveBeenCalledWith(expect.objectContaining({
-      queryKey: queryKeys.library("library-1", 1, "MOVIE", "Name", "Ascending", "all"),
+      queryKey: queryKeys.library("library-1", 1, "MOVIE,SERIES", "Name", "Ascending", "all"),
       initialPageParam: 1,
     }));
   });

@@ -1,6 +1,18 @@
 import type {
+  AccountPreferences,
+  AccountPreferencesUpdate,
   AccountProfile,
+  AccountEmailVerificationResponse,
+  AccountEmailVerificationResendResponse,
   AuthSession,
+  UserInvitationAcceptanceInput,
+  UserInvitationAcceptanceResponse,
+  PublicUserRegistrationInput,
+  PublicUserRegistrationResponse,
+  PublicUserRegistrationEmailVerificationInput,
+  PublicUserRegistrationEmailVerificationResponse,
+  PublicUserRegistrationResendInput,
+  RegistrationMode,
   AdminAuditEvent,
   AdminDashboard,
   AdminHealth,
@@ -17,11 +29,17 @@ import type {
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
   AdminLibraryCoverJob,
+  AdminLibraryDeletionJob,
+  AdminLibraryDeletionJobsPage,
   AdminLibraryPipelineActivityPage,
   AdminLibrary,
   AdminRoot,
   AdminSettings,
   AdminSettingsPatch,
+  AdminMailSettingsResponse,
+  AdminRegistrationSettings,
+  MailSettings,
+  SmtpCredentialsInput,
   AdminEmbyMigrationConnection,
   AdminEmbyMigrationSourceUserPage,
   AdminEmbyMigrationScope,
@@ -33,8 +51,46 @@ import type {
   AdminEmbyMigrationUserLink,
   AdminApiKey,
   NetworkProxyDiagnostics,
+  AdminContentRestrictionIndexStatus,
+  AdminUserContentRestrictionsResponse,
+  AdminUserContentRestrictionUpdateInput,
+  AdminUserActivityPage,
+  AdminUserActivityQuery,
+  AdminUserAccessBlacklistRulesPage,
+  AdminUserAccessBlacklistRule,
+  CreateAdminUserAccessBlacklistRuleInput,
   AdminUser,
+  AdminUserDevicePage,
+  AdminUserEmbySessionPage,
+  AdminUserPlaybackSessionPage,
+  AdminUserEmbySessionRevokeAllResponse,
+  AdminUserWebSessionPage,
+  AdminUserPermissionPreset,
+  AdminUserPermissionPresetBatchResponse,
+  AdminUserPermissionPresetInput,
+  AdminUserStatusBatchResponse,
+  AdminAccountPreferenceCopyApplyInput,
+  AdminAccountPreferenceCopyBatchResponse,
+  AdminAccountPreferenceCopyPreview,
+  AdminAccountPreferenceCopyPreviewInput,
+  AdminUserPermissionCopyApplyInput,
+  AdminUserPermissionCopyBatchResponse,
+  AdminUserPermissionCopyPreview,
+  AdminUserPermissionCopyPreviewInput,
+  AdminUserLibraryAccess,
+  AdminUserLibraryAccessUpdateResult,
   AdminUserPlaybackPolicy,
+  AdminUserInvitationListQuery,
+  AdminUserInvitationPage,
+  CreateAdminUserInvitationInput,
+  CreateAdminUserInvitationResponse,
+  ResendAdminUserInvitationResponse,
+  RevokeAdminUserInvitationResponse,
+  AdminUserRegistrationApprovalInput,
+  AdminUserRegistrationApprovalResponse,
+  AdminUserRegistrationListQuery,
+  AdminUserRegistrationPage,
+  AdminUserRegistrationRejectionResponse,
   AdminUserListQuery,
   AdminUserListResponse,
   AdminMetadataCandidate,
@@ -55,6 +111,7 @@ import type {
   HomeLatestLibrariesResponse,
   HomeResponse,
   UserLibraryOrder,
+  UserLibraryOrderUpdate,
   UserPasswordChangeInput,
   LibrariesResponse,
   LuxUser,
@@ -79,12 +136,63 @@ import type {
   SetupDatabaseStatus,
   MetadataRefreshMode,
   UserPlaybackSettings,
+  UserPlaybackSettingsUpdate,
 } from "./types";
 
 const csrfCookie = "lux_csrf";
 const csrfTokenStorageKey = "lux_csrf_token";
+const deviceIdStorageKey = "lux_device_id";
+const deviceIdPattern = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 const HOME_REQUEST_TIMEOUT_MS = 15_000;
 let inMemoryCsrfToken = "";
+let inMemoryDeviceId = "";
+
+function createClientDeviceId(): string {
+  try {
+    if (typeof globalThis.crypto === "undefined") return "";
+    const bytes = globalThis.crypto.getRandomValues(new Uint8Array(16));
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0")).join("");
+    return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+  } catch {
+    return "";
+  }
+}
+
+function readClientDeviceId(): string {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const stored = localStorage.getItem(deviceIdStorageKey);
+      if (stored && deviceIdPattern.test(stored)) return stored;
+    }
+  } catch {
+    // Storage restrictions should not prevent an API request.
+  }
+
+  if (inMemoryDeviceId) {
+    try {
+      if (typeof localStorage !== "undefined") {
+        localStorage.setItem(deviceIdStorageKey, inMemoryDeviceId);
+      }
+    } catch {
+      // Keep the existing process-local ID when storage remains blocked.
+    }
+    return inMemoryDeviceId;
+  }
+  const generated = createClientDeviceId();
+  if (!generated) return "";
+  inMemoryDeviceId = generated;
+
+  try {
+    if (typeof localStorage !== "undefined") {
+      localStorage.setItem(deviceIdStorageKey, generated);
+    }
+  } catch {
+    // Keep the ID in memory for this page lifetime when storage is unavailable.
+  }
+  return generated;
+}
 
 export type LibrarySortBy = "Name" | "DateCreated" | "PremiereDate" | "CommunityRating";
 export type LibrarySortOrder = "Ascending" | "Descending";
@@ -94,6 +202,8 @@ export type LibraryItemsOptions = {
   metadataStatus?: "PENDING";
   pageSize?: number;
   parentId?: string;
+  fields?: "card";
+  count?: boolean;
 };
 
 function withHomeRequestTimeout<T>(
@@ -153,6 +263,14 @@ export class ApiError extends Error {
     this.requestId = options.requestId;
     this.status = options.status;
   }
+}
+
+function publicAuthEndpointPath(sitePath: string, endpoint: string): string {
+  const prefix = sitePath.replace(/\/+$/, "");
+  if (!/^(?:\/[^/?#\\\s]+)*$/.test(prefix)) {
+    throw new ApiError("站点路径无效", { code: "INVALID_REQUEST", status: 400 });
+  }
+  return prefix + endpoint;
 }
 
 function readCookie(name: string): string {
@@ -217,6 +335,8 @@ export class LuxApiClient {
     const method = options.method?.toUpperCase() ?? "GET";
     const headers = new Headers(options.headers);
     headers.set("Accept", "application/json");
+    const deviceId = readClientDeviceId();
+    if (deviceId) headers.set("X-Lux-Device-Id", deviceId);
     if (options.body && !headers.has("Content-Type")) {
       headers.set("Content-Type", "application/json");
     }
@@ -230,6 +350,24 @@ export class LuxApiClient {
       credentials: "same-origin",
       headers,
     });
+    return this.decodeResponse<T>(response);
+  }
+
+  private async requestPublic<T>(path: string, options: RequestInit = {}): Promise<T> {
+    const headers = new Headers(options.headers);
+    headers.set("Accept", "application/json");
+    if (options.body && !headers.has("Content-Type")) {
+      headers.set("Content-Type", "application/json");
+    }
+    const response = await fetch(path, {
+      ...options,
+      credentials: "omit",
+      headers,
+    });
+    return this.decodeResponse<T>(response);
+  }
+
+  private async decodeResponse<T>(response: Response): Promise<T> {
     const body = await readJson<T & ApiErrorBody>(response);
     if (!response.ok) {
       throw new ApiError(
@@ -310,6 +448,61 @@ export class LuxApiClient {
     return this.request<LoginBackgroundResponse>("/api/v1/auth/login-background");
   }
 
+  acceptUserInvitation(input: UserInvitationAcceptanceInput, sitePath = "") {
+    const prefix = sitePath.replace(/\/+$/, "");
+    if (!/^(?:\/[^/?#\\\s]+)*$/.test(prefix)) {
+      return Promise.reject(new ApiError("站点路径无效", { code: "INVALID_REQUEST", status: 400 }));
+    }
+    return this.request<UserInvitationAcceptanceResponse>(prefix + "/api/v1/auth/invitations/accept", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  submitPublicUserRegistration(input: PublicUserRegistrationInput, sitePath = "") {
+    return this.requestPublic<PublicUserRegistrationResponse>(
+      publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations"),
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  publicRegistrationSettings(sitePath = "") {
+    let path: string;
+    try {
+      path = publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations/settings");
+    } catch (error) {
+      return Promise.reject(error);
+    }
+    return this.requestPublic<{ registrationMode: RegistrationMode }>(
+      path,
+    );
+  }
+
+  verifyPublicUserRegistrationEmail(
+    input: PublicUserRegistrationEmailVerificationInput,
+    sitePath = "",
+  ) {
+    return this.requestPublic<PublicUserRegistrationEmailVerificationResponse>(
+      publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations/verify-email"),
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  resendPublicUserRegistrationEmail(
+    input: PublicUserRegistrationResendInput,
+    idempotencyKey: string,
+    sitePath = "",
+  ) {
+    return this.requestPublic<PublicUserRegistrationResponse>(
+      publicAuthEndpointPath(sitePath, "/api/v1/auth/registrations/resend"),
+      {
+        method: "POST",
+        headers: { "Idempotency-Key": idempotencyKey },
+        body: JSON.stringify(input),
+      },
+    );
+  }
+
   logout() {
     return this.request<void>("/api/v1/auth/logout", { method: "POST" }).then(() => {
       writeStoredCsrfToken(null);
@@ -325,6 +518,17 @@ export class LuxApiClient {
     return this.request<{ user: AccountProfile }>("/api/v1/auth/profile");
   }
 
+  accountPreferences() {
+    return this.request<AccountPreferences>("/api/v1/auth/account-preferences");
+  }
+
+  updateAccountPreferences(input: AccountPreferencesUpdate) {
+    return this.request<AccountPreferences>("/api/v1/auth/account-preferences", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
   updateAccountProfile(input: { displayName: string; email: string }) {
     return this.request<{ user: AccountProfile }>("/api/v1/auth/profile", {
       method: "PATCH",
@@ -332,11 +536,25 @@ export class LuxApiClient {
     });
   }
 
+  resendAccountEmailVerification() {
+    return this.request<AccountEmailVerificationResendResponse>(
+      "/api/v1/auth/profile/email-verification/resend",
+      { method: "POST" },
+    );
+  }
+
+  verifyAccountEmail(input: { token: string }) {
+    return this.request<AccountEmailVerificationResponse>(
+      "/api/v1/auth/profile/email-verification/verify",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
   userSettings() {
     return this.request<UserPlaybackSettings>("/api/v1/auth/settings");
   }
 
-  updateUserSettings(input: Partial<UserPlaybackSettings>) {
+  updateUserSettings(input: UserPlaybackSettingsUpdate) {
     return this.request<UserPlaybackSettings>("/api/v1/auth/settings", {
       method: "PATCH",
       body: JSON.stringify(input),
@@ -354,7 +572,7 @@ export class LuxApiClient {
     return this.request<UserLibraryOrder>("/api/v1/auth/library-order");
   }
 
-  updateLibraryOrder(input: UserLibraryOrder) {
+  updateLibraryOrder(input: UserLibraryOrderUpdate) {
     return this.request<UserLibraryOrder>("/api/v1/auth/library-order", {
       method: "PATCH",
       body: JSON.stringify(input),
@@ -462,6 +680,8 @@ export class LuxApiClient {
     if (options.sortOrder) params.set("sortOrder", options.sortOrder);
     if (options.metadataStatus) params.set("metadataStatus", options.metadataStatus);
     if (options.parentId) params.set("parentId", options.parentId);
+    if (options.fields) params.set("fields", options.fields);
+    if (options.count === false) params.set("count", "false");
     return this.request<PageResponse<MediaItem>>(
       `/api/v1/libraries/${encodeURIComponent(libraryId)}/items?${params}`,
     );
@@ -1040,9 +1260,22 @@ export class LuxApiClient {
   }
 
   deleteAdminLibrary(libraryId: string) {
-    return this.request<void>(`/api/v1/admin/libraries/${encodeURIComponent(libraryId)}`, {
+    return this.request<{ job: AdminLibraryDeletionJob }>(`/api/v1/admin/libraries/${encodeURIComponent(libraryId)}`, {
       method: "DELETE",
     });
+  }
+
+  adminLibraryDeletionJobs(status?: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    if (status) params.set("status", status);
+    return this.request<AdminLibraryDeletionJobsPage>(`/api/v1/admin/library-deletion-jobs?${params}`);
+  }
+
+  retryAdminLibraryDeletion(jobId: string) {
+    return this.request<{ job: AdminLibraryDeletionJob }>(
+      `/api/v1/admin/library-deletion-jobs/${encodeURIComponent(jobId)}/retry`,
+      { method: "POST" },
+    );
   }
 
   addAdminLibraryRoot(libraryId: string, path: string) {
@@ -1085,6 +1318,65 @@ export class LuxApiClient {
     );
   }
 
+  adminUserInvitations(options: AdminUserInvitationListQuery = {}) {
+    const params = new URLSearchParams({
+      page: String(options.page ?? 1),
+      pageSize: String(options.pageSize ?? 20),
+    });
+    if (options.status) params.set("status", options.status);
+    return this.request<AdminUserInvitationPage>(
+      `/api/v1/admin/user-invitations?${params}`,
+    );
+  }
+
+  createAdminUserInvitation(input: CreateAdminUserInvitationInput) {
+    return this.request<CreateAdminUserInvitationResponse>(
+      "/api/v1/admin/user-invitations",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  resendAdminUserInvitation(invitationId: string, idempotencyKey: string) {
+    return this.request<ResendAdminUserInvitationResponse>(
+      `/api/v1/admin/user-invitations/${encodeURIComponent(invitationId)}/resend`,
+      { method: "POST", headers: { "Idempotency-Key": idempotencyKey } },
+    );
+  }
+
+  revokeAdminUserInvitation(invitationId: string) {
+    return this.request<RevokeAdminUserInvitationResponse>(
+      `/api/v1/admin/user-invitations/${encodeURIComponent(invitationId)}/revoke`,
+      { method: "POST" },
+    );
+  }
+
+  adminUserRegistrations(options: AdminUserRegistrationListQuery = {}) {
+    const params = new URLSearchParams({
+      page: String(options.page ?? 1),
+      pageSize: String(options.pageSize ?? 20),
+    });
+    return this.request<AdminUserRegistrationPage>(
+      `/api/v1/admin/user-registrations?${params}`,
+    );
+  }
+
+  approveAdminUserRegistration(
+    requestId: string,
+    input: AdminUserRegistrationApprovalInput,
+  ) {
+    return this.request<AdminUserRegistrationApprovalResponse>(
+      `/api/v1/admin/user-registrations/${encodeURIComponent(requestId)}/approve`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  rejectAdminUserRegistration(requestId: string) {
+    return this.request<AdminUserRegistrationRejectionResponse>(
+      `/api/v1/admin/user-registrations/${encodeURIComponent(requestId)}/reject`,
+      { method: "POST" },
+    );
+  }
+
   adminUsers(options: Partial<AdminUserListQuery> = {}) {
     const params = new URLSearchParams({
       page: String(options.page ?? 1),
@@ -1097,9 +1389,239 @@ export class LuxApiClient {
     return this.request<AdminUserListResponse>(`/api/v1/admin/users?${params}`);
   }
 
+  adminUserPermissionPresets() {
+    return this.request<{ presets: AdminUserPermissionPreset[] }>(
+      "/api/v1/admin/user-permission-presets",
+    );
+  }
+
+  createAdminUserPermissionPreset(input: AdminUserPermissionPresetInput) {
+    return this.request<{ preset: AdminUserPermissionPreset }>(
+      "/api/v1/admin/user-permission-presets",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  updateAdminUserPermissionPreset(
+    presetId: string,
+    version: number,
+    input: AdminUserPermissionPresetInput,
+  ) {
+    return this.request<{ preset: AdminUserPermissionPreset }>(
+      `/api/v1/admin/user-permission-presets/${encodeURIComponent(presetId)}`,
+      { method: "PUT", body: JSON.stringify({ version, ...input }) },
+    );
+  }
+
+  deleteAdminUserPermissionPreset(presetId: string, version: number) {
+    return this.request<void>(
+      `/api/v1/admin/user-permission-presets/${encodeURIComponent(presetId)}?version=${version}`,
+      { method: "DELETE" },
+    );
+  }
+
+  applyAdminUserPermissionPreset(userId: string, presetId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/permission-preset`,
+      { method: "POST", body: JSON.stringify({ presetId }) },
+    );
+  }
+
+  applyAdminUserPermissionPresetBatch(userIds: string[], presetId: string) {
+    return this.request<AdminUserPermissionPresetBatchResponse>(
+      "/api/v1/admin/users/batch/permission-preset",
+      { method: "POST", body: JSON.stringify({ userIds, presetId }) },
+    );
+  }
+
+  updateAdminUserStatusBatch(userIds: string[], isDisabled: boolean) {
+    return this.request<AdminUserStatusBatchResponse>(
+      "/api/v1/admin/users/batch/status",
+      { method: "POST", body: JSON.stringify({ userIds, isDisabled }) },
+    );
+  }
+
+  previewAdminAccountPreferencesCopy(input: AdminAccountPreferenceCopyPreviewInput) {
+    return this.request<AdminAccountPreferenceCopyPreview>(
+      "/api/v1/admin/users/account-preferences/copy/preview",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  copyAdminAccountPreferences(input: AdminAccountPreferenceCopyApplyInput) {
+    return this.request<AdminAccountPreferenceCopyBatchResponse>(
+      "/api/v1/admin/users/account-preferences/copy",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  previewAdminUserPermissionCopy(input: AdminUserPermissionCopyPreviewInput) {
+    return this.request<AdminUserPermissionCopyPreview>(
+      "/api/v1/admin/users/permission-copy/preview",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  copyAdminUserPermissionGroups(input: AdminUserPermissionCopyApplyInput) {
+    return this.request<AdminUserPermissionCopyBatchResponse>(
+      "/api/v1/admin/users/permission-copy",
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
   adminUser(userId: string) {
     return this.request<{ user?: AdminUser }>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}`,
+    );
+  }
+
+  adminUserAccountPreferences(userId: string) {
+    return this.request<AccountPreferences>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/account-preferences`,
+    );
+  }
+
+  adminContentRestrictionIndexStatus() {
+    return this.request<AdminContentRestrictionIndexStatus>(
+      "/api/v1/admin/content-restriction-index",
+    );
+  }
+
+  adminUserContentRestrictions(userId: string) {
+    return this.request<AdminUserContentRestrictionsResponse>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/content-restrictions`,
+    );
+  }
+
+  updateAdminUserContentRestrictions(userId: string, input: AdminUserContentRestrictionUpdateInput) {
+    return this.request<AdminUserContentRestrictionsResponse>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/content-restrictions`,
+      { method: "PUT", body: JSON.stringify(input) },
+    );
+  }
+
+  adminUserWebSessions(userId: string, page = 1, pageSize = 50) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserWebSessionPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/sessions?${params.toString()}`,
+    );
+  }
+
+  revokeAdminUserWebSession(userId: string, sessionId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  adminUserEmbySessions(userId: string, page = 1, pageSize = 50) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserEmbySessionPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions?${params.toString()}`,
+    );
+  }
+
+  revokeAdminUserEmbySession(userId: string, sessionId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  revokeAllAdminUserEmbySessions(userId: string) {
+    return this.request<AdminUserEmbySessionRevokeAllResponse>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/emby-sessions`,
+      { method: "DELETE" },
+    );
+  }
+
+  adminUserDevices(userId: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserDevicePage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/devices?${params.toString()}`,
+    );
+  }
+
+  adminGlobalAccessBlacklistRules(page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserAccessBlacklistRulesPage>(
+      `/api/v1/admin/access-blacklist/global?${params.toString()}`,
+    );
+  }
+
+  createAdminGlobalAccessBlacklistRule(input: CreateAdminUserAccessBlacklistRuleInput) {
+    return this.request<AdminUserAccessBlacklistRule>("/api/v1/admin/access-blacklist/global", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  setAdminGlobalAccessBlacklistRuleEnabled(ruleId: string, isEnabled: boolean) {
+    return this.request<{ id: string; isEnabled: boolean }>(
+      `/api/v1/admin/access-blacklist/global/${encodeURIComponent(ruleId)}`,
+      { method: "PATCH", body: JSON.stringify({ isEnabled }) },
+    );
+  }
+
+  deleteAdminGlobalAccessBlacklistRule(ruleId: string) {
+    return this.request<void>(
+      `/api/v1/admin/access-blacklist/global/${encodeURIComponent(ruleId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  adminUserAccessBlacklistRules(userId: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserAccessBlacklistRulesPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist?${params.toString()}`,
+    );
+  }
+
+  createAdminUserAccessBlacklistRule(userId: string, input: CreateAdminUserAccessBlacklistRuleInput) {
+    return this.request<AdminUserAccessBlacklistRule>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist`,
+      { method: "POST", body: JSON.stringify(input) },
+    );
+  }
+
+  setAdminUserAccessBlacklistRuleEnabled(userId: string, ruleId: string, isEnabled: boolean) {
+    return this.request<{ id: string; isEnabled: boolean }>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist/${encodeURIComponent(ruleId)}`,
+      { method: "PATCH", body: JSON.stringify({ isEnabled }) },
+    );
+  }
+
+  deleteAdminUserAccessBlacklistRule(userId: string, ruleId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/access-blacklist/${encodeURIComponent(ruleId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  adminUserActivity(userId: string, query: AdminUserActivityQuery = {}) {
+    const params = new URLSearchParams({
+      page: String(query.page ?? 1),
+      pageSize: String(query.pageSize ?? 20),
+    });
+    if (query.eventType !== undefined) params.set("eventType", query.eventType);
+    if (query.from !== undefined) params.set("from", String(query.from));
+    if (query.to !== undefined) params.set("to", String(query.to));
+    return this.request<AdminUserActivityPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/activity?${params.toString()}`,
+    );
+  }
+
+  adminUserPlaybackSessions(userId: string, page = 1, pageSize = 20) {
+    const params = new URLSearchParams({ page: String(page), pageSize: String(pageSize) });
+    return this.request<AdminUserPlaybackSessionPage>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-sessions?${params.toString()}`,
+    );
+  }
+
+  stopAdminUserPlaybackSession(userId: string, playbackId: string) {
+    return this.request<void>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/playback-sessions/${encodeURIComponent(playbackId)}`,
+      { method: "DELETE" },
     );
   }
 
@@ -1186,8 +1708,15 @@ export class LuxApiClient {
   }
 
   adminUserLibraryAccess(userId: string) {
-    return this.request<{ libraryIds?: string[] }>(
+    return this.request<AdminUserLibraryAccess>(
       `/api/v1/admin/users/${encodeURIComponent(userId)}/libraries`,
+    );
+  }
+
+  updateAdminUserLibraryAccess(userId: string, access: AdminUserLibraryAccess) {
+    return this.request<AdminUserLibraryAccessUpdateResult>(
+      `/api/v1/admin/users/${encodeURIComponent(userId)}/libraries`,
+      { method: "PUT", body: JSON.stringify(access) },
     );
   }
 
@@ -1481,6 +2010,48 @@ export class LuxApiClient {
     return this.request<AdminSettings>("/api/v1/admin/settings", {
       method: "PATCH",
       body: JSON.stringify(input),
+    });
+  }
+
+  adminRegistrationSettings() {
+    return this.request<AdminRegistrationSettings>("/api/v1/admin/settings/registration");
+  }
+
+  updateAdminRegistrationSettings(input: AdminRegistrationSettings) {
+    return this.request<AdminRegistrationSettings>("/api/v1/admin/settings/registration", {
+      method: "PATCH",
+      body: JSON.stringify(input),
+    });
+  }
+
+  adminMailSettings() {
+    return this.request<AdminMailSettingsResponse>("/api/v1/admin/settings/mail");
+  }
+
+  updateAdminMailSettings(input: MailSettings) {
+    return this.request<void>("/api/v1/admin/settings/mail", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    });
+  }
+
+  updateAdminMailCredentials(input: SmtpCredentialsInput) {
+    return this.request<void>("/api/v1/admin/settings/mail/credentials", {
+      method: "PUT",
+      body: JSON.stringify(input),
+    });
+  }
+
+  deleteAdminMailCredentials() {
+    return this.request<void>("/api/v1/admin/settings/mail/credentials", {
+      method: "DELETE",
+    });
+  }
+
+  testAdminMailConnection() {
+    return this.request<{ reachable: boolean }>("/api/v1/admin/settings/mail/test", {
+      method: "POST",
+      body: JSON.stringify({}),
     });
   }
 

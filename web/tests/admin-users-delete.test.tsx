@@ -34,7 +34,7 @@ describe("AdminUsersPage user actions", () => {
     });
 
     expect(container.querySelector(".lux-admin-page-state")).toBeNull();
-    expect(container.querySelector(".lux-admin-user-row")).toBeTruthy();
+    expect(container.querySelector(".lux-users-row")).toBeTruthy();
   });
 
   it("confirms before disabling and refreshes the list", async () => {
@@ -50,6 +50,7 @@ describe("AdminUsersPage user actions", () => {
     renderPage();
 
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+    openRowMenu();
     const button = container.querySelector<HTMLButtonElement>('button[aria-label="禁用观众账户"]');
     act(() => button?.click());
     expect(confirm).toHaveBeenCalledWith("确定要禁用账户“观众”吗？账户数据会保留，但用户将无法登录。");
@@ -77,6 +78,7 @@ describe("AdminUsersPage user actions", () => {
     renderPage();
 
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+    openRowMenu();
     const button = container.querySelector<HTMLButtonElement>('button[aria-label="启用观众账户"]');
     expect(button).toBeTruthy();
     expect(button?.textContent).toContain("启用");
@@ -106,6 +108,7 @@ describe("AdminUsersPage user actions", () => {
     renderPage();
 
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+    openRowMenu();
     const button = container.querySelector<HTMLButtonElement>('button[aria-label="禁用观众账户"]');
     expect(button?.textContent).toContain("禁用");
   });
@@ -124,6 +127,7 @@ describe("AdminUsersPage user actions", () => {
     renderPage(14);
 
     await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+    openRowMenu();
     const button = container.querySelector<HTMLButtonElement>('button[aria-label="删除观众账户"]');
     await act(async () => { await vi.waitFor(() => expect(button?.title).toBe("移入回收站，保留 14 天")); });
     act(() => button?.click());
@@ -150,10 +154,17 @@ describe("AdminUsersPage user actions", () => {
 
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("观众"));
-      container.querySelector<HTMLButtonElement>('button[aria-label="删除观众账户"]')?.click();
+    });
+    openRowMenu();
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="删除观众账户"]')?.click());
+    await act(async () => {
       await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("删除失败：最后一个管理员不能删除"));
     });
   });
+
+  function openRowMenu(name = "观众") {
+    act(() => container.querySelector<HTMLButtonElement>(`button[aria-label="更多操作：${name}"]`)?.click());
+  }
 
   function renderPage(userDeletionGraceDays = 7) {
     vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays } as AdminSettings);

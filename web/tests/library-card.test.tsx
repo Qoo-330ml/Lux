@@ -62,7 +62,7 @@ describe("LibraryCard", () => {
       );
     });
 
-    const link = container.querySelector<HTMLAnchorElement>(".lux-library-card-link");
+    const link = container.querySelector<HTMLAnchorElement>(".lux-library-card-copy-link");
     await act(async () => {
       link?.dispatchEvent(new MouseEvent("mouseover", { bubbles: true }));
       link?.dispatchEvent(new FocusEvent("focusin", { bubbles: true }));
@@ -88,7 +88,7 @@ describe("LibraryCard", () => {
       );
     });
 
-    const link = container.querySelector<HTMLAnchorElement>(".lux-library-card-link");
+    const link = container.querySelector<HTMLAnchorElement>(".lux-library-card-copy-link");
     expect(link?.getAttribute("href")).toBe(`/libraries/${GLOBAL_COLLECTION_LIBRARY_ID}`);
     expect(container.querySelector(".lux-library-card-menu-trigger")).toBeNull();
     const contextMenuEvent = new MouseEvent("contextmenu", { bubbles: true, cancelable: true });

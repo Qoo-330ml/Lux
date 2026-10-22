@@ -48,11 +48,15 @@ pub fn library_item_directory(
     config_dir: &Path,
     item_id: &str,
 ) -> Result<PathBuf, MetadataPathError> {
-    validate_component(item_id, "item ID")?;
     Ok(metadata_root(config_dir)
         .join(LIBRARY_DIR)
-        .join(stable_shard(item_id))
-        .join(item_id))
+        .join(item_relative_directory(item_id)?))
+}
+
+/// Shared item layout for metadata and derived image caches.
+pub(crate) fn item_relative_directory(item_id: &str) -> Result<PathBuf, MetadataPathError> {
+    validate_component(item_id, "item ID")?;
+    Ok(PathBuf::from(stable_shard(item_id)).join(item_id))
 }
 
 pub fn people_directory(

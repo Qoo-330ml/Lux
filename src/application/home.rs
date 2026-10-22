@@ -15,6 +15,7 @@ use crate::application::{
     catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
     libraries::{LibraryService, LibraryServiceError, LibraryView},
 };
+use crate::storage::UserContentRestrictions;
 
 const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
 const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -64,11 +65,13 @@ struct HomeCacheKey {
     user_id: String,
     is_admin: bool,
     library_ids: Vec<String>,
+    content_restriction_version: Option<i64>,
 }
 
 struct HomeCacheEntry {
     principal: AccessPrincipal,
     library_ids: Vec<String>,
+    content_restrictions: Option<UserContentRestrictions>,
     value: Mutex<Option<CachedSnapshot>>,
     compute_lock: Mutex<()>,
 }
@@ -153,27 +156,51 @@ impl HomeService {
     ) -> Result<Arc<HomeSnapshot>, HomeError> {
         library_ids.sort_unstable();
         library_ids.dedup();
-        let recommended = self.carousel(principal, library_ids.clone()).await?;
+        let content_restrictions = self
+            .inner
+            .catalog
+            .content_restrictions_for_principal(principal)
+            .await?;
+        let recommended = self
+            .cached_snapshot_with_policy(principal, &library_ids, content_restrictions.clone())
+            .await?
+            .recommended
+            .clone();
         let user_id = principal.user_id_string();
         let (continue_watching, recently_added, latest_groups, views) = tokio::try_join!(
             async {
                 self.inner
                     .catalog
-                    .list_home_continue_watching_for_library_ids(&library_ids, &user_id, 0, 10)
+                    .list_home_continue_watching_for_library_ids(
+                        &library_ids,
+                        &user_id,
+                        content_restrictions.as_ref(),
+                        0,
+                        10,
+                    )
                     .await
                     .map_err(HomeError::Catalog)
             },
             async {
                 self.inner
                     .catalog
-                    .list_recently_added_for_library_ids(&library_ids, 0, 12)
+                    .list_recently_added_for_library_ids(
+                        &library_ids,
+                        content_restrictions.as_ref(),
+                        0,
+                        12,
+                    )
                     .await
                     .map_err(HomeError::Catalog)
             },
             async {
                 self.inner
                     .catalog
-                    .list_recently_added_by_library_ids(&library_ids, 12)
+                    .list_recently_added_by_library_ids(
+                        &library_ids,
+                        content_restrictions.as_ref(),
+                        12,
+                    )
                     .await
                     .map_err(HomeError::Catalog)
             },
@@ -206,24 +233,50 @@ impl HomeService {
     ) -> Result<Vec<CatalogItem>, HomeError> {
         library_ids.sort_unstable();
         library_ids.dedup();
+        let content_restrictions = self
+            .inner
+            .catalog
+            .content_restrictions_for_principal(principal)
+            .await?;
         Ok(self
-            .cached_snapshot(principal, &library_ids)
+            .cached_snapshot_with_policy(principal, &library_ids, content_restrictions)
             .await?
             .recommended
             .clone())
     }
 
+    #[cfg(test)]
     async fn cached_snapshot(
         &self,
         principal: AccessPrincipal,
         library_ids: &[String],
     ) -> Result<Arc<CachedHomeSnapshot>, HomeError> {
+        let content_restrictions = self
+            .inner
+            .catalog
+            .content_restrictions_for_principal(principal)
+            .await?;
+        self.cached_snapshot_with_policy(principal, library_ids, content_restrictions)
+            .await
+    }
+
+    async fn cached_snapshot_with_policy(
+        &self,
+        principal: AccessPrincipal,
+        library_ids: &[String],
+        content_restrictions: Option<UserContentRestrictions>,
+    ) -> Result<Arc<CachedHomeSnapshot>, HomeError> {
         let key = HomeCacheKey {
             user_id: principal.user_id_string(),
             is_admin: principal.is_admin,
             library_ids: library_ids.to_vec(),
+            content_restriction_version: content_restrictions
+                .as_ref()
+                .map(|restrictions| restrictions.version),
         };
-        let entry = self.entry(key, principal).await;
+        let entry = self
+            .entry(key, principal, content_restrictions.clone())
+            .await;
         loop {
             let generation = self.inner.generation.load(Ordering::Acquire);
             {
@@ -253,7 +306,10 @@ impl HomeService {
                 }
             }
 
-            let snapshot = Arc::new(self.build_cached_snapshot(principal, library_ids).await?);
+            let snapshot = Arc::new(
+                self.build_cached_snapshot(principal, library_ids, content_restrictions.as_ref())
+                    .await?,
+            );
             if self.inner.generation.load(Ordering::Acquire) != generation
                 || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch
             {
@@ -370,7 +426,12 @@ impl HomeService {
         }
     }
 
-    async fn entry(&self, key: HomeCacheKey, principal: AccessPrincipal) -> Arc<HomeCacheEntry> {
+    async fn entry(
+        &self,
+        key: HomeCacheKey,
+        principal: AccessPrincipal,
+        content_restrictions: Option<UserContentRestrictions>,
+    ) -> Arc<HomeCacheEntry> {
         let mut entries = self.inner.entries.lock().await;
         if !entries.contains_key(&key) && entries.len() >= MAX_HOME_CACHE_ENTRIES {
             entries.clear();
@@ -382,6 +443,7 @@ impl HomeService {
                 Arc::new(HomeCacheEntry {
                     principal,
                     library_ids,
+                    content_restrictions,
                     value: Mutex::new(None),
                     compute_lock: Mutex::new(()),
                 })
@@ -440,7 +502,11 @@ impl HomeService {
             drop(cached);
             let notified = self.inner.invalidation_notify.notified();
             let result = tokio::select! {
-                result = self.build_cached_snapshot(entry.principal, &entry.library_ids) => Some(result),
+                result = self.build_cached_snapshot(
+                    entry.principal,
+                    &entry.library_ids,
+                    entry.content_restrictions.as_ref(),
+                ) => Some(result),
                 _ = notified => None,
             };
             match result {
@@ -474,12 +540,18 @@ impl HomeService {
         &self,
         principal: AccessPrincipal,
         accessible_library_ids: &[String],
+        content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<CachedHomeSnapshot, HomeError> {
         let user_id = principal.user_id_string();
         let recommended = self
             .inner
             .catalog
-            .list_recommended_for_library_ids(accessible_library_ids, &user_id, 7)
+            .list_recommended_for_library_ids_with_policy(
+                accessible_library_ids,
+                &user_id,
+                content_restrictions,
+                7,
+            )
             .await?;
         Ok(CachedHomeSnapshot { recommended })
     }
@@ -498,10 +570,14 @@ mod tests {
             scanner::LibraryScanner,
             setup::SetupService,
         },
+        auth::users::UserStore,
         config::Config,
         domain::ids::UserId,
         library::LibraryKind,
-        storage::{Database, NewPlaybackEvent},
+        storage::{
+            Database, NewPlaybackEvent, NewUserContentRestrictions,
+            UserContentRestrictionsCasResult,
+        },
     };
 
     #[tokio::test]
@@ -535,6 +611,62 @@ mod tests {
 
         assert!(std::ptr::eq(first.as_ref(), reused.as_ref()));
         assert!(!std::ptr::eq(first.as_ref(), isolated.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn carousel_cache_isolated_by_content_restriction_version() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let user = UserStore::new(database.clone())
+            .expect("user store")
+            .create_user(
+                "home-policy-cache-viewer",
+                "Home Policy Cache Viewer",
+                "test password",
+                false,
+            )
+            .await
+            .expect("regular user");
+        let principal = AccessPrincipal::new(user.id, false);
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database.clone()),
+        );
+
+        let before_policy = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("initial policy snapshot");
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                &user.id.to_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await
+            .expect("save content restriction policy");
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+
+        let after_policy = home
+            .cached_snapshot(principal, &[])
+            .await
+            .expect("updated policy snapshot");
+
+        assert!(!std::ptr::eq(before_policy.as_ref(), after_policy.as_ref()));
     }
 
     #[tokio::test]

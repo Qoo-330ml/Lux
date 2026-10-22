@@ -27,6 +27,7 @@ pub enum ApiErrorCode {
     PluginNoUpdate,
     RateLimited,
     InvalidCredentials,
+    VersionConflict,
     SetupAlreadyCompleted,
 }
 
@@ -57,6 +58,7 @@ impl ApiErrorCode {
             Self::PluginNoUpdate => "PLUGIN_NO_UPDATE",
             Self::RateLimited => "RATE_LIMITED",
             Self::InvalidCredentials => "INVALID_CREDENTIALS",
+            Self::VersionConflict => "VERSION_CONFLICT",
             Self::SetupAlreadyCompleted => "SETUP_ALREADY_COMPLETED",
         }
     }

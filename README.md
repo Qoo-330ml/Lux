@@ -1,9 +1,15 @@
-# Lux
-
-[![GitHub Stars](https://img.shields.io/github/stars/Qoo-330ml/Lux?style=flat-square)](https://github.com/Qoo-330ml/Lux/stargazers)
-[![Docker Pulls](https://img.shields.io/docker/pulls/pdzhou/lux?style=flat-square)](https://hub.docker.com/r/pdzhou/lux)
-
-![Lux logo](logo.svg)
+<div align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/logo-white.svg">
+    <img src="assets/logo-black.svg" alt="Lux 标志" width="132">
+  </picture>
+  <h1>Lux</h1>
+  <p>
+    <a href="https://github.com/Qoo-330ml/Lux/stargazers"><img src="https://img.shields.io/github/stars/Qoo-330ml/Lux?style=flat-square" alt="GitHub Stars"></a>
+    <a href="https://hub.docker.com/r/pdzhou/lux"><img src="https://img.shields.io/docker/pulls/pdzhou/lux?style=flat-square" alt="Docker Pulls"></a>
+  </p>
+  <p>Telegram 群组：<a href="https://t.me/lux_prism">@lux_prism</a></p>
+</div>
 
 ## 实机截图
 

@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 const mobileRules = stylesheet.match(/@media \(max-width: 720px\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
 const menuRule = mobileRules.match(/\.lux-library-action-menu\s*\{([^}]*)\}/)?.[1] ?? "";
 

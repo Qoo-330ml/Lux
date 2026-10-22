@@ -64,3 +64,4 @@ define_id!(LibraryRootId);
 define_id!(FilesystemEntryId);
 define_id!(SourceId);
 define_id!(JobId);
+define_id!(LibraryDeletionJobId);

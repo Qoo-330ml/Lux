@@ -1,8 +1,18 @@
 use super::*;
+use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 
 const LUX_SEARCH_ITEM_TYPES: [&str; 3] = ["MOVIE", "SERIES", "VIDEO"];
 const MAX_HOME_LATEST_LIBRARY_IDS: usize = 100;
 const HOME_LATEST_ITEMS_PER_LIBRARY: i64 = 12;
+
+#[derive(Deserialize, Default)]
+pub(super) struct LuxImageQuery {
+    #[serde(default)]
+    #[allow(dead_code)]
+    tag: Option<String>,
+    #[serde(default)]
+    w: Option<String>,
+}
 
 #[derive(Deserialize, Default)]
 pub(super) struct LuxPageQuery {
@@ -26,6 +36,10 @@ pub(super) struct LuxPageQuery {
     sort_order: Option<String>,
     #[serde(rename = "metadataStatus", default)]
     metadata_status: Option<String>,
+    #[serde(default)]
+    fields: Option<String>,
+    #[serde(default)]
+    count: Option<bool>,
 }
 
 #[derive(Deserialize, Default)]
@@ -302,11 +316,19 @@ pub(super) async fn lux_list_home_library_latest(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let content_restrictions = match catalog.content_restrictions_for_principal(principal).await {
+        Ok(restrictions) => restrictions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
 
     let mut latest_items = Vec::new();
     if !regular_library_ids.is_empty() {
         let latest_groups = match catalog
-            .list_recently_added_by_library_ids(&regular_library_ids, HOME_LATEST_ITEMS_PER_LIBRARY)
+            .list_recently_added_by_library_ids(
+                &regular_library_ids,
+                content_restrictions.as_ref(),
+                HOME_LATEST_ITEMS_PER_LIBRARY,
+            )
             .await
         {
             Ok(groups) => groups,
@@ -481,8 +503,16 @@ pub(super) async fn lux_list_library_latest(
     if !accessible_library_ids.iter().any(|id| id == &library_id) {
         return StatusCode::FORBIDDEN.into_response();
     }
+    let content_restrictions = match catalog.content_restrictions_for_principal(principal).await {
+        Ok(restrictions) => restrictions,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     match catalog
-        .list_recently_added_by_library_ids(std::slice::from_ref(&library_id), 12)
+        .list_recently_added_by_library_ids(
+            std::slice::from_ref(&library_id),
+            content_restrictions.as_ref(),
+            12,
+        )
         .await
     {
         Ok(groups) => {
@@ -857,6 +887,21 @@ pub(super) async fn lux_list_library_items(
             .into_response();
         }
     };
+    let projection = match query.fields.as_deref() {
+        None => crate::application::catalog::CatalogItemProjection::Full,
+        Some(value) if value.eq_ignore_ascii_case("card") => {
+            crate::application::catalog::CatalogItemProjection::Card
+        }
+        Some(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "fields 参数无效",
+            )
+            .into_response();
+        }
+    };
     let Some(catalog) = state.catalog.as_ref() else {
         return api_error(
             &headers,
@@ -907,13 +952,17 @@ pub(super) async fn lux_list_library_items(
                     .iter()
                     .map(|card| card.item.clone())
                     .collect::<Vec<_>>();
-                let mut values =
-                    match lux_catalog_items_json_for_user(database, &user.id.to_string(), &items)
-                        .await
-                    {
-                        Ok(values) => values,
-                        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-                    };
+                let mut values = match lux_catalog_items_json_for_user_with_projection(
+                    database,
+                    &user.id.to_string(),
+                    &items,
+                    projection,
+                )
+                .await
+                {
+                    Ok(values) => values,
+                    Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+                };
                 for (value, card) in values.iter_mut().zip(&page.cards) {
                     add_global_collection_card_fields(
                         value,
@@ -953,6 +1002,9 @@ pub(super) async fn lux_list_library_items(
             parent_id.to_owned(),
         )),
     };
+    if query.count == Some(false) {
+        filter.include_total = false;
+    }
     if parent_scope.is_some() {
         if filter.item_types.is_empty() {
             filter.item_types = vec!["FOLDER".to_owned(), "VIDEO".to_owned()];
@@ -986,7 +1038,14 @@ pub(super) async fn lux_list_library_items(
         .await
     {
         Ok(page) => {
-            match lux_catalog_page_json_for_user(database, &user.id.to_string(), &page).await {
+            match lux_catalog_page_json_for_user_with_projection(
+                database,
+                &user.id.to_string(),
+                &page,
+                projection,
+            )
+            .await
+            {
                 Ok(body) => Json(body).into_response(),
                 Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
             }
@@ -1356,12 +1415,7 @@ pub(super) async fn lux_get_children(
                 .list_children(principal, &item_id, "SEASON", offset, limit)
                 .await
         }
-        _ => Ok(CatalogPage {
-            items: Vec::new(),
-            total: 0,
-            offset,
-            limit,
-        }),
+        _ => Ok(CatalogPage::new(Vec::new(), 0, offset, limit)),
     };
     match result {
         Ok(page) => {
@@ -1581,11 +1635,16 @@ pub(super) async fn lux_image(
     headers: HeaderMap,
     method: Method,
     Path((item_id, image_type)): Path<(String, String)>,
+    Query(query): Query<LuxImageQuery>,
     State(state): State<AppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
+    };
+    let width = match lux_image_variant_width(&state, &headers, query.w.as_deref()) {
+        Ok(width) => width,
+        Err(response) => return *response,
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(images) = state.images.as_ref() else {
@@ -1593,12 +1652,16 @@ pub(super) async fn lux_image(
     };
     serve_image(
         images,
+        state.image_variants.as_ref(),
         principal,
         &headers,
         &method,
-        &item_id,
-        &image_type,
-        0,
+        ServeImageTarget {
+            item_id: &item_id,
+            image_type: &image_type,
+            image_index: 0,
+        },
+        width,
     )
     .await
 }
@@ -1607,29 +1670,77 @@ pub(super) async fn lux_image_at_index(
     headers: HeaderMap,
     method: Method,
     Path((item_id, image_type, image_index)): Path<(String, String, String)>,
+    Query(query): Query<LuxImageQuery>,
     State(state): State<AppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Ok(image_index) = image_index.parse::<i64>() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
+    let width = match lux_image_variant_width(&state, &headers, query.w.as_deref()) {
+        Ok(width) => width,
+        Err(response) => return *response,
+    };
+    let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Some(images) = state.images.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     serve_image(
         images,
+        state.image_variants.as_ref(),
         principal,
         &headers,
         &method,
-        &item_id,
-        &image_type,
-        image_index,
+        ServeImageTarget {
+            item_id: &item_id,
+            image_type: &image_type,
+            image_index,
+        },
+        width,
     )
     .await
+}
+
+fn lux_image_variant_width(
+    state: &AppState,
+    headers: &HeaderMap,
+    requested: Option<&str>,
+) -> Result<Option<u32>, Box<Response>> {
+    let Some(variants) = state.image_variants.as_ref() else {
+        return Ok(None);
+    };
+    if !variants.enabled() {
+        return Ok(None);
+    }
+    let Some(requested) = requested else {
+        return Ok(None);
+    };
+    let Ok(width) = requested.parse::<u32>() else {
+        return Err(Box::new(
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "图片宽度无效",
+            )
+            .into_response(),
+        ));
+    };
+    if !crate::application::image_variants::IMAGE_VARIANT_WIDTHS.contains(&width) {
+        return Err(Box::new(
+            api_error(
+                headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "图片宽度无效",
+            )
+            .into_response(),
+        ));
+    }
+    Ok(Some(width))
 }
 
 pub(super) async fn lux_list_item_images(
@@ -2059,12 +2170,16 @@ pub(super) async fn emby_image(
         Some(principal) => {
             serve_image(
                 images,
+                None,
                 principal,
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                0,
+                ServeImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index: 0,
+                },
+                None,
             )
             .await
         }
@@ -2178,12 +2293,16 @@ pub(super) async fn emby_image_at_index(
         Some(principal) => {
             serve_image(
                 images,
+                None,
                 principal,
                 &headers,
                 &method,
-                &internal_item_id,
-                &image_type,
-                image_index,
+                ServeImageTarget {
+                    item_id: &internal_item_id,
+                    image_type: &image_type,
+                    image_index,
+                },
+                None,
             )
             .await
         }
@@ -2401,6 +2520,7 @@ pub(super) struct EmbyStreamQuery {
     pub(super) play_session_id: Option<String>,
     pub(super) playback_user_id: Option<String>,
     pub(super) playback_is_admin: Option<bool>,
+    pub(super) playback_ticket_version: Option<String>,
     pub(super) playback_expires: Option<i64>,
     pub(super) playback_signature: Option<String>,
 }
@@ -2446,6 +2566,10 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
                 "0" => Some(false),
                 _ => None,
             };
+        } else if query.playback_ticket_version.is_none()
+            && name.eq_ignore_ascii_case("luxPlaybackTicketVersion")
+        {
+            query.playback_ticket_version = Some(value.into_owned());
         } else if query.playback_expires.is_none()
             && name.eq_ignore_ascii_case("luxPlaybackExpires")
         {
@@ -2463,6 +2587,7 @@ pub(super) fn emby_stream_query_from_raw(raw_query: RawQuery) -> EmbyStreamQuery
 pub(super) fn emby_stream_query_has_playback_ticket(query: &EmbyStreamQuery) -> bool {
     query.playback_user_id.is_some()
         || query.playback_is_admin.is_some()
+        || query.playback_ticket_version.is_some()
         || query.playback_expires.is_some()
         || query.playback_signature.is_some()
 }
@@ -2512,6 +2637,9 @@ pub(super) fn emby_stream_query_from_path(
     if query.playback_is_admin.is_none() {
         query.playback_is_admin = embedded.playback_is_admin;
     }
+    if query.playback_ticket_version.is_none() {
+        query.playback_ticket_version = embedded.playback_ticket_version;
+    }
     if query.playback_expires.is_none() {
         query.playback_expires = embedded.playback_expires;
     }
@@ -2553,16 +2681,58 @@ pub(super) async fn emby_stream_principal(
         let Some(service) = state.web_playback.as_ref() else {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         };
-        if !service.verify_emby_direct_stream(
-            &user_id.to_string(),
-            is_admin,
-            item_id,
-            source_id,
-            play_session_id,
-            expires_at,
-            signature,
-        ) {
+        let ticket_user_id = user_id.to_string();
+        let legacy_ticket = query.playback_ticket_version.is_none();
+        let is_valid = match query.playback_ticket_version.as_deref() {
+            None => service.verify_emby_direct_stream(
+                &ticket_user_id,
+                is_admin,
+                item_id,
+                source_id,
+                play_session_id,
+                expires_at,
+                signature,
+            ),
+            Some(EMBY_DIRECT_STREAM_TICKET_VERSION) => service.verify_emby_direct_stream_v2(
+                &ticket_user_id,
+                is_admin,
+                item_id,
+                source_id,
+                play_session_id,
+                expires_at,
+                signature,
+            ),
+            Some(_) => false,
+        };
+        if !is_valid {
             return Err(StatusCode::UNAUTHORIZED);
+        }
+        let client_ip = super::request_access_ip(headers, state)
+            .await
+            .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+        match service
+            .authorize_emby_direct_playback_ticket_with_ip(
+                &ticket_user_id,
+                play_session_id,
+                expires_at,
+                legacy_ticket,
+                client_ip,
+            )
+            .await
+        {
+            Ok(()) => {}
+            Err(crate::application::playback::session::WebPlaybackSessionError::NotFound) => {
+                return Err(StatusCode::UNAUTHORIZED);
+            }
+            Err(
+                crate::application::playback::session::WebPlaybackSessionError::Expired
+                | crate::application::playback::session::WebPlaybackSessionError::NotActive,
+            ) => return Err(StatusCode::GONE),
+            Err(
+                crate::application::playback::session::WebPlaybackSessionError::AccessRulesUnavailable
+                | crate::application::playback::session::WebPlaybackSessionError::Storage(_),
+            ) => return Err(StatusCode::SERVICE_UNAVAILABLE),
+            Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
         }
         return Ok(AccessPrincipal::new(user_id, is_admin));
     }
@@ -2865,6 +3035,8 @@ async fn serve_media_file_internal(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let playback_probe_source =
+        (source.source_kind == "STRM_URL").then_some((request.item_id, source.source_id.as_str()));
     if source.source_kind == "STRM_URL" {
         let Some(external_url) = source.external_url else {
             return StatusCode::NOT_FOUND.into_response();
@@ -2882,6 +3054,7 @@ async fn serve_media_file_internal(
                         method,
                         request.play_session_id,
                         response,
+                        playback_probe_source,
                     )
                     .await;
                 }
@@ -2906,6 +3079,7 @@ async fn serve_media_file_internal(
                     method,
                     request.play_session_id,
                     response,
+                    playback_probe_source,
                 )
                 .await;
             }
@@ -2940,6 +3114,7 @@ async fn serve_media_file_internal(
                     method,
                     request.play_session_id,
                     response,
+                    playback_probe_source,
                 )
                 .await;
             }
@@ -2967,6 +3142,7 @@ async fn serve_media_file_internal(
             method,
             request.play_session_id,
             response,
+            playback_probe_source,
         )
         .await;
     }
@@ -2986,6 +3162,7 @@ async fn serve_media_file_internal(
         method,
         request.play_session_id,
         response,
+        playback_probe_source,
     )
     .await
 }
@@ -2997,23 +3174,29 @@ async fn admit_emby_media_response(
     method: &Method,
     play_session_id: Option<&str>,
     response: Response,
+    playback_probe_source: Option<(&str, &str)>,
 ) -> Response {
     if *method != Method::GET
         || !(response.status().is_success() || response.status().is_redirection())
     {
         return response;
     }
-    let Some(play_session_id) = play_session_id else {
-        return response;
-    };
-    let user_id = principal.user_id_string();
-    if user_id.is_empty() {
-        return StatusCode::UNAUTHORIZED.into_response();
+    if let Some(play_session_id) = play_session_id {
+        let user_id = principal.user_id_string();
+        if user_id.is_empty() {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
+        if let Err(response) =
+            super::playback::admit_emby_direct_playback(headers, state, &user_id, play_session_id)
+                .await
+        {
+            return response;
+        }
     }
-    if let Err(response) =
-        super::playback::admit_emby_direct_playback(headers, state, &user_id, play_session_id).await
+    if let Some((item_id, source_id)) = playback_probe_source
+        && let Some(strm_probe) = state.strm_probe.as_ref()
     {
-        return response;
+        strm_probe.schedule_playback_probe(item_id, source_id);
     }
     response
 }
@@ -3397,15 +3580,26 @@ fn embedded_subtitle_error(
     status.into_response()
 }
 
+pub(super) struct ServeImageTarget<'a> {
+    pub item_id: &'a str,
+    pub image_type: &'a str,
+    pub image_index: i64,
+}
+
 pub(super) async fn serve_image(
     images: &ImageService,
+    variants: Option<&Arc<crate::application::image_variants::ImageVariantService>>,
     principal: AccessPrincipal,
     headers: &HeaderMap,
     method: &Method,
-    item_id: &str,
-    image_type: &str,
-    image_index: i64,
+    target: ServeImageTarget<'_>,
+    width: Option<u32>,
 ) -> Response {
+    let ServeImageTarget {
+        item_id,
+        image_type,
+        image_index,
+    } = target;
     let Some(image_type) = normalize_image_type(image_type) else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -3435,6 +3629,12 @@ pub(super) async fn serve_image(
         Err(ImageError::Io { .. }) => return StatusCode::NOT_FOUND.into_response(),
         Err(ImageError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    if let (Some(width), Some(variants)) = (width, variants)
+        && let Some(variant) = variants.resolve_variant(item_id, &image, width).await
+        && let Some(response) = serve_variant_file(&variant, headers, method).await
+    {
+        return response;
+    }
     serve_image_file(
         &image.path,
         image.content_type,
@@ -3638,6 +3838,47 @@ pub(super) async fn serve_image_file(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response())
 }
 
+async fn serve_variant_file(
+    variant: &crate::application::image_variants::VariantFile,
+    headers: &HeaderMap,
+    method: &Method,
+) -> Option<Response> {
+    if headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == variant.etag))
+    {
+        return Some(
+            Response::builder()
+                .status(StatusCode::NOT_MODIFIED)
+                .header("ETag", &variant.etag)
+                .header("Cache-Control", "private, max-age=31536000, immutable")
+                .body(Body::empty())
+                .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+        );
+    }
+    let body = if method == Method::HEAD {
+        Body::empty()
+    } else {
+        // A concurrent startup scan or LRU eviction can delete the cache file
+        // between resolution and opening it; fall back to the original image.
+        let Ok(file) = tokio::fs::File::open(&variant.path).await else {
+            return None;
+        };
+        Body::from_stream(tokio_util::io::ReaderStream::new(file))
+    };
+    Some(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("Content-Type", "image/jpeg")
+            .header("Content-Length", variant.content_length)
+            .header("ETag", &variant.etag)
+            .header("Cache-Control", "private, max-age=31536000, immutable")
+            .body(body)
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response()),
+    )
+}
+
 pub(super) fn lux_page_params(query: &LuxPageQuery) -> Result<(i64, i64), &'static str> {
     page_params(query.page, query.page_size)
 }
@@ -3668,7 +3909,23 @@ pub(super) async fn lux_catalog_items_json_for_user(
     user_id: &str,
     items: &[CatalogItem],
 ) -> Result<Vec<Value>, StorageError> {
-    let values = lux_catalog_item_values_by_id(database, user_id, items).await?;
+    lux_catalog_items_json_for_user_with_projection(
+        database,
+        user_id,
+        items,
+        crate::application::catalog::CatalogItemProjection::Full,
+    )
+    .await
+}
+
+pub(super) async fn lux_catalog_items_json_for_user_with_projection(
+    database: &Database,
+    user_id: &str,
+    items: &[CatalogItem],
+    projection: crate::application::catalog::CatalogItemProjection,
+) -> Result<Vec<Value>, StorageError> {
+    let values =
+        lux_catalog_item_values_by_id_with_projection(database, user_id, items, projection).await?;
     Ok(lux_catalog_items_from_values(items, &values))
 }
 
@@ -3676,6 +3933,21 @@ pub(super) async fn lux_catalog_item_values_by_id(
     database: &Database,
     user_id: &str,
     items: &[CatalogItem],
+) -> Result<HashMap<String, Value>, StorageError> {
+    lux_catalog_item_values_by_id_with_projection(
+        database,
+        user_id,
+        items,
+        crate::application::catalog::CatalogItemProjection::Full,
+    )
+    .await
+}
+
+pub(super) async fn lux_catalog_item_values_by_id_with_projection(
+    database: &Database,
+    user_id: &str,
+    items: &[CatalogItem],
+    projection: crate::application::catalog::CatalogItemProjection,
 ) -> Result<HashMap<String, Value>, StorageError> {
     let mut item_ids = Vec::with_capacity(items.len());
     let mut seen = HashSet::with_capacity(items.len());
@@ -3692,7 +3964,14 @@ pub(super) async fn lux_catalog_item_values_by_id(
     Ok(items
         .iter()
         .map(|item| {
-            let mut value = lux_catalog_item_json_with_user_state(item, states.get(&item.id));
+            let mut value = match projection {
+                crate::application::catalog::CatalogItemProjection::Full => {
+                    lux_catalog_item_json_with_user_state(item, states.get(&item.id))
+                }
+                crate::application::catalog::CatalogItemProjection::Card => {
+                    lux_catalog_card_json_with_user_state(item, states.get(&item.id))
+                }
+            };
             if let Value::Object(object) = &mut value {
                 object.insert(
                     "metadataPending".to_owned(),
@@ -3723,13 +4002,34 @@ pub(super) async fn lux_catalog_page_json_for_user(
     user_id: &str,
     page: &CatalogPage,
 ) -> Result<Value, StorageError> {
-    let items = lux_catalog_items_json_for_user(database, user_id, &page.items).await?;
-    Ok(json!({
+    lux_catalog_page_json_for_user_with_projection(
+        database,
+        user_id,
+        page,
+        crate::application::catalog::CatalogItemProjection::Full,
+    )
+    .await
+}
+
+pub(super) async fn lux_catalog_page_json_for_user_with_projection(
+    database: &Database,
+    user_id: &str,
+    page: &CatalogPage,
+    projection: crate::application::catalog::CatalogItemProjection,
+) -> Result<Value, StorageError> {
+    let items =
+        lux_catalog_items_json_for_user_with_projection(database, user_id, &page.items, projection)
+            .await?;
+    let mut body = json!({
         "items": items,
-        "total": page.total,
         "page": page.offset / page.limit + 1,
         "pageSize": page.limit,
-    }))
+        "hasNext": page.has_next,
+    });
+    if page.total_included {
+        body["total"] = json!(page.total);
+    }
+    Ok(body)
 }
 
 pub(super) fn lux_catalog_item_json(item: &CatalogItem) -> Value {
@@ -3805,6 +4105,88 @@ pub(super) fn lux_catalog_item_json_with_user_state(
         object.insert("userData".to_owned(), lux_user_data_json(user_state));
     }
     value
+}
+
+pub(super) fn lux_catalog_card_json(item: &CatalogItem) -> Value {
+    let default_duration_ticks = item
+        .media_sources
+        .iter()
+        .find(|source| source.is_default)
+        .or_else(|| item.media_sources.first())
+        .and_then(|source| source.duration_ticks);
+    let mut object = serde_json::Map::new();
+    object.insert("id".to_owned(), json!(item.id));
+    object.insert("libraryId".to_owned(), json!(item.library_id));
+    object.insert("itemType".to_owned(), json!(item.item_type));
+    object.insert("title".to_owned(), json!(item.title));
+    object.insert("addedAt".to_owned(), json!(item.added_at));
+    for (key, value) in [
+        ("productionYear", item.production_year.map(Value::from)),
+        ("rating", item.rating.map(Value::from)),
+        ("runtimeTicks", item.runtime_ticks.map(Value::from)),
+        ("episodeCount", item.episode_count.map(Value::from)),
+        ("seriesId", item.series_id.as_deref().map(Value::from)),
+        ("parentId", item.parent_id.as_deref().map(Value::from)),
+        (
+            "defaultDurationTicks",
+            default_duration_ticks.map(Value::from),
+        ),
+    ] {
+        if let Some(value) = value {
+            object.insert(key.to_owned(), value);
+        }
+    }
+    let mut image_tags = serde_json::Map::new();
+    for (key, value) in [
+        ("poster", item.poster_image_tag.as_ref()),
+        ("fanart", item.fanart_image_tag.as_ref()),
+        ("thumb", item.thumb_image_tag.as_ref()),
+        ("logo", item.logo_image_tag.as_ref()),
+    ] {
+        if let Some(value) = value {
+            image_tags.insert(key.to_owned(), json!(value));
+        }
+    }
+    if !image_tags.is_empty() {
+        object.insert("imageTags".to_owned(), Value::Object(image_tags));
+    }
+    Value::Object(object)
+}
+
+pub(super) fn lux_catalog_card_json_with_user_state(
+    item: &CatalogItem,
+    user_state: Option<&crate::storage::StoredUserItemState>,
+) -> Value {
+    let mut value = lux_catalog_card_json(item);
+    if let Value::Object(object) = &mut value {
+        object.insert(
+            "userData".to_owned(),
+            lux_catalog_card_user_data_json(user_state),
+        );
+    }
+    value
+}
+
+fn lux_catalog_card_user_data_json(state: Option<&crate::storage::StoredUserItemState>) -> Value {
+    let mut object = serde_json::Map::new();
+    if let Some(state) = state {
+        if state.position_ticks != 0 {
+            object.insert("positionTicks".to_owned(), json!(state.position_ticks));
+        }
+        if state.play_count != 0 {
+            object.insert("playCount".to_owned(), json!(state.play_count));
+        }
+        if state.is_favorite {
+            object.insert("isFavorite".to_owned(), json!(true));
+        }
+        if state.is_played {
+            object.insert("isPlayed".to_owned(), json!(true));
+        }
+        if let Some(last_played_at) = state.last_played_at {
+            object.insert("lastPlayedAt".to_owned(), json!(last_played_at));
+        }
+    }
+    Value::Object(object)
 }
 
 pub(super) fn apply_local_nfo_details(
@@ -3933,4 +4315,224 @@ pub(super) fn lux_catalog_chapter_json(
         "markerType": chapter.marker_type,
         "chapterIndex": chapter.chapter_index,
     })
+}
+
+#[cfg(test)]
+mod direct_ticket_tests {
+    use super::*;
+    use crate::{
+        api::AppState,
+        application::setup::SetupService,
+        auth::{emby::EmbyAuthService, sessions::WebAuthService},
+        config::Config,
+        storage::Database,
+    };
+
+    #[tokio::test]
+    async fn legacy_direct_ticket_initializes_empty_context_then_fails_closed_on_client_rule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let state = AppState::ready(
+            config,
+            database.clone(),
+            setup,
+            WebAuthService::new(database.clone())?,
+            EmbyAuthService::new(database.clone())?,
+        );
+        let service = state
+            .web_playback
+            .as_ref()
+            .ok_or("missing Web playback service")?;
+        let user_id = user.id.to_string();
+        let item_id = uuid::Uuid::now_v7().to_string();
+        let source_id = uuid::Uuid::now_v7().to_string();
+        let play_session_id = "legacy-direct-ticket-session";
+        let expires_at = crate::application::playback::session::unix_timestamp() + 60;
+        let signature = service
+            .sign_emby_direct_stream_legacy(
+                &user_id,
+                user.is_admin,
+                &item_id,
+                &source_id,
+                play_session_id,
+                expires_at,
+            )
+            .ok_or("could not sign legacy direct ticket")?;
+        let query = emby_stream_query_from_raw(RawQuery(Some(format!(
+            "luxPlaybackUserId={user_id}&luxPlaybackAdmin=1&PlaySessionId={play_session_id}&luxPlaybackExpires={expires_at}&luxPlaybackSignature={signature}"
+        ))));
+
+        assert!(query.playback_ticket_version.is_none());
+        assert!(
+            emby_stream_principal(
+                &HeaderMap::new(),
+                &state,
+                &query,
+                &item_id,
+                Some(&source_id),
+            )
+            .await
+            .is_ok()
+        );
+        let stored_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, play_session_id)
+            .await?
+            .ok_or("legacy direct ticket context was not initialized")?;
+        assert_eq!(stored_ticket.authorization_device_id, None);
+        assert_eq!(stored_ticket.authorization_client_name, None);
+
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by
+             ) VALUES ('legacy-direct-ticket-client-rule', NULL, 'CLIENT', 'playbacktest', 1, ?)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+        let blocked = emby_stream_principal(
+            &HeaderMap::new(),
+            &state,
+            &query,
+            &item_id,
+            Some(&source_id),
+        )
+        .await;
+        assert!(matches!(blocked, Err(StatusCode::GONE)));
+        let stored_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, play_session_id)
+            .await?
+            .ok_or("legacy direct ticket row disappeared")?;
+        assert!(stored_ticket.revoked_at.is_some());
+
+        state.shutdown_background_workers().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_ticket_with_ip_rule_fails_closed_without_peer_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let state = AppState::ready(
+            config,
+            database.clone(),
+            setup,
+            WebAuthService::new(database.clone())?,
+            EmbyAuthService::new(database.clone())?,
+        );
+        let service = state
+            .web_playback
+            .as_ref()
+            .ok_or("missing Web playback service")?;
+        let user_id = user.id.to_string();
+        let item_id = uuid::Uuid::now_v7().to_string();
+        let source_id = uuid::Uuid::now_v7().to_string();
+        let play_session_id = "direct-ticket-missing-peer-session";
+        let expires_at = crate::application::playback::session::unix_timestamp() + 60;
+        let signature = service
+            .sign_emby_direct_stream_v2(
+                &user_id,
+                user.is_admin,
+                &item_id,
+                &source_id,
+                play_session_id,
+                expires_at,
+            )
+            .ok_or("could not sign v2 direct ticket")?;
+        service
+            .register_emby_direct_playback_ticket(
+                &user_id,
+                play_session_id,
+                Some("device-id"),
+                Some("PlaybackTest"),
+                expires_at,
+                crate::application::playback::session::unix_timestamp(),
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by
+             ) VALUES ('direct-ticket-missing-peer-rule', NULL, 'IP_CIDR', '192.0.2.0/24', 1, ?)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+        let query = emby_stream_query_from_raw(RawQuery(Some(format!(
+            "luxPlaybackUserId={user_id}&luxPlaybackAdmin=1&PlaySessionId={play_session_id}&luxPlaybackTicketVersion=2&luxPlaybackExpires={expires_at}&luxPlaybackSignature={signature}"
+        ))));
+
+        let denied = emby_stream_principal(
+            &HeaderMap::new(),
+            &state,
+            &query,
+            &item_id,
+            Some(&source_id),
+        )
+        .await;
+        assert!(matches!(denied, Err(StatusCode::SERVICE_UNAVAILABLE)));
+        let stored_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, play_session_id)
+            .await?
+            .ok_or("direct ticket context was not persisted")?;
+        assert!(stored_ticket.revoked_at.is_some());
+        sqlx::query("DELETE FROM user_access_blacklist_rules WHERE id = ?")
+            .bind("direct-ticket-missing-peer-rule")
+            .execute(database.pool())
+            .await?;
+
+        let invalid_rule_session_id = "direct-ticket-invalid-ip-rule-session";
+        let invalid_rule_expires_at = crate::application::playback::session::unix_timestamp() + 60;
+        service
+            .register_emby_direct_playback_ticket(
+                &user_id,
+                invalid_rule_session_id,
+                Some("device-id"),
+                Some("PlaybackTest"),
+                invalid_rule_expires_at,
+                crate::application::playback::session::unix_timestamp(),
+            )
+            .await?;
+        sqlx::query(
+            "INSERT INTO user_access_blacklist_rules (
+                 id, user_id, rule_type, match_value, is_enabled, created_by
+             ) VALUES ('direct-ticket-invalid-ip-rule', NULL, 'IP_CIDR', 'not-a-cidr', 1, ?)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+        let invalid_rule_result = service
+            .authorize_emby_direct_playback_ticket_with_ip(
+                &user_id,
+                invalid_rule_session_id,
+                invalid_rule_expires_at,
+                false,
+                Some("192.0.2.1".parse()?),
+            )
+            .await;
+        assert!(matches!(
+            invalid_rule_result,
+            Err(crate::application::playback::session::WebPlaybackSessionError::AccessRulesUnavailable)
+        ));
+        let invalid_rule_ticket = database
+            .find_emby_direct_playback_ticket(&user_id, invalid_rule_session_id)
+            .await?
+            .ok_or("invalid-rule ticket context was not persisted")?;
+        assert!(invalid_rule_ticket.revoked_at.is_some());
+
+        state.shutdown_background_workers().await;
+        Ok(())
+    }
 }

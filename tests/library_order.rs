@@ -47,9 +47,33 @@ async fn library_order_is_persisted_and_used_by_web_and_emby_views()
     let second = libraries
         .create_library("Movies B", LibraryKind::Movie, false)
         .await?;
+    let hidden = libraries
+        .create_library("Disabled Movies", LibraryKind::Movie, false)
+        .await?;
     let regular = UserStore::new(database.clone())?
         .create_user("viewer", "Viewer", "viewer password", false)
         .await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(hidden.id.to_string())
+        .execute(database.pool())
+        .await?;
+    for (position, library_id) in [
+        first.id.to_string(),
+        hidden.id.to_string(),
+        second.id.to_string(),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        sqlx::query(
+            "INSERT INTO user_library_order (user_id, library_id, position) VALUES (?, ?, ?)",
+        )
+        .bind(regular.id.to_string())
+        .bind(library_id)
+        .bind(position as i64)
+        .execute(database.pool())
+        .await?;
+    }
     let emby_first_id = emby_public_id(&first.id.to_string());
     let emby_second_id = emby_public_id(&second.id.to_string());
     let app = app_with_state(AppState::ready(
@@ -84,20 +108,33 @@ async fn library_order_is_persisted_and_used_by_web_and_emby_views()
         .send()
         .await?;
     assert_eq!(defaults.status(), reqwest::StatusCode::OK);
-    assert_eq!(defaults.json::<Value>().await?["libraryOrder"], json!([]));
+    let defaults = defaults.json::<Value>().await?;
+    assert_eq!(defaults["libraryOrder"], json!([]));
+    assert_eq!(defaults["preferencesVersion"], 0);
 
     let updated = client
         .patch(format!("{base_url}/api/v1/auth/library-order"))
         .header(COOKIE, &cookies)
         .header("x-csrf-token", &csrf)
-        .json(&json!({ "libraryOrder": [second.id, first.id] }))
+        .json(&json!({ "libraryOrder": [second.id, first.id], "expectedVersion": 0 }))
         .send()
         .await?;
     assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let updated = updated.json::<Value>().await?;
     assert_eq!(
-        updated.json::<Value>().await?["libraryOrder"],
+        updated["libraryOrder"],
         json!([second.id.to_string(), first.id.to_string()])
     );
+    assert_eq!(updated["preferencesVersion"], 1);
+
+    let stale = client
+        .patch(format!("{base_url}/api/v1/auth/library-order"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "libraryOrder": [first.id, second.id], "expectedVersion": 0 }))
+        .send()
+        .await?;
+    assert_eq!(stale.status(), reqwest::StatusCode::CONFLICT);
 
     for library_id in [&first.id.to_string(), &second.id.to_string()] {
         let access = client
@@ -135,6 +172,23 @@ async fn library_order_is_persisted_and_used_by_web_and_emby_views()
         .await?;
     assert_eq!(regular_defaults["useAdminLibraryOrder"], true);
     assert_eq!(regular_defaults["libraryOrderForced"], false);
+
+    let regular_preferences = client
+        .get(format!("{base_url}/api/v1/auth/account-preferences"))
+        .header(COOKIE, &regular_cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    assert_eq!(
+        regular_preferences["libraryOrder"],
+        json!([first.id.to_string(), second.id.to_string()])
+    );
+    assert!(
+        !regular_preferences["libraryOrder"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id == &hidden.id.to_string()))
+    );
 
     let regular_admin_order = client
         .get(format!("{base_url}/api/v1/auth/library-order"))

@@ -1,3 +1,4 @@
+import "./player.css";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   useCallback,

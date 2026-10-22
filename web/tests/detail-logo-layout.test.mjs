@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
 test("detail logo sits above the title in the copy column", () => {
   const source = readFileSync(new URL("../src/features/detail/MediaDetailHero.tsx", import.meta.url), "utf8");
-  const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+  const stylesheet = allStyles;
   const titleRowStart = source.indexOf('className="lux-detail-title-row"');
   const titleRowEnd = source.indexOf("</div>", titleRowStart);
   const titleRow = titleRowStart >= 0 && titleRowEnd > titleRowStart ? source.slice(titleRowStart, titleRowEnd) : "";

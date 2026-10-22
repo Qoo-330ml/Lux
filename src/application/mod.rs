@@ -13,11 +13,13 @@ pub(crate) mod admin_scan_jobs;
 pub(crate) mod admin_scheduled_tasks;
 pub(crate) mod admin_task_activity;
 pub(crate) mod admin_user_access;
+pub(crate) mod admin_user_lifecycle;
 pub(crate) mod background_work;
 pub mod candidates;
 pub mod catalog;
 pub mod chapter_detector;
 pub mod collections;
+pub(crate) mod content_restriction_index;
 pub mod danmaku;
 pub mod database_diagnostics;
 pub mod database_setup;
@@ -30,13 +32,17 @@ pub mod emby_migration_service;
 pub mod home;
 pub mod identification;
 pub mod image_repairs;
+pub(crate) mod image_variants;
 pub mod images;
 pub(crate) mod internal_write;
 pub mod ip_location;
 pub mod item_merge;
 pub mod libraries;
 pub mod library_covers;
+pub(crate) mod library_deletion;
 pub mod login_background_assets;
+pub(crate) mod mail;
+pub mod mail_worker;
 pub mod media_matching;
 pub mod metadata;
 pub mod metadata_objects;
@@ -72,7 +78,22 @@ pub mod strm_probe_policy;
 pub mod strm_target;
 pub(crate) mod thumbnail_policy;
 pub mod thumbnails;
+pub(crate) mod user_access_rules;
+pub(crate) mod user_account_preferences;
 pub mod user_avatars;
 pub(crate) mod user_cleanup;
+pub(crate) mod user_content_restrictions;
+// LUX-790 consumes these invitation operations in the admin API.
+#[allow(dead_code)]
+pub(crate) mod user_invitations;
+// LUX-809 connects public registration endpoints to this service.
+#[allow(dead_code)]
+pub(crate) mod user_email_verification;
+#[allow(dead_code)]
+pub(crate) mod user_registration;
+// The next API task consumes this service; keep this task limited to its storage and business model.
+pub(crate) mod user_permission_copy;
+#[allow(dead_code)]
+pub(crate) mod user_presets;
 pub mod watch;
 pub mod webhooks;

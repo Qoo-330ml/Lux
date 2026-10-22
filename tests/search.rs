@@ -49,6 +49,10 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     .bind(unrelated_library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
     let root = temp_dir.path().join("Movies");
     tokio::fs::create_dir_all(&root).await?;
     tokio::fs::write(root.join("银河护卫队.2024.mkv"), b"one").await?;

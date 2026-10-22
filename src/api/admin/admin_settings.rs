@@ -3,8 +3,26 @@ use super::*;
 pub(super) fn api_routes() -> Router<AppState> {
     Router::new()
         .route(
+            "/api/v1/admin/settings/registration",
+            get(admin_get_registration_settings)
+                .patch(admin_update_registration_settings)
+                .layer(axum::extract::DefaultBodyLimit::max(4 * 1024)),
+        )
+        .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
+        )
+        .route(
+            "/api/v1/admin/settings/mail",
+            get(admin_get_mail_settings).put(admin_update_mail_settings),
+        )
+        .route(
+            "/api/v1/admin/settings/mail/credentials",
+            put(admin_update_mail_credentials).delete(admin_delete_mail_credentials),
+        )
+        .route(
+            "/api/v1/admin/settings/mail/test",
+            post(admin_test_mail_connection),
         )
         .route(
             "/api/v1/admin/api-key",
@@ -15,6 +33,265 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/settings/network-proxy/test",
             post(admin_test_network_proxy),
         )
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RegistrationSettingsPatch {
+    registration_mode: Option<String>,
+    version: Option<i64>,
+}
+
+fn registration_settings_response(settings: crate::storage::StoredRegistrationMode) -> Response {
+    Json(json!({ "registrationMode": settings.mode, "version": settings.version })).into_response()
+}
+
+async fn admin_get_registration_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::settings::read_registration_mode(database).await {
+        Ok(settings) => registration_settings_response(settings),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+async fn admin_update_registration_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let invalid = || {
+        api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册设置无效",
+        )
+        .into_response()
+    };
+    let value = match payload {
+        Ok(Json(value)) => value,
+        Err(error) if error.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return StatusCode::PAYLOAD_TOO_LARGE.into_response();
+        }
+        Err(_) => return invalid(),
+    };
+    if value
+        .as_object()
+        .is_some_and(|fields| fields.values().any(Value::is_null))
+    {
+        return invalid();
+    }
+    let Ok(request) = serde_json::from_value::<RegistrationSettingsPatch>(value) else {
+        return invalid();
+    };
+    if request.version.is_some_and(|version| version < 0) {
+        return invalid();
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(mode) = request.registration_mode else {
+        return match crate::application::settings::read_registration_mode(database).await {
+            Ok(settings) => registration_settings_response(settings),
+            Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    };
+    let Some(version) = request.version else {
+        return invalid();
+    };
+    use crate::application::settings::RegistrationModeError;
+    match crate::application::settings::update_registration_mode(database, &mode, version).await {
+        Ok(settings) => {
+            record_audit_event(
+                &state,
+                &headers,
+                "SETTINGS_UPDATED",
+                Some("registration_settings"),
+                None,
+                &json!({"registrationMode": settings.mode, "version": settings.version})
+                    .to_string(),
+            )
+            .await;
+            registration_settings_response(settings)
+        }
+        Err(RegistrationModeError::InvalidMode) => invalid(),
+        Err(RegistrationModeError::Conflict) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::VersionConflict,
+            "注册设置已更新，请刷新后重试",
+        )
+        .into_response(),
+        Err(RegistrationModeError::Unavailable) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_get_mail_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let settings = match crate::application::mail::read_mail_settings(config_dir).await {
+        Ok(settings) => settings,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    let credentials_configured =
+        match crate::application::mail::read_smtp_credentials(config_dir).await {
+            Ok(credentials) => credentials.is_some(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+    Json(json!({
+        "configured": settings.is_some(),
+        "credentialsConfigured": credentials_configured,
+        "settings": settings,
+    }))
+    .into_response()
+}
+
+pub(crate) async fn admin_update_mail_settings(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(settings): Json<crate::application::mail::MailSettings>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if settings.validate().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 设置无效",
+        )
+        .into_response();
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::write_mail_settings(config_dir, Some(&settings)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 设置无效",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_update_mail_credentials(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(credentials): Json<crate::application::mail::SmtpCredentials>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if credentials.validate().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 凭据无效",
+        )
+        .into_response();
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::write_smtp_credentials(config_dir, Some(&credentials)).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 凭据无效",
+        )
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_delete_mail_credentials(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::write_smtp_credentials(config_dir, None).await {
+        Ok(()) => StatusCode::NO_CONTENT.into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_test_mail_connection(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::mail::test_smtp_connection(config_dir).await {
+        Ok(()) => Json(json!({ "reachable": true })).into_response(),
+        Err(crate::application::mail::MailError::SettingsNotConfigured) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "请先保存 SMTP 设置",
+        )
+        .into_response(),
+        Err(crate::application::mail::MailError::SettingsRejected) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "SMTP 设置无效",
+        )
+        .into_response(),
+        Err(crate::application::mail::MailError::SettingsUnavailable)
+        | Err(crate::application::mail::MailError::CredentialsUnavailable) => {
+            StatusCode::SERVICE_UNAVAILABLE.into_response()
+        }
+        Err(crate::application::mail::MailError::CredentialsRejected) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "SMTP 配置暂时不可用",
+        )
+        .into_response(),
+        Err(crate::application::mail::MailError::ConnectionFailed)
+        | Err(crate::application::mail::MailError::TransportUnavailable) => api_error(
+            &headers,
+            StatusCode::BAD_GATEWAY,
+            lux::ApiErrorCode::Internal,
+            "SMTP 连接失败",
+        )
+        .into_response(),
+    }
 }
 
 pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
@@ -40,6 +317,9 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "resumeMinTicks": settings.resume_min_ticks,
         "forceAdminLibraryOrder": settings.force_admin_library_order,
         "userDeletionGraceDays": settings.user_deletion_grace_days,
+        "userActivityRetentionDays": settings.user_activity_retention_days,
+        "trustedProxyCidrs": settings.trusted_proxy_cidrs,
+        "newUserPermissions": settings.new_user_permissions,
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,
@@ -143,6 +423,9 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
     pub(crate) user_deletion_grace_days: Option<i64>,
+    pub(crate) user_activity_retention_days: Option<i64>,
+    pub(crate) trusted_proxy_cidrs: Option<Vec<String>>,
+    pub(crate) new_user_permissions: Option<crate::application::settings::NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     #[serde(flatten)]
@@ -257,6 +540,9 @@ pub(crate) async fn admin_update_settings(
             resume_min_ticks: request.resume_min_ticks,
             force_admin_library_order: request.force_admin_library_order,
             user_deletion_grace_days: request.user_deletion_grace_days,
+            user_activity_retention_days: request.user_activity_retention_days,
+            trusted_proxy_cidrs: request.trusted_proxy_cidrs,
+            new_user_permissions: request.new_user_permissions,
             login_background_source: request.login_background_source,
             media_strategy: request.media_strategy,
             network_proxy,
@@ -307,6 +593,33 @@ pub(crate) async fn admin_update_settings(
             )
             .into_response();
         }
+        Err(crate::application::settings::AdminSettingsError::InvalidUserActivityRetentionDays) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "用户活动记录保留期限必须在 1 到 3650 天之间",
+            )
+            .into_response();
+        }
+        Err(crate::application::settings::AdminSettingsError::InvalidTrustedProxyCidrs) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "可信代理网段无效",
+            )
+            .into_response();
+        }
+        Err(crate::application::settings::AdminSettingsError::InvalidNewUserPermissions) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "新用户权限设置无效",
+            )
+            .into_response();
+        }
         Err(crate::application::settings::AdminSettingsError::InvalidNetworkProxy) => {
             return api_error(
                 &headers,
@@ -329,13 +642,16 @@ pub(crate) async fn admin_update_settings(
             return plugin_error(&headers, error);
         }
     };
+    if let Some(variants) = state.image_variants.as_ref() {
+        variants.apply_settings(settings.media_strategy.images.variant_cache.clone());
+    }
     record_audit_event(
         &state,
         &headers,
         "SETTINGS_UPDATED",
         Some("settings"),
         None,
-        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"loginBackgroundSource":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.login_background_source),
+        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"userActivityRetentionDays":{},"loginBackgroundSource":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.user_activity_retention_days, settings.login_background_source),
     )
     .await;
     Json(json!({
@@ -344,6 +660,9 @@ pub(crate) async fn admin_update_settings(
         "resumeMinTicks": settings.resume_min_ticks,
         "forceAdminLibraryOrder": settings.force_admin_library_order,
         "userDeletionGraceDays": settings.user_deletion_grace_days,
+        "userActivityRetentionDays": settings.user_activity_retention_days,
+        "trustedProxyCidrs": settings.trusted_proxy_cidrs,
+        "newUserPermissions": settings.new_user_permissions,
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,

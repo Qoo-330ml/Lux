@@ -1,3 +1,4 @@
+import "./detail.css";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
 import { ArrowLeft, Play } from "lucide-react";
 import { useState } from "react";
@@ -6,6 +7,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { GLOBAL_COLLECTION_LIBRARY_ID, type CollectionMember, type CollectionSourceCopy, type CollectionSourceVersion } from "../../lib/api/types";
 import { mediaTitle, posterUrlWithFallback } from "../home/media";
+import { useImageVariants } from "../home/image-variants";
 
 const COLLECTION_PAGE_SIZE = 24;
 
@@ -24,6 +26,7 @@ type SourcePreferenceChange = {
 
 export function CollectionDetailPage() {
   const { collectionId = "" } = useParams();
+  const { enabled } = useImageVariants();
   const queryClient = useQueryClient();
   const [selectedChoices, setSelectedChoices] = useState<Record<string, string>>({});
   const collectionQuery = useInfiniteQuery({
@@ -60,7 +63,7 @@ export function CollectionDetailPage() {
   if (!firstPage) return null;
   const collection = firstPage.collection;
   const members = collectionQuery.data.pages.flatMap((page) => page.items ?? []);
-  const poster = posterUrlWithFallback(collection);
+  const poster = posterUrlWithFallback(collection, undefined, enabled ? 720 : undefined);
 
   return (
     <main className="lux-page lux-collection-detail">

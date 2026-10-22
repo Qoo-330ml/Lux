@@ -8,6 +8,7 @@ import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library, MediaItem } from "../../lib/api/types";
 import { MediaCardEditors } from "./media-card-editors";
 import { MediaCardVisual, MediaCardCopy } from "./media-card-visual";
+import { useImageVariants } from "./image-variants";
 import { MediaCardOverlay } from "./media-card-overlay";
 import { usePopoverPosition } from "../media/usePopoverPosition";
 import type { MediaCardEditor } from "./media-card-editors";
@@ -97,7 +98,9 @@ export function ContinueWatchingRail({ items, total }: { items: MediaItem[]; tot
 }
 
 function ContinueWatchingCard({ item }: { item: MediaItem }) {
-  const image = imageUrl(item, "fanart") ?? imageUrl(item);
+  const { enabled } = useImageVariants();
+  const image = imageUrl(item, "fanart", enabled ? 360 : undefined)
+    ?? imageUrl(item, "poster", enabled ? 360 : undefined);
   const progress = playbackProgress(item);
   const remaining = remainingRuntimeLabel(item);
   const title = item.itemType === "EPISODE" && item.seriesName
@@ -321,12 +324,13 @@ export function LibraryCard({ library, coverItems, onPrefetch }: { library: Libr
 }
 
 function GlobalCollectionLibraryCover({ items }: { items: MediaItem[] }) {
+  const { enabled } = useImageVariants();
   const posterItems = [
     ...items.filter((item) => item.posterItemId === item.id),
     ...items.filter((item) => item.posterItemId !== item.id),
   ];
   const posters = posterItems
-    .map((item) => ({ id: item.id, src: imageUrl(item) }))
+    .map((item) => ({ id: item.id, src: imageUrl(item, "poster", enabled ? 360 : undefined) }))
     .filter((poster): poster is { id: string; src: string } => Boolean(poster.src))
     .slice(0, 5);
 

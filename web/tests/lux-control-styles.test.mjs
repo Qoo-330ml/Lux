@@ -1,8 +1,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const css = await readFile(new URL("../src/react.css", import.meta.url), "utf8");
+const css = allStyles;
 
 test("defines shared Lux styles for form inputs and checkboxes", () => {
   assert.match(css, /:where\(input:not\(\[type="checkbox"\]\)/);

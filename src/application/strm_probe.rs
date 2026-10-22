@@ -3,7 +3,7 @@ use std::{
     fmt,
     path::{Path, PathBuf},
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
@@ -50,6 +50,9 @@ const MAX_STRM_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 const PROGRESS_UPDATE_EVERY: usize = 32;
 const CANCEL_CHECK_EVERY: usize = 32;
 const PROGRESS_UPDATE_INTERVAL: Duration = Duration::from_secs(1);
+const PLAYBACK_PROBE_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
+const PLAYBACK_PROBE_WAIT_INTERVAL: Duration = Duration::from_millis(250);
+const MAX_PENDING_PLAYBACK_PROBES: usize = 128;
 
 #[derive(Clone, Copy, Debug)]
 pub struct StrmProbeOptions {
@@ -77,6 +80,7 @@ pub struct StrmProbeService {
     operations: Arc<Mutex<HashMap<String, Arc<Semaphore>>>>,
     incremental_creation_lock: Arc<Mutex<()>>,
     configured_start_scheduled: Arc<AtomicBool>,
+    playback_probe_sources: Arc<StdMutex<HashSet<String>>>,
     resources: ResourceMetrics,
 }
 
@@ -88,6 +92,7 @@ impl StrmProbeService {
             operations: Arc::new(Mutex::new(HashMap::new())),
             incremental_creation_lock: Arc::new(Mutex::new(())),
             configured_start_scheduled: Arc::new(AtomicBool::new(false)),
+            playback_probe_sources: Arc::new(StdMutex::new(HashSet::new())),
             resources: ResourceMetrics::new(),
         }
     }
@@ -144,8 +149,15 @@ impl StrmProbeService {
         let mut jobs = Vec::with_capacity(libraries.len());
         for (library_id, total_count) in libraries {
             jobs.push(
-                self.create_job_record(&operation_id, &library_id, None, total_count, options)
-                    .await?,
+                self.create_job_record(
+                    &operation_id,
+                    &library_id,
+                    None,
+                    None,
+                    total_count,
+                    options,
+                )
+                .await?,
             );
         }
         Ok(jobs)
@@ -200,6 +212,7 @@ impl StrmProbeService {
                 &operation_id,
                 &library_id_text,
                 Some(scan_job_id),
+                None,
                 total_count,
                 StrmProbeOptions {
                     concurrency: settings.concurrency,
@@ -219,6 +232,7 @@ impl StrmProbeService {
         operation_id: &str,
         library_id: &str,
         target_scan_job_id: Option<&str>,
+        target_source_id: Option<&str>,
         total_count: i64,
         options: StrmProbeOptions,
     ) -> Result<StrmProbeJob, StrmProbeError> {
@@ -235,6 +249,7 @@ impl StrmProbeService {
                 thumbnail_enabled: options.thumbnail_enabled,
                 thumbnail_position_percent: options.thumbnail_position_percent,
                 target_scan_job_id,
+                target_source_id,
                 total_count,
             })
             .await?;
@@ -244,6 +259,158 @@ impl StrmProbeService {
             .await?
             .ok_or(StrmProbeError::JobNotFound)?;
         Ok(strm_probe_job(job))
+    }
+
+    pub fn schedule_playback_probe(&self, item_id: &str, source_id: &str) -> bool {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return false;
+        };
+        let Ok(mut pending_sources) = self.playback_probe_sources.lock() else {
+            return false;
+        };
+        if pending_sources.len() >= MAX_PENDING_PLAYBACK_PROBES
+            || !pending_sources.insert(source_id.to_owned())
+        {
+            return false;
+        }
+        drop(pending_sources);
+
+        let service = self.clone();
+        let item_id = item_id.to_owned();
+        let source_id = source_id.to_owned();
+        runtime.spawn(async move {
+            let result = async {
+                if let Some(job_id) = service
+                    .enqueue_playback_probe_after_wait(&item_id, &source_id)
+                    .await?
+                {
+                    service.run(&job_id).await?;
+                }
+                Ok::<(), StrmProbeError>(())
+            }
+            .await;
+            if result.is_err() {
+                tracing::debug!(
+                    event = "playback_strm_probe_not_completed",
+                    "playback-triggered STRM metadata probe did not complete"
+                );
+            }
+            if let Ok(mut pending_sources) = service.playback_probe_sources.lock() {
+                pending_sources.remove(&source_id);
+            }
+        });
+        true
+    }
+
+    async fn enqueue_playback_probe_after_wait(
+        &self,
+        item_id: &str,
+        source_id: &str,
+    ) -> Result<Option<String>, StrmProbeError> {
+        let deadline = Instant::now() + PLAYBACK_PROBE_WAIT_TIMEOUT;
+        loop {
+            if self
+                .playback_probe_settings_for_source(item_id, source_id)
+                .await?
+                .is_none()
+            {
+                return Ok(None);
+            }
+            if self.database.has_active_strm_probe_jobs().await? {
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                tokio::time::sleep(PLAYBACK_PROBE_WAIT_INTERVAL).await;
+                continue;
+            }
+
+            let creation_guard = self.incremental_creation_lock.lock().await;
+            let Some((library_id, settings)) = self
+                .playback_probe_settings_for_source(item_id, source_id)
+                .await?
+            else {
+                drop(creation_guard);
+                return Ok(None);
+            };
+            if self.database.has_active_strm_probe_jobs().await? {
+                drop(creation_guard);
+                if Instant::now() >= deadline {
+                    return Ok(None);
+                }
+                tokio::time::sleep(PLAYBACK_PROBE_WAIT_INTERVAL).await;
+                continue;
+            }
+
+            let operation_id = Uuid::now_v7().to_string();
+            let job = self
+                .create_job_record(
+                    &operation_id,
+                    &library_id,
+                    None,
+                    Some(source_id),
+                    1,
+                    StrmProbeOptions {
+                        concurrency: settings.concurrency,
+                        include_ready: false,
+                        write_sidecars: settings.write_sidecars,
+                        media_info_enabled: true,
+                        thumbnail_enabled: false,
+                        thumbnail_position_percent: settings.thumbnail_position_percent,
+                    },
+                )
+                .await?;
+            drop(creation_guard);
+            return Ok(Some(job.id));
+        }
+    }
+
+    async fn playback_probe_settings_for_source(
+        &self,
+        item_id: &str,
+        source_id: &str,
+    ) -> Result<Option<(String, crate::application::plugins::MediaInfoSettings)>, StrmProbeError>
+    {
+        let Some(library_id) = self.database.find_item_library_id(item_id).await? else {
+            return Ok(None);
+        };
+        let Ok(parsed_library_id) = library_id.parse::<LibraryId>() else {
+            return Ok(None);
+        };
+        let Some(settings) = self.plugins.enabled_media_info_settings().await? else {
+            return Ok(None);
+        };
+        if !settings.media_info_enabled || !settings.library_ids.contains(&parsed_library_id) {
+            return Ok(None);
+        }
+        let Some(library) = self.database.find_library(&library_id).await? else {
+            return Ok(None);
+        };
+        if !library.is_enabled {
+            return Ok(None);
+        }
+        if !self
+            .database
+            .media_source_belongs_to_item(source_id, item_id)
+            .await?
+        {
+            return Ok(None);
+        }
+        let Some(source) = self
+            .database
+            .find_strm_media_source_for_library(&library_id, source_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if source.has_media_info
+            || !source
+                .external_url
+                .as_deref()
+                .is_some_and(validate_remote_media_url)
+        {
+            return Ok(None);
+        }
+        Ok(Some((library_id, settings)))
     }
 
     pub async fn create_configured_jobs(&self) -> Result<Vec<StrmProbeJob>, StrmProbeError> {
@@ -418,7 +585,24 @@ impl StrmProbeService {
             thumbnail_enabled: job.thumbnail_enabled,
             thumbnail_position_percent: job.thumbnail_position_percent,
         };
-        if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
+        if let Some(source_id) = job.target_source_id.as_deref() {
+            let _creation_guard = self.incremental_creation_lock.lock().await;
+            if self.database.has_active_strm_probe_jobs().await? {
+                return Err(StrmProbeError::AlreadyActive);
+            }
+            let operation_id = Uuid::now_v7().to_string();
+            let library_id_text = library_id.to_string();
+            self.create_job_record(
+                &operation_id,
+                &library_id_text,
+                None,
+                Some(source_id),
+                1,
+                options,
+            )
+            .await
+        } else if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
+            let _creation_guard = self.incremental_creation_lock.lock().await;
             if self.database.has_active_strm_probe_jobs().await? {
                 return Err(StrmProbeError::AlreadyActive);
             }
@@ -432,6 +616,7 @@ impl StrmProbeService {
                 &operation_id,
                 &library_id_text,
                 Some(scan_job_id),
+                None,
                 total_count,
                 options,
             )
@@ -479,10 +664,23 @@ impl StrmProbeService {
         let mut failed = 0_usize;
         let mut cancelled = false;
         let mut after_source_id = None::<String>;
+        let mut source_scope_pending = job.target_source_id.is_some();
         let mut progress = ProbeProgress::new(Instant::now());
 
         loop {
-            let sources = if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
+            let sources = if source_scope_pending {
+                source_scope_pending = false;
+                let Some(source_id) = job.target_source_id.as_deref() else {
+                    continue;
+                };
+                self.database
+                    .find_strm_media_source_for_library(&job.library_id, source_id)
+                    .await?
+                    .into_iter()
+                    .collect()
+            } else if job.target_source_id.is_some() {
+                Vec::new()
+            } else if let Some(scan_job_id) = job.target_scan_job_id.as_deref() {
                 self.database
                     .list_strm_media_sources_for_incremental_scan_page(
                         scan_job_id,
@@ -533,7 +731,7 @@ impl StrmProbeService {
                 let service = self.clone();
                 let semaphore = operation_semaphore.clone();
                 let options = ProbeSourceOptions {
-                    include_ready: job.include_ready,
+                    include_ready: job.target_source_id.is_none() && job.include_ready,
                     media_info_enabled: job.media_info_enabled,
                     thumbnail_enabled: job.thumbnail_enabled,
                     thumbnail_position_percent: job.thumbnail_position_percent,
@@ -1132,6 +1330,62 @@ mod tests {
             .expect("cleanup operation");
 
         assert!(service.operations.lock().await.is_empty());
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn retrying_scan_scoped_job_waits_for_strm_job_creation_lock() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let libraries = crate::application::libraries::LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", crate::library::LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let scan_job_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, scan_phase)
+             VALUES (?, ?, 'INCREMENTAL_SCAN', 'COMPLETED', 'retry-generation', 'IDLE')",
+        )
+        .bind(&scan_job_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await
+        .expect("scan job");
+        sqlx::query(
+            "INSERT INTO strm_probe_jobs
+             (id, operation_id, library_id, status, concurrency, target_scan_job_id)
+             VALUES ('failed-retry', 'failed-operation', ?, 'FAILED', 1, ?)",
+        )
+        .bind(library.id.to_string())
+        .bind(scan_job_id)
+        .execute(database.pool())
+        .await
+        .expect("failed STRM job");
+
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+        let creation_guard = service.incremental_creation_lock.lock().await;
+        let retry_service = service.clone();
+        let mut retry_task = tokio::spawn(async move { retry_service.retry("failed-retry").await });
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut retry_task)
+                .await
+                .is_err(),
+            "scan-scoped retries must wait for the shared STRM job creation lock"
+        );
+
+        drop(creation_guard);
+        let retried_job = retry_task
+            .await
+            .expect("retry task")
+            .expect("retry STRM job");
+        assert_eq!(retried_job.status, "PENDING");
         database.close().await;
     }
 

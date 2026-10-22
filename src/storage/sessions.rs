@@ -4,6 +4,59 @@ use crate::storage::{
 };
 
 impl Database {
+    // LUX-736 wires this bounded storage contract into the admin playback API.
+    #[allow(dead_code)]
+    pub(crate) async fn list_current_user_playback_sessions(
+        &self,
+        user_id: &str,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredPlaybackSession>, i64), StorageError> {
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let total_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM playback_sessions
+                 WHERE user_id = ?
+                   AND state != 'STOPPED'
+                   AND last_event_at > unixepoch() - ?",
+            )
+            .bind(user_id)
+            .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let sessions = self
+            .query(
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        device_id, client, device_name, client_version, device_type,
+                        remote_ip, state,
+                        position_ticks, duration_ticks, is_paused, started_at,
+                        last_event_at
+                 FROM playback_sessions
+                 WHERE user_id = ?
+                   AND state != 'STOPPED'
+                   AND last_event_at > unixepoch() - ?
+                 ORDER BY last_event_at DESC, id ASC
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(user_id)
+            .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| rows.into_iter().map(stored_playback_session).collect())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((sessions, total_count))
+    }
+
     pub(crate) async fn check_playback_admission(
         &self,
         user_id: &str,
@@ -867,6 +920,198 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
+    pub(crate) async fn set_web_playback_access_context(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        device_id: Option<&str>,
+        client_name: Option<&str>,
+        updated_at: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE web_playback_sessions
+             SET authorization_device_id = ?, authorization_client_name = ?, updated_at = ?
+             WHERE id = ? AND user_id = ? AND state = 'ACTIVE'",
+        )
+        .bind(device_id)
+        .bind(client_name)
+        .bind(updated_at)
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
+    pub(crate) async fn find_web_playback_access_context(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<StoredWebPlaybackAccessContext>, StorageError> {
+        self.query(
+            "SELECT user_id, authorization_device_id, authorization_client_name
+             FROM web_playback_sessions
+             WHERE id = ? AND state = 'ACTIVE'",
+        )
+        .bind(session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredWebPlaybackAccessContext {
+                user_id: row.get("user_id"),
+                device_id: row.get("authorization_device_id"),
+                client_name: row.get("authorization_client_name"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn insert_emby_direct_playback_ticket(
+        &self,
+        ticket: NewEmbyDirectPlaybackTicket<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, authorization_device_id,
+                 authorization_client_name, expires_at, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?)",
+        )
+        .bind(ticket.user_id)
+        .bind(ticket.play_session_id)
+        .bind(ticket.authorization_device_id)
+        .bind(ticket.authorization_client_name)
+        .bind(ticket.expires_at)
+        .bind(ticket.created_at)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn ensure_legacy_emby_direct_playback_ticket(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        expires_at: i64,
+        created_at: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, authorization_device_id,
+                 authorization_client_name, expires_at, created_at
+             ) VALUES (?, ?, NULL, NULL, ?, ?)
+             ON CONFLICT(user_id, play_session_id) DO NOTHING",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .bind(expires_at)
+        .bind(created_at)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn find_emby_direct_playback_ticket(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<Option<StoredEmbyDirectPlaybackTicket>, StorageError> {
+        self.query(
+            "SELECT user_id, play_session_id, authorization_device_id,
+                    authorization_client_name, expires_at, revoked_at, created_at
+             FROM emby_direct_playback_tickets
+             WHERE user_id = ? AND play_session_id = ?",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| {
+            row.map(|row| StoredEmbyDirectPlaybackTicket {
+                user_id: row.get("user_id"),
+                play_session_id: row.get("play_session_id"),
+                authorization_device_id: row.get("authorization_device_id"),
+                authorization_client_name: row.get("authorization_client_name"),
+                expires_at: row.get("expires_at"),
+                revoked_at: row.get("revoked_at"),
+                created_at: row.get("created_at"),
+            })
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn revoke_emby_direct_playback_ticket(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        revoked_at: i64,
+    ) -> Result<bool, StorageError> {
+        self.query(
+            "UPDATE emby_direct_playback_tickets
+             SET revoked_at = ?
+             WHERE user_id = ? AND play_session_id = ? AND revoked_at IS NULL
+               AND created_at <= ? AND expires_at >= ?",
+        )
+        .bind(revoked_at)
+        .bind(user_id)
+        .bind(play_session_id)
+        .bind(revoked_at)
+        .bind(revoked_at)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() == 1)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    #[allow(dead_code)] // LUX-776 periodically drops expired direct-ticket contexts.
+    pub(crate) async fn delete_expired_emby_direct_playback_tickets(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<u64, StorageError> {
+        let limit = limit.clamp(1, 1_000);
+        self.query(
+            "DELETE FROM emby_direct_playback_tickets
+             WHERE (user_id, play_session_id) IN (
+                 SELECT user_id, play_session_id
+                 FROM emby_direct_playback_tickets
+                 WHERE expires_at < ?
+                 ORDER BY expires_at, user_id, play_session_id
+                 LIMIT ?
+             )",
+        )
+        .bind(now.max(0))
+        .bind(limit)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,

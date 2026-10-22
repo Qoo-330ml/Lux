@@ -11,6 +11,13 @@ use std::{
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 
 use super::sql_templates::SqlTemplateCache;
+use super::{
+    NewInvitationUserAccount, NewUserRegistrationRequest, StoredUserInvitationAcceptance,
+    StoredUserRegistrationChallenge, StoredUserRegistrationRequest, UserEmailChangeCreateResult,
+    UserInvitationAcceptResult, UserRegistrationApproveResult, UserRegistrationCreateResult,
+    UserRegistrationRejectResult, UserRegistrationRequestPage, UserRegistrationResendResult,
+    UserRegistrationStatus, UserRegistrationVerifyResult,
+};
 use sqlx::{
     Acquire, Any, AnyPool, Executor, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
@@ -26,6 +33,12 @@ mod database_cleanup;
 #[path = "database_diagnostics.rs"]
 mod database_diagnostics;
 pub use database_diagnostics::DatabaseDiagnosticsSnapshot;
+#[path = "database_maintenance.rs"]
+mod database_maintenance;
+pub use database_maintenance::{
+    DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    MaintenanceCandidate, MaintenanceReport,
+};
 #[path = "device_pairings.rs"]
 mod device_pairings;
 #[path = "emby_migration.rs"]
@@ -48,6 +61,9 @@ mod media_sources;
 
 #[path = "library.rs"]
 mod library;
+#[path = "library_deletion.rs"]
+mod library_deletion;
+pub(crate) use library_deletion::LibraryDeletionBatch;
 #[path = "library_roots.rs"]
 mod library_roots;
 #[path = "subtitles.rs"]
@@ -277,8 +293,14 @@ pub(crate) use emby_migration::{
     StoredMigrationPersonIdentity, StoredPlaybackHistoryEvent,
 };
 
-use crate::config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError};
 use crate::observability::logs::{LogStore, NewAuditLogEvent};
+use crate::{
+    config::{Config, DatabaseBackend, DatabaseConfiguration, DatabaseConfigurationError},
+    domain::content_restrictions::{
+        ContentRestrictionPolicy, content_restriction_policy_is_restrictive,
+        content_restriction_policy_is_valid,
+    },
+};
 
 // Keep the embedded migrator source coupled to newly added migration files.
 static SQLITE_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
@@ -411,6 +433,449 @@ pub(crate) struct DatabasePoolSnapshot {
     pub idle: u32,
     pub in_use: u32,
     pub saturated: bool,
+}
+
+// LUX-783 constructs these templates in the delivery worker.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailOutboxTemplateKind {
+    Invitation,
+    EmailVerification,
+}
+
+#[allow(dead_code)]
+impl MailOutboxTemplateKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Invitation => "INVITATION",
+            Self::EmailVerification => "EMAIL_VERIFICATION",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "INVITATION" => Ok(Self::Invitation),
+            "EMAIL_VERIFICATION" => Ok(Self::EmailVerification),
+            _ => Err(StorageError::Serialization(
+                "unknown mail template kind".to_owned(),
+            )),
+        }
+    }
+}
+
+// LUX-783 and LUX-784 consume these states in delivery and queue administration.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailOutboxStatus {
+    Pending,
+    Sending,
+    RetryWait,
+    Sent,
+    Failed,
+}
+
+#[allow(dead_code)]
+impl MailOutboxStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Sending => "SENDING",
+            Self::RetryWait => "RETRY_WAIT",
+            Self::Sent => "SENT",
+            Self::Failed => "FAILED",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "SENDING" => Ok(Self::Sending),
+            "RETRY_WAIT" => Ok(Self::RetryWait),
+            "SENT" => Ok(Self::Sent),
+            "FAILED" => Ok(Self::Failed),
+            _ => Err(StorageError::Serialization(
+                "unknown mail outbox status".to_owned(),
+            )),
+        }
+    }
+}
+
+// LUX-783 maps transport failures to these fixed, non-sensitive values.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailDeliveryErrorCode {
+    SmtpUnavailable,
+    SettingsMissing,
+    TemplateMissing,
+    ReferenceMissing,
+}
+
+#[allow(dead_code)]
+impl MailDeliveryErrorCode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::SmtpUnavailable => "SMTP_UNAVAILABLE",
+            Self::SettingsMissing => "SETTINGS_UNAVAILABLE",
+            Self::TemplateMissing => "TEMPLATE_UNAVAILABLE",
+            Self::ReferenceMissing => "REFERENCE_UNAVAILABLE",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "SMTP_UNAVAILABLE" => Ok(Self::SmtpUnavailable),
+            "SETTINGS_UNAVAILABLE" => Ok(Self::SettingsMissing),
+            "TEMPLATE_UNAVAILABLE" => Ok(Self::TemplateMissing),
+            "REFERENCE_UNAVAILABLE" => Ok(Self::ReferenceMissing),
+            _ => Err(StorageError::Serialization(
+                "unknown mail delivery error code".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewMailOutboxMessage<'a> {
+    pub(crate) idempotency_key: &'a str,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) template_kind: MailOutboxTemplateKind,
+    pub(crate) reference_id: &'a str,
+    pub(crate) available_at: i64,
+}
+
+// LUX-783 consumes the delivery fields and LUX-784 exposes the safe status fields.
+#[allow(dead_code)]
+pub(crate) struct StoredMailOutboxMessage {
+    pub(crate) id: String,
+    pub(crate) idempotency_key: String,
+    pub(crate) recipient_email: String,
+    pub(crate) template_kind: MailOutboxTemplateKind,
+    pub(crate) reference_id: String,
+    pub(crate) status: MailOutboxStatus,
+    pub(crate) attempt_count: i64,
+    pub(crate) available_at: i64,
+    pub(crate) lease_expires_at: Option<i64>,
+    pub(crate) last_error_code: Option<MailDeliveryErrorCode>,
+    pub(crate) sent_at: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+// LUX-784 maps this bounded page to the admin queue API.
+#[allow(dead_code)]
+pub(crate) struct MailOutboxPage {
+    pub(crate) messages: Vec<StoredMailOutboxMessage>,
+    pub(crate) total_count: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // LUX-789 consumes these states in the invitation API.
+pub(crate) enum UserInvitationStatus {
+    Pending,
+    Accepted,
+    Revoked,
+    Expired,
+}
+
+impl UserInvitationStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "PENDING",
+            Self::Accepted => "ACCEPTED",
+            Self::Revoked => "REVOKED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+
+    #[allow(dead_code)] // LUX-789 parses persisted states in the invitation API.
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "PENDING" => Ok(Self::Pending),
+            "ACCEPTED" => Ok(Self::Accepted),
+            "REVOKED" => Ok(Self::Revoked),
+            "EXPIRED" => Ok(Self::Expired),
+            _ => Err(StorageError::Serialization(
+                "unknown user invitation status".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewUserInvitation<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) created_by_user_id: Option<&'a str>,
+    pub(crate) preset_id: &'a str,
+    pub(crate) preset_name: &'a str,
+    pub(crate) preset_version: i64,
+    pub(crate) permission_snapshot_json: &'a str,
+    pub(crate) expires_at: i64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserInvitationCreateResult {
+    Created,
+    AlreadyPending,
+    RateLimited,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserInvitationResendResult {
+    Queued,
+    NotResendable,
+    RateLimited,
+}
+
+const INVITATION_EMAIL_RATE_LIMIT_PER_HOUR: i64 = 5;
+const INVITATION_EMAIL_RATE_WINDOW_SECONDS: i64 = 60 * 60;
+
+#[allow(dead_code)] // LUX-789 consumes the full invitation profile in its admin API.
+pub(crate) struct StoredUserInvitation {
+    pub(crate) id: String,
+    pub(crate) recipient_email: String,
+    pub(crate) created_by_user_id: Option<String>,
+    pub(crate) accepted_user_id: Option<String>,
+    pub(crate) status: UserInvitationStatus,
+    pub(crate) preset_id: String,
+    pub(crate) preset_name: String,
+    pub(crate) preset_version: i64,
+    pub(crate) permission_snapshot_json: String,
+    pub(crate) expires_at: i64,
+    pub(crate) accepted_at: Option<i64>,
+    pub(crate) revoked_at: Option<i64>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)] // LUX-789 returns this page from the invitation API.
+pub(crate) struct UserInvitationPage {
+    pub(crate) entries: Vec<StoredUserInvitation>,
+    pub(crate) page_size: i64,
+    pub(crate) total_count: i64,
+}
+
+// LUX-784 uses this type to rebuild a stable, non-persisted mail link token.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MailChallengeKind {
+    Invitation,
+    EmailVerification,
+}
+
+#[allow(dead_code)]
+impl MailChallengeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Invitation => "INVITATION",
+            Self::EmailVerification => "EMAIL_VERIFICATION",
+        }
+    }
+
+    fn parse(value: &str) -> Result<Self, StorageError> {
+        match value {
+            "INVITATION" => Ok(Self::Invitation),
+            "EMAIL_VERIFICATION" => Ok(Self::EmailVerification),
+            _ => Err(StorageError::Serialization(
+                "unknown mail challenge kind".to_owned(),
+            )),
+        }
+    }
+}
+
+pub(crate) struct NewMailChallenge<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) kind: MailChallengeKind,
+    pub(crate) recipient_email: &'a str,
+    pub(crate) reference_id: &'a str,
+    pub(crate) token_hash: &'a [u8],
+    pub(crate) expires_at: i64,
+}
+
+// The digest is internal storage state and must never be mapped into an API DTO.
+#[allow(dead_code)]
+pub(crate) struct StoredMailChallenge {
+    pub(crate) id: String,
+    pub(crate) kind: MailChallengeKind,
+    pub(crate) recipient_email: String,
+    pub(crate) reference_id: String,
+    pub(crate) token_hash: Vec<u8>,
+    pub(crate) expires_at: i64,
+    pub(crate) consumed_at: Option<i64>,
+    pub(crate) revoked_at: Option<i64>,
+    pub(crate) created_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(sqlx::FromRow)]
+struct MailChallengeRecord {
+    id: String,
+    challenge_kind: String,
+    recipient_email: String,
+    reference_id: String,
+    token_hash: Vec<u8>,
+    expires_at: i64,
+    consumed_at: Option<i64>,
+    revoked_at: Option<i64>,
+    created_at: i64,
+}
+
+impl TryFrom<MailChallengeRecord> for StoredMailChallenge {
+    type Error = StorageError;
+
+    fn try_from(record: MailChallengeRecord) -> Result<Self, Self::Error> {
+        if record.token_hash.len() != 32 {
+            return Err(StorageError::Serialization(
+                "mail challenge digest has invalid length".to_owned(),
+            ));
+        }
+        Ok(Self {
+            id: record.id,
+            kind: MailChallengeKind::parse(&record.challenge_kind)?,
+            recipient_email: record.recipient_email,
+            reference_id: record.reference_id,
+            token_hash: record.token_hash,
+            expires_at: record.expires_at,
+            consumed_at: record.consumed_at,
+            revoked_at: record.revoked_at,
+            created_at: record.created_at,
+        })
+    }
+}
+
+#[allow(dead_code)]
+#[derive(sqlx::FromRow)]
+struct MailOutboxRecord {
+    id: String,
+    idempotency_key: String,
+    recipient_email: String,
+    template_kind: String,
+    reference_id: String,
+    status: String,
+    attempt_count: i64,
+    available_at: i64,
+    lease_expires_at: Option<i64>,
+    last_error_code: Option<String>,
+    sent_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(sqlx::FromRow)]
+#[allow(dead_code)] // LUX-789 consumes this record in the invitation API.
+struct UserInvitationRecord {
+    id: String,
+    recipient_email: String,
+    created_by_user_id: Option<String>,
+    accepted_user_id: Option<String>,
+    status: String,
+    preset_id: String,
+    preset_name: String,
+    preset_version: i64,
+    permission_snapshot_json: String,
+    expires_at: i64,
+    accepted_at: Option<i64>,
+    revoked_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct UserRegistrationRequestRecord {
+    recipient_email: String,
+    username_normalized: String,
+    display_name: String,
+    password_hash: Option<String>,
+    email_verified_at: Option<i64>,
+}
+
+#[derive(sqlx::FromRow)]
+struct UserRegistrationRequestSummaryRecord {
+    id: String,
+    recipient_email: String,
+    username_normalized: String,
+    display_name: String,
+    permission_snapshot_json: String,
+    status: String,
+    expires_at: i64,
+    email_verified_at: Option<i64>,
+    reviewed_at: Option<i64>,
+    reviewed_by_user_id: Option<String>,
+    approved_user_id: Option<String>,
+    last_error_code: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+const USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR: i64 = 5;
+const USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS: i64 = 60 * 60;
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserInvitationPermissionSnapshot {
+    is_admin: bool,
+    can_manage_server: bool,
+    permissions: UserInvitationPermissionSnapshotFields,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct UserInvitationPermissionSnapshotFields {
+    library_access_mode: String,
+    library_ids: Vec<String>,
+    can_download: bool,
+    can_play: bool,
+    max_simultaneous_playbacks: i64,
+    allow_remux: bool,
+    allow_audio_transcode: bool,
+    allow_video_transcode: bool,
+}
+
+impl TryFrom<MailOutboxRecord> for StoredMailOutboxMessage {
+    type Error = StorageError;
+
+    fn try_from(record: MailOutboxRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: record.id,
+            idempotency_key: record.idempotency_key,
+            recipient_email: record.recipient_email,
+            template_kind: MailOutboxTemplateKind::parse(&record.template_kind)?,
+            reference_id: record.reference_id,
+            status: MailOutboxStatus::parse(&record.status)?,
+            attempt_count: record.attempt_count,
+            available_at: record.available_at,
+            lease_expires_at: record.lease_expires_at,
+            last_error_code: record
+                .last_error_code
+                .as_deref()
+                .map(MailDeliveryErrorCode::parse)
+                .transpose()?,
+            sent_at: record.sent_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        })
+    }
+}
+
+impl TryFrom<UserInvitationRecord> for StoredUserInvitation {
+    type Error = StorageError;
+
+    fn try_from(record: UserInvitationRecord) -> Result<Self, Self::Error> {
+        Ok(Self {
+            id: record.id,
+            recipient_email: record.recipient_email,
+            created_by_user_id: record.created_by_user_id,
+            accepted_user_id: record.accepted_user_id,
+            status: UserInvitationStatus::parse(&record.status)?,
+            preset_id: record.preset_id,
+            preset_name: record.preset_name,
+            preset_version: record.preset_version,
+            permission_snapshot_json: record.permission_snapshot_json,
+            expires_at: record.expires_at,
+            accepted_at: record.accepted_at,
+            revoked_at: record.revoked_at,
+            created_at: record.created_at,
+            updated_at: record.updated_at,
+        })
+    }
 }
 
 impl Database {
@@ -1002,6 +1467,3285 @@ impl Database {
     }
 }
 
+// LUX-783 wires the worker and LUX-784 wires the admin queue API to this storage contract.
+#[allow(dead_code)]
+impl Database {
+    pub(crate) async fn enqueue_mail_outbox(
+        &self,
+        message: NewMailOutboxMessage<'_>,
+        now: i64,
+    ) -> Result<StoredMailOutboxMessage, StorageError> {
+        if now < 0
+            || message.available_at < 0
+            || message.idempotency_key.trim() != message.idempotency_key
+            || !(1..=256).contains(&message.idempotency_key.len())
+            || message.idempotency_key.chars().any(char::is_control)
+            || message.recipient_email.trim() != message.recipient_email
+            || !(3..=320).contains(&message.recipient_email.len())
+            || message.recipient_email.chars().any(char::is_control)
+            || message.reference_id.trim() != message.reference_id
+            || !(1..=128).contains(&message.reference_id.len())
+            || message.reference_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox message".to_owned(),
+            ));
+        }
+
+        let id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(&id)
+        .bind(message.idempotency_key)
+        .bind(message.recipient_email)
+        .bind(message.template_kind.as_str())
+        .bind(message.reference_id)
+        .bind(message.available_at)
+        .bind(now)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let record = self
+            .query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE idempotency_key = ?",
+            )
+            .bind(message.idempotency_key)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if record.recipient_email != message.recipient_email
+            || record.template_kind != message.template_kind.as_str()
+            || record.reference_id != message.reference_id
+        {
+            return Err(StorageError::Conflict(
+                "mail outbox idempotency key already used".to_owned(),
+            ));
+        }
+        record.try_into()
+    }
+
+    pub(crate) async fn claim_mail_outbox(
+        &self,
+        now: i64,
+        lease_seconds: i64,
+    ) -> Result<Option<StoredMailOutboxMessage>, StorageError> {
+        if now < 0 || !(1..=900).contains(&lease_seconds) {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox lease".to_owned(),
+            ));
+        }
+        let lease_expires_at = now.saturating_add(lease_seconds);
+        let statement = match self.backend {
+            DatabaseBackend::Sqlite => {
+                "UPDATE mail_outbox
+                 SET status = 'SENDING', attempt_count = attempt_count + 1,
+                     lease_expires_at = ?, last_error_code = NULL,
+                     sent_at = NULL, updated_at = ?
+                 WHERE id = (
+                     SELECT id FROM mail_outbox
+                     WHERE (status IN ('PENDING', 'RETRY_WAIT') AND available_at <= ?)
+                        OR (status = 'SENDING' AND lease_expires_at <= ?)
+                     ORDER BY available_at, created_at, id
+                     LIMIT 1
+                 )
+                 RETURNING id, idempotency_key, recipient_email, template_kind,
+                           reference_id, status, attempt_count, available_at,
+                           lease_expires_at, last_error_code, sent_at, created_at, updated_at"
+            }
+            DatabaseBackend::Postgres => {
+                "WITH candidate AS (
+                     SELECT id FROM mail_outbox
+                     WHERE (status IN ('PENDING', 'RETRY_WAIT') AND available_at <= ?)
+                        OR (status = 'SENDING' AND lease_expires_at <= ?)
+                     ORDER BY available_at, created_at, id
+                     LIMIT 1 FOR UPDATE SKIP LOCKED
+                 )
+                 UPDATE mail_outbox AS outbox
+                 SET status = 'SENDING', attempt_count = outbox.attempt_count + 1,
+                     lease_expires_at = ?, last_error_code = NULL,
+                     sent_at = NULL, updated_at = ?
+                 FROM candidate
+                 WHERE outbox.id = candidate.id
+                 RETURNING outbox.id, outbox.idempotency_key, outbox.recipient_email,
+                           outbox.template_kind, outbox.reference_id, outbox.status,
+                           outbox.attempt_count, outbox.available_at,
+                           outbox.lease_expires_at, outbox.last_error_code,
+                           outbox.sent_at, outbox.created_at, outbox.updated_at"
+            }
+        };
+        let mut query = self.query_as::<MailOutboxRecord>(statement);
+        if self.backend == DatabaseBackend::Postgres {
+            query = query.bind(now).bind(now);
+        }
+        query = query.bind(lease_expires_at).bind(now);
+        if self.backend == DatabaseBackend::Sqlite {
+            query = query.bind(now).bind(now);
+        }
+        query
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .map(TryInto::try_into)
+            .transpose()
+    }
+
+    pub(crate) async fn mark_mail_outbox_sent(
+        &self,
+        id: &str,
+        attempt_count: i64,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if attempt_count <= 0 || now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox completion".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'SENT', lease_expires_at = NULL, last_error_code = NULL,
+                     sent_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .bind(attempt_count)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn defer_mail_outbox(
+        &self,
+        id: &str,
+        attempt_count: i64,
+        available_at: i64,
+        error_code: MailDeliveryErrorCode,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if attempt_count <= 0 || now < 0 || available_at < now {
+            return Err(StorageError::Conflict("invalid mail retry time".to_owned()));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'RETRY_WAIT', available_at = ?, lease_expires_at = NULL,
+                     last_error_code = ?, sent_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
+            )
+            .bind(available_at)
+            .bind(error_code.as_str())
+            .bind(now)
+            .bind(id)
+            .bind(attempt_count)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn fail_mail_outbox(
+        &self,
+        id: &str,
+        attempt_count: i64,
+        error_code: MailDeliveryErrorCode,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if attempt_count <= 0 || now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox failure".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'FAILED', lease_expires_at = NULL, last_error_code = ?,
+                     sent_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
+            )
+            .bind(error_code.as_str())
+            .bind(now)
+            .bind(id)
+            .bind(attempt_count)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn retry_failed_mail_outbox(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid mail outbox retry time".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_outbox
+                 SET status = 'PENDING', attempt_count = 0, available_at = ?,
+                     last_error_code = NULL, sent_at = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'FAILED'",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn list_mail_outbox_page(
+        &self,
+        status: Option<MailOutboxStatus>,
+        page_size: i64,
+        offset: i64,
+    ) -> Result<MailOutboxPage, StorageError> {
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let total_count = if let Some(status) = status {
+            self.query_scalar::<i64>("SELECT COUNT(*) FROM mail_outbox WHERE status = ?")
+                .bind(status.as_str())
+                .fetch_one(&self.pool)
+                .await
+        } else {
+            self.query_scalar::<i64>("SELECT COUNT(*) FROM mail_outbox")
+                .fetch_one(&self.pool)
+                .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let records = if let Some(status) = status {
+            self.query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE status = ?
+                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(status.as_str())
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        } else {
+            self.query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
+            )
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let messages = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<StoredMailOutboxMessage>, StorageError>>()?;
+        Ok(MailOutboxPage {
+            messages,
+            total_count,
+        })
+    }
+}
+
+// LUX-784 consumes these methods while resolving queued invitation and verification mail.
+#[allow(dead_code)]
+impl Database {
+    pub(crate) async fn create_mail_challenge(
+        &self,
+        challenge: NewMailChallenge<'_>,
+        now: i64,
+    ) -> Result<StoredMailChallenge, StorageError> {
+        if now < 0
+            || challenge.expires_at <= now
+            || challenge.id.trim() != challenge.id
+            || !(1..=128).contains(&challenge.id.len())
+            || challenge.id.chars().any(char::is_control)
+            || challenge.token_hash.len() != 32
+            || challenge.recipient_email.trim() != challenge.recipient_email
+            || !(3..=320).contains(&challenge.recipient_email.len())
+            || challenge.recipient_email.chars().any(char::is_control)
+            || challenge.reference_id.trim() != challenge.reference_id
+            || !(1..=128).contains(&challenge.reference_id.len())
+            || challenge.reference_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict("invalid mail challenge".to_owned()));
+        }
+
+        self.query_as::<MailChallengeRecord>(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)
+             RETURNING id, challenge_kind, recipient_email, reference_id, token_hash,
+                       expires_at, consumed_at, revoked_at, created_at",
+        )
+        .bind(challenge.id)
+        .bind(challenge.kind.as_str())
+        .bind(challenge.recipient_email)
+        .bind(challenge.reference_id)
+        .bind(challenge.token_hash)
+        .bind(challenge.expires_at)
+        .bind(now)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .try_into()
+    }
+
+    pub(crate) async fn create_user_email_change_with_mail(
+        &self,
+        user_id: &str,
+        challenge: NewMailChallenge<'_>,
+        message: NewMailOutboxMessage<'_>,
+        expected_pending_challenge_id: Option<&str>,
+        now: i64,
+    ) -> Result<UserEmailChangeCreateResult, StorageError> {
+        if now < 0
+            || challenge.kind != MailChallengeKind::EmailVerification
+            || challenge.reference_id != user_id
+            || challenge.expires_at <= now
+            || challenge.id.trim() != challenge.id
+            || !(1..=128).contains(&challenge.id.len())
+            || challenge.id.chars().any(char::is_control)
+            || challenge.token_hash.len() != 32
+            || challenge.recipient_email.trim() != challenge.recipient_email
+            || challenge.recipient_email != challenge.recipient_email.to_lowercase()
+            || !(3..=254).contains(&challenge.recipient_email.len())
+            || challenge.recipient_email.chars().any(char::is_control)
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+            || expected_pending_challenge_id.is_some_and(|id| {
+                id.trim() != id
+                    || !(1..=128).contains(&id.len())
+                    || id.chars().any(char::is_control)
+            })
+            || message.idempotency_key.trim() != message.idempotency_key
+            || !(1..=256).contains(&message.idempotency_key.len())
+            || message.idempotency_key.chars().any(char::is_control)
+            || message.recipient_email != challenge.recipient_email
+            || message.template_kind != MailOutboxTemplateKind::EmailVerification
+            || message.reference_id != challenge.id
+            || message.available_at != now
+        {
+            return Err(StorageError::Conflict(
+                "invalid user email change mail request".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let active_user_statement = format!(
+            "SELECT id FROM users WHERE id = ? AND is_disabled = 0
+             AND deleted_at IS NULL{lock_clause}"
+        );
+        let active_user_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(active_user_statement))
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if active_user_id.is_none() {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserEmailChangeCreateResult::NotAcceptable);
+        }
+
+        if let Some(expected_challenge_id) = expected_pending_challenge_id {
+            let current_pending_challenge_id: Option<String> = self
+                .query_scalar(
+                    "SELECT id FROM mail_challenges
+                     WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+                       AND expires_at > ? AND created_at <= ?
+                       AND consumed_at IS NULL AND revoked_at IS NULL
+                     ORDER BY created_at DESC, id DESC LIMIT 1",
+                )
+                .bind(user_id)
+                .bind(now)
+                .bind(now)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if current_pending_challenge_id.as_deref() != Some(expected_challenge_id) {
+                transaction
+                    .commit()
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                return Ok(UserEmailChangeCreateResult::NotAcceptable);
+            }
+        }
+
+        self.query(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, created_at
+             ) VALUES (?, 'EMAIL_VERIFICATION', ?, ?, ?, ?, ?)",
+        )
+        .bind(challenge.id)
+        .bind(challenge.recipient_email)
+        .bind(user_id)
+        .bind(challenge.token_hash)
+        .bind(challenge.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let outbox_id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'EMAIL_VERIFICATION', ?, 'PENDING', 0, ?, ?, ?)",
+        )
+        .bind(&outbox_id)
+        .bind(message.idempotency_key)
+        .bind(message.recipient_email)
+        .bind(message.reference_id)
+        .bind(message.available_at)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        self.query(
+            "UPDATE mail_challenges SET revoked_at = ?
+             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+               AND id <> ? AND consumed_at IS NULL AND revoked_at IS NULL
+               AND created_at <= ?",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(challenge.id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE mail_outbox
+             SET status = 'FAILED', lease_expires_at = NULL,
+                 last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
+                 updated_at = ?
+             WHERE reference_id IN (
+                 SELECT id FROM mail_challenges
+                 WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+                   AND id <> ?
+             ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(challenge.id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserEmailChangeCreateResult::Created)
+    }
+
+    pub(crate) async fn clear_user_email_change(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid user email change clearing request".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let active_user_statement = format!(
+            "SELECT id FROM users WHERE id = ? AND is_disabled = 0
+             AND deleted_at IS NULL{lock_clause}"
+        );
+        let active_user_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(active_user_statement))
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if active_user_id.is_none() {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+
+        self.query(
+            "UPDATE users SET email = NULL, email_verified_at = NULL, updated_at = ?
+             WHERE id = ? AND is_disabled = 0 AND deleted_at IS NULL",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE mail_challenges SET revoked_at = ?
+             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+               AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE mail_outbox
+             SET status = 'FAILED', lease_expires_at = NULL,
+                 last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
+                 updated_at = ?
+             WHERE reference_id IN (
+                 SELECT id FROM mail_challenges
+                 WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+             ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
+        )
+        .bind(now)
+        .bind(user_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
+    pub(crate) async fn create_user_invitation_with_mail(
+        &self,
+        invitation: NewUserInvitation<'_>,
+        challenge: NewMailChallenge<'_>,
+        message: NewMailOutboxMessage<'_>,
+        now: i64,
+    ) -> Result<UserInvitationCreateResult, StorageError> {
+        let snapshot =
+            serde_json::from_str::<serde_json::Value>(invitation.permission_snapshot_json)
+                .map_err(|_| {
+                    StorageError::Conflict("invalid invitation permission snapshot".to_owned())
+                })?;
+        if now < 0
+            || invitation.id.trim() != invitation.id
+            || !(1..=128).contains(&invitation.id.len())
+            || invitation.id.chars().any(char::is_control)
+            || invitation.recipient_email.trim() != invitation.recipient_email
+            || invitation.recipient_email != invitation.recipient_email.to_lowercase()
+            || !(3..=254).contains(&invitation.recipient_email.len())
+            || invitation.recipient_email.chars().any(char::is_control)
+            || invitation
+                .created_by_user_id
+                .is_some_and(|id| id.trim() != id || !(1..=128).contains(&id.len()))
+            || invitation.preset_id.trim() != invitation.preset_id
+            || !(1..=128).contains(&invitation.preset_id.len())
+            || invitation.preset_name.trim() != invitation.preset_name
+            || !(1..=80).contains(&invitation.preset_name.chars().count())
+            || invitation.preset_version < 1
+            || invitation.permission_snapshot_json.len() > 32_768
+            || !snapshot.is_object()
+            || invitation.expires_at <= now
+            || challenge.id.trim() != challenge.id
+            || !(1..=128).contains(&challenge.id.len())
+            || challenge.id.chars().any(char::is_control)
+            || challenge.kind != MailChallengeKind::Invitation
+            || challenge.recipient_email != invitation.recipient_email
+            || challenge.reference_id != invitation.id
+            || challenge.token_hash.len() != 32
+            || challenge.expires_at != invitation.expires_at
+            || message.idempotency_key.trim() != message.idempotency_key
+            || !(1..=256).contains(&message.idempotency_key.len())
+            || message.idempotency_key.chars().any(char::is_control)
+            || message.recipient_email != invitation.recipient_email
+            || message.template_kind != MailOutboxTemplateKind::Invitation
+            || message.reference_id != challenge.id
+            || message.available_at != now
+        {
+            return Err(StorageError::Conflict(
+                "invalid user invitation and mail bundle".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query(
+            "UPDATE user_invitations
+             SET status = 'EXPIRED', updated_at = ?
+             WHERE recipient_email = ? AND status = 'PENDING' AND expires_at <= ?",
+        )
+        .bind(now)
+        .bind(invitation.recipient_email)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let inserted = self
+            .query(
+                "INSERT INTO user_invitations (
+                     id, recipient_email, created_by_user_id, status, preset_id,
+                     preset_name, preset_version, permission_snapshot_json,
+                     expires_at, created_at, updated_at
+                 ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(invitation.id)
+            .bind(invitation.recipient_email)
+            .bind(invitation.created_by_user_id)
+            .bind(invitation.preset_id)
+            .bind(invitation.preset_name)
+            .bind(invitation.preset_version)
+            .bind(invitation.permission_snapshot_json)
+            .bind(invitation.expires_at)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if inserted.rows_affected() != 1 {
+            let pending_invitation_exists: Option<String> = self
+                .query_scalar(
+                    "SELECT id FROM user_invitations
+                     WHERE recipient_email = ? AND status = 'PENDING' AND expires_at > ?
+                     LIMIT 1",
+                )
+                .bind(invitation.recipient_email)
+                .bind(now)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return if pending_invitation_exists.is_some() {
+                Ok(UserInvitationCreateResult::AlreadyPending)
+            } else {
+                Err(StorageError::Conflict(
+                    "user invitation ID already exists".to_owned(),
+                ))
+            };
+        }
+
+        let recent_email_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = ? AND template_kind = 'INVITATION'
+                   AND created_at > ?",
+            )
+            .bind(invitation.recipient_email)
+            .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationCreateResult::RateLimited);
+        }
+
+        self.query(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(challenge.id)
+        .bind(challenge.kind.as_str())
+        .bind(challenge.recipient_email)
+        .bind(challenge.reference_id)
+        .bind(challenge.token_hash)
+        .bind(challenge.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let outbox_id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)",
+        )
+        .bind(&outbox_id)
+        .bind(message.idempotency_key)
+        .bind(message.recipient_email)
+        .bind(message.template_kind.as_str())
+        .bind(message.reference_id)
+        .bind(message.available_at)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserInvitationCreateResult::Created)
+    }
+
+    pub(crate) async fn queue_user_invitation_resend(
+        &self,
+        invitation_id: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<UserInvitationResendResult, StorageError> {
+        if now < 0
+            || invitation_id.trim() != invitation_id
+            || !(1..=128).contains(&invitation_id.len())
+            || invitation_id.chars().any(char::is_control)
+            || idempotency_key.trim() != idempotency_key
+            || !(1..=256).contains(&idempotency_key.len())
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid user invitation resend".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let invitation_statement = format!(
+            "SELECT recipient_email, expires_at FROM user_invitations
+             WHERE id = ? AND status = 'PENDING' AND expires_at > ?{lock_clause}"
+        );
+        let invitation: Option<(String, i64)> = self
+            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(invitation_statement))
+            .bind(invitation_id)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((recipient_email, invitation_expires_at)) = invitation else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationResendResult::NotResendable);
+        };
+
+        let challenge_statement = format!(
+            "SELECT id FROM mail_challenges
+             WHERE challenge_kind = 'INVITATION' AND reference_id = ?
+               AND recipient_email = ? AND expires_at = ? AND expires_at > ?
+               AND created_at <= ? AND consumed_at IS NULL AND revoked_at IS NULL
+             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
+        );
+        let challenge_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
+            .bind(invitation_id)
+            .bind(&recipient_email)
+            .bind(invitation_expires_at)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(challenge_id) = challenge_id else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationResendResult::NotResendable);
+        };
+
+        let existing_message = self
+            .query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some(existing_message) = existing_message {
+            if existing_message.recipient_email != recipient_email
+                || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
+                || existing_message.reference_id != challenge_id
+            {
+                return Err(StorageError::Conflict(
+                    "mail outbox idempotency key already used".to_owned(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationResendResult::Queued);
+        }
+
+        let recent_email_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = ? AND template_kind = 'INVITATION'
+                   AND created_at > ?",
+            )
+            .bind(&recipient_email)
+            .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationResendResult::RateLimited);
+        }
+
+        let outbox_id = Uuid::now_v7().to_string();
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'INVITATION', ?, 'PENDING', 0, ?, ?, ?)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(&outbox_id)
+        .bind(idempotency_key)
+        .bind(&recipient_email)
+        .bind(&challenge_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let existing_message = self
+            .query_as::<MailOutboxRecord>(
+                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
+                        status, attempt_count, available_at, lease_expires_at,
+                        last_error_code, sent_at, created_at, updated_at
+                 FROM mail_outbox WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if existing_message.recipient_email != recipient_email
+            || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
+            || existing_message.reference_id != challenge_id
+        {
+            return Err(StorageError::Conflict(
+                "mail outbox idempotency key already used".to_owned(),
+            ));
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserInvitationResendResult::Queued)
+    }
+
+    pub(crate) async fn get_user_invitation(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<Option<StoredUserInvitation>, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid invitation read time".to_owned(),
+            ));
+        }
+        self.query_as::<UserInvitationRecord>(
+            "SELECT id, recipient_email, created_by_user_id, accepted_user_id,
+                    CASE WHEN status = 'PENDING' AND expires_at <= ?
+                         THEN 'EXPIRED' ELSE status END AS status,
+                    preset_id, preset_name, preset_version, permission_snapshot_json,
+                    expires_at, accepted_at, revoked_at, created_at, updated_at
+             FROM user_invitations WHERE id = ?",
+        )
+        .bind(now)
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn get_user_invitation_for_challenge_hash(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<StoredUserInvitationAcceptance>, StorageError> {
+        if now < 0 || token_hash.len() != 32 {
+            return Err(StorageError::Conflict(
+                "invalid invitation challenge lookup".to_owned(),
+            ));
+        }
+        let row = self
+            .query_as::<(String, String, String, i64)>(
+                "SELECT i.id, c.id, c.recipient_email, c.expires_at
+                 FROM mail_challenges c
+                 JOIN user_invitations i ON i.id = c.reference_id
+                 WHERE c.challenge_kind = 'INVITATION' AND c.token_hash = ?
+                   AND c.expires_at > ? AND c.created_at <= ?
+                   AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+                   AND i.status = 'PENDING' AND i.expires_at > ?
+                   AND i.recipient_email = c.recipient_email
+                   AND i.expires_at = c.expires_at
+                 ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
+            )
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.map(
+            |(invitation_id, challenge_id, recipient_email, expires_at)| {
+                StoredUserInvitationAcceptance {
+                    invitation_id,
+                    challenge_id,
+                    recipient_email,
+                    expires_at,
+                }
+            },
+        ))
+    }
+
+    pub(crate) async fn accept_user_invitation(
+        &self,
+        challenge_id: &str,
+        token_hash: &[u8],
+        account: NewInvitationUserAccount<'_>,
+        now: i64,
+    ) -> Result<UserInvitationAcceptResult, StorageError> {
+        if now < 0
+            || challenge_id.trim() != challenge_id
+            || !(1..=128).contains(&challenge_id.len())
+            || challenge_id.chars().any(char::is_control)
+            || token_hash.len() != 32
+            || account.id.trim() != account.id
+            || !(1..=128).contains(&account.id.len())
+            || account.id.chars().any(char::is_control)
+            || account.username_normalized.trim() != account.username_normalized
+            || account.username_normalized.is_empty()
+            || account.username_normalized.chars().count() > 128
+            || account.username_normalized != account.username_normalized.to_lowercase()
+            || account.display_name.trim().is_empty()
+            || account.display_name.chars().count() > 128
+            || account.password_hash.trim().is_empty()
+            || account.password_hash.len() > 512
+        {
+            return Err(StorageError::Conflict(
+                "invalid invitation acceptance".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let invitation_statement = format!(
+            "SELECT i.id, i.recipient_email, i.permission_snapshot_json FROM user_invitations i
+             JOIN mail_challenges c ON c.reference_id = i.id
+             WHERE c.id = ? AND c.challenge_kind = 'INVITATION' AND c.token_hash = ?
+               AND c.expires_at > ? AND c.created_at <= ?
+               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+               AND i.status = 'PENDING' AND i.expires_at > ?
+               AND i.recipient_email = c.recipient_email
+               AND i.expires_at = c.expires_at{lock_clause}"
+        );
+        let invitation: Option<(String, String, String)> = self
+            .query_as(sqlx::AssertSqlSafe(invitation_statement))
+            .bind(challenge_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((invitation_id, recipient_email, permission_snapshot_json)) = invitation else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationAcceptResult::NotAcceptable);
+        };
+
+        let permission_snapshot: UserInvitationPermissionSnapshot =
+            serde_json::from_str(&permission_snapshot_json).map_err(|_| {
+                StorageError::Serialization("invitation permission snapshot is invalid".to_owned())
+            })?;
+        let permissions = permission_snapshot.permissions;
+        if !matches!(
+            permissions.library_access_mode.as_str(),
+            "ALL" | "SELECTED" | "NONE"
+        ) || permissions.max_simultaneous_playbacks < 0
+        {
+            return Err(StorageError::Serialization(
+                "invitation permission snapshot is invalid".to_owned(),
+            ));
+        }
+
+        let username_taken = self
+            .query_scalar::<String>("SELECT id FROM users WHERE username_normalized = ? LIMIT 1")
+            .bind(account.username_normalized)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if username_taken {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationAcceptResult::UsernameTaken);
+        }
+
+        let insert_user = self
+            .query(
+                "INSERT INTO users (
+                    id, username_normalized, display_name, password_hash,
+                    is_admin, can_manage_server, has_password, email, email_verified_at,
+                    can_download, can_play, max_simultaneous_playbacks,
+                    allow_remux, allow_audio_transcode, allow_video_transcode,
+                    library_access_mode
+                 ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(account.id)
+            .bind(account.username_normalized)
+            .bind(account.display_name)
+            .bind(account.password_hash)
+            .bind(database_flag(permission_snapshot.is_admin))
+            .bind(database_flag(permission_snapshot.can_manage_server))
+            .bind(&recipient_email)
+            .bind(now)
+            .bind(database_flag(permissions.can_download))
+            .bind(database_flag(permissions.can_play))
+            .bind(permissions.max_simultaneous_playbacks)
+            .bind(database_flag(permissions.allow_remux))
+            .bind(database_flag(permissions.allow_audio_transcode))
+            .bind(database_flag(permissions.allow_video_transcode))
+            .bind(&permissions.library_access_mode)
+            .execute(&mut *transaction)
+            .await;
+        if let Err(source) = insert_user {
+            let unique_violation = source
+                .as_database_error()
+                .is_some_and(|error| error.is_unique_violation());
+            if unique_violation {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|rollback_error| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source: rollback_error,
+                    })?;
+
+                let username_taken = self
+                    .query_scalar::<String>(
+                        "SELECT id FROM users WHERE username_normalized = ? LIMIT 1",
+                    )
+                    .bind(account.username_normalized)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .is_some();
+                if username_taken {
+                    return Ok(UserInvitationAcceptResult::UsernameTaken);
+                }
+
+                let email_already_registered = self
+                    .query_scalar::<String>(
+                        "SELECT id FROM users
+                         WHERE email IS NOT NULL AND email <> ''
+                           AND LOWER(email) = LOWER(?)
+                         LIMIT 1",
+                    )
+                    .bind(&recipient_email)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .is_some();
+                if email_already_registered {
+                    return Ok(UserInvitationAcceptResult::EmailAlreadyRegistered);
+                }
+            }
+            return Err(StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            });
+        }
+
+        if permissions.library_access_mode == "SELECTED" {
+            for library_id in &permissions.library_ids {
+                self.query(
+                    "INSERT INTO user_library_access (user_id, library_id, can_view)
+                     VALUES (?, ?, 1)",
+                )
+                .bind(account.id)
+                .bind(library_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
+        let invitation_updated = self
+            .query(
+                "UPDATE user_invitations
+                 SET status = 'ACCEPTED', accepted_user_id = ?, accepted_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'PENDING' AND expires_at > ?",
+            )
+            .bind(account.id)
+            .bind(now)
+            .bind(now)
+            .bind(&invitation_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        let challenge_consumed = self
+            .query(
+                "UPDATE mail_challenges SET consumed_at = ?
+                 WHERE id = ? AND token_hash = ? AND challenge_kind = 'INVITATION'
+                   AND consumed_at IS NULL AND revoked_at IS NULL
+                   AND expires_at > ? AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(challenge_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        if invitation_updated != 1 || challenge_consumed != 1 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserInvitationAcceptResult::NotAcceptable);
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserInvitationAcceptResult::Accepted)
+    }
+
+    pub(crate) async fn list_user_invitations_page(
+        &self,
+        status: Option<UserInvitationStatus>,
+        page_size: i64,
+        offset: i64,
+        now: i64,
+    ) -> Result<UserInvitationPage, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid invitation page time".to_owned(),
+            ));
+        }
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let status_filter = if status.is_some() {
+            " WHERE status = ?"
+        } else {
+            ""
+        };
+        let count_statement = format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT CASE WHEN status = 'PENDING' AND expires_at <= ?
+                             THEN 'EXPIRED' ELSE status END AS status
+                 FROM user_invitations
+             ) AS invitations{status_filter}"
+        );
+        let mut count_query = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_statement));
+        count_query = count_query.bind(now);
+        if let Some(status) = status {
+            count_query = count_query.bind(status.as_str());
+        }
+        let total_count =
+            count_query
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+        let page_statement = format!(
+            "SELECT id, recipient_email, created_by_user_id, accepted_user_id, status,
+                    preset_id, preset_name, preset_version, permission_snapshot_json,
+                    expires_at, accepted_at, revoked_at, created_at, updated_at
+             FROM (
+                 SELECT id, recipient_email, created_by_user_id, accepted_user_id,
+                        CASE WHEN status = 'PENDING' AND expires_at <= ?
+                             THEN 'EXPIRED' ELSE status END AS status,
+                        preset_id, preset_name, preset_version, permission_snapshot_json,
+                        expires_at, accepted_at, revoked_at, created_at, updated_at
+                 FROM user_invitations
+             ) AS invitations{status_filter}
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut page_query = self
+            .query_as::<UserInvitationRecord>(sqlx::AssertSqlSafe(page_statement))
+            .bind(now);
+        if let Some(status) = status {
+            page_query = page_query.bind(status.as_str());
+        }
+        let records = page_query
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let entries = records
+            .into_iter()
+            .map(TryInto::try_into)
+            .collect::<Result<Vec<StoredUserInvitation>, StorageError>>()?;
+        Ok(UserInvitationPage {
+            entries,
+            page_size,
+            total_count,
+        })
+    }
+
+    pub(crate) async fn revoke_user_invitation(
+        &self,
+        id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0 || id.trim() != id || !(1..=128).contains(&id.len()) {
+            return Err(StorageError::Conflict(
+                "invalid invitation revocation".to_owned(),
+            ));
+        }
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.query(
+            "UPDATE user_invitations
+             SET status = 'EXPIRED', updated_at = ?
+             WHERE id = ? AND status = 'PENDING' AND expires_at <= ?",
+        )
+        .bind(now)
+        .bind(id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let revoked = self
+            .query(
+                "UPDATE user_invitations
+                 SET status = 'REVOKED', revoked_at = ?, updated_at = ?
+                 WHERE id = ? AND status = 'PENDING' AND expires_at > ?",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected()
+            == 1;
+        if revoked {
+            self.query(
+                "UPDATE mail_challenges SET revoked_at = ?
+                 WHERE challenge_kind = 'INVITATION' AND reference_id = ?
+                   AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.query(
+                "UPDATE mail_outbox
+                 SET status = 'FAILED', lease_expires_at = NULL,
+                     last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
+                     updated_at = ?
+                 WHERE reference_id IN (
+                     SELECT id FROM mail_challenges
+                     WHERE challenge_kind = 'INVITATION' AND reference_id = ?
+                 ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
+            )
+            .bind(now)
+            .bind(id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(revoked)
+    }
+
+    pub(crate) async fn get_mail_challenge(
+        &self,
+        id: &str,
+    ) -> Result<Option<StoredMailChallenge>, StorageError> {
+        self.query_as::<MailChallengeRecord>(
+            "SELECT id, challenge_kind, recipient_email, reference_id, token_hash,
+                    expires_at, consumed_at, revoked_at, created_at
+             FROM mail_challenges WHERE id = ?",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn get_user_email_change_challenge_by_token_hash(
+        &self,
+        user_id: &str,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<StoredMailChallenge>, StorageError> {
+        if now < 0
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+            || token_hash.len() != 32
+        {
+            return Err(StorageError::Conflict(
+                "invalid user email change challenge lookup".to_owned(),
+            ));
+        }
+        self.query_as::<MailChallengeRecord>(
+            "SELECT c.id, c.challenge_kind, c.recipient_email, c.reference_id,
+                    c.token_hash, c.expires_at, c.consumed_at, c.revoked_at, c.created_at
+             FROM mail_challenges c
+             JOIN users u ON u.id = c.reference_id
+             WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.reference_id = ?
+               AND c.token_hash = ? AND c.expires_at > ? AND c.created_at <= ?
+               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+               AND u.is_disabled = 0 AND u.deleted_at IS NULL
+             LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(token_hash)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn get_pending_user_email_change(
+        &self,
+        user_id: &str,
+        now: i64,
+    ) -> Result<Option<StoredMailChallenge>, StorageError> {
+        if now < 0
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid pending user email change lookup".to_owned(),
+            ));
+        }
+        self.query_as::<MailChallengeRecord>(
+            "SELECT c.id, c.challenge_kind, c.recipient_email, c.reference_id,
+                    c.token_hash, c.expires_at, c.consumed_at, c.revoked_at, c.created_at
+             FROM mail_challenges c
+             JOIN users u ON u.id = c.reference_id
+             WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.reference_id = ?
+               AND c.expires_at > ? AND c.created_at <= ?
+               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+               AND u.is_disabled = 0 AND u.deleted_at IS NULL
+             ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(now)
+        .bind(now)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?
+        .map(TryInto::try_into)
+        .transpose()
+    }
+
+    pub(crate) async fn consume_mail_challenge(
+        &self,
+        id: &str,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        if now < 0 || token_hash.len() != 32 {
+            return Err(StorageError::Conflict(
+                "invalid mail challenge consumption".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_challenges SET consumed_at = ?
+                 WHERE id = ? AND token_hash = ? AND consumed_at IS NULL
+                   AND revoked_at IS NULL AND expires_at > ? AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub(crate) async fn revoke_mail_challenges(
+        &self,
+        kind: MailChallengeKind,
+        reference_id: &str,
+        now: i64,
+    ) -> Result<u64, StorageError> {
+        if now < 0
+            || reference_id.trim() != reference_id
+            || !(1..=128).contains(&reference_id.len())
+            || reference_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid mail challenge revocation".to_owned(),
+            ));
+        }
+        let result = self
+            .query(
+                "UPDATE mail_challenges SET revoked_at = ?
+                 WHERE challenge_kind = ? AND reference_id = ?
+                   AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(kind.as_str())
+            .bind(reference_id)
+            .bind(now)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(result.rows_affected())
+    }
+}
+
+fn user_registration_permission_snapshot(
+    json: &str,
+) -> Result<UserInvitationPermissionSnapshot, StorageError> {
+    let snapshot: UserInvitationPermissionSnapshot = serde_json::from_str(json).map_err(|_| {
+        StorageError::Conflict("invalid user registration permission snapshot".to_owned())
+    })?;
+    if json.len() > 32_768
+        || !matches!(
+            snapshot.permissions.library_access_mode.as_str(),
+            "ALL" | "SELECTED" | "NONE"
+        )
+        || snapshot.permissions.max_simultaneous_playbacks < 0
+        || snapshot.permissions.library_ids.iter().any(|id| {
+            id.trim() != id || !(1..=128).contains(&id.len()) || id.chars().any(char::is_control)
+        })
+        || snapshot
+            .permissions
+            .library_ids
+            .iter()
+            .collect::<HashSet<_>>()
+            .len()
+            != snapshot.permissions.library_ids.len()
+    {
+        return Err(StorageError::Conflict(
+            "invalid user registration permission snapshot".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[allow(dead_code)] // LUX-808 and LUX-812 consume this request workflow.
+impl Database {
+    async fn cancel_user_registration_mail(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        request_id: &str,
+        now: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE mail_challenges SET revoked_at = ?
+             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+               AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
+        )
+        .bind(now)
+        .bind(request_id)
+        .bind(now)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE mail_outbox
+             SET status = 'FAILED', lease_expires_at = NULL,
+                 last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL, updated_at = ?
+             WHERE reference_id IN (
+                 SELECT id FROM mail_challenges
+                 WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+             ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
+        )
+        .bind(now)
+        .bind(request_id)
+        .execute(&mut **transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn create_user_registration_request_with_mail(
+        &self,
+        request: NewUserRegistrationRequest<'_>,
+        challenge: NewMailChallenge<'_>,
+        message: NewMailOutboxMessage<'_>,
+        now: i64,
+    ) -> Result<UserRegistrationCreateResult, StorageError> {
+        let _snapshot = user_registration_permission_snapshot(request.permission_snapshot_json)?;
+        if now < 0
+            || request.id.trim() != request.id
+            || !(1..=128).contains(&request.id.len())
+            || request.id.chars().any(char::is_control)
+            || request.recipient_email.trim() != request.recipient_email
+            || request.recipient_email != request.recipient_email.to_lowercase()
+            || !(3..=254).contains(&request.recipient_email.chars().count())
+            || request.recipient_email.chars().any(char::is_whitespace)
+            || request.username_normalized.trim() != request.username_normalized
+            || request.username_normalized.is_empty()
+            || request.username_normalized.chars().count() > 128
+            || request.username_normalized != request.username_normalized.to_lowercase()
+            || request.username_normalized.chars().any(char::is_control)
+            || request.display_name.trim().is_empty()
+            || request.display_name.chars().count() > 128
+            || request.display_name.chars().any(char::is_control)
+            || request.password_hash.len() > 2048
+            || !request.password_hash.starts_with("$argon2id$")
+            || request.expires_at <= now
+            || challenge.id.trim() != challenge.id
+            || !(1..=128).contains(&challenge.id.len())
+            || challenge.id.chars().any(char::is_control)
+            || challenge.kind != MailChallengeKind::EmailVerification
+            || challenge.recipient_email != request.recipient_email
+            || challenge.reference_id != request.id
+            || challenge.token_hash.len() != 32
+            || challenge.expires_at != request.expires_at
+            || message.idempotency_key.trim() != message.idempotency_key
+            || !(1..=256).contains(&message.idempotency_key.len())
+            || message.idempotency_key.chars().any(char::is_control)
+            || message.recipient_email != request.recipient_email
+            || message.template_kind != MailOutboxTemplateKind::EmailVerification
+            || message.reference_id != challenge.id
+            || message.available_at != now
+        {
+            return Err(StorageError::Conflict(
+                "invalid user registration and mail bundle".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let expired_ids: Vec<String> = self
+            .query_scalar(
+                "SELECT id FROM user_registration_requests
+                 WHERE recipient_email = ?
+                   AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?",
+            )
+            .bind(request.recipient_email)
+            .bind(now)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for expired_id in expired_ids {
+            self.query(
+                "UPDATE user_registration_requests
+                 SET status = 'EXPIRED', password_hash = NULL, last_error_code = NULL, updated_at = ?
+                 WHERE id = ? AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?",
+            )
+            .bind(now)
+            .bind(&expired_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            self.cancel_user_registration_mail(&mut transaction, &expired_id, now)
+                .await?;
+        }
+
+        let existing_user: Option<String> = self
+            .query_scalar(
+                "SELECT id FROM users WHERE email IS NOT NULL AND LOWER(email) = ? LIMIT 1",
+            )
+            .bind(request.recipient_email)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if existing_user.is_some() {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationCreateResult::AlreadyExists);
+        }
+
+        let recent_email_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = ? AND template_kind = 'EMAIL_VERIFICATION'
+                   AND created_at > ?",
+            )
+            .bind(request.recipient_email)
+            .bind(now.saturating_sub(USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if recent_email_count >= USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationCreateResult::RateLimited);
+        }
+
+        let inserted = self
+            .query(
+                "INSERT INTO user_registration_requests (
+                     id, recipient_email, username_normalized, display_name, password_hash,
+                     permission_snapshot_json, status, expires_at, created_at, updated_at
+                 ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING_EMAIL', ?, ?, ?)
+                 ON CONFLICT DO NOTHING",
+            )
+            .bind(request.id)
+            .bind(request.recipient_email)
+            .bind(request.username_normalized)
+            .bind(request.display_name)
+            .bind(request.password_hash)
+            .bind(request.permission_snapshot_json)
+            .bind(request.expires_at)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if inserted.rows_affected() != 1 {
+            let existing_request: Option<String> = self
+                .query_scalar(
+                    "SELECT id FROM user_registration_requests
+                     WHERE recipient_email = ? AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL')
+                       AND expires_at > ? LIMIT 1",
+                )
+                .bind(request.recipient_email)
+                .bind(now)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return if existing_request.is_some() {
+                Ok(UserRegistrationCreateResult::AlreadyExists)
+            } else {
+                Err(StorageError::Conflict(
+                    "user registration request identifier already exists".to_owned(),
+                ))
+            };
+        }
+
+        self.query(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(challenge.id)
+        .bind(challenge.kind.as_str())
+        .bind(challenge.recipient_email)
+        .bind(challenge.reference_id)
+        .bind(challenge.token_hash)
+        .bind(challenge.expires_at)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(message.idempotency_key)
+        .bind(message.recipient_email)
+        .bind(message.template_kind.as_str())
+        .bind(message.reference_id)
+        .bind(message.available_at)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserRegistrationCreateResult::Created)
+    }
+}
+
+#[allow(dead_code)] // LUX-808 and LUX-812 consume these registration transitions.
+impl Database {
+    pub(crate) async fn queue_user_registration_resend(
+        &self,
+        recipient_email: &str,
+        idempotency_key: &str,
+        now: i64,
+    ) -> Result<UserRegistrationResendResult, StorageError> {
+        if now < 0
+            || recipient_email.trim() != recipient_email
+            || recipient_email != recipient_email.to_lowercase()
+            || !(3..=254).contains(&recipient_email.chars().count())
+            || recipient_email
+                .chars()
+                .any(|character| character.is_control() || character.is_whitespace())
+            || idempotency_key.trim() != idempotency_key
+            || !(1..=256).contains(&idempotency_key.len())
+            || idempotency_key.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid user registration resend".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let request_statement = format!(
+            "SELECT id, expires_at FROM user_registration_requests
+             WHERE recipient_email = ? AND status = 'PENDING_EMAIL'
+               AND email_verified_at IS NULL AND password_hash IS NOT NULL
+               AND expires_at > ? AND created_at <= ?
+             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
+        );
+        let request: Option<(String, i64)> = self
+            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(request_statement))
+            .bind(recipient_email)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some((request_id, request_expires_at)) = request else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::NotResendable);
+        };
+
+        let challenge_statement = format!(
+            "SELECT id FROM mail_challenges
+             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+               AND recipient_email = ? AND expires_at = ? AND expires_at > ?
+               AND created_at <= ? AND consumed_at IS NULL AND revoked_at IS NULL
+             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
+        );
+        let challenge_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
+            .bind(&request_id)
+            .bind(recipient_email)
+            .bind(request_expires_at)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(challenge_id) = challenge_id else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::NotResendable);
+        };
+
+        let existing_message: Option<(String, String, String)> = self
+            .query_as(
+                "SELECT recipient_email, template_kind, reference_id FROM mail_outbox
+                 WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if let Some((existing_email, existing_template, existing_reference)) = existing_message {
+            if existing_email != recipient_email
+                || existing_template != MailOutboxTemplateKind::EmailVerification.as_str()
+                || existing_reference != challenge_id
+            {
+                return Err(StorageError::Conflict(
+                    "mail outbox idempotency key already used".to_owned(),
+                ));
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::Queued);
+        }
+
+        let recent_email_count: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = ? AND template_kind = 'EMAIL_VERIFICATION'
+                   AND created_at > ?",
+            )
+            .bind(recipient_email)
+            .bind(now.saturating_sub(USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS))
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if recent_email_count >= USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationResendResult::RateLimited);
+        }
+
+        self.query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, attempt_count, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'EMAIL_VERIFICATION', ?, 'PENDING', 0, ?, ?, ?)
+             ON CONFLICT (idempotency_key) DO NOTHING",
+        )
+        .bind(Uuid::now_v7().to_string())
+        .bind(idempotency_key)
+        .bind(recipient_email)
+        .bind(&challenge_id)
+        .bind(now)
+        .bind(now)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+
+        let stored_message: (String, String, String) = self
+            .query_as(
+                "SELECT recipient_email, template_kind, reference_id FROM mail_outbox
+                 WHERE idempotency_key = ?",
+            )
+            .bind(idempotency_key)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if stored_message.0 != recipient_email
+            || stored_message.1 != MailOutboxTemplateKind::EmailVerification.as_str()
+            || stored_message.2 != challenge_id
+        {
+            return Err(StorageError::Conflict(
+                "mail outbox idempotency key already used".to_owned(),
+            ));
+        }
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserRegistrationResendResult::Queued)
+    }
+
+    pub(crate) async fn get_user_registration_challenge_by_token_hash(
+        &self,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<Option<StoredUserRegistrationChallenge>, StorageError> {
+        if now < 0 || token_hash.len() != 32 {
+            return Err(StorageError::Conflict(
+                "invalid user registration challenge lookup".to_owned(),
+            ));
+        }
+        let record: Option<(String, i64)> = self
+            .query_as(
+                "SELECT c.id, c.expires_at
+                 FROM mail_challenges c
+                 JOIN user_registration_requests r ON r.id = c.reference_id
+                 WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.token_hash = ?
+                   AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+                   AND c.expires_at > ? AND c.created_at <= ?
+                   AND r.status = 'PENDING_EMAIL' AND r.expires_at > ?
+                   AND r.recipient_email = c.recipient_email AND r.expires_at = c.expires_at
+                 ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
+            )
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(record.map(|(id, expires_at)| StoredUserRegistrationChallenge { id, expires_at }))
+    }
+
+    pub(crate) async fn verify_user_registration_email(
+        &self,
+        challenge_id: &str,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<UserRegistrationVerifyResult, StorageError> {
+        if now < 0
+            || challenge_id.trim() != challenge_id
+            || !(1..=128).contains(&challenge_id.len())
+            || challenge_id.chars().any(char::is_control)
+            || token_hash.len() != 32
+        {
+            return Err(StorageError::Conflict(
+                "invalid user registration verification".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE OF r, c"
+        } else {
+            ""
+        };
+        let statement = format!(
+            "SELECT r.id FROM user_registration_requests r
+             JOIN mail_challenges c ON c.reference_id = r.id
+             WHERE c.id = ? AND c.challenge_kind = 'EMAIL_VERIFICATION'
+               AND c.token_hash = ? AND c.expires_at > ? AND c.created_at <= ?
+               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
+               AND r.status = 'PENDING_EMAIL' AND r.expires_at > ?
+               AND r.recipient_email = c.recipient_email AND r.expires_at = c.expires_at{lock_clause}"
+        );
+        let request_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(statement))
+            .bind(challenge_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(request_id) = request_id else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationVerifyResult::NotAcceptable);
+        };
+
+        let consumed = self
+            .query(
+                "UPDATE mail_challenges SET consumed_at = ?
+                 WHERE id = ? AND challenge_kind = 'EMAIL_VERIFICATION' AND token_hash = ?
+                   AND consumed_at IS NULL AND revoked_at IS NULL
+                   AND expires_at > ? AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(challenge_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        let transitioned = self
+            .query(
+                "UPDATE user_registration_requests
+                 SET status = 'PENDING_APPROVAL', email_verified_at = ?, updated_at = ?,
+                     last_error_code = NULL
+                 WHERE id = ? AND status = 'PENDING_EMAIL' AND expires_at > ?
+                   AND email_verified_at IS NULL",
+            )
+            .bind(now)
+            .bind(now)
+            .bind(&request_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        if consumed != 1 || transitioned != 1 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationVerifyResult::NotAcceptable);
+        }
+        self.cancel_user_registration_mail(&mut transaction, &request_id, now)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserRegistrationVerifyResult::Verified)
+    }
+
+    pub(crate) async fn verify_user_email_change(
+        &self,
+        user_id: &str,
+        challenge_id: &str,
+        token_hash: &[u8],
+        now: i64,
+    ) -> Result<super::UserEmailChangeVerifyResult, StorageError> {
+        if now < 0
+            || user_id.trim() != user_id
+            || !(1..=128).contains(&user_id.len())
+            || user_id.chars().any(char::is_control)
+            || challenge_id.trim() != challenge_id
+            || !(1..=128).contains(&challenge_id.len())
+            || challenge_id.chars().any(char::is_control)
+            || token_hash.len() != 32
+        {
+            return Err(StorageError::Conflict(
+                "invalid user email change verification".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let user_statement = format!(
+            "SELECT id FROM users WHERE id = ? AND is_disabled = 0
+             AND deleted_at IS NULL{lock_clause}"
+        );
+        let active_user_id: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(user_statement))
+            .bind(user_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if active_user_id.is_none() {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(super::UserEmailChangeVerifyResult::NotAcceptable);
+        }
+
+        let challenge_statement = format!(
+            "SELECT recipient_email FROM mail_challenges
+             WHERE id = ? AND challenge_kind = 'EMAIL_VERIFICATION'
+               AND reference_id = ? AND token_hash = ?
+               AND expires_at > ? AND created_at <= ?
+               AND consumed_at IS NULL AND revoked_at IS NULL{lock_clause}"
+        );
+        let recipient_email: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
+            .bind(challenge_id)
+            .bind(user_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(recipient_email) = recipient_email else {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(super::UserEmailChangeVerifyResult::NotAcceptable);
+        };
+
+        let email_in_use: i64 = self
+            .query_scalar(
+                "SELECT CASE WHEN EXISTS (
+                     SELECT 1 FROM users WHERE id <> ? AND LOWER(COALESCE(email, '')) = LOWER(?)
+                 ) THEN 1 ELSE 0 END",
+            )
+            .bind(user_id)
+            .bind(&recipient_email)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if email_in_use != 0 {
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(super::UserEmailChangeVerifyResult::EmailConflict);
+        }
+
+        let updated_user = self
+            .query(
+                "UPDATE users SET email = ?, email_verified_at = ?, updated_at = ?
+                 WHERE id = ? AND is_disabled = 0 AND deleted_at IS NULL",
+            )
+            .bind(&recipient_email)
+            .bind(now)
+            .bind(now)
+            .bind(user_id)
+            .execute(&mut *transaction)
+            .await;
+        let updated_user = match updated_user {
+            Ok(result) => result.rows_affected(),
+            Err(source)
+                if source
+                    .as_database_error()
+                    .is_some_and(|error| error.is_unique_violation()) =>
+            {
+                transaction
+                    .rollback()
+                    .await
+                    .map_err(|rollback| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source: rollback,
+                    })?;
+                return Ok(super::UserEmailChangeVerifyResult::EmailConflict);
+            }
+            Err(source) => {
+                return Err(StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+            }
+        };
+        let consumed_challenge = self
+            .query(
+                "UPDATE mail_challenges SET consumed_at = ?
+                 WHERE id = ? AND challenge_kind = 'EMAIL_VERIFICATION'
+                   AND reference_id = ? AND token_hash = ?
+                   AND consumed_at IS NULL AND revoked_at IS NULL
+                   AND expires_at > ? AND created_at <= ?",
+            )
+            .bind(now)
+            .bind(challenge_id)
+            .bind(user_id)
+            .bind(token_hash)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        if updated_user != 1 || consumed_challenge != 1 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(super::UserEmailChangeVerifyResult::NotAcceptable);
+        }
+
+        self.query(
+            "UPDATE mail_challenges SET revoked_at = ?
+             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
+               AND id <> ? AND consumed_at IS NULL AND revoked_at IS NULL
+               AND created_at <= ?",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(challenge_id)
+        .bind(now)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(super::UserEmailChangeVerifyResult::Verified)
+    }
+
+    pub(crate) async fn list_user_registration_requests_page(
+        &self,
+        status: Option<UserRegistrationStatus>,
+        page_size: i64,
+        offset: i64,
+        now: i64,
+    ) -> Result<UserRegistrationRequestPage, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid user registration page time".to_owned(),
+            ));
+        }
+        let page_size = page_size.clamp(1, 100);
+        let offset = offset.max(0);
+        let status_filter = if status.is_some() {
+            " WHERE status = ?"
+        } else {
+            ""
+        };
+        let count_statement = format!(
+            "SELECT COUNT(*) FROM (
+                 SELECT CASE
+                     WHEN status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?
+                         THEN 'EXPIRED' ELSE status END AS status
+                 FROM user_registration_requests
+             ) AS requests{status_filter}"
+        );
+        let mut count_query = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_statement));
+        count_query = count_query.bind(now);
+        if let Some(status) = status {
+            count_query = count_query.bind(status.as_str());
+        }
+        let total_count =
+            count_query
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+
+        let page_statement = format!(
+            "SELECT id, recipient_email, username_normalized, display_name,
+                    permission_snapshot_json, status, expires_at, email_verified_at,
+                    reviewed_at, reviewed_by_user_id, approved_user_id, last_error_code,
+                    created_at, updated_at
+             FROM (
+                 SELECT id, recipient_email, username_normalized, display_name,
+                        permission_snapshot_json,
+                        CASE WHEN status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?
+                             THEN 'EXPIRED' ELSE status END AS status,
+                        expires_at, email_verified_at, reviewed_at, reviewed_by_user_id,
+                        approved_user_id, last_error_code, created_at, updated_at
+                 FROM user_registration_requests
+             ) AS requests{status_filter}
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        );
+        let mut page_query = self
+            .query_as::<UserRegistrationRequestSummaryRecord>(sqlx::AssertSqlSafe(page_statement))
+            .bind(now);
+        if let Some(status) = status {
+            page_query = page_query.bind(status.as_str());
+        }
+        let records = page_query
+            .bind(page_size)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let requests = records
+            .into_iter()
+            .map(|record| {
+                Ok(StoredUserRegistrationRequest {
+                    id: record.id,
+                    recipient_email: record.recipient_email,
+                    username_normalized: record.username_normalized,
+                    display_name: record.display_name,
+                    status: UserRegistrationStatus::parse(&record.status)?,
+                    permission_snapshot_json: record.permission_snapshot_json,
+                    expires_at: record.expires_at,
+                    email_verified_at: record.email_verified_at,
+                    reviewed_at: record.reviewed_at,
+                    reviewed_by_user_id: record.reviewed_by_user_id,
+                    approved_user_id: record.approved_user_id,
+                    last_error_code: record.last_error_code,
+                    created_at: record.created_at,
+                    updated_at: record.updated_at,
+                })
+            })
+            .collect::<Result<Vec<_>, StorageError>>()?;
+        Ok(UserRegistrationRequestPage {
+            requests,
+            page_size,
+            total_count,
+        })
+    }
+
+    async fn mark_user_registration_error(
+        &self,
+        request_id: &str,
+        error_code: &str,
+        now: i64,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "UPDATE user_registration_requests
+             SET last_error_code = ?, updated_at = ?
+             WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at > ?
+               AND email_verified_at IS NOT NULL",
+        )
+        .bind(error_code)
+        .bind(now)
+        .bind(request_id)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(())
+    }
+
+    pub(crate) async fn approve_user_registration_request(
+        &self,
+        request_id: &str,
+        reviewer_user_id: &str,
+        permission_snapshot_json: &str,
+        now: i64,
+    ) -> Result<UserRegistrationApproveResult, StorageError> {
+        let permission_snapshot = user_registration_permission_snapshot(permission_snapshot_json)?;
+        if now < 0
+            || request_id.trim() != request_id
+            || !(1..=128).contains(&request_id.len())
+            || request_id.chars().any(char::is_control)
+            || reviewer_user_id.trim() != reviewer_user_id
+            || !(1..=128).contains(&reviewer_user_id.len())
+            || reviewer_user_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid user registration approval".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let request_statement = format!(
+            "SELECT recipient_email, username_normalized, display_name, password_hash,
+                    email_verified_at
+             FROM user_registration_requests
+             WHERE id = ? AND status = 'PENDING_APPROVAL' AND email_verified_at IS NOT NULL
+               AND expires_at > ?{lock_clause}"
+        );
+        let request = self
+            .query_as::<UserRegistrationRequestRecord>(sqlx::AssertSqlSafe(request_statement))
+            .bind(request_id)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(request) = request else {
+            let expired = self
+                .query(
+                    "UPDATE user_registration_requests
+                     SET status = 'EXPIRED', password_hash = NULL,
+                         last_error_code = NULL, updated_at = ?
+                     WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at <= ?",
+                )
+                .bind(now)
+                .bind(request_id)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if expired == 1 {
+                self.cancel_user_registration_mail(&mut transaction, request_id, now)
+                    .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationApproveResult::NotReviewable);
+        };
+        let Some(email_verified_at) = request.email_verified_at else {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationApproveResult::NotReviewable);
+        };
+        if now < email_verified_at {
+            return Err(StorageError::Conflict(
+                "registration approval time precedes email verification".to_owned(),
+            ));
+        }
+        let Some(password_hash) = request.password_hash.as_deref() else {
+            return Err(StorageError::Serialization(
+                "pending user registration has no password hash".to_owned(),
+            ));
+        };
+
+        let username_taken = self
+            .query_scalar::<String>("SELECT id FROM users WHERE username_normalized = ? LIMIT 1")
+            .bind(&request.username_normalized)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if username_taken {
+            self.query(
+                "UPDATE user_registration_requests
+                 SET last_error_code = 'USERNAME_CONFLICT', updated_at = ? WHERE id = ?",
+            )
+            .bind(now)
+            .bind(request_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationApproveResult::UsernameConflict);
+        }
+        let email_taken = self
+            .query_scalar::<String>(
+                "SELECT id FROM users WHERE email IS NOT NULL AND LOWER(email) = ? LIMIT 1",
+            )
+            .bind(&request.recipient_email)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .is_some();
+        if email_taken {
+            self.query(
+                "UPDATE user_registration_requests
+                 SET last_error_code = 'EMAIL_CONFLICT', updated_at = ? WHERE id = ?",
+            )
+            .bind(now)
+            .bind(request_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationApproveResult::EmailConflict);
+        }
+
+        let user_id = Uuid::now_v7().to_string();
+        let permissions = permission_snapshot.permissions;
+        let inserted_user = self
+            .query(
+                "INSERT INTO users (
+                    id, username_normalized, display_name, password_hash,
+                    is_admin, can_manage_server, has_password, email, email_verified_at,
+                    can_download, can_play, max_simultaneous_playbacks,
+                    allow_remux, allow_audio_transcode, allow_video_transcode,
+                    library_access_mode
+                 ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&user_id)
+            .bind(&request.username_normalized)
+            .bind(&request.display_name)
+            .bind(password_hash)
+            .bind(database_flag(permission_snapshot.is_admin))
+            .bind(database_flag(permission_snapshot.can_manage_server))
+            .bind(&request.recipient_email)
+            .bind(email_verified_at)
+            .bind(database_flag(permissions.can_download))
+            .bind(database_flag(permissions.can_play))
+            .bind(permissions.max_simultaneous_playbacks)
+            .bind(database_flag(permissions.allow_remux))
+            .bind(database_flag(permissions.allow_audio_transcode))
+            .bind(database_flag(permissions.allow_video_transcode))
+            .bind(&permissions.library_access_mode)
+            .execute(&mut *transaction)
+            .await;
+        if let Err(source) = inserted_user {
+            let unique_violation = source
+                .as_database_error()
+                .is_some_and(|error| error.is_unique_violation());
+            transaction
+                .rollback()
+                .await
+                .map_err(|rollback_error| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source: rollback_error,
+                })?;
+            if unique_violation {
+                let username_taken = self
+                    .query_scalar::<String>(
+                        "SELECT id FROM users WHERE username_normalized = ? LIMIT 1",
+                    )
+                    .bind(&request.username_normalized)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .is_some();
+                if username_taken {
+                    self.mark_user_registration_error(request_id, "USERNAME_CONFLICT", now)
+                        .await?;
+                    return Ok(UserRegistrationApproveResult::UsernameConflict);
+                }
+                let email_taken = self
+                    .query_scalar::<String>(
+                        "SELECT id FROM users WHERE email IS NOT NULL AND LOWER(email) = ? LIMIT 1",
+                    )
+                    .bind(&request.recipient_email)
+                    .fetch_optional(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+                    .is_some();
+                if email_taken {
+                    self.mark_user_registration_error(request_id, "EMAIL_CONFLICT", now)
+                        .await?;
+                    return Ok(UserRegistrationApproveResult::EmailConflict);
+                }
+            }
+            return Err(StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            });
+        }
+
+        if permissions.library_access_mode == "SELECTED" {
+            for library_id in &permissions.library_ids {
+                if let Err(source) = self
+                    .query(
+                        "INSERT INTO user_library_access (user_id, library_id, can_view)
+                         VALUES (?, ?, 1)",
+                    )
+                    .bind(&user_id)
+                    .bind(library_id)
+                    .execute(&mut *transaction)
+                    .await
+                {
+                    transaction
+                        .rollback()
+                        .await
+                        .map_err(|rollback_error| StorageError::Sqlx {
+                            path: self.path.clone(),
+                            source: rollback_error,
+                        })?;
+                    return Err(StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    });
+                }
+            }
+        }
+        let updated = self
+            .query(
+                "UPDATE user_registration_requests
+                 SET status = 'APPROVED', permission_snapshot_json = ?,
+                     reviewed_at = ?, reviewed_by_user_id = ?, approved_user_id = ?,
+                     password_hash = NULL, last_error_code = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at > ?",
+            )
+            .bind(permission_snapshot_json)
+            .bind(now)
+            .bind(reviewer_user_id)
+            .bind(&user_id)
+            .bind(now)
+            .bind(request_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        if updated != 1 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationApproveResult::NotReviewable);
+        }
+        self.cancel_user_registration_mail(&mut transaction, request_id, now)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserRegistrationApproveResult::Approved(user_id))
+    }
+}
+
+#[allow(dead_code)] // LUX-812 and the registration expiry worker consume these transitions.
+impl Database {
+    pub(crate) async fn reject_user_registration_request(
+        &self,
+        request_id: &str,
+        reviewer_user_id: &str,
+        now: i64,
+    ) -> Result<UserRegistrationRejectResult, StorageError> {
+        if now < 0
+            || request_id.trim() != request_id
+            || !(1..=128).contains(&request_id.len())
+            || request_id.chars().any(char::is_control)
+            || reviewer_user_id.trim() != reviewer_user_id
+            || !(1..=128).contains(&reviewer_user_id.len())
+            || reviewer_user_id.chars().any(char::is_control)
+        {
+            return Err(StorageError::Conflict(
+                "invalid user registration rejection".to_owned(),
+            ));
+        }
+
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE"
+        } else {
+            ""
+        };
+        let statement = format!(
+            "SELECT id FROM user_registration_requests
+             WHERE id = ? AND status = 'PENDING_APPROVAL' AND email_verified_at IS NOT NULL
+               AND expires_at > ?{lock_clause}"
+        );
+        let reviewable: Option<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(statement))
+            .bind(request_id)
+            .bind(now)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if reviewable.is_none() {
+            let expired = self
+                .query(
+                    "UPDATE user_registration_requests
+                     SET status = 'EXPIRED', password_hash = NULL,
+                         last_error_code = NULL, updated_at = ?
+                     WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at <= ?",
+                )
+                .bind(now)
+                .bind(request_id)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if expired == 1 {
+                self.cancel_user_registration_mail(&mut transaction, request_id, now)
+                    .await?;
+            }
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationRejectResult::NotReviewable);
+        }
+
+        let updated = self
+            .query(
+                "UPDATE user_registration_requests
+                 SET status = 'REJECTED', reviewed_at = ?, reviewed_by_user_id = ?,
+                     password_hash = NULL, last_error_code = NULL, updated_at = ?
+                 WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at > ?",
+            )
+            .bind(now)
+            .bind(reviewer_user_id)
+            .bind(now)
+            .bind(request_id)
+            .bind(now)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        if updated != 1 {
+            transaction
+                .rollback()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(UserRegistrationRejectResult::NotReviewable);
+        }
+        self.cancel_user_registration_mail(&mut transaction, request_id, now)
+            .await?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(UserRegistrationRejectResult::Rejected)
+    }
+
+    pub(crate) async fn expire_user_registration_requests(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<u64, StorageError> {
+        if now < 0 {
+            return Err(StorageError::Conflict(
+                "invalid user registration expiry time".to_owned(),
+            ));
+        }
+        let limit = limit.clamp(1, 100);
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let lock_clause = if self.backend == DatabaseBackend::Postgres {
+            " FOR UPDATE SKIP LOCKED"
+        } else {
+            ""
+        };
+        let statement = format!(
+            "SELECT id FROM user_registration_requests
+             WHERE status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?
+             ORDER BY expires_at, id LIMIT ?{lock_clause}"
+        );
+        let expired_ids: Vec<String> = self
+            .query_scalar(sqlx::AssertSqlSafe(statement))
+            .bind(now)
+            .bind(limit)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut expired_count = 0_u64;
+        for request_id in expired_ids {
+            let updated = self
+                .query(
+                    "UPDATE user_registration_requests
+                     SET status = 'EXPIRED', password_hash = NULL,
+                         last_error_code = NULL, updated_at = ?
+                     WHERE id = ? AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL')
+                       AND expires_at <= ?",
+                )
+                .bind(now)
+                .bind(&request_id)
+                .bind(now)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+            if updated == 1 {
+                self.cancel_user_registration_mail(&mut transaction, &request_id, now)
+                    .await?;
+                expired_count += 1;
+            }
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(expired_count)
+    }
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct RegistrationModeRecord {
+    mode: super::RegistrationMode,
+    version: i64,
+}
+
+// LUX-803 consumes these versioned settings without changing the other settings keys.
+#[allow(dead_code)]
+impl Database {
+    pub(crate) async fn registration_mode(
+        &self,
+    ) -> Result<super::StoredRegistrationMode, StorageError> {
+        let raw_value: Option<String> = self
+            .query_scalar("SELECT value FROM server_settings WHERE key = 'registration_mode'")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let parsed = raw_value
+            .as_deref()
+            .and_then(|value| serde_json::from_str::<RegistrationModeRecord>(value).ok())
+            .filter(|record| record.version > 0);
+        let (mode, version) = parsed
+            .map_or((super::RegistrationMode::InvitationOnly, 0), |record| {
+                (record.mode, record.version)
+            });
+        Ok(super::StoredRegistrationMode {
+            mode,
+            version,
+            raw_value,
+        })
+    }
+
+    pub(crate) async fn compare_and_set_registration_mode(
+        &self,
+        expected: &super::StoredRegistrationMode,
+        mode: super::RegistrationMode,
+    ) -> Result<bool, StorageError> {
+        let version = expected.version.checked_add(1).ok_or_else(|| {
+            StorageError::Conflict("registration setting version exhausted".to_owned())
+        })?;
+        let value =
+            serde_json::to_string(&RegistrationModeRecord { mode, version }).map_err(|_| {
+                StorageError::Serialization("registration setting serialization failed".to_owned())
+            })?;
+        let result = if let Some(raw_value) = expected.raw_value.as_deref() {
+            self.query(
+                "UPDATE server_settings SET value = ?, updated_at = unixepoch()
+                        WHERE key = 'registration_mode' AND value = ?",
+            )
+            .bind(&value)
+            .bind(raw_value)
+            .execute(&self.pool)
+            .await
+        } else {
+            self.query(
+                "INSERT INTO server_settings (key, value) VALUES ('registration_mode', ?)
+                        ON CONFLICT(key) DO NOTHING",
+            )
+            .bind(&value)
+            .execute(&self.pool)
+            .await
+        }
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        Ok(result.rows_affected() == 1)
+    }
+}
+
 async fn sqlite_has_legacy_timestamp_migration_checksum(
     pool: &AnyPool,
 ) -> Result<bool, sqlx::Error> {
@@ -1080,6 +4824,75 @@ pub(crate) struct NewStoredUser<'a> {
     pub(crate) email: Option<&'a str>,
 }
 
+// LUX-654 consumes this versioned contract in the account settings API.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserAccountPreferences {
+    pub(crate) theme: String,
+    pub(crate) accent_color: String,
+    pub(crate) show_media_libraries: bool,
+    pub(crate) show_continue_watching: bool,
+    pub(crate) audio_language: String,
+    pub(crate) subtitle_language: String,
+    pub(crate) auto_play_next_episode: bool,
+    pub(crate) library_order: Vec<String>,
+    pub(crate) played_percent: i64,
+    pub(crate) version: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewUserAccountPreferences<'a> {
+    pub(crate) theme: &'a str,
+    pub(crate) accent_color: &'a str,
+    pub(crate) show_media_libraries: bool,
+    pub(crate) show_continue_watching: bool,
+    pub(crate) audio_language: &'a str,
+    pub(crate) subtitle_language: &'a str,
+    pub(crate) auto_play_next_episode: bool,
+    pub(crate) library_order: Option<&'a [String]>,
+    pub(crate) played_percent: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserAccountPreferencesCasResult {
+    Updated(UserAccountPreferences),
+    Conflict,
+    UserUnavailable,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct UserContentRestrictions {
+    pub(crate) rating_system: String,
+    pub(crate) maximum_rating: Option<String>,
+    pub(crate) allow_unrated: bool,
+    pub(crate) allowed_tags: Vec<String>,
+    pub(crate) blocked_tags: Vec<String>,
+    pub(crate) version: i64,
+    pub(crate) updated_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewUserContentRestrictions<'a> {
+    pub(crate) rating_system: &'a str,
+    pub(crate) maximum_rating: Option<&'a str>,
+    pub(crate) allow_unrated: bool,
+    pub(crate) allowed_tags: &'a [String],
+    pub(crate) blocked_tags: &'a [String],
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum UserContentRestrictionsCasResult {
+    Updated(UserContentRestrictions),
+    Conflict,
+    UserUnavailable,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum AdminUserStatusFilter {
     All,
@@ -1116,12 +4929,35 @@ pub(crate) struct StoredAdminUserListItem {
     pub(crate) current_playback_count: i64,
 }
 
+// LUX-648 exposes this stored source in administrator user projections.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredUserPermissionPresetSource {
+    pub(crate) preset_id: String,
+    pub(crate) preset_name: String,
+    pub(crate) preset_version: i64,
+    pub(crate) applied_at: i64,
+}
+
 #[derive(Debug)]
 pub(crate) struct StoredAccessTokenDevice {
     pub(crate) device_id: String,
     pub(crate) client_name: String,
     pub(crate) device_name: String,
     pub(crate) client_version: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyLoginSessionSummary {
+    pub(crate) id: String,
+    pub(crate) device_id: String,
+    pub(crate) device_name: String,
+    pub(crate) device_type: Option<String>,
+    pub(crate) client_name: String,
+    pub(crate) client_version: String,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) last_seen_at: Option<i64>,
 }
 
 pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
@@ -1167,6 +5003,19 @@ pub(crate) fn stored_admin_user_list_item(row: sqlx::any::AnyRow) -> StoredAdmin
     }
 }
 
+// LUX-648 uses this mapping when building administrator user projections.
+#[allow(dead_code)]
+pub(crate) fn stored_user_permission_preset_source(
+    row: sqlx::any::AnyRow,
+) -> StoredUserPermissionPresetSource {
+    StoredUserPermissionPresetSource {
+        preset_id: row.get("preset_id"),
+        preset_name: row.get("preset_name"),
+        preset_version: row.get("preset_version"),
+        applied_at: row.get("applied_at"),
+    }
+}
+
 pub(crate) struct UpdateUser<'a> {
     pub(crate) display_name: Option<&'a str>,
     pub(crate) password_hash: Option<&'a str>,
@@ -1184,6 +5033,128 @@ pub(crate) struct NewAuditEvent<'a> {
     pub(crate) target_type: Option<&'a str>,
     pub(crate) target_id: Option<&'a str>,
     pub(crate) metadata_json: &'a str,
+}
+
+// LUX-721 wires this persistence contract into the activity event recorder.
+#[allow(dead_code)]
+pub(crate) struct NewUserActivityEvent<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) actor_user_id: Option<&'a str>,
+    pub(crate) event_type: &'a str,
+    pub(crate) target_type: Option<&'a str>,
+    pub(crate) target_id: Option<&'a str>,
+    pub(crate) metadata_json: &'a str,
+}
+
+// LUX-742 and LUX-743 connect this device observation contract to successful authentication.
+#[allow(dead_code)]
+pub(crate) struct NewUserDeviceObservation<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) device_name: Option<&'a str>,
+    pub(crate) device_type: Option<&'a str>,
+    pub(crate) client_name: &'a str,
+    pub(crate) client_version: Option<&'a str>,
+    pub(crate) last_remote_ip: Option<&'a str>,
+    pub(crate) seen_at: i64,
+}
+
+// LUX-745 connects this bounded device page to the administrator user API.
+#[allow(dead_code)]
+pub(crate) struct UserDevicePageQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct StoredUserDevice {
+    pub(crate) device_id: String,
+    pub(crate) has_active_login: bool,
+    pub(crate) device_name: Option<String>,
+    pub(crate) device_type: Option<String>,
+    pub(crate) client_name: String,
+    pub(crate) client_version: Option<String>,
+    pub(crate) first_seen_at: i64,
+    pub(crate) last_seen_at: i64,
+    pub(crate) last_remote_ip: Option<String>,
+}
+
+// LUX-755 exposes scope-safe persistence for device, client, and IP rules.
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum UserAccessBlacklistRuleScope<'a> {
+    Global,
+    User(&'a str),
+}
+
+#[allow(dead_code)]
+pub(crate) struct UserAccessBlacklistRulePageQuery<'a> {
+    pub(crate) scope: UserAccessBlacklistRuleScope<'a>,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
+pub(crate) struct UserAccessBlacklistRuleMatchQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) device_id: Option<&'a str>,
+    pub(crate) client_name: Option<&'a str>,
+}
+
+#[allow(dead_code)]
+pub(crate) struct UserAccessBlacklistIpRuleQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
+pub(crate) struct NewUserAccessBlacklistRule<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) user_id: Option<&'a str>,
+    pub(crate) rule_type: &'a str,
+    pub(crate) match_value: &'a str,
+    pub(crate) is_enabled: bool,
+    pub(crate) created_by: Option<&'a str>,
+    pub(crate) created_at: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct StoredUserAccessBlacklistRule {
+    pub(crate) id: String,
+    pub(crate) user_id: Option<String>,
+    pub(crate) rule_type: String,
+    pub(crate) match_value: String,
+    pub(crate) is_enabled: bool,
+    pub(crate) created_by: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+}
+
+// LUX-723 consumes this bounded query contract in the administrator activity API.
+#[allow(dead_code)]
+pub(crate) struct UserActivityEventQuery<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) event_type: Option<&'a str>,
+    pub(crate) from_at: Option<i64>,
+    pub(crate) to_at: Option<i64>,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+pub(crate) struct StoredUserActivityEvent {
+    pub(crate) id: String,
+    pub(crate) user_id: String,
+    pub(crate) actor_user_id: Option<String>,
+    pub(crate) event_type: String,
+    pub(crate) target_type: Option<String>,
+    pub(crate) target_id: Option<String>,
+    pub(crate) metadata_json: String,
+    pub(crate) occurred_at: i64,
 }
 
 #[derive(Debug)]
@@ -1228,6 +5199,21 @@ pub(crate) struct StoredLibraryIdentity {
     pub(crate) id: String,
     pub(crate) name: String,
     pub(crate) root_paths: Vec<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredLibraryDeletionJob {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) library_name: String,
+    pub(crate) status: String,
+    pub(crate) stage: String,
+    pub(crate) processed_count: i64,
+    pub(crate) error_code: Option<String>,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) started_at: Option<i64>,
+    pub(crate) finished_at: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -1897,6 +5883,7 @@ pub(crate) struct StoredStrmProbeJob {
     pub(crate) thumbnail_enabled: bool,
     pub(crate) thumbnail_position_percent: i64,
     pub(crate) target_scan_job_id: Option<String>,
+    pub(crate) target_source_id: Option<String>,
     pub(crate) cursor: Option<String>,
     pub(crate) processed_count: i64,
     pub(crate) total_count: i64,
@@ -1918,6 +5905,7 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) thumbnail_enabled: bool,
     pub(crate) thumbnail_position_percent: i64,
     pub(crate) target_scan_job_id: Option<&'a str>,
+    pub(crate) target_source_id: Option<&'a str>,
     pub(crate) total_count: i64,
 }
 
@@ -1992,6 +5980,7 @@ fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
         thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
         thumbnail_position_percent: row.get("thumbnail_position_percent"),
         target_scan_job_id: row.get("target_scan_job_id"),
+        target_source_id: row.get("target_source_id"),
         cursor: row.get("cursor"),
         processed_count: row.get("processed_count"),
         total_count: row.get("total_count"),
@@ -2673,6 +6662,29 @@ pub(crate) struct NewWebPlaybackSession<'a> {
     pub(crate) now: i64,
 }
 
+#[allow(dead_code)] // LUX-775 creates context before returning a signed direct ticket.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct NewEmbyDirectPlaybackTicket<'a> {
+    pub(crate) user_id: &'a str,
+    pub(crate) play_session_id: &'a str,
+    pub(crate) authorization_device_id: Option<&'a str>,
+    pub(crate) authorization_client_name: Option<&'a str>,
+    pub(crate) expires_at: i64,
+    pub(crate) created_at: i64,
+}
+
+#[allow(dead_code)] // LUX-776 enforces blacklist rules using this stored context.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredEmbyDirectPlaybackTicket {
+    pub(crate) user_id: String,
+    pub(crate) play_session_id: String,
+    pub(crate) authorization_device_id: Option<String>,
+    pub(crate) authorization_client_name: Option<String>,
+    pub(crate) expires_at: i64,
+    pub(crate) revoked_at: Option<i64>,
+    pub(crate) created_at: i64,
+}
+
 pub(crate) struct NewWebPlaybackEvent<'a> {
     pub(crate) session_id: &'a str,
     pub(crate) user_id: &'a str,
@@ -2682,6 +6694,13 @@ pub(crate) struct NewWebPlaybackEvent<'a> {
     pub(crate) position_ticks: i64,
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) now: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredWebPlaybackAccessContext {
+    pub(crate) user_id: String,
+    pub(crate) device_id: Option<String>,
+    pub(crate) client_name: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -2826,8 +6845,12 @@ pub(crate) struct StoredSubtitleStream {
 #[derive(Debug)]
 pub(crate) struct StoredItemImageCandidate {
     pub(crate) id: String,
+    pub(crate) image_type: String,
     pub(crate) local_path: String,
     pub(crate) root_path: String,
+    pub(crate) content_tag: Option<String>,
+    pub(crate) width: Option<i64>,
+    pub(crate) height: Option<i64>,
 }
 
 pub(crate) struct ItemImageMetadata<'a> {
@@ -2972,6 +6995,11 @@ fn catalog_filter_where_clause<'a>(
     } else {
         where_clause.push_str(CATALOG_VISIBLE_PREDICATE);
     }
+    append_content_restriction_predicate(
+        &mut where_clause,
+        &mut binds,
+        filter.content_restrictions,
+    );
     let mut id_predicates = Vec::new();
     if let Some(item_ids) = item_ids
         && !item_ids.is_empty()
@@ -3172,6 +7200,154 @@ fn catalog_filter_where_clause<'a>(
     (where_clause, binds)
 }
 
+fn content_rating_order_expression(rating_system: &str) -> Option<&'static str> {
+    match rating_system {
+        "MPA" => Some(
+            "CASE restriction_index.certification_code
+                 WHEN 'G' THEN 0 WHEN 'PG' THEN 1 WHEN 'PG-13' THEN 2
+                 WHEN 'R' THEN 3 WHEN 'NC-17' THEN 4 ELSE NULL END",
+        ),
+        "TVPG" => Some(
+            "CASE restriction_index.certification_code
+                 WHEN 'TV-Y' THEN 0 WHEN 'TV-G' THEN 1 WHEN 'TV-Y7' THEN 2
+                 WHEN 'TV-PG' THEN 3 WHEN 'TV-14' THEN 4 WHEN 'TV-MA' THEN 5
+                 ELSE NULL END",
+        ),
+        "BBFC" => Some(
+            "CASE restriction_index.certification_code
+                 WHEN 'U' THEN 0 WHEN 'PG' THEN 1 WHEN '12' THEN 2
+                 WHEN '12A' THEN 2 WHEN '15' THEN 3 WHEN '18' THEN 4
+                 WHEN 'R18' THEN 5 ELSE NULL END",
+        ),
+        _ => None,
+    }
+}
+
+fn content_rating_order(rating_system: &str, rating: &str) -> Option<i64> {
+    let levels: &[&str] = match rating_system {
+        "MPA" => &["G", "PG", "PG-13", "R", "NC-17"],
+        "TVPG" => &["TV-Y", "TV-G", "TV-Y7", "TV-PG", "TV-14", "TV-MA"],
+        "BBFC" => &["U", "PG", "12", "12A", "15", "18", "R18"],
+        _ => return None,
+    };
+    if rating_system == "BBFC" && rating.eq_ignore_ascii_case("12A") {
+        return Some(2);
+    }
+    levels
+        .iter()
+        .position(|level| level.eq_ignore_ascii_case(rating))
+        .map(|order| order as i64)
+}
+
+fn append_content_restriction_predicate<'a>(
+    where_clause: &mut String,
+    binds: &mut Vec<CatalogBind<'a>>,
+    restrictions: Option<&'a UserContentRestrictions>,
+) {
+    append_content_restriction_predicate_for_item_alias(where_clause, binds, restrictions, "mi");
+}
+
+fn append_content_restriction_predicate_for_item_alias<'a>(
+    where_clause: &mut String,
+    binds: &mut Vec<CatalogBind<'a>>,
+    restrictions: Option<&'a UserContentRestrictions>,
+    item_alias: &str,
+) {
+    let Some(restrictions) = restrictions else {
+        return;
+    };
+    let policy = ContentRestrictionPolicy {
+        rating_system: &restrictions.rating_system,
+        maximum_rating: restrictions.maximum_rating.as_deref(),
+        allow_unrated: restrictions.allow_unrated,
+        allowed_tags: &restrictions.allowed_tags,
+        blocked_tags: &restrictions.blocked_tags,
+    };
+    if !content_restriction_policy_is_valid(&policy) {
+        where_clause.push_str(" AND 1 = 0");
+        return;
+    }
+    if !content_restriction_policy_is_restrictive(&policy) {
+        return;
+    }
+
+    let mut violations = vec!["restriction_index.item_id IS NULL".to_owned()];
+    if restrictions.maximum_rating.is_some() || !restrictions.allow_unrated {
+        let Some(rating_order_expression) =
+            content_rating_order_expression(&restrictions.rating_system)
+        else {
+            where_clause.push_str(" AND 1 = 0");
+            return;
+        };
+        if let Some(maximum_rating) = restrictions.maximum_rating.as_deref() {
+            let Some(maximum_order) =
+                content_rating_order(&restrictions.rating_system, maximum_rating)
+            else {
+                where_clause.push_str(" AND 1 = 0");
+                return;
+            };
+            let unrated_disallowed = !restrictions.allow_unrated;
+            violations.push(format!(
+                "(({rating_order_expression}) IS NOT NULL
+                    AND ({rating_order_expression}) > {maximum_order})
+                 OR (({rating_order_expression}) IS NULL AND {unrated_disallowed})"
+            ));
+        } else {
+            violations.push(format!("({rating_order_expression}) IS NULL"));
+        }
+    }
+
+    if !restrictions.blocked_tags.is_empty() {
+        let placeholders = std::iter::repeat_n("?", restrictions.blocked_tags.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        violations.push(format!(
+            "EXISTS (
+                SELECT 1 FROM media_content_restriction_tags blocked_tag
+                WHERE blocked_tag.item_id = restriction_item.id
+                  AND blocked_tag.tag IN ({placeholders})
+            )"
+        ));
+        binds.extend(
+            restrictions
+                .blocked_tags
+                .iter()
+                .map(|tag| CatalogBind::Text(tag)),
+        );
+    }
+    if !restrictions.allowed_tags.is_empty() {
+        let placeholders = std::iter::repeat_n("?", restrictions.allowed_tags.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        violations.push(format!(
+            "NOT EXISTS (
+                SELECT 1 FROM media_content_restriction_tags allowed_tag
+                WHERE allowed_tag.item_id = restriction_item.id
+                  AND allowed_tag.tag IN ({placeholders})
+            )"
+        ));
+        binds.extend(
+            restrictions
+                .allowed_tags
+                .iter()
+                .map(|tag| CatalogBind::Text(tag)),
+        );
+    }
+
+    where_clause.push_str(&format!(
+        " AND NOT EXISTS (
+             SELECT 1
+             FROM media_items restriction_item
+             LEFT JOIN media_content_restriction_index restriction_index
+               ON restriction_index.item_id = restriction_item.id
+             WHERE restriction_item.id IN ({item_alias}.id, {item_alias}.parent_id, {item_alias}.series_id)
+               AND restriction_item.item_type IN ('MOVIE', 'SERIES', 'SEASON', 'EPISODE', 'VIDEO')
+               AND (",
+    ));
+    where_clause.push_str(&violations.join(" OR "));
+    where_clause.push_str("))");
+}
+
 pub(crate) fn movie_parent_folder_identity(
     library_root_id: &str,
     relative_path: &str,
@@ -3337,23 +7513,26 @@ pub(crate) struct CatalogFilterQuery<'a> {
     pub(crate) min_date_last_saved: Option<i64>,
     pub(crate) metadata_pending: bool,
     pub(crate) parent_id_scope: Option<Option<&'a str>>,
+    pub(crate) content_restrictions: Option<&'a UserContentRestrictions>,
     pub(crate) sort_by: CatalogSort,
     pub(crate) descending: bool,
     pub(crate) offset: i64,
     pub(crate) limit: i64,
+    pub(crate) include_total: bool,
 }
 
 pub(crate) struct ResumeItemsQuery<'a> {
     pub(crate) user_id: &'a str,
     pub(crate) library_ids: &'a [String],
     pub(crate) item_types: &'a [&'a str],
+    pub(crate) content_restrictions: Option<&'a UserContentRestrictions>,
     pub(crate) played_percent: i64,
     pub(crate) minimum_ticks: i64,
     pub(crate) offset: i64,
     pub(crate) limit: i64,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum CatalogSort {
     Name,
     SortName,
@@ -3737,6 +7916,7 @@ pub(crate) struct NewMediaChapterMarker {
 #[derive(Debug)]
 pub(crate) struct StoredWebSession {
     pub(crate) csrf_token_hash: Vec<u8>,
+    pub(crate) device_id: Option<String>,
     pub(crate) user_id: String,
     pub(crate) username_normalized: String,
     pub(crate) display_name: String,
@@ -4163,6 +8343,473 @@ impl std::error::Error for StorageError {
             Self::Migration { source, .. } => Some(source),
             Self::Conflict(_) | Self::LastManager | Self::Serialization(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod mail_outbox_tests {
+    use super::*;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8100".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        Ok((directory, database))
+    }
+
+    fn new_message<'a>(
+        idempotency_key: &'a str,
+        recipient_email: &'a str,
+        reference_id: &'a str,
+        available_at: i64,
+    ) -> NewMailOutboxMessage<'a> {
+        NewMailOutboxMessage {
+            idempotency_key,
+            recipient_email,
+            template_kind: MailOutboxTemplateKind::Invitation,
+            reference_id,
+            available_at,
+        }
+    }
+
+    fn new_challenge<'a>(
+        id: &'a str,
+        kind: MailChallengeKind,
+        recipient_email: &'a str,
+        reference_id: &'a str,
+        token_hash: &'a [u8],
+        expires_at: i64,
+    ) -> NewMailChallenge<'a> {
+        NewMailChallenge {
+            id,
+            kind,
+            recipient_email,
+            reference_id,
+            token_hash,
+            expires_at,
+        }
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_migration_applies_to_an_empty_sqlite_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(count, 0);
+        let columns = sqlx::query("PRAGMA table_info(mail_outbox)")
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert!(columns.contains(&"recipient_email".to_owned()));
+        assert!(columns.contains(&"template_kind".to_owned()));
+        assert!(columns.contains(&"reference_id".to_owned()));
+        assert!(!columns.iter().any(|column| {
+            matches!(
+                column.as_str(),
+                "body" | "html_body" | "text_body" | "payload" | "token" | "password"
+            )
+        }));
+        let challenge_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_challenges")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(challenge_count, 0);
+        let challenge_columns = sqlx::query("PRAGMA table_info(mail_challenges)")
+            .fetch_all(database.pool())
+            .await?
+            .into_iter()
+            .map(|row| row.get::<String, _>("name"))
+            .collect::<Vec<_>>();
+        assert_eq!(challenge_columns.len(), 9);
+        assert!(challenge_columns.contains(&"token_hash".to_owned()));
+        assert!(!challenge_columns.iter().any(|column| {
+            matches!(column.as_str(), "token" | "raw_token" | "body" | "password")
+        }));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_is_single_use_and_rejects_expired_or_revoked_tokens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let invitation_hash = [7_u8; 32];
+        let invitation = database
+            .create_mail_challenge(
+                new_challenge(
+                    "challenge-invitation-1",
+                    MailChallengeKind::Invitation,
+                    "one@example.test",
+                    "invite-record-1",
+                    &invitation_hash,
+                    20,
+                ),
+                10,
+            )
+            .await?;
+        assert_eq!(invitation.kind, MailChallengeKind::Invitation);
+        assert_eq!(invitation.id, "challenge-invitation-1");
+        assert_eq!(invitation.token_hash, invitation_hash);
+        assert!(database.get_mail_challenge(&invitation.id).await?.is_some());
+        assert!(
+            database
+                .create_mail_challenge(
+                    new_challenge(
+                        "challenge-invitation-1",
+                        MailChallengeKind::Invitation,
+                        "one@example.test",
+                        "invite-record-1",
+                        &invitation_hash,
+                        20,
+                    ),
+                    10,
+                )
+                .await
+                .is_err()
+        );
+        assert!(
+            !database
+                .consume_mail_challenge(&invitation.id, &[8_u8; 32], 11)
+                .await?
+        );
+        assert!(
+            !database
+                .consume_mail_challenge(&invitation.id, &invitation_hash, 20)
+                .await?
+        );
+        assert!(
+            database
+                .consume_mail_challenge(&invitation.id, &invitation_hash, 19)
+                .await?
+        );
+        assert!(
+            !database
+                .consume_mail_challenge(&invitation.id, &invitation_hash, 19)
+                .await?
+        );
+
+        let verification_hash = [9_u8; 32];
+        let verification = database
+            .create_mail_challenge(
+                new_challenge(
+                    "challenge-verification-1",
+                    MailChallengeKind::EmailVerification,
+                    "two@example.test",
+                    "registration-2",
+                    &verification_hash,
+                    30,
+                ),
+                20,
+            )
+            .await?;
+        assert_eq!(verification.kind, MailChallengeKind::EmailVerification);
+        assert_eq!(
+            database
+                .revoke_mail_challenges(MailChallengeKind::EmailVerification, "registration-2", 21,)
+                .await?,
+            1
+        );
+        assert!(
+            !database
+                .consume_mail_challenge(&verification.id, &verification_hash, 22)
+                .await?
+        );
+        let revoked = database
+            .get_mail_challenge(&verification.id)
+            .await?
+            .ok_or("revoked challenge disappeared")?;
+        assert_eq!(revoked.revoked_at, Some(21));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_storage_rejects_invalid_hashes_and_times()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        assert!(matches!(
+            database
+                .create_mail_challenge(
+                    new_challenge(
+                        "invalid-hash-challenge",
+                        MailChallengeKind::Invitation,
+                        "one@example.test",
+                        "invite-record-1",
+                        &[1_u8; 31],
+                        20,
+                    ),
+                    10,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            database
+                .create_mail_challenge(
+                    new_challenge(
+                        "expired-challenge",
+                        MailChallengeKind::Invitation,
+                        "one@example.test",
+                        "invite-record-1",
+                        &[1_u8; 32],
+                        10,
+                    ),
+                    10,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            database
+                .consume_mail_challenge("missing", &[1_u8; 31], 11)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_challenge_storage_rejects_invalid_ids() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_directory, database) = test_database().await?;
+        let long_id = "x".repeat(129);
+        database.reset_query_count();
+        for id in ["", " padded ", "control\ncharacter", long_id.as_str()] {
+            assert!(matches!(
+                database
+                    .create_mail_challenge(
+                        new_challenge(
+                            id,
+                            MailChallengeKind::Invitation,
+                            "one@example.test",
+                            "invite-record-1",
+                            &[1_u8; 32],
+                            20,
+                        ),
+                        10,
+                    )
+                    .await,
+                Err(StorageError::Conflict(_))
+            ));
+        }
+        assert_eq!(database.query_count(), 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_enqueue_is_idempotent_and_rejects_key_reuse()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let first = database
+            .enqueue_mail_outbox(
+                new_message("invite:abc", "one@example.test", "invite-abc", 10),
+                10,
+            )
+            .await?;
+        let duplicate = database
+            .enqueue_mail_outbox(
+                new_message("invite:abc", "one@example.test", "invite-abc", 10),
+                11,
+            )
+            .await?;
+        assert_eq!(first.id, duplicate.id);
+        assert_eq!(duplicate.status, MailOutboxStatus::Pending);
+
+        let conflicting = database
+            .enqueue_mail_outbox(
+                new_message("invite:abc", "other@example.test", "invite-abc", 10),
+                12,
+            )
+            .await;
+        assert!(matches!(conflicting, Err(StorageError::Conflict(_))));
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(total, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_claim_is_atomic_and_recovers_expired_leases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let first = database
+            .enqueue_mail_outbox(
+                new_message("invite:first", "one@example.test", "invite-first", 10),
+                10,
+            )
+            .await?;
+        database
+            .enqueue_mail_outbox(
+                new_message("invite:second", "two@example.test", "invite-second", 10),
+                10,
+            )
+            .await?;
+
+        let (left, right) = tokio::join!(
+            database.claim_mail_outbox(10, 5),
+            database.claim_mail_outbox(10, 5),
+        );
+        let left = left?.ok_or("first worker did not claim a message")?;
+        let right = right?.ok_or("second worker did not claim a message")?;
+        assert_ne!(left.id, right.id);
+        assert_eq!(left.attempt_count, 1);
+        assert_eq!(left.status, MailOutboxStatus::Sending);
+        assert_eq!(left.lease_expires_at, Some(15));
+
+        assert!(database.claim_mail_outbox(14, 5).await?.is_none());
+        let reclaimed = database
+            .claim_mail_outbox(15, 5)
+            .await?
+            .ok_or("expired lease was not recovered")?;
+        assert_eq!(reclaimed.id, first.id);
+        assert_eq!(reclaimed.attempt_count, 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_transitions_are_fenced_and_error_codes_are_sanitized()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let created = database
+            .enqueue_mail_outbox(
+                new_message("verify:abc", "one@example.test", "challenge-abc", 10),
+                10,
+            )
+            .await?;
+        let claimed = database
+            .claim_mail_outbox(10, 5)
+            .await?
+            .ok_or("message was not claimable")?;
+        assert!(!database.mark_mail_outbox_sent(&created.id, 9, 11).await?);
+        assert!(matches!(
+            database
+                .mark_mail_outbox_sent(&created.id, claimed.attempt_count, -1)
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(matches!(
+            database
+                .defer_mail_outbox(
+                    &created.id,
+                    0,
+                    20,
+                    MailDeliveryErrorCode::SmtpUnavailable,
+                    11,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(
+            database
+                .defer_mail_outbox(
+                    &created.id,
+                    claimed.attempt_count,
+                    20,
+                    MailDeliveryErrorCode::SmtpUnavailable,
+                    11,
+                )
+                .await?
+        );
+        let deferred = database.list_mail_outbox_page(None, 20, 0).await?;
+        assert_eq!(deferred.messages[0].status, MailOutboxStatus::RetryWait);
+        assert_eq!(
+            deferred.messages[0].last_error_code,
+            Some(MailDeliveryErrorCode::SmtpUnavailable)
+        );
+
+        let retry = database
+            .claim_mail_outbox(20, 5)
+            .await?
+            .ok_or("deferred message was not claimable")?;
+        assert_eq!(retry.attempt_count, 2);
+        assert!(
+            database
+                .mark_mail_outbox_sent(&retry.id, retry.attempt_count, 21)
+                .await?
+        );
+        let sent = database.list_mail_outbox_page(None, 20, 0).await?;
+        assert_eq!(sent.messages[0].status, MailOutboxStatus::Sent);
+        assert_eq!(sent.messages[0].sent_at, Some(21));
+        assert_eq!(sent.messages[0].last_error_code, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mail_outbox_failure_can_be_manually_retried_and_pages_are_bounded()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let created = database
+            .enqueue_mail_outbox(
+                new_message("invite:retry", "one@example.test", "invite-retry", 1),
+                1,
+            )
+            .await?;
+        let claimed = database
+            .claim_mail_outbox(1, 5)
+            .await?
+            .ok_or("message was not claimable")?;
+        assert!(matches!(
+            database
+                .fail_mail_outbox(
+                    &claimed.id,
+                    claimed.attempt_count,
+                    MailDeliveryErrorCode::TemplateMissing,
+                    -1,
+                )
+                .await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(
+            database
+                .fail_mail_outbox(
+                    &claimed.id,
+                    claimed.attempt_count,
+                    MailDeliveryErrorCode::TemplateMissing,
+                    2,
+                )
+                .await?
+        );
+        assert!(matches!(
+            database.retry_failed_mail_outbox(&created.id, -1).await,
+            Err(StorageError::Conflict(_))
+        ));
+        assert!(database.retry_failed_mail_outbox(&created.id, 3).await?);
+        assert!(!database.retry_failed_mail_outbox(&created.id, 3).await?);
+
+        for index in 0..101 {
+            let key = format!("verify:{index}");
+            let reference = format!("challenge-{index}");
+            database
+                .enqueue_mail_outbox(new_message(&key, "one@example.test", &reference, 4), 4)
+                .await?;
+        }
+        let page = database
+            .list_mail_outbox_page(Some(MailOutboxStatus::Pending), 1_000, 0)
+            .await?;
+        assert_eq!(page.total_count, 102);
+        assert_eq!(page.messages.len(), 100);
+        assert!(
+            page.messages
+                .iter()
+                .all(|message| message.status == MailOutboxStatus::Pending)
+        );
+        let next_page = database
+            .list_mail_outbox_page(Some(MailOutboxStatus::Pending), 100, 100)
+            .await?;
+        assert_eq!(next_page.messages.len(), 2);
+        assert!(
+            !page
+                .messages
+                .iter()
+                .any(|message| message.id == next_page.messages[0].id)
+        );
+        Ok(())
     }
 }
 

@@ -6,6 +6,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
 import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media-display";
+import { useImageVariants } from "../home/image-variants";
 import { useMediaSource } from "./MediaSourcePanel";
 import { sourceBadges } from "./media-source";
 import { useSseConnectionState } from "../activity/useUserEvents";
@@ -46,10 +47,15 @@ export function useSeriesContext() {
 
 function useDetailIdentity(media: MediaItem) {
   const series = useSeriesContext();
+  const { enabled } = useImageVariants();
+  const backdropWidth = enabled ? 1280 : undefined;
+  const posterWidth = enabled ? 720 : undefined;
   const seriesImageFallback = media.itemType === "SEASON" ? series : undefined;
-  const backdrop = imageUrl(media, "fanart") ?? imageUrl(media)
-    ?? (seriesImageFallback ? imageUrl(seriesImageFallback, "fanart") ?? imageUrl(seriesImageFallback) : undefined);
-  const poster = posterUrlWithFallback(media, seriesImageFallback);
+  const backdrop = imageUrl(media, "fanart", backdropWidth) ?? imageUrl(media, "poster", backdropWidth)
+    ?? (seriesImageFallback
+      ? imageUrl(seriesImageFallback, "fanart", backdropWidth) ?? imageUrl(seriesImageFallback, "poster", backdropWidth)
+      : undefined);
+  const poster = posterUrlWithFallback(media, seriesImageFallback, posterWidth);
   return { series, backdrop, poster };
 }
 

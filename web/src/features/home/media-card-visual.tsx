@@ -3,6 +3,7 @@ import { memo, type ReactNode } from "react";
 import { Link } from "react-router-dom";
 import type { MediaItem } from "../../lib/api/types";
 import { EpisodeCount, MediaPlaceholder, Rating, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress } from "./media-display";
+import { useImageVariants } from "./image-variants";
 
 type MediaCardLinkProps = { item: MediaItem; href?: string; children: ReactNode };
 
@@ -17,7 +18,9 @@ function MediaCardLink({ item, href, children }: MediaCardLinkProps) {
 }
 
 export const MediaCardVisual = memo(function MediaCardVisual({ item, landscape, href }: { item: MediaItem; landscape: boolean; href?: string }) {
-  const image = imageUrl(item, landscape ? "fanart" : "poster") ?? imageUrl(item);
+  const { enabled } = useImageVariants();
+  const image = imageUrl(item, landscape ? "fanart" : "poster", enabled ? 360 : undefined)
+    ?? imageUrl(item, "poster", enabled ? 360 : undefined);
   const progress = playbackProgress(item);
   const isFolder = item.itemType === "FOLDER";
   return (

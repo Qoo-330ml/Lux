@@ -75,6 +75,34 @@ describe("actor search and filmography", () => {
     expect(mediaResults?.querySelector(".lux-rating svg")).toBeNull();
   });
 
+  it("virtualizes large search result sets", async () => {
+    const items = Array.from({ length: 500 }, (_, index) => ({
+      id: `movie-${index}`,
+      title: `电影 ${index}`,
+      itemType: "MOVIE",
+    }));
+    vi.spyOn(api, "search").mockResolvedValue({ items, total: 500, page: 1, pageSize: 24 });
+    vi.spyOn(api, "searchPeople").mockResolvedValue({ items: [], total: 0, page: 1, pageSize: 12 });
+    root = createRoot(container!);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/search?q=电影"]}>
+            <Routes><Route path="search" element={<SearchPage />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await flushReact();
+    await flushReact();
+
+    const cards = container?.querySelectorAll(".lux-media-card") ?? [];
+    expect(cards.length).toBeGreaterThan(0);
+    expect(cards.length).toBeLessThan(50);
+  });
+
   it("loads and displays the actor's accessible movie and series works", async () => {
     vi.spyOn(api, "person").mockResolvedValue({ id: "42", name: "演员甲" });
     vi.spyOn(api, "personItems").mockResolvedValue({

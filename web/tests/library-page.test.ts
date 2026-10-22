@@ -150,6 +150,8 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "root",
@@ -167,6 +169,8 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.textContent).toContain("Show S01E01"));
     });
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "folder-trips",
@@ -179,6 +183,8 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.textContent).toContain("Movie (2024)"));
     });
     expect(libraryItems).toHaveBeenCalledWith("home-videos", 1, undefined, {
+      fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
       parentId: "folder-2024",
@@ -396,7 +402,9 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(1));
     });
 
-    expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "SERIES", {
+    expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE,SERIES", {
+      fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
     });
@@ -407,7 +415,9 @@ describe("LibraryPage infinite scroll", () => {
       await vi.waitFor(() => expect(container?.querySelectorAll(".lux-media-card")).toHaveLength(2));
     });
 
-    expect(libraryItems).toHaveBeenCalledWith("library-1", 2, "SERIES", {
+    expect(libraryItems).toHaveBeenCalledWith("library-1", 2, "MOVIE,SERIES", {
+      fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
     });
@@ -546,7 +556,9 @@ describe("LibraryPage infinite scroll", () => {
       sortBy.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true }));
     });
     await act(async () => {
-      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE,SERIES", {
+        fields: "card",
+      count: false,
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -600,7 +612,9 @@ describe("LibraryPage infinite scroll", () => {
       const releaseDateOption = document.querySelector<HTMLButtonElement>("[role='option'][data-value='PremiereDate']");
       if (!releaseDateOption) throw new Error("release-date sort option was not rendered");
       releaseDateOption.click();
-      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE,SERIES", {
+        fields: "card",
+      count: false,
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
@@ -613,12 +627,14 @@ describe("LibraryPage infinite scroll", () => {
 
     await renderLibraryPage();
     await act(async () => {
-      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE,SERIES", {
+        fields: "card",
+      count: false,
         sortBy: "PremiereDate",
         sortOrder: "Descending",
       }));
     });
-    expect(container.querySelector("[role='combobox'][aria-label='排序方式']")?.textContent).toContain("发行日期");
+    await vi.waitFor(() => expect(container.querySelector("[role='combobox'][aria-label='排序方式']")?.textContent).toContain("发行日期"));
   });
 
   it("opens with the pending metadata filter from a task result", async () => {
@@ -654,13 +670,15 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     await act(async () => {
-      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE", {
+      await vi.waitFor(() => expect(libraryItems).toHaveBeenCalledWith("library-1", 1, "MOVIE,SERIES", {
+        fields: "card",
+      count: false,
         sortBy: "Name",
         sortOrder: "Ascending",
         metadataStatus: "PENDING",
       }));
     });
-    expect(container.textContent).toContain("待确认");
+    await vi.waitFor(() => expect(container.textContent).toContain("待确认"));
     expect(container.querySelector(".lux-metadata-attention-badge")?.textContent).toContain("待确认");
   });
 
@@ -926,6 +944,8 @@ describe("LibraryPage infinite scroll", () => {
     });
 
     expect(libraryItems).toHaveBeenCalledWith(collectionLibraryId, 1, "BOX_SET", {
+      fields: "card",
+      count: false,
       sortBy: "Name",
       sortOrder: "Ascending",
     });

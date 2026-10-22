@@ -1,7 +1,8 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 
 function lightThemeRule(selector: string) {
   const escapedSelector = selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");

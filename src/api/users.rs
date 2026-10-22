@@ -6,6 +6,21 @@ use crate::{
         DEFAULT_LOGIN_BACKGROUND_SOURCE, RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE,
         is_valid_login_background_source, login_background_plugin_id,
     },
+    application::user_account_preferences::{
+        AccountPreferencesError, UpdateAccountPreferences, get_account_preferences,
+        update_account_preferences,
+    },
+    application::user_email_verification::{
+        UserEmailVerificationError, clear_user_email_change, pending_user_email_change,
+        request_user_email_change, resend_user_email_change, verify_user_email_change,
+    },
+    application::user_invitations::{
+        AcceptUserInvitationInput, UserInvitationAcceptanceError, accept_user_invitation,
+    },
+    application::user_registration::{
+        SubmitUserRegistrationInput, UserRegistrationError, resend_public_user_registration_email,
+        submit_public_user_registration, verify_public_user_registration_email,
+    },
     auth::sessions::AuthenticatedSession,
     security::{
         DEVICE_PAIRING_CREATE_LIMIT, DEVICE_PAIRING_REDEEM_LIMIT,
@@ -748,6 +763,71 @@ pub(super) struct AuthLoginRequest {
     password: String,
 }
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AuthInvitationAcceptRequest {
+    token: String,
+    username: String,
+    #[serde(default)]
+    display_name: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(super) struct AuthUserRegistrationRequest {
+    email: String,
+    username: String,
+    #[serde(default)]
+    display_name: String,
+    password: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthUserRegistrationTokenRequest {
+    token: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthUserRegistrationResendRequest {
+    email: String,
+}
+
+fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
+    let header_id = header_str(headers, "x-lux-device-id")?;
+    let device_id = uuid::Uuid::parse_str(header_id).ok()?;
+    (device_id.get_version_num() == 4).then_some(device_id.to_string())
+}
+
+async fn record_web_device_observation(
+    headers: &HeaderMap,
+    state: &AppState,
+    user_id: &str,
+    device_id: Option<&str>,
+) {
+    let (Some(device_id), Some(database)) = (device_id, state.database.as_ref()) else {
+        return;
+    };
+    let remote_ip = request_client_ip(headers, &state.remote_access);
+    if let Err(error) = database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id,
+            device_id,
+            device_name: None,
+            device_type: Some("WEB"),
+            client_name: "Lux Web",
+            client_version: None,
+            last_remote_ip: remote_ip.as_deref(),
+            seen_at: super::playback::current_unix_timestamp(),
+        })
+        .await
+    {
+        tracing::warn!(%error, "failed to update web user device inventory");
+    }
+}
+
 pub(super) async fn auth_login(
     headers: HeaderMap,
     State(state): State<AppState>,
@@ -764,6 +844,7 @@ pub(super) async fn auth_login(
     };
 
     let login_key = login_attempt_key(&headers, &request.username);
+    let login_device_id = web_login_device_id(&headers);
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return api_error(
             &headers,
@@ -773,8 +854,8 @@ pub(super) async fn auth_login(
         )
         .into_response();
     }
-    let mut session = match auth.login(&request.username, &request.password).await {
-        Ok(session) => session,
+    let client_ip = match super::request_access_ip(&headers, &state).await {
+        Ok(client_ip) => client_ip,
         Err(_) => {
             return api_error(
                 &headers,
@@ -785,6 +866,36 @@ pub(super) async fn auth_login(
             .into_response();
         }
     };
+    let mut session = match auth
+        .login_with_device_and_ip(
+            &request.username,
+            &request.password,
+            login_device_id.as_deref(),
+            client_ip,
+        )
+        .await
+    {
+        Ok(session) => session,
+        Err(crate::auth::sessions::WebAuthError::AccessDenied) => {
+            return api_error(
+                &headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "当前设备、客户端或 IP 已被禁止访问",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "登录暂时不可用",
+            )
+            .into_response();
+        }
+    };
+    let mut migration_auth_failed = false;
     if session.is_none()
         && let Some(migration) = state.emby_migration.clone()
     {
@@ -792,8 +903,25 @@ pub(super) async fn auth_login(
             .authenticate_pending_user(&request.username, &request.password)
             .await
         {
-            Ok(true) => match auth.login(&request.username, &request.password).await {
+            Ok(true) => match auth
+                .login_with_device_and_ip(
+                    &request.username,
+                    &request.password,
+                    login_device_id.as_deref(),
+                    client_ip,
+                )
+                .await
+            {
                 Ok(reauthenticated) => session = reauthenticated,
+                Err(crate::auth::sessions::WebAuthError::AccessDenied) => {
+                    return api_error(
+                        &headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前设备、客户端或 IP 已被禁止访问",
+                    )
+                    .into_response();
+                }
                 Err(_) => {
                     return api_error(
                         &headers,
@@ -805,11 +933,23 @@ pub(super) async fn auth_login(
                 }
             },
             Ok(false) => {}
-            Err(_) => {}
+            Err(_) => migration_auth_failed = true,
         }
     }
     let Some(session) = session else {
         state.login_rate_limiter.record_failure(&login_key).await;
+        if !migration_auth_failed
+            && let Ok(Some(user_id)) = auth.find_user_id_by_username(&request.username).await
+        {
+            record_failed_authentication_event(
+                state.database.as_ref(),
+                &state.admin_events,
+                &user_id,
+                "LUX_WEB",
+                request_client_ip(&headers, &state.remote_access),
+            )
+            .await;
+        }
         return api_error(
             &headers,
             StatusCode::UNAUTHORIZED,
@@ -835,6 +975,7 @@ pub(super) async fn auth_login(
     }
 
     let user_id = session.user.id.to_string();
+    record_web_device_observation(&headers, &state, &user_id, login_device_id.as_deref()).await;
     record_activity_event(
         state.database.as_ref(),
         &state.admin_events,
@@ -885,6 +1026,374 @@ pub(super) async fn auth_login(
         .into_response()
 }
 
+pub(super) async fn auth_accept_user_invitation(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<Json<AuthInvitationAcceptRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) if rejection.status() == StatusCode::PAYLOAD_TOO_LARGE => {
+            return api_error(
+                &headers,
+                StatusCode::PAYLOAD_TOO_LARGE,
+                lux::ApiErrorCode::InvalidRequest,
+                "邀请请求内容过大",
+            )
+            .into_response();
+        }
+        Err(_) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "邀请请求无效",
+            )
+            .into_response();
+        }
+    };
+    let (Some(database), Some(config_dir)) = (state.database.as_ref(), state.config_dir.as_ref())
+    else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "邀请暂时无法处理",
+        )
+        .into_response();
+    };
+
+    match accept_user_invitation(
+        database,
+        config_dir,
+        AcceptUserInvitationInput {
+            token: &request.token,
+            username: &request.username,
+            display_name: &request.display_name,
+            password: &request.password,
+        },
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (StatusCode::CREATED, Json(json!({ "created": true }))).into_response(),
+        Err(UserInvitationAcceptanceError::UsernameTaken)
+        | Err(UserInvitationAcceptanceError::EmailAlreadyRegistered) => api_error(
+            &headers,
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::InvalidRequest,
+            "用户名或邮箱不可用",
+        )
+        .into_response(),
+        Err(UserInvitationAcceptanceError::InvalidInput)
+        | Err(UserInvitationAcceptanceError::NotAcceptable) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "邀请请求无效或已失效",
+        )
+        .into_response(),
+        Err(UserInvitationAcceptanceError::SigningUnavailable)
+        | Err(UserInvitationAcceptanceError::PasswordUnavailable) => api_error(
+            &headers,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            lux::ApiErrorCode::Internal,
+            "邀请暂时无法处理",
+        )
+        .into_response(),
+        Err(UserInvitationAcceptanceError::Storage(_)) => api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "邀请暂时无法处理",
+        )
+        .into_response(),
+    }
+}
+
+fn user_registration_error(headers: &HeaderMap, error: UserRegistrationError) -> Response {
+    match error {
+        UserRegistrationError::InvalidEmail
+        | UserRegistrationError::InvalidInput
+        | UserRegistrationError::NotAcceptable => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册请求无效或已失效",
+        )
+        .into_response(),
+        UserRegistrationError::RegistrationClosed => api_error(
+            headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "公开注册当前不可用",
+        )
+        .into_response(),
+        UserRegistrationError::RateLimited => api_error(
+            headers,
+            StatusCode::TOO_MANY_REQUESTS,
+            lux::ApiErrorCode::RateLimited,
+            "注册请求过于频繁，请稍后重试",
+        )
+        .into_response(),
+        UserRegistrationError::PasswordUnavailable | UserRegistrationError::SigningUnavailable => {
+            api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::Internal,
+                "注册服务暂时不可用",
+            )
+            .into_response()
+        }
+        UserRegistrationError::SettingsUnavailable | UserRegistrationError::StorageUnavailable => {
+            api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "注册服务暂时不可用",
+            )
+            .into_response()
+        }
+    }
+}
+
+fn user_email_verification_error(
+    headers: &HeaderMap,
+    error: UserEmailVerificationError,
+) -> Response {
+    match error {
+        UserEmailVerificationError::InvalidEmail
+        | UserEmailVerificationError::InvalidInput
+        | UserEmailVerificationError::NotAcceptable => api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "邮箱验证请求无效或已失效",
+        )
+        .into_response(),
+        UserEmailVerificationError::RateLimited => api_error(
+            headers,
+            StatusCode::TOO_MANY_REQUESTS,
+            lux::ApiErrorCode::RateLimited,
+            "邮箱验证请求过于频繁，请稍后重试",
+        )
+        .into_response(),
+        UserEmailVerificationError::SigningUnavailable => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "邮箱验证服务暂时不可用",
+        )
+        .into_response(),
+        UserEmailVerificationError::StorageUnavailable => api_error(
+            headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "邮箱验证服务暂时不可用",
+        )
+        .into_response(),
+    }
+}
+
+fn registration_request_body_error(headers: &HeaderMap, too_large: bool) -> Response {
+    if too_large {
+        api_error(
+            headers,
+            StatusCode::PAYLOAD_TOO_LARGE,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册请求内容过大",
+        )
+        .into_response()
+    } else {
+        api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "注册请求无效",
+        )
+        .into_response()
+    }
+}
+
+fn registration_connection_peer(headers: &HeaderMap) -> Option<std::net::IpAddr> {
+    header_str(headers, "x-lux-peer-ip")?.parse().ok()
+}
+
+pub(super) async fn auth_submit_public_user_registration(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<Json<AuthUserRegistrationRequest>, axum::extract::rejection::JsonRejection>,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return registration_request_body_error(
+                &headers,
+                rejection.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            );
+        }
+    };
+    let (Some(database), Some(config_dir), Some(connection_peer)) = (
+        state.database.as_ref(),
+        state.config_dir.as_deref(),
+        registration_connection_peer(&headers),
+    ) else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "注册服务暂时不可用",
+        )
+        .into_response();
+    };
+
+    match submit_public_user_registration(
+        database,
+        config_dir,
+        &state.device_pairing_rate_limiter,
+        connection_peer,
+        SubmitUserRegistrationInput {
+            email: &request.email,
+            username: &request.username,
+            display_name: &request.display_name,
+            password: &request.password,
+        },
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "accepted": true,
+                "message": "若申请符合条件，我们会发送邮件"
+            })),
+        )
+            .into_response(),
+        Err(error) => user_registration_error(&headers, error),
+    }
+}
+
+pub(super) async fn auth_verify_public_user_registration_email(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<
+        Json<AuthUserRegistrationTokenRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return registration_request_body_error(
+                &headers,
+                rejection.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            );
+        }
+    };
+    let (Some(database), Some(config_dir), Some(connection_peer)) = (
+        state.database.as_ref(),
+        state.config_dir.as_deref(),
+        registration_connection_peer(&headers),
+    ) else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "邮箱验证暂时无法处理",
+        )
+        .into_response();
+    };
+    match verify_public_user_registration_email(
+        database,
+        config_dir,
+        &state.device_pairing_rate_limiter,
+        connection_peer,
+        &request.token,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            Json(json!({ "verified": true, "status": "PENDING_APPROVAL" })),
+        )
+            .into_response(),
+        Err(error) => user_registration_error(&headers, error),
+    }
+}
+
+pub(super) async fn auth_resend_public_user_registration_email(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    request: Result<
+        Json<AuthUserRegistrationResendRequest>,
+        axum::extract::rejection::JsonRejection,
+    >,
+) -> Response {
+    let Json(request) = match request {
+        Ok(request) => request,
+        Err(rejection) => {
+            return registration_request_body_error(
+                &headers,
+                rejection.status() == StatusCode::PAYLOAD_TOO_LARGE,
+            );
+        }
+    };
+    let Some(idempotency_key) = header_str(&headers, "idempotency-key") else {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "重发请求缺少幂等键",
+        )
+        .into_response();
+    };
+    let (Some(database), Some(connection_peer)) = (
+        state.database.as_ref(),
+        registration_connection_peer(&headers),
+    ) else {
+        return api_error(
+            &headers,
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::Internal,
+            "注册服务暂时不可用",
+        )
+        .into_response();
+    };
+
+    match resend_public_user_registration_email(
+        database,
+        &state.device_pairing_rate_limiter,
+        connection_peer,
+        &request.email,
+        idempotency_key,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(json!({
+                "accepted": true,
+                "message": "若申请符合条件，我们会发送邮件"
+            })),
+        )
+            .into_response(),
+        Err(error) => user_registration_error(&headers, error),
+    }
+}
+
+pub(super) async fn public_registration_settings(State(state): State<AppState>) -> Response {
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match crate::application::settings::read_registration_mode(database).await {
+        Ok(settings) => Json(json!({ "registrationMode": settings.mode })).into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
 pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Some(candidate) = lux_api_key_from_headers(&headers) {
         let Some(service) = state.admin_api_key.as_ref() else {
@@ -921,6 +1430,7 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
                         },
                     },
                     "serverName": server_name,
+                    "imageVariantsEnabled": false,
                 }))
                 .into_response();
             }
@@ -941,9 +1451,14 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
         Err(response) => return response,
     };
     let server_name = current_emby_server_name(&state).await;
+    let image_variants_available = state
+        .image_variants
+        .as_ref()
+        .is_some_and(|variants| variants.enabled());
     Json(json!({
         "user": user_json(&user),
         "serverName": server_name,
+        "imageVariantsEnabled": image_variants_available,
     }))
     .into_response()
 }
@@ -955,10 +1470,14 @@ pub(super) struct AuthProfilePatch {
     email: Option<String>,
 }
 
-fn account_profile_json(profile: &crate::auth::users::AdminUserProfile) -> Value {
+fn account_profile_json(
+    profile: &crate::auth::users::AdminUserProfile,
+    pending_email: Option<&str>,
+) -> Value {
     let mut user = user_json(&profile.user);
     user["email"] = json!(profile.email);
     user["emailVerifiedAt"] = json!(profile.email_verified_at);
+    user["pendingEmail"] = json!(pending_email);
     json!({ "user": user })
 }
 
@@ -978,7 +1497,23 @@ pub(super) async fn auth_account_profile(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match users.find_admin_profile_by_id(&user.id.to_string()).await {
-        Ok(Some(profile)) => Json(account_profile_json(&profile)).into_response(),
+        Ok(Some(profile)) => {
+            let pending_email = match pending_user_email_change(
+                database,
+                &user.id.to_string(),
+                super::playback::current_unix_timestamp(),
+            )
+            .await
+            {
+                Ok(pending) => pending.map(|pending| pending.pending_email),
+                Err(error) => return user_email_verification_error(&headers, error),
+            };
+            (
+                [("Cache-Control", "no-store")],
+                Json(account_profile_json(&profile, pending_email.as_deref())),
+            )
+                .into_response()
+        }
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
@@ -1000,41 +1535,179 @@ pub(super) async fn auth_update_account_profile(
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let email = request.email.as_deref().map(|email| {
-        let email = email.trim();
-        if email.is_empty() { None } else { Some(email) }
-    });
-    match users
-        .update_profile(
-            &session.user.id.to_string(),
-            request.display_name.as_deref(),
-            email,
-        )
-        .await
+    let user_id = session.user.id.to_string();
+    let current_profile = match users.find_admin_profile_by_id(&user_id).await {
+        Ok(Some(profile)) => profile,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    if let Some(email) = request.email.as_deref().map(str::trim) {
+        if email.is_empty() {
+            if let Err(error) = clear_user_email_change(
+                database,
+                &user_id,
+                super::playback::current_unix_timestamp(),
+            )
+            .await
+            {
+                return user_email_verification_error(&headers, error);
+            }
+        } else {
+            let is_unchanged_verified_email =
+                current_profile.email.as_deref().is_some_and(|current| {
+                    current_profile.email_verified_at.is_some()
+                        && current.eq_ignore_ascii_case(email)
+                });
+            if !is_unchanged_verified_email {
+                let Some(config_dir) = state.config_dir.as_deref() else {
+                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
+                };
+                if let Err(error) = request_user_email_change(
+                    database,
+                    config_dir,
+                    &state.device_pairing_rate_limiter,
+                    &user_id,
+                    email,
+                    super::playback::current_unix_timestamp(),
+                )
+                .await
+                {
+                    return user_email_verification_error(&headers, error);
+                }
+            }
+        }
+    }
+    let profile = if let Some(display_name) = request.display_name.as_deref() {
+        match users
+            .update_profile(&user_id, Some(display_name), None)
+            .await
+        {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "账户资料暂时无法保存",
+                )
+                .into_response();
+            }
+        }
+    } else {
+        match users.find_admin_profile_by_id(&user_id).await {
+            Ok(Some(profile)) => profile,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    };
+    let pending_email = match pending_user_email_change(
+        database,
+        &user_id,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
     {
-        Ok(Some(profile)) => Json(account_profile_json(&profile)).into_response(),
-        Ok(None) => StatusCode::NOT_FOUND.into_response(),
-        Err(UserStoreError::InvalidEmail) => api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            "邮箱格式无效",
+        Ok(pending) => pending.map(|pending| pending.pending_email),
+        Err(error) => return user_email_verification_error(&headers, error),
+    };
+    (
+        [("Cache-Control", "no-store")],
+        Json(account_profile_json(&profile, pending_email.as_deref())),
+    )
+        .into_response()
+}
+
+pub(super) async fn auth_resend_account_email_change(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let user_id = session.user.id.to_string();
+    let pending = match pending_user_email_change(
+        database,
+        &user_id,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(pending) => pending,
+        Err(error) => return user_email_verification_error(&headers, error),
+    };
+    let Some(pending) = pending else {
+        return (
+            StatusCode::ACCEPTED,
+            [("Cache-Control", "no-store")],
+            Json(json!({ "accepted": true })),
         )
-        .into_response(),
-        Err(UserStoreError::Storage(error)) if error.is_unique_violation() => api_error(
-            &headers,
-            StatusCode::CONFLICT,
-            lux::ApiErrorCode::InvalidRequest,
-            "该邮箱已被其他账户使用",
+            .into_response();
+    };
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match resend_user_email_change(
+        database,
+        config_dir,
+        &state.device_pairing_rate_limiter,
+        &user_id,
+        &pending,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(_) => (
+            StatusCode::ACCEPTED,
+            [("Cache-Control", "no-store")],
+            Json(json!({ "accepted": true })),
         )
-        .into_response(),
-        Err(_) => api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "账户资料暂时无法保存",
+            .into_response(),
+        Err(error) => user_email_verification_error(&headers, error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct AuthAccountEmailVerificationRequest {
+    token: String,
+}
+
+pub(super) async fn auth_verify_account_email_change(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<AuthAccountEmailVerificationRequest>,
+) -> Response {
+    let session = match require_web_session_csrf(&headers, &state).await {
+        Ok(session) => session,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match verify_user_email_change(
+        database,
+        config_dir,
+        &session.user.id.to_string(),
+        &request.token,
+        super::playback::current_unix_timestamp(),
+    )
+    .await
+    {
+        Ok(()) => (
+            StatusCode::OK,
+            [("Cache-Control", "no-store")],
+            Json(json!({ "verified": true })),
         )
-        .into_response(),
+            .into_response(),
+        Err(error) => user_email_verification_error(&headers, error),
     }
 }
 
@@ -1228,7 +1901,8 @@ async fn require_web_session_csrf(
         )
         .into_response());
     };
-    let session = match auth.resolve(&session_token).await {
+    let session = match resolve_web_session_for_request(headers, state, auth, &session_token).await
+    {
         Ok(Some(session)) => session,
         Ok(None) => {
             return Err(api_error(
@@ -1283,6 +1957,12 @@ async fn require_web_session_csrf(
         )
         .into_response());
     }
+    let user_id = session.user.id.to_string();
+    let device_id = session
+        .device_id
+        .clone()
+        .or_else(|| web_login_device_id(headers));
+    record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
     Ok(session)
 }
 
@@ -1369,9 +2049,9 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let played_percent = match database.user_played_percent(&user.id.to_string()).await {
-        Ok(played_percent) => played_percent,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    let preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
     };
     let (use_admin_library_order, library_order_forced) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)
@@ -1381,11 +2061,128 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(json!({
-        "playedPercent": played_percent,
+        "playedPercent": preferences.played_percent,
+        "preferencesVersion": preferences.version,
         "useAdminLibraryOrder": use_admin_library_order,
         "libraryOrderForced": library_order_forced,
     }))
     .into_response()
+}
+
+pub(super) async fn auth_account_preferences(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
+    let accessible_library_ids = match library_order_access_scope(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(status) => return status.into_response(),
+    };
+    preferences
+        .library_order
+        .retain(|library_id| accessible_library_ids.contains(library_id));
+    Json(preferences).into_response()
+}
+
+pub(super) async fn auth_update_account_preferences(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(mut request): Json<UpdateAccountPreferences>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let accessible_library_ids = match library_order_access_scope(
+        &state,
+        AccessPrincipal::new(user.id, user.is_admin),
+    )
+    .await
+    {
+        Ok(ids) => ids,
+        Err(status) => return status.into_response(),
+    };
+    if let Some(requested_order) = request.library_order.as_deref() {
+        let Some(libraries) = state.libraries.as_ref() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        match libraries
+            .normalize_library_order(requested_order, &accessible_library_ids)
+            .await
+        {
+            Ok(order) => request.library_order = Some(order),
+            Err(LibraryServiceError::InvalidLibraryOrder(message)) => {
+                return api_error(
+                    &headers,
+                    StatusCode::BAD_REQUEST,
+                    lux::ApiErrorCode::InvalidRequest,
+                    &message,
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        }
+    }
+    match update_account_preferences(database, &user.id.to_string(), request).await {
+        Ok(mut preferences) => {
+            preferences
+                .library_order
+                .retain(|library_id| accessible_library_ids.contains(library_id));
+            if let Some(home) = state.home.as_ref() {
+                home.invalidate();
+            }
+            state.user_events.publish_home_coalesced().await;
+            Json(preferences).into_response()
+        }
+        Err(error) => account_preferences_error(&headers, error),
+    }
+}
+
+fn account_preferences_error(headers: &HeaderMap, error: AccountPreferencesError) -> Response {
+    let (status, code, message) = match error {
+        AccountPreferencesError::InvalidPreferences => (
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "账户偏好设置无效",
+        ),
+        AccountPreferencesError::VersionConflict => (
+            StatusCode::CONFLICT,
+            lux::ApiErrorCode::VersionConflict,
+            "账户偏好已在其他页面更新，请重新加载后重试",
+        ),
+        AccountPreferencesError::UserUnavailable => (
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "账户不可用",
+        ),
+        AccountPreferencesError::Storage(_) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            lux::ApiErrorCode::DatabaseUnavailable,
+            "账户偏好暂时不可用",
+        ),
+    };
+    api_error(headers, status, code, message).into_response()
 }
 
 #[derive(Deserialize)]
@@ -1393,6 +2190,7 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
 pub(super) struct AuthSettingsPatch {
     played_percent: Option<i64>,
     use_admin_library_order: Option<bool>,
+    expected_version: Option<i64>,
 }
 
 pub(super) async fn auth_update_settings(
@@ -1422,13 +2220,37 @@ pub(super) async fn auth_update_settings(
     let Some(database) = state.database.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
+    if request
+        .expected_version
+        .is_some_and(|expected| expected != preferences.version)
+    {
+        return account_preferences_error(&headers, AccountPreferencesError::VersionConflict);
+    }
     if let Some(played_percent) = request.played_percent {
-        if database
-            .set_user_played_percent(&user.id.to_string(), played_percent)
-            .await
-            .is_err()
+        match update_account_preferences(
+            database,
+            &user.id.to_string(),
+            UpdateAccountPreferences {
+                expected_version: request.expected_version.unwrap_or(preferences.version),
+                theme: preferences.theme.clone(),
+                accent_color: preferences.accent_color.clone(),
+                show_media_libraries: preferences.show_media_libraries,
+                show_continue_watching: preferences.show_continue_watching,
+                audio_language: preferences.audio_language.clone(),
+                subtitle_language: preferences.subtitle_language.clone(),
+                auto_play_next_episode: preferences.auto_play_next_episode,
+                library_order: None,
+                played_percent: Some(played_percent),
+            },
+        )
+        .await
         {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            Ok(updated) => preferences = updated,
+            Err(error) => return account_preferences_error(&headers, error),
         }
     }
     if let Some(use_admin_library_order) = request.use_admin_library_order {
@@ -1447,10 +2269,6 @@ pub(super) async fn auth_update_settings(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    let played_percent = match database.user_played_percent(&user.id.to_string()).await {
-        Ok(played_percent) => played_percent,
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
     let (use_admin_library_order, library_order_forced) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)
         .await
@@ -1459,7 +2277,8 @@ pub(super) async fn auth_update_settings(
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     Json(json!({
-        "playedPercent": played_percent,
+        "playedPercent": preferences.played_percent,
+        "preferencesVersion": preferences.version,
         "useAdminLibraryOrder": use_admin_library_order,
         "libraryOrderForced": library_order_forced,
     }))
@@ -1526,8 +2345,12 @@ pub(super) async fn auth_update_password(
     }
 }
 
-fn user_library_order_response(library_order: Vec<String>) -> Response {
-    Json(json!({ "libraryOrder": library_order })).into_response()
+fn user_library_order_response(library_order: Vec<String>, preferences_version: i64) -> Response {
+    Json(json!({
+        "libraryOrder": library_order,
+        "preferencesVersion": preferences_version,
+    }))
+    .into_response()
 }
 
 async fn effective_library_order(
@@ -1578,6 +2401,13 @@ pub(super) async fn auth_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
@@ -1591,7 +2421,7 @@ pub(super) async fn auth_library_order(
     )
     .await
     {
-        Ok(library_order) => user_library_order_response(library_order),
+        Ok(library_order) => user_library_order_response(library_order, preferences.version),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
@@ -1600,6 +2430,7 @@ pub(super) async fn auth_library_order(
 #[serde(rename_all = "camelCase")]
 pub(super) struct LibraryOrderPatch {
     library_order: Vec<String>,
+    expected_version: Option<i64>,
 }
 
 pub(super) async fn auth_update_library_order(
@@ -1626,6 +2457,19 @@ pub(super) async fn auth_update_library_order(
     let Some(libraries) = state.libraries.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let Some(database) = state.database.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let preferences = match get_account_preferences(database, &user.id.to_string()).await {
+        Ok(preferences) => preferences,
+        Err(error) => return account_preferences_error(&headers, error),
+    };
+    if request
+        .expected_version
+        .is_some_and(|expected| expected != preferences.version)
+    {
+        return account_preferences_error(&headers, AccountPreferencesError::VersionConflict);
+    }
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let accessible_library_ids = match library_order_access_scope(&state, principal).await {
         Ok(ids) => ids,
@@ -1647,33 +2491,54 @@ pub(super) async fn auth_update_library_order(
         )
         .await
         {
-            Ok(library_order) => user_library_order_response(library_order),
+            Ok(library_order) => user_library_order_response(library_order, preferences.version),
             Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
     }
-    match libraries
-        .set_library_order(
-            &user.id.to_string(),
-            &request.library_order,
-            &accessible_library_ids,
-        )
+    let library_order = match libraries
+        .normalize_library_order(&request.library_order, &accessible_library_ids)
         .await
     {
-        Ok(library_order) => {
+        Ok(order) => order,
+        Err(LibraryServiceError::InvalidLibraryOrder(message)) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                &message,
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    match update_account_preferences(
+        database,
+        &user.id.to_string(),
+        UpdateAccountPreferences {
+            expected_version: request.expected_version.unwrap_or(preferences.version),
+            theme: preferences.theme,
+            accent_color: preferences.accent_color,
+            show_media_libraries: preferences.show_media_libraries,
+            show_continue_watching: preferences.show_continue_watching,
+            audio_language: preferences.audio_language,
+            subtitle_language: preferences.subtitle_language,
+            auto_play_next_episode: preferences.auto_play_next_episode,
+            library_order: Some(library_order),
+            played_percent: None,
+        },
+    )
+    .await
+    {
+        Ok(updated) => {
+            let library_order = updated.library_order;
+            let preferences_version = updated.version;
             if let Some(home) = state.home.as_ref() {
                 home.invalidate();
             }
             state.user_events.publish_home_coalesced().await;
-            Json(json!({ "libraryOrder": library_order })).into_response()
+            user_library_order_response(library_order, preferences_version)
         }
-        Err(LibraryServiceError::InvalidLibraryOrder(message)) => api_error(
-            &headers,
-            StatusCode::BAD_REQUEST,
-            lux::ApiErrorCode::InvalidRequest,
-            &message,
-        )
-        .into_response(),
-        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(error) => account_preferences_error(&headers, error),
     }
 }
 
@@ -1748,19 +2613,20 @@ pub(super) async fn auth_sessions(headers: HeaderMap, State(state): State<AppSta
         )
         .into_response();
     };
-    let session = match auth.resolve(&session_token).await {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response();
-        }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let session =
+        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return api_error(
+                    &headers,
+                    StatusCode::UNAUTHORIZED,
+                    lux::ApiErrorCode::AuthenticationRequired,
+                    "需要登录",
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     match auth.list_sessions(&session.user.id, &session_token).await {
         Ok(sessions) => Json(json!({
             "sessions": sessions.iter().map(|session| json!({
@@ -1794,19 +2660,20 @@ pub(super) async fn auth_revoke_session(
         )
         .into_response();
     };
-    let session = match auth.resolve(&session_token).await {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response();
-        }
-        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-    };
+    let session =
+        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return api_error(
+                    &headers,
+                    StatusCode::UNAUTHORIZED,
+                    lux::ApiErrorCode::AuthenticationRequired,
+                    "需要登录",
+                )
+                .into_response();
+            }
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
     let Some(csrf_token) = headers
         .get("x-csrf-token")
         .and_then(|value| value.to_str().ok())
@@ -1858,7 +2725,7 @@ pub(super) async fn auth_revoke_session(
 }
 
 pub(super) async fn auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth else {
+    let Some(auth) = state.auth.as_ref() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1876,27 +2743,28 @@ pub(super) async fn auth_logout(headers: HeaderMap, State(state): State<AppState
         )
         .into_response();
     };
-    let session = match auth.resolve(&session_token).await {
-        Ok(Some(session)) => session,
-        Ok(None) => {
-            return api_error(
-                &headers,
-                StatusCode::UNAUTHORIZED,
-                lux::ApiErrorCode::AuthenticationRequired,
-                "需要登录",
-            )
-            .into_response();
-        }
-        Err(_) => {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "认证暂时不可用",
-            )
-            .into_response();
-        }
-    };
+    let session =
+        match resolve_web_session_for_request(&headers, &state, auth, &session_token).await {
+            Ok(Some(session)) => session,
+            Ok(None) => {
+                return api_error(
+                    &headers,
+                    StatusCode::UNAUTHORIZED,
+                    lux::ApiErrorCode::AuthenticationRequired,
+                    "需要登录",
+                )
+                .into_response();
+            }
+            Err(_) => {
+                return api_error(
+                    &headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response();
+            }
+        };
     let Some(csrf_token) = headers
         .get("x-csrf-token")
         .and_then(|value| value.to_str().ok())
@@ -1955,6 +2823,18 @@ pub(super) async fn require_web_user(
     }
 }
 
+async fn resolve_web_session_for_request(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &crate::auth::sessions::WebAuthService,
+    session_token: &str,
+) -> Result<Option<AuthenticatedSession>, crate::auth::sessions::WebAuthError> {
+    let client_ip = super::request_access_ip(headers, state)
+        .await
+        .map_err(|_| crate::auth::sessions::WebAuthError::AccessRulesUnavailable)?;
+    auth.resolve_with_ip(session_token, client_ip).await
+}
+
 pub(super) async fn require_web_principal(
     headers: &HeaderMap,
     state: &AppState,
@@ -1994,7 +2874,19 @@ pub(super) async fn require_web_principal(
             )
             .into_response());
         };
-        return match auth.resolve_token(&token).await {
+        let client_ip = match super::request_access_ip(headers, state).await {
+            Ok(client_ip) => client_ip,
+            Err(_) => {
+                return Err(api_error(
+                    headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "认证暂时不可用",
+                )
+                .into_response());
+            }
+        };
+        return match auth.resolve_token_with_ip(&token, client_ip).await {
             Ok(Some(user)) => {
                 if state.remote_access.is_remote(
                     header_str(headers, "x-lux-peer-ip"),
@@ -2017,6 +2909,13 @@ pub(super) async fn require_web_principal(
                 StatusCode::UNAUTHORIZED,
                 lux::ApiErrorCode::AuthenticationRequired,
                 "需要有效的客户端令牌",
+            )
+            .into_response()),
+            Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "认证暂时不可用",
             )
             .into_response()),
             Err(_) => Err(api_error(
@@ -2046,7 +2945,7 @@ pub(super) async fn require_web_principal(
         )
         .into_response());
     };
-    match auth.resolve(&session_token).await {
+    match resolve_web_session_for_request(headers, state, auth, &session_token).await {
         Ok(Some(session)) => {
             if state.remote_access.is_remote(
                 header_str(headers, "x-lux-peer-ip"),
@@ -2061,6 +2960,45 @@ pub(super) async fn require_web_principal(
                 )
                 .into_response());
             }
+            let user_id = session.user.id.to_string();
+            match auth
+                .is_user_access_blacklisted(&user_id, session.device_id.as_deref())
+                .await
+            {
+                Ok(false) => {}
+                Ok(true) => {
+                    if auth.logout(&session_token).await.is_err() {
+                        return Err(api_error(
+                            headers,
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            lux::ApiErrorCode::DatabaseUnavailable,
+                            "登录状态暂时无法更新",
+                        )
+                        .into_response());
+                    }
+                    return Err(api_error(
+                        headers,
+                        StatusCode::FORBIDDEN,
+                        lux::ApiErrorCode::PermissionDenied,
+                        "当前设备或客户端已被禁止访问",
+                    )
+                    .into_response());
+                }
+                Err(_) => {
+                    return Err(api_error(
+                        headers,
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        lux::ApiErrorCode::DatabaseUnavailable,
+                        "访问规则暂时无法读取",
+                    )
+                    .into_response());
+                }
+            }
+            let device_id = session
+                .device_id
+                .clone()
+                .or_else(|| web_login_device_id(headers));
+            record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
             Ok(crate::auth::users::AuthenticationPrincipal::User(
                 session.user,
             ))
@@ -2108,7 +3046,8 @@ pub(super) async fn require_web_csrf(
         )
         .into_response());
     };
-    let session = match auth.resolve(&session_token).await {
+    let session = match resolve_web_session_for_request(headers, state, auth, &session_token).await
+    {
         Ok(Some(session)) => session,
         Ok(None) => {
             return Err(api_error(
@@ -2208,11 +3147,42 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route("/api/v1/setup/complete", post(users::setup_complete))
         .route("/api/v1/auth/login", post(users::auth_login))
+        .route(
+            "/api/v1/auth/invitations/accept",
+            post(users::auth_accept_user_invitation).layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/v1/auth/registrations/settings",
+            get(users::public_registration_settings),
+        )
+        .route(
+            "/api/v1/auth/registrations",
+            post(users::auth_submit_public_user_registration)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/v1/auth/registrations/verify-email",
+            post(users::auth_verify_public_user_registration_email)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
+        .route(
+            "/api/v1/auth/registrations/resend",
+            post(users::auth_resend_public_user_registration_email)
+                .layer(DefaultBodyLimit::max(16 * 1024)),
+        )
         .route("/api/v1/auth/logout", post(users::auth_logout))
         .route("/api/v1/auth/me", get(users::auth_me))
         .route(
             "/api/v1/auth/profile",
             get(users::auth_account_profile).patch(users::auth_update_account_profile),
+        )
+        .route(
+            "/api/v1/auth/profile/email-verification/resend",
+            post(users::auth_resend_account_email_change),
+        )
+        .route(
+            "/api/v1/auth/profile/email-verification/verify",
+            post(users::auth_verify_account_email_change).layer(DefaultBodyLimit::max(16 * 1024)),
         )
         .route(
             "/api/v1/auth/device-pairings",
@@ -2229,6 +3199,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/auth/settings",
             get(users::auth_settings).patch(users::auth_update_settings),
+        )
+        .route(
+            "/api/v1/auth/account-preferences",
+            get(users::auth_account_preferences).patch(users::auth_update_account_preferences),
         )
         .route("/api/v1/auth/password", patch(users::auth_update_password))
         .route(

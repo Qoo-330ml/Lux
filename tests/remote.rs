@@ -309,6 +309,10 @@ async fn remote_policy_blocks_auth_and_media_until_user_is_allowed()
     .bind(library.id.to_string())
     .execute(database.pool())
     .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
 
     let web_auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;

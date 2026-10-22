@@ -1,3 +1,4 @@
+import "./detail.css";
 import { useQuery } from "@tanstack/react-query";
 import { useParams, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";

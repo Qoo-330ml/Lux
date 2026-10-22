@@ -83,6 +83,10 @@ impl LibraryService {
         self.change_notifier.clone()
     }
 
+    pub(crate) fn notify_library_changed(&self) {
+        self.change_notifier.notify();
+    }
+
     pub async fn create_library(
         &self,
         name: &str,
@@ -312,6 +316,20 @@ impl LibraryService {
         requested_library_ids: &[String],
         accessible_library_ids: &[String],
     ) -> Result<Vec<String>, LibraryServiceError> {
+        let ordered = self
+            .normalize_library_order(requested_library_ids, accessible_library_ids)
+            .await?;
+        self.database
+            .replace_user_library_order(user_id, &ordered)
+            .await?;
+        Ok(ordered)
+    }
+
+    pub async fn normalize_library_order(
+        &self,
+        requested_library_ids: &[String],
+        accessible_library_ids: &[String],
+    ) -> Result<Vec<String>, LibraryServiceError> {
         let accessible = accessible_library_ids
             .iter()
             .cloned()
@@ -343,9 +361,6 @@ impl LibraryService {
         {
             ordered.push(global_collections_id);
         }
-        self.database
-            .replace_user_library_order(user_id, &ordered)
-            .await?;
         Ok(ordered)
     }
 
@@ -506,7 +521,8 @@ impl LibraryService {
             })
             .transpose()?
             .unwrap_or_else(LibraryRootId::new);
-        self.database
+        if !self
+            .database
             .insert_library_root(NewLibraryRoot {
                 id: &id.to_string(),
                 library_id: &library_id_text,
@@ -515,7 +531,10 @@ impl LibraryService {
                 is_available: inspection.is_available,
                 is_writable: inspection.is_writable,
             })
-            .await?;
+            .await?
+        {
+            return Err(LibraryServiceError::LibraryNotFound);
+        }
         self.database
             .delete_library_root_history(&library_id_text, &canonical_path)
             .await?;

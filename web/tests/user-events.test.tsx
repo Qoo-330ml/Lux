@@ -104,6 +104,20 @@ it.each(["home", "item", "library", "favorites"])("refreshes media caches for a 
   expect(client.getQueryState(playerKey)?.isInvalidated).toBe(false);
 });
 
+it("scopes a library event to that library and does not refetch pages in the background", async () => {
+  client.setQueryData(["library", "library-1"], { value: "old" });
+  client.setQueryData(["library", "library-2"], { value: "other" });
+  const firstKey = ["library", "library-1"];
+  let refetchCount = 0;
+  client.setQueryDefaults(firstKey, { queryFn: async () => { refetchCount += 1; return { value: "new" }; } });
+  renderShell();
+  act(() => FakeEventSource.instances[0].emit("invalidate", { scope: "library", libraryId: "library-1" }));
+  await act(async () => { await Promise.resolve(); });
+  expect(client.getQueryState(firstKey)?.isInvalidated).toBe(true);
+  expect(client.getQueryState(["library", "library-2"])?.isInvalidated).toBe(false);
+  expect(refetchCount).toBe(0);
+});
+
 it("ignores malformed and unknown invalidations", () => {
   client.setQueryData(["item", "item-1"], { title: "old" });
   renderShell();

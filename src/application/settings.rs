@@ -1,4 +1,4 @@
-use std::{io::Write, path::Path};
+use std::{collections::HashSet, io::Write, path::Path};
 
 use serde::{Deserialize, Serialize};
 
@@ -16,7 +16,56 @@ use crate::{
 };
 use tokio::fs;
 
+// The following versioned contract is exposed by LUX-803.
+#[allow(dead_code)]
+#[derive(Debug, Eq, PartialEq)]
+pub(crate) enum RegistrationModeError {
+    InvalidMode,
+    Conflict,
+    Unavailable,
+}
+
+#[allow(dead_code)]
+pub(crate) async fn read_registration_mode(
+    database: &Database,
+) -> Result<crate::storage::StoredRegistrationMode, RegistrationModeError> {
+    database
+        .registration_mode()
+        .await
+        .map_err(|_| RegistrationModeError::Unavailable)
+}
+
+#[allow(dead_code)]
+pub(crate) async fn update_registration_mode(
+    database: &Database,
+    mode: &str,
+    expected_version: i64,
+) -> Result<crate::storage::StoredRegistrationMode, RegistrationModeError> {
+    use crate::storage::RegistrationMode;
+    let mode = match mode {
+        "INVITATION_ONLY" => RegistrationMode::InvitationOnly,
+        "PUBLIC_EMAIL" => RegistrationMode::PublicEmail,
+        _ => return Err(RegistrationModeError::InvalidMode),
+    };
+    if expected_version < 0 {
+        return Err(RegistrationModeError::InvalidMode);
+    }
+    let current = read_registration_mode(database).await?;
+    if current.version != expected_version {
+        return Err(RegistrationModeError::Conflict);
+    }
+    if !database
+        .compare_and_set_registration_mode(&current, mode)
+        .await
+        .map_err(|_| RegistrationModeError::Unavailable)?
+    {
+        return Err(RegistrationModeError::Conflict);
+    }
+    read_registration_mode(database).await
+}
+
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
+const MAX_TRUSTED_PROXY_CIDRS: usize = 100;
 pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";
 pub const RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE: &str = "RECENTLY_ADDED";
 pub const LOGIN_BACKGROUND_PLUGIN_SOURCE_PREFIX: &str = "PLUGIN:";
@@ -55,6 +104,48 @@ pub(crate) struct MediaImageStrategySettings {
     pub(crate) write_to_metadata: bool,
     pub(crate) max_backdrop_count: i64,
     pub(crate) min_download_width: i64,
+    #[serde(default)]
+    pub(crate) variant_cache: ImageVariantCacheSettings,
+}
+
+pub(crate) const MIN_IMAGE_VARIANT_CACHE_FILES: u64 = 100;
+pub(crate) const MAX_IMAGE_VARIANT_CACHE_FILES: u64 = 1_000_000;
+pub(crate) const MIN_IMAGE_VARIANT_CACHE_BYTES: u64 = 64 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_VARIANT_CACHE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+pub(crate) const MIN_IMAGE_VARIANT_CONCURRENCY: usize = 1;
+pub(crate) const MAX_IMAGE_VARIANT_CONCURRENCY: usize = 4;
+pub(crate) const DEFAULT_IMAGE_VARIANT_CACHE_FILES: u64 = 20_000;
+pub(crate) const DEFAULT_IMAGE_VARIANT_CACHE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+pub(crate) const DEFAULT_IMAGE_VARIANT_CONCURRENCY: usize = 2;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase", default)]
+pub(crate) struct ImageVariantCacheSettings {
+    pub(crate) enabled: bool,
+    pub(crate) max_files: u64,
+    pub(crate) max_bytes: u64,
+    pub(crate) concurrency: usize,
+}
+
+impl Default for ImageVariantCacheSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_files: DEFAULT_IMAGE_VARIANT_CACHE_FILES,
+            max_bytes: DEFAULT_IMAGE_VARIANT_CACHE_BYTES,
+            concurrency: DEFAULT_IMAGE_VARIANT_CONCURRENCY,
+        }
+    }
+}
+
+impl ImageVariantCacheSettings {
+    pub(crate) fn is_valid(&self) -> bool {
+        (MIN_IMAGE_VARIANT_CACHE_FILES..=MAX_IMAGE_VARIANT_CACHE_FILES).contains(&self.max_files)
+            && (MIN_IMAGE_VARIANT_CACHE_BYTES..=MAX_IMAGE_VARIANT_CACHE_BYTES)
+                .contains(&self.max_bytes)
+            && (MIN_IMAGE_VARIANT_CONCURRENCY..=MAX_IMAGE_VARIANT_CONCURRENCY)
+                .contains(&self.concurrency)
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -89,6 +180,7 @@ impl Default for MediaStrategySettings {
                 write_to_metadata: false,
                 max_backdrop_count: 1,
                 min_download_width: 1280,
+                variant_cache: ImageVariantCacheSettings::default(),
             },
             subtitles: MediaSubtitleStrategySettings {
                 auto_download: false,
@@ -96,6 +188,69 @@ impl Default for MediaStrategySettings {
                 forced_only: false,
                 hearing_impaired: false,
             },
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct NewUserPermissions {
+    pub(crate) library_access_mode: String,
+    pub(crate) library_ids: Vec<String>,
+    pub(crate) can_download: bool,
+    pub(crate) can_play: bool,
+    pub(crate) max_simultaneous_playbacks: i64,
+    pub(crate) allow_remux: bool,
+    pub(crate) allow_audio_transcode: bool,
+    pub(crate) allow_video_transcode: bool,
+}
+
+impl Default for NewUserPermissions {
+    fn default() -> Self {
+        Self {
+            library_access_mode: "NONE".to_owned(),
+            library_ids: Vec::new(),
+            can_download: false,
+            can_play: true,
+            max_simultaneous_playbacks: 2,
+            allow_remux: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+        }
+    }
+}
+
+impl NewUserPermissions {
+    pub(crate) fn has_valid_shape(&self) -> bool {
+        self.max_simultaneous_playbacks >= 0
+            && self.library_ids.len() <= 100
+            && match self.library_access_mode.as_str() {
+                "ALL" | "NONE" => self.library_ids.is_empty(),
+                "SELECTED" => !self
+                    .library_ids
+                    .iter()
+                    .enumerate()
+                    .any(|(index, id)| self.library_ids[..index].contains(id)),
+                _ => false,
+            }
+    }
+
+    pub(crate) fn normalize_empty_selection(&mut self) {
+        if self.library_access_mode == "SELECTED" && self.library_ids.is_empty() {
+            self.library_access_mode = "NONE".to_owned();
+        }
+    }
+
+    pub(crate) fn stored_snapshot(&self) -> crate::storage::NewStoredUserPermissions<'_> {
+        crate::storage::NewStoredUserPermissions {
+            library_access_mode: &self.library_access_mode,
+            library_ids: &self.library_ids,
+            can_download: self.can_download,
+            can_play: self.can_play,
+            max_simultaneous_playbacks: self.max_simultaneous_playbacks,
+            allow_remux: self.allow_remux,
+            allow_audio_transcode: self.allow_audio_transcode,
+            allow_video_transcode: self.allow_video_transcode,
         }
     }
 }
@@ -116,6 +271,9 @@ pub(crate) struct AdminSettingsSnapshot {
     pub(crate) resume_min_ticks: i64,
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
+    pub(crate) user_activity_retention_days: i64,
+    pub(crate) trusted_proxy_cidrs: Vec<String>,
+    pub(crate) new_user_permissions: NewUserPermissions,
     pub(crate) login_background_source: String,
     pub(crate) login_background_source_status: String,
     pub(crate) media_strategy: MediaStrategySettings,
@@ -134,6 +292,9 @@ pub(crate) struct AdminSettingsUpdate {
     pub(crate) resume_min_ticks: Option<i64>,
     pub(crate) force_admin_library_order: Option<bool>,
     pub(crate) user_deletion_grace_days: Option<i64>,
+    pub(crate) user_activity_retention_days: Option<i64>,
+    pub(crate) trusted_proxy_cidrs: Option<Vec<String>>,
+    pub(crate) new_user_permissions: Option<NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
     pub(crate) network_proxy: NetworkProxyChange,
@@ -147,6 +308,9 @@ pub(crate) enum AdminSettingsError {
     InvalidServerName,
     InvalidGlobalSettings,
     InvalidUserDeletionGraceDays,
+    InvalidUserActivityRetentionDays,
+    InvalidTrustedProxyCidrs,
+    InvalidNewUserPermissions,
     InvalidNetworkProxy,
     PluginServiceUnavailable,
     Plugin(PluginServiceError),
@@ -158,6 +322,9 @@ struct StoredAdminSettings {
     resume_min_ticks: i64,
     force_admin_library_order: bool,
     user_deletion_grace_days: i64,
+    user_activity_retention_days: i64,
+    trusted_proxy_cidrs: Vec<String>,
+    new_user_permissions: NewUserPermissions,
     login_background_source: String,
     media_strategy: MediaStrategySettings,
 }
@@ -172,6 +339,12 @@ pub(crate) async fn read_admin_settings(
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
     let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
+    let user_activity_retention_days = database
+        .user_activity_retention_days()
+        .await
+        .map_err(|_| ())?;
+    let trusted_proxy_cidrs = read_trusted_proxy_cidrs(database).await?;
+    let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
         _ => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
@@ -189,6 +362,9 @@ pub(crate) async fn read_admin_settings(
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        user_activity_retention_days,
+        trusted_proxy_cidrs,
+        new_user_permissions,
         login_background_source,
         login_background_source_status,
         media_strategy,
@@ -248,6 +424,33 @@ pub(crate) async fn update_admin_settings(
     if !(1..=3_650).contains(&user_deletion_grace_days) {
         return Err(AdminSettingsError::InvalidUserDeletionGraceDays);
     }
+    let user_activity_retention_days = update
+        .user_activity_retention_days
+        .unwrap_or(current.user_activity_retention_days);
+    if !(1..=3_650).contains(&user_activity_retention_days) {
+        return Err(AdminSettingsError::InvalidUserActivityRetentionDays);
+    }
+    let trusted_proxy_cidrs = match update.trusted_proxy_cidrs {
+        Some(values) => normalize_trusted_proxy_cidrs(values)?,
+        None => current.trusted_proxy_cidrs,
+    };
+    let trusted_proxy_cidrs_json =
+        serde_json::to_string(&trusted_proxy_cidrs).map_err(|_| AdminSettingsError::Unavailable)?;
+    let mut new_user_permissions = update
+        .new_user_permissions
+        .unwrap_or(current.new_user_permissions);
+    new_user_permissions.normalize_empty_selection();
+    if !new_user_permissions.has_valid_shape()
+        || (new_user_permissions.library_access_mode == "SELECTED"
+            && !database
+                .are_enabled_regular_libraries(&new_user_permissions.library_ids)
+                .await
+                .map_err(|_| AdminSettingsError::Unavailable)?)
+    {
+        return Err(AdminSettingsError::InvalidNewUserPermissions);
+    }
+    let new_user_permissions_json = serde_json::to_string(&new_user_permissions)
+        .map_err(|_| AdminSettingsError::Unavailable)?;
     if !(1..=100).contains(&resume_played_percent)
         || resume_min_ticks < 0
         || !validate_media_strategy(&media_strategy)
@@ -307,6 +510,9 @@ pub(crate) async fn update_admin_settings(
             media_strategy_json: &media_strategy_json,
             force_admin_library_order,
             user_deletion_grace_days,
+            user_activity_retention_days,
+            trusted_proxy_cidrs_json: &trusted_proxy_cidrs_json,
+            new_user_permissions_json: &new_user_permissions_json,
             login_background_source: &login_background_source,
             server_name: &server_name,
             refresh_login_background: login_background_source_changed
@@ -324,6 +530,9 @@ pub(crate) async fn update_admin_settings(
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        user_activity_retention_days,
+        trusted_proxy_cidrs,
+        new_user_permissions,
         login_background_source,
         login_background_source_status,
         media_strategy,
@@ -337,6 +546,12 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
     let media_strategy = read_media_strategy_settings(database).await?;
     let force_admin_library_order = database.force_admin_library_order().await.map_err(|_| ())?;
     let user_deletion_grace_days = database.user_deletion_grace_days().await.map_err(|_| ())?;
+    let user_activity_retention_days = database
+        .user_activity_retention_days()
+        .await
+        .map_err(|_| ())?;
+    let trusted_proxy_cidrs = read_trusted_proxy_cidrs(database).await?;
+    let new_user_permissions = read_new_user_permissions(database).await?;
     let login_background_source = match database.login_background_source().await.map_err(|_| ())? {
         Some(source) if is_valid_login_background_source(&source) => source,
         _ => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
@@ -351,9 +566,59 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         resume_min_ticks,
         force_admin_library_order,
         user_deletion_grace_days,
+        user_activity_retention_days,
+        trusted_proxy_cidrs,
+        new_user_permissions,
         login_background_source,
         media_strategy,
     })
+}
+
+pub(crate) async fn read_trusted_proxy_cidrs(database: &Database) -> Result<Vec<String>, ()> {
+    let stored = database.trusted_proxy_cidrs_json().await.map_err(|_| ())?;
+    let Some(stored) = stored else {
+        return Ok(Vec::new());
+    };
+    let values = serde_json::from_str::<Vec<String>>(&stored).map_err(|_| ())?;
+    normalize_trusted_proxy_cidrs(values).map_err(|_| ())
+}
+
+fn normalize_trusted_proxy_cidrs(values: Vec<String>) -> Result<Vec<String>, AdminSettingsError> {
+    if values.len() > MAX_TRUSTED_PROXY_CIDRS {
+        return Err(AdminSettingsError::InvalidTrustedProxyCidrs);
+    }
+    let mut seen = HashSet::with_capacity(values.len());
+    let mut normalized = Vec::with_capacity(values.len());
+    for value in values {
+        let value = crate::application::user_access_rules::normalize_user_access_blacklist_value(
+            crate::application::user_access_rules::UserAccessBlacklistRuleType::IpCidr,
+            &value,
+        )
+        .map_err(|_| AdminSettingsError::InvalidTrustedProxyCidrs)?;
+        if !seen.insert(value.clone()) {
+            return Err(AdminSettingsError::InvalidTrustedProxyCidrs);
+        }
+        normalized.push(value);
+    }
+    Ok(normalized)
+}
+
+pub(crate) async fn read_new_user_permissions(
+    database: &Database,
+) -> Result<NewUserPermissions, ()> {
+    let stored = database.new_user_permissions_json().await.map_err(|_| ())?;
+    let Some(stored) = stored else {
+        return Ok(NewUserPermissions::default());
+    };
+    let Ok(mut permissions) = serde_json::from_str::<NewUserPermissions>(&stored) else {
+        return Ok(NewUserPermissions::default());
+    };
+    permissions.normalize_empty_selection();
+    if permissions.has_valid_shape() {
+        Ok(permissions)
+    } else {
+        Ok(NewUserPermissions::default())
+    }
 }
 
 async fn login_background_source_status(plugins: Option<&PluginService>, source: &str) -> String {
@@ -548,6 +813,7 @@ pub(crate) fn validate_media_strategy(settings: &MediaStrategySettings) -> bool 
         )
         && (0..=20).contains(&settings.images.max_backdrop_count)
         && (0..=8192).contains(&settings.images.min_download_width)
+        && settings.images.variant_cache.is_valid()
         && (1..=8).contains(&settings.subtitles.languages.len())
         && settings
             .subtitles
@@ -562,6 +828,9 @@ pub(crate) struct AdminSettingsWrite<'a> {
     pub(crate) media_strategy_json: &'a str,
     pub(crate) force_admin_library_order: bool,
     pub(crate) user_deletion_grace_days: i64,
+    pub(crate) user_activity_retention_days: i64,
+    pub(crate) trusted_proxy_cidrs_json: &'a str,
+    pub(crate) new_user_permissions_json: &'a str,
     pub(crate) login_background_source: &'a str,
     pub(crate) server_name: &'a str,
     pub(crate) refresh_login_background: bool,
@@ -585,6 +854,18 @@ pub(crate) async fn write_admin_settings(
         .map_err(|_| ())?;
     database
         .set_user_deletion_grace_days(settings.user_deletion_grace_days)
+        .await
+        .map_err(|_| ())?;
+    database
+        .set_user_activity_retention_days(settings.user_activity_retention_days)
+        .await
+        .map_err(|_| ())?;
+    database
+        .set_trusted_proxy_cidrs_json(settings.trusted_proxy_cidrs_json)
+        .await
+        .map_err(|_| ())?;
+    database
+        .set_new_user_permissions_json(settings.new_user_permissions_json)
         .await
         .map_err(|_| ())?;
     if settings.refresh_login_background
@@ -677,4 +958,77 @@ async fn write_secret_file(
     })
     .await
     .map_err(|error| std::io::Error::other(error.to_string()))?
+}
+
+#[cfg(test)]
+mod variant_cache_tests {
+    use super::*;
+
+    #[test]
+    fn legacy_media_strategy_json_defaults_the_variant_cache_to_off() {
+        let value = serde_json::json!({
+            "metadataLanguage": "zh-CN",
+            "imageLanguage": "zh-CN",
+            "region": "CN",
+            "scraperId": null,
+            "applyScope": "NEW_CONTENT",
+            "images": {
+                "poster": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 1,
+                "minDownloadWidth": 1280
+            },
+            "subtitles": {
+                "autoDownload": false,
+                "languages": ["zh-CN"],
+                "forcedOnly": false,
+                "hearingImpaired": false
+            }
+        });
+        let settings: MediaStrategySettings = serde_json::from_value(value).expect("legacy json");
+        assert_eq!(
+            settings.images.variant_cache,
+            ImageVariantCacheSettings::default()
+        );
+        assert!(!settings.images.variant_cache.enabled);
+        assert_eq!(settings.images.variant_cache.max_files, 20_000);
+        assert_eq!(
+            settings.images.variant_cache.max_bytes,
+            2 * 1024 * 1024 * 1024
+        );
+        assert_eq!(settings.images.variant_cache.concurrency, 2);
+        assert!(validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn variant_cache_ranges_are_validated() {
+        let mut settings = MediaStrategySettings::default();
+        assert!(validate_media_strategy(&settings));
+
+        settings.images.variant_cache.max_files = 99;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_files = 1_000_001;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_files = 20_000;
+
+        settings.images.variant_cache.max_bytes = 64 * 1024 * 1024 - 1;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_bytes = 64 * 1024 * 1024 * 1024 + 1;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.max_bytes = 2 * 1024 * 1024 * 1024;
+
+        settings.images.variant_cache.concurrency = 0;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.concurrency = 5;
+        assert!(!validate_media_strategy(&settings));
+        settings.images.variant_cache.concurrency = 4;
+        assert!(validate_media_strategy(&settings));
+    }
 }

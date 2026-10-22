@@ -1,3 +1,4 @@
+import "./detail.css";
 import { ArrowLeft, Cake, Heart, MapPin, UserRound } from "lucide-react";
 import { Fragment, type FormEvent, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
@@ -6,6 +7,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { LuxUser, PersonDetail } from "../../lib/api/types";
 import { MediaCard } from "../home/media";
+import { LibraryGrid } from "../library/LibraryGrid";
 
 type PersonDetailPageProps = { user?: LuxUser };
 
@@ -189,7 +191,11 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
         {works.isPending ? <p className="lux-muted-copy">正在加载参演作品…</p> : null}
         {works.error ? <p className="lux-error-copy" role="alert">参演作品加载失败：{works.error.message}</p> : null}
         {!works.isPending && !works.error && !workItems.length ? <p className="lux-muted-copy">暂无已入库的参演电影或剧集。</p> : null}
-        {workItems.length ? <div className="lux-person-works-grid lux-poster-grid">{workItems.map((item) => <MediaCard item={item} key={item.id} />)}</div> : null}
+        {workItems.length ? (
+          <div className="lux-person-works-grid">
+            <LibraryGrid items={workItems} renderItem={(item) => <MediaCard item={item} key={item.id} />} />
+          </div>
+        ) : null}
         {works.hasNextPage ? <div className="lux-person-works-actions"><button className="lux-button lux-button-secondary" type="button" onClick={() => void works.fetchNextPage()} disabled={works.isFetchingNextPage}>{works.isFetchingNextPage ? "加载中…" : "加载更多"}</button></div> : null}
       </section>
     </article>

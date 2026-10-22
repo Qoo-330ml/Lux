@@ -5,7 +5,6 @@ use crate::{
             AddRootResult, LibraryService, LibraryServiceError, LibrarySettingsPatch, LibraryView,
         },
         plugins::PluginService,
-        scanner::{LibraryDeletionGuard, ScanJobError, ScanJobService},
     },
     domain::ids::LibraryId,
     library::{LibraryKind, LibraryRecord, LibraryScraper},
@@ -17,11 +16,6 @@ pub(crate) enum LibrarySettingsWriteError {
     ChapterSchedule(crate::application::plugins::PluginServiceError),
 }
 
-pub(crate) enum DeleteLibraryError {
-    Library(LibraryServiceError),
-    Scan(ScanJobError),
-}
-
 pub(crate) struct CreateLibraryInput<'a> {
     pub(crate) name: &'a str,
     pub(crate) kind: LibraryKind,
@@ -29,48 +23,6 @@ pub(crate) struct CreateLibraryInput<'a> {
     pub(crate) scrapers: &'a [LibraryScraper],
     pub(crate) chapter_source_id: Option<&'a str>,
     pub(crate) realtime_metadata_auto_match_enabled: bool,
-}
-
-pub(crate) async fn delete_library(
-    libraries: &LibraryService,
-    scan_jobs: Option<&ScanJobService>,
-    plugins: Option<&PluginService>,
-    home: Option<&HomeService>,
-    library_id: LibraryId,
-) -> Result<Option<LibraryDeletionGuard>, DeleteLibraryError> {
-    let deletion_guard = match scan_jobs {
-        Some(scan_jobs) => Some(
-            scan_jobs
-                .prepare_library_deletion(library_id)
-                .await
-                .map_err(DeleteLibraryError::Scan)?,
-        ),
-        None => None,
-    };
-    libraries
-        .delete_library(library_id)
-        .await
-        .map_err(DeleteLibraryError::Library)?;
-    if let Some(plugins) = plugins {
-        if let Err(error) = plugins.prune_media_info_library_ids().await {
-            tracing::error!(
-                library_id = %library_id,
-                %error,
-                "library deleted but STRM media-info plugin configuration could not be pruned"
-            );
-        }
-        if let Err(error) = plugins.prune_danmaku_library_ids().await {
-            tracing::error!(
-                library_id = %library_id,
-                %error,
-                "library deleted but danmaku plugin configuration could not be pruned"
-            );
-        }
-    }
-    if let Some(home) = home {
-        home.invalidate();
-    }
-    Ok(deletion_guard)
 }
 
 pub(crate) async fn create_library(

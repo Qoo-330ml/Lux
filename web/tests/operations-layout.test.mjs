@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
+import { mediaStyles, stylesheet as allStyles } from "./style-source.mjs";
 
-const stylesheet = fs.readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const stylesheet = allStyles;
 
 function rule(selector) {
   return stylesheet.match(new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\s*\\{([^}]*)\\}`))?.[1] ?? "";
@@ -46,7 +47,7 @@ test("task schedule editing keeps the field and actions in one aligned row", () 
 });
 
 test("mobile registered task details keep the action row from narrowing the lower copy", () => {
-  const mobileRules = stylesheet.match(/@media \(max-width: 900px\) \{([\s\S]*?)\n\}/)?.[1] ?? "";
+  const mobileRules = mediaStyles("@media (max-width: 900px)");
 
   assert.match(mobileRules, /\.lux-registered-task-row\s*\{[^}]*position:\s*relative;[^}]*grid-template-columns:\s*38px\s+minmax\(0,\s*1fr\)/);
   assert.match(mobileRules, /\.lux-registered-task-row:not\(.is-editing\) \.lux-registered-task-heading\s*\{[^}]*padding-right:\s*148px/);

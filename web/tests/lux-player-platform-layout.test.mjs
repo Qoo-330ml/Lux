@@ -1,8 +1,9 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import test from "node:test";
+import { stylesheet as allStyles } from "./style-source.mjs";
 
-const styles = readFileSync(new URL("../src/react.css", import.meta.url), "utf8");
+const styles = allStyles;
 
 test("LuxPlayer reserves dynamic viewport and safe-area space for mobile controls", () => {
   assert.match(styles, /\.lux-player-page \{[^}]*height: 100dvh/);

@@ -1,7 +1,657 @@
 use super::*;
+use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
 use crate::storage::{
-    PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, UserPlaybackPolicy,
+    ApplyUserPermissionPreset, CONTENT_RESTRICTION_INDEX_BATCH_LIMIT,
+    MediaContentRestrictionIndexCandidate, NewEmbyDirectPlaybackTicket, NewInvitationUserAccount,
+    NewMailChallenge, NewMailOutboxMessage, NewStoredUserPermissions, NewUserAccessBlacklistRule,
+    NewUserActivityEvent, NewUserContentRestrictions, NewUserDeviceObservation, NewUserInvitation,
+    NewUserRegistrationRequest, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+    StoredUserActivityEvent, UserAccessBlacklistRuleMatchQuery, UserAccessBlacklistRulePageQuery,
+    UserAccessBlacklistRuleScope, UserActivityEventQuery, UserContentRestrictionsCasResult,
+    UserDevicePageQuery, UserInvitationAcceptResult, UserInvitationCreateResult,
+    UserInvitationStatus, UserPermissionCopyGroups, UserPermissionCopyResult, UserPlaybackPolicy,
+    UserRegistrationApproveResult, UserRegistrationCreateResult, UserRegistrationRejectResult,
+    UserRegistrationResendResult, UserRegistrationStatus, UserRegistrationVerifyResult,
 };
+use crate::storage::{UserEmailChangeCreateResult, UserEmailChangeVerifyResult};
+
+#[tokio::test]
+async fn web_session_device_association_is_optional_and_only_read_from_active_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config};
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete("Session Device", "Session Device", "password")
+        .await?;
+    let user_id = user.id.to_string();
+    let token_hash = [1_u8; 32];
+    database
+        .create_web_session_with_device(
+            "device-session",
+            &user_id,
+            &token_hash,
+            &[2_u8; 32],
+            Some("browser-device-id"),
+            3600,
+        )
+        .await?;
+    let stored = database
+        .find_web_session(&token_hash)
+        .await?
+        .ok_or("active device session was not found")?;
+    assert_eq!(stored.device_id.as_deref(), Some("browser-device-id"));
+
+    let legacy_token_hash = [3_u8; 32];
+    database
+        .create_web_session(
+            "legacy-session",
+            &user_id,
+            &legacy_token_hash,
+            &[4_u8; 32],
+            3600,
+        )
+        .await?;
+    let legacy = database
+        .find_web_session(&legacy_token_hash)
+        .await?
+        .ok_or("active legacy session was not found")?;
+    assert_eq!(legacy.device_id, None);
+
+    let expired_token_hash = [5_u8; 32];
+    database
+        .create_web_session_with_device(
+            "expired-session",
+            &user_id,
+            &expired_token_hash,
+            &[6_u8; 32],
+            Some("expired-device"),
+            -1,
+        )
+        .await?;
+    assert!(
+        database
+            .find_web_session(&expired_token_hash)
+            .await?
+            .is_none()
+    );
+    database.revoke_web_session(&token_hash).await?;
+    assert!(database.find_web_session(&token_hash).await?.is_none());
+    assert!(database.find_web_session(&[7_u8; 32]).await?.is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_access_blacklist_rules_are_scoped_stable_and_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, username) in [
+        ("blacklist-user-a", "blacklist-user-a"),
+        ("blacklist-user-b", "blacklist-user-b"),
+        ("blacklist-creator", "blacklist-creator"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test-hash')",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(username)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, user_id, rule_type, match_value, created_at) in [
+        ("global-client", None, "CLIENT", "infuse", 200_i64),
+        ("global-device", None, "DEVICE", "living-room-tv", 200_i64),
+        (
+            "user-a-client",
+            Some("blacklist-user-a"),
+            "CLIENT",
+            "infuse",
+            250_i64,
+        ),
+        (
+            "user-a-ip",
+            Some("blacklist-user-a"),
+            "IP_CIDR",
+            "192.0.2.0/24",
+            150_i64,
+        ),
+        (
+            "user-b-device",
+            Some("blacklist-user-b"),
+            "DEVICE",
+            "living-room-tv",
+            300_i64,
+        ),
+    ] {
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id,
+                user_id,
+                rule_type,
+                match_value,
+                is_enabled: true,
+                created_by: Some("blacklist-creator"),
+                created_at,
+            })
+            .await?;
+    }
+
+    let (global_page_1, global_total) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::Global,
+            offset: 0,
+            limit: 1,
+        })
+        .await?;
+    assert_eq!(global_total, 2);
+    assert_eq!(global_page_1[0].id, "global-client");
+    let (global_page_2, _) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::Global,
+            offset: 1,
+            limit: 1,
+        })
+        .await?;
+    assert_eq!(global_page_2[0].id, "global-device");
+
+    let (user_a_page, user_a_total) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+            offset: -1,
+            limit: 0,
+        })
+        .await?;
+    assert_eq!(user_a_total, 2);
+    assert_eq!(user_a_page.len(), 1);
+    assert_eq!(user_a_page[0].id, "user-a-client");
+    assert_eq!(user_a_page[0].user_id.as_deref(), Some("blacklist-user-a"));
+    assert!(user_a_page[0].is_enabled);
+
+    let (user_b_page, user_b_total) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::User("blacklist-user-b"),
+            offset: 0,
+            limit: 101,
+        })
+        .await?;
+    assert_eq!(user_b_total, 1);
+    assert_eq!(user_b_page.len(), 1);
+    assert_eq!(user_b_page[0].id, "user-b-device");
+
+    assert!(
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: "duplicate-global-client",
+                user_id: None,
+                rule_type: "CLIENT",
+                match_value: "infuse",
+                is_enabled: true,
+                created_by: Some("blacklist-creator"),
+                created_at: 300,
+            })
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: "duplicate-user-device",
+                user_id: Some("blacklist-user-b"),
+                rule_type: "DEVICE",
+                match_value: "living-room-tv",
+                is_enabled: true,
+                created_by: Some("blacklist-creator"),
+                created_at: 300,
+            })
+            .await
+            .is_err()
+    );
+
+    assert!(
+        database
+            .set_user_access_blacklist_rule_enabled(
+                UserAccessBlacklistRuleScope::Global,
+                "global-client",
+                false,
+            )
+            .await?
+    );
+    assert!(
+        !database
+            .set_user_access_blacklist_rule_enabled(
+                UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+                "global-client",
+                false,
+            )
+            .await?
+    );
+    let (disabled_page, _) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::Global,
+            offset: 0,
+            limit: 10,
+        })
+        .await?;
+    let disabled = disabled_page
+        .iter()
+        .find(|rule| rule.id == "global-client")
+        .ok_or("disabled global rule was not listed")?;
+    assert!(!disabled.is_enabled);
+    assert!(disabled.updated_at >= disabled.created_at);
+
+    assert!(
+        !database
+            .delete_user_access_blacklist_rule(
+                UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+                "global-client",
+            )
+            .await?
+    );
+    assert!(
+        database
+            .delete_user_access_blacklist_rule(
+                UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+                "user-a-ip",
+            )
+            .await?
+    );
+    let (_, user_a_after_delete) = database
+        .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+            scope: UserAccessBlacklistRuleScope::User("blacklist-user-a"),
+            offset: 0,
+            limit: 100,
+        })
+        .await?;
+    assert_eq!(user_a_after_delete, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_access_blacklist_matching_is_scoped_enabled_and_type_specific()
+-> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    assert_user_access_blacklist_matching_contract(&database).await
+}
+
+async fn assert_user_access_blacklist_matching_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    assert!(
+        !database
+            .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                user_id: "blacklist-match-a",
+                device_id: Some("unmatched-device"),
+                client_name: Some("lux web"),
+            })
+            .await?
+    );
+    assert_eq!(
+        database
+            .active_user_access_device_client_blacklist_rules("blacklist-match-a")
+            .await?,
+        (false, false)
+    );
+    for (user_id, username) in [
+        ("blacklist-match-a", "blacklist-match-a"),
+        ("blacklist-match-b", "blacklist-match-b"),
+        ("blacklist-match-creator", "blacklist-match-creator"),
+    ] {
+        database
+            .query(
+                "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test-hash')",
+            )
+            .bind(user_id)
+            .bind(username)
+            .bind(username)
+            .execute(database.pool())
+            .await?;
+    }
+
+    for (id, user_id, rule_type, match_value, is_enabled) in [
+        ("match-global-device", None, "DEVICE", "shared-tv", true),
+        ("match-global-client", None, "CLIENT", "lux web", true),
+        (
+            "match-user-a-device",
+            Some("blacklist-match-a"),
+            "DEVICE",
+            "a-phone",
+            true,
+        ),
+        (
+            "match-user-a-client",
+            Some("blacklist-match-a"),
+            "CLIENT",
+            "plex",
+            true,
+        ),
+        (
+            "match-user-b-device",
+            Some("blacklist-match-b"),
+            "DEVICE",
+            "b-phone",
+            true,
+        ),
+        (
+            "match-disabled-device",
+            None,
+            "DEVICE",
+            "disabled-tv",
+            false,
+        ),
+        (
+            "match-ip-same-value",
+            None,
+            "IP_CIDR",
+            "203.0.113.5/32",
+            true,
+        ),
+    ] {
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id,
+                user_id,
+                rule_type,
+                match_value,
+                is_enabled,
+                created_by: Some("blacklist-match-creator"),
+                created_at: 100,
+            })
+            .await?;
+    }
+
+    for (user_id, device_id, client_name) in [
+        ("blacklist-match-a", Some("shared-tv"), None),
+        ("blacklist-match-b", Some("shared-tv"), None),
+        ("blacklist-match-a", Some("a-phone"), None),
+        ("blacklist-match-a", None, Some("lux web")),
+        ("blacklist-match-a", None, Some("plex")),
+    ] {
+        assert!(
+            database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id,
+                    device_id,
+                    client_name,
+                })
+                .await?
+        );
+    }
+
+    for (user_id, device_id, client_name) in [
+        ("blacklist-match-b", Some("a-phone"), None),
+        ("blacklist-match-a", Some("a-phone-extra"), None),
+        ("blacklist-match-a", Some("disabled-tv"), None),
+        ("blacklist-match-a", None, Some("203.0.113.5/32")),
+        ("blacklist-match-a", None, None),
+    ] {
+        assert!(
+            !database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id,
+                    device_id,
+                    client_name,
+                })
+                .await?
+        );
+    }
+    assert_eq!(
+        database
+            .active_user_access_device_client_blacklist_rules("blacklist-match-creator")
+            .await?,
+        (true, true)
+    );
+    for id in ["match-global-device", "match-global-client"] {
+        assert!(
+            database
+                .set_user_access_blacklist_rule_enabled(
+                    UserAccessBlacklistRuleScope::Global,
+                    id,
+                    false
+                )
+                .await?
+        );
+    }
+    for (user_id, expected) in [
+        ("blacklist-match-a", (true, true)),
+        ("blacklist-match-b", (true, false)),
+        ("blacklist-match-creator", (false, false)),
+    ] {
+        assert_eq!(
+            database
+                .active_user_access_device_client_blacklist_rules(user_id)
+                .await?,
+            expected
+        );
+    }
+    assert!(
+        database
+            .set_user_access_blacklist_rule_enabled(
+                UserAccessBlacklistRuleScope::User("blacklist-match-a"),
+                "match-user-a-device",
+                false,
+            )
+            .await?
+    );
+    assert_eq!(
+        database
+            .active_user_access_device_client_blacklist_rules("blacklist-match-a")
+            .await?,
+        (false, true)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_access_blacklist_queries_and_web_login_are_portable()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        },
+        &DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let test_database = database.clone();
+    let assertions = tokio::spawn(async move {
+        SetupService::new(test_database.clone())?
+            .complete("postgres-blacklist-admin", "Admin", "test-password")
+            .await?;
+        let auth = crate::auth::sessions::WebAuthService::new(test_database.clone())?;
+        assert!(
+            auth.login("postgres-blacklist-admin", "test-password")
+                .await?
+                .is_some()
+        );
+        assert_user_access_blacklist_matching_contract(&test_database).await?;
+        assert!(
+            test_database
+                .set_user_access_blacklist_rule_enabled(
+                    UserAccessBlacklistRuleScope::Global,
+                    "match-global-client",
+                    true,
+                )
+                .await?
+        );
+        assert!(matches!(
+            auth.login("postgres-blacklist-admin", "test-password")
+                .await,
+            Err(crate::auth::sessions::WebAuthError::AccessDenied)
+        ));
+        Ok::<(), Box<dyn std::error::Error + Send + Sync>>(())
+    })
+    .await;
+    database.close().await;
+    let cleanup = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    cleanup?;
+    assertions?.map_err(|error| error as Box<dyn std::error::Error>)
+}
+
+#[tokio::test]
+async fn user_access_ip_blacklist_rules_are_bounded_enabled_and_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, username) in [
+        ("ip-rules-a", "ip-rules-a"),
+        ("ip-rules-b", "ip-rules-b"),
+        ("ip-rules-creator", "ip-rules-creator"),
+    ] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test-hash')",
+        )
+        .bind(user_id)
+        .bind(username)
+        .bind(username)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, user_id, rule_type, value, enabled) in [
+        ("ip-global-a", None, "IP_CIDR", "192.0.2.0/24", true),
+        (
+            "ip-global-disabled",
+            None,
+            "IP_CIDR",
+            "198.51.100.0/24",
+            false,
+        ),
+        (
+            "ip-user-a",
+            Some("ip-rules-a"),
+            "IP_CIDR",
+            "2001:db8::/32",
+            true,
+        ),
+        (
+            "ip-user-b",
+            Some("ip-rules-b"),
+            "IP_CIDR",
+            "203.0.113.0/24",
+            true,
+        ),
+        ("ip-not-ip", None, "CLIENT", "192.0.2.0/24", true),
+    ] {
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id,
+                user_id,
+                rule_type,
+                match_value: value,
+                is_enabled: enabled,
+                created_by: Some("ip-rules-creator"),
+                created_at: 100,
+            })
+            .await?;
+    }
+
+    let rules = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-a",
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(rules, ["192.0.2.0/24", "2001:db8::/32"]);
+
+    let limited = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-a",
+            limit: 1,
+        })
+        .await?;
+    assert_eq!(limited.len(), 1);
+
+    let other_user = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-b",
+            limit: 10,
+        })
+        .await?;
+    assert_eq!(other_user, ["192.0.2.0/24", "203.0.113.0/24"]);
+
+    for index in 0..205 {
+        let id = format!("ip-overflow-{index}");
+        let match_value = format!("203.0.113.{index}/32");
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: &id,
+                user_id: None,
+                rule_type: "IP_CIDR",
+                match_value: &match_value,
+                is_enabled: true,
+                created_by: Some("ip-rules-creator"),
+                created_at: 101,
+            })
+            .await?;
+    }
+    let bounded = database
+        .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+            user_id: "ip-rules-a",
+            limit: 500,
+        })
+        .await?;
+    assert_eq!(bounded.len(), 201);
+    Ok(())
+}
 
 #[tokio::test]
 async fn scan_job_retry_diagnostics_cover_history_and_filter_before_pagination()
@@ -2002,6 +2652,7 @@ async fn home_resume_page_returns_items_and_total_with_one_query() {
                 user_id: &user_id,
                 library_ids: std::slice::from_ref(&library_id),
                 item_types: &["MOVIE"],
+                content_restrictions: None,
                 played_percent: 90,
                 minimum_ticks: 0,
                 offset: 0,
@@ -2024,6 +2675,7 @@ async fn home_resume_page_returns_items_and_total_with_one_query() {
                 user_id: &user_id,
                 library_ids: std::slice::from_ref(&library_id),
                 item_types: &["MOVIE"],
+                content_restrictions: None,
                 played_percent: 90,
                 minimum_ticks: 0,
                 offset: 10,
@@ -2037,6 +2689,100 @@ async fn home_resume_page_returns_items_and_total_with_one_query() {
     assert!(past_end.is_empty());
     assert_eq!(total, 2);
     assert_eq!(database.query_count(), 2);
+}
+
+#[tokio::test]
+async fn resume_items_apply_content_restrictions_before_ranking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("Resume Admin", "resume-admin", "test password")
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Restricted resume", LibraryKind::Movie, false)
+        .await?;
+    let user_id = admin.id.to_string();
+    let library_id = library.id.to_string();
+    for (item_id, certification) in [("resume-visible", "PG"), ("resume-hidden", "R")] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 2000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(&library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, is_played, position_ticks, last_played_at
+             ) VALUES (?, ?, 0, 1000000000, 1)",
+        )
+        .bind(&user_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES (?, ?)",
+        )
+        .bind(item_id)
+        .bind(certification)
+        .execute(database.pool())
+        .await?;
+    }
+    let restrictions = match database
+        .compare_and_swap_user_content_restrictions(
+            &user_id,
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &[],
+                blocked_tags: &[],
+            },
+        )
+        .await?
+    {
+        UserContentRestrictionsCasResult::Updated(value) => value,
+        other => return Err(format!("expected policy update, got {other:?}").into()),
+    };
+    let query = ResumeItemsQuery {
+        user_id: &user_id,
+        library_ids: std::slice::from_ref(&library_id),
+        item_types: &["MOVIE"],
+        content_restrictions: Some(&restrictions),
+        played_percent: 90,
+        minimum_ticks: 0,
+        offset: 0,
+        limit: 10,
+    };
+
+    let (rows, total) = database.list_resume_items_with_total(&query, true).await?;
+
+    assert_eq!(total, 1);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].item_id, "resume-visible");
+    let past_end_query = ResumeItemsQuery {
+        offset: 1,
+        limit: 1,
+        ..query
+    };
+    let (past_end, total) = database
+        .list_resume_items_with_total(&past_end_query, true)
+        .await?;
+    assert!(past_end.is_empty());
+    assert_eq!(total, 1);
+    Ok(())
 }
 
 #[tokio::test]
@@ -10190,10 +10936,12 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
         min_date_last_saved: None,
         metadata_pending: false,
         parent_id_scope: None,
+        content_restrictions: None,
         sort_by: CatalogSort::DateCreated,
         descending: true,
         offset: 0,
         limit: 24,
+        include_total: true,
     };
     let (where_clause, binds) = catalog_filter_where_clause(&filter);
     let query = format!(
@@ -10223,6 +10971,331 @@ async fn favorite_catalog_filter_uses_favorite_state_index() {
             .any(|detail| detail.contains("idx_user_item_state_favorites")),
         "favorite query did not use the favorite state index: {plan:?}"
     );
+}
+
+#[tokio::test]
+async fn content_restrictions_filter_catalog_rows_before_pagination()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::UserContentRestrictions;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Content restriction filter", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+
+    let items = [
+        ("01-allowed", "MOVIE", None, None),
+        ("02-too-high", "MOVIE", None, None),
+        ("03-not-allowed", "MOVIE", None, None),
+        ("04-blocked", "MOVIE", None, None),
+        ("05-unrated", "MOVIE", None, None),
+        ("06-unindexed", "MOVIE", None, None),
+        ("07-restricted-series", "SERIES", None, None),
+        (
+            "08-parent-season",
+            "SEASON",
+            Some("07-restricted-series"),
+            Some("07-restricted-series"),
+        ),
+        (
+            "09-inherited",
+            "EPISODE",
+            Some("08-parent-season"),
+            Some("07-restricted-series"),
+        ),
+        ("10-allowed", "MOVIE", None, None),
+    ];
+    for (item_id, item_type, parent_id, series_id) in items {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, parent_id, series_id,
+                     title, sort_title, identification_status, has_available_source
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_type)
+            .bind(parent_id)
+            .bind(series_id)
+            .bind(item_id)
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    for (item_id, certification) in [
+        ("01-allowed", Some("PG-13")),
+        ("02-too-high", Some("R")),
+        ("03-not-allowed", Some("PG")),
+        ("04-blocked", Some("PG")),
+        ("05-unrated", None),
+        ("07-restricted-series", Some("R")),
+        ("08-parent-season", Some("G")),
+        ("09-inherited", Some("G")),
+        ("10-allowed", Some("G")),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)",
+            )
+            .bind(item_id)
+            .bind(certification)
+            .execute(database.pool())
+            .await?;
+    }
+    for item_id in [
+        "01-allowed",
+        "02-too-high",
+        "04-blocked",
+        "05-unrated",
+        "09-inherited",
+        "10-allowed",
+    ] {
+        database
+            .query("INSERT INTO media_content_restriction_tags (item_id, tag) VALUES (?, 'action')")
+            .bind(item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    database
+        .query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag) VALUES ('03-not-allowed', 'family')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('04-blocked', 'violent')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    let restrictions = UserContentRestrictions {
+        rating_system: "MPA".to_owned(),
+        maximum_rating: Some("PG-13".to_owned()),
+        allow_unrated: false,
+        allowed_tags: vec!["action".to_owned()],
+        blocked_tags: vec!["violent".to_owned()],
+        version: 4,
+        updated_at: 1,
+    };
+    let library_ids = vec![library_id];
+    let empty_item_types = Vec::new();
+    let empty_excluded_item_types = Vec::new();
+    let empty_years = Vec::new();
+    let make_filter = |offset, limit| CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "policy-user",
+        item_types: &empty_item_types,
+        excluded_item_types: &empty_excluded_item_types,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &empty_years,
+        is_played: None,
+        is_favorite: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: Some(&restrictions),
+        sort_by: CatalogSort::Name,
+        descending: false,
+        offset,
+        limit,
+        include_total: true,
+    };
+
+    let unrestricted_query = CatalogFilterQuery {
+        content_restrictions: None,
+        ..make_filter(0, 20)
+    };
+    let (_, baseline_total) = database
+        .list_filtered_catalog_rows(&unrestricted_query)
+        .await?;
+    assert_eq!(baseline_total, 10, "fixture exposes every inserted item");
+
+    let (first_page, total) = database
+        .list_filtered_catalog_rows(&make_filter(0, 1))
+        .await?;
+    assert_eq!(total, 2, "only policy-eligible items contribute to total");
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].item_id, "01-allowed");
+    let (second_page, second_total) = database
+        .list_filtered_catalog_rows(&make_filter(1, 1))
+        .await?;
+    assert_eq!(second_total, total);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].item_id, "10-allowed");
+    let (past_end, third_total) = database
+        .list_filtered_catalog_rows(&make_filter(2, 1))
+        .await?;
+    assert_eq!(third_total, total);
+    assert!(past_end.is_empty());
+
+    let unrestricted = UserContentRestrictions {
+        rating_system: "MPA".to_owned(),
+        maximum_rating: None,
+        allow_unrated: true,
+        allowed_tags: Vec::new(),
+        blocked_tags: Vec::new(),
+        version: 1,
+        updated_at: 1,
+    };
+    let unrestricted_filter = CatalogFilterQuery {
+        content_restrictions: Some(&unrestricted),
+        ..make_filter(0, 20)
+    };
+    let (_, unrestricted_total) = database
+        .list_filtered_catalog_rows(&unrestricted_filter)
+        .await?;
+    assert_eq!(unrestricted_total, 10, "a non-restrictive row is a no-op");
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_sort_expression_indexes_cover_default_sorting()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await
+    .expect("database");
+    let library_ids: Vec<String> = (0..3)
+        .map(|index| format!("index-plan-library-{index}"))
+        .collect();
+    for (index, library_id) in library_ids.iter().enumerate() {
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind, is_enabled, scan_concurrency, probe_concurrency)
+                 VALUES (?, ?, 'MOVIE', 1, 2, 1)",
+            )
+            .bind(library_id)
+            .bind(format!("Index plan {index}"))
+            .execute(database.pool())
+            .await?;
+    }
+    for index in 0..1_800_i64 {
+        let library_id = &library_ids[(index % 3) as usize];
+        let item_id = format!("index-plan-item-{index:04}");
+        let title = format!("Movie {index:04}");
+        let sort_title = format!("Sort {index:04}");
+        let year = 1990 + index % 35;
+        let month = 1 + index % 12;
+        database
+            .query(
+                "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, production_year,
+                    premiere_date, rating, identification_status, added_at, has_available_source
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, 1)",
+            )
+            .bind(&item_id)
+            .bind(library_id)
+            .bind(&title)
+            .bind(&sort_title)
+            .bind(year)
+            .bind(format!("{year:04}-{month:02}-01"))
+            .bind((index % 20) as f64 / 2.0)
+            .bind(1_700_000_000 + (index % 50) * 86_400)
+            .execute(database.pool())
+            .await?;
+    }
+    database.query("ANALYZE").execute(database.pool()).await?;
+    let library_ids = vec![library_ids[1].clone()];
+    let item_types = vec!["MOVIE".to_owned()];
+    let empty: Vec<String> = Vec::new();
+    let empty_years: Vec<i64> = Vec::new();
+    let cases = [
+        (
+            CatalogSort::Name,
+            false,
+            "idx_media_items_library_name_sort",
+        ),
+        (
+            CatalogSort::SortName,
+            false,
+            "idx_media_items_library_sortname_sort",
+        ),
+        (
+            CatalogSort::DateCreated,
+            true,
+            "idx_media_items_library_added_sort",
+        ),
+        (
+            CatalogSort::PremiereDate,
+            true,
+            "idx_media_items_library_premiere_sort",
+        ),
+        (
+            CatalogSort::Rating,
+            true,
+            "idx_media_items_library_rating_sort",
+        ),
+    ];
+    for (sort_by, descending, index_name) in cases {
+        let filter = CatalogFilterQuery {
+            library_ids: &library_ids,
+            user_id: "index-plan-user",
+            item_types: &item_types,
+            excluded_item_types: &empty,
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &empty_years,
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by,
+            descending,
+            offset: 0,
+            limit: 24,
+            include_total: true,
+        };
+        let plan = database.explain_filtered_catalog_rows(&filter).await?;
+        let joined = plan.join("\n");
+        assert!(
+            joined.contains(index_name),
+            "{sort_by:?} must use {index_name}: {joined}"
+        );
+        let outer_start = plan
+            .iter()
+            .position(|line| line.contains("SCAN selected"))
+            .unwrap_or(plan.len());
+        assert!(
+            !plan[..outer_start]
+                .iter()
+                .any(|line| line.contains("TEMP B-TREE")),
+            "{sort_by:?} still sorts the library with a temporary b-tree: {joined}"
+        );
+        assert!(
+            !plan[..outer_start]
+                .iter()
+                .any(|line| line.contains("SCAN mi")),
+            "{sort_by:?} still scans media_items: {joined}"
+        );
+    }
+
+    database.close().await;
+    Ok(())
 }
 
 #[tokio::test]
@@ -11849,10 +12922,12 @@ async fn catalog_tie_breakers_use_displayed_title_when_sort_key_is_stale() {
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
+            content_restrictions: None,
             sort_by,
             descending,
             offset: 0,
             limit: 10,
+            include_total: true,
         };
         let (rows, total) = database
             .list_filtered_catalog_rows(&filter)
@@ -11922,6 +12997,8 @@ async fn catalog_filter_parent_scope_applies_before_pagination() {
         offset: 0,
         limit: 1,
         parent_id_scope: Some(None),
+        content_restrictions: None,
+        include_total: true,
     };
 
     let (root_page, root_total) = database
@@ -12083,10 +13160,12 @@ async fn catalog_premiere_date_sort_falls_back_to_production_year() {
             min_date_last_saved: None,
             metadata_pending: false,
             parent_id_scope: None,
+            content_restrictions: None,
             sort_by: CatalogSort::PremiereDate,
             descending,
             offset: 0,
             limit: 10,
+            include_total: true,
         };
         let (rows, total) = database
             .list_filtered_catalog_rows(&filter)
@@ -13854,6 +14933,408 @@ async fn configured_user_deletion_grace_period_sets_purge_deadline()
 }
 
 #[tokio::test]
+async fn disable_and_soft_delete_user_revoke_credentials_and_stop_playback_sessions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("User deletion", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title,
+            identification_status, has_available_source
+         ) VALUES ('user-deletion-item', ?, 'MOVIE', 'Deletion', 'deletion',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    for (user_id, is_disabled) in [("deletion-target", 0), ("deletion-other", 0)] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash,
+                can_download, is_disabled
+             ) VALUES (?, ?, ?, 'test', 1, ?)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(is_disabled)
+        .execute(database.pool())
+        .await?;
+    }
+    for (session_id, user_id, hash) in [
+        ("delete-web-session", "deletion-target", vec![1_u8; 32]),
+        ("other-web-session", "deletion-other", vec![2_u8; 32]),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_sessions (
+                id, user_id, session_token_hash, csrf_token_hash, expires_at
+             ) VALUES (?, ?, ?, ?, unixepoch() + 3600)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(&hash)
+        .bind(vec![3_u8; 32])
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO access_tokens (
+            id, token_hash, user_id, device_id, client_name, device_name, client_version
+         ) VALUES ('delete-access-token', ?, 'deletion-target', 'device', 'client', 'device', '1')",
+    )
+    .bind(vec![4_u8; 32])
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens (
+            id, token_hash, user_id, device_id, client_name, device_name, client_version
+         ) VALUES ('other-access-token', ?, 'deletion-other', 'device', 'client', 'device', '1')",
+    )
+    .bind(vec![5_u8; 32])
+    .execute(database.pool())
+    .await?;
+    for (session_id, user_id, play_session_id, state) in [
+        ("delete-playing", "deletion-target", "playing", "PLAYING"),
+        ("delete-paused", "deletion-target", "paused", "PAUSED"),
+        ("other-playing", "deletion-other", "other", "PLAYING"),
+    ] {
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                id, user_id, item_id, play_session_id, device_id, state
+             ) VALUES (?, ?, 'user-deletion-item', ?, 'device', ?)",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(play_session_id)
+        .bind(state)
+        .execute(database.pool())
+        .await?;
+    }
+    for (session_id, plan) in [
+        ("delete-web-direct", "DIRECT"),
+        ("delete-web-hls", "SERVER_HLS"),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_playback_sessions (
+                id, user_id, item_id, play_session_id, tier, plan, state,
+                expires_at, last_heartbeat_at
+             ) VALUES (?, 'deletion-target', 'user-deletion-item', ?, 0, ?, 'ACTIVE',
+                       unixepoch() + 3600, unixepoch())",
+        )
+        .bind(session_id)
+        .bind(session_id)
+        .bind(plan)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO web_playback_sessions (
+            id, user_id, item_id, play_session_id, tier, plan, state,
+            expires_at, last_heartbeat_at
+         ) VALUES ('other-web-active', 'deletion-other', 'user-deletion-item',
+                   'other-web-active', 0, 'DIRECT', 'ACTIVE', unixepoch() + 3600, unixepoch())",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO web_playback_sessions (
+            id, user_id, item_id, play_session_id, tier, plan, state,
+            expires_at, last_heartbeat_at
+         ) VALUES ('other-web-hls', 'deletion-other', 'user-deletion-item',
+                   'other-web-hls', 0, 'SERVER_HLS', 'ACTIVE', unixepoch() + 3600, unixepoch())",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(
+        database.soft_delete_user("deletion-target").await?,
+        Some(vec!["delete-web-hls".to_owned()])
+    );
+    let deleted: (i64, i64, i64, i64, i64) = sqlx::query_as(
+        "SELECT is_disabled, is_disabled_before_delete, can_download,
+                deleted_at, deletion_purge_at
+         FROM users WHERE id = 'deletion-target'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(deleted.0, 1);
+    assert_eq!(deleted.1, 0);
+    assert_eq!(deleted.2, 1, "permissions remain available for recovery");
+    assert_eq!(deleted.4 - deleted.3, 7 * 86_400);
+    let web_session_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'delete-web-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(web_session_revoked.is_some());
+    let access_token_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = 'delete-access-token'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(access_token_revoked.is_some());
+    let playback_states: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT id, state, is_paused FROM playback_sessions
+         WHERE user_id = 'deletion-target' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        playback_states,
+        vec![
+            ("delete-paused".to_owned(), "STOPPED".to_owned(), 0),
+            ("delete-playing".to_owned(), "STOPPED".to_owned(), 0),
+        ]
+    );
+    let web_playback_states: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, state FROM web_playback_sessions
+         WHERE user_id = 'deletion-target' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        web_playback_states,
+        vec![
+            ("delete-web-direct".to_owned(), "STOPPED".to_owned()),
+            ("delete-web-hls".to_owned(), "STOPPED".to_owned()),
+        ]
+    );
+    let other_session_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'other-web-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(other_session_revoked.is_none());
+    let other_playback_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = 'other-playing'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(other_playback_state, "PLAYING");
+    let other_web_playback_state: String =
+        sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = 'other-web-active'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(other_web_playback_state, "ACTIVE");
+
+    let (_, disabled_hls_ids) = database
+        .update_user_with_hls_session_ids(
+            "deletion-other",
+            UpdateUser {
+                display_name: None,
+                password_hash: None,
+                has_password: None,
+                is_disabled: Some(true),
+                is_admin: None,
+                can_manage_server: None,
+                can_remote_access: None,
+                can_download: None,
+            },
+        )
+        .await?
+        .ok_or("other user should be disabled")?;
+    assert_eq!(disabled_hls_ids, ["other-web-hls"]);
+    let other_web_session_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = 'other-web-session'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(other_web_session_revoked.is_some());
+    let other_access_token_revoked: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = 'other-access-token'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(other_access_token_revoked.is_some());
+    let disabled_playback_state: String =
+        sqlx::query_scalar("SELECT state FROM playback_sessions WHERE id = 'other-playing'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(disabled_playback_state, "STOPPED");
+    let disabled_web_playback_states: Vec<String> = sqlx::query_scalar(
+        "SELECT state FROM web_playback_sessions
+         WHERE user_id = 'deletion-other' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(disabled_web_playback_states, ["STOPPED", "STOPPED"]);
+
+    assert!(
+        database
+            .soft_delete_user("deletion-target")
+            .await?
+            .is_none()
+    );
+    let after_repeat: (i64, i64) = sqlx::query_as(
+        "SELECT deleted_at, deletion_purge_at FROM users WHERE id = 'deletion-target'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!((after_repeat.0, after_repeat.1), (deleted.3, deleted.4));
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_deleted_user_restores_disabled_state_without_credentials()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (user_id, is_disabled) in [("restore-enabled", 0_i64), ("restore-disabled", 1_i64)] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash, is_disabled, can_download
+             ) VALUES (?, ?, ?, 'test', ?, 1)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(is_disabled)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO web_sessions (
+                id, user_id, session_token_hash, csrf_token_hash, expires_at
+             ) VALUES (?, ?, ?, ?, unixepoch() + 3600)",
+        )
+        .bind(format!("{user_id}-session"))
+        .bind(user_id)
+        .bind(format!("{user_id}-session-token").into_bytes())
+        .bind(format!("{user_id}-csrf-token").into_bytes())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name, client_version
+             ) VALUES (?, ?, ?, 'device', 'client', 'device', '1')",
+        )
+        .bind(format!("{user_id}-access-token"))
+        .bind(format!("{user_id}-access-token-hash").into_bytes())
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+        assert!(database.soft_delete_user(user_id).await?.is_some());
+    }
+
+    for (user_id, expected_disabled) in [("restore-enabled", 0_i64), ("restore-disabled", 1_i64)] {
+        assert!(database.restore_deleted_user(user_id).await?);
+        let restored: (i64, i64, i64, Option<i64>, Option<i64>) = sqlx::query_as(
+            "SELECT is_disabled, is_disabled_before_delete, can_download,
+                    deleted_at, deletion_purge_at
+             FROM users WHERE id = ?",
+        )
+        .bind(user_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(restored.0, expected_disabled);
+        assert_eq!(restored.1, 0);
+        assert_eq!(restored.2, 1);
+        assert!(restored.3.is_none());
+        assert!(restored.4.is_none());
+        let revoked_at: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM web_sessions WHERE id = ?")
+                .bind(format!("{user_id}-session"))
+                .fetch_one(database.pool())
+                .await?;
+        assert!(revoked_at.is_some());
+        let access_token_revoked_at: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = ?")
+                .bind(format!("{user_id}-access-token"))
+                .fetch_one(database.pool())
+                .await?;
+        assert!(access_token_revoked_at.is_some());
+        assert!(
+            !database.restore_deleted_user(user_id).await?,
+            "a second restore must not alter the restored account"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_deletion_protects_last_manager_and_only_purges_deleted_users()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in ["purge-manager-one", "purge-manager-two"] {
+        sqlx::query(
+            "INSERT INTO users (
+                id, username_normalized, display_name, password_hash,
+                is_admin, can_manage_server
+             ) VALUES (?, ?, ?, 'test', 1, 1)",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('purge-active-user', 'purge-active-user', 'Active', 'test')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert!(!database.purge_deleted_user("purge-active-user").await?);
+    assert!(
+        database
+            .soft_delete_user("purge-manager-one")
+            .await?
+            .is_some()
+    );
+    assert!(matches!(
+        database.soft_delete_user("purge-manager-two").await,
+        Err(StorageError::LastManager)
+    ));
+    let last_manager_deleted_at: Option<i64> =
+        sqlx::query_scalar("SELECT deleted_at FROM users WHERE id = 'purge-manager-two'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(last_manager_deleted_at.is_none());
+    assert!(database.purge_deleted_user("purge-manager-one").await?);
+    assert!(!database.purge_deleted_user("purge-manager-one").await?);
+    assert!(!database.purge_deleted_user("missing-purge-user").await?);
+
+    assert!(
+        database
+            .soft_delete_user("purge-active-user")
+            .await?
+            .is_some()
+    );
+    let purge_at: i64 =
+        sqlx::query_scalar("SELECT deletion_purge_at FROM users WHERE id = 'purge-active-user'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        database
+            .purge_expired_deleted_users(purge_at - 1, 50)
+            .await?
+            .is_empty()
+    );
+    assert_eq!(
+        database.purge_expired_deleted_users(purge_at, 50).await?,
+        ["purge-active-user"]
+    );
+    assert!(
+        database
+            .purge_expired_deleted_users(purge_at, 50)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn user_playback_policy_migration_defaults_keep_existing_playback_compatible()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -14046,6 +15527,2135 @@ async fn user_playback_admission_migration_creates_constrained_ledger()
 }
 
 #[tokio::test]
+async fn user_library_access_mode_migration_preserves_legacy_semantics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await?;
+    sqlx::raw_sql(
+        "CREATE TABLE users (id TEXT PRIMARY KEY);
+         CREATE TABLE user_library_access (
+             user_id TEXT NOT NULL,
+             library_id TEXT NOT NULL,
+             can_view INTEGER NOT NULL
+         );
+         INSERT INTO users (id) VALUES ('legacy-all'), ('legacy-denials-only'), ('legacy-selected');
+         INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES ('legacy-denials-only', 'library-a', 0),
+                    ('legacy-selected', 'library-a', 1);",
+    )
+    .execute(&pool)
+    .await?;
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0187_user_library_access_mode.sql"
+    ))
+    .execute(&pool)
+    .await?;
+
+    let modes: Vec<(String, String)> =
+        sqlx::query_as("SELECT id, library_access_mode FROM users ORDER BY id")
+            .fetch_all(&pool)
+            .await?;
+    assert_eq!(
+        modes,
+        [
+            ("legacy-all".to_owned(), "ALL".to_owned()),
+            ("legacy-denials-only".to_owned(), "ALL".to_owned()),
+            ("legacy-selected".to_owned(), "SELECTED".to_owned()),
+        ]
+    );
+    let legacy_access_rows: Vec<(String, String, i64)> = sqlx::query_as(
+        "SELECT user_id, library_id, can_view FROM user_library_access
+         ORDER BY user_id, library_id",
+    )
+    .fetch_all(&pool)
+    .await?;
+    assert_eq!(
+        legacy_access_rows,
+        [
+            ("legacy-denials-only".to_owned(), "library-a".to_owned(), 0,),
+            ("legacy-selected".to_owned(), "library-a".to_owned(), 1),
+        ]
+    );
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = 'legacy-all'")
+        .execute(&pool)
+        .await?;
+    assert!(
+        sqlx::query("UPDATE users SET library_access_mode = 'INVALID' WHERE id = 'legacy-all'")
+            .execute(&pool)
+            .await
+            .is_err()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_preferences_use_compare_and_swap_versions()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .insert_user(
+            "preferences-cas-user",
+            "preferences-cas-user",
+            "Preferences CAS",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library_one = libraries
+        .create_library(
+            "Preference order one",
+            crate::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let library_two = libraries
+        .create_library(
+            "Preference order two",
+            crate::library::LibraryKind::Movie,
+            false,
+        )
+        .await?;
+    let initial_library_order = vec![library_two.id.to_string(), library_one.id.to_string()];
+    let stale_library_order = vec![library_one.id.to_string()];
+    let invalid_library_order = vec!["missing-library".to_owned()];
+    assert!(
+        database
+            .user_account_preferences("preferences-cas-user")
+            .await?
+            .is_none()
+    );
+
+    let created = database
+        .compare_and_swap_user_account_preferences(
+            "preferences-cas-user",
+            0,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "berry",
+                show_media_libraries: true,
+                show_continue_watching: false,
+                audio_language: "日本語",
+                subtitle_language: "关闭",
+                auto_play_next_episode: false,
+                library_order: Some(&initial_library_order),
+                played_percent: Some(73),
+            },
+        )
+        .await?;
+    let UserAccountPreferencesCasResult::Updated(created) = created else {
+        return Err("first account preference write should create version 1".into());
+    };
+    assert_eq!(created.version, 1);
+    assert_eq!(created.theme, "light");
+    assert_eq!(created.accent_color, "berry");
+    assert!(created.show_media_libraries);
+    assert!(!created.show_continue_watching);
+    assert_eq!(created.audio_language, "日本語");
+    assert_eq!(created.subtitle_language, "关闭");
+    assert!(!created.auto_play_next_episode);
+    assert_eq!(
+        created.library_order,
+        [library_two.id.to_string(), library_one.id.to_string()]
+    );
+    assert_eq!(created.played_percent, 73);
+    assert_eq!(
+        database.user_played_percent("preferences-cas-user").await?,
+        73
+    );
+
+    let updated = database
+        .compare_and_swap_user_account_preferences(
+            "preferences-cas-user",
+            1,
+            NewUserAccountPreferences {
+                theme: "dark",
+                accent_color: "ocean",
+                show_media_libraries: false,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                library_order: None,
+                played_percent: None,
+            },
+        )
+        .await?;
+    let UserAccountPreferencesCasResult::Updated(updated) = updated else {
+        return Err("matching account preference version should update".into());
+    };
+    assert_eq!(updated.version, 2);
+    assert_eq!(updated.theme, "dark");
+    assert_eq!(updated.accent_color, "ocean");
+    assert_eq!(updated.library_order, created.library_order);
+    assert_eq!(updated.played_percent, 73);
+
+    let stale = database
+        .compare_and_swap_user_account_preferences(
+            "preferences-cas-user",
+            1,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "mint",
+                show_media_libraries: true,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                library_order: Some(&stale_library_order),
+                played_percent: Some(49),
+            },
+        )
+        .await?;
+    assert_eq!(stale, UserAccountPreferencesCasResult::Conflict);
+    assert_eq!(
+        database.user_played_percent("preferences-cas-user").await?,
+        73
+    );
+    assert_eq!(
+        database
+            .user_account_preferences("preferences-cas-user")
+            .await?
+            .map(|preferences| (preferences.version, preferences.accent_color)),
+        Some((2, "ocean".to_owned()))
+    );
+
+    assert!(
+        database
+            .compare_and_swap_user_account_preferences(
+                "preferences-cas-user",
+                2,
+                NewUserAccountPreferences {
+                    theme: "sepia",
+                    accent_color: "silver",
+                    show_media_libraries: true,
+                    show_continue_watching: true,
+                    audio_language: "原始音轨",
+                    subtitle_language: "简体中文",
+                    auto_play_next_episode: true,
+                    library_order: Some(&invalid_library_order),
+                    played_percent: Some(41),
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .user_account_preferences("preferences-cas-user")
+            .await?
+            .map(|preferences| preferences.version),
+        Some(2),
+        "failed mirror writes must roll back the preference version"
+    );
+    assert_eq!(
+        database.user_played_percent("preferences-cas-user").await?,
+        73
+    );
+    assert_eq!(
+        database.user_library_order("preferences-cas-user").await?,
+        created.library_order
+    );
+    assert!(
+        database
+            .soft_delete_user("preferences-cas-user")
+            .await?
+            .is_some()
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_account_preferences(
+                "preferences-cas-user",
+                2,
+                NewUserAccountPreferences {
+                    theme: "light",
+                    accent_color: "silver",
+                    show_media_libraries: true,
+                    show_continue_watching: true,
+                    audio_language: "原始音轨",
+                    subtitle_language: "简体中文",
+                    auto_play_next_episode: true,
+                    library_order: None,
+                    played_percent: None,
+                },
+            )
+            .await?,
+        UserAccountPreferencesCasResult::UserUnavailable
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_account_preferences(
+                "missing-preferences-user",
+                0,
+                NewUserAccountPreferences {
+                    theme: "dark",
+                    accent_color: "silver",
+                    show_media_libraries: true,
+                    show_continue_watching: true,
+                    audio_language: "原始音轨",
+                    subtitle_language: "简体中文",
+                    auto_play_next_episode: true,
+                    library_order: None,
+                    played_percent: None,
+                },
+            )
+            .await?,
+        UserAccountPreferencesCasResult::UserUnavailable
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_content_restrictions_storage_uses_atomic_versioned_tag_replacement()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .insert_user(
+            "content-policy-cas-user",
+            "content-policy-cas-user",
+            "Content Policy",
+            "test",
+            false,
+            true,
+        )
+        .await?;
+    assert!(
+        database
+            .user_content_restrictions("content-policy-cas-user")
+            .await?
+            .is_none()
+    );
+
+    let allowed = vec!["Family".to_owned(), "Animation".to_owned()];
+    let blocked = vec!["Horror".to_owned()];
+    let created = database
+        .compare_and_swap_user_content_restrictions(
+            "content-policy-cas-user",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed,
+                blocked_tags: &blocked,
+            },
+        )
+        .await?;
+    let UserContentRestrictionsCasResult::Updated(created) = created else {
+        return Err("first content restriction write should create version 1".into());
+    };
+    assert_eq!(created.version, 1);
+    assert_eq!(created.rating_system, "MPAA");
+    assert_eq!(created.maximum_rating.as_deref(), Some("PG-13"));
+    assert!(!created.allow_unrated);
+    assert_eq!(created.allowed_tags, ["animation", "family"]);
+    assert_eq!(created.blocked_tags, ["horror"]);
+
+    let next_allowed = vec!["Documentary".to_owned()];
+    let next_blocked = vec!["Violence".to_owned()];
+    let updated = database
+        .compare_and_swap_user_content_restrictions(
+            "content-policy-cas-user",
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: None,
+                allow_unrated: true,
+                allowed_tags: &next_allowed,
+                blocked_tags: &next_blocked,
+            },
+        )
+        .await?;
+    let UserContentRestrictionsCasResult::Updated(updated) = updated else {
+        return Err("matching content restriction version should update".into());
+    };
+    assert_eq!(updated.version, 2);
+    assert_eq!(updated.maximum_rating, None);
+    assert!(updated.allow_unrated);
+    assert_eq!(updated.allowed_tags, ["documentary"]);
+    assert_eq!(updated.blocked_tags, ["violence"]);
+
+    let stale = database
+        .compare_and_swap_user_content_restrictions(
+            "content-policy-cas-user",
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("G"),
+                allow_unrated: false,
+                allowed_tags: &allowed,
+                blocked_tags: &blocked,
+            },
+        )
+        .await?;
+    assert_eq!(stale, UserContentRestrictionsCasResult::Conflict);
+    let unchanged = database
+        .user_content_restrictions("content-policy-cas-user")
+        .await?
+        .ok_or("updated content restriction should be readable")?;
+    assert_eq!(unchanged, updated);
+
+    let duplicate_tags = vec!["Family".to_owned(), " family ".to_owned()];
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &duplicate_tags,
+                    blocked_tags: &[],
+                },
+            )
+            .await
+            .is_err()
+    );
+    let too_many_tags = vec!["family".to_owned(); 101];
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &too_many_tags,
+                    blocked_tags: &[],
+                },
+            )
+            .await
+            .is_err()
+    );
+    for (rating_system, maximum_rating) in [("  ", None), ("MPAA", Some(" \t "))] {
+        assert!(
+            database
+                .compare_and_swap_user_content_restrictions(
+                    "content-policy-cas-user",
+                    2,
+                    NewUserContentRestrictions {
+                        rating_system,
+                        maximum_rating,
+                        allow_unrated: true,
+                        allowed_tags: &[],
+                        blocked_tags: &[],
+                    },
+                )
+                .await
+                .is_err()
+        );
+    }
+    let too_long_tag = vec!["x".repeat(129)];
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &too_long_tag,
+                    blocked_tags: &[],
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                -1,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?,
+        UserContentRestrictionsCasResult::Conflict
+    );
+
+    sqlx::query(
+        "CREATE TRIGGER reject_content_restriction_tag_write
+         BEFORE INSERT ON user_content_restriction_tags
+         BEGIN SELECT RAISE(ABORT, 'injected content restriction tag failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: Some("PG"),
+                    allow_unrated: false,
+                    allowed_tags: &allowed,
+                    blocked_tags: &blocked,
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .user_content_restrictions("content-policy-cas-user")
+            .await?
+            .ok_or("content restriction should survive a failed tag write")?,
+        updated,
+        "policy version and tags must roll back together"
+    );
+    database.soft_delete_user("content-policy-cas-user").await?;
+    assert_eq!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "content-policy-cas-user",
+                2,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?,
+        UserContentRestrictionsCasResult::UserUnavailable
+    );
+    assert_eq!(
+        database
+            .compare_and_swap_user_content_restrictions(
+                "missing-content-policy-user",
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPAA",
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?,
+        UserContentRestrictionsCasResult::UserUnavailable
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_permission_copy_snapshots_read_bounded_complete_snapshots()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, username) in [
+        ("permission-copy-source", "permission-copy-source"),
+        ("permission-copy-target", "permission-copy-target"),
+        ("permission-copy-empty", "permission-copy-empty"),
+        ("permission-copy-deleted", "permission-copy-deleted"),
+    ] {
+        database
+            .insert_user(id, username, username, "test", false, true)
+            .await?;
+    }
+    let library = LibraryService::new(database.clone())
+        .create_library("Permission Copy", LibraryKind::Movie, false)
+        .await?;
+    let second_library = LibraryService::new(database.clone())
+        .create_library("Permission Copy Two", LibraryKind::Movie, false)
+        .await?;
+    let mut library_ids = vec![library.id.to_string(), second_library.id.to_string()];
+    library_ids.sort_unstable();
+    database
+        .replace_user_library_access_mode("permission-copy-source", "SELECTED", &library_ids)
+        .await?;
+    database
+        .query(
+            "UPDATE users SET can_download = 1, can_play = 1,
+                max_simultaneous_playbacks = 3, allow_remux = 0,
+                allow_audio_transcode = 1, allow_video_transcode = 0
+             WHERE id = 'permission-copy-source'",
+        )
+        .execute(database.pool())
+        .await?;
+    let allowed_tags = vec!["Family".to_owned(), "Animation".to_owned()];
+    let blocked_tags = vec!["Horror".to_owned(), "Action".to_owned()];
+    let policy = database
+        .compare_and_swap_user_content_restrictions(
+            "permission-copy-source",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed_tags,
+                blocked_tags: &blocked_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        policy,
+        UserContentRestrictionsCasResult::Updated(_)
+    ));
+    database
+        .query("UPDATE users SET deleted_at = unixepoch() WHERE id = 'permission-copy-deleted'")
+        .execute(database.pool())
+        .await?;
+
+    database.reset_query_count();
+    let snapshots = database
+        .user_permission_copy_snapshots(&[
+            "permission-copy-source".to_owned(),
+            "permission-copy-target".to_owned(),
+            "permission-copy-empty".to_owned(),
+            "permission-copy-deleted".to_owned(),
+            "permission-copy-missing".to_owned(),
+        ])
+        .await?;
+
+    assert_eq!(
+        database.query_count(),
+        3,
+        "snapshot reads should stay batched"
+    );
+    assert_eq!(
+        snapshots.len(),
+        3,
+        "missing and deleted users are unavailable"
+    );
+    let source = &snapshots["permission-copy-source"];
+    assert_eq!(source.library_access_mode, "SELECTED");
+    assert_eq!(source.library_ids, library_ids);
+    assert!(source.can_download);
+    assert!(source.playback_policy.can_play);
+    assert_eq!(source.playback_policy.max_simultaneous_playbacks, 3);
+    assert!(!source.playback_policy.allow_remux);
+    assert!(source.playback_policy.allow_audio_transcode);
+    assert!(!source.playback_policy.allow_video_transcode);
+    let restrictions = source
+        .content_restrictions
+        .as_ref()
+        .ok_or("source content restriction snapshot missing")?;
+    assert_eq!(restrictions.version, 1);
+    assert_eq!(restrictions.rating_system, "MPA");
+    assert_eq!(restrictions.maximum_rating.as_deref(), Some("PG-13"));
+    assert!(!restrictions.allow_unrated);
+    assert_eq!(restrictions.allowed_tags, ["animation", "family"]);
+    assert_eq!(restrictions.blocked_tags, ["action", "horror"]);
+
+    let empty_policy_user = &snapshots["permission-copy-empty"];
+    assert_eq!(empty_policy_user.library_access_mode, "ALL");
+    assert!(empty_policy_user.content_restrictions.is_none());
+    assert_eq!(
+        empty_policy_user.playback_policy.max_simultaneous_playbacks,
+        2
+    );
+
+    let over_limit = (0..102)
+        .map(|index| format!("permission-copy-target-{index}"))
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    assert!(
+        database
+            .user_permission_copy_snapshots(&over_limit)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database.query_count(),
+        0,
+        "over-limit reads should not query"
+    );
+
+    database.reset_query_count();
+    assert!(
+        database
+            .user_permission_copy_snapshots(&[])
+            .await?
+            .is_empty()
+    );
+    assert_eq!(database.query_count(), 0, "empty reads should not query");
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_permission_copy_applies_selected_groups_with_snapshot_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for id in [
+        "permission-write-source",
+        "permission-write-target",
+        "permission-write-empty-source",
+    ] {
+        database
+            .insert_user(id, id, id, "test", false, true)
+            .await?;
+    }
+    let library = LibraryService::new(database.clone())
+        .create_library("Permission Write", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    database
+        .replace_user_library_access_mode(
+            "permission-write-source",
+            "SELECTED",
+            std::slice::from_ref(&library_id),
+        )
+        .await?;
+    database
+        .replace_user_library_access_mode("permission-write-target", "NONE", &[])
+        .await?;
+    database
+        .query(
+            "UPDATE users SET can_download = 1, is_admin = 1, can_manage_server = 1
+             WHERE id = 'permission-write-source'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query(
+            "UPDATE users SET can_download = 0, can_play = 0,
+                max_simultaneous_playbacks = 1, allow_remux = 0,
+                allow_audio_transcode = 0, allow_video_transcode = 0,
+                is_admin = 0, can_manage_server = 0
+             WHERE id = 'permission-write-target'",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .update_user_playback_policy(
+            "permission-write-source",
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 4,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    let allowed_tags = vec!["Family".to_owned()];
+    let blocked_tags = vec!["Horror".to_owned()];
+    let source_policy = database
+        .compare_and_swap_user_content_restrictions(
+            "permission-write-source",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed_tags,
+                blocked_tags: &blocked_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        source_policy,
+        UserContentRestrictionsCasResult::Updated(_)
+    ));
+    let target_allowed_tags = vec!["Documentary".to_owned()];
+    let target_blocked_tags = vec!["Violence".to_owned()];
+    let target_policy = database
+        .compare_and_swap_user_content_restrictions(
+            "permission-write-target",
+            0,
+            NewUserContentRestrictions {
+                rating_system: "BBFC",
+                maximum_rating: Some("12"),
+                allow_unrated: true,
+                allowed_tags: &target_allowed_tags,
+                blocked_tags: &target_blocked_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        target_policy,
+        UserContentRestrictionsCasResult::Updated(_)
+    ));
+
+    let snapshots = database
+        .user_permission_copy_snapshots(&[
+            "permission-write-source".to_owned(),
+            "permission-write-target".to_owned(),
+            "permission-write-empty-source".to_owned(),
+        ])
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                &snapshots["permission-write-source"],
+                "permission-write-target",
+                &snapshots["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: false,
+                    content: false,
+                    playback: true,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Updated
+    );
+    let playback_only = database
+        .user_permission_copy_snapshots(&[
+            "permission-write-source".to_owned(),
+            "permission-write-target".to_owned(),
+        ])
+        .await?;
+    let target = &playback_only["permission-write-target"];
+    assert_eq!(target.library_access_mode, "NONE");
+    assert!(target.library_ids.is_empty());
+    assert!(target.can_download);
+    assert!(target.playback_policy.can_play);
+    assert_eq!(target.playback_policy.max_simultaneous_playbacks, 4);
+    assert_eq!(
+        target
+            .content_restrictions
+            .as_ref()
+            .map(|policy| policy.rating_system.as_str()),
+        Some("BBFC")
+    );
+
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                &playback_only["permission-write-source"],
+                "permission-write-target",
+                &playback_only["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: true,
+                    playback: false,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Updated
+    );
+    let copied = database
+        .user_permission_copy_snapshots(&[
+            "permission-write-source".to_owned(),
+            "permission-write-target".to_owned(),
+        ])
+        .await?;
+    let source = &copied["permission-write-source"];
+    let target = &copied["permission-write-target"];
+    assert_eq!(target.library_access_mode, "SELECTED");
+    assert_eq!(target.library_ids, [library_id.clone()]);
+    assert!(target.can_download);
+    let copied_content = target
+        .content_restrictions
+        .as_ref()
+        .ok_or("target content restriction snapshot missing")?;
+    let source_content = source
+        .content_restrictions
+        .as_ref()
+        .ok_or("source content restriction snapshot missing")?;
+    assert_eq!(copied_content.version, 2);
+    assert_eq!(copied_content.rating_system, source_content.rating_system);
+    assert_eq!(copied_content.maximum_rating, source_content.maximum_rating);
+    assert_eq!(copied_content.allow_unrated, source_content.allow_unrated);
+    assert_eq!(copied_content.allowed_tags, source_content.allowed_tags);
+    assert_eq!(copied_content.blocked_tags, source_content.blocked_tags);
+    let target_admin: (i64, i64) = sqlx::query_as(
+        "SELECT is_admin, can_manage_server FROM users WHERE id = 'permission-write-target'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        target_admin,
+        (0, 0),
+        "copy must not grant management rights"
+    );
+
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-empty-source",
+                &snapshots["permission-write-empty-source"],
+                "permission-write-target",
+                target,
+                UserPermissionCopyGroups {
+                    library: false,
+                    content: true,
+                    playback: false,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Updated
+    );
+    let cleared = database
+        .user_permission_copy_snapshots(&["permission-write-target".to_owned()])
+        .await?;
+    assert!(
+        cleared["permission-write-target"]
+            .content_restrictions
+            .is_none()
+    );
+
+    let stale_target = copied["permission-write-target"].clone();
+    database
+        .update_user_playback_policy(
+            "permission-write-target",
+            UserPlaybackPolicy {
+                can_play: false,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: false,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                source,
+                "permission-write-target",
+                &stale_target,
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: false,
+                    playback: true,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Conflict
+    );
+    let after_conflict = database
+        .user_permission_copy_snapshots(&["permission-write-target".to_owned()])
+        .await?;
+    assert_eq!(
+        after_conflict["permission-write-target"].library_access_mode, "SELECTED",
+        "stale playback snapshot must not partially copy the library group"
+    );
+    database
+        .update_user_playback_policy(
+            "permission-write-source",
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 6,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                source,
+                "permission-write-target",
+                &after_conflict["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: false,
+                    content: false,
+                    playback: true,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::Conflict,
+        "stale source snapshot must not overwrite the target"
+    );
+    database
+        .query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .copy_user_permission_groups(
+                "permission-write-source",
+                source,
+                "permission-write-target",
+                &after_conflict["permission-write-target"],
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: false,
+                    playback: false,
+                },
+            )
+            .await?,
+        UserPermissionCopyResult::InvalidSnapshot
+    );
+    let after_invalid_library = database
+        .user_permission_copy_snapshots(&["permission-write-target".to_owned()])
+        .await?;
+    assert_eq!(
+        after_invalid_library["permission-write-target"].library_access_mode, "SELECTED",
+        "unavailable source library must not alter target permissions"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_permission_copy_rolls_back_all_selected_groups_on_content_write_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for id in ["permission-rollback-source", "permission-rollback-target"] {
+        database
+            .insert_user(id, id, id, "test", false, true)
+            .await?;
+    }
+    let library = LibraryService::new(database.clone())
+        .create_library("Permission Rollback", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    database
+        .replace_user_library_access_mode(
+            "permission-rollback-source",
+            "SELECTED",
+            std::slice::from_ref(&library_id),
+        )
+        .await?;
+    database
+        .replace_user_library_access_mode("permission-rollback-target", "NONE", &[])
+        .await?;
+    database
+        .update_user_playback_policy(
+            "permission-rollback-source",
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 5,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    database
+        .update_user_playback_policy(
+            "permission-rollback-target",
+            UserPlaybackPolicy {
+                can_play: false,
+                max_simultaneous_playbacks: 2,
+                allow_remux: false,
+                allow_audio_transcode: false,
+                allow_video_transcode: false,
+            },
+        )
+        .await?;
+    let source_tags = vec!["Family".to_owned()];
+    let no_tags: Vec<String> = Vec::new();
+    for (user_id, expected_version, rating_system) in [
+        ("permission-rollback-source", 0, "MPA"),
+        ("permission-rollback-target", 0, "BBFC"),
+    ] {
+        let policy = database
+            .compare_and_swap_user_content_restrictions(
+                user_id,
+                expected_version,
+                NewUserContentRestrictions {
+                    rating_system,
+                    maximum_rating: None,
+                    allow_unrated: true,
+                    allowed_tags: if user_id == "permission-rollback-source" {
+                        &source_tags
+                    } else {
+                        &no_tags
+                    },
+                    blocked_tags: &no_tags,
+                },
+            )
+            .await?;
+        assert!(matches!(
+            policy,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+    }
+    database
+        .query(
+            "CREATE TRIGGER fail_permission_copy_content_tag
+             BEFORE INSERT ON user_content_restriction_tags
+             WHEN NEW.user_id = 'permission-rollback-target'
+             BEGIN SELECT RAISE(ABORT, 'forced permission copy failure'); END",
+        )
+        .execute(database.pool())
+        .await?;
+    let snapshots = database
+        .user_permission_copy_snapshots(&[
+            "permission-rollback-source".to_owned(),
+            "permission-rollback-target".to_owned(),
+        ])
+        .await?;
+
+    assert!(
+        database
+            .copy_user_permission_groups(
+                "permission-rollback-source",
+                &snapshots["permission-rollback-source"],
+                "permission-rollback-target",
+                &snapshots["permission-rollback-target"],
+                UserPermissionCopyGroups {
+                    library: true,
+                    content: true,
+                    playback: true,
+                },
+            )
+            .await
+            .is_err()
+    );
+
+    let after_failure = database
+        .user_permission_copy_snapshots(&["permission-rollback-target".to_owned()])
+        .await?;
+    let target = &after_failure["permission-rollback-target"];
+    assert_eq!(target.library_access_mode, "NONE");
+    assert!(target.library_ids.is_empty());
+    assert!(!target.playback_policy.can_play);
+    assert_eq!(target.playback_policy.max_simultaneous_playbacks, 2);
+    let retained_content = target
+        .content_restrictions
+        .as_ref()
+        .ok_or("failed copy removed target content policy")?;
+    assert_eq!(retained_content.version, 1);
+    assert_eq!(retained_content.rating_system, "BBFC");
+    assert!(retained_content.allowed_tags.is_empty());
+    Ok(())
+}
+
+async fn assert_media_content_restriction_index_storage(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library = LibraryService::new(database.clone())
+        .create_library("Restriction Index", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let original_nfo = r#"{"certification":"PG-13"}"#;
+    let changed_nfo = r#"{"certification":"R"}"#;
+    for (item_id, nfo_json, removed_at) in [
+        ("restriction-index-a", Some(original_nfo), None),
+        ("restriction-index-b", None, None),
+        (
+            "restriction-index-c",
+            Some(r#"{"certification":"G"}"#),
+            None,
+        ),
+        (
+            "restriction-index-d",
+            Some(r#"{"certification":"NC-17"}"#),
+            Some(1_i64),
+        ),
+    ] {
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     nfo_metadata_json, removed_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .bind(nfo_json)
+            .bind(removed_at)
+            .execute(database.pool())
+            .await?;
+    }
+    database
+        .query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('restriction-index-c', 'G')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    assert_eq!(
+        database.media_content_restriction_index_status().await?,
+        (3, 1)
+    );
+
+    let candidates = database
+        .media_content_restriction_index_candidates(None, 1)
+        .await?;
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].item_id, "restriction-index-a");
+    assert_eq!(
+        candidates[0].nfo_metadata_json.as_deref(),
+        Some(original_nfo)
+    );
+    let after_first = database
+        .media_content_restriction_index_candidates(Some("restriction-index-a"), 1)
+        .await?;
+    assert_eq!(after_first.len(), 1);
+    assert_eq!(after_first[0].item_id, "restriction-index-b");
+    assert!(
+        database
+            .media_content_restriction_index_candidates(Some("restriction-index-b"), 10)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        database
+            .media_content_restriction_index_candidates(None, 0)
+            .await?
+            .is_empty()
+    );
+    assert!(
+        !database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-d",
+                Some(r#"{"certification":"NC-17"}"#),
+                &ContentRestrictionIndexProjection {
+                    certification_code: Some("NC-17".to_owned()),
+                    tags: Vec::new(),
+                },
+            )
+            .await?
+    );
+
+    let projection = ContentRestrictionIndexProjection {
+        certification_code: Some("PG-13".to_owned()),
+        tags: vec!["family".to_owned()],
+    };
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-a",
+                Some(original_nfo),
+                &projection,
+            )
+            .await?
+    );
+    assert_eq!(
+        database.media_content_restriction_index_status().await?,
+        (3, 2)
+    );
+    let indexed: (Option<String>,) = database
+        .query_as(
+            "SELECT certification_code FROM media_content_restriction_index
+             WHERE item_id = 'restriction-index-a'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(indexed.0.as_deref(), Some("PG-13"));
+    let indexed_tags: Vec<String> = database
+        .query_scalar(
+            "SELECT tag FROM media_content_restriction_tags
+             WHERE item_id = 'restriction-index-a' ORDER BY tag",
+        )
+        .fetch_all(database.pool())
+        .await?;
+    assert_eq!(indexed_tags, ["family"]);
+
+    database
+        .query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
+        .bind(changed_nfo)
+        .bind("restriction-index-a")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-a",
+                Some(original_nfo),
+                &projection,
+            )
+            .await?
+    );
+    let pending = database
+        .media_content_restriction_index_candidates(None, 10)
+        .await?;
+    assert_eq!(
+        pending,
+        [
+            MediaContentRestrictionIndexCandidate {
+                item_id: "restriction-index-a".to_owned(),
+                nfo_metadata_json: Some(changed_nfo.to_owned()),
+            },
+            MediaContentRestrictionIndexCandidate {
+                item_id: "restriction-index-b".to_owned(),
+                nfo_metadata_json: None,
+            },
+        ]
+    );
+
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-b",
+                None,
+                &ContentRestrictionIndexProjection {
+                    certification_code: None,
+                    tags: vec!["x".repeat(129)],
+                },
+            )
+            .await
+            .is_err()
+    );
+    let failed_write_rows: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index
+             WHERE item_id = 'restriction-index-b'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        failed_write_rows, 0,
+        "index and tags must roll back together"
+    );
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-b",
+                None,
+                &ContentRestrictionIndexProjection {
+                    certification_code: None,
+                    tags: Vec::new(),
+                },
+            )
+            .await?
+    );
+    assert!(
+        database
+            .replace_media_content_restriction_index_if_nfo_json_matches(
+                "restriction-index-a",
+                Some(changed_nfo),
+                &ContentRestrictionIndexProjection {
+                    certification_code: None,
+                    tags: vec!["horror".to_owned()],
+                },
+            )
+            .await?
+    );
+    let ready_unrated: (Option<String>,) = database
+        .query_as(
+            "SELECT certification_code FROM media_content_restriction_index
+             WHERE item_id = 'restriction-index-b'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(ready_unrated.0, None);
+    let ready_unrated_tags: i64 = database
+        .query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_tags
+             WHERE item_id = 'restriction-index-b'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(ready_unrated_tags, 0);
+    assert!(
+        database
+            .media_content_restriction_index_candidates(None, 10)
+            .await?
+            .is_empty()
+    );
+
+    for index in 0..105 {
+        let item_id = format!("restriction-index-z-batch-{index:03}");
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+            )
+            .bind(&item_id)
+            .bind(&library_id)
+            .bind(&item_id)
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+    }
+    let bounded = database
+        .media_content_restriction_index_candidates(None, usize::MAX)
+        .await?;
+    assert_eq!(bounded.len(), CONTENT_RESTRICTION_INDEX_BATCH_LIMIT);
+    assert_eq!(
+        bounded.first().map(|row| row.item_id.as_str()),
+        Some("restriction-index-z-batch-000")
+    );
+    assert_eq!(
+        bounded.last().map(|row| row.item_id.as_str()),
+        Some("restriction-index-z-batch-099")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_content_restriction_index_storage_uses_bounded_snapshot_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    assert_media_content_restriction_index_storage(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_media_content_restriction_index_storage_uses_bounded_snapshot_writes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = crate::config::DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect_with_configuration(
+        &Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        },
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let assertions = assert_media_content_restriction_index_storage(&database).await;
+    database.close().await;
+    let drop_database = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    assertions?;
+    drop_database?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_library_access_modes_are_enforced_by_storage_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("Access Mode One", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Access Mode Two", LibraryKind::Movie, false)
+        .await?;
+    for user_id in [
+        "access-mode-all",
+        "access-mode-selected",
+        "access-mode-none",
+    ] {
+        database
+            .insert_user(user_id, user_id, user_id, "test-hash", false, true)
+            .await?;
+    }
+    let later_library = libraries
+        .create_library("Access Mode Three", LibraryKind::Movie, false)
+        .await?;
+
+    database
+        .set_user_library_access("access-mode-selected", &first_library.id.to_string(), true)
+        .await?;
+    database
+        .set_user_library_access("access-mode-none", &first_library.id.to_string(), true)
+        .await?;
+    let selected_mode: String = sqlx::query_scalar(
+        "SELECT library_access_mode FROM users WHERE id = 'access-mode-selected'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(selected_mode, "SELECTED");
+    sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = 'access-mode-none'")
+        .execute(database.pool())
+        .await?;
+
+    assert!(
+        database
+            .has_user_library_access("access-mode-all", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .has_user_library_access("access-mode-all", &second_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .has_user_library_access("access-mode-selected", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        !database
+            .has_user_library_access("access-mode-selected", &second_library.id.to_string())
+            .await?
+    );
+    assert!(
+        !database
+            .has_user_library_access("access-mode-none", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        !database
+            .has_user_library_access("missing-access-mode-user", &first_library.id.to_string())
+            .await?
+    );
+
+    assert_eq!(
+        database
+            .list_accessible_library_ids("access-mode-all")
+            .await?,
+        vec![
+            first_library.id.to_string(),
+            later_library.id.to_string(),
+            second_library.id.to_string(),
+        ]
+    );
+    assert_eq!(
+        database
+            .list_accessible_library_ids("access-mode-selected")
+            .await?,
+        vec![first_library.id.to_string()]
+    );
+    database
+        .set_user_library_access("access-mode-selected", &first_library.id.to_string(), false)
+        .await?;
+    let mode_after_clearing_selection: String = sqlx::query_scalar(
+        "SELECT library_access_mode FROM users WHERE id = 'access-mode-selected'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(mode_after_clearing_selection, "ALL");
+    assert!(
+        database
+            .has_user_library_access("access-mode-selected", &later_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .list_accessible_library_ids("access-mode-none")
+            .await?
+            .is_empty()
+    );
+    assert!(
+        database
+            .list_accessible_library_ids("missing-access-mode-user")
+            .await?
+            .is_empty()
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_permission_snapshot_is_inserted_with_selected_library_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Default snapshot", LibraryKind::Movie, false)
+        .await?;
+    let user = NewStoredUser {
+        id: "new-user-snapshot",
+        username_normalized: "snapshot-user",
+        display_name: "Snapshot User",
+        password_hash: "test-hash",
+        is_admin: false,
+        has_password: true,
+        email: None,
+    };
+    let library_ids = [library.id.to_string()];
+    let permissions = NewStoredUserPermissions {
+        library_access_mode: "SELECTED",
+        library_ids: &library_ids,
+        can_download: true,
+        can_play: false,
+        max_simultaneous_playbacks: 4,
+        allow_remux: false,
+        allow_audio_transcode: true,
+        allow_video_transcode: false,
+    };
+
+    database
+        .insert_user_with_email_and_permissions(user, permissions)
+        .await?;
+
+    let stored: (i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT can_download, can_play, max_simultaneous_playbacks,
+                allow_remux, allow_audio_transcode, allow_video_transcode,
+                library_access_mode
+         FROM users WHERE id = 'new-user-snapshot'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored, (1, 0, 4, 0, 1, 0, "SELECTED".to_owned()));
+    assert_eq!(
+        database
+            .list_accessible_library_ids("new-user-snapshot")
+            .await?,
+        library_ids
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn new_user_permission_snapshot_rolls_back_user_when_library_grant_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Failing default snapshot", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_new_user_permission_grant
+         BEFORE INSERT ON user_library_access
+         BEGIN SELECT RAISE(ABORT, 'grant rejected'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let library_ids = [library.id.to_string()];
+    let result = database
+        .insert_user_with_email_and_permissions(
+            NewStoredUser {
+                id: "new-user-snapshot-rollback",
+                username_normalized: "snapshot-rollback",
+                display_name: "Snapshot Rollback",
+                password_hash: "test-hash",
+                is_admin: false,
+                has_password: true,
+                email: None,
+            },
+            NewStoredUserPermissions {
+                library_access_mode: "SELECTED",
+                library_ids: &library_ids,
+                can_download: false,
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    let user_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE id = 'new-user-snapshot-rollback'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(user_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_user_permission_preset_replaces_snapshot_and_source()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let first_library = libraries
+        .create_library("Preset source first", LibraryKind::Movie, false)
+        .await?;
+    let second_library = libraries
+        .create_library("Preset source second", LibraryKind::Movie, false)
+        .await?;
+    let first_library_ids = [first_library.id.to_string()];
+    database
+        .insert_user_with_email_and_permissions(
+            NewStoredUser {
+                id: "preset-apply-user",
+                username_normalized: "preset-apply-user",
+                display_name: "Preset Apply User",
+                password_hash: "test-hash",
+                is_admin: false,
+                has_password: true,
+                email: None,
+            },
+            NewStoredUserPermissions {
+                library_access_mode: "SELECTED",
+                library_ids: &first_library_ids,
+                can_download: false,
+                can_play: true,
+                max_simultaneous_playbacks: 2,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    database
+        .insert_user(
+            "preset-apply-secondary-manager",
+            "preset-apply-secondary-manager",
+            "Preset Apply Secondary Manager",
+            "test-hash",
+            true,
+            true,
+        )
+        .await?;
+
+    let second_library_ids = [second_library.id.to_string()];
+    assert!(
+        database
+            .apply_user_permission_preset(
+                "preset-apply-user",
+                ApplyUserPermissionPreset {
+                    preset_id: "preset-family",
+                    preset_name: "Family",
+                    preset_version: 2,
+                    is_admin: false,
+                    can_manage_server: false,
+                    permissions: NewStoredUserPermissions {
+                        library_access_mode: "SELECTED",
+                        library_ids: &second_library_ids,
+                        can_download: true,
+                        can_play: false,
+                        max_simultaneous_playbacks: 4,
+                        allow_remux: false,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                },
+            )
+            .await?
+    );
+
+    let stored: (i64, i64, i64, i64, i64, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT is_admin, can_manage_server, can_download, can_play,
+                max_simultaneous_playbacks, allow_remux, allow_audio_transcode,
+                allow_video_transcode,
+                library_access_mode
+         FROM users WHERE id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored, (0, 0, 1, 0, 4, 0, 1, 0, "SELECTED".to_owned()));
+    assert_eq!(
+        database
+            .list_accessible_library_ids("preset-apply-user")
+            .await?,
+        second_library_ids
+    );
+    let source: (String, String, i64, i64) = sqlx::query_as(
+        "SELECT preset_id, preset_name, preset_version, applied_at
+         FROM user_permission_preset_sources WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source.0, "preset-family");
+    assert_eq!(source.1, "Family");
+    assert_eq!(source.2, 2);
+    assert!(source.3 > 0);
+
+    assert!(
+        database
+            .apply_user_permission_preset(
+                "preset-apply-user",
+                ApplyUserPermissionPreset {
+                    preset_id: "builtin-admin",
+                    preset_name: "管理员",
+                    preset_version: 1,
+                    is_admin: true,
+                    can_manage_server: true,
+                    permissions: NewStoredUserPermissions {
+                        library_access_mode: "ALL",
+                        library_ids: &[],
+                        can_download: true,
+                        can_play: true,
+                        max_simultaneous_playbacks: 0,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: true,
+                    },
+                },
+            )
+            .await?
+    );
+    let remaining_access: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_library_access WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_access, 0);
+    assert!(
+        database
+            .has_user_library_access("preset-apply-user", &first_library.id.to_string())
+            .await?
+    );
+    assert!(
+        database
+            .has_user_library_access("preset-apply-user", &second_library.id.to_string())
+            .await?
+    );
+
+    assert!(
+        database
+            .apply_user_permission_preset(
+                "preset-apply-user",
+                ApplyUserPermissionPreset {
+                    preset_id: "builtin-user",
+                    preset_name: "普通用户",
+                    preset_version: 1,
+                    is_admin: false,
+                    can_manage_server: false,
+                    permissions: NewStoredUserPermissions {
+                        library_access_mode: "NONE",
+                        library_ids: &[],
+                        can_download: false,
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: true,
+                    },
+                },
+            )
+            .await?
+    );
+    let remaining_access: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_library_access WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_access, 0);
+    assert!(
+        !database
+            .has_user_library_access("preset-apply-user", &first_library.id.to_string())
+            .await?
+    );
+    let updated_source: (String, String, i64) = sqlx::query_as(
+        "SELECT preset_id, preset_name, preset_version
+         FROM user_permission_preset_sources WHERE user_id = 'preset-apply-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        updated_source,
+        ("builtin-user".to_owned(), "普通用户".to_owned(), 1)
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_permission_preset_source_reads_support_single_and_batch_queries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in [
+        "preset-source-first",
+        "preset-source-second",
+        "preset-source-empty",
+    ] {
+        database
+            .insert_user(user_id, user_id, user_id, "test-hash", false, true)
+            .await?;
+    }
+    for (user_id, preset_id, preset_name, preset_version, applied_at) in [
+        ("preset-source-first", "family", "Family", 3_i64, 101_i64),
+        (
+            "preset-source-second",
+            "builtin-user",
+            "普通用户",
+            1_i64,
+            202_i64,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_permission_preset_sources
+             (user_id, preset_id, preset_name, preset_version, applied_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(preset_id)
+        .bind(preset_name)
+        .bind(preset_version)
+        .bind(applied_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .user_permission_preset_source("preset-source-first")
+            .await?,
+        Some(crate::storage::StoredUserPermissionPresetSource {
+            preset_id: "family".to_owned(),
+            preset_name: "Family".to_owned(),
+            preset_version: 3,
+            applied_at: 101,
+        })
+    );
+    assert_eq!(database.query_count(), 1);
+    database.reset_query_count();
+    assert_eq!(
+        database
+            .user_permission_preset_source("preset-source-empty")
+            .await?,
+        None
+    );
+    assert_eq!(database.query_count(), 1);
+
+    database.reset_query_count();
+    let empty = database.user_permission_preset_sources(&[]).await?;
+    assert!(empty.is_empty());
+    assert_eq!(database.query_count(), 0);
+    let user_ids = [
+        "preset-source-first".to_owned(),
+        "preset-source-second".to_owned(),
+        "preset-source-empty".to_owned(),
+    ];
+    database.reset_query_count();
+    let sources = database.user_permission_preset_sources(&user_ids).await?;
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(sources.len(), 2);
+    assert_eq!(
+        sources["preset-source-second"],
+        crate::storage::StoredUserPermissionPresetSource {
+            preset_id: "builtin-user".to_owned(),
+            preset_name: "普通用户".to_owned(),
+            preset_version: 1,
+            applied_at: 202,
+        }
+    );
+    assert!(!sources.contains_key("preset-source-empty"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_user_permission_preset_protects_last_manager_and_ignores_deleted_users()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    database
+        .insert_user(
+            "only-manager",
+            "only-manager",
+            "Only Manager",
+            "test-hash",
+            true,
+            true,
+        )
+        .await?;
+    let regular_preset = ApplyUserPermissionPreset {
+        preset_id: "builtin-user",
+        preset_name: "普通用户",
+        preset_version: 1,
+        is_admin: false,
+        can_manage_server: false,
+        permissions: NewStoredUserPermissions {
+            library_access_mode: "NONE",
+            library_ids: &[],
+            can_download: false,
+            can_play: true,
+            max_simultaneous_playbacks: 2,
+            allow_remux: true,
+            allow_audio_transcode: true,
+            allow_video_transcode: true,
+        },
+    };
+    assert!(matches!(
+        database
+            .apply_user_permission_preset("only-manager", regular_preset)
+            .await,
+        Err(StorageError::LastManager)
+    ));
+    assert!(
+        !database
+            .apply_user_permission_preset("missing-preset-user", regular_preset)
+            .await?
+    );
+
+    database
+        .insert_user(
+            "second-preset-manager",
+            "second-preset-manager",
+            "Second Preset Manager",
+            "test-hash",
+            true,
+            true,
+        )
+        .await?;
+    let (first_demotion, second_demotion) = tokio::join!(
+        database.apply_user_permission_preset("only-manager", regular_preset),
+        database.apply_user_permission_preset("second-preset-manager", regular_preset),
+    );
+    assert_eq!(
+        (matches!(&first_demotion, Ok(true)) as usize)
+            + (matches!(&second_demotion, Ok(true)) as usize),
+        1
+    );
+    assert!(
+        matches!(&first_demotion, Err(StorageError::LastManager))
+            || matches!(&second_demotion, Err(StorageError::LastManager))
+    );
+    let active_manager_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM users
+         WHERE can_manage_server = 1 AND is_disabled = 0 AND deleted_at IS NULL",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(active_manager_count, 1);
+
+    database
+        .insert_user(
+            "deleted-preset-user",
+            "deleted-preset-user",
+            "Deleted Preset User",
+            "test-hash",
+            false,
+            true,
+        )
+        .await?;
+    sqlx::query("UPDATE users SET deleted_at = unixepoch() WHERE id = 'deleted-preset-user'")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        !database
+            .apply_user_permission_preset("deleted-preset-user", regular_preset)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn apply_user_permission_preset_rolls_back_when_library_write_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Preset rollback", LibraryKind::Movie, false)
+        .await?;
+    database
+        .insert_user(
+            "preset-rollback-user",
+            "preset-rollback-user",
+            "Preset Rollback User",
+            "test-hash",
+            false,
+            true,
+        )
+        .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_user_permission_preset_grant
+         BEFORE INSERT ON user_library_access
+         BEGIN SELECT RAISE(ABORT, 'grant rejected'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let library_ids = [library.id.to_string()];
+    let result = database
+        .apply_user_permission_preset(
+            "preset-rollback-user",
+            ApplyUserPermissionPreset {
+                preset_id: "preset-family",
+                preset_name: "Family",
+                preset_version: 1,
+                is_admin: true,
+                can_manage_server: true,
+                permissions: NewStoredUserPermissions {
+                    library_access_mode: "SELECTED",
+                    library_ids: &library_ids,
+                    can_download: true,
+                    can_play: false,
+                    max_simultaneous_playbacks: 5,
+                    allow_remux: false,
+                    allow_audio_transcode: false,
+                    allow_video_transcode: false,
+                },
+            },
+        )
+        .await;
+    assert!(result.is_err());
+    let stored: (i64, i64, i64, i64, String) = sqlx::query_as(
+        "SELECT is_admin, can_manage_server, can_download, max_simultaneous_playbacks,
+                library_access_mode
+         FROM users WHERE id = 'preset-rollback-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(stored, (0, 0, 0, 2, "ALL".to_owned()));
+    let source_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_permission_preset_sources
+         WHERE user_id = 'preset-rollback-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(source_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -14189,6 +17799,272 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     );
     assert_eq!(disabled.active_playback_count, 3);
     Ok(())
+}
+
+async fn exercise_user_management_concurrency_storage_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let user_id = "user-management-concurrency-user";
+    database
+        .insert_user(
+            user_id,
+            user_id,
+            "Concurrency Contract",
+            "test-hash",
+            false,
+            true,
+        )
+        .await?;
+
+    let initial_preferences = database
+        .compare_and_swap_user_account_preferences(
+            user_id,
+            0,
+            NewUserAccountPreferences {
+                theme: "dark",
+                accent_color: "silver",
+                show_media_libraries: true,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                library_order: None,
+                played_percent: None,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        initial_preferences,
+        UserAccountPreferencesCasResult::Updated(ref saved) if saved.version == 1
+    ));
+    let (preference_a, preference_b) = tokio::join!(
+        database.compare_and_swap_user_account_preferences(
+            user_id,
+            1,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "berry",
+                show_media_libraries: false,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                library_order: None,
+                played_percent: None,
+            },
+        ),
+        database.compare_and_swap_user_account_preferences(
+            user_id,
+            1,
+            NewUserAccountPreferences {
+                theme: "light",
+                accent_color: "ocean",
+                show_media_libraries: false,
+                show_continue_watching: true,
+                audio_language: "原始音轨",
+                subtitle_language: "简体中文",
+                auto_play_next_episode: true,
+                library_order: None,
+                played_percent: None,
+            },
+        ),
+    );
+    assert!(matches!(
+        (preference_a?, preference_b?),
+        (
+            UserAccountPreferencesCasResult::Updated(_),
+            UserAccountPreferencesCasResult::Conflict
+        ) | (
+            UserAccountPreferencesCasResult::Conflict,
+            UserAccountPreferencesCasResult::Updated(_)
+        )
+    ));
+    let saved_preferences = database
+        .user_account_preferences(user_id)
+        .await?
+        .ok_or("concurrent preference update was not stored")?;
+    assert_eq!(saved_preferences.version, 2);
+
+    let no_tags = Vec::new();
+    let initial_restrictions = database
+        .compare_and_swap_user_content_restrictions(
+            user_id,
+            0,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: None,
+                allow_unrated: true,
+                allowed_tags: &no_tags,
+                blocked_tags: &no_tags,
+            },
+        )
+        .await?;
+    assert!(matches!(
+        initial_restrictions,
+        UserContentRestrictionsCasResult::Updated(ref saved) if saved.version == 1
+    ));
+    let allowed_a = vec!["Family".to_owned()];
+    let blocked_a = vec!["Horror".to_owned()];
+    let allowed_b = vec!["Documentary".to_owned()];
+    let blocked_b = vec!["Violence".to_owned()];
+    let (restriction_a, restriction_b) = tokio::join!(
+        database.compare_and_swap_user_content_restrictions(
+            user_id,
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("PG-13"),
+                allow_unrated: false,
+                allowed_tags: &allowed_a,
+                blocked_tags: &blocked_a,
+            },
+        ),
+        database.compare_and_swap_user_content_restrictions(
+            user_id,
+            1,
+            NewUserContentRestrictions {
+                rating_system: "MPAA",
+                maximum_rating: Some("R"),
+                allow_unrated: false,
+                allowed_tags: &allowed_b,
+                blocked_tags: &blocked_b,
+            },
+        ),
+    );
+    assert!(matches!(
+        (restriction_a?, restriction_b?),
+        (
+            UserContentRestrictionsCasResult::Updated(_),
+            UserContentRestrictionsCasResult::Conflict
+        ) | (
+            UserContentRestrictionsCasResult::Conflict,
+            UserContentRestrictionsCasResult::Updated(_)
+        )
+    ));
+    let saved_restrictions = database
+        .user_content_restrictions(user_id)
+        .await?
+        .ok_or("concurrent content restriction update was not stored")?;
+    assert_eq!(saved_restrictions.version, 2);
+    assert!(
+        (saved_restrictions.allowed_tags == ["family"]
+            && saved_restrictions.blocked_tags == ["horror"])
+            || (saved_restrictions.allowed_tags == ["documentary"]
+                && saved_restrictions.blocked_tags == ["violence"]),
+        "stored restriction tags must come from one complete winning update"
+    );
+
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+    let (admission_a, admission_b) = tokio::join!(
+        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000),
+        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000),
+    );
+    let admission_a = admission_a?.ok_or("playback user disappeared")?;
+    let admission_b = admission_b?.ok_or("playback user disappeared")?;
+    assert!(matches!(
+        (admission_a.decision, admission_b.decision),
+        (
+            PlaybackAdmissionDecision::Admitted,
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit)
+        ) | (
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit),
+            PlaybackAdmissionDecision::Admitted
+        )
+    ));
+    assert_eq!(admission_a.active_playback_count, 1);
+    assert_eq!(admission_b.active_playback_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_management_concurrency_storage_contract_is_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    exercise_user_management_concurrency_storage_contract(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_management_concurrency_storage_contract_is_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::{Config, DatabaseConfiguration, PostgresConnection};
+
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let test_database_name = database_name.clone();
+    let task = tokio::spawn(async move {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: test_database_name,
+                ..admin_connection
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let result = exercise_user_management_concurrency_storage_contract(&database)
+            .await
+            .map_err(|error| error.to_string());
+        database.close().await;
+        result
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    match task {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 #[tokio::test]
@@ -17294,6 +21170,1986 @@ async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
     assert_eq!(candidate_status, "SELECTED");
 }
 
+fn invitation_storage_bundle<'a>(
+    id: &'a str,
+    recipient_email: &'a str,
+    challenge_id: &'a str,
+    idempotency_key: &'a str,
+    expires_at: i64,
+    available_at: i64,
+    token_hash: &'a [u8],
+) -> (
+    NewUserInvitation<'a>,
+    NewMailChallenge<'a>,
+    NewMailOutboxMessage<'a>,
+) {
+    (
+        NewUserInvitation {
+            id,
+            recipient_email,
+            created_by_user_id: None,
+            preset_id: "viewer",
+            preset_name: "Viewer",
+            preset_version: 1,
+            permission_snapshot_json: r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"NONE","libraryIds":[],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#,
+            expires_at,
+        },
+        NewMailChallenge {
+            id: challenge_id,
+            kind: MailChallengeKind::Invitation,
+            recipient_email,
+            reference_id: id,
+            token_hash,
+            expires_at,
+        },
+        NewMailOutboxMessage {
+            idempotency_key,
+            recipient_email,
+            template_kind: MailOutboxTemplateKind::Invitation,
+            reference_id: challenge_id,
+            available_at,
+        },
+    )
+}
+
+#[tokio::test]
+async fn user_invitation_storage_creates_mail_atomically_and_rejects_duplicate_email()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let now = 1_000;
+    let first_hash = [1_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-first",
+        "viewer@example.test",
+        "challenge-first",
+        "invite-mail-first",
+        10_000,
+        now,
+        &first_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, now)
+            .await?,
+        UserInvitationCreateResult::Created
+    );
+    let created = database
+        .get_user_invitation("invitation-first", now)
+        .await?
+        .ok_or("created invitation was not found")?;
+    assert_eq!(created.status, UserInvitationStatus::Pending);
+    assert_eq!(created.recipient_email, "viewer@example.test");
+    let stored_challenge = database
+        .get_mail_challenge("challenge-first")
+        .await?
+        .ok_or("invitation challenge was not stored")?;
+    assert_eq!(stored_challenge.reference_id, created.id);
+    let queued = database.list_mail_outbox_page(None, 100, 0).await?;
+    assert_eq!(queued.messages.len(), 1);
+    assert_eq!(queued.messages[0].reference_id, "challenge-first");
+
+    let second_hash = [2_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-duplicate",
+        "viewer@example.test",
+        "challenge-duplicate",
+        "invite-mail-duplicate",
+        10_000,
+        now,
+        &second_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, now)
+            .await?,
+        UserInvitationCreateResult::AlreadyPending
+    );
+    assert!(
+        database
+            .get_mail_challenge("challenge-duplicate")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .list_mail_outbox_page(None, 100, 0)
+            .await?
+            .messages
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_requeues_valid_challenge_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [16_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "resend-active-invitation",
+        "resend-active@example.test",
+        "resend-active-challenge",
+        "resend-active-initial-mail",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+
+    assert_eq!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "resend-mail-1", 1_001)
+            .await?,
+        UserInvitationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "resend-mail-1", 1_002)
+            .await?,
+        UserInvitationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "resend-mail-2", 1_003)
+            .await?,
+        UserInvitationResendResult::Queued
+    );
+    assert!(
+        database
+            .queue_user_invitation_resend("resend-active-invitation", "", 1_004)
+            .await
+            .is_err()
+    );
+
+    let resend_rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT idempotency_key, recipient_email, reference_id
+         FROM mail_outbox WHERE idempotency_key LIKE 'resend-mail-%'
+         ORDER BY idempotency_key",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(resend_rows.len(), 2);
+    assert_eq!(resend_rows[0].0, "resend-mail-1");
+    assert_eq!(resend_rows[1].0, "resend-mail-2");
+    assert!(resend_rows.iter().all(|row| {
+        row.1 == "resend-active@example.test" && row.2 == "resend-active-challenge"
+    }));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_challenges")
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("resend-active-invitation", 1_003)
+            .await?
+            .ok_or("resend invitation disappeared")?
+            .expires_at,
+        10_000
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_does_not_resend_inactive_challenges()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, email, challenge_id, mail_key, expires_at, byte) in [
+        (
+            "resend-expired-invitation",
+            "resend-expired@example.test",
+            "resend-expired-challenge",
+            "resend-expired-mail",
+            1_100,
+            17_u8,
+        ),
+        (
+            "resend-revoked-invitation",
+            "resend-revoked@example.test",
+            "resend-revoked-challenge",
+            "resend-revoked-mail",
+            10_000,
+            18_u8,
+        ),
+        (
+            "resend-accepted-invitation",
+            "resend-accepted@example.test",
+            "resend-accepted-challenge",
+            "resend-accepted-mail",
+            10_000,
+            19_u8,
+        ),
+        (
+            "resend-consumed-invitation",
+            "resend-consumed@example.test",
+            "resend-consumed-challenge",
+            "resend-consumed-mail",
+            10_000,
+            20_u8,
+        ),
+        (
+            "resend-challenge-revoked-invitation",
+            "resend-challenge-revoked@example.test",
+            "resend-challenge-revoked",
+            "resend-challenge-revoked-mail",
+            10_000,
+            21_u8,
+        ),
+        (
+            "resend-challenge-expired-invitation",
+            "resend-challenge-expired@example.test",
+            "resend-challenge-expired",
+            "resend-challenge-expired-mail",
+            10_000,
+            22_u8,
+        ),
+        (
+            "resend-challenge-missing-invitation",
+            "resend-challenge-missing@example.test",
+            "resend-challenge-missing",
+            "resend-challenge-missing-mail",
+            10_000,
+            23_u8,
+        ),
+    ] {
+        let token_hash = [byte; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            id,
+            email,
+            challenge_id,
+            mail_key,
+            expires_at,
+            1_000,
+            &token_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+            .await?;
+    }
+
+    assert_eq!(
+        database
+            .queue_user_invitation_resend("resend-expired-invitation", "resend-x1", 1_100)
+            .await?,
+        UserInvitationResendResult::NotResendable
+    );
+    assert!(
+        database
+            .revoke_user_invitation("resend-revoked-invitation", 1_200)
+            .await?
+    );
+    sqlx::query(
+        "UPDATE user_invitations SET status = 'ACCEPTED', accepted_at = 1200
+         WHERE id = 'resend-accepted-invitation'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE mail_challenges SET consumed_at = 1200 WHERE id = 'resend-consumed-challenge'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE mail_challenges SET revoked_at = 1200
+         WHERE id = 'resend-challenge-revoked'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE mail_challenges SET expires_at = 1100
+         WHERE id = 'resend-challenge-expired'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("DELETE FROM mail_challenges WHERE id = 'resend-challenge-missing'")
+        .execute(database.pool())
+        .await?;
+
+    for (invitation_id, idempotency_key) in [
+        ("resend-revoked-invitation", "resend-x2"),
+        ("resend-accepted-invitation", "resend-x3"),
+        ("resend-consumed-invitation", "resend-x4"),
+        ("resend-challenge-revoked-invitation", "resend-x5"),
+        ("resend-challenge-expired-invitation", "resend-x6"),
+        ("resend-challenge-missing-invitation", "resend-x7"),
+    ] {
+        assert_eq!(
+            database
+                .queue_user_invitation_resend(invitation_id, idempotency_key, 1_201)
+                .await?,
+            UserInvitationResendResult::NotResendable
+        );
+    }
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+            .fetch_one(database.pool())
+            .await?,
+        7
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_accepts_once_and_creates_verified_user_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [31_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "accept-invitation",
+        "accept@example.test",
+        "accept-challenge",
+        "accept-mail",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('accept-library', 'Accept', 'MOVIE')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE user_invitations SET permission_snapshot_json = ? WHERE id = ?",
+    )
+    .bind(
+        r#"{"isAdmin":true,"canManageServer":true,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["accept-library"],"canDownload":true,"canPlay":true,"maxSimultaneousPlaybacks":4,"allowRemux":false,"allowAudioTranscode":true,"allowVideoTranscode":false}}"#,
+    )
+    .bind("accept-invitation")
+    .execute(database.pool())
+    .await?;
+
+    let context = database
+        .get_user_invitation_for_challenge_hash(&token_hash, 1_001)
+        .await?
+        .ok_or("active invitation was not found by its token digest")?;
+    assert_eq!(context.invitation_id, "accept-invitation");
+    assert_eq!(context.challenge_id, "accept-challenge");
+    assert_eq!(context.recipient_email, "accept@example.test");
+    assert_eq!(context.expires_at, 10_000);
+    assert!(
+        database
+            .get_user_invitation_for_challenge_hash(&[32_u8; 32], 1_001)
+            .await?
+            .is_none()
+    );
+
+    let account = NewInvitationUserAccount {
+        id: "accepted-user",
+        username_normalized: "accepted-user",
+        display_name: "Accepted User",
+        password_hash: "$argon2id$test-hash",
+    };
+    let (first_acceptance, second_acceptance) = tokio::join!(
+        database.accept_user_invitation(&context.challenge_id, &token_hash, account, 1_001),
+        database.accept_user_invitation(&context.challenge_id, &token_hash, account, 1_001),
+    );
+    let results = [first_acceptance?, second_acceptance?];
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == UserInvitationAcceptResult::Accepted)
+            .count(),
+        1
+    );
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| **result == UserInvitationAcceptResult::NotAcceptable)
+            .count(),
+        1
+    );
+
+    let accepted_user: InvitationAcceptanceUserSnapshot = sqlx::query_as(
+        "SELECT email, email_verified_at, is_disabled, has_password, is_admin, can_manage_server,
+                can_download, can_play, max_simultaneous_playbacks, allow_remux,
+                allow_audio_transcode, allow_video_transcode, library_access_mode
+         FROM users WHERE id = 'accepted-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(accepted_user.email, "accept@example.test");
+    assert_eq!(accepted_user.email_verified_at, Some(1_001));
+    assert_eq!(accepted_user.is_disabled, 0);
+    assert_eq!(accepted_user.has_password, 1);
+    assert_eq!(accepted_user.is_admin, 1);
+    assert_eq!(accepted_user.can_manage_server, 1);
+    assert_eq!(accepted_user.can_download, 1);
+    assert_eq!(accepted_user.can_play, 1);
+    assert_eq!(accepted_user.max_simultaneous_playbacks, 4);
+    assert_eq!(accepted_user.allow_remux, 0);
+    assert_eq!(accepted_user.allow_audio_transcode, 1);
+    assert_eq!(accepted_user.allow_video_transcode, 0);
+    assert_eq!(accepted_user.library_access_mode, "SELECTED");
+    let (library_id, can_view): (String, i64) = sqlx::query_as(
+        "SELECT library_id, can_view FROM user_library_access WHERE user_id = 'accepted-user'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(library_id, "accept-library");
+    assert_eq!(can_view, 1);
+    assert_eq!(
+        database
+            .get_user_invitation("accept-invitation", 1_001)
+            .await?
+            .ok_or("accepted invitation disappeared")?
+            .status,
+        UserInvitationStatus::Accepted
+    );
+    assert_eq!(
+        database
+            .get_mail_challenge("accept-challenge")
+            .await?
+            .ok_or("accepted challenge disappeared")?
+            .consumed_at,
+        Some(1_001)
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(&context.challenge_id, &token_hash, account, 1_002)
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+    Ok(())
+}
+
+#[derive(sqlx::FromRow)]
+struct InvitationAcceptanceUserSnapshot {
+    email: String,
+    email_verified_at: Option<i64>,
+    is_disabled: i64,
+    has_password: i64,
+    is_admin: i64,
+    can_manage_server: i64,
+    can_download: i64,
+    can_play: i64,
+    max_simultaneous_playbacks: i64,
+    allow_remux: i64,
+    allow_audio_transcode: i64,
+    allow_video_transcode: i64,
+    library_access_mode: String,
+}
+
+#[tokio::test]
+async fn user_invitation_storage_rejects_inactive_challenges_and_username_conflicts_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    for (id, email, challenge_id, mail_key, expires_at, byte) in [
+        (
+            "reject-expired-invitation",
+            "reject-expired@example.test",
+            "reject-expired-challenge",
+            "reject-expired-mail",
+            1_100,
+            41_u8,
+        ),
+        (
+            "reject-revoked-invitation",
+            "reject-revoked@example.test",
+            "reject-revoked-challenge",
+            "reject-revoked-mail",
+            10_000,
+            42_u8,
+        ),
+        (
+            "reject-mismatch-invitation",
+            "reject-mismatch@example.test",
+            "reject-mismatch-challenge",
+            "reject-mismatch-mail",
+            10_000,
+            43_u8,
+        ),
+        (
+            "reject-conflict-invitation",
+            "reject-conflict@example.test",
+            "reject-conflict-challenge",
+            "reject-conflict-mail",
+            10_000,
+            44_u8,
+        ),
+        (
+            "reject-library-rollback-invitation",
+            "reject-library-rollback@example.test",
+            "reject-library-rollback-challenge",
+            "reject-library-rollback-mail",
+            10_000,
+            45_u8,
+        ),
+        (
+            "reject-email-mismatch-invitation",
+            "reject-email-mismatch@example.test",
+            "reject-email-mismatch-challenge",
+            "reject-email-mismatch-mail",
+            10_000,
+            46_u8,
+        ),
+        (
+            "reject-expiry-mismatch-invitation",
+            "reject-expiry-mismatch@example.test",
+            "reject-expiry-mismatch-challenge",
+            "reject-expiry-mismatch-mail",
+            10_000,
+            47_u8,
+        ),
+        (
+            "reject-registered-email-invitation",
+            "registered@example.test",
+            "reject-registered-email-challenge",
+            "reject-registered-email-mail",
+            10_000,
+            48_u8,
+        ),
+    ] {
+        let token_hash = [byte; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            id,
+            email,
+            challenge_id,
+            mail_key,
+            expires_at,
+            1_000,
+            &token_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+            .await?;
+    }
+    sqlx::query(
+        "UPDATE user_invitations SET permission_snapshot_json = ? WHERE id = ?",
+    )
+    .bind(
+        r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["missing-library"],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#,
+    )
+    .bind("reject-library-rollback-invitation")
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash, email)
+         VALUES ('existing-email-user', 'existing-email-user', 'Existing Email User', 'hash',
+                 'registered@example.test')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE mail_challenges SET recipient_email = ? WHERE id = ?")
+        .bind("other-email@example.test")
+        .bind("reject-email-mismatch-challenge")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE mail_challenges SET expires_at = ? WHERE id = ?")
+        .bind(9_000_i64)
+        .bind("reject-expiry-mismatch-challenge")
+        .execute(database.pool())
+        .await?;
+
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[41_u8; 32], 1_100)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[46_u8; 32], 1_102)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[47_u8; 32], 1_102)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-expired-challenge",
+                &[41_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-expired-user",
+                    username_normalized: "reject-expired-user",
+                    display_name: "Expired User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_100,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+
+    assert!(
+        database
+            .revoke_user_invitation("reject-revoked-invitation", 1_101)
+            .await?
+    );
+    assert_eq!(
+        database
+            .get_user_invitation_for_challenge_hash(&[42_u8; 32], 1_102)
+            .await?,
+        None
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-revoked-challenge",
+                &[42_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-revoked-user",
+                    username_normalized: "reject-revoked-user",
+                    display_name: "Revoked User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_102,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-mismatch-challenge",
+                &[99_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-mismatch-user",
+                    username_normalized: "reject-mismatch-user",
+                    display_name: "Mismatch User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_103,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('existing-username-user', 'already-used', 'Existing User', 'hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-email-mismatch-challenge",
+                &[46_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-email-mismatch-user",
+                    username_normalized: "reject-email-mismatch-user",
+                    display_name: "Email Mismatch User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_103,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-expiry-mismatch-challenge",
+                &[47_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-expiry-mismatch-user",
+                    username_normalized: "reject-expiry-mismatch-user",
+                    display_name: "Expiry Mismatch User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_103,
+            )
+            .await?,
+        UserInvitationAcceptResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-conflict-challenge",
+                &[44_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-conflict-new-user",
+                    username_normalized: "already-used",
+                    display_name: "Conflicting User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_104,
+            )
+            .await?,
+        UserInvitationAcceptResult::UsernameTaken
+    );
+    assert_eq!(
+        database
+            .accept_user_invitation(
+                "reject-registered-email-challenge",
+                &[48_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-registered-email-user",
+                    username_normalized: "reject-registered-email-user",
+                    display_name: "Registered Email User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_104,
+            )
+            .await?,
+        UserInvitationAcceptResult::EmailAlreadyRegistered
+    );
+    assert!(
+        database
+            .accept_user_invitation(
+                "reject-library-rollback-challenge",
+                &[45_u8; 32],
+                NewInvitationUserAccount {
+                    id: "reject-library-rollback-user",
+                    username_normalized: "reject-library-rollback-user",
+                    display_name: "Library Rollback User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                1_104,
+            )
+            .await
+            .is_err()
+    );
+
+    for id in [
+        "reject-expired-user",
+        "reject-revoked-user",
+        "reject-mismatch-user",
+        "reject-conflict-new-user",
+        "reject-library-rollback-user",
+        "reject-email-mismatch-user",
+        "reject-expiry-mismatch-user",
+        "reject-registered-email-user",
+    ] {
+        let user_exists: i64 =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM users WHERE id = ?)")
+                .bind(id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(user_exists, 0, "rejected acceptance created {id}");
+    }
+    for (challenge_id, expected_consumed_at) in [
+        ("reject-expired-challenge", None),
+        ("reject-revoked-challenge", None),
+        ("reject-mismatch-challenge", None),
+        ("reject-conflict-challenge", None),
+        ("reject-library-rollback-challenge", None),
+        ("reject-email-mismatch-challenge", None),
+        ("reject-expiry-mismatch-challenge", None),
+        ("reject-registered-email-challenge", None),
+    ] {
+        let challenge = database
+            .get_mail_challenge(challenge_id)
+            .await?
+            .ok_or("rejected challenge disappeared")?;
+        assert_eq!(challenge.consumed_at, expected_consumed_at);
+    }
+    assert_eq!(
+        database
+            .get_user_invitation("reject-revoked-invitation", 1_105)
+            .await?
+            .ok_or("revoked invitation disappeared")?
+            .status,
+        UserInvitationStatus::Revoked
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("reject-mismatch-invitation", 1_105)
+            .await?
+            .ok_or("mismatched invitation disappeared")?
+            .status,
+        UserInvitationStatus::Pending
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("reject-conflict-invitation", 1_105)
+            .await?
+            .ok_or("username-conflict invitation disappeared")?
+            .status,
+        UserInvitationStatus::Pending
+    );
+    assert_eq!(
+        database
+            .get_user_invitation("reject-library-rollback-invitation", 1_105)
+            .await?
+            .ok_or("library rollback invitation disappeared")?
+            .status,
+        UserInvitationStatus::Pending
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_library_access")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_enforces_rolling_email_mail_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [25_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "rate-limit-resend-invitation",
+        "rate-limit@example.test",
+        "rate-limit-resend-challenge",
+        "rate-limit-initial-mail",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+
+    for index in 1..=3 {
+        assert_eq!(
+            database
+                .queue_user_invitation_resend(
+                    "rate-limit-resend-invitation",
+                    &format!("rate-limit-resend-{index}"),
+                    1_000 + index,
+                )
+                .await?,
+            UserInvitationResendResult::Queued
+        );
+    }
+    let (first_result, second_result) = tokio::join!(
+        database.queue_user_invitation_resend(
+            "rate-limit-resend-invitation",
+            "rate-limit-resend-4",
+            1_004,
+        ),
+        database.queue_user_invitation_resend(
+            "rate-limit-resend-invitation",
+            "rate-limit-resend-5",
+            1_005,
+        ),
+    );
+    let first_result = first_result?;
+    let second_result = second_result?;
+    assert_eq!(
+        [first_result, second_result]
+            .into_iter()
+            .filter(|result| *result == UserInvitationResendResult::Queued)
+            .count(),
+        1
+    );
+    assert_eq!(
+        [first_result, second_result]
+            .into_iter()
+            .filter(|result| *result == UserInvitationResendResult::RateLimited)
+            .count(),
+        1
+    );
+    let idempotent_key = if first_result == UserInvitationResendResult::Queued {
+        "rate-limit-resend-4"
+    } else {
+        "rate-limit-resend-5"
+    };
+    assert_eq!(
+        database
+            .queue_user_invitation_resend("rate-limit-resend-invitation", idempotent_key, 1_006)
+            .await?,
+        UserInvitationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .queue_user_invitation_resend(
+                "rate-limit-resend-invitation",
+                "rate-limit-resend-after-window",
+                4_601,
+            )
+            .await?,
+        UserInvitationResendResult::Queued
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox WHERE recipient_email = 'rate-limit@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        6
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_creation_enforces_rolling_email_mail_limit_atomically()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for index in 0..=5 {
+        let invitation_id = format!("rate-create-invitation-{index}");
+        let challenge_id = format!("rate-create-challenge-{index}");
+        let mail_key = format!("rate-create-mail-{index}");
+        let token_hash = [index as u8 + 26; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            &invitation_id,
+            "rate-create@example.test",
+            &challenge_id,
+            &mail_key,
+            10_000,
+            1_000 + index,
+            &token_hash,
+        );
+        let result = database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000 + index)
+            .await?;
+        if index < 5 {
+            assert_eq!(result, UserInvitationCreateResult::Created);
+            sqlx::query(
+                "UPDATE user_invitations SET status = 'ACCEPTED', accepted_at = ?
+                 WHERE id = ?",
+            )
+            .bind(1_000 + index)
+            .bind(&invitation_id)
+            .execute(database.pool())
+            .await?;
+        } else {
+            assert_eq!(result, UserInvitationCreateResult::RateLimited);
+        }
+    }
+    assert!(
+        database
+            .get_user_invitation("rate-create-invitation-5", 1_005)
+            .await?
+            .is_none()
+    );
+    assert!(
+        database
+            .get_mail_challenge("rate-create-challenge-5")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM mail_outbox WHERE recipient_email = 'rate-create@example.test'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        5
+    );
+
+    let token_hash = [31_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "rate-create-after-window",
+        "rate-create@example.test",
+        "rate-create-after-window-challenge",
+        "rate-create-after-window-mail",
+        20_000,
+        4_600,
+        &token_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 4_600)
+            .await?,
+        UserInvitationCreateResult::Created
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_expires_replaced_rows_and_paginates_revokeable_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let first_hash = [3_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-expired",
+        "viewer@example.test",
+        "challenge-expired",
+        "invite-mail-expired",
+        1_100,
+        1_000,
+        &first_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+        .await?;
+
+    let second_hash = [4_u8; 32];
+    let (invitation, challenge, outbox) = invitation_storage_bundle(
+        "invitation-current",
+        "viewer@example.test",
+        "challenge-current",
+        "invite-mail-current",
+        10_000,
+        1_100,
+        &second_hash,
+    );
+    database
+        .create_user_invitation_with_mail(invitation, challenge, outbox, 1_100)
+        .await?;
+    let expired = database
+        .get_user_invitation("invitation-expired", 1_100)
+        .await?
+        .ok_or("expired invitation was not found")?;
+    assert_eq!(expired.status, UserInvitationStatus::Expired);
+
+    let all = database
+        .list_user_invitations_page(None, 1_000, 0, 1_100)
+        .await?;
+    assert_eq!(all.total_count, 2);
+    assert_eq!(all.page_size, 100);
+    assert_eq!(all.entries.len(), 2);
+    assert_eq!(all.entries[0].id, "invitation-current");
+    let expired_page = database
+        .list_user_invitations_page(Some(UserInvitationStatus::Expired), 20, 0, 1_100)
+        .await?;
+    assert_eq!(expired_page.total_count, 1);
+    assert_eq!(expired_page.entries[0].id, "invitation-expired");
+
+    assert!(
+        database
+            .revoke_user_invitation("invitation-current", 1_200)
+            .await?
+    );
+    assert!(
+        !database
+            .revoke_user_invitation("invitation-current", 1_201)
+            .await?
+    );
+    let revoked = database
+        .get_user_invitation("invitation-current", 1_201)
+        .await?
+        .ok_or("revoked invitation was not found")?;
+    assert_eq!(revoked.status, UserInvitationStatus::Revoked);
+    assert!(
+        !database
+            .revoke_user_invitation("missing-invitation", 1_201)
+            .await?
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_invitation_storage_rolls_back_when_mail_enqueue_fails()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let token_hash = [5_u8; 32];
+    let (first_invitation, first_challenge, first_outbox) = invitation_storage_bundle(
+        "invitation-existing",
+        "existing@example.test",
+        "challenge-existing",
+        "shared-mail-idempotency",
+        10_000,
+        1_000,
+        &token_hash,
+    );
+    database
+        .create_user_invitation_with_mail(first_invitation, first_challenge, first_outbox, 1_000)
+        .await?;
+
+    let second_hash = [6_u8; 32];
+    let (second_invitation, second_challenge, second_outbox) = invitation_storage_bundle(
+        "invitation-rolled-back",
+        "rollback@example.test",
+        "challenge-rolled-back",
+        "shared-mail-idempotency",
+        10_000,
+        1_001,
+        &second_hash,
+    );
+    assert!(
+        database
+            .create_user_invitation_with_mail(
+                second_invitation,
+                second_challenge,
+                second_outbox,
+                1_001,
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        database
+            .get_user_invitation("invitation-rolled-back", 1_001)
+            .await?
+            .is_none()
+    );
+    assert!(
+        database
+            .get_mail_challenge("challenge-rolled-back")
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .list_mail_outbox_page(None, 100, 0)
+            .await?
+            .messages
+            .len(),
+        1
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_invitation_storage_covers_lifecycle_and_atomicity()
+-> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_configuration = DatabaseConfiguration::Postgres(admin_connection.clone());
+    let admin_url = admin_configuration
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let result = async {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: database_name.clone(),
+                ..admin_connection.clone()
+            }),
+        )
+        .await?;
+        let token_hash = [7_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-expiring-invitation",
+            "postgres@example.test",
+            "postgres-expiring-challenge",
+            "postgres-mail-key",
+            1_100,
+            1_000,
+            &token_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_000)
+                .await?,
+            UserInvitationCreateResult::Created
+        );
+
+        let duplicate_hash = [8_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-duplicate-invitation",
+            "postgres@example.test",
+            "postgres-duplicate-challenge",
+            "postgres-duplicate-mail-key",
+            10_000,
+            1_050,
+            &duplicate_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_050)
+                .await?,
+            UserInvitationCreateResult::AlreadyPending
+        );
+        assert!(
+            database
+                .get_mail_challenge("postgres-duplicate-challenge")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+                .fetch_one(database.pool())
+                .await?,
+            1
+        );
+
+        let replacement_hash = [9_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-replacement-invitation",
+            "postgres@example.test",
+            "postgres-replacement-challenge",
+            "postgres-replacement-mail-key",
+            10_000,
+            1_100,
+            &replacement_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_100)
+                .await?,
+            UserInvitationCreateResult::Created
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-expiring-invitation", 1_100)
+                .await?
+                .ok_or("expired PostgreSQL invitation was not found")?
+                .status,
+            UserInvitationStatus::Expired
+        );
+        assert_eq!(
+            database
+                .list_user_invitations_page(Some(UserInvitationStatus::Expired), 10, 0, 1_100)
+                .await?
+                .total_count,
+            1
+        );
+
+        let revocable_hash = [10_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-revocable-invitation",
+            "revoke@example.test",
+            "postgres-revocable-challenge",
+            "postgres-revocable-mail-key",
+            10_000,
+            1_200,
+            &revocable_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_200)
+            .await?;
+
+        let accepted_hash = [11_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-accepted-invitation",
+            "accepted@example.test",
+            "postgres-accepted-challenge",
+            "postgres-accepted-mail-key",
+            10_000,
+            1_200,
+            &accepted_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_200)
+            .await?;
+        sqlx::query(
+            "UPDATE user_invitations
+             SET status = 'ACCEPTED', accepted_at = 1_200, updated_at = 1_200
+             WHERE id = 'postgres-accepted-invitation'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        for (id, email, challenge_id, key, byte) in [
+            (
+                "postgres-stable-a",
+                "stable-a@example.test",
+                "postgres-stable-a-challenge",
+                "postgres-stable-a-mail-key",
+                12_u8,
+            ),
+            (
+                "postgres-stable-b",
+                "stable-b@example.test",
+                "postgres-stable-b-challenge",
+                "postgres-stable-b-mail-key",
+                13_u8,
+            ),
+        ] {
+            let token_hash = [byte; 32];
+            let (invitation, challenge, outbox) =
+                invitation_storage_bundle(id, email, challenge_id, key, 10_000, 1_300, &token_hash);
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_300)
+                .await?;
+        }
+
+        let page = database
+            .list_user_invitations_page(None, 1_000, 0, 1_300)
+            .await?;
+        assert_eq!(page.total_count, 6);
+        assert_eq!(page.page_size, 100);
+        assert_eq!(page.entries.len(), 6);
+        assert_eq!(page.entries[0].id, "postgres-stable-b");
+        assert_eq!(page.entries[1].id, "postgres-stable-a");
+
+        let rollback_hash = [14_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-rolled-back-invitation",
+            "rollback@example.test",
+            "postgres-rolled-back-challenge",
+            "postgres-mail-key",
+            10_000,
+            1_400,
+            &rollback_hash,
+        );
+        assert!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_400)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .get_user_invitation("postgres-rolled-back-invitation", 1_400)
+                .await?
+                .is_none()
+        );
+        assert!(
+            database
+                .get_mail_challenge("postgres-rolled-back-challenge")
+                .await?
+                .is_none()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM mail_outbox")
+                .fetch_one(database.pool())
+                .await?,
+            6
+        );
+
+        let mismatch_hash = [15_u8; 32];
+        let (invitation, mut challenge, outbox) = invitation_storage_bundle(
+            "postgres-mismatched-invitation",
+            "mismatch@example.test",
+            "postgres-mismatched-challenge",
+            "postgres-mismatched-mail-key",
+            10_000,
+            1_500,
+            &mismatch_hash,
+        );
+        challenge.recipient_email = "different@example.test";
+        assert!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_500)
+                .await
+                .is_err()
+        );
+        assert!(
+            database
+                .get_user_invitation("postgres-mismatched-invitation", 1_500)
+                .await?
+                .is_none()
+        );
+
+        assert!(
+            database
+                .revoke_user_invitation("postgres-revocable-invitation", 1_501)
+                .await?
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-revocable-invitation", 1_501)
+                .await?
+                .ok_or("PostgreSQL invitation was not found")?
+                .status,
+            UserInvitationStatus::Revoked
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-revocable-invitation", 1_502)
+                .await?
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-expiring-invitation", 1_501)
+                .await?
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-accepted-invitation", 1_501)
+                .await?
+        );
+        assert!(
+            !database
+                .revoke_user_invitation("postgres-missing-invitation", 1_501)
+                .await?
+        );
+        let challenge_revoked_at: Option<i64> =
+            sqlx::query_scalar("SELECT revoked_at FROM mail_challenges WHERE id = $1")
+                .bind("postgres-revocable-challenge")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(challenge_revoked_at, Some(1_501));
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT status FROM mail_outbox WHERE idempotency_key = $1",
+            )
+            .bind("postgres-revocable-mail-key")
+            .fetch_one(database.pool())
+            .await?,
+            "FAILED"
+        );
+        assert_eq!(
+            database
+                .queue_user_invitation_resend(
+                    "postgres-revocable-invitation",
+                    "postgres-resend-revoked",
+                    1_502
+                )
+                .await?,
+            UserInvitationResendResult::NotResendable
+        );
+        assert_eq!(
+            database
+                .queue_user_invitation_resend(
+                    "postgres-expiring-invitation",
+                    "postgres-resend-expired",
+                    1_501
+                )
+                .await?,
+            UserInvitationResendResult::NotResendable
+        );
+        assert_eq!(
+            database
+                .queue_user_invitation_resend(
+                    "postgres-accepted-invitation",
+                    "postgres-resend-accepted",
+                    1_501
+                )
+                .await?,
+            UserInvitationResendResult::NotResendable
+        );
+
+        let resend_hash = [24_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-resend-invitation",
+            "postgres-resend@example.test",
+            "postgres-resend-challenge",
+            "postgres-resend-initial-mail",
+            20_000,
+            1_600,
+            &resend_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 1_600)
+            .await?;
+        for (key, now) in [
+            ("postgres-resend-mail-1", 1_601),
+            ("postgres-resend-mail-1", 1_602),
+            ("postgres-resend-mail-2", 1_603),
+            ("postgres-resend-mail-3", 1_604),
+        ] {
+            assert_eq!(
+                database
+                    .queue_user_invitation_resend("postgres-resend-invitation", key, now)
+                    .await?,
+                UserInvitationResendResult::Queued
+            );
+        }
+        let (first_result, second_result) = tokio::join!(
+            database.queue_user_invitation_resend(
+                "postgres-resend-invitation",
+                "postgres-resend-mail-4",
+                1_605,
+            ),
+            database.queue_user_invitation_resend(
+                "postgres-resend-invitation",
+                "postgres-resend-mail-5",
+                1_606,
+            ),
+        );
+        let first_result = first_result?;
+        let second_result = second_result?;
+        assert_eq!(
+            [first_result, second_result]
+                .into_iter()
+                .filter(|result| *result == UserInvitationResendResult::Queued)
+                .count(),
+            1
+        );
+        assert_eq!(
+            [first_result, second_result]
+                .into_iter()
+                .filter(|result| *result == UserInvitationResendResult::RateLimited)
+                .count(),
+            1
+        );
+        let successful_idempotency_key = if first_result == UserInvitationResendResult::Queued {
+            "postgres-resend-mail-4"
+        } else {
+            "postgres-resend-mail-5"
+        };
+        assert_eq!(
+            database
+                .queue_user_invitation_resend(
+                    "postgres-resend-invitation",
+                    successful_idempotency_key,
+                    1_607,
+                )
+                .await?,
+            UserInvitationResendResult::Queued
+        );
+        let resend_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM mail_outbox
+             WHERE reference_id = 'postgres-resend-challenge'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(resend_count, 5);
+        sqlx::query(
+            "UPDATE user_invitations SET status = 'ACCEPTED', accepted_at = 1608
+             WHERE id = 'postgres-resend-invitation'",
+        )
+        .execute(database.pool())
+        .await?;
+        let rate_limited_hash = [25_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-rate-limited-invitation",
+            "postgres-resend@example.test",
+            "postgres-rate-limited-challenge",
+            "postgres-rate-limited-mail",
+            20_000,
+            1_608,
+            &rate_limited_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 1_608)
+                .await?,
+            UserInvitationCreateResult::RateLimited
+        );
+        assert!(
+            database
+                .get_user_invitation("postgres-rate-limited-invitation", 1_608)
+                .await?
+                .is_none()
+        );
+        let recovered_hash = [26_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-rate-window-recovered",
+            "postgres-resend@example.test",
+            "postgres-rate-window-recovered-challenge",
+            "postgres-rate-window-recovered-mail",
+            20_000,
+            5_208,
+            &recovered_hash,
+        );
+        assert_eq!(
+            database
+                .create_user_invitation_with_mail(invitation, challenge, outbox, 5_208)
+                .await?,
+            UserInvitationCreateResult::Created
+        );
+
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ($1, $2, 'MOVIE')")
+            .bind("postgres-accept-library")
+            .bind("Postgres Accept")
+            .execute(database.pool())
+            .await?;
+        let acceptance_hash = [27_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-acceptance-invitation",
+            "postgres-acceptance@example.test",
+            "postgres-acceptance-challenge",
+            "postgres-acceptance-mail",
+            20_000,
+            5_209,
+            &acceptance_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 5_209)
+            .await?;
+        sqlx::query(
+            "UPDATE user_invitations SET permission_snapshot_json = $1 WHERE id = $2",
+        )
+        .bind(
+            r#"{"isAdmin":true,"canManageServer":true,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["postgres-accept-library"],"canDownload":true,"canPlay":false,"maxSimultaneousPlaybacks":3,"allowRemux":false,"allowAudioTranscode":true,"allowVideoTranscode":false}}"#,
+        )
+        .bind("postgres-acceptance-invitation")
+        .execute(database.pool())
+        .await?;
+        let acceptance = database
+            .get_user_invitation_for_challenge_hash(&acceptance_hash, 5_210)
+            .await?
+            .ok_or("PostgreSQL invitation was not found by its challenge digest")?;
+        let (first_acceptance, second_acceptance) = tokio::join!(
+            database.accept_user_invitation(
+                    &acceptance.challenge_id,
+                    &acceptance_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-accepted-user",
+                        username_normalized: "postgres-accepted-user",
+                        display_name: "Postgres Accepted User",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_210,
+                ),
+            database.accept_user_invitation(
+                &acceptance.challenge_id,
+                &acceptance_hash,
+                NewInvitationUserAccount {
+                    id: "postgres-accepted-user",
+                    username_normalized: "postgres-accepted-user",
+                    display_name: "Postgres Accepted User",
+                    password_hash: "$argon2id$test-hash",
+                },
+                5_210,
+            ),
+        );
+        let results = [first_acceptance?, second_acceptance?];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == UserInvitationAcceptResult::Accepted)
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|result| **result == UserInvitationAcceptResult::NotAcceptable)
+                .count(),
+            1
+        );
+        let (email_verified_at, is_admin, can_manage_server, can_download, can_play): (
+            Option<i64>,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = sqlx::query_as(
+            "SELECT email_verified_at, is_admin, can_manage_server, can_download, can_play
+             FROM users WHERE id = $1",
+        )
+        .bind("postgres-accepted-user")
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(email_verified_at, Some(5_210));
+        assert_eq!((is_admin, can_manage_server, can_download, can_play), (1, 1, 1, 0));
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM user_library_access
+                 WHERE user_id = $1 AND library_id = $2 AND can_view = 1",
+            )
+            .bind("postgres-accepted-user")
+            .bind("postgres-accept-library")
+            .fetch_one(database.pool())
+            .await?,
+            1
+        );
+        assert_eq!(
+            database
+                .accept_user_invitation(
+                    &acceptance.challenge_id,
+                    &acceptance_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-accepted-user-retry",
+                        username_normalized: "postgres-accepted-user-retry",
+                        display_name: "Postgres Accepted Retry",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_211,
+                )
+                .await?,
+            UserInvitationAcceptResult::NotAcceptable
+        );
+
+        let library_failure_hash = [28_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-library-rollback-invitation",
+            "postgres-library-rollback@example.test",
+            "postgres-library-rollback-challenge",
+            "postgres-library-rollback-mail",
+            20_000,
+            5_212,
+            &library_failure_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 5_212)
+            .await?;
+        sqlx::query(
+            "UPDATE user_invitations SET permission_snapshot_json = $1 WHERE id = $2",
+        )
+        .bind(
+            r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["missing-library"],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#,
+        )
+        .bind("postgres-library-rollback-invitation")
+        .execute(database.pool())
+        .await?;
+        assert!(
+            database
+                .accept_user_invitation(
+                    "postgres-library-rollback-challenge",
+                    &library_failure_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-library-rollback-user",
+                        username_normalized: "postgres-library-rollback-user",
+                        display_name: "Postgres Rollback User",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_213,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE id = $1")
+                .bind("postgres-library-rollback-user")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-library-rollback-invitation", 5_213)
+                .await?
+                .ok_or("PostgreSQL rollback invitation disappeared")?
+                .status,
+            UserInvitationStatus::Pending
+        );
+        assert_eq!(
+            database
+                .get_mail_challenge("postgres-library-rollback-challenge")
+                .await?
+                .ok_or("PostgreSQL rollback challenge disappeared")?
+                .consumed_at,
+            None
+        );
+
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash, email)
+             VALUES ($1, $2, $3, $4, $5)",
+        )
+        .bind("postgres-existing-email-user")
+        .bind("postgres-existing-email-user")
+        .bind("Existing Email User")
+        .bind("hash")
+        .bind("postgres-registered@example.test")
+        .execute(database.pool())
+        .await?;
+        let registered_email_hash = [29_u8; 32];
+        let (invitation, challenge, outbox) = invitation_storage_bundle(
+            "postgres-registered-email-invitation",
+            "postgres-registered@example.test",
+            "postgres-registered-email-challenge",
+            "postgres-registered-email-mail",
+            20_000,
+            5_214,
+            &registered_email_hash,
+        );
+        database
+            .create_user_invitation_with_mail(invitation, challenge, outbox, 5_214)
+            .await?;
+        assert_eq!(
+            database
+                .accept_user_invitation(
+                    "postgres-registered-email-challenge",
+                    &registered_email_hash,
+                    NewInvitationUserAccount {
+                        id: "postgres-registered-email-new-user",
+                        username_normalized: "postgres-registered-email-new-user",
+                        display_name: "Registered Email User",
+                        password_hash: "$argon2id$test-hash",
+                    },
+                    5_215,
+                )
+                .await?,
+            UserInvitationAcceptResult::EmailAlreadyRegistered
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM users WHERE id = $1")
+                .bind("postgres-registered-email-new-user")
+                .fetch_one(database.pool())
+                .await?,
+            0
+        );
+        assert_eq!(
+            database
+                .get_user_invitation("postgres-registered-email-invitation", 5_215)
+                .await?
+                .ok_or("PostgreSQL registered-email invitation disappeared")?
+                .status,
+            UserInvitationStatus::Pending
+        );
+        assert_eq!(
+            database
+                .get_mail_challenge("postgres-registered-email-challenge")
+                .await?
+                .ok_or("PostgreSQL registered-email challenge disappeared")?
+                .consumed_at,
+            None
+        );
+        database.close().await;
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    let admin_url = DatabaseConfiguration::Postgres(PostgresConnection {
+        database: "postgres".to_owned(),
+        ..admin_connection
+    })
+    .postgres_url()?
+    .ok_or("missing PostgreSQL admin URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    result?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_current_playback_sessions_are_filtered_and_paginated()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let admin_id: String = sqlx::query_scalar("SELECT id FROM users LIMIT 1")
+        .fetch_one(database.pool())
+        .await?;
+    let user_id = "playback-page-user";
+    database
+        .insert_user(
+            user_id,
+            "playback-page-user",
+            "Playback User",
+            "hash",
+            false,
+            true,
+        )
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback page", LibraryKind::Movie, false)
+        .await?;
+    let item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback page', 'playback page', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    for (id, session_user_id, state, last_event_at) in [
+        ("target-newest", user_id, "PLAYING", now - 1),
+        ("target-older", user_id, "PAUSED", now - 2),
+        ("target-stale", user_id, "PLAYING", now - 91),
+        ("target-stopped", user_id, "STOPPED", now - 1),
+        ("other-current", admin_id.as_str(), "PLAYING", now - 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                    id, user_id, item_id, play_session_id, device_id, state, last_event_at
+                 ) VALUES (?, ?, ?, ?, 'test-device', ?, ?)",
+        )
+        .bind(id)
+        .bind(session_user_id)
+        .bind(&item_id)
+        .bind(format!("play-{id}"))
+        .bind(state)
+        .bind(last_event_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first_page, first_total) = database
+        .list_current_user_playback_sessions(user_id, 1, 0)
+        .await?;
+    assert_eq!(first_total, 2);
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].id, "target-newest");
+
+    let (second_page, second_total) = database
+        .list_current_user_playback_sessions(user_id, 1, 1)
+        .await?;
+    assert_eq!(second_total, 2);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].id, "target-older");
+
+    for index in 0..101 {
+        let id = format!("target-page-{index:03}");
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                    id, user_id, item_id, play_session_id, device_id, state, last_event_at
+                 ) VALUES (?, ?, ?, ?, 'test-device', 'PLAYING', ?)",
+        )
+        .bind(&id)
+        .bind(user_id)
+        .bind(&item_id)
+        .bind(format!("play-{id}"))
+        .bind(now - 3)
+        .execute(database.pool())
+        .await?;
+    }
+    let (capped_page, capped_total) = database
+        .list_current_user_playback_sessions(user_id, 1_000, -1)
+        .await?;
+    assert_eq!(capped_total, 103);
+    assert_eq!(capped_page.len(), 100);
+    assert_eq!(capped_page[0].id, "target-newest");
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -17386,6 +23242,384 @@ async fn expired_web_playback_sessions_are_stopped_in_a_bounded_batch() {
     .await
     .expect("remaining expired sessions");
     assert_eq!(active_count, 2);
+}
+
+#[tokio::test]
+async fn web_playback_access_context_is_scoped_to_active_session()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{
+        application::{libraries::LibraryService, setup::SetupService},
+        config::Config,
+        library::LibraryKind,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete("Playback Context", "Playback Context", "context password")
+        .await?;
+    let user_id = user.id.to_string();
+    let library = LibraryService::new(database.clone())
+        .create_library("Playback Context", LibraryKind::Movie, false)
+        .await?;
+    let item_id = Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES (?, ?, 'MOVIE', 'Playback Context', 'playback context', 'LOCAL_CONFIRMED')",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    database
+        .insert_web_playback_session(NewWebPlaybackSession {
+            id: "playback-context-session",
+            user_id: &user_id,
+            item_id: &item_id,
+            media_source_id: None,
+            play_session_id: "lux-web:playback-context-session",
+            tier: 1,
+            plan: "DIRECT",
+            temp_dir: None,
+            is_admin: true,
+            expires_at: 10_000,
+            now: 1,
+        })
+        .await?;
+
+    let empty_context = database
+        .find_web_playback_access_context("playback-context-session")
+        .await?
+        .ok_or("active playback session has no access context")?;
+    assert_eq!(empty_context.user_id, user_id);
+    assert_eq!(empty_context.device_id, None);
+    assert_eq!(empty_context.client_name, None);
+
+    assert!(
+        database
+            .set_web_playback_access_context(
+                "playback-context-session",
+                &user_id,
+                Some("browser-device-id"),
+                Some("Lux Web"),
+                2,
+            )
+            .await?
+    );
+    let stored_context = database
+        .find_web_playback_access_context("playback-context-session")
+        .await?
+        .ok_or("updated playback context was not found")?;
+    assert_eq!(
+        stored_context.device_id.as_deref(),
+        Some("browser-device-id")
+    );
+    assert_eq!(stored_context.client_name.as_deref(), Some("Lux Web"));
+
+    assert!(
+        !database
+            .set_web_playback_access_context(
+                "playback-context-session",
+                "another-user",
+                Some("other-device"),
+                Some("Other Client"),
+                3,
+            )
+            .await?
+    );
+    sqlx::query(
+        "UPDATE web_playback_sessions SET state = 'STOPPED' WHERE id = 'playback-context-session'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        !database
+            .set_web_playback_access_context(
+                "playback-context-session",
+                &user_id,
+                Some("late-device"),
+                Some("Late Client"),
+                4,
+            )
+            .await?
+    );
+    assert!(
+        database
+            .find_web_playback_access_context("playback-context-session")
+            .await?
+            .is_none()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_direct_playback_ticket_migration_creates_revocable_context_table()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config};
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let table_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name = 'emby_direct_playback_tickets'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(table_count, 1);
+
+    let columns = sqlx::query("PRAGMA table_info(emby_direct_playback_tickets)")
+        .fetch_all(database.pool())
+        .await?
+        .into_iter()
+        .map(|row| row.get::<String, _>("name"))
+        .collect::<Vec<_>>();
+    for expected in [
+        "user_id",
+        "play_session_id",
+        "authorization_device_id",
+        "authorization_client_name",
+        "expires_at",
+        "revoked_at",
+        "created_at",
+    ] {
+        assert!(columns.iter().any(|column| column == expected));
+    }
+
+    let user = SetupService::new(database.clone())?
+        .complete("Direct Ticket", "Direct Ticket", "ticket password")
+        .await?;
+    let user_id = user.id.to_string();
+    sqlx::query(
+        "INSERT INTO emby_direct_playback_tickets (
+             user_id, play_session_id, authorization_device_id,
+             authorization_client_name, expires_at, created_at
+         ) VALUES (?, 'ticket-session', 'device-1', 'client-1', 500, 100)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, '', 500, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, 'negative-time', -1, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, 'reversed-time', 99, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    assert!(
+        sqlx::query(
+            "INSERT INTO emby_direct_playback_tickets (
+                 user_id, play_session_id, expires_at, created_at
+             ) VALUES (?, 'ticket-session', 500, 100)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await
+        .is_err()
+    );
+    let expiry_index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'index' AND name = 'idx_emby_direct_playback_tickets_expiry'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(expiry_index_count, 1);
+
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM emby_direct_playback_tickets WHERE user_id = ?")
+            .bind(&user_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn emby_direct_playback_ticket_storage_scopes_and_revokes_context()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config};
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete(
+            "Direct Ticket Storage",
+            "Direct Ticket Storage",
+            "ticket password",
+        )
+        .await?;
+    let user_id = user.id.to_string();
+    database
+        .insert_emby_direct_playback_ticket(NewEmbyDirectPlaybackTicket {
+            user_id: &user_id,
+            play_session_id: "stored-ticket-session",
+            authorization_device_id: Some("device-1"),
+            authorization_client_name: Some("Client 1"),
+            expires_at: 500,
+            created_at: 100,
+        })
+        .await?;
+
+    let stored = database
+        .find_emby_direct_playback_ticket(&user_id, "stored-ticket-session")
+        .await?
+        .ok_or("stored Emby direct playback ticket was not found")?;
+    assert_eq!(stored.authorization_device_id.as_deref(), Some("device-1"));
+    assert_eq!(
+        stored.authorization_client_name.as_deref(),
+        Some("Client 1")
+    );
+    assert_eq!(stored.revoked_at, None);
+    assert!(
+        database
+            .find_emby_direct_playback_ticket("another-user", "stored-ticket-session")
+            .await?
+            .is_none()
+    );
+
+    assert!(
+        !database
+            .ensure_legacy_emby_direct_playback_ticket(&user_id, "stored-ticket-session", 500, 100,)
+            .await?
+    );
+    let unchanged = database
+        .find_emby_direct_playback_ticket(&user_id, "stored-ticket-session")
+        .await?
+        .ok_or("ticket disappeared after legacy ensure")?;
+    assert_eq!(
+        unchanged.authorization_device_id.as_deref(),
+        Some("device-1")
+    );
+
+    assert!(
+        database
+            .ensure_legacy_emby_direct_playback_ticket(&user_id, "legacy-ticket-session", 600, 100)
+            .await?
+    );
+    let legacy = database
+        .find_emby_direct_playback_ticket(&user_id, "legacy-ticket-session")
+        .await?
+        .ok_or("legacy ticket context was not created")?;
+    assert_eq!(legacy.authorization_device_id, None);
+    assert_eq!(legacy.authorization_client_name, None);
+
+    assert!(
+        database
+            .revoke_emby_direct_playback_ticket(&user_id, "stored-ticket-session", 200)
+            .await?
+    );
+    assert!(
+        !database
+            .revoke_emby_direct_playback_ticket(&user_id, "stored-ticket-session", 300)
+            .await?
+    );
+    assert_eq!(
+        database
+            .find_emby_direct_playback_ticket(&user_id, "stored-ticket-session")
+            .await?
+            .and_then(|ticket| ticket.revoked_at),
+        Some(200)
+    );
+
+    database
+        .insert_emby_direct_playback_ticket(NewEmbyDirectPlaybackTicket {
+            user_id: &user_id,
+            play_session_id: "expired-ticket-session",
+            authorization_device_id: None,
+            authorization_client_name: None,
+            expires_at: 150,
+            created_at: 100,
+        })
+        .await?;
+    assert_eq!(
+        database
+            .delete_expired_emby_direct_playback_tickets(151, 1)
+            .await?,
+        1
+    );
+    assert!(
+        database
+            .find_emby_direct_playback_ticket(&user_id, "expired-ticket-session")
+            .await?
+            .is_none()
+    );
+    sqlx::query(
+        "WITH RECURSIVE numbers(value) AS (
+             SELECT 1
+             UNION ALL
+             SELECT value + 1 FROM numbers WHERE value < 1001
+         )
+         INSERT INTO emby_direct_playback_tickets (
+             user_id, play_session_id, expires_at, created_at
+         )
+         SELECT ?, 'bounded-expired-' || value, 150, 100 FROM numbers",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(
+        database
+            .delete_expired_emby_direct_playback_tickets(151, 50_000)
+            .await?,
+        1_000
+    );
+    let remaining_expired: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM emby_direct_playback_tickets
+         WHERE user_id = ? AND expires_at < 151",
+    )
+    .bind(&user_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_expired, 1);
+    assert_eq!(
+        database
+            .delete_expired_emby_direct_playback_tickets(151, 0)
+            .await?,
+        1
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -20414,6 +26648,841 @@ async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_fin
 }
 
 #[tokio::test]
+async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subjects()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    let first_id = database
+        .insert_user_activity_event(NewUserActivityEvent {
+            user_id: "activity-index-subject",
+            actor_user_id: Some("activity-index-actor"),
+            event_type: "AUTH_LOGIN",
+            target_type: Some("media_item"),
+            target_id: Some("activity-index-item"),
+            metadata_json: r#"{
+                "remoteIp":"203.0.113.8",
+                "nested":{"accessToken":"do-not-store-this"},
+                "requestUrl":"https://private.example/path"
+            }"#,
+        })
+        .await?;
+    let second_id = database
+        .insert_user_activity_event(NewUserActivityEvent {
+            user_id: "activity-index-subject",
+            actor_user_id: None,
+            event_type: "AUTH_LOGIN",
+            target_type: None,
+            target_id: None,
+            metadata_json: "not json",
+        })
+        .await?;
+
+    assert_ne!(first_id, second_id);
+    let first_row: (
+        String,
+        String,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+    ) = sqlx::query_as(
+        "SELECT id, user_id, actor_user_id, event_type, target_type, target_id,
+                metadata_json, occurred_at
+         FROM user_activity_events WHERE id = ?",
+    )
+    .bind(&first_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(first_row.0, first_id);
+    assert_eq!(first_row.1, "activity-index-subject");
+    assert_eq!(first_row.2.as_deref(), Some("activity-index-actor"));
+    assert_eq!(first_row.3, "AUTH_LOGIN");
+    assert_eq!(first_row.4.as_deref(), Some("media_item"));
+    assert_eq!(first_row.5.as_deref(), Some("activity-index-item"));
+    assert!(first_row.7 > 0);
+    assert!(!first_row.6.contains("do-not-store-this"));
+    assert!(!first_row.6.contains("private.example"));
+    let first_metadata: serde_json::Value = serde_json::from_str(&first_row.6)?;
+    assert_eq!(first_metadata["nested"]["accessToken"], "[REDACTED]");
+    assert_eq!(first_metadata["requestUrl"], "[REDACTED]");
+    assert_eq!(first_metadata["remoteIp"], "203.0.113.8");
+
+    let invalid_metadata: String =
+        sqlx::query_scalar("SELECT metadata_json FROM user_activity_events WHERE id = ?")
+            .bind(second_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(invalid_metadata, r#"{"invalid":true}"#);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_observations_merge_monotonically_and_are_user_scoped()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, normalized) in [
+        ("device-observation-owner", "device-observation-owner"),
+        ("device-observation-other", "device-observation-other"),
+    ] {
+        database
+            .query(
+                "INSERT INTO users (id, username_normalized, display_name, password_hash)
+                 VALUES (?, ?, ?, 'test-hash')",
+            )
+            .bind(user_id)
+            .bind(normalized)
+            .bind(user_id)
+            .execute(database.pool())
+            .await?;
+    }
+
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: Some("Phone"),
+            device_type: Some("Mobile"),
+            client_name: "Lux Web",
+            client_version: Some("1.0"),
+            last_remote_ip: Some("198.51.100.1"),
+            seen_at: 100,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: Some("Phone Updated"),
+            device_type: Some("Mobile"),
+            client_name: "Lux Prism",
+            client_version: Some("2.0"),
+            last_remote_ip: Some("198.51.100.2"),
+            seen_at: 200,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: Some("Outdated Name"),
+            device_type: Some("Unknown"),
+            client_name: "Outdated Client",
+            client_version: Some("0.9"),
+            last_remote_ip: Some("198.51.100.0"),
+            seen_at: 50,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-owner",
+            device_id: "shared-device",
+            device_name: None,
+            device_type: None,
+            client_name: "Lux Prism",
+            client_version: None,
+            last_remote_ip: None,
+            seen_at: 250,
+        })
+        .await?;
+    database
+        .upsert_user_device(NewUserDeviceObservation {
+            user_id: "device-observation-other",
+            device_id: "shared-device",
+            device_name: Some("Other User Device"),
+            device_type: Some("TV"),
+            client_name: "Other Client",
+            client_version: Some("3.0"),
+            last_remote_ip: Some("203.0.113.3"),
+            seen_at: 300,
+        })
+        .await?;
+
+    let owner_record: (
+        Option<String>,
+        Option<String>,
+        String,
+        Option<String>,
+        i64,
+        i64,
+        Option<String>,
+    ) = sqlx::query_as(
+        "SELECT device_name, device_type, client_name, client_version,
+                first_seen_at, last_seen_at, last_remote_ip
+         FROM user_devices
+         WHERE user_id = 'device-observation-owner' AND device_id = 'shared-device'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(owner_record.0.as_deref(), Some("Phone Updated"));
+    assert_eq!(owner_record.1.as_deref(), Some("Mobile"));
+    assert_eq!(owner_record.2, "Lux Prism");
+    assert_eq!(owner_record.3.as_deref(), Some("2.0"));
+    assert_eq!(owner_record.4, 50);
+    assert_eq!(owner_record.5, 250);
+    assert_eq!(owner_record.6.as_deref(), Some("198.51.100.2"));
+
+    let user_scoped_devices: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_devices WHERE device_id = 'shared-device'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(user_scoped_devices, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_device_listing_is_scoped_stable_and_bounded() -> Result<(), Box<dyn std::error::Error>>
+{
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    for (user_id, normalized) in [
+        ("device-list-owner", "device-list-owner"),
+        ("device-list-other", "device-list-other"),
+    ] {
+        database
+            .query(
+                "INSERT INTO users (id, username_normalized, display_name, password_hash)
+                 VALUES (?, ?, ?, 'test-hash')",
+            )
+            .bind(user_id)
+            .bind(normalized)
+            .bind(user_id)
+            .execute(database.pool())
+            .await?;
+    }
+    for (user_id, device_id, device_name, client_name, seen_at) in [
+        (
+            "device-list-owner",
+            "device-b",
+            Some("Phone B"),
+            "Infuse",
+            300_i64,
+        ),
+        (
+            "device-list-owner",
+            "device-a",
+            Some("Phone A"),
+            "Lux Web",
+            300_i64,
+        ),
+        ("device-list-owner", "device-c", None, "Kodi", 200_i64),
+        (
+            "device-list-other",
+            "other-device",
+            Some("Other User Device"),
+            "Other Client",
+            999_i64,
+        ),
+    ] {
+        database
+            .upsert_user_device(NewUserDeviceObservation {
+                user_id,
+                device_id,
+                device_name,
+                device_type: Some("TEST"),
+                client_name,
+                client_version: Some("1.2.3"),
+                last_remote_ip: Some("203.0.113.10"),
+                seen_at,
+            })
+            .await?;
+    }
+    sqlx::query(
+        "INSERT INTO web_sessions (
+             id, user_id, session_token_hash, csrf_token_hash, expires_at, device_id
+         ) VALUES ('device-a-web-session', 'device-list-owner', X'01', X'11', unixepoch() + 3600, 'device-a'),
+                  ('device-c-expired-web-session', 'device-list-owner', X'02', X'12', unixepoch() - 1, 'device-c')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO access_tokens (
+             id, token_hash, user_id, device_id, client_name, device_name,
+             client_version, created_at, updated_at, revoked_at
+         ) VALUES ('device-b-emby-token', X'21', 'device-list-owner', 'device-b', 'Emby', 'Phone B', '1.0', unixepoch(), unixepoch(), NULL),
+                  ('device-c-revoked-emby-token', X'22', 'device-list-owner', 'device-c', 'Emby', 'Tablet C', '1.0', unixepoch(), unixepoch(), unixepoch())",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let (first_page, total_count) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 0,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(total_count, 3);
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|device| device.device_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["device-a", "device-b"]
+    );
+    assert_eq!(first_page[0].device_name.as_deref(), Some("Phone A"));
+    assert_eq!(first_page[0].device_type.as_deref(), Some("TEST"));
+    assert_eq!(first_page[0].client_name, "Lux Web");
+    assert_eq!(first_page[0].client_version.as_deref(), Some("1.2.3"));
+    assert_eq!(first_page[0].first_seen_at, 300);
+    assert_eq!(first_page[0].last_seen_at, 300);
+    assert!(first_page[0].has_active_login);
+    assert!(first_page[1].has_active_login);
+    assert_eq!(
+        first_page[0].last_remote_ip.as_deref(),
+        Some("203.0.113.10")
+    );
+
+    let (second_page, second_total) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 2,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(second_total, 3);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].device_id, "device-c");
+    assert!(!second_page[0].has_active_login);
+
+    let (empty_page, empty_total) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 100,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(empty_total, 3);
+    assert!(empty_page.is_empty());
+
+    let (negative_offset_page, _) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: -1,
+            limit: 0,
+        })
+        .await?;
+    assert_eq!(negative_offset_page.len(), 1);
+    assert_eq!(negative_offset_page[0].device_id, "device-a");
+
+    for index in 0..101_i64 {
+        let device_id = format!("overflow-{index:03}");
+        database
+            .upsert_user_device(NewUserDeviceObservation {
+                user_id: "device-list-owner",
+                device_id: &device_id,
+                device_name: None,
+                device_type: Some("TEST"),
+                client_name: "Client",
+                client_version: None,
+                last_remote_ip: None,
+                seen_at: 1000 + index,
+            })
+            .await?;
+    }
+    let (bounded_page, bounded_total) = database
+        .list_user_devices_page(UserDevicePageQuery {
+            user_id: "device-list-owner",
+            offset: 0,
+            limit: 101,
+        })
+        .await?;
+    assert_eq!(bounded_total, 104);
+    assert_eq!(bounded_page.len(), 100);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_activity_index_query_filters_and_pages_in_stable_order()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, user_id, event_type, occurred_at) in [
+        ("login-10", "timeline-user", "AUTH_LOGIN", 10_i64),
+        ("pause-20", "timeline-user", "PLAYBACK_PAUSED", 20),
+        ("started-20", "timeline-user", "PLAYBACK_STARTED", 20),
+        ("before-9", "timeline-user", "AUTH_LOGIN", 9),
+        ("other-30", "other-timeline-user", "AUTH_LOGIN", 30),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, event_type, occurred_at)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(user_id)
+        .bind(event_type)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first_page, total_count) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: Some(10),
+            to_at: Some(20),
+            offset: 0,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(total_count, 3);
+    assert_eq!(
+        first_page
+            .iter()
+            .map(|event: &StoredUserActivityEvent| event.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["started-20", "pause-20"]
+    );
+    assert_eq!(first_page[0].user_id, "timeline-user");
+    assert_eq!(first_page[0].event_type, "PLAYBACK_STARTED");
+    assert_eq!(first_page[0].occurred_at, 20);
+
+    let (second_page, second_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: Some(10),
+            to_at: Some(20),
+            offset: 2,
+            limit: 2,
+        })
+        .await?;
+    assert_eq!(second_total, 3);
+    assert_eq!(second_page.len(), 1);
+    assert_eq!(second_page[0].id, "login-10");
+
+    let (playback_events, playback_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: Some("PLAYBACK_PAUSED"),
+            from_at: None,
+            to_at: None,
+            offset: 0,
+            limit: 100,
+        })
+        .await?;
+    assert_eq!(playback_total, 1);
+    assert_eq!(playback_events[0].id, "pause-20");
+
+    for index in 0..101_i64 {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, event_type, occurred_at)
+             VALUES (?, 'timeline-user', 'FILLER', ?)",
+        )
+        .bind(format!("filler-{index:03}"))
+        .bind(100 + index)
+        .execute(database.pool())
+        .await?;
+    }
+    let (bounded_page, bounded_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: None,
+            to_at: None,
+            offset: -1,
+            limit: 1_000,
+        })
+        .await?;
+    assert_eq!(bounded_total, 105);
+    assert_eq!(bounded_page.len(), 100);
+    assert_eq!(bounded_page[0].id, "filler-100");
+
+    let (past_end, past_end_total) = database
+        .list_user_activity_events(UserActivityEventQuery {
+            user_id: "timeline-user",
+            event_type: None,
+            from_at: None,
+            to_at: None,
+            offset: 10_000,
+            limit: 20,
+        })
+        .await?;
+    assert!(past_end.is_empty());
+    assert_eq!(past_end_total, 105);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_activity_index_retention_deletes_old_events_in_bounded_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for (id, occurred_at) in [
+        ("retention-old-a", 10_i64),
+        ("retention-old-b", 10),
+        ("retention-old-c", 99),
+        ("retention-boundary", 100),
+        ("retention-new", 101),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_activity_events (id, user_id, event_type, occurred_at)
+             VALUES (?, 'retention-user', 'AUTH_LOGIN', ?)",
+        )
+        .bind(id)
+        .bind(occurred_at)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO audit_events (id, event_type, metadata_json, created_at)
+         VALUES ('retention-audit', 'AUTH_LOGIN', '{}', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(
+        database.delete_user_activity_events_before(100, 2).await?,
+        2
+    );
+    let old_after_first_batch: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_activity_events WHERE occurred_at < 100")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(old_after_first_batch, 1);
+    assert_eq!(
+        database.delete_user_activity_events_before(100, 2).await?,
+        1
+    );
+    assert_eq!(
+        database.delete_user_activity_events_before(100, 2).await?,
+        0
+    );
+    let retained_ids: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM user_activity_events ORDER BY occurred_at, id")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(retained_ids, vec!["retention-boundary", "retention-new"]);
+    let audit_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM audit_events WHERE id = 'retention-audit'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(audit_count, 1);
+    assert_eq!(database.delete_user_activity_events_before(0, 0).await?, 0);
+    assert_eq!(database.delete_user_activity_events_before(0, -1).await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_activity_retention_setting_defaults_validates_and_recovers_invalid_values()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    assert_eq!(database.user_activity_retention_days().await?, 90);
+    database.set_user_activity_retention_days(180).await?;
+    assert_eq!(database.user_activity_retention_days().await?, 180);
+    assert!(database.set_user_activity_retention_days(0).await.is_err());
+    assert!(database.set_user_activity_retention_days(-1).await.is_err());
+    assert!(
+        database
+            .set_user_activity_retention_days(3_651)
+            .await
+            .is_err()
+    );
+    assert_eq!(database.user_activity_retention_days().await?, 180);
+
+    sqlx::query(
+        "UPDATE server_settings SET value = 'not-a-number'
+         WHERE key = 'user_activity_retention_days'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.user_activity_retention_days().await?, 90);
+    sqlx::query(
+        "UPDATE server_settings SET value = '0'
+         WHERE key = 'user_activity_retention_days'",
+    )
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.user_activity_retention_days().await?, 90);
+    Ok(())
+}
+
+#[tokio::test]
+async fn trusted_proxy_cidrs_setting_reads_and_replaces_raw_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+
+    assert_eq!(database.trusted_proxy_cidrs_json().await?, None);
+    database
+        .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+        .await?;
+    assert_eq!(
+        database.trusted_proxy_cidrs_json().await?.as_deref(),
+        Some("[\"10.0.0.0/8\"]")
+    );
+    database
+        .set_trusted_proxy_cidrs_json("[\"192.0.2.0/24\",\"2001:db8::/32\"]")
+        .await?;
+    assert_eq!(
+        database.trusted_proxy_cidrs_json().await?.as_deref(),
+        Some("[\"192.0.2.0/24\",\"2001:db8::/32\"]")
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_emby_login_session_page_is_bounded_and_excludes_revoked_tokens()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in ["emby-page-user", "emby-page-other"] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test')",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, user_id, updated_at, last_seen_at, revoked_at) in [
+        ("older", "emby-page-user", 120_i64, Some(130_i64), None),
+        ("newer", "emby-page-user", 140, Some(150), None),
+        ("revoked", "emby-page-user", 1_000, Some(1_000), Some(1_100)),
+        ("other-user", "emby-page-other", 2_000, Some(2_000), None),
+    ] {
+        let mut token_hash = id.as_bytes().to_vec();
+        token_hash.resize(32, 0);
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name,
+                client_version, device_type, created_at, updated_at, last_seen_at, revoked_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 100, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(format!("device-{id}"))
+        .bind("Emby")
+        .bind(format!("Device {id}"))
+        .bind("1.2.3")
+        .bind("TV")
+        .bind(updated_at)
+        .bind(last_seen_at)
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for index in 0..101_i64 {
+        let id = format!("filler-{index:03}");
+        let last_seen_at = (index != 100).then_some(110_i64);
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name,
+                client_version, device_type, created_at, updated_at, last_seen_at
+             ) VALUES (?, ?, 'emby-page-user', ?, 'Emby', ?, '1.2.3', 'TV', 100, 110, ?)",
+        )
+        .bind(&id)
+        .bind(vec![index as u8; 32])
+        .bind(format!("device-{id}"))
+        .bind(format!("Device {id}"))
+        .bind(last_seen_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first_page, total_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 1, 0)
+        .await?;
+    assert_eq!(total_count, 103);
+    assert_eq!(first_page.len(), 1);
+    assert_eq!(first_page[0].id, "newer");
+    assert_eq!(first_page[0].device_id, "device-newer");
+    assert_eq!(first_page[0].device_name, "Device newer");
+    assert_eq!(first_page[0].device_type.as_deref(), Some("TV"));
+    assert_eq!(first_page[0].client_name, "Emby");
+    assert_eq!(first_page[0].client_version, "1.2.3");
+    assert_eq!(first_page[0].created_at, 100);
+    assert_eq!(first_page[0].updated_at, 140);
+    assert_eq!(first_page[0].last_seen_at, Some(150));
+    assert!(!format!("{:?}", first_page[0]).contains("token_hash"));
+
+    let (second_page, second_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 1, 1)
+        .await?;
+    assert_eq!(second_count, 103);
+    assert_eq!(second_page[0].id, "older");
+    let (tie_page, tie_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 2, 2)
+        .await?;
+    assert_eq!(tie_count, 103);
+    assert_eq!(tie_page[0].id, "filler-100");
+    assert_eq!(tie_page[0].last_seen_at, None);
+    assert_eq!(tie_page[1].id, "filler-099");
+    let (bounded_page, bounded_count) = database
+        .list_user_emby_login_sessions_for_admin("emby-page-user", 1_000, -4)
+        .await?;
+    assert_eq!(bounded_count, 103);
+    assert_eq!(bounded_page.len(), 100);
+    assert_eq!(bounded_page[0].id, "newer");
+    assert!(bounded_page.iter().all(|session| session.id != "revoked"));
+    assert!(
+        bounded_page
+            .iter()
+            .all(|session| session.id != "other-user")
+    );
+    let (empty_page, empty_count) = database
+        .list_user_emby_login_sessions_for_admin("missing-user", 50, 0)
+        .await?;
+    assert!(empty_page.is_empty());
+    assert_eq!(empty_count, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_emby_login_session_revocation_is_scoped_and_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    for user_id in ["emby-revoke-user", "emby-revoke-other"] {
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES (?, ?, ?, 'test')",
+        )
+        .bind(user_id)
+        .bind(user_id)
+        .bind(user_id)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, user_id, revoked_at) in [
+        ("target-one", "emby-revoke-user", None),
+        ("target-two", "emby-revoke-user", None),
+        ("target-revoked", "emby-revoke-user", Some(777_i64)),
+        ("other-active", "emby-revoke-other", None),
+    ] {
+        let mut token_hash = id.as_bytes().to_vec();
+        token_hash.resize(32, 0);
+        sqlx::query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name,
+                client_version, created_at, updated_at, revoked_at
+             ) VALUES (?, ?, ?, ?, 'Emby', ?, '1.2.3', 100, 100, ?)",
+        )
+        .bind(id)
+        .bind(token_hash)
+        .bind(user_id)
+        .bind(format!("device-{id}"))
+        .bind(format!("Device {id}"))
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let emby_auth = crate::auth::emby::EmbyAuthService::new(database.clone())?;
+    let (initial_sessions, initial_count) = emby_auth
+        .list_admin_login_sessions("emby-revoke-user", 100, 0)
+        .await?;
+    assert_eq!(initial_count, 2);
+    assert_eq!(initial_sessions.len(), 2);
+    assert!(
+        initial_sessions
+            .iter()
+            .all(|session| session.id != "target-revoked")
+    );
+
+    assert!(
+        emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "target-one")
+            .await?
+    );
+    assert!(
+        !emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "target-one")
+            .await?
+    );
+    assert!(
+        !emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "other-active")
+            .await?
+    );
+    assert!(
+        !emby_auth
+            .revoke_admin_login_session("emby-revoke-user", "missing-session")
+            .await?
+    );
+
+    let all_revoked = emby_auth
+        .revoke_all_admin_login_sessions("emby-revoke-user")
+        .await?;
+    assert_eq!(all_revoked, 1);
+    assert_eq!(
+        emby_auth
+            .revoke_all_admin_login_sessions("emby-revoke-user")
+            .await?,
+        0
+    );
+    let target_revocations: Vec<(String, Option<i64>)> = sqlx::query_as(
+        "SELECT id, revoked_at FROM access_tokens WHERE user_id = 'emby-revoke-user' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(target_revocations.len(), 3);
+    assert!(
+        target_revocations
+            .iter()
+            .all(|(_, revoked_at)| revoked_at.is_some())
+    );
+    assert_eq!(
+        target_revocations
+            .iter()
+            .find(|(id, _)| id == "target-revoked")
+            .map(|(_, revoked_at)| *revoked_at),
+        Some(Some(777))
+    );
+    let other_revocation: Option<i64> =
+        sqlx::query_scalar("SELECT revoked_at FROM access_tokens WHERE id = 'other-active'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(other_revocation, None);
+    Ok(())
+}
+
+#[tokio::test]
 async fn library_pipeline_activity_page_is_bounded_and_aggregates_scan_status()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::StoredPipelineStageKind;
@@ -21759,4 +28828,1483 @@ async fn postgres_scan_job_retry_diagnostics() -> Result<(), Box<dyn std::error:
     outcome??;
     drop_database?;
     Ok(())
+}
+
+#[tokio::test]
+async fn registration_mode_defaults_validates_and_uses_versioned_updates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    assert_registration_mode_contract(&database).await
+}
+
+async fn assert_registration_mode_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::settings::{
+        RegistrationModeError, read_registration_mode, update_registration_mode,
+    };
+    use crate::storage::RegistrationMode;
+
+    let initial = read_registration_mode(database)
+        .await
+        .map_err(|_| "read failed")?;
+    assert_eq!(initial.mode, RegistrationMode::InvitationOnly);
+    assert_eq!(initial.version, 0);
+    database
+        .query(
+            "INSERT INTO server_settings (key, value) VALUES ('mail-test-sentinel', 'untouched')",
+        )
+        .execute(database.pool())
+        .await?;
+
+    assert!(matches!(
+        update_registration_mode(database, "PUBLIC", 0).await,
+        Err(RegistrationModeError::InvalidMode)
+    ));
+    assert!(matches!(
+        update_registration_mode(database, "PUBLIC_EMAIL", -1).await,
+        Err(RegistrationModeError::InvalidMode)
+    ));
+    let saved = update_registration_mode(database, "PUBLIC_EMAIL", 0)
+        .await
+        .map_err(|_| "update failed")?;
+    assert_eq!(saved.mode, RegistrationMode::PublicEmail);
+    assert_eq!(saved.version, 1);
+    assert!(matches!(
+        update_registration_mode(database, "INVITATION_ONLY", 0).await,
+        Err(RegistrationModeError::Conflict)
+    ));
+
+    assert!(
+        !database
+            .compare_and_set_registration_mode(&initial, RegistrationMode::InvitationOnly)
+            .await?
+    );
+    let snapshot = database.registration_mode().await?;
+    let other_snapshot = database.registration_mode().await?;
+    let (one, two) = tokio::join!(
+        database.compare_and_set_registration_mode(&snapshot, RegistrationMode::InvitationOnly),
+        database.compare_and_set_registration_mode(&other_snapshot, RegistrationMode::PublicEmail),
+    );
+    assert_eq!(usize::from(one?) + usize::from(two?), 1);
+    assert_eq!(
+        read_registration_mode(database)
+            .await
+            .map_err(|_| "read failed")?
+            .version,
+        2
+    );
+    let sentinel: String = database
+        .query_scalar("SELECT value FROM server_settings WHERE key = 'mail-test-sentinel'")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(sentinel, "untouched");
+
+    for damaged in [
+        "broken",
+        r#"{"mode":"FUTURE","version":5}"#,
+        r#"{"mode":"PUBLIC_EMAIL","version":-1}"#,
+        r#"{"mode":"PUBLIC_EMAIL","version":0}"#,
+    ] {
+        database
+            .query("UPDATE server_settings SET value = ? WHERE key = 'registration_mode'")
+            .bind(damaged)
+            .execute(database.pool())
+            .await?;
+        let fallback = read_registration_mode(database)
+            .await
+            .map_err(|_| "read failed")?;
+        assert_eq!(fallback.mode, RegistrationMode::InvitationOnly);
+        assert_eq!(fallback.version, 0);
+        let repaired = update_registration_mode(database, "INVITATION_ONLY", 0)
+            .await
+            .map_err(|_| "repair failed")?;
+        assert_eq!(repaired.version, 1);
+    }
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_registration_mode_contract() -> Result<(), Box<dyn std::error::Error>> {
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let result = async {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: database_name.clone(),
+                ..admin_connection
+            }),
+        )
+        .await?;
+        let result = assert_registration_mode_contract(&database).await;
+        database.close().await;
+        result
+    }
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    result
+}
+
+const REGISTRATION_TEST_PERMISSION_SNAPSHOT: &str = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"NONE","libraryIds":[],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#;
+
+fn registration_storage_bundle<'a>(
+    id: &'a str,
+    recipient_email: &'a str,
+    username_normalized: &'a str,
+    challenge_id: &'a str,
+    idempotency_key: &'a str,
+    expires_at: i64,
+    now: i64,
+    token_hash: &'a [u8],
+) -> (
+    NewUserRegistrationRequest<'a>,
+    NewMailChallenge<'a>,
+    NewMailOutboxMessage<'a>,
+) {
+    (
+        NewUserRegistrationRequest {
+            id,
+            recipient_email,
+            username_normalized,
+            display_name: "Registration Applicant",
+            password_hash: "$argon2id$registration-test-hash",
+            permission_snapshot_json: REGISTRATION_TEST_PERMISSION_SNAPSHOT,
+            expires_at,
+        },
+        NewMailChallenge {
+            id: challenge_id,
+            kind: MailChallengeKind::EmailVerification,
+            recipient_email,
+            reference_id: id,
+            token_hash,
+            expires_at,
+        },
+        NewMailOutboxMessage {
+            idempotency_key,
+            recipient_email,
+            template_kind: MailOutboxTemplateKind::EmailVerification,
+            reference_id: challenge_id,
+            available_at: now,
+        },
+    )
+}
+
+async fn exercise_user_registration_storage(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('registration-reviewer', 'registration-reviewer', 'Reviewer', 'test-hash')",
+        )
+        .execute(database.pool())
+        .await?;
+    database
+        .query("INSERT INTO libraries (id, name, kind) VALUES ('registration-library', 'Registration', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+
+    let main_hash = [51_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-main",
+        "registration-main@example.test",
+        "registration-main",
+        "registration-main-challenge",
+        "registration-main-mail",
+        5_000,
+        1_000,
+        &main_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_000)
+            .await?,
+        UserRegistrationCreateResult::Created
+    );
+    let duplicate_hash = [52_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-duplicate",
+        "registration-main@example.test",
+        "registration-duplicate",
+        "registration-duplicate-challenge",
+        "registration-duplicate-mail",
+        5_000,
+        1_001,
+        &duplicate_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_001)
+            .await?,
+        UserRegistrationCreateResult::AlreadyExists
+    );
+    assert!(
+        database
+            .get_mail_challenge("registration-duplicate-challenge")
+            .await?
+            .is_none()
+    );
+    database
+        .query(
+            "UPDATE mail_outbox SET status = 'SENT', sent_at = 1_000
+             WHERE idempotency_key = 'registration-main-mail'",
+        )
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-1",
+                1_001,
+            )
+            .await?,
+        UserRegistrationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-1",
+                1_002,
+            )
+            .await?,
+        UserRegistrationResendResult::Queued
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = 'registration-main@example.test'
+                   AND template_kind = 'EMAIL_VERIFICATION'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        2
+    );
+    for (idempotency_key, previous_key, now) in [
+        (
+            "registration-main-resend-2",
+            "registration-main-resend-1",
+            1_003_i64,
+        ),
+        (
+            "registration-main-resend-3",
+            "registration-main-resend-2",
+            1_004_i64,
+        ),
+        (
+            "registration-main-resend-4",
+            "registration-main-resend-3",
+            1_005_i64,
+        ),
+    ] {
+        database
+            .query("UPDATE mail_outbox SET status = 'SENT', sent_at = ? WHERE idempotency_key = ?")
+            .bind(now - 1)
+            .bind(previous_key)
+            .execute(database.pool())
+            .await?;
+        assert_eq!(
+            database
+                .queue_user_registration_resend(
+                    "registration-main@example.test",
+                    idempotency_key,
+                    now,
+                )
+                .await?,
+            UserRegistrationResendResult::Queued
+        );
+    }
+    database
+        .query(
+            "UPDATE mail_outbox SET status = 'SENT', sent_at = 1_005
+             WHERE idempotency_key = 'registration-main-resend-4'",
+        )
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-5",
+                1_006,
+            )
+            .await?,
+        UserRegistrationResendResult::RateLimited
+    );
+    let challenge_before_verify: (i64, i64, Option<i64>, Option<i64>) = database
+        .query_as(
+            "SELECT expires_at, created_at, consumed_at, revoked_at FROM mail_challenges
+             WHERE id = 'registration-main-challenge'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(challenge_before_verify, (5_000, 1_000, None, None));
+    let main_snapshot: (String, String, i64) = database
+        .query_as(
+            "SELECT permission_snapshot_json, status, expires_at
+             FROM user_registration_requests WHERE id = 'registration-main'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(main_snapshot.0, REGISTRATION_TEST_PERMISSION_SNAPSHOT);
+    assert_eq!(main_snapshot.1, "PENDING_EMAIL");
+    assert_eq!(main_snapshot.2, 5_000);
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "missing-registration@example.test",
+                "missing-resend",
+                1_007
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
+    );
+    let conflict_hash = [59_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-resend-conflict",
+        "registration-resend-conflict@example.test",
+        "registration-resend-conflict",
+        "registration-resend-conflict-challenge",
+        "registration-resend-conflict-mail",
+        5_000,
+        1_008,
+        &conflict_hash,
+    );
+    assert_eq!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_008)
+            .await?,
+        UserRegistrationCreateResult::Created
+    );
+    assert!(
+        database
+            .queue_user_registration_resend(
+                "registration-resend-conflict@example.test",
+                "registration-main-resend-1",
+                1_009,
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM mail_outbox
+                 WHERE recipient_email = 'registration-resend-conflict@example.test'
+                   AND template_kind = 'EMAIL_VERIFICATION'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    let stored_challenge = database
+        .get_user_registration_challenge_by_token_hash(&main_hash, 1_000)
+        .await?
+        .ok_or("valid registration challenge was not found by token hash")?;
+    assert_eq!(stored_challenge.id, "registration-main-challenge");
+    assert_eq!(stored_challenge.expires_at, 5_000);
+    assert!(
+        database
+            .get_user_registration_challenge_by_token_hash(&[99_u8; 32], 1_000)
+            .await?
+            .is_none()
+    );
+
+    let rollback_hash = [53_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-rollback",
+        "registration-rollback@example.test",
+        "registration-rollback",
+        "registration-rollback-challenge",
+        "registration-main-mail",
+        5_000,
+        1_002,
+        &rollback_hash,
+    );
+    assert!(
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_002)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM user_registration_requests WHERE id = 'registration-rollback'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    assert!(
+        database
+            .get_mail_challenge("registration-rollback-challenge")
+            .await?
+            .is_none()
+    );
+
+    let revoked_hash = [54_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-revoked",
+        "registration-revoked@example.test",
+        "registration-revoked",
+        "registration-revoked-challenge",
+        "registration-revoked-mail",
+        5_000,
+        1_003,
+        &revoked_hash,
+    );
+    database
+        .create_user_registration_request_with_mail(request, challenge, outbox, 1_003)
+        .await?;
+    database
+        .query("UPDATE mail_challenges SET revoked_at = 1_004 WHERE id = 'registration-revoked-challenge'")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-revoked@example.test",
+                "registration-revoked-resend",
+                1_005,
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
+    );
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-revoked-challenge", &revoked_hash, 1_005)
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    let (revoked_status, revoked_hash): (String, Option<String>) = database
+        .query_as(
+            "SELECT status, password_hash FROM user_registration_requests WHERE id = 'registration-revoked'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(revoked_status, "PENDING_EMAIL");
+    assert!(revoked_hash.is_some());
+
+    let invalid_digest = [55_u8; 32];
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-main-challenge", &invalid_digest, 1_010)
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-main-challenge", &main_hash, 1_010)
+            .await?,
+        UserRegistrationVerifyResult::Verified
+    );
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-main@example.test",
+                "registration-main-resend-after-verify",
+                1_010,
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
+    );
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-main-challenge", &main_hash, 1_011)
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    assert!(
+        database
+            .get_user_registration_challenge_by_token_hash(&main_hash, 1_011)
+            .await?
+            .is_none()
+    );
+    let page = database
+        .list_user_registration_requests_page(
+            Some(UserRegistrationStatus::PendingApproval),
+            1_000,
+            0,
+            1_011,
+        )
+        .await?;
+    assert_eq!(page.page_size, 100);
+    assert_eq!(page.total_count, 1);
+    assert_eq!(page.requests[0].id, "registration-main");
+    assert_eq!(
+        page.requests[0].status,
+        UserRegistrationStatus::PendingApproval
+    );
+    assert_eq!(page.requests[0].email_verified_at, Some(1_010));
+    assert_eq!(
+        page.requests[0].permission_snapshot_json,
+        REGISTRATION_TEST_PERMISSION_SNAPSHOT
+    );
+
+    let missing_library_permissions = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["missing-registration-library"],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#;
+    assert!(
+        database
+            .approve_user_registration_request(
+                "registration-main",
+                "registration-reviewer",
+                missing_library_permissions,
+                1_020,
+            )
+            .await
+            .is_err()
+    );
+    let (pending_status, pending_hash): (String, Option<String>) = database
+        .query_as(
+            "SELECT status, password_hash FROM user_registration_requests WHERE id = 'registration-main'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(pending_status, "PENDING_APPROVAL");
+    assert!(pending_hash.is_some());
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM users WHERE email = 'registration-main@example.test'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+
+    let approved_permissions = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"SELECTED","libraryIds":["registration-library"],"canDownload":true,"canPlay":true,"maxSimultaneousPlaybacks":3,"allowRemux":false,"allowAudioTranscode":true,"allowVideoTranscode":false}}"#;
+    let (first_approval, second_approval) = tokio::join!(
+        database.approve_user_registration_request(
+            "registration-main",
+            "registration-reviewer",
+            approved_permissions,
+            1_030,
+        ),
+        database.approve_user_registration_request(
+            "registration-main",
+            "registration-reviewer",
+            approved_permissions,
+            1_030,
+        ),
+    );
+    let approvals = [first_approval?, second_approval?];
+    let approved_user_id = approvals
+        .iter()
+        .find_map(|result| match result {
+            UserRegistrationApproveResult::Approved(user_id) => Some(user_id.clone()),
+            _ => None,
+        })
+        .ok_or("registration was not approved")?;
+    assert_eq!(
+        approvals
+            .iter()
+            .filter(|result| matches!(result, UserRegistrationApproveResult::Approved(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        approvals
+            .iter()
+            .filter(|result| **result == UserRegistrationApproveResult::NotReviewable)
+            .count(),
+        1
+    );
+    let account: (String, Option<i64>, i64, i64, i64, String) = database
+        .query_as(
+            "SELECT email, email_verified_at, is_disabled, has_password, can_download, library_access_mode
+             FROM users WHERE id = ?",
+        )
+        .bind(&approved_user_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        account,
+        (
+            "registration-main@example.test".to_owned(),
+            Some(1_010),
+            0,
+            1,
+            1,
+            "SELECTED".to_owned()
+        )
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM user_library_access WHERE user_id = ? AND library_id = 'registration-library' AND can_view = 1",
+            )
+            .bind(&approved_user_id)
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .approve_user_registration_request(
+                "registration-main",
+                "registration-reviewer",
+                approved_permissions,
+                1_031,
+            )
+            .await?,
+        UserRegistrationApproveResult::NotReviewable
+    );
+
+    let reject_hash = [56_u8; 32];
+    let (request, challenge, outbox) = registration_storage_bundle(
+        "registration-rejected",
+        "registration-rejected@example.test",
+        "registration-rejected",
+        "registration-rejected-challenge",
+        "registration-rejected-mail",
+        5_000,
+        1_040,
+        &reject_hash,
+    );
+    database
+        .create_user_registration_request_with_mail(request, challenge, outbox, 1_040)
+        .await?;
+    assert_eq!(
+        database
+            .verify_user_registration_email("registration-rejected-challenge", &reject_hash, 1_050)
+            .await?,
+        UserRegistrationVerifyResult::Verified
+    );
+    assert_eq!(
+        database
+            .reject_user_registration_request(
+                "registration-rejected",
+                "registration-reviewer",
+                1_060
+            )
+            .await?,
+        UserRegistrationRejectResult::Rejected
+    );
+    assert_eq!(
+        database
+            .reject_user_registration_request(
+                "registration-rejected",
+                "registration-reviewer",
+                1_061
+            )
+            .await?,
+        UserRegistrationRejectResult::NotReviewable
+    );
+    let rejected: (String, Option<String>, Option<String>) = database
+        .query_as(
+            "SELECT status, password_hash, reviewed_by_user_id
+             FROM user_registration_requests WHERE id = 'registration-rejected'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        rejected,
+        (
+            "REJECTED".to_owned(),
+            None,
+            Some("registration-reviewer".to_owned())
+        )
+    );
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT status FROM mail_outbox WHERE idempotency_key = 'registration-rejected-mail'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        "FAILED"
+    );
+
+    for (id, byte) in [
+        ("registration-expiring-a", 57_u8),
+        ("registration-expiring-b", 58_u8),
+    ] {
+        let email = format!("{id}@example.test");
+        let challenge_id = format!("{id}-challenge");
+        let mail_id = format!("{id}-mail");
+        let username = id;
+        let token_hash = [byte; 32];
+        let (request, challenge, outbox) = registration_storage_bundle(
+            id,
+            &email,
+            username,
+            &challenge_id,
+            &mail_id,
+            1_100,
+            1_070,
+            &token_hash,
+        );
+        database
+            .create_user_registration_request_with_mail(request, challenge, outbox, 1_070)
+            .await?;
+    }
+    assert!(
+        database
+            .get_user_registration_challenge_by_token_hash(&[57_u8; 32], 1_100)
+            .await?
+            .is_none()
+    );
+    assert_eq!(
+        database
+            .verify_user_registration_email(
+                "registration-expiring-a-challenge",
+                &[57_u8; 32],
+                1_100
+            )
+            .await?,
+        UserRegistrationVerifyResult::NotAcceptable
+    );
+    let expired_page = database
+        .list_user_registration_requests_page(Some(UserRegistrationStatus::Expired), 100, 0, 1_100)
+        .await?;
+    assert_eq!(expired_page.total_count, 2);
+    assert!(expired_page.requests.iter().all(|request| {
+        matches!(
+            request.id.as_str(),
+            "registration-expiring-a" | "registration-expiring-b"
+        ) && request.status == UserRegistrationStatus::Expired
+    }));
+    let pending_email_page = database
+        .list_user_registration_requests_page(
+            Some(UserRegistrationStatus::PendingEmail),
+            100,
+            0,
+            1_100,
+        )
+        .await?;
+    assert_eq!(pending_email_page.total_count, 2);
+    assert!(pending_email_page.requests.iter().any(|request| {
+        request.id == "registration-revoked"
+            && request.status == UserRegistrationStatus::PendingEmail
+    }));
+    assert!(pending_email_page.requests.iter().any(|request| {
+        request.id == "registration-resend-conflict"
+            && request.status == UserRegistrationStatus::PendingEmail
+    }));
+    assert_eq!(
+        database.expire_user_registration_requests(1_100, 1).await?,
+        1
+    );
+    assert_eq!(
+        database
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) FROM user_registration_requests
+                 WHERE status = 'PENDING_EMAIL' AND expires_at <= 1100",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        1
+    );
+    assert_eq!(
+        database
+            .expire_user_registration_requests(1_100, 100)
+            .await?,
+        1
+    );
+    for id in ["registration-expiring-a", "registration-expiring-b"] {
+        let (status, password_hash): (String, Option<String>) = database
+            .query_as("SELECT status, password_hash FROM user_registration_requests WHERE id = ?")
+            .bind(id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(status, "EXPIRED");
+        assert!(password_hash.is_none());
+    }
+    assert_eq!(
+        database
+            .queue_user_registration_resend(
+                "registration-expiring-a@example.test",
+                "registration-expiring-resend",
+                1_100,
+            )
+            .await?,
+        UserRegistrationResendResult::NotResendable
+    );
+    assert_eq!(
+        database
+            .query_scalar::<String>(
+                "SELECT status FROM mail_outbox WHERE idempotency_key = 'registration-expiring-a-mail'",
+            )
+            .fetch_one(database.pool())
+            .await?,
+        "FAILED"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_registration_storage_contract_is_atomic_and_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    exercise_user_registration_storage(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_registration_storage_contract_is_atomic_and_bounded()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::{DatabaseConfiguration, PostgresConnection};
+
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let test_database_name = database_name.clone();
+    let task = tokio::spawn(async move {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(crate::config::PostgresConnection {
+                database: test_database_name,
+                ..admin_connection
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let result = exercise_user_registration_storage(&database)
+            .await
+            .map_err(|error| error.to_string());
+        database.close().await;
+        result
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    match task {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+async fn seed_email_change_user(
+    database: &Database,
+    id: &str,
+    email: &str,
+    verified_at: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .insert_user_with_email(NewStoredUser {
+            id,
+            username_normalized: id,
+            display_name: id,
+            password_hash: "test-hash",
+            is_admin: false,
+            has_password: true,
+            email: Some(email),
+        })
+        .await?;
+    database
+        .query("UPDATE users SET email_verified_at = ? WHERE id = ?")
+        .bind(verified_at)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
+async fn seed_email_change_challenge(
+    database: &Database,
+    id: &str,
+    user_id: &str,
+    email: &str,
+    token_hash: &[u8],
+    created_at: i64,
+    expires_at: i64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    database
+        .create_mail_challenge(
+            NewMailChallenge {
+                id,
+                kind: MailChallengeKind::EmailVerification,
+                recipient_email: email,
+                reference_id: user_id,
+                token_hash,
+                expires_at,
+            },
+            created_at,
+        )
+        .await?;
+    Ok(())
+}
+
+async fn exercise_user_email_change_storage_contract(
+    database: &Database,
+) -> Result<(), Box<dyn std::error::Error>> {
+    seed_email_change_user(database, "email-owner", "old@example.test", 100).await?;
+    seed_email_change_user(database, "email-conflict", "claimed@example.test", 100).await?;
+    let old_hash = [1_u8; 32];
+    let valid_hash = [2_u8; 32];
+    let conflict_hash = [3_u8; 32];
+    let expired_hash = [4_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-old",
+        "email-owner",
+        "previous-pending@example.test",
+        &old_hash,
+        110,
+        300,
+    )
+    .await?;
+    seed_email_change_challenge(
+        database,
+        "email-change-valid",
+        "email-owner",
+        "new@example.test",
+        &valid_hash,
+        111,
+        300,
+    )
+    .await?;
+    seed_email_change_challenge(
+        database,
+        "email-change-conflict",
+        "email-owner",
+        "CLAIMED@example.test",
+        &conflict_hash,
+        112,
+        300,
+    )
+    .await?;
+    seed_email_change_challenge(
+        database,
+        "email-change-expired",
+        "email-owner",
+        "expired@example.test",
+        &expired_hash,
+        113,
+        120,
+    )
+    .await?;
+
+    let before: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-owner")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(before, (Some("old@example.test".to_owned()), Some(100)));
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-valid", &[9_u8; 32], 150)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_email_change("email-conflict", "email-change-valid", &valid_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-expired", &expired_hash, 120)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-conflict", &conflict_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::EmailConflict
+    );
+    for id in [
+        "email-change-valid",
+        "email-change-expired",
+        "email-change-conflict",
+    ] {
+        let challenge = database
+            .get_mail_challenge(id)
+            .await?
+            .ok_or("pending email challenge disappeared")?;
+        assert_eq!(challenge.consumed_at, None);
+    }
+    let after_rejections: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-owner")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(after_rejections, before);
+
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-valid", &valid_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::Verified
+    );
+    let updated: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-owner")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(updated, (Some("new@example.test".to_owned()), Some(150)));
+    let consumed = database
+        .get_mail_challenge("email-change-valid")
+        .await?
+        .ok_or("consumed challenge disappeared")?;
+    assert_eq!(consumed.consumed_at, Some(150));
+    let revoked_old = database
+        .get_mail_challenge("email-change-old")
+        .await?
+        .ok_or("old challenge disappeared")?;
+    assert_eq!(revoked_old.revoked_at, Some(150));
+    assert_eq!(
+        database
+            .verify_user_email_change("email-owner", "email-change-valid", &valid_hash, 151)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+
+    seed_email_change_user(database, "email-disabled", "disabled@example.test", 100).await?;
+    let disabled_hash = [5_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-disabled",
+        "email-disabled",
+        "disabled-new@example.test",
+        &disabled_hash,
+        120,
+        300,
+    )
+    .await?;
+    database
+        .query("UPDATE users SET is_disabled = 1 WHERE id = ?")
+        .bind("email-disabled")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .verify_user_email_change(
+                "email-disabled",
+                "email-change-disabled",
+                &disabled_hash,
+                150,
+            )
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    let disabled_challenge = database
+        .get_mail_challenge("email-change-disabled")
+        .await?
+        .ok_or("disabled user's challenge disappeared")?;
+    assert_eq!(disabled_challenge.consumed_at, None);
+    let disabled_user: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-disabled")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        disabled_user,
+        (Some("disabled@example.test".to_owned()), Some(100))
+    );
+
+    seed_email_change_user(database, "email-deleted", "deleted@example.test", 100).await?;
+    let deleted_hash = [6_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-deleted",
+        "email-deleted",
+        "deleted-new@example.test",
+        &deleted_hash,
+        120,
+        300,
+    )
+    .await?;
+    database
+        .query("DELETE FROM users WHERE id = ?")
+        .bind("email-deleted")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        database
+            .verify_user_email_change("email-deleted", "email-change-deleted", &deleted_hash, 150)
+            .await?,
+        UserEmailChangeVerifyResult::NotAcceptable
+    );
+    let deleted_challenge = database
+        .get_mail_challenge("email-change-deleted")
+        .await?
+        .ok_or("deleted user's challenge disappeared")?;
+    assert_eq!(deleted_challenge.consumed_at, None);
+
+    seed_email_change_user(database, "email-race", "race-old@example.test", 100).await?;
+    let race_hash = [7_u8; 32];
+    seed_email_change_challenge(
+        database,
+        "email-change-race",
+        "email-race",
+        "race-new@example.test",
+        &race_hash,
+        120,
+        300,
+    )
+    .await?;
+    let (first, second) = tokio::join!(
+        database.verify_user_email_change("email-race", "email-change-race", &race_hash, 150,),
+        database.verify_user_email_change("email-race", "email-change-race", &race_hash, 150,)
+    );
+    let outcomes = [first?, second?];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == UserEmailChangeVerifyResult::Verified)
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|outcome| **outcome == UserEmailChangeVerifyResult::NotAcceptable)
+            .count(),
+        1
+    );
+    let race_user: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-race")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        race_user,
+        (Some("race-new@example.test".to_owned()), Some(150))
+    );
+
+    seed_email_change_user(database, "email-request", "request-old@example.test", 100).await?;
+    let first_hash = [8_u8; 32];
+    let first_challenge = database
+        .create_user_email_change_with_mail(
+            "email-request",
+            NewMailChallenge {
+                id: "email-request-first",
+                kind: MailChallengeKind::EmailVerification,
+                recipient_email: "request-new@example.test",
+                reference_id: "email-request",
+                token_hash: &first_hash,
+                expires_at: 3_700,
+            },
+            NewMailOutboxMessage {
+                idempotency_key: "email-request-mail-first",
+                recipient_email: "request-new@example.test",
+                template_kind: MailOutboxTemplateKind::EmailVerification,
+                reference_id: "email-request-first",
+                available_at: 100,
+            },
+            None,
+            100,
+        )
+        .await?;
+    assert_eq!(first_challenge, UserEmailChangeCreateResult::Created);
+    let original_email: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-request")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(
+        original_email,
+        (Some("request-old@example.test".to_owned()), Some(100))
+    );
+    let first_pending = database
+        .get_pending_user_email_change("email-request", 101)
+        .await?
+        .ok_or("first pending email change was not found")?;
+    assert_eq!(first_pending.recipient_email, "request-new@example.test");
+    assert_eq!(first_pending.expires_at, 3_700);
+    assert_eq!(
+        database
+            .get_user_email_change_challenge_by_token_hash("email-request", &first_hash, 101)
+            .await?
+            .map(|challenge| challenge.id),
+        Some("email-request-first".to_owned())
+    );
+
+    let second_hash = [9_u8; 32];
+    assert_eq!(
+        database
+            .create_user_email_change_with_mail(
+                "email-request",
+                NewMailChallenge {
+                    id: "email-request-second",
+                    kind: MailChallengeKind::EmailVerification,
+                    recipient_email: "request-next@example.test",
+                    reference_id: "email-request",
+                    token_hash: &second_hash,
+                    expires_at: 3_800,
+                },
+                NewMailOutboxMessage {
+                    idempotency_key: "email-request-mail-second",
+                    recipient_email: "request-next@example.test",
+                    template_kind: MailOutboxTemplateKind::EmailVerification,
+                    reference_id: "email-request-second",
+                    available_at: 200,
+                },
+                None,
+                200,
+            )
+            .await?,
+        UserEmailChangeCreateResult::Created
+    );
+    let revoked_first = database
+        .get_mail_challenge("email-request-first")
+        .await?
+        .ok_or("first email change challenge disappeared")?;
+    assert_eq!(revoked_first.revoked_at, Some(200));
+    assert!(
+        database
+            .get_user_email_change_challenge_by_token_hash("email-request", &first_hash, 201)
+            .await?
+            .is_none()
+    );
+    let second_pending = database
+        .get_pending_user_email_change("email-request", 201)
+        .await?
+        .ok_or("second pending email change was not found")?;
+    assert_eq!(second_pending.recipient_email, "request-next@example.test");
+
+    let stale_resend_hash = [10_u8; 32];
+    assert_eq!(
+        database
+            .create_user_email_change_with_mail(
+                "email-request",
+                NewMailChallenge {
+                    id: "email-request-stale-resend",
+                    kind: MailChallengeKind::EmailVerification,
+                    recipient_email: "request-new@example.test",
+                    reference_id: "email-request",
+                    token_hash: &stale_resend_hash,
+                    expires_at: 3_900,
+                },
+                NewMailOutboxMessage {
+                    idempotency_key: "email-request-mail-stale-resend",
+                    recipient_email: "request-new@example.test",
+                    template_kind: MailOutboxTemplateKind::EmailVerification,
+                    reference_id: "email-request-stale-resend",
+                    available_at: 300,
+                },
+                Some("email-request-first"),
+                300,
+            )
+            .await?,
+        UserEmailChangeCreateResult::NotAcceptable
+    );
+    assert_eq!(
+        database
+            .get_mail_challenge("email-request-stale-resend")
+            .await?
+            .map(|challenge| challenge.id),
+        None
+    );
+    let stale_outbox_count: i64 = database
+        .query_scalar("SELECT COUNT(*) FROM mail_outbox WHERE idempotency_key = ?")
+        .bind("email-request-mail-stale-resend")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(stale_outbox_count, 0);
+    let still_pending = database
+        .get_pending_user_email_change("email-request", 301)
+        .await?
+        .ok_or("pending email change disappeared after stale resend")?;
+    assert_eq!(still_pending.id, "email-request-second");
+    assert_eq!(still_pending.recipient_email, "request-next@example.test");
+
+    seed_email_change_user(database, "email-clear", "clear-old@example.test", 100).await?;
+    let clear_hash = [11_u8; 32];
+    assert_eq!(
+        database
+            .create_user_email_change_with_mail(
+                "email-clear",
+                NewMailChallenge {
+                    id: "email-clear-challenge",
+                    kind: MailChallengeKind::EmailVerification,
+                    recipient_email: "clear-pending@example.test",
+                    reference_id: "email-clear",
+                    token_hash: &clear_hash,
+                    expires_at: 3_700,
+                },
+                NewMailOutboxMessage {
+                    idempotency_key: "email-clear-outbox",
+                    recipient_email: "clear-pending@example.test",
+                    template_kind: MailOutboxTemplateKind::EmailVerification,
+                    reference_id: "email-clear-challenge",
+                    available_at: 100,
+                },
+                None,
+                100,
+            )
+            .await?,
+        UserEmailChangeCreateResult::Created
+    );
+    assert!(database.clear_user_email_change("email-clear", 150).await?);
+    let cleared_user: (Option<String>, Option<i64>) = database
+        .query_as("SELECT email, email_verified_at FROM users WHERE id = ?")
+        .bind("email-clear")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cleared_user, (None, None));
+    let cleared_challenge = database
+        .get_mail_challenge("email-clear-challenge")
+        .await?
+        .ok_or("cleared email challenge disappeared")?;
+    assert_eq!(cleared_challenge.revoked_at, Some(150));
+    let cleared_outbox_status: String = database
+        .query_scalar("SELECT status FROM mail_outbox WHERE idempotency_key = ?")
+        .bind("email-clear-outbox")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(cleared_outbox_status, "FAILED");
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_email_change_storage_contract_is_atomic() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    exercise_user_email_change_storage_contract(&database).await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_user_email_change_storage_contract_is_atomic()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::{Config, DatabaseConfiguration, PostgresConnection};
+
+    let database_name = format!("lux_test_{}", Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let test_database_name = database_name.clone();
+    let task = tokio::spawn(async move {
+        let database = Database::connect_with_configuration(
+            &config,
+            &DatabaseConfiguration::Postgres(PostgresConnection {
+                database: test_database_name,
+                ..admin_connection
+            }),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+        let result = exercise_user_email_change_storage_contract(&database)
+            .await
+            .map_err(|error| error.to_string());
+        database.close().await;
+        result
+    })
+    .await;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE {database_name} WITH (FORCE)"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    admin_pool.close().await;
+    match task {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(error)) => Err(error.into()),
+        Err(error) => Err(error.into()),
+    }
 }

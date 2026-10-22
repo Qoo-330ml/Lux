@@ -2,8 +2,9 @@ use crate::{
     auth::password::{PasswordError, PasswordService},
     domain::ids::UserId,
     storage::{
-        AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser, StorageError,
-        StoredAdminUserListItem, UpdateUser, UserPlaybackPolicy,
+        AdminUserSortField, AdminUserStatusFilter, Database, NewStoredUser,
+        NewStoredUserPermissions, StorageError, StoredAdminUserListItem,
+        StoredUserPermissionPresetSource, UpdateUser, UserPlaybackPolicy,
     },
 };
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -30,6 +31,7 @@ pub struct AdminUserProfile {
     pub email_verified_at: Option<i64>,
     pub deleted_at: Option<i64>,
     pub deletion_purge_at: Option<i64>,
+    pub(crate) preset_source: Option<StoredUserPermissionPresetSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -41,6 +43,7 @@ pub(crate) struct AdminUserListEntry {
     pub deletion_purge_at: Option<i64>,
     pub created_at: i64,
     pub current_playback_count: i64,
+    pub preset_source: Option<StoredUserPermissionPresetSource>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,10 +139,11 @@ impl UserStore {
         let email = email.map(normalize_email).transpose()?;
         let password_hash = self.passwords.hash_password(password)?;
         let id = UserId::new();
+        let id_string = id.to_string();
 
         self.database
             .insert_user_with_email(NewStoredUser {
-                id: &id.to_string(),
+                id: &id_string,
                 username_normalized: &username_normalized,
                 display_name: &display_name,
                 password_hash: &password_hash,
@@ -159,6 +163,52 @@ impl UserStore {
             can_manage_server: is_admin,
             can_remote_access: false,
             can_download: false,
+            last_login_at: None,
+            last_activity_at: None,
+        })
+    }
+
+    pub(crate) async fn create_user_with_email_and_permission_snapshot(
+        &self,
+        username: &str,
+        display_name: &str,
+        password: &str,
+        is_admin: bool,
+        email: Option<&str>,
+        permissions: NewStoredUserPermissions<'_>,
+    ) -> Result<UserRecord, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        let display_name = normalized_display_name(display_name, &username_normalized);
+        let email = email.map(normalize_email).transpose()?;
+        let password_hash = self.passwords.hash_password(password)?;
+        let id = UserId::new();
+        let id_string = id.to_string();
+
+        self.database
+            .insert_user_with_email_and_permissions(
+                NewStoredUser {
+                    id: &id_string,
+                    username_normalized: &username_normalized,
+                    display_name: &display_name,
+                    password_hash: &password_hash,
+                    is_admin,
+                    has_password: true,
+                    email: email.as_deref(),
+                },
+                permissions,
+            )
+            .await?;
+
+        Ok(UserRecord {
+            id,
+            username_normalized,
+            display_name,
+            has_password: true,
+            is_disabled: false,
+            is_admin,
+            can_manage_server: is_admin,
+            can_remote_access: false,
+            can_download: permissions.can_download,
             last_login_at: None,
             last_activity_at: None,
         })
@@ -202,6 +252,50 @@ impl UserStore {
         })
     }
 
+    pub(crate) async fn create_user_without_password_with_permission_snapshot(
+        &self,
+        username: &str,
+        display_name: &str,
+        is_admin: bool,
+        permissions: NewStoredUserPermissions<'_>,
+    ) -> Result<UserRecord, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        let display_name = normalized_display_name(display_name, &username_normalized);
+        let placeholder = format!("lux-unset-password-{}", UserId::new());
+        let password_hash = self.passwords.hash_password(&placeholder)?;
+        let id = UserId::new();
+        let id_string = id.to_string();
+
+        self.database
+            .insert_user_with_email_and_permissions(
+                NewStoredUser {
+                    id: &id_string,
+                    username_normalized: &username_normalized,
+                    display_name: &display_name,
+                    password_hash: &password_hash,
+                    is_admin,
+                    has_password: false,
+                    email: None,
+                },
+                permissions,
+            )
+            .await?;
+
+        Ok(UserRecord {
+            id,
+            username_normalized,
+            display_name,
+            has_password: false,
+            is_disabled: false,
+            is_admin,
+            can_manage_server: is_admin,
+            can_remote_access: false,
+            can_download: permissions.can_download,
+            last_login_at: None,
+            last_activity_at: None,
+        })
+    }
+
     pub async fn has_users(&self) -> Result<bool, UserStoreError> {
         Ok(self.database.has_users().await?)
     }
@@ -240,9 +334,20 @@ impl UserStore {
             .database
             .query_admin_users(status, search, sort_by, descending, page_size, offset)
             .await?;
+        let user_ids = stored
+            .iter()
+            .map(|user| user.id.clone())
+            .collect::<Vec<_>>();
+        let preset_sources = self
+            .database
+            .user_permission_preset_sources(&user_ids)
+            .await?;
         let entries = stored
             .into_iter()
-            .map(admin_user_list_entry)
+            .map(|stored| {
+                let preset_source = preset_sources.get(&stored.id).cloned();
+                admin_user_list_entry(stored, preset_source)
+            })
             .collect::<Result<Vec<_>, _>>()?;
         Ok(AdminUserPage {
             entries,
@@ -267,11 +372,11 @@ impl UserStore {
         if user_id.parse::<UserId>().is_err() {
             return Err(UserStoreError::InvalidUserId(user_id.to_owned()));
         }
-        self.database
-            .find_user_by_id(user_id)
-            .await?
-            .map(admin_user_profile)
-            .transpose()
+        let Some(stored) = self.database.find_user_by_id(user_id).await? else {
+            return Ok(None);
+        };
+        let preset_source = self.database.user_permission_preset_source(user_id).await?;
+        admin_user_profile(stored, preset_source).map(Some)
     }
 
     pub(crate) async fn get_playback_policy(
@@ -396,15 +501,19 @@ impl UserStore {
         let email = email
             .map(|email| email.map(normalize_email).transpose())
             .transpose()?;
-        self.database
+        let Some(stored) = self
+            .database
             .update_user_profile(
                 user_id,
                 display_name,
                 email.as_ref().map(|email| email.as_deref()),
             )
             .await?
-            .map(admin_user_profile)
-            .transpose()
+        else {
+            return Ok(None);
+        };
+        let preset_source = self.database.user_permission_preset_source(user_id).await?;
+        admin_user_profile(stored, preset_source).map(Some)
     }
 
     pub async fn change_password(
@@ -534,30 +643,24 @@ impl UserStore {
         self.authenticate_stored_user(stored, password).await
     }
 
+    pub(crate) async fn find_emby_authentication_target_id(
+        &self,
+        username: &str,
+    ) -> Result<Option<String>, UserStoreError> {
+        Ok(self
+            .find_stored_emby_authentication_target(username)
+            .await?
+            .map(|user| user.id))
+    }
+
     pub(crate) async fn authenticate_emby_name(
         &self,
         username: &str,
         password: &str,
     ) -> Result<Option<UserRecord>, UserStoreError> {
-        let username_normalized = normalize_username(username)?;
         let stored = self
-            .database
-            .find_user_by_username(&username_normalized)
+            .find_stored_emby_authentication_target(username)
             .await?;
-        let stored = if stored.is_some() {
-            stored
-        } else {
-            let mut matching_display_names = self
-                .database
-                .list_users()
-                .await?
-                .into_iter()
-                .filter(|user| user.display_name == username.trim());
-            match (matching_display_names.next(), matching_display_names.next()) {
-                (Some(user), None) => Some(user),
-                _ => None,
-            }
-        };
         self.authenticate_stored_user(stored, password).await
     }
 
@@ -607,6 +710,29 @@ impl UserStore {
             last_login_at,
             last_activity_at: stored.last_activity_at,
         }))
+    }
+
+    async fn find_stored_emby_authentication_target(
+        &self,
+        username: &str,
+    ) -> Result<Option<crate::storage::StoredUser>, UserStoreError> {
+        let username_normalized = normalize_username(username)?;
+        if let Some(user) = self
+            .database
+            .find_user_by_username(&username_normalized)
+            .await?
+        {
+            return Ok(Some(user));
+        }
+        let mut matching_display_names = self
+            .database
+            .find_users_by_display_name_exact(username.trim())
+            .await?;
+        if matching_display_names.len() == 1 {
+            Ok(Some(matching_display_names.remove(0)))
+        } else {
+            Ok(None)
+        }
     }
 }
 
@@ -744,6 +870,7 @@ fn user_record(stored: crate::storage::StoredUser) -> Result<UserRecord, UserSto
 
 fn admin_user_list_entry(
     stored: StoredAdminUserListItem,
+    preset_source: Option<StoredUserPermissionPresetSource>,
 ) -> Result<AdminUserListEntry, UserStoreError> {
     let id = stored
         .id
@@ -769,11 +896,13 @@ fn admin_user_list_entry(
         deletion_purge_at: stored.deletion_purge_at,
         created_at: stored.created_at,
         current_playback_count: stored.current_playback_count,
+        preset_source,
     })
 }
 
 fn admin_user_profile(
     stored: crate::storage::StoredUser,
+    preset_source: Option<StoredUserPermissionPresetSource>,
 ) -> Result<AdminUserProfile, UserStoreError> {
     let email = stored.email.clone();
     let email_verified_at = stored.email_verified_at;
@@ -786,5 +915,6 @@ fn admin_user_profile(
         email_verified_at,
         deleted_at,
         deletion_purge_at,
+        preset_source,
     })
 }

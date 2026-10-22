@@ -14,6 +14,13 @@ async fn library_deletion_cancels_jobs_and_fences_late_workers()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
+    let deletion_state_column: Option<String> = sqlx::query_scalar(
+        "SELECT name FROM pragma_table_info('libraries') WHERE name = 'deletion_state'",
+    )
+    .fetch_optional(database.pool())
+    .await?;
+    assert_eq!(deletion_state_column.as_deref(), Some("deletion_state"));
+
     let libraries = LibraryService::new(database.clone());
     let library = libraries
         .create_library("Movies", LibraryKind::Movie, false)

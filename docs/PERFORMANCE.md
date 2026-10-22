@@ -2,6 +2,258 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-829–839 总览（2026-10-21）
+
+同一 1,000,000 条夹具、release `luxd`、20 Mbps / 40 ms、每轮重启服务的冷启动序列：
+
+| 指标 | LUX-829 基线 | 当前（CSS 收敛后） | 变化 | 方案目标 |
+|---|---:|---:|---:|---|
+| M1 首卡可见 | 1,669.3 ms | 580.3 ms | -65.2% | ≤50% 基线（达成） |
+| M2 列表 TTFB | 1,638.5 ms | 520.3 ms | -68.2% | ≤50% 基线且 ≤300 ms（绝对目标未达） |
+| M3 排序后首卡 | 1,268.2 ms | 305.7 ms | -75.9% | ≤50% 基线（达成） |
+| M4 滚动 long task | 0 | 0 | 不变 | ≤50%（基线已为 0，无法体现） |
+| M5 首屏字节 | 19,257,462 B | 18,503,387 B（变体开启 681,565 B） | -3.9%（变体开启 -96.5%） | ≤50%（变体开启后达成） |
+| M6 滚动掉帧率 | 0% | 0% | 不变 | <1%（达成） |
+
+M1–M3 为三次冷启动的中位数（先跑一轮预热）。M5 中 CSS 37,899 → 20,285 B、JS 147,037 B、图片 18,335,296 B、HTML 769 B；变体关闭时图片占 99%。本轮用 `--scroll-seconds 5` 跑 M4/M6（基线协议是 30 s），两值都是 0，不能据此外推长滚动手感。变体关闭时几何平均改善约 46%，低于方案“≥100%”，缺口几乎全在图片字节上；把 LUX-826 的变体打开后 M5 降到 681,565 B（见下节），但产品默认仍按方案要求关闭。
+
+已完成并提交：LUX-829 基准、LUX-830 排序索引、LUX-831 卡片投影、LUX-832 去 COUNT、LUX-834 静态预压缩、LUX-835 系统宋体栈、LUX-836 首屏并行、LUX-837 SSE 失效收敛、LUX-838 网格虚拟化、LUX-839 图片变体基准。
+
+未完成/部分完成：
+
+- **LUX-833 图片热路径缓存**：未改认证/ACL 代码。本机 release 图片端点 10 次热请求为 min 1.6 ms / median 1.9 ms / max 2.9 ms，已低于方案 5 ms 目标；方案中的 23 ms/张来自不同环境。会话/黑名单/撤销缓存需要新的失效设计，本轮不在缺少真实部署证据时修改安全边界。
+- **CSS 路由拆分与 Tailwind 按需加载**（LUX-835 后半）：主 CSS 109,630 B / gzip 20,080 B，raw ≤150 KB 与 gzip ≤35 KB 两项目标均达成。Tailwind 的 preflight（约 3.7 KB）仍全局加载以承担 reset，工具类已随详情路由懒加载；library/auth/home 的共享规则仍在主包。
+- **SSE 请求上限**：活跃媒体库重取受 `maxPages: 5` 限制，未达到方案 ≤2 个请求；非活跃库不重取。
+- **图片变体灰度**：未实施灰度策略（项目所有者保留观察期决定）；并发 2 峰值内存已实测 33.6 MB（预算 40 MB）。变体仍默认关闭，M5 未包含变体开启场景。
+
+最终门禁（2026-10-21）：
+
+- `cargo build --locked`、`cargo fmt --all -- --check` 通过；`--test catalog` 3/3。
+- `cargo test --locked --all-targets`：1155 通过 / 4 失败 / 31 忽略。4 个失败均为既有基线：3 个 FILL_MISSING 队列用例，以及受并行媒体库删除改动影响的 `shutdown_cancels_legacy_scan_jobs_in_one_bounded_update`（10 vs 9）。此前记录的 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo` 已随并行修复转为通过。
+- 全目标 Clippy 仍报 14 项既有/并行代码诊断（`emby_catalog`、`media`、`playback/session`、`database_maintenance`、存储测试）；本次新增/修改文件未发现新诊断。
+- `pnpm --dir web install --frozen-lockfile`、`pnpm --dir web build` 通过；全量 Web 测试 844 通过 / 1 失败，唯一失败为并行媒体库删除改动的 `admin-libraries` 旧断言（LUX-826 已记录）。
+
+## LUX-839 图片变体生成基准（2026-10-21）
+
+新增 `tests/image_variants_perf.rs`（`#[ignore]`），在本机 `media/` 的 5,857 张真实图片中按序取 1,000 张，对 360/720/1280 三档重复执行与生产相同的解码、EXIF 方向、Lanczos3 缩放、JPEG q80 编码和落盘流程。
+
+| 长边 | 1,000 张总耗时 | p50 | p95 | 最大 |
+|---:|---:|---:|---:|---:|
+| 360 px | 25.72 s | 17.18 ms | 63.71 ms | 102.22 ms |
+| 720 px | 29.03 s | 20.39 ms | 68.38 ms | 103.45 ms |
+| 1280 px | 31.53 s | 29.88 ms | 81.19 ms | 146.41 ms |
+
+命令：`LUX_PERF_IMAGE_DIR=media cargo test --release --locked --test image_variants_perf -- --ignored --nocapture`。三档 p95 均 ≤120 ms 的本机目标；最大 146.41 ms 出现在 1280 档，说明冷缓存/大图仍可能超过响应预算并由 LUX-826 的 300 ms 回退路径处理。
+
+未测：并发 2 时的峰值内存、真实 1,000 张去重后的网络首屏、命中率/回退率、灰度策略（只对 POSTER/THUMB 生效并观察 1 周）和 FNOS/x86_64。样本来自本机媒体库，包含真实 EXIF/尺寸差异，不代表 NAS 或低端 CPU；测试使用临时输出目录，不写媒体库。
+
+## LUX-838 未虚拟化网格与合成层降压（2026-10-21）
+
+搜索、收藏和人物作品页改用已虚拟化的 `LibraryGrid`；搜索页从单页查询改为 infinite query，提供“加载更多”并保留人物结果。媒体卡片上的 5 处 `backdrop-filter: blur(12px)`（集数徽标、多选控件、菜单触发器及两处操作按钮）改为纯色半透明，保留弹层、详情页和播放器模糊。
+
+| 指标 | 结果 |
+|---|---|
+| 500 条搜索结果挂载卡片 | 测试断言 <50，实际通过 |
+| 卡片合成层模糊 | 从 5 处降至 0；弹层/详情保留 |
+| 搜索可达结果 | 从仅第 1 页扩展到 infinite query（最多 5 页），“加载更多”可用 |
+
+验证：`web/tests/search-and-filmography.test.tsx` 4/4（新增 500 条结果虚拟化断言）、`web/tests/library-grid.test.tsx`、`web/tests/library-card-performance.test.tsx` 通过；`pnpm --dir web build` 通过。该结果来自 jsdom 与静态构建，不是真实 GPU 合成层、滚动帧率或 120 Hz 设备测量。
+
+限制：jsdom 不执行真实布局/合成，<50 张卡片不能直接证明长期滚动 long task 或掉帧下降；未在 500 条真实数据、低端 GPU、Safari/Firefox 或 FNOS/x86_64 上做视觉回归和性能采样。搜索只保留 5 页（120 条），更早结果需要重新搜索。
+
+## LUX-837 SSE 精确失效与分页上限（2026-10-21）
+
+`useUserEvents` 不再把 `["library"]` 放进每次事件的通用刷新键：带 `libraryId` 的媒体库事件只让对应媒体库的活跃查询失效，不带 ID 的媒体库事件和 home/item/favorites 事件让全部活跃媒体库查询失效，均使用 `refetchType: "active"`；媒体库 infinite query 与预取增加 `maxPages: 5`，活跃查询的重取最多 5 页。
+
+| 场景 | 旧行为 | 新行为 |
+|---|---|---|
+| 51 页已加载后收到一次扫描事件 | `["library"]` 前缀失效，infinite query 重放全部 51 页 | 只重取活跃查询，最多 `maxPages: 5` 页；非活跃媒体库不重取 |
+| 事件带 `libraryId` | 同时失效所有媒体库与目标媒体库 | 只失效目标媒体库的活跃查询 |
+| SSE 断线 | 详情剧照每 30 s 轮询 | 保持 30 s 轮询（连接时已关闭） |
+
+验证：`web/tests/user-events.test.tsx` 10/10，新增“目标媒体库只失效该库且后台不重取”的计数断言；`pnpm --dir web exec vitest run tests/library-page.test.ts tests/user-events.test.tsx` 通过；`pnpm --dir web build` 通过。该结果来自 jsdom 查询缓存与 fake EventSource，不是真实服务器 SSE 延迟或浏览器网络测量。
+
+限制：活跃媒体库仍会重取最多 5 页，未达到方案“≤2 个请求”的目标；`maxPages: 5` 会丢弃更早的分页，回滚时重新请求。未在真实扫描、真实慢客户端或 FNOS/x86_64 上复测请求数。
+
+## LUX-836 首屏并行与列表预取（2026-10-21）
+
+`App` 的 `setup` 与 `me` 改为并行发起，`me` 在未初始化服务器上的失败由 setup 完成后的 effect 重试；`LibraryPage` 不再等待 `libraries` 解析，直接用 URL 中的 `libraryId` 发 `fields=card&count=false` 请求，未知名媒体库使用 `MOVIE,SERIES` 顶层过滤，HOMEVIDEOS 在媒体库记录到达后切换；`prefetchLibrary` 使用同一 `itemType` 组合，避免预取键与页面键不一致。媒体库记录未就绪时显示加载骨架，不会误报“媒体库不存在”。
+
+| 指标 | LUX-832 后 | 首屏并行后 | 相对 LUX-829 基线 |
+|---|---:|---:|---:|
+| M1 首卡可见中位数 | 712.3 ms | 615.8 ms | -63.1%（基线 1,669.3 ms） |
+| M2 列表 TTFB 中位数 | 652.1 ms | 558.3 ms | -65.9%（基线 1,638.5 ms） |
+| 列表请求自身耗时 | 52.3 ms | 52.2 ms | 不变 |
+| M3 排序后首卡中位数 | 314.9 ms | 324.9 ms | -74.4%（基线 1,268.2 ms） |
+| M5 首屏字节 | 18,535,204 B | 18,535,200 B | 不变 |
+
+M1 相对基线下降 63.1%，达到方案“改善 ≥40%”的阶段目标；M2 仍高于 300 ms，首条 items 请求约在导航后 500 ms 发出，剩余成本是 HTML/JS 传输与执行、两个引导 RTT 和 20 Mbps 网络。未在本机测量 Playwright 之外的真实浏览器导航缓存或 Service Worker。以上仅代表本机 arm64 headless Chromium。
+
+## LUX-832 列表跳过 COUNT 复测（2026-10-21）
+
+`GET /api/v1/libraries/{libraryId}/items` 新增 `count=false`：跳过每页全库 `COUNT(*)`，内层查询取 `limit+1` 判断 `hasNext`，响应省略 `total`。Web 媒体库首屏与预取同时使用 `fields=card&count=false`；Emby 与其他 Lux 列表仍包含完整计数。
+
+| 指标 | LUX-830 索引后 | `count=false` + card | 相对 LUX-829 基线 |
+|---|---:|---:|---:|
+| M1 首卡可见中位数 | 1,365.5 ms | 712.3 ms | -57.3%（基线 1,669.3 ms） |
+| M2 列表 TTFB 中位数 | 1,335.9 ms | 652.1 ms | -60.2%（基线 1,638.5 ms） |
+| 列表请求自身耗时 | 434–442 ms | 51–54 ms | 约 -93% |
+| M3 排序后首卡中位数 | 772.7 ms | 314.9 ms（CV 52.9%） | -75.2%（基线 1,268.2 ms） |
+| M5 首屏字节 | 19,257,462 B | 18,535,204 B | -3.8% |
+
+单页 `count=false` 请求：冷启动后首次约 12 ms，连续 10 次热请求最小 1.5 ms、中位 1.5 ms、最大 1.7 ms；同页 `count=true` 约 443 ms。M2 仍未达到方案“≤300 ms”的绝对目标，剩余成本来自 setup→me→libraries 引导链和 20 Mbps / 40 ms 网络；留给 LUX-836（首屏并行）处理。Emby 路由和其他未传 `count=false` 的调用保持原响应。以上只代表本机 arm64 与直接写库夹具。
+
+## LUX-826 图片变体开启后的首屏字节（2026-10-21）
+
+方案 §10 的「首屏 24 张图片 ≤1 MB」与 M5「≤50% 基线」只有在图片变体开启时才可能达到。本机用 100 万条夹具验证：在夹具库中把 `media_strategy.images.variantCache.enabled` 置为 true、给测试账号 `optimized_images = 1`，重启 `luxd` 后 `/api/v1/auth/me` 返回 `imageVariantsAvailable/enabled: true`；先用 `?w=360` 预热 24 张首屏海报（缓存 556 KB），再跑基准。
+
+| 指标 | 变体关闭 | 变体开启 |
+|---|---:|---:|
+| M5 首屏字节 | 18,503,387 B | 681,565 B（-96.3%） |
+| 其中图片 | 18,335,296 B | 513,474 B |
+| 其中 CSS | 20,285 B | 20,285 B |
+| 其中 JS | 147,037 B | 147,037 B |
+| 最大单张首屏图 | 2,019,167 B | 39,129 B |
+| M1 首卡可见 | 580.3 ms | 579.0 ms |
+| M2 列表 TTFB | 520.3 ms | 520.0 ms |
+
+三次冷启动的 M5 完全一致（681,565 B），因为变体命中后字节数确定。首屏 24 张图片合计 513 KB，满足「≤1 MB」；相对 19,257,462 B 基线为 3.5%，满足 M5 的「≤50%」。
+
+限制：这一组数字是在**手动开启**变体后测得的，产品默认仍是关闭（方案要求默认关闭、由管理员主开关 + 用户偏好双重控制）。冷缓存首次访问时单张超过 300 ms 预算会回退原图，所以本测量先做了预热；未测未预热时的一次性成本分布，也不代表 NAS/x86_64。M4/M6 用 5 秒滚动窗口，都为 0，不能说明长滚动手感。
+
+## LUX-839 图片变体并发内存（2026-10-21）
+
+`tests/image_variants_perf.rs` 新增 `image_variant_concurrent_memory`（ignored），用 `getrusage(RUSAGE_SELF).ru_maxrss` 测并发 2 的进程峰值增量。样本取本机媒体库按文件大小排序的 40%–60% 区间（1,133 张 JPEG，中位 2,073,600 像素），先做一次 1280 预热再取基线。
+
+| 指标 | 数值 |
+|---|---:|
+| baseline `ru_maxrss` | 15,204,352 B |
+| 并发 2 后峰值 | 50,479,104 B |
+| 增量 | 33.6 MB（预算 40 MB） |
+
+同一轮三档耗时：360 p50 17.01 / p95 63.36 / max 98.54 ms；720 p50 20.23 / p95 68.23 / max 100.06 ms；1280 p50 29.24 / p95 80.80 / max 115.30 ms。
+
+该预算只对中位尺寸的海报/缩略图成立：改用餐具里的 4K 剧照或 11 MB clearlogo PNG 作样本时，同样的测量会升到 130 MB 以上，因为单张解码本身就接近 40 MP 上限。结论只代表本机 arm64，不代表 FNOS/x86_64 或低端 CPU。
+
+## LUX-835 系统宋体栈与字体字节（2026-10-21）
+
+删除 101 个 Noto Serif SC 子集（约 111 KB CSS、6.0 MB 字体资产），保留 3 个 Libre Bodoni 拉丁字体；中文编辑标题改用系统 `"Songti SC", "STSong", "SimSun", serif` 栈。
+
+| 指标 | 优化前 | 优化后 |
+|---|---:|---:|
+| 主 CSS 原始 | 430,446 B | 229,689 B（-46.6%） |
+| 主 CSS gzip | 89,188 B | 37,545 B（-57.9%） |
+| 构建字体资产 | 101 个 Noto 子集 + 3 个 Bodoni（约 6.06 MB） | 3 个 Bodoni（53,204 B） |
+| 库页字体请求 | 视中文标题命中可达 18 个子集（约 1.28 MB） | 1 个 Bodoni 子集（约 18–26 KB），中文 0 |
+
+路由拆分后主 CSS 为 229,689 B / gzip 37,545 B；admin/player/detail/account 的懒加载 CSS 分别为 48,719 / 18,790 / 21,142 / 8,860 B。Playwright 1280×900 检查首页、媒体库、详情、账户和管理页，控制台 0 error，详情/账户/管理布局正常；媒体库页 M5 CSS 从 18,535,200 的组成中降至 37,899 B，M5 总量 18,521,016 B。主 CSS 仍未达到 ≤150 KB / ≤35 KB，Tailwind 与 library/auth/home 共享样式仍在主包。该结果只代表本机 macOS arm64 Chromium，不代表 Windows/Linux 系统字体差异或真实低端设备。
+
+第二次拆分（同日）把主 CSS 里仍只属于 admin/detail/player 路由的规则整体迁入对应懒加载表。判定条件是「该类名在 react.css 中的所有规则都只归一个路由」，因此基础规则、`:hover` 与浅色覆盖一起迁移；跨路由复用的组件（`AdminApiKeyPanel` 在 `/admin/settings` 渲染）不迁；迁出规则前置写入目标表，因为 react.css 总是先加载。
+
+| 指标 | 一次拆分 | 二次拆分 |
+|---|---:|---:|
+| 主 CSS 原始 | 229,689 B | 164,828 B（-28.2%） |
+| 主 CSS gzip | 37,545 B | 28,472 B（-24.2%） |
+| admin 懒加载 CSS | 48,719 B | 88,578 B |
+| detail 懒加载 CSS | 21,142 B | 41,129 B |
+
+gzip 侧已达到 ≤35 KB 目标，原始体积仍高于 ≤150 KB。第三次拆分把带 `@media` 覆盖的路由类名也整组迁出（判定条件扩展为「提及该类名的所有规则只归一个路由」），主 CSS 进一步降到 123,840 B / gzip 22,672 B，两项目标同时达标。
+
+| 指标 | 一次拆分 | 二次拆分 | 三次拆分 | Tailwind 按路由懒加载 |
+|---|---:|---:|---:|---:|
+| 主 CSS 原始 | 229,689 B | 164,828 B | 123,840 B | 109,630 B |
+| 主 CSS gzip | 37,545 B | 28,472 B | 22,672 B | 20,080 B |
+| admin 懒加载 | 48,719 B | 88,578 B | 122,104 B | 122,104 B |
+| detail 懒加载 | 21,142 B | 41,129 B | 53,467 B | 59,770 B |
+
+最后一次调整把 Tailwind 的 `utilities` 层从主表移到懒加载的 `detail.css`：核对后确认工具类只出现在 `MediaInfoPanel`、`MediaNfoPanel` 两个组件里，而它们只被详情路由使用；`react.css` 只保留 `theme` 与 `preflight`，并用 `@layer theme, base, components, utilities;` 固定层顺序，`detail.css` 用 `theme(reference)` 引用主题而不重复输出。代价是详情表的 CSS 增加约 6 KB，但首屏不再承担它。
+
+等价性验证没有用截图，而是对 11 条路由（home、library、detail、account、admin、admin-jobs、admin-users、admin-libraries、admin-plugins、admin-notifications、admin-settings）逐元素导出 computed style 的 23 项（颜色、字号、内外边距、display、gap、圆角、transform、字体栈、行高等），与改动前构建逐条比对：三次拆分后桌面 1280×900 与移动 390×844 两个视口全部一致，唯一差异是首页 hero 进度条的一帧动画 transform。该验证只覆盖本机 Chromium 与一个媒体库夹具，不覆盖 320/768/1024/1440 全视口、Safari/Firefox 或真实弱网。
+
+## LUX-834 静态资源预压缩（2026-10-21）
+
+`scripts/build-web.mjs` 在 `vite build` 后为 `web/dist` 下 ≥512 B 的 JS/CSS/SVG/HTML/JSON 生成 level 9 gzip 兄弟文件；`ServeDir`/`ServeFile` 启用 `precompressed_gzip()`，按 `Accept-Encoding` 直接返回 `.gz`。本机 `pnpm --dir web build` 生成 61 个 `.gz`：源文件 3,377,162 B，压缩后 896,497 B（26.5%）。
+
+| 请求 | `content-encoding` | `content-length` | `vary` |
+|---|---|---:|---|
+| `/assets/index-BKmsjUTO.js` + `Accept-Encoding: gzip` | gzip | 33,968 | accept-encoding |
+| 同上，不带 `Accept-Encoding` | 无 | 129,539 | accept-encoding |
+| `/` + `Accept-Encoding: gzip` | gzip | 448 | accept-encoding |
+
+在 LUX-829 的 100 万条夹具、20 Mbps / 40 ms 下单轮测量：M5 首屏字节 19,257,462→18,571,776 B（-3.6%），其中 JS 490,161→146,164、CSS 430,755→89,543、HTML 1,250→773；图片仍占 18,335,296 B。CSS/JS 的 50% 传输目标已达成，但总首屏 50% 目标需要同时启用 LUX-826 图片变体（默认关闭）。本轮使用 debug `luxd` 验证静态响应，M5 字节与 release 的差异可忽略；M1/M2 未作为本任务结论。未在本机之外验证 nginx `http2 on`/`gzip_static on` 或浏览器实际 h2。
+
+## LUX-830 目录排序表达式索引复测（2026-10-21）
+
+在 LUX-829 同一 1,000,000 条夹具、同一 release `luxd`、20 Mbps / 40 ms、每轮重启服务的条件下复测。新增 `migrations/0205_catalog_sort_indexes.sql` 与 PostgreSQL 对等 migration；SQLite 旧库/新库表重建路径同步重建五个索引。空库/新库迁移后 `schema_version=205`，在 100 万条库上应用约 14 秒。
+
+| 指标 | 基线（无索引） | 索引后 | 变化 |
+|---|---:|---:|---:|
+| M1 首卡可见中位数 | 1,669.3 ms | 1,365.5 ms | -18.2% |
+| M2 列表 TTFB 中位数 | 1,638.5 ms | 1,335.9 ms | -18.5% |
+| 列表请求自身耗时中位数 | 736–768 ms | 434–442 ms | 约 -41% |
+| M3 排序后首卡中位数 | 1,268.2 ms | 772.7 ms | -39.1%（单轮 1,382.5 ms，CV 31.7%，仅作方向参考） |
+| M5 首屏字节 | 19,257,462 B | 19,257,462 B | 不变 |
+| M4 / M6 | 0 / 0% | 0 / 0% | 不变 |
+
+`EXPLAIN QUERY PLAN` 对 `Name`、`SortName`、`DateCreated`、`PremiereDate`、`Rating` 五种排序分别使用 `idx_media_items_library_name_sort`、`idx_media_items_library_sortname_sort`、`idx_media_items_library_added_sort`、`idx_media_items_library_premiere_sort`、`idx_media_items_library_rating_sort`；内层 100 万条扫描不再出现 `TEMP B-TREE`。外层按已选 24 条再做 source/stream 排序时仍可能使用一个有界临时 B-tree，测试按“内层目录扫描无临时排序”断言并在结果中保留该说明。
+
+索引后的列表内层查询（同一 SQL、同一夹具，预热后）在本机为约 0.01 ms/次；`COUNT(*)` 仍约 661 ms，是 M2 尚未达到 ≤300 ms 的主要原因，留给 LUX-832（`count=false`）处理。M3 的单轮波动来自服务重启后的本地元数据回填与浏览器调度，不能作为稳定的 50% 收益证据。以上仍只代表本机 arm64 与直接写库夹具，不代表 NAS/x86_64 或真实网络。
+
+## LUX-829 Web 性能基准（2026-10-21）
+
+固定 1,000,000 条合成媒体、20 Mbps / 40 ms 模拟网络和无浏览器缓存的三次冷启动基线。用于后续 LUX-830–LUX-838 的前后对比；数字只代表本机 arm64，不代表 FNOS/x86_64 或真实 NAS。
+
+### 环境与数据集
+
+| 项 | 值 |
+|---|---|
+| 架构 | macOS `arm64`（`uname -m=arm64`），10 核，16 GiB |
+| 代码 | `73290437` 加工作树并行未提交改动；`target/release/luxd` 于基准前构建 |
+| 夹具 | `lux-catalog-fixture-v1` / `lux-catalog-db-v1`：1,000,000 条媒体，3 个用户媒体库（MOVIE / SERIES / MIXED），2,400 个媒体源、10,800 条轨道、5,000 张图片索引 |
+| 图片 | 200 张真实海报硬链接复用；`detailItemCount=2,000`（仅前 2,000 条物化源、轨道和图片，其余条目仍参与 100 万条列表查询） |
+| 搜索索引 | `searchIndexPopulated=false`（夹具跳过 `media_search` FTS 触发器，以将 100 万条种子控制在 43 秒内；列表基准不使用全文搜索） |
+| 媒体文件 | 不生成 100 万媒体文件，也不调用 ffprobe；夹具直接写入已迁移 SQLite 库 |
+| 服务 | `LUX_CONFIG_DIR=/tmp/lux-perf-1m LUX_HTTP_ADDR=127.0.0.1:8100 target/release/luxd`，每轮测量前重启并等待健康 |
+| 浏览器 | Playwright 1.63.0 Chromium 1243 headless，1280×900，CDP `Network.emulateNetworkConditions` 20 Mbps 下行 / 5 Mbps 上行 / 40 ms 延迟，禁用浏览器缓存 |
+| 采集 | `scripts/run-web-performance.mjs --runs 3 --warmup 0 --cooldown-seconds 5 --restart-command ...` |
+
+命令：
+
+```bash
+python3 tools/catalog-fixture/generate.py \
+  --catalog-db /tmp/lux-perf-1m/lux.db --media-root /tmp/lux-perf-1m/media \
+  --items 1000000 --libraries 3 --posters 200 --posters-dir media \
+  --skip-search-index --detail-items 2000 \
+  --session-token perf-token-0123456789 --manifest /tmp/lux-perf-1m/manifest.json
+
+node scripts/run-web-performance.mjs \
+  --base-url http://127.0.0.1:8100 --manifest /tmp/lux-perf-1m/manifest.json \
+  --runs 3 --warmup 0 --cooldown-seconds 5 \
+  --restart-command /tmp/lux-perf-1m-restart.sh \
+  --scroll-seconds 30 --output /tmp/lux-perf-1m/baseline.json
+```
+
+### 基线结果（三次，median / p95 / CV）
+
+| 指标 | 中位数 | p95 | CV | 目标（方案 §2） |
+|---|---:|---:|---:|---|
+| M1 首张卡片可见 | 1,669.3 ms | 1,690.5 ms | 0.75% | ≤ 基线 50% |
+| M2 媒体库列表 TTFB | 1,638.5 ms | 1,660.0 ms | 0.77% | ≤ 基线 50%，且 ≤ 300 ms |
+| M3 排序切换后首卡更新 | 1,268.2 ms | 1,275.6 ms | 1.84% | ≤ 基线 50% |
+| M4 滚动 30 s 的 long task 数 | 0 | 0 | 0% | ≤ 基线 50% |
+| M5 首屏字节（HTML+JS+CSS+字体+前 24 图） | 19,257,462 B（18.36 MiB） | 同左 | 0% | ≤ 基线 50% |
+| M6 滚动掉帧率 | 0% | 0.056% | — | 不劣化，目标 <1% |
+
+M5 分项：HTML 1,250 B、JS 490,161 B、CSS 430,755 B、字体 0 B、前 24 张 POSTER 18,335,296 B、其他静态资源 3,545 B。列表响应体（完整 DTO，非卡片投影）为 48,228 B。
+
+### 结论与限制
+
+- 三次冷启动的 M1–M5 CV 均低于 2%，M6 只为 0/0.06%，满足“连续跑 3 次 CV <15%”的复现要求。
+- M4/M6 在本机 headless Chromium 下接近零；这是本夹具滚动路径的结果，不代表真实低端设备、真实海报解码或 120 Hz 屏幕。
+- 夹具以直接写库替代 100 万次 ffprobe / 扫描；只有前 2,000 条有源、轨道和图片，全文搜索索引为空。它验证列表、图片和排序路径，不等同于完整扫描或搜索性能。
+- 20 Mbps / 40 ms 是 CDP 模拟值，不是真实弱网、TLS 或 HTTP/2 环境；未在 FNOS/x86_64、真实 NAS 或真实浏览器网络下复测。
+- 这组数字是 LUX-830 起的“优化前”基线；后续任务在同一夹具、同一命令下复测并更新本表。
+
 ## LUX-561 多管线共享后台预算（2026-10-16）
 
 实现新增进程级共享预算，协调扫描准备与指纹、本地 NFO/图片计算、ffprobe 和缩略图 ffmpeg。预算容量按可见 CPU 与 cgroup CPU 限额推导，也可用 `LUX_BACKGROUND_CPU_BUDGET` 显式设置；运行时仍保留各管线原有局部并发上限。功能测试用于证明准入、取消与回收语义，不作为 CPU 性能结果。
