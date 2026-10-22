@@ -29,6 +29,8 @@ use super::plugin_protocol::{
 const MAX_PLUGIN_ARCHIVE_BYTES: u64 = 128 * 1024 * 1024;
 const MAX_PLUGIN_UNCOMPRESSED_BYTES: u64 = 256 * 1024 * 1024;
 const MAX_PLUGIN_FILES: usize = 512;
+/// A plugin manifest is small JSON; anything larger is not a valid package.
+const MAX_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
 const MAX_PLUGIN_INFLIGHT: usize = 16;
 const MAX_PLUGIN_RESPONSE_BYTES: usize = 4 * 1024 * 1024;
 
@@ -859,6 +861,18 @@ fn discover_archive(path: &Path) -> Result<DiscoveredPlugin, PluginDiscoveryErro
 }
 
 fn read_manifest(path: &Path) -> Result<PluginManifest, PluginDiscoveryError> {
+    let metadata = fs::metadata(path).map_err(|error| {
+        if error.kind() == io::ErrorKind::NotFound {
+            PluginDiscoveryError::InvalidPackage("manifest.json is missing".to_owned())
+        } else {
+            PluginDiscoveryError::Io(error)
+        }
+    })?;
+    if !metadata.is_file() || metadata.len() > MAX_PLUGIN_MANIFEST_BYTES {
+        return Err(PluginDiscoveryError::InvalidPackage(
+            "manifest.json is not a regular file within the size limit".to_owned(),
+        ));
+    }
     let contents = fs::read_to_string(path).map_err(|error| {
         if error.kind() == io::ErrorKind::NotFound {
             PluginDiscoveryError::InvalidPackage("manifest.json is missing".to_owned())
@@ -948,17 +962,23 @@ fn extract_archive(
             fs::create_dir_all(&target)?;
             continue;
         }
-        total_size = total_size.saturating_add(file.size());
-        if total_size > MAX_PLUGIN_UNCOMPRESSED_BYTES {
-            return Err(PluginDiscoveryError::InvalidPackage(
-                "plugin archive expands beyond the size limit".to_owned(),
-            ));
-        }
         if let Some(parent) = target.parent() {
             fs::create_dir_all(parent)?;
         }
         let mut output = File::create(&target)?;
-        io::copy(&mut file, &mut output)?;
+        // Count what is actually written: a malformed archive can declare a small size and
+        // still expand past the budget.
+        let remaining = MAX_PLUGIN_UNCOMPRESSED_BYTES.saturating_sub(total_size);
+        let written = io::copy(
+            &mut (&mut file).take(remaining.saturating_add(1)),
+            &mut output,
+        )?;
+        if written > remaining {
+            return Err(PluginDiscoveryError::InvalidPackage(
+                "plugin archive expands beyond the size limit".to_owned(),
+            ));
+        }
+        total_size = total_size.saturating_add(written);
         output.flush()?;
         #[cfg(unix)]
         if target.starts_with(destination.join("binaries")) {
@@ -989,6 +1009,18 @@ fn sha256_file(path: &Path) -> Result<String, PluginDiscoveryError> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn oversized_plugin_manifests_are_rejected_before_reading() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let path = directory.path().join("manifest.json");
+        std::fs::write(&path, vec![b'{'; MAX_PLUGIN_MANIFEST_BYTES as usize + 1])
+            .expect("write oversized manifest");
+        assert!(matches!(
+            read_manifest(&path),
+            Err(PluginDiscoveryError::InvalidPackage(_))
+        ));
+    }
 
     #[test]
     fn a_timed_out_request_only_recycles_an_unshared_plugin() {
