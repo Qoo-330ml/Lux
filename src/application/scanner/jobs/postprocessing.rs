@@ -10,6 +10,8 @@ struct ScanPostprocessingOptions {
     thumbnails: Option<ThumbnailService>,
 }
 
+const SCAN_IDLE_BATCH_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+
 const MAX_CHANGED_LOCAL_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 fn media_info_sidecar_source_stem(path: &Path) -> Option<&str> {
@@ -378,6 +380,11 @@ impl ScanJobService {
             if self.should_yield_to_realtime(job_id).await? {
                 drop(scan_permit);
                 scan_permit = self.acquire_scan_lock_for_job(job_id).await?;
+            }
+            if report.processed == 0 {
+                // No progress this round means another worker still has to drain its outbox
+                // (or the batch had nothing claimable); sleeping avoids a hot loop on the DB.
+                tokio::time::sleep(SCAN_IDLE_BATCH_BACKOFF).await;
             }
             tokio::task::yield_now().await;
         }

@@ -1414,7 +1414,15 @@ impl ScanJobService {
                 {
                     return self.cancel_running_job(&job.id).await;
                 }
-                Err(ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_)) => {
+                Err(error @ (ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_))) => {
+                    // Keep the conservative root-level handling, but leave a trace of which
+                    // directory failed so an operator can act on it.
+                    tracing::warn!(
+                        root_id = %root.id,
+                        job_id = %job.id,
+                        %error,
+                        "manifest discovery could not read a directory; marking the root unavailable"
+                    );
                     self.database
                         .update_library_root_availability(&root.id, false)
                         .await?;
@@ -1604,7 +1612,15 @@ impl ScanJobService {
                 {
                     return self.cancel_running_job(&job.id).await;
                 }
-                Err(ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_)) => {
+                Err(error @ (ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_))) => {
+                    // Keep the conservative root-level handling, but leave a trace of which
+                    // directory failed so an operator can act on it.
+                    tracing::warn!(
+                        root_id = %root.id,
+                        job_id = %job.id,
+                        %error,
+                        "manifest discovery could not read a directory; marking the root unavailable"
+                    );
                     self.database
                         .update_library_root_availability(&root.id, false)
                         .await?;
