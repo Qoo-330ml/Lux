@@ -3338,7 +3338,10 @@ pub(super) async fn serve_media_path(
         size,
     ) {
         Ok(range) => range,
-        Err(RangeError::Invalid | RangeError::Unsatisfiable) => {
+        // An unparseable Range header must be ignored (RFC 9113 §14.2 sends the full body);
+        // only a syntactically valid but unsatisfiable range earns a 416.
+        Err(RangeError::Invalid) => ByteRange::Full,
+        Err(RangeError::Unsatisfiable) => {
             let mut response = Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header("Accept-Ranges", "bytes")
