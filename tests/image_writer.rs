@@ -37,6 +37,7 @@ const PNG_1X1: &[u8] = &[
 fn local_image_config() -> ImageDownloadConfig {
     ImageDownloadConfig {
         allow_loopback_http: true,
+        direct_connection_only: true,
         ..ImageDownloadConfig::default()
     }
 }
@@ -1069,6 +1070,7 @@ async fn stops_chunked_image_download_at_the_configured_limit()
             timeout: Duration::from_millis(100),
             max_bytes: 8,
             allow_loopback_http: true,
+            direct_connection_only: true,
         },
     )?;
     let result = tokio::time::timeout(

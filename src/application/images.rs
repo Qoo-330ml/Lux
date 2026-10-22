@@ -268,6 +268,9 @@ pub struct ImageDownloadConfig {
     /// Allows plain-HTTP image downloads from loopback hosts. Only local test stubs need this;
     /// production downloads must never reach the loopback interface.
     pub allow_loopback_http: bool,
+    /// Ignores the operating-system proxy. Tests use it so a developer's global proxy cannot
+    /// intercept requests to their loopback stub servers.
+    pub direct_connection_only: bool,
 }
 
 impl Default for ImageDownloadConfig {
@@ -276,6 +279,7 @@ impl Default for ImageDownloadConfig {
             timeout: Duration::from_secs(10),
             max_bytes: MAX_IMAGE_BYTES,
             allow_loopback_http: false,
+            direct_connection_only: false,
         }
     }
 }
@@ -286,6 +290,7 @@ pub struct ImageWriteService {
     http: Client,
     max_bytes: u64,
     allow_loopback_http: bool,
+    direct_connection_only: bool,
     config_dir: Option<PathBuf>,
     download_permits: Arc<ImagePermitPool>,
     write_permits: Arc<ImagePermitPool>,
@@ -416,14 +421,20 @@ impl ImageWriteService {
             .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?
             .timeout(config.timeout)
             // A redirect would bypass the URL checks done before the request.
-            .redirect(reqwest::redirect::Policy::none())
-            .build()
-            .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
+            .redirect(reqwest::redirect::Policy::none());
+        let http = if config.direct_connection_only {
+            http.no_proxy()
+        } else {
+            http
+        }
+        .build()
+        .map_err(|error| ImageWriteError::ClientBuild(error.to_string()))?;
         Ok(Self {
             database,
             http,
             max_bytes: config.max_bytes,
             allow_loopback_http: config.allow_loopback_http,
+            direct_connection_only: config.direct_connection_only,
             config_dir,
             download_permits,
             write_permits,

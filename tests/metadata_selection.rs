@@ -2962,6 +2962,7 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
 fn local_image_config() -> luxd::application::images::ImageDownloadConfig {
     luxd::application::images::ImageDownloadConfig {
         allow_loopback_http: true,
+        direct_connection_only: true,
         ..Default::default()
     }
 }
