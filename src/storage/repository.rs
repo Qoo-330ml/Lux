@@ -465,6 +465,7 @@ pub struct Database {
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
     dashboard_stats_cache: Arc<AsyncMutex<Option<CachedDashboardStats>>>,
+    write_probe: Arc<AsyncMutex<Option<std::time::Instant>>>,
     filesystem_path_templates: Arc<SqlTemplateCache>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
@@ -1069,6 +1070,7 @@ impl Database {
                 RecommendationRatingMedianCache::default(),
             )),
             dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+            write_probe: Arc::new(AsyncMutex::new(None)),
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
@@ -1467,6 +1469,23 @@ impl Database {
     /// application data or the schema. Committing is intentional: a rollback
     /// can succeed even when the filesystem cannot persist a durable write.
     pub async fn probe_write(&self) -> Result<(), StorageError> {
+        /// Successful probes are cached so a k8s/LB liveness check does not turn into a write
+        /// on every poll. Failures are never cached: readiness must notice a read-only mount
+        /// immediately.
+        const SUCCESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let mut last_success = self.write_probe.lock().await;
+        if last_success.is_some_and(|checked_at| checked_at.elapsed() < SUCCESS_TTL) {
+            return Ok(());
+        }
+        drop(last_success);
+        let result = self.probe_write_once().await;
+        if result.is_ok() {
+            *self.write_probe.lock().await = Some(std::time::Instant::now());
+        }
+        result
+    }
+
+    async fn probe_write_once(&self) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
             .begin()

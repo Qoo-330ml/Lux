@@ -11906,6 +11906,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+        write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -14504,6 +14505,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+        write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -14572,6 +14574,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+        write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -14702,6 +14705,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+        write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -18561,6 +18565,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+        write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -18651,6 +18656,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+        write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -19153,6 +19159,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+        write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -30650,5 +30657,34 @@ async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn 
         Some("{\"title\":\"C\"}")
     );
     assert!(!cached.contains_key("nfo-b"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn successful_write_probes_are_cached_so_health_checks_do_not_write()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    database.probe_write().await?;
+    let first: String =
+        sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = '__lux_write_probe__'")
+            .fetch_one(database.pool())
+            .await?;
+    database.probe_write().await?;
+    let second: String =
+        sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = '__lux_write_probe__'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        first, second,
+        "a second probe inside the cache window must not write"
+    );
     Ok(())
 }
