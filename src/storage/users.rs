@@ -1025,14 +1025,7 @@ impl Database {
         user_id: &str,
         update: &UpdateUser<'_>,
     ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
             .query(
                 "SELECT is_disabled, can_manage_server, deleted_at
@@ -1200,14 +1193,7 @@ impl Database {
     }
 
     pub(crate) async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
             .query(
                 "SELECT is_disabled, can_manage_server
@@ -1264,14 +1250,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Option<Vec<String>>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
             .query(
                 "SELECT is_disabled, can_manage_server, deleted_at

@@ -671,14 +671,7 @@ impl Database {
         evidence_json: &str,
     ) -> Result<StoredCanonicalPerson, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
 
         if let Some(person) = self
             .query(
@@ -2023,14 +2016,7 @@ impl Database {
     ) -> Result<StoredCanonicalPerson, StorageError> {
         const IDENTITY_INSERT_CHUNK_SIZE: usize = 100;
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let person = self
             .query("SELECT id FROM people WHERE id = ?")
             .bind(person_id)
