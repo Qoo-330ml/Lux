@@ -1025,7 +1025,10 @@ pub(super) async fn emby_query_users(
 
 fn emby_users_page_params(query: &EmbyUsersQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(50);
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => 50,
+    };
     if offset < 0 || !(1..=100).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }

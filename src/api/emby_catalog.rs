@@ -3308,8 +3308,17 @@ pub(super) fn emby_person_image_tag(person_id: &str) -> String {
 
 pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(50);
-    let count_only = limit == 0 && query.enable_total_record_count == Some(true);
+    // `Limit=0` means "no explicit limit": count-only when totals were requested, otherwise the
+    // endpoint default. Rejecting it would break clients that send the Emby default verbatim.
+    let count_only = query.limit == Some(0) && query.enable_total_record_count == Some(true);
+    let limit = if count_only {
+        0
+    } else {
+        match query.limit {
+            Some(value) if value > 0 => value,
+            _ => 50,
+        }
+    };
     if offset < 0 || (!count_only && !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit)) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -3326,12 +3335,11 @@ pub(super) fn emby_show_episode_page_params(
     query: &EmbyItemsQuery,
 ) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(EMBY_SHOW_EPISODE_DEFAULT_LIMIT);
-    if offset < 0
-        || query
-            .limit
-            .is_some_and(|limit| !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit))
-    {
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => EMBY_SHOW_EPISODE_DEFAULT_LIMIT,
+    };
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -3339,7 +3347,10 @@ pub(super) fn emby_show_episode_page_params(
 
 pub(super) fn emby_person_page_params(query: &EmbyPersonsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(50);
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => 50,
+    };
     if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -3547,7 +3558,6 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         ("Id".to_owned(), json!(emby_public_id(&item.id))),
         ("ServerId".to_owned(), json!(server_id)),
         ("Type".to_owned(), json!(emby_item_type(&item.item_type))),
-        ("MediaType".to_owned(), json!("Video")),
         (
             "IsFolder".to_owned(),
             json!(matches!(
@@ -3570,6 +3580,11 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         ),
         ("UserData".to_owned(), Value::Object(user_data)),
     ]);
+    // Emby reports a media type only for playable items; folders, series and box sets leave it
+    // null so clients do not treat them as videos.
+    if let Some(media_type) = emby_media_type(&item.item_type) {
+        object.insert("MediaType".to_owned(), json!(media_type));
+    }
 
     if fields.is_none() {
         object.extend([
@@ -4714,6 +4729,14 @@ pub(super) fn normalize_strm_http_location(value: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(url.as_str()).ok()
 }
 
+/// Emby's `MediaType` is only set for playable items.
+fn emby_media_type(item_type: &str) -> Option<&'static str> {
+    match item_type {
+        "MOVIE" | "EPISODE" | "UNRESOLVED" | "VIDEO" => Some("Video"),
+        _ => None,
+    }
+}
+
 pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
     let language = stream
         .language
@@ -5285,7 +5308,7 @@ mod page_params_tests {
     }
 
     #[test]
-    fn zero_limit_is_count_only_or_a_bad_request_everywhere() {
+    fn zero_limit_is_count_only_or_the_endpoint_default_everywhere() {
         let count_only = EmbyItemsQuery {
             limit: Some(0),
             enable_total_record_count: Some(true),
@@ -5298,11 +5321,15 @@ mod page_params_tests {
             limit: Some(0),
             ..EmbyItemsQuery::default()
         };
-        assert_eq!(emby_page_params(&zero), Err(StatusCode::BAD_REQUEST));
+        assert_eq!(emby_page_params(&zero), Ok((0, 50)));
         assert_eq!(
             emby_catalog_items_page_params(&zero),
-            Err(StatusCode::BAD_REQUEST),
+            Ok((0, 50)),
             "catalog items must agree with the shared page contract"
+        );
+        assert_eq!(
+            emby_show_episode_page_params(&zero),
+            Ok((0, EMBY_MAX_PAGE_LIMIT))
         );
     }
 
@@ -5316,6 +5343,11 @@ mod page_params_tests {
             emby_person_page_params(&query),
             Err(StatusCode::BAD_REQUEST)
         );
+        let zero = EmbyPersonsQuery {
+            limit: Some(0),
+            ..EmbyPersonsQuery::default()
+        };
+        assert_eq!(emby_person_page_params(&zero), Ok((0, 50)));
         let allowed = EmbyPersonsQuery {
             limit: Some(EMBY_MAX_PAGE_LIMIT),
             ..EmbyPersonsQuery::default()
@@ -5336,10 +5368,21 @@ mod tests {
 
     use super::{
         EmbyItemsQuery, catalog_filter_from_emby, emby_media_source_json_with_resolver,
-        emby_media_stream_json, emby_page_params, emby_playback_container_name,
+        emby_media_stream_json, emby_media_type, emby_page_params, emby_playback_container_name,
     };
 
     use crate::application::catalog::{CatalogSource, CatalogStream};
+
+    #[test]
+    fn only_playable_items_report_a_media_type() {
+        assert_eq!(emby_media_type("MOVIE"), Some("Video"));
+        assert_eq!(emby_media_type("EPISODE"), Some("Video"));
+        assert_eq!(emby_media_type("VIDEO"), Some("Video"));
+        assert_eq!(emby_media_type("SERIES"), None);
+        assert_eq!(emby_media_type("SEASON"), None);
+        assert_eq!(emby_media_type("BOX_SET"), None);
+        assert_eq!(emby_media_type("FOLDER"), None);
+    }
 
     #[test]
     fn emby_media_source_uses_filename_and_reports_quality_on_video_stream() {
