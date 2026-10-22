@@ -30549,3 +30549,52 @@ fn sqlite_auto_vacuum_opt_in_parses_conservatively() {
     assert!(!parse_sqlite_auto_vacuum_request(Some("full")));
     assert!(!parse_sqlite_auto_vacuum_request(Some("  ")));
 }
+
+#[tokio::test]
+async fn sqlite_catalog_constraints_are_repaired_and_the_repair_is_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    async fn table_schema(pool: &sqlx::AnyPool, table: &str) -> Result<String, sqlx::Error> {
+        sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?")
+            .bind(table)
+            .fetch_one(pool)
+            .await
+    }
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    // A database built from the migrations alone must end up with the modern constraints.
+    let libraries = table_schema(database.pool(), "libraries").await?;
+    let media_items = table_schema(database.pool(), "media_items").await?;
+    assert!(
+        libraries.contains("'HOMEVIDEOS'"),
+        "libraries must accept the home-video kind: {libraries}"
+    );
+    assert!(
+        media_items.contains("'VIDEO'"),
+        "media items must accept the video type: {media_items}"
+    );
+    assert!(
+        !media_items.contains("UNIQUE (library_id, sort_title, production_year)"),
+        "the legacy title uniqueness constraint must be gone"
+    );
+
+    // Running the repair again must not touch an up-to-date schema.
+    super::migration::migrate_sqlite_catalog_constraints(
+        database.pool(),
+        std::path::Path::new("test"),
+    )
+    .await?;
+    assert_eq!(table_schema(database.pool(), "libraries").await?, libraries);
+    assert_eq!(
+        table_schema(database.pool(), "media_items").await?,
+        media_items
+    );
+    Ok(())
+}

@@ -20,6 +20,16 @@ const MEDIA_CONTENT_RESTRICTION_INDEX_QUEUE_TRIGGER: &str =
          ON CONFLICT(item_id) DO UPDATE SET queued_at = unixepoch();
      END";
 
+/// Repairs SQLite catalog constraints that the migration history cannot express.
+///
+/// SQLite cannot alter a `CHECK` constraint in place, and the historical base migrations
+/// (`0005`, `0006`) must keep replaying byte-for-byte for existing databases. This rebuild runs
+/// after every migration, detects the legacy shapes through `sqlite_master`, and only then
+/// recreates `libraries`/`media_items` with the current constraints. It is idempotent: a database
+/// that already has the modern shape costs two catalog reads and no DDL.
+///
+/// A future task should replace this with a replayable rebuild migration, which requires pinning
+/// the column set of the migration it is inserted at; see the storage review notes.
 pub(super) async fn migrate_sqlite_catalog_constraints(
     pool: &AnyPool,
     path: &Path,
