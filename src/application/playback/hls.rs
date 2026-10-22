@@ -34,6 +34,8 @@ const HLS_SEGMENT_RESTART_GAP: i64 = 6;
 const HLS_MAX_TRACKED_SEGMENTS: usize = 4_096;
 const MAX_EMBY_VOD_SEGMENTS: i64 = 1_000_000;
 const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Upper bound for inspecting the process table while reclaiming orphans at startup.
+const ORPHAN_PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Session identifiers become directory names, so they stay within one predictable segment.
 const MAX_SESSION_ID_BYTES: usize = 128;
 
@@ -1001,6 +1003,7 @@ impl HlsManager {
     }
 
     pub(crate) async fn cleanup_orphans(&self) -> Result<(), HlsError> {
+        self.terminate_orphan_processes().await;
         fs::create_dir_all(&self.base_directory)
             .await
             .map_err(HlsError::Io)?;
@@ -1015,6 +1018,45 @@ impl HlsManager {
             }
         }
         Ok(())
+    }
+
+    /// Kills the ffmpeg children a crashed process left behind.
+    ///
+    /// Startup drops every session directory, but an ffmpeg process started by a previous
+    /// incarnation keeps encoding into its deleted output paths, burning CPU until the host is
+    /// rebooted. Session ids are regenerated per process, so any process whose command line
+    /// mentions both our ffmpeg executable and the session directory base at startup is stale.
+    async fn terminate_orphan_processes(&self) {
+        let executable = escape_pgrep_pattern(&self.ffmpeg_executable);
+        let base_directory = escape_pgrep_pattern(&self.base_directory.to_string_lossy().as_ref());
+        let (Some(by_executable), Some(by_directory)) = (
+            process_ids_matching(&executable).await,
+            process_ids_matching(&base_directory).await,
+        ) else {
+            tracing::warn!(
+                "could not inspect the process table for orphaned Web HLS ffmpeg processes"
+            );
+            return;
+        };
+        let own_pid = std::process::id();
+        let orphans = by_executable
+            .intersection(&by_directory)
+            .copied()
+            .filter(|pid| *pid != own_pid)
+            .collect::<Vec<_>>();
+        for pid in &orphans {
+            #[cfg(unix)]
+            if let Ok(pid) = libc::pid_t::try_from(*pid) {
+                // The process is unrelated to this incarnation, so it cannot be reaped normally.
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        if !orphans.is_empty() {
+            tracing::warn!(
+                processes = orphans.len(),
+                "terminated orphaned Web HLS ffmpeg processes"
+            );
+        }
     }
 
     fn acquire_permit(&self, tier: ServerTier) -> Result<OwnedSemaphorePermit, HlsError> {
@@ -1242,6 +1284,42 @@ fn kill_process_group(pid: u32) {
 
 fn ffmpeg_executable() -> String {
     std::env::var("LUX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned())
+}
+
+/// Returns the pids whose command line matches `pattern`, or `None` when the process table cannot
+/// be inspected at all.
+async fn process_ids_matching(pattern: &str) -> Option<std::collections::HashSet<u32>> {
+    let output = tokio::time::timeout(
+        ORPHAN_PROCESS_SCAN_TIMEOUT,
+        Command::new("pgrep").arg("-f").arg(pattern).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    // `pgrep` exits with 1 when nothing matches, which is not an inspection failure.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect(),
+    )
+}
+
+fn escape_pgrep_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '.' | '\\' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -1725,6 +1803,64 @@ mod tests {
         ffmpeg_args_for_output, ffmpeg_args_with_audio, ffmpeg_args_with_timeline,
         hls_segment_path, hls_start_number, is_valid_asset, vod_manifest,
     };
+
+    #[test]
+    fn pgrep_patterns_escape_regex_metacharacters() {
+        assert_eq!(
+            super::escape_pgrep_pattern("/tmp/lux+config/ffmpeg.bin"),
+            "/tmp/lux\\+config/ffmpeg\\.bin"
+        );
+        assert_eq!(super::escape_pgrep_pattern("ffmpeg"), "ffmpeg");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_orphans_terminates_stale_ffmpeg_processes() {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config_dir = temp_dir.path().join("config");
+        let base_directory = config_dir.join("web-playback");
+        let stale_session = base_directory.join("stale-session");
+        std::fs::create_dir_all(&stale_session).expect("stale session directory");
+        let script = base_directory.join("ffmpeg");
+        std::fs::write(&script, "#!/bin/sh\nsleep 60\n").expect("write fake ffmpeg");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake ffmpeg executable");
+        let manager = super::HlsManager::new_for_tests(
+            config_dir.clone(),
+            script.to_string_lossy().into_owned(),
+        );
+        let mut child = super::Command::new(&script)
+            .spawn()
+            .expect("spawn stale fake ffmpeg");
+        let child_pid = child.id().expect("child pid");
+        let pattern = super::escape_pgrep_pattern(&script.to_string_lossy());
+        let mut visible = false;
+        for _ in 0..100 {
+            if super::process_ids_matching(&pattern)
+                .await
+                .is_some_and(|pids| pids.contains(&child_pid))
+            {
+                visible = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(visible, "the stale process must be visible to pgrep");
+
+        manager.cleanup_orphans().await.expect("cleanup orphans");
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .expect("the orphaned ffmpeg process must be terminated")
+            .expect("wait for the orphaned process");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            !stale_session.exists(),
+            "stale session directories are removed"
+        );
+    }
 
     #[test]
     fn tracked_segment_generations_stay_within_their_budget() {
