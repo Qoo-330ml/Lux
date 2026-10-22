@@ -31,7 +31,10 @@ mod unix {
         child: &mut tokio::process::Child,
         health_url: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match client.get(health_url).send().await {

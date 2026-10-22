@@ -75,7 +75,10 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -420,7 +423,10 @@ async fn serves_managed_image_when_media_root_is_temporarily_unavailable()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
@@ -468,7 +474,10 @@ async fn image_search_requires_server_management() -> Result<(), Box<dyn std::er
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let viewer_login = client
         .post(format!("{base_url}/api/v1/auth/login"))

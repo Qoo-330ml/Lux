@@ -49,7 +49,10 @@ async fn emby_system_routes_work_with_both_prefixes_without_paths()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     for path in ["/System/Ping", "/emby/System/Ping"] {
         let response = client.get(format!("http://{address}{path}")).send().await?;

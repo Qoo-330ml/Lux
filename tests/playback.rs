@@ -113,7 +113,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await
     });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -1186,7 +1189,10 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -1541,7 +1547,10 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(

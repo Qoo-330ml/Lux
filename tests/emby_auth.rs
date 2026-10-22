@@ -58,7 +58,10 @@ async fn emby_users_requires_server_manager_and_supports_both_prefixes()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     for path in ["/Users", "/emby/Users"] {
         let response = client
@@ -162,7 +165,10 @@ async fn emby_users_query_returns_paginated_admin_user_result()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     for path in ["/Users/Query", "/emby/Users/Query"] {
         let response = client
@@ -245,7 +251,10 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let public = client
         .get(format!("http://{address}/emby/Users/Public"))
@@ -442,7 +451,10 @@ async fn emby_user_id_authentication_matches_avdb_request() -> Result<(), Box<dy
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     for prefix in ["", "/emby"] {
         let path = format!("{prefix}/Users/{}/Authenticate", admin.id);
@@ -508,7 +520,10 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -864,7 +879,10 @@ async fn emby_create_user_accepts_query_name_without_a_request_body()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let created = client
         .post(format!("http://{address}/emby/Users/New"))
@@ -980,7 +998,10 @@ async fn emby_user_creation_deletion_and_configuration_are_persistent()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -1165,7 +1186,10 @@ async fn emby_authenticated_access_refreshes_device_activity()
         )
         .await
     }));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let device_id = "emby-activity-device";
     sqlx::query(
         "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
@@ -1472,7 +1496,10 @@ async fn emby_password_logins_update_device_inventory_without_blocking_auth()
         )
         .await
     }));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let device_id = "emby-shared-device";
     let remote_ip = "203.0.113.10";
     sqlx::query(
@@ -1626,7 +1653,10 @@ async fn emby_credentials_follow_server_precedence_without_query_alias_conflicts
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let invalid = "invalid-test-credential";
     for prefix in ["", "/emby"] {
         // Public discovery and password login do not authenticate with query tokens.

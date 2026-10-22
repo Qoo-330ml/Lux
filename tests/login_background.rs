@@ -138,7 +138,10 @@ async fn login_background_uses_recent_posters_only_when_enabled()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let default_background = client
         .get(format!("{base_url}/api/v1/auth/login-background"))
@@ -347,7 +350,10 @@ for request_line in sys.stdin:
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -575,7 +581,10 @@ for request_line in sys.stdin:
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let upload_url =
         format!("{base_url}/api/v1/admin/plugins/{plugin_id}/config/image/customImage");
     let image_bytes = |pixel| {

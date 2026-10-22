@@ -27,7 +27,10 @@ async fn user_playback_threshold_defaults_to_95_and_is_csrf_protected()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -121,7 +124,10 @@ async fn account_preferences_api_is_authenticated_versioned_and_csrf_protected()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let unauthenticated = client
         .get(format!("{base_url}/api/v1/auth/account-preferences"))

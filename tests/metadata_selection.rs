@@ -175,7 +175,10 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     .await?;
     let item_id = fixture.item_id.clone();
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let response = client
@@ -305,7 +308,10 @@ async fn metadata_selection_refreshes_cached_catalog_and_home_images()
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
     let list_url = format!("{base_url}/api/v1/libraries/{library_id}/items?pageSize=10");
 
@@ -900,7 +906,10 @@ async fn admin_can_batch_confirm_pending_metadata_items() -> Result<(), Box<dyn 
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let response = client
@@ -955,7 +964,10 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let selected = client
@@ -1050,7 +1062,10 @@ async fn local_nfo_cast_is_exposed_by_detail_api_without_selection()
         .await?;
 
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, _) = login(&client, &base_url).await?;
     let detail = client
         .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
@@ -1092,7 +1107,10 @@ async fn local_nfo_cast_exposes_all_one_hundred_actors_in_detail_api()
         .await?;
 
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, _) = login(&client, &base_url).await?;
     let detail = client
         .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
@@ -1203,7 +1221,10 @@ async fn image_failure_does_not_block_selection_or_nfo_writeback()
     .await?;
     let item_id = fixture.item_id.clone();
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
     let path = format!(
         "{base_url}/api/v1/admin/items/{item_id}/identify/candidates/{candidate_id}/select"
@@ -1270,7 +1291,10 @@ async fn selection_failure_after_writeback_checks_does_not_confirm_candidate()
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let response = client

@@ -365,7 +365,10 @@ async fn remote_policy_blocks_auth_and_media_until_user_is_allowed()
         .await
     });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let denied_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .header("x-forwarded-for", "8.8.8.8")

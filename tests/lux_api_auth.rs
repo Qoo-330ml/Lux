@@ -44,7 +44,10 @@ async fn lux_client_tokens_authenticate_lux_api_without_web_cookies()
     let _server = AbortOnDrop(tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
     }));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let unauthenticated = client
         .get(format!("http://{address}/api/v1/home"))

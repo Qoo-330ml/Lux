@@ -288,7 +288,10 @@ async fn admin_can_request_metadata_job_cancellation() -> Result<(), Box<dyn std
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("http://{address}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))

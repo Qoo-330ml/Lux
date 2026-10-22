@@ -57,7 +57,10 @@ async fn media_info_plugin_config_api_drives_a_background_run()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     client
         .post(format!("{base_url}/api/v1/setup/complete"))

@@ -125,7 +125,10 @@ async fn playback_events_preserve_same_session_order_and_allow_new_session_rewin
         .await
     });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -799,7 +802,10 @@ async fn emby_session_stop_by_session_id_stops_only_owned_sessions_and_is_idempo
         .await
     });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let item_id = emby_public_id(&item_id);
     let admin_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))

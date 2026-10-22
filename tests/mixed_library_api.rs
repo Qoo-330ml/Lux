@@ -64,7 +64,10 @@ async fn all_emby_clients_use_the_standard_mixed_library_shape()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let emby_library_id = emby_public_id(&library.id.to_string());
 
     let emby_token = emby_login(&client, &base_url, "Emby").await?;
@@ -202,7 +205,10 @@ async fn homevideos_emby_views_and_parent_browsing_use_video_items()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let token = emby_login(&client, &base_url, "Emby").await?;
     let emby_library_id = emby_public_id(&library.id.to_string());
 
@@ -314,7 +320,10 @@ async fn emby_parent_folder_can_list_folder_and_video_children()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let token = emby_login(&client, &base_url, "Emby").await?;
 
     let trips_id: String = sqlx::query_scalar(

@@ -124,7 +124,10 @@ async fn playback_webhooks_and_home_events_follow_emby_progress()
     let server =
         tokio::spawn(async move { axum::serve(listener, app_with_state(app_state)).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(

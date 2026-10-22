@@ -88,7 +88,10 @@ async fn emby_media_folders_returns_concrete_folder_ids_and_refreshes_one_folder
         .rotate()
         .await?;
     let (base_url, _server) = start_server(config, database.clone(), setup).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let library_id = emby_public_id(&library.id.to_string());
 
     let folders = client
@@ -185,7 +188,10 @@ async fn emby_media_updated_queues_incremental_scan_for_absolute_path()
         .await?;
     let (base_url, _server) = start_server(config, database.clone(), setup).await?;
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client")
         .post(format!("{base_url}/Library/Media/Updated"))
         .query(&[("api_key", key.as_str())])
         .json(&json!({
@@ -242,7 +248,10 @@ async fn emby_scheduled_tasks_reports_library_scan_state() -> Result<(), Box<dyn
         .await?;
     let (base_url, _server) = start_server(config, database, setup).await?;
 
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client")
         .get(format!("{base_url}/emby/ScheduledTasks"))
         .query(&[("api_key", key.as_str())])
         .send()
@@ -308,7 +317,10 @@ async fn emby_library_refresh_queues_all_enabled_libraries_and_reuses_active_job
         .create_user("Viewer", "Viewer", "viewer password", false)
         .await?;
     let (base_url, _server) = start_server(config, database.clone(), setup).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let response = client
         .post(format!("{base_url}/emby/Library/Refresh"))
@@ -389,7 +401,10 @@ async fn admin_path_scan_queues_only_the_requested_relative_path()
         .rotate()
         .await?;
     let (base_url, _server) = start_server(config, database.clone(), setup).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let valid_request = client
         .post(format!(
             "{base_url}/api/v1/admin/libraries/{}/scan-path",
@@ -487,7 +502,10 @@ async fn emby_media_folders_applies_pagination_across_accessible_libraries()
         .rotate()
         .await?;
     let (base_url, _server) = start_server(config, database, setup).await?;
-    let response = reqwest::Client::new()
+    let response = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client")
         .get(format!("{base_url}/Library/MediaFolders"))
         .query(&[
             ("StartIndex", "0"),
@@ -569,7 +587,10 @@ async fn modified_notification_and_admin_endpoint_refresh_local_metadata_precise
         .rotate()
         .await?;
     let (base_url, _server) = start_server(config, database.clone(), setup).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     // An Emby-compatible "Modified" notification for one directory re-indexes just that one.
     let response = client

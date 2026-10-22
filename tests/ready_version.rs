@@ -44,7 +44,10 @@ async fn ready_and_version_report_migrated_state_without_paths()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let ready = client
         .get(format!("http://{address}/health/ready"))
         .send()

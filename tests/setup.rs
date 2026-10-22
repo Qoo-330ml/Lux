@@ -37,7 +37,10 @@ async fn setup_can_create_one_admin_and_then_closes() -> Result<(), Box<dyn std:
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let status = client
         .get(format!("{base_url}/api/v1/setup/status"))
@@ -104,7 +107,10 @@ async fn setup_does_not_store_tmdb_configuration_and_can_create_first_library()
         config_dir: config_dir.clone(),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let complete = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -142,7 +148,10 @@ async fn setup_can_skip_tmdb_and_first_library() -> Result<(), Box<dyn std::erro
         config_dir: config_dir.clone(),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let complete = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -172,7 +181,10 @@ async fn setup_rejects_invalid_first_library_before_creating_admin()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let invalid = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -223,7 +235,10 @@ async fn concurrent_setup_requests_only_allow_one_admin() -> Result<(), Box<dyn 
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let first = client
         .post(format!("{base_url}/api/v1/setup/complete"))
         .json(

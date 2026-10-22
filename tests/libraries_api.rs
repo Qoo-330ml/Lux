@@ -352,7 +352,10 @@ async fn admin_library_pipeline_activity_is_authorized_bounded_and_sanitized()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let endpoint = format!("{base_url}/api/v1/admin/library-pipeline-activity");
 
     let unauthorized = client.get(&endpoint).send().await?;
@@ -597,7 +600,10 @@ async fn admin_can_delete_disabled_library_with_active_scan_and_probe_jobs()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -691,7 +697,10 @@ async fn deleting_library_removes_it_from_strm_media_info_plugin_config()
         config_dir: config_dir.clone(),
     };
     let (base_url, server, _) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -879,7 +888,10 @@ async fn library_cover_survives_server_restart() -> Result<(), Box<dyn std::erro
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config.clone()).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1032,7 +1044,10 @@ async fn non_admin_cannot_manage_libraries() -> Result<(), Box<dyn std::error::E
     users
         .create_user("viewer", "Viewer", "viewer password", false)
         .await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url, "viewer", "viewer password").await?;
 
     let response = client
@@ -1057,7 +1072,10 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1329,7 +1347,10 @@ async fn admin_task_activity_includes_scan_postprocessing() -> Result<(), Box<dy
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1392,7 +1413,10 @@ async fn admin_task_activity_includes_current_media_title_for_chapter_jobs()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1514,7 +1538,10 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1839,7 +1866,10 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
         .json(&json!({
@@ -2013,7 +2043,10 @@ async fn admin_plan_run_continues_after_one_library_rejection()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
         .json(&json!({

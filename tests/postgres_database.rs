@@ -3343,7 +3343,10 @@ async fn postgres_resume_visibility_preserves_progress_and_recent_order()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login: serde_json::Value = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(

@@ -45,7 +45,10 @@ async fn setup_selects_sqlite_before_creating_the_first_admin()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, _) = test_server(config.clone()).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let status: Value = client
         .get(format!("{base_url}/api/v1/setup/database"))
@@ -109,7 +112,10 @@ async fn setup_can_request_restart_after_selecting_a_different_database()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, restart_receiver) = test_server(config.clone()).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     tokio::fs::write(
         config.config_dir.join("database.json"),
@@ -146,7 +152,10 @@ async fn setup_rejects_invalid_postgres_configuration_without_persisting_it()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, _) = test_server(config.clone()).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let response = client
         .post(format!("{base_url}/api/v1/setup/database/select"))
@@ -178,7 +187,10 @@ async fn setup_requires_database_selection_before_admin_creation()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, _) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let response = client
         .post(format!("{base_url}/api/v1/setup/complete"))

@@ -121,7 +121,10 @@ async fn emby_item_counts_respects_auth_user_scope_and_favorites()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let unauthenticated = client
         .get(format!("{base_url}/emby/Items/Counts"))
