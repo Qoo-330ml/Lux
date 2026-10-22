@@ -360,11 +360,9 @@ impl EmbyAuthService {
         client_ip: Option<IpAddr>,
     ) -> Result<Option<UserRecord>, EmbyAuthError> {
         let token_hash = hash_token(token);
-        if self.should_touch_access_token(&token_hash) {
-            self.database.touch_access_token(&token_hash).await?;
-            self.mark_access_token_touched(&token_hash);
-        }
         let Some(stored) = self.database.find_user_by_access_token(&token_hash).await? else {
+            // Unknown tokens must not reach the activity UPDATE below; otherwise any random
+            // string would still open a write transaction on every request.
             return Ok(None);
         };
         if stored.is_disabled {
@@ -381,6 +379,10 @@ impl EmbyAuthService {
         {
             self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
+        }
+        if self.should_touch_access_token(&token_hash) {
+            self.database.touch_access_token(&token_hash).await?;
+            self.mark_access_token_touched(&token_hash);
         }
         user_record(stored).map(Some)
     }
