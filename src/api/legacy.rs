@@ -1082,6 +1082,7 @@ async fn reject_unmatched_api_path(request: Request<Body>, next: Next) -> Respon
     if !is_api_or_emby_namespace_path(request.uri().path()) {
         return next.run(request).await;
     }
+    let is_lux_api = request.uri().path().starts_with("/api/");
     let request_headers = request.headers().clone();
     let response = next.run(request).await;
     let is_html_fallback = response.status().is_success()
@@ -1097,6 +1098,10 @@ async fn reject_unmatched_api_path(request: Request<Body>, next: Next) -> Respon
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"));
     if is_html_fallback || is_non_json_not_found {
+        // Emby clients expect a bare status, so only the Lux API uses the error envelope.
+        if !is_lux_api {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         return api_error(
             &request_headers,
             StatusCode::NOT_FOUND,

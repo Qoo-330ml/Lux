@@ -206,3 +206,35 @@ async fn request_bursts_from_one_peer_are_rate_limited() -> Result<(), Box<dyn s
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn unmatched_emby_paths_answer_with_a_bare_404() -> Result<(), Box<dyn std::error::Error>> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app()).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let emby = client
+        .get(format!("http://{address}/Items/unknown-item/UnknownThing"))
+        .send()
+        .await?;
+    assert_eq!(emby.status(), reqwest::StatusCode::NOT_FOUND);
+    assert!(
+        emby.bytes().await?.is_empty(),
+        "Emby namespaces must not receive the Lux error envelope"
+    );
+
+    let api = client
+        .get(format!("http://{address}/api/v1/no-such-endpoint"))
+        .send()
+        .await?;
+    assert_eq!(api.status(), reqwest::StatusCode::NOT_FOUND);
+    let body: Value = api.json().await?;
+    assert_eq!(body["error"]["code"], "NOT_FOUND");
+
+    server.abort();
+    Ok(())
+}
