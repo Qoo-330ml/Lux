@@ -2599,9 +2599,23 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM media_items mi
+             FROM (
+                 -- Page over items first: the source/stream join would otherwise consume page
+                 -- slots for multi-source items and repeat or skip entries between pages.
+                 SELECT mi.id AS item_id,
+                        us.last_played_at AS progress_order
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                   AND us.is_played = 0 AND us.position_ticks > 0
+                   AND mi.library_id IN ({library_placeholders}){series_predicate}
+                 ORDER BY us.last_played_at DESC, mi.series_id, mi.season_number,
+                          mi.episode_number, mi.id
+                 LIMIT ? OFFSET ?
+             ) page
+             JOIN media_items mi ON mi.id = page.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
               AND EXISTS (
@@ -2609,12 +2623,8 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-               AND us.is_played = 0 AND us.position_ticks > 0
-               AND mi.library_id IN ({library_placeholders}){series_predicate}
-             ORDER BY us.last_played_at DESC, mi.series_id, mi.season_number,
-                      mi.episode_number, mi.id
-             LIMIT ? OFFSET ?"
+             ORDER BY page.progress_order DESC, mi.series_id, mi.season_number,
+                      mi.episode_number, mi.id, ms.id, mt.stream_index"
         );
         let mut binds = Vec::with_capacity(item_types.len() + library_ids.len() + 4);
         binds.push(CatalogBind::Text(user_id));

@@ -31088,3 +31088,121 @@ async fn catalog_children_page_over_items_not_joined_source_rows()
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn progress_items_page_over_items_not_joined_source_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::{application::setup::SetupService, config::Config, library::LibraryKind};
+    use std::collections::BTreeSet;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    let user = SetupService::new(database.clone())?
+        .complete("Admin", "Admin", "password")
+        .await?;
+    let user_id = user.id.to_string();
+    let libraries = crate::application::libraries::LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO library_roots (
+            id, library_id, canonical_path, display_path, is_available, is_writable
+        ) VALUES ('root-progress', ?, '/media/movies', '/media/movies', 1, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    for (index, position, played_at) in [
+        (1_u32, 300_i64, 1_700_000_300_i64),
+        (2, 200, 1_700_000_200),
+        (3, 100, 1_700_000_100),
+    ] {
+        let item_id = format!("progress-item-{index}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status,
+                has_available_source
+            ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(&library_id)
+        .bind(format!("Progress {index}"))
+        .bind(format!("Progress {index}"))
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played, last_played_at)
+             VALUES (?, ?, ?, 0, ?)",
+        )
+        .bind(&user_id)
+        .bind(&item_id)
+        .bind(position)
+        .bind(played_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // Two playable sources on the most recent item: joined pagination would consume two slots.
+    for (suffix, path) in [("a", "p1-a.mkv"), ("b", "p1-b.mkv")] {
+        let entry_id = format!("entry-progress-{suffix}");
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                id, library_root_id, relative_path, entry_kind, size, modified_at,
+                last_seen_generation
+            ) VALUES (?, 'root-progress', ?, 'FILE', 1, 1, 'gen')",
+        )
+        .bind(&entry_id)
+        .bind(path)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                id, item_id, source_kind, filesystem_entry_id, is_default
+            ) VALUES (?, 'progress-item-1', 'LOCAL_FILE', ?, 0)",
+        )
+        .bind(format!("source-progress-{suffix}"))
+        .bind(&entry_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let first = database
+        .list_progress_items(
+            &user_id,
+            std::slice::from_ref(&library_id),
+            &["MOVIE"],
+            None,
+            0,
+            2,
+        )
+        .await?;
+    let first_items = first
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        first_items,
+        BTreeSet::from(["progress-item-1".to_owned(), "progress-item-2".to_owned()])
+    );
+    let second = database
+        .list_progress_items(
+            &user_id,
+            std::slice::from_ref(&library_id),
+            &["MOVIE"],
+            None,
+            2,
+            2,
+        )
+        .await?;
+    let second_items = second
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<BTreeSet<_>>();
+    assert_eq!(second_items, BTreeSet::from(["progress-item-3".to_owned()]));
+    Ok(())
+}
