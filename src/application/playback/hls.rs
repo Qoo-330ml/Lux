@@ -26,6 +26,11 @@ const MAX_HARDWARE_SESSIONS: usize = 2;
 const MAX_SOFTWARE_SESSIONS: usize = 1;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+/// Default cap for all Web HLS session directories together.
+///
+/// Four sessions of the per-session ceiling fit inside it, so the disk cannot be filled by
+/// playback even when every transcode slot is busy. Override with `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES`.
+const DEFAULT_MAX_GLOBAL_SESSION_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MANIFEST_WAIT_ATTEMPTS: usize = 50;
 const HLS_ASSET_WAIT_ATTEMPTS: usize = 600;
 const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
@@ -219,6 +224,7 @@ pub(crate) struct HlsManager {
     hardware_encoder: Option<String>,
     ffmpeg_executable: String,
     min_free_bytes: u64,
+    max_global_session_bytes: u64,
 }
 
 impl HlsManager {
@@ -233,6 +239,12 @@ impl HlsManager {
     #[cfg(test)]
     pub(crate) fn new_for_tests(config_dir: PathBuf, ffmpeg_executable: String) -> Self {
         Self::new_with_limits(config_dir, ffmpeg_executable, 0)
+    }
+
+    #[cfg(test)]
+    fn with_global_session_budget(mut self, bytes: u64) -> Self {
+        self.max_global_session_bytes = bytes;
+        self
     }
 
     fn new_with_limits(
@@ -252,6 +264,8 @@ impl HlsManager {
             hardware_encoder,
             ffmpeg_executable,
             min_free_bytes,
+            max_global_session_bytes: global_session_budget_from_env()
+                .unwrap_or(DEFAULT_MAX_GLOBAL_SESSION_BYTES),
         }
     }
 
@@ -354,6 +368,14 @@ impl HlsManager {
             .await
             .map_err(HlsError::Io)?;
         if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes).await {
+            return Err(HlsError::Limit);
+        }
+        if !self.session_bytes_within_global_budget().await? {
+            tracing::warn!(
+                budget_bytes = self.max_global_session_bytes,
+                session_id = %session_id,
+                "refusing to start Web HLS: the global disk budget is exhausted"
+            );
             return Err(HlsError::Limit);
         }
         let directory = self.validated_session_directory(session_id)?;
@@ -1059,6 +1081,53 @@ impl HlsManager {
         }
     }
 
+    /// Checks that the existing session directories still fit the global disk budget.
+    ///
+    /// Uses the cached per-session quota totals when they are fresh and walks the session
+    /// directory otherwise, so admitting a playback start never walks every segment on the hot
+    /// path. Existing sessions are never evicted: a new start is refused instead.
+    async fn session_bytes_within_global_budget(&self) -> Result<bool, HlsError> {
+        let processes = self
+            .processes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut total_bytes = 0_u64;
+        for process in processes {
+            let cached = {
+                let quota = process.quota.lock().await;
+                quota.is_fresh(now).then_some(quota.total_bytes)
+            };
+            let bytes = match cached {
+                Some(bytes) => bytes,
+                None => {
+                    let bytes = match session_directory_bytes(&process.directory).await {
+                        Ok(bytes) => bytes,
+                        // A registered process whose directory is already gone holds no space.
+                        Err(HlsError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            0
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let mut quota = process.quota.lock().await;
+                    quota.total_bytes = bytes;
+                    quota.checked_at = Some(Instant::now());
+                    bytes
+                }
+            };
+            total_bytes = total_bytes.saturating_add(bytes);
+            if total_bytes >= self.max_global_session_bytes {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     fn acquire_permit(&self, tier: ServerTier) -> Result<OwnedSemaphorePermit, HlsError> {
         let semaphore = match tier {
             ServerTier::Remux | ServerTier::AudioTranscode => &self.remux_slots,
@@ -1284,6 +1353,13 @@ fn kill_process_group(pid: u32) {
 
 fn ffmpeg_executable() -> String {
     std::env::var("LUX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned())
+}
+
+fn global_session_budget_from_env() -> Option<u64> {
+    std::env::var("LUX_HLS_GLOBAL_DISK_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
 }
 
 /// Returns the pids whose command line matches `pattern`, or `None` when the process table cannot
@@ -1793,16 +1869,157 @@ fn available_free_bytes(_path: &Path) -> Result<u64, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use std::{
-        path::Path,
+        path::{Path, PathBuf},
+        sync::Arc,
         time::{Duration, Instant},
     };
 
+    use tokio::sync::Mutex;
+
     use super::{
-        HLS_SEGMENT_DURATION_TICKS, HlsSegmentContainer, HlsStartOptions, SESSION_QUOTA_CACHE_TTL,
-        ServerTier, SessionQuotaCache, asset_segment_number, emby_init_segment_number, ffmpeg_args,
-        ffmpeg_args_for_output, ffmpeg_args_with_audio, ffmpeg_args_with_timeline,
-        hls_segment_path, hls_start_number, is_valid_asset, vod_manifest,
+        HLS_SEGMENT_DURATION_TICKS, HlsError, HlsSegmentContainer, HlsStartOptions,
+        SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, asset_segment_number,
+        emby_init_segment_number, ffmpeg_args, ffmpeg_args_for_output, ffmpeg_args_with_audio,
+        ffmpeg_args_with_timeline, hls_segment_path, hls_start_number, is_valid_asset,
+        vod_manifest,
     };
+
+    fn fake_process(directory: PathBuf, total_bytes: Option<u64>) -> super::HlsProcess {
+        super::HlsProcess {
+            directory: directory.clone(),
+            initial_manifest: directory.join("index.m3u8"),
+            runtime_ticks: None,
+            specification: super::HlsProcessSpecification {
+                input: PathBuf::from("/media/movie.mkv"),
+                tier: ServerTier::Remux,
+                video_bitrate: None,
+                audio_stream_index: None,
+                emby_vod: false,
+                segment_container: HlsSegmentContainer::MpegTs,
+            },
+            state: Mutex::new(super::HlsProcessState {
+                child: None,
+                generation: 0,
+                emby_segment_generations: std::collections::HashMap::new(),
+                init: directory.join("init.mp4"),
+                manifest: directory.join("index.m3u8"),
+                permit: None,
+                segment_start_number: 0,
+            }),
+            restart: Mutex::new(()),
+            quota: Mutex::new(super::SessionQuotaCache {
+                checked_at: total_bytes.map(|_| Instant::now()),
+                total_bytes: total_bytes.unwrap_or_default(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn global_session_budget_accounts_for_every_session_directory() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config_dir = temp_dir.path().join("config");
+        let manager =
+            super::HlsManager::new_for_tests(config_dir.clone(), "/usr/bin/false".to_owned())
+                .with_global_session_budget(1_000);
+        assert!(
+            manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("empty budget check"),
+            "no session directory means no usage"
+        );
+
+        let session_directory = config_dir.join("web-playback/session-a");
+        std::fs::create_dir_all(&session_directory).expect("session directory");
+        std::fs::write(session_directory.join("segment_000000.ts"), vec![0_u8; 600])
+            .expect("segment");
+        manager.processes.write().await.insert(
+            "session-a".to_owned(),
+            Arc::new(fake_process(session_directory.clone(), None)),
+        );
+        assert!(
+            manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("stale budget check"),
+            "the stale cache must fall back to measuring the directory"
+        );
+        let measured = {
+            let processes = manager.processes.read().await;
+            let process = processes.get("session-a").expect("process").clone();
+            drop(processes);
+            let quota = process.quota.lock().await;
+            assert!(quota.is_fresh(Instant::now()));
+            quota.total_bytes
+        };
+        assert_eq!(measured, 600);
+
+        let second_directory = config_dir.join("web-playback/session-b");
+        std::fs::create_dir_all(&second_directory).expect("session directory");
+        std::fs::write(second_directory.join("segment_000000.ts"), vec![0_u8; 600])
+            .expect("segment");
+        manager.processes.write().await.insert(
+            "session-b".to_owned(),
+            Arc::new(fake_process(second_directory, Some(600))),
+        );
+        assert!(
+            !manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("over-budget check"),
+            "two sessions above the shared budget must refuse another start"
+        );
+
+        manager.processes.write().await.clear();
+        manager.processes.write().await.insert(
+            "gone".to_owned(),
+            Arc::new(fake_process(config_dir.join("web-playback/gone"), None)),
+        );
+        assert!(
+            manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("missing directory check"),
+            "a registered session whose directory vanished must not block new starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_global_budget_refuses_to_start_a_session() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config_dir = temp_dir.path().join("config");
+        let manager =
+            super::HlsManager::new_for_tests(config_dir.clone(), "/usr/bin/false".to_owned())
+                .with_global_session_budget(100);
+        let session_directory = config_dir.join("web-playback/existing");
+        std::fs::create_dir_all(&session_directory).expect("session directory");
+        std::fs::write(session_directory.join("segment_000000.ts"), vec![0_u8; 200])
+            .expect("segment");
+        manager.processes.write().await.insert(
+            "existing".to_owned(),
+            Arc::new(fake_process(session_directory, Some(200))),
+        );
+
+        let error = manager
+            .start_emby_vod(
+                "new-session",
+                ServerTier::Remux,
+                Path::new("/media/movie.mkv"),
+                None,
+                super::HlsStartOptions {
+                    segment_container: HlsSegmentContainer::MpegTs,
+                    start_time_ticks: None,
+                    runtime_ticks: None,
+                },
+            )
+            .await
+            .expect_err("the global budget must refuse a new session");
+        assert!(matches!(error, HlsError::Limit));
+        assert!(
+            !manager.processes.read().await.contains_key("new-session"),
+            "a refused session must not be registered"
+        );
+    }
 
     #[test]
     fn pgrep_patterns_escape_regex_metacharacters() {
