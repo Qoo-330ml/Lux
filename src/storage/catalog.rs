@@ -7438,6 +7438,9 @@ impl Database {
         expected_generation: i64,
     ) -> Result<bool, StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
+        // One transaction on purpose: a collection's membership and references become visible
+        // together. Batching the rows would expose half-synced collections and transient orphan
+        // references to readers while the worker is running.
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let lock_clause = if self.backend == DatabaseBackend::Postgres {
             " FOR UPDATE"

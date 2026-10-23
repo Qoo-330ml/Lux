@@ -133,6 +133,10 @@ impl ScanJobService {
         cancellation: &AtomicBool,
     ) -> Result<ScanBatchReport, ScanJobError> {
         let mut created_items = 0_usize;
+        // Each changed path is committed on its own so a failure only loses that path's work and
+        // cancellation between files keeps already-indexed files. Grouping several paths into one
+        // transaction would increase throughput slightly but roll back successfully processed files
+        // on a single failure and make cancellation coarser; revisit only with measurements.
         for path in paths {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(&job.id).await;

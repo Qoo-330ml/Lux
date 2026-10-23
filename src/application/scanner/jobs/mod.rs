@@ -14,6 +14,12 @@ pub struct ScanJobService {
     pub(super) database: Database,
     pub(super) admin_events: AdminEventHub,
     pub(super) user_events: UserEventHub,
+    /// Serializes scan work across libraries on purpose.
+    ///
+    /// One permit is deliberate rather than an oversight: SQLite has a single writer, the scan
+    /// pipeline already saturates the bounded background budget, and the full-vs-incremental
+    /// coordination assumes a single active scan. Per-library concurrency is a policy change
+    /// (CPU/IO budget and database contention), not a mechanical lock split.
     pub(super) scan_lock: Arc<Semaphore>,
     pub(super) full_scan_queue: Arc<Semaphore>,
     pub(super) library_covers: Option<LibraryCoverService>,
