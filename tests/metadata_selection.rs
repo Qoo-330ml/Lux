@@ -1456,6 +1456,121 @@ async fn series_and_season_selection_writes_to_their_media_directories()
 }
 
 #[tokio::test]
+async fn keep_and_fill_overwrite_policies_protect_existing_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (overwrite, mode) in [
+        ("KEEP", MetadataSelectionMode::RefreshUnlocked),
+        ("FILL", MetadataSelectionMode::RefreshUnlocked),
+        ("OVERWRITE", MetadataSelectionMode::FillMissing),
+    ] {
+        let fixture = prepare_fixture(false).await?;
+        let (image_url, image_server) = start_image_stub().await?;
+        let poster_path = fixture.movie_dir.join("poster.png");
+        tokio::fs::write(&poster_path, b"old-poster").await?;
+        set_library_image_strategy(
+            &fixture.database,
+            &fixture.item_id,
+            json!({
+                "poster": true,
+                "backdrop": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 1,
+                "minDownloadWidth": 0,
+                "levels": {
+                    "movie": { "artworks": { "poster": { "overwrite": overwrite } } }
+                }
+            }),
+        )
+        .await?;
+        let candidate_id = insert_candidate(
+            &fixture.database,
+            &fixture.item_id,
+            json!({ "title": "Online Movie", "posterUrl": format!("{image_url}/poster") }),
+        )
+        .await?;
+        let selection = MetadataSelectionService::new(
+            fixture.database.clone(),
+            ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+        );
+
+        selection
+            .select(&fixture.item_id, &candidate_id, mode)
+            .await
+            .map_err(|error| format!("selection failed for {overwrite}: {error:?}"))?;
+
+        assert_eq!(
+            tokio::fs::read(&poster_path).await?,
+            b"old-poster",
+            "{overwrite} policy must not replace an existing poster in {mode:?} mode"
+        );
+        image_server.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn overwrite_policy_replaces_existing_image_on_full_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let poster_path = fixture.movie_dir.join("poster.png");
+    tokio::fs::write(&poster_path, b"old-poster").await?;
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 1,
+            "minDownloadWidth": 0,
+            "levels": {
+                "movie": { "artworks": { "poster": { "overwrite": "OVERWRITE" } } }
+            }
+        }),
+    )
+    .await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "Online Movie", "posterUrl": format!("{image_url}/poster") }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await
+        .map_err(|error| format!("selection failed: {error:?}"))?;
+
+    assert_eq!(tokio::fs::read(&poster_path).await?, PNG_1X1);
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn level_overrides_enable_and_disable_posters_per_media_level()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_series_fixture().await?;

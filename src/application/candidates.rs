@@ -3239,14 +3239,37 @@ impl MetadataSelectionService {
             let images = self.images.clone();
             let item_id = item_id.to_owned();
             let source = source.to_owned();
+            let overwrite = image_policy
+                .type_policy_for_item_type(item_type, image_type)
+                .overwrite;
             tasks.spawn(async move {
                 let _permit = permit;
+                if matches!(overwrite, ArtworkOverwrite::Keep) {
+                    match images.has_local_image(&item_id, image_type).await {
+                        Ok(true) => return Ok(None),
+                        Ok(false) => {}
+                        Err(error) => return Err(error),
+                    }
+                }
+                // The job mode is a ceiling: fill-missing never replaces, even
+                // when a cell asks for OVERWRITE.
+                let replace = matches!(mode, MetadataSelectionMode::RefreshUnlocked)
+                    && matches!(
+                        overwrite,
+                        ArtworkOverwrite::Inherit | ArtworkOverwrite::Overwrite
+                    );
                 let mut last_error = None;
                 for url in urls.into_iter().take(4) {
-                    let result = match mode {
-                        MetadataSelectionMode::FillMissing => {
+                    let result = if replace {
+                        if image_index == 0 {
                             images
-                                .try_download_item_image_if_missing_from_scraper_at_index(
+                                .download_item_image_from_scraper(
+                                    &item_id, image_type, &url, &source,
+                                )
+                                .await
+                        } else {
+                            images
+                                .download_item_image_from_scraper_at_index(
                                     &item_id,
                                     image_type,
                                     &url,
@@ -3255,25 +3278,16 @@ impl MetadataSelectionService {
                                 )
                                 .await
                         }
-                        MetadataSelectionMode::RefreshUnlocked => {
-                            if image_index == 0 {
-                                images
-                                    .download_item_image_from_scraper(
-                                        &item_id, image_type, &url, &source,
-                                    )
-                                    .await
-                            } else {
-                                images
-                                    .download_item_image_from_scraper_at_index(
-                                        &item_id,
-                                        image_type,
-                                        &url,
-                                        &source,
-                                        image_index,
-                                    )
-                                    .await
-                            }
-                        }
+                    } else {
+                        images
+                            .try_download_item_image_if_missing_from_scraper_at_index(
+                                &item_id,
+                                image_type,
+                                &url,
+                                &source,
+                                image_index,
+                            )
+                            .await
                     };
                     match result {
                         Ok(Some(report)) => {
@@ -3995,10 +4009,13 @@ impl ImageLevel {
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum ArtworkOverwrite {
-    /// Keep whatever image is already registered or on disk.
-    Keep,
-    /// Download only when the type is missing; the default for every level.
+    /// Follow the metadata refresh mode: fill-missing never replaces, full
+    /// refresh replaces (the pre-existing behaviour).
     #[default]
+    Inherit,
+    /// Never touch an existing image of this type.
+    Keep,
+    /// Only download when the type is missing, even in a full refresh.
     Fill,
     /// Replace an existing image, but only in a full-refresh job.
     Overwrite,
@@ -4007,6 +4024,7 @@ pub(crate) enum ArtworkOverwrite {
 impl ArtworkOverwrite {
     fn parse(value: &str) -> Option<Self> {
         match value {
+            "INHERIT" => Some(Self::Inherit),
             "KEEP" => Some(Self::Keep),
             "FILL" => Some(Self::Fill),
             "OVERWRITE" => Some(Self::Overwrite),
