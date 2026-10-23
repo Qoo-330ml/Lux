@@ -87,6 +87,30 @@ where
     }
 }
 
+/// Runs `run` and restarts it after a panic until it returns normally.
+///
+/// Use this for tasks that outlive any owner, such as the local metadata outbox worker: a panic
+/// must not silently stop background processing for the rest of the process lifetime.
+pub(crate) async fn supervise_with_restart<F, Fut>(name: &'static str, run: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: Future<Output = ()> + Send + 'static,
+{
+    loop {
+        match tokio::spawn(run()).await {
+            Ok(()) => return,
+            Err(error) => {
+                tracing::error!(
+                    loop_name = name,
+                    %error,
+                    "background task panicked; restarting it"
+                );
+                tokio::time::sleep(PANIC_RESTART_DELAY).await;
+            }
+        }
+    }
+}
+
 /// Sleeps for `duration`, returning `true` when shutdown was requested first.
 pub(crate) async fn wait_or_shutdown(
     shutdown: &mut watch::Receiver<bool>,
@@ -149,6 +173,40 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), worker.shutdown())
             .await
             .expect("shutdown must stop the restarted loop");
+    }
+
+    #[tokio::test]
+    async fn restart_helper_runs_the_task_again_after_a_panic() {
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let finished = Arc::new(Mutex::new(None));
+        let task_attempts = attempts.clone();
+        let task_finished = finished.clone();
+        let supervisor = tokio::spawn(super::supervise_with_restart("restarted", move || {
+            let attempts = task_attempts.clone();
+            let finished = task_finished.clone();
+            async move {
+                if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                    panic!("first run fails");
+                }
+                *finished.lock().await = Some(attempts.load(Ordering::SeqCst));
+            }
+        }));
+
+        for _ in 0..250 {
+            if finished.lock().await.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            *finished.lock().await,
+            Some(2),
+            "the task must run again after it panicked"
+        );
+        tokio::time::timeout(Duration::from_secs(5), supervisor)
+            .await
+            .expect("the supervisor must finish once the task returns")
+            .expect("supervisor task");
     }
 
     #[tokio::test]
