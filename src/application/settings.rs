@@ -127,7 +127,7 @@ pub(crate) const IMAGE_TYPE_KEYS: [&str; 8] = [
     "disc",
     "wallpaper",
 ];
-pub(crate) const ARTWORK_SOURCE_KEYS: [&str; 3] = ["LOCAL", "SCRAPER", "SCREENSHOT"];
+pub(crate) const ARTWORK_SOURCE_KEYS: [&str; 2] = ["SCRAPER", "SCREENSHOT"];
 pub(crate) const SCRAPER_ROLE_KEYS: [&str; 3] = ["PRIMARY", "BACKUP", "SUPPLEMENT"];
 pub(crate) const ARTWORK_OVERWRITE_KEYS: [&str; 4] = ["INHERIT", "KEEP", "FILL", "OVERWRITE"];
 pub(crate) const EPISODE_IMAGE_POLICY_KEYS: [&str; 3] =
@@ -1214,7 +1214,7 @@ mod image_level_tests {
                     "poster".to_owned(),
                     ArtworkPolicySettings {
                         enabled: Some(false),
-                        sources: Some(vec!["LOCAL".to_owned(), "SCRAPER".to_owned()]),
+                        sources: Some(vec!["SCRAPER".to_owned(), "SCREENSHOT".to_owned()]),
                         scraper_roles: Some(vec!["PRIMARY".to_owned()]),
                         overwrite: Some("FILL".to_owned()),
                         max_count: Some(1),
@@ -1265,7 +1265,7 @@ mod image_level_tests {
                 ..ArtworkPolicySettings::default()
             },
             ArtworkPolicySettings {
-                sources: Some(vec!["LOCAL".to_owned(), "LOCAL".to_owned()]),
+                sources: Some(vec!["SCRAPER".to_owned(), "SCRAPER".to_owned()]),
                 ..ArtworkPolicySettings::default()
             },
             ArtworkPolicySettings {

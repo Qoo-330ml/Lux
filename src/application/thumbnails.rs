@@ -310,17 +310,20 @@ impl ThumbnailService {
             if !seen_items.insert(candidate.item_id.clone()) {
                 continue;
             }
+            let image_policy = ImageSelectionPolicy::from_json(
+                candidate.library_media_strategy_json.as_deref(),
+                global_strategy,
+            );
             let mode = effective_thumbnail_mode(
                 &candidate.item_type,
-                ImageSelectionPolicy::from_json(
-                    candidate.library_media_strategy_json.as_deref(),
-                    global_strategy,
-                ),
+                image_policy,
                 ThumbnailScrapingMode::from_strategy_json(
                     candidate.library_media_strategy_json.as_deref(),
                     global_strategy,
                 ),
             );
+            let (poster_screenshots, thumb_screenshots) =
+                screenshot_permissions(&candidate.item_type, image_policy);
             if !mode.allows_screenshots() {
                 report.skipped_policy += 1;
                 continue;
@@ -346,7 +349,9 @@ impl ThumbnailService {
             let service = self.clone();
             pending.spawn(async move {
                 let item_id = candidate.item_id.clone();
-                let result = service.generate_for_source(&candidate, mode).await;
+                let result = service
+                    .generate_for_source(&candidate, mode, (poster_screenshots, thumb_screenshots))
+                    .await;
                 (item_id, result)
             });
         }
@@ -405,6 +410,7 @@ impl ThumbnailService {
         &self,
         source: &StoredThumbnailSource,
         mode: ThumbnailScrapingMode,
+        screenshots: (bool, bool),
     ) -> Result<ThumbnailOutcome, ThumbnailFileError> {
         let (source_path, _target_path, root_path) = resolve_media_paths(source).await?;
         let _image_write_lock = acquire_image_write_lock(&source.item_id).await;
@@ -422,7 +428,7 @@ impl ThumbnailService {
             indexed_image_availability(&indexed_images, "POSTER", &root_path).await?;
         let thumbnail_availability =
             indexed_image_availability(&indexed_images, "THUMB", &root_path).await?;
-        let poster_plan = self
+        let mut poster_plan = self
             .plan_artwork(
                 "POSTER",
                 poster_target,
@@ -431,7 +437,7 @@ impl ThumbnailService {
                 mode,
             )
             .await?;
-        let thumbnail_plan = self
+        let mut thumbnail_plan = self
             .plan_artwork(
                 "THUMB",
                 thumbnail_target,
@@ -440,6 +446,13 @@ impl ThumbnailService {
                 mode,
             )
             .await?;
+        let (poster_screenshots, thumb_screenshots) = screenshots;
+        if !poster_screenshots {
+            poster_plan.action = ArtworkAction::Keep;
+        }
+        if !thumb_screenshots {
+            thumbnail_plan.action = ArtworkAction::Keep;
+        }
 
         if poster_availability == ImageAvailability::Missing
             && thumbnail_availability == ImageAvailability::Missing
@@ -1156,6 +1169,24 @@ impl From<ThumbnailFileError> for ThumbnailError {
 
 /// Episodes follow the three-way `episodeImagePolicy`: scraper still, local
 /// screenshot, or neither. Other item types keep the shared thumbnail mode.
+/// Per-type permission for generating ffmpeg screenshots. A cell can turn
+/// screenshots off for POSTER or THUMB while keeping scraper artwork.
+pub(crate) fn screenshot_permissions(
+    item_type: &str,
+    policy: ImageSelectionPolicy,
+) -> (bool, bool) {
+    (
+        policy
+            .type_policy_for_item_type(item_type, "POSTER")
+            .sources
+            .screenshot,
+        policy
+            .type_policy_for_item_type(item_type, "THUMB")
+            .sources
+            .screenshot,
+    )
+}
+
 pub(crate) fn effective_thumbnail_mode(
     item_type: &str,
     policy: ImageSelectionPolicy,
@@ -1268,6 +1299,21 @@ mod episode_image_mode_tests {
                 expected_mode
             );
         }
+    }
+
+    #[test]
+    fn screenshot_permissions_follow_the_cell_sources() {
+        let policy = ImageSelectionPolicy::from_json(
+            Some(
+                r#"{"images":{"levels":{"series":{"artworks":{"poster":{"sources":["SCRAPER"]},"thumbnail":{"sources":["SCREENSHOT"]}}}}}}"#,
+            ),
+            None,
+        );
+        assert_eq!(
+            super::screenshot_permissions("SERIES", policy),
+            (false, true)
+        );
+        assert_eq!(super::screenshot_permissions("MOVIE", policy), (true, true));
     }
 
     #[test]

@@ -4146,9 +4146,10 @@ impl ArtworkOverwrite {
     }
 }
 
+/// Which artwork origins may supply a type. Local files always win and are
+/// never disabled per type, matching the metadata priority rules.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ArtworkSources {
-    pub(crate) local: bool,
     pub(crate) scraper: bool,
     pub(crate) screenshot: bool,
 }
@@ -4156,7 +4157,6 @@ pub(crate) struct ArtworkSources {
 impl Default for ArtworkSources {
     fn default() -> Self {
         Self {
-            local: true,
             scraper: true,
             screenshot: true,
         }
@@ -4169,13 +4169,11 @@ impl ArtworkSources {
             return None;
         }
         let mut sources = Self {
-            local: false,
             scraper: false,
             screenshot: false,
         };
         for value in values {
             match value.as_str() {
-                "LOCAL" => sources.local = true,
                 "SCRAPER" => sources.scraper = true,
                 "SCREENSHOT" => sources.screenshot = true,
                 _ => return None,
@@ -6409,7 +6407,7 @@ mod tests {
     fn type_policy_defaults_come_from_the_flat_limits_and_level_values_win() {
         let policy = parse_image_selection_policy(
             r#"{"images":{"poster":true,"artwork":true,"maxBackdropCount":3,"minDownloadWidth":1920,
-                 "levels":{"series":{"artworks":{"artwork":{"maxCount":1,"minWidth":720,"overwrite":"KEEP","sources":["LOCAL"],"scraperRoles":["PRIMARY"]}}}}}}"#,
+                 "levels":{"series":{"artworks":{"artwork":{"maxCount":1,"minWidth":720,"overwrite":"KEEP","sources":["SCRAPER"],"scraperRoles":["PRIMARY"]}}}}}}"#,
         )
         .expect("strategy JSON is valid");
 
@@ -6419,7 +6417,7 @@ mod tests {
         assert_eq!(movie_art.max_count, 3);
         assert_eq!(movie_art.min_width, 1920);
         assert_eq!(movie_art.overwrite, ArtworkOverwrite::Inherit);
-        assert!(movie_art.sources.local && movie_art.sources.scraper);
+        assert!(movie_art.sources.scraper && movie_art.sources.screenshot);
 
         let series_art = policy
             .type_policy(ImageLevel::Series, "ART")
@@ -6427,8 +6425,7 @@ mod tests {
         assert_eq!(series_art.max_count, 1);
         assert_eq!(series_art.min_width, 720);
         assert_eq!(series_art.overwrite, ArtworkOverwrite::Keep);
-        assert!(series_art.sources.local);
-        assert!(!series_art.sources.scraper);
+        assert!(series_art.sources.scraper);
         assert!(!series_art.sources.screenshot);
         assert!(series_art.scraper_roles.primary);
         assert!(!series_art.scraper_roles.backup);

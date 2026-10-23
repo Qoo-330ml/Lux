@@ -1848,7 +1848,8 @@ async fn level_overrides_enable_and_disable_posters_per_media_level()
 }
 
 #[tokio::test]
-async fn local_only_source_policy_skips_online_images() -> Result<(), Box<dyn std::error::Error>> {
+async fn screenshot_only_source_policy_skips_online_images()
+-> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_series_fixture().await?;
     let (image_url, image_server) = start_image_stub().await?;
     set_library_image_strategy(
@@ -1870,8 +1871,8 @@ async fn local_only_source_policy_skips_online_images() -> Result<(), Box<dyn st
             "levels": {
                 "series": {
                     "artworks": {
-                        "poster": { "enabled": true, "sources": ["LOCAL"] },
-                        "backdrop": { "enabled": true, "sources": ["LOCAL"] }
+                        "poster": { "enabled": true, "sources": ["SCREENSHOT"] },
+                        "backdrop": { "enabled": true, "sources": ["SCREENSHOT"] }
                     }
                 }
             }
