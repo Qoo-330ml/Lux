@@ -3399,6 +3399,32 @@ impl Database {
         Ok(true)
     }
 
+    /// Role the owning library assigned to one scraper. Unknown scrapers (for
+    /// example a provider name that is not a configured plugin) return `None`
+    /// so callers can keep their pre-existing permissive behaviour.
+    pub(crate) async fn find_item_scraper_role(
+        &self,
+        item_id: &str,
+        scraper_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query(
+            "SELECT library_scrapers.role AS role
+             FROM library_scrapers
+             JOIN media_items ON media_items.library_id = library_scrapers.library_id
+             WHERE media_items.id = ? AND library_scrapers.scraper_id = ?
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .bind(scraper_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(|row| row.get::<String, _>("role")))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn find_media_item_metadata(
         &self,
         item_id: &str,

@@ -1456,6 +1456,119 @@ async fn series_and_season_selection_writes_to_their_media_directories()
 }
 
 #[tokio::test]
+async fn scraper_role_policy_limits_which_source_may_supply_artwork()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    for (position, scraper_id, role) in [
+        (0_i64, "org.lux.tmdb", "PRIMARY"),
+        (1, "org.lux.supplement", "SUPPLEMENT"),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&library_id)
+        .bind(scraper_id)
+        .bind(position)
+        .bind(role)
+        .execute(fixture.database.pool())
+        .await?;
+    }
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 4,
+            "minDownloadWidth": 0,
+            "levels": {
+                "movie": {
+                    "artworks": {
+                        "poster": { "scraperRoles": ["PRIMARY"] },
+                        "backdrop": { "scraperRoles": ["PRIMARY"] }
+                    }
+                }
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let supplement_candidate = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Supplement Movie",
+            "posterUrl": format!("{image_url}/poster"),
+            "fanartUrl": format!("{image_url}/fanart")
+        }),
+    )
+    .await?;
+    selection
+        .select_with_scraper(
+            &fixture.item_id,
+            &supplement_candidate,
+            MetadataSelectionMode::FillMissing,
+            Some("org.lux.supplement"),
+            true,
+        )
+        .await
+        .map_err(|error| format!("supplement selection failed: {error:?}"))?;
+    assert!(
+        !fixture.movie_dir.join("poster.png").exists(),
+        "a SUPPLEMENT source must not supply PRIMARY-only artwork"
+    );
+    let written: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type IN ('POSTER', 'FANART')",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(written, 0);
+
+    let primary_candidate = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Primary Movie",
+            "posterUrl": format!("{image_url}/poster")
+        }),
+    )
+    .await?;
+    selection
+        .select_with_scraper(
+            &fixture.item_id,
+            &primary_candidate,
+            MetadataSelectionMode::FillMissing,
+            Some("org.lux.tmdb"),
+            false,
+        )
+        .await
+        .map_err(|error| format!("primary selection failed: {error:?}"))?;
+    assert!(fixture.movie_dir.join("poster.png").exists());
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn keep_and_fill_overwrite_policies_protect_existing_images()
 -> Result<(), Box<dyn std::error::Error>> {
     for (overwrite, mode) in [

@@ -3240,11 +3240,20 @@ impl MetadataSelectionService {
         };
         // A level/type cell may forbid online images; local-only cells keep
         // whatever the media directory already has.
+        let source_role = if image_policy.has_scraper_role_restrictions(item_type) {
+            self.database
+                .find_item_scraper_role(item_id, source)
+                .await
+                .map_err(MetadataSelectionError::Storage)?
+        } else {
+            None
+        };
         let scraper_allowed = |image_type: &str| {
-            image_policy
-                .type_policy_for_item_type(item_type, image_type)
-                .sources
-                .scraper
+            let cell = image_policy.type_policy_for_item_type(item_type, image_type);
+            cell.sources.scraper
+                && source_role
+                    .as_deref()
+                    .is_none_or(|role| cell.scraper_roles.allows(role))
         };
         macro_rules! add_spec {
             ($image_type:expr, $urls:expr) => {
@@ -4194,6 +4203,18 @@ impl Default for ScraperRoles {
 }
 
 impl ScraperRoles {
+    /// Whether this cell accepts a library scraper with the given role. The
+    /// library may also store `BOTH`, which serves as primary or backup.
+    pub(crate) fn allows(self, role: &str) -> bool {
+        match role {
+            "PRIMARY" => self.primary,
+            "BACKUP" => self.backup,
+            "SUPPLEMENT" => self.supplement,
+            "BOTH" => self.primary || self.backup,
+            _ => true,
+        }
+    }
+
     fn from_keys(values: &[String]) -> Option<Self> {
         if values.is_empty() {
             return None;
@@ -4408,6 +4429,16 @@ impl ImageSelectionPolicy {
                 .unwrap_or_else(|| self.flat_type_policy(image_type)),
             None => self.flat_type_policy(image_type),
         }
+    }
+
+    /// True when any image type of this item restricts which scraper roles may
+    /// supply artwork, so the writer only pays for one role lookup when needed.
+    pub(crate) fn has_scraper_role_restrictions(self, item_type: &str) -> bool {
+        IMAGE_TYPE_KEYS.into_iter().any(|image_type| {
+            self.type_policy_for_item_type(item_type, image_type)
+                .scraper_roles
+                != ScraperRoles::default()
+        })
     }
 
     pub(crate) fn enabled_types_for_item_type(self, item_type: &str) -> Vec<&'static str> {
@@ -5129,8 +5160,8 @@ mod tests {
         ACTOR_METADATA_FETCH_CONCURRENCY, ArtworkOverwrite, COMPLETENESS_PLAN_ITEM_CONCURRENCY,
         EpisodeImagePolicy, FillMissingRequestPlan, ImageLevel, ImageSelectionPolicy,
         MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
-        MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors,
-        candidate_payload, capability_needs_request, completeness_capabilities,
+        MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles, candidate_actor_credits,
+        candidate_actors, candidate_payload, capability_needs_request, completeness_capabilities,
         credits_need_actor_relation_check, default_image_selection_policy, enrich_actor_metadata,
         filtered_candidate_images, generic_candidate_actors, generic_candidate_images,
         image_attempt_identities, local_metadata_completeness_plan, merge_actor_values,
@@ -6513,5 +6544,28 @@ mod tests {
             season.get("FANART"),
             Some(&vec!["https://images.example/backdrop".to_owned()])
         );
+    }
+
+    #[test]
+    fn scraper_role_policy_accepts_the_configured_roles() {
+        let primary_only = ScraperRoles {
+            primary: true,
+            backup: false,
+            supplement: false,
+        };
+        assert!(primary_only.allows("PRIMARY"));
+        assert!(primary_only.allows("BOTH"));
+        assert!(!primary_only.allows("BACKUP"));
+        assert!(!primary_only.allows("SUPPLEMENT"));
+        assert!(primary_only.allows("UNKNOWN-ROLE"));
+
+        let supplement_only = ScraperRoles {
+            primary: false,
+            backup: false,
+            supplement: true,
+        };
+        assert!(!supplement_only.allows("PRIMARY"));
+        assert!(!supplement_only.allows("BOTH"));
+        assert!(supplement_only.allows("SUPPLEMENT"));
     }
 }
