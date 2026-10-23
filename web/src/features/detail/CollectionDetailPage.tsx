@@ -1,8 +1,8 @@
 import "./detail.css";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft } from "lucide-react";
-import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { ArrowLeft, ChevronRight, X } from "lucide-react";
+import { useEffect, useRef, useState } from "react";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { GLOBAL_COLLECTION_LIBRARY_ID, type CollectionMember, type CollectionSourceCopy, type CollectionSourceVersion } from "../../lib/api/types";
@@ -19,17 +19,9 @@ type CollectionSourceChoice = {
   version?: CollectionSourceVersion;
 };
 
-type SourcePreferenceChange = {
-  workItemId: string;
-  sourceItemId: string;
-  mediaSourceId?: string;
-  value: string;
-};
-
 export function CollectionDetailPage() {
   const { collectionId = "" } = useParams();
-  const queryClient = useQueryClient();
-  const [selectedChoices, setSelectedChoices] = useState<Record<string, string>>({});
+  const [choosingMemberId, setChoosingMemberId] = useState<string>();
   const collectionQuery = useInfiniteQuery({
     queryKey: queryKeys.collection(collectionId),
     queryFn: ({ pageParam }) => api.collection(collectionId, pageParam, COLLECTION_PAGE_SIZE),
@@ -39,17 +31,6 @@ export function CollectionDetailPage() {
       const page = lastPage.page ?? 1;
       const pageSize = lastPage.pageSize ?? COLLECTION_PAGE_SIZE;
       return page * pageSize < lastPage.total ? page + 1 : undefined;
-    },
-  });
-  const preference = useMutation({
-    mutationFn: (change: SourcePreferenceChange) => api.setCollectionSourcePreference(
-      collectionId,
-      change.workItemId,
-      { sourceItemId: change.sourceItemId, mediaSourceId: change.mediaSourceId },
-    ),
-    onSuccess: (_result, change) => {
-      setSelectedChoices((current) => ({ ...current, [change.workItemId]: change.value }));
-      void queryClient.invalidateQueries({ queryKey: queryKeys.collection(collectionId) });
     },
   });
 
@@ -66,6 +47,7 @@ export function CollectionDetailPage() {
   const members = collectionQuery.data.pages.flatMap((page) => page.items ?? []);
   const title = mediaTitle(collection);
   const originalTitle = collection.originalTitle?.trim();
+  const choosingMember = members.find((member) => member.id === choosingMemberId);
 
   return (
     <main className="lux-detail-page lux-collection-detail">
@@ -106,10 +88,7 @@ export function CollectionDetailPage() {
                     key={member.id}
                     collectionId={collectionId}
                     member={member}
-                    selectedValue={selectedChoices[member.id]}
-                    isSaving={preference.isPending}
-                    saveError={preference.variables?.workItemId === member.id ? preference.error?.message : undefined}
-                    onSelect={(change) => preference.mutate(change)}
+                    onChooseSource={() => setChoosingMemberId(member.id)}
                   />
                 ))}
               </ol>
@@ -129,6 +108,7 @@ export function CollectionDetailPage() {
           {collectionQuery.isFetchNextPageError ? <p className="lux-error-copy" role="alert">加载更多影片失败，请稍后重试。</p> : null}
         </section>
       </div>
+      {choosingMember ? <CollectionSourceDialog collectionId={collectionId} member={choosingMember} onClose={() => setChoosingMemberId(undefined)} /> : null}
     </main>
   );
 }
@@ -136,25 +116,18 @@ export function CollectionDetailPage() {
 function CollectionWorkCard({
   collectionId,
   member,
-  selectedValue,
-  isSaving,
-  saveError,
-  onSelect,
+  onChooseSource,
 }: {
   collectionId: string;
   member: CollectionMember;
-  selectedValue?: string;
-  isSaving: boolean;
-  saveError?: string;
-  onSelect: (change: SourcePreferenceChange) => void;
+  onChooseSource: () => void;
 }) {
   const choices = sourceChoices(member.sources);
   const preferred = choices.find((choice) =>
     choice.source.itemId === member.preferredSourceItemId
     && (!member.preferredMediaSourceId || choice.version?.id === member.preferredMediaSourceId),
   );
-  const currentValue = selectedValue ?? preferred?.value ?? choices[0]?.value ?? "";
-  const selected = choices.find((choice) => choice.value === currentValue);
+  const selected = preferred ?? choices[0];
   const sourceItem = selected ? {
     ...member,
     id: selected.source.itemId,
@@ -162,44 +135,85 @@ function CollectionWorkCard({
     posterItemId: undefined,
     imageTags: { poster: selected.source.posterImageTag ?? undefined },
   } : undefined;
-  const detailQuery = new URLSearchParams({ collectionId });
-  if (selected?.version) detailQuery.set("sourceId", selected.version.id);
-  const detailHref = selected
-    ? `/items/${encodeURIComponent(selected.source.itemId)}?${detailQuery.toString()}`
-    : undefined;
-
-  function handleSourceChange(value: string) {
-    const choice = choices.find((entry) => entry.value === value);
-    if (!choice) return;
-    onSelect({
-      workItemId: member.id,
-      sourceItemId: choice.source.itemId,
-      ...(choice.version ? { mediaSourceId: choice.version.id } : {}),
-      value,
-    });
-  }
+  const detailHref = selected ? collectionMovieHref(collectionId, selected) : undefined;
+  const onActivate = member.sources.length > 1 ? onChooseSource : undefined;
 
   return (
     <li className="lux-media-card lux-collection-work">
       {sourceItem && detailHref ? <>
-        <MediaCardVisual item={sourceItem} landscape={false} href={detailHref} />
-        <MediaCardCopy item={sourceItem} metadataAttention={false} href={detailHref} />
+        <MediaCardVisual item={sourceItem} landscape={false} href={detailHref} onActivate={onActivate} />
+        <MediaCardCopy item={sourceItem} metadataAttention={false} href={detailHref} onActivate={onActivate} />
       </> : <>
         <div className="lux-media-art"><MediaPlaceholder item={member} /></div>
         <div className="lux-media-copy"><strong>{mediaTitle(member)}</strong></div>
         <p className="lux-muted-copy" role="status">该影片目前没有可访问的播放副本。</p>
       </>}
-      {choices.length > 1 ? (
-        <label className="lux-collection-source-control">
-          <span>来源与版本</span>
-          <select aria-label={`选择《${mediaTitle(member)}》的可访问来源`} value={currentValue} disabled={isSaving} onChange={(event) => handleSourceChange(event.target.value)}>
-            {choices.map((choice) => <option key={choice.value} value={choice.value}>{sourceChoiceLabel(choice.source, choice.version)}</option>)}
-          </select>
-        </label>
-      ) : null}
-      {saveError ? <p className="lux-error-copy" role="alert">来源保存失败：{saveError}</p> : null}
     </li>
   );
+}
+
+function CollectionSourceDialog({ collectionId, member, onClose }: { collectionId: string; member: CollectionMember; onClose: () => void }) {
+  const dialogRef = useRef<HTMLDialogElement>(null);
+  const activeRef = useRef(false);
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
+  const preference = useMutation({
+    mutationFn: (choice: CollectionSourceChoice) => api.setCollectionSourcePreference(collectionId, member.id, {
+      sourceItemId: choice.source.itemId,
+      ...(choice.version ? { mediaSourceId: choice.version.id } : {}),
+    }),
+    onSuccess: (_result, choice) => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.collection(collectionId) });
+      if (activeRef.current) navigate(collectionMovieHref(collectionId, choice));
+    },
+  });
+
+  useEffect(() => {
+    const dialog = dialogRef.current;
+    if (!dialog) return;
+    activeRef.current = true;
+    dialog.showModal();
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    return () => {
+      activeRef.current = false;
+      dialog.close();
+      document.body.style.overflow = previousOverflow;
+    };
+  }, []);
+
+  return (
+    <dialog ref={dialogRef} className="lux-collection-source-dialog" aria-labelledby="collection-source-heading" aria-describedby="collection-source-description" onCancel={onClose} onClick={(event) => {
+      if (event.target !== event.currentTarget) return;
+      const bounds = event.currentTarget.getBoundingClientRect();
+      if (event.clientX < bounds.left || event.clientX > bounds.right || event.clientY < bounds.top || event.clientY > bounds.bottom) onClose();
+    }}>
+      <header className="lux-detail-overview-dialog-header">
+        <div><h2 id="collection-source-heading">选择影片来源</h2><p id="collection-source-description">{mediaTitle(member)}</p></div>
+        <button className="lux-detail-overview-dialog-close" type="button" aria-label="关闭来源选择" onClick={onClose} autoFocus><X size={19} aria-hidden="true" /></button>
+      </header>
+      <div className="lux-collection-source-body" aria-busy={preference.isPending}>
+        <ul className="lux-collection-source-options">
+          {sourceChoices(member.sources).map((choice) => (
+            <li key={choice.value}>
+              <button className="lux-collection-source-option" type="button" disabled={preference.isPending} onClick={() => preference.mutate(choice)}>
+                <span><strong>{choice.source.libraryName}</strong><small>{sourceChoiceLabel(choice.source, choice.version)}</small></span>
+                <ChevronRight size={18} aria-hidden="true" />
+              </button>
+            </li>
+          ))}
+        </ul>
+        {preference.isPending ? <p className="lux-muted-copy" role="status">正在打开影片…</p> : null}
+        {preference.error ? <p className="lux-error-copy" role="alert">来源保存失败：{preference.error.message}，请选择来源重试。</p> : null}
+      </div>
+    </dialog>
+  );
+}
+
+function collectionMovieHref(collectionId: string, choice: CollectionSourceChoice) {
+  const query = new URLSearchParams({ collectionId });
+  if (choice.version) query.set("sourceId", choice.version.id);
+  return `/items/${encodeURIComponent(choice.source.itemId)}?${query.toString()}`;
 }
 
 function sourceChoices(sources: CollectionSourceCopy[]): CollectionSourceChoice[] {
@@ -217,5 +231,5 @@ function sourceChoiceLabel(source: CollectionSourceCopy, version?: CollectionSou
   const versionLabel = [version?.editionName, version?.qualityLabel, version?.container?.toUpperCase()]
     .filter((value): value is string => Boolean(value?.trim()))
     .join(" · ");
-  return [source.libraryName, source.title, versionLabel].filter(Boolean).join(" — ");
+  return [source.title, versionLabel].filter(Boolean).join(" — ");
 }

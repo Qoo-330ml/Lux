@@ -7,11 +7,31 @@
 
 /* Route-only rules moved out of react.css so the shared sheet stays small (LUX-835). */
 
-.lux-collection-source-control { display: grid; gap: 6px; margin-top: 12px; color: var(--lux-subtle); font-size: .75rem; }
-
-.lux-collection-source-control select { width: 100%; min-width: 0; min-height: 42px; padding: 8px 34px 8px 12px; border: 1px solid var(--lux-line); border-radius: 8px; color: var(--lux-text); background: var(--lux-surface); font: inherit; }
+.lux-collection-work button.lux-media-card-link { width: 100%; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: inherit; cursor: pointer; }
 
 .lux-collection-work .lux-media-card-link:focus-visible { outline: 2px solid var(--lux-text); outline-offset: 4px; border-radius: 10px; }
+
+.lux-collection-source-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); margin: auto; padding: 0; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--lux-line); border-radius: 16px; color: var(--lux-text); background: var(--lux-surface-strong); box-shadow: 0 24px 64px rgba(0,0,0,.35); }
+
+.lux-collection-source-dialog::backdrop { background: rgba(0,0,0,.65); }
+
+.lux-collection-source-dialog header p { margin: 10px 0 0; color: var(--lux-muted); font-size: .9rem; overflow-wrap: anywhere; }
+
+.lux-collection-source-body { padding: 20px; }
+
+.lux-collection-source-options { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
+
+.lux-collection-source-option { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-height: 64px; padding: 16px; border: 1px solid var(--lux-line); border-radius: 10px; color: var(--lux-text); background: var(--lux-surface); font: inherit; text-align: left; cursor: pointer; }
+
+.lux-collection-source-option > span { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
+
+.lux-collection-source-option small { color: var(--lux-muted); line-height: 1.5; }
+
+.lux-collection-source-option > svg { flex: 0 0 auto; }
+
+.lux-collection-source-option:hover, .lux-collection-source-option:focus-visible { border-color: var(--lux-text); }
+
+.lux-collection-source-option:disabled { opacity: .6; cursor: wait; }
 
 .lux-section-heading-sub { font-family: var(--lux-editorial-font-family); font-size: .74rem; font-weight: 300; letter-spacing: .14em; text-transform: uppercase; color: rgba(255,255,255,.52); font-style: normal; line-height: 1; }
 
@@ -763,7 +783,6 @@ html[data-lux-theme="light"] .lux-detail-watched-status.is-played { border-color
 }
 
 @media (max-width: 700px) {
-  .lux-collection-source-control select { min-height: var(--lux-button-height-touch); }
   .lux-person-detail-page { width: 92%; box-sizing: border-box; padding-top: 0; }
   .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-person-detail-photo-frame { width: min(58vw, 220px); margin: 0 auto; }
