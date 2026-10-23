@@ -5275,7 +5275,7 @@ pub(super) fn emby_library_type_options_json(
             "MinWidth": media_strategy.images.min_download_width,
         }));
     }
-    if media_strategy.images.max_backdrop_count > 0 {
+    if media_strategy.images.backdrop && media_strategy.images.max_backdrop_count > 0 {
         image_options.push(json!({
             "Type": "Backdrop",
             "Limit": media_strategy.images.max_backdrop_count,

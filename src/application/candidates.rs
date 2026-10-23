@@ -397,6 +397,25 @@ impl MetadataCandidateService {
         Self { database }
     }
 
+    async fn candidate_image_policy_for(
+        &self,
+        item_id: &str,
+        plan: MetadataRequestPlan,
+    ) -> Result<ImageSelectionPolicy, MetadataCandidateError> {
+        if let Some(policy) = plan.image_policy {
+            return Ok(policy);
+        }
+        let (library, global) = self
+            .database
+            .find_item_media_strategy_settings(item_id)
+            .await?
+            .ok_or(MetadataCandidateError::ItemNotFound)?;
+        Ok(ImageSelectionPolicy::from_json(
+            library.as_deref(),
+            global.as_deref(),
+        ))
+    }
+
     pub async fn list_pending(
         &self,
         offset: i64,
@@ -708,6 +727,7 @@ impl MetadataCandidateService {
             MediaKind::Series => crate::application::scraper::ScraperItemType::Series,
             MediaKind::Episode => return Err(MetadataCandidateError::InvalidSearch),
         };
+        let candidate_image_policy = self.candidate_image_policy_for(item_id, plan).await?;
         let direct_provider_id = selected_scraper_provider_id(current, scraper).filter(|_| {
             if plan != MetadataRequestPlan::full() {
                 return true;
@@ -1191,7 +1211,14 @@ impl MetadataCandidateService {
                     provider_id,
                     images: images_response
                         .as_ref()
-                        .map(|response| generic_candidate_images(&response.images, item_type))
+                        .map(|response| {
+                            filtered_candidate_images(
+                                &response.images,
+                                item_type,
+                                &current.item_type,
+                                candidate_image_policy,
+                            )
+                        })
                         .unwrap_or_default(),
                     actors,
                     metadata_fetched: details.is_some(),
@@ -1364,6 +1391,7 @@ impl MetadataCandidateService {
             "EPISODE" => ScraperItemType::Episode,
             _ => return Err(MetadataCandidateError::InvalidSearch),
         };
+        let candidate_image_policy = self.candidate_image_policy_for(item_id, plan).await?;
         let season_number = current
             .season_number
             .and_then(|value| i32::try_from(value).ok())
@@ -1527,7 +1555,12 @@ impl MetadataCandidateService {
                     trailers: Vec::new(),
                     provider: parent.provider,
                     provider_id,
-                    images: generic_candidate_images(&images.images, item_type),
+                    images: filtered_candidate_images(
+                        &images.images,
+                        item_type,
+                        &current.item_type,
+                        candidate_image_policy,
+                    ),
                     actors: Vec::new(),
                     metadata_fetched,
                     score: Some(parent.score),
@@ -2141,33 +2174,73 @@ impl From<StorageError> for MetadataCandidateError {
     }
 }
 
+fn candidate_image_targets(
+    image_type: &str,
+    item_type: ScraperItemType,
+) -> &'static [&'static str] {
+    match image_type {
+        "Primary" | "Poster" | "POSTER" => &["POSTER", "DISC"],
+        "Logo" | "LOGO" => &["LOGO"],
+        "Backdrop" | "Fanart" | "FANART" if item_type == ScraperItemType::Episode => &["FANART"],
+        "Backdrop" | "Fanart" | "FANART" => &["FANART", "THUMB", "BANNER", "ART", "WALLPAPER"],
+        "Thumb" | "THUMB" if item_type == ScraperItemType::Episode => &["FANART"],
+        "Thumb" | "THUMB" => &["THUMB"],
+        "Banner" | "BANNER" => &["BANNER"],
+        "Disc" | "DISC" => &["DISC"],
+        "Art" | "ART" => &["ART"],
+        "Wallpaper" | "WALLPAPER" => &["WALLPAPER"],
+        _ => &[],
+    }
+}
+
+fn candidate_image_entries(
+    images: &[crate::application::scraper::ScraperImage],
+    item_type: ScraperItemType,
+) -> Vec<(&'static str, &str, Option<i32>)> {
+    let mut entries = Vec::new();
+    for image in images {
+        for image_type in candidate_image_targets(&image.image_type, item_type) {
+            entries.push((*image_type, image.url.as_str(), image.width));
+        }
+    }
+    entries
+}
+
+#[cfg(test)]
 fn generic_candidate_images(
     images: &[crate::application::scraper::ScraperImage],
     item_type: ScraperItemType,
 ) -> BTreeMap<String, Vec<String>> {
     let mut result = BTreeMap::<String, Vec<String>>::new();
-    for image in images {
-        let image_types: &[&str] = match image.image_type.as_str() {
-            "Primary" | "Poster" | "POSTER" => &["POSTER", "DISC"],
-            "Logo" | "LOGO" => &["LOGO"],
-            "Backdrop" | "Fanart" | "FANART" if item_type == ScraperItemType::Episode => {
-                &["FANART"]
-            }
-            "Backdrop" | "Fanart" | "FANART" => &["FANART", "THUMB", "BANNER", "ART", "WALLPAPER"],
-            "Thumb" | "THUMB" if item_type == ScraperItemType::Episode => &["FANART"],
-            "Thumb" | "THUMB" => &["THUMB"],
-            "Banner" | "BANNER" => &["BANNER"],
-            "Disc" | "DISC" => &["DISC"],
-            "Art" | "ART" => &["ART"],
-            "Wallpaper" | "WALLPAPER" => &["WALLPAPER"],
-            _ => continue,
-        };
-        for image_type in image_types {
-            result
-                .entry((*image_type).to_owned())
-                .or_default()
-                .push(image.url.clone());
+    for (image_type, url, _) in candidate_image_entries(images, item_type) {
+        result
+            .entry(image_type.to_owned())
+            .or_default()
+            .push(url.to_owned());
+    }
+    result
+}
+
+/// Candidate images that already dropped entries below the configured minimum
+/// width for the owning item type. Unknown upstream widths are kept.
+fn filtered_candidate_images(
+    images: &[crate::application::scraper::ScraperImage],
+    scraper_item_type: ScraperItemType,
+    host_item_type: &str,
+    policy: ImageSelectionPolicy,
+) -> BTreeMap<String, Vec<String>> {
+    let mut result = BTreeMap::<String, Vec<String>>::new();
+    for (image_type, url, width) in candidate_image_entries(images, scraper_item_type) {
+        let cell = policy.type_policy_for_item_type(host_item_type, image_type);
+        let below_minimum =
+            cell.min_width > 0 && width.is_some_and(|width| i64::from(width) < cell.min_width);
+        if below_minimum {
+            continue;
         }
+        result
+            .entry(image_type.to_owned())
+            .or_default()
+            .push(url.to_owned());
     }
     result
 }
@@ -3003,12 +3076,14 @@ impl MetadataSelectionService {
         let image_types = self
             .write_selected_images(
                 item_id,
-                &current.item_type,
                 &payload,
                 image_policy,
-                image_source,
-                application_mode,
-                options.supplemental,
+                SelectedImageWrite {
+                    item_type: &current.item_type,
+                    source: image_source,
+                    mode: application_mode,
+                    supplemental: options.supplemental,
+                },
             )
             .await?;
         let screenshot_fallback_types = if image_policy
@@ -3142,13 +3217,16 @@ impl MetadataSelectionService {
     async fn write_selected_images(
         &self,
         item_id: &str,
-        item_type: &str,
         payload: &CandidatePayload,
         image_policy: ImageSelectionPolicy,
-        source: &str,
-        mode: MetadataSelectionMode,
-        supplemental: bool,
+        context: SelectedImageWrite<'_>,
     ) -> Result<Vec<&'static str>, MetadataSelectionError> {
+        let SelectedImageWrite {
+            item_type,
+            source,
+            mode,
+            supplemental,
+        } = context;
         let mut specs = Vec::new();
         let screenshot_fallback_types = if image_policy
             .thumbnail_scraping_mode_for_item_type(item_type)
@@ -4193,6 +4271,15 @@ fn is_multi_image_type(image_type: &str) -> bool {
     matches!(image_type, "FANART" | "ART" | "WALLPAPER")
 }
 
+/// Inputs for one image writeback pass.
+#[derive(Clone, Copy)]
+struct SelectedImageWrite<'a> {
+    item_type: &'a str,
+    source: &'a str,
+    mode: MetadataSelectionMode,
+    supplemental: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct ImageSelectionPolicy {
     poster: bool,
@@ -5045,10 +5132,10 @@ mod tests {
         MetadataSelectionService, SCRAPER_IMAGE_TYPES, candidate_actor_credits, candidate_actors,
         candidate_payload, capability_needs_request, completeness_capabilities,
         credits_need_actor_relation_check, default_image_selection_policy, enrich_actor_metadata,
-        generic_candidate_actors, generic_candidate_images, image_attempt_identities,
-        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
-        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
-        metadata_request_plan_has_work, parse_image_selection_policy,
+        filtered_candidate_images, generic_candidate_actors, generic_candidate_images,
+        image_attempt_identities, local_metadata_completeness_plan, merge_actor_values,
+        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
+        metadata_request_plan, metadata_request_plan_has_work, parse_image_selection_policy,
         run_bounded_completeness_plan_tasks, selected_scraper_provider_id,
     };
     use crate::application::images::ImageWriteService;
@@ -6300,7 +6387,7 @@ mod tests {
             .expect("art cell");
         assert_eq!(movie_art.max_count, 3);
         assert_eq!(movie_art.min_width, 1920);
-        assert_eq!(movie_art.overwrite, ArtworkOverwrite::Fill);
+        assert_eq!(movie_art.overwrite, ArtworkOverwrite::Inherit);
         assert!(movie_art.sources.local && movie_art.sources.scraper);
 
         let series_art = policy
@@ -6373,5 +6460,58 @@ mod tests {
     fn image_selection_policy_stays_small_enough_to_copy() {
         let size = std::mem::size_of::<ImageSelectionPolicy>();
         assert!(size <= 512, "image selection policy grew to {size} bytes");
+    }
+
+    #[test]
+    fn minimum_width_filters_candidate_images_per_level() {
+        let images = vec![
+            ScraperImage {
+                image_type: "Poster".to_owned(),
+                url: "https://images.example/poster-small".to_owned(),
+                width: Some(1000),
+                ..ScraperImage::default()
+            },
+            ScraperImage {
+                image_type: "Poster".to_owned(),
+                url: "https://images.example/poster-large".to_owned(),
+                width: Some(2000),
+                ..ScraperImage::default()
+            },
+            ScraperImage {
+                image_type: "Poster".to_owned(),
+                url: "https://images.example/poster-unknown".to_owned(),
+                width: None,
+                ..ScraperImage::default()
+            },
+            ScraperImage {
+                image_type: "Backdrop".to_owned(),
+                url: "https://images.example/backdrop".to_owned(),
+                width: Some(1280),
+                ..ScraperImage::default()
+            },
+        ];
+        let policy = parse_image_selection_policy(
+            r#"{"images":{"minDownloadWidth":1920,"levels":{"season":{"artworks":{"backdrop":{"minWidth":1000}}}}}}"#,
+        )
+        .expect("strategy JSON is valid");
+
+        let movie = filtered_candidate_images(&images, ScraperItemType::Movie, "MOVIE", policy);
+        assert_eq!(
+            movie.get("POSTER"),
+            Some(&vec![
+                "https://images.example/poster-large".to_owned(),
+                "https://images.example/poster-unknown".to_owned()
+            ])
+        );
+        assert!(
+            movie.get("FANART").is_none(),
+            "a 1280px backdrop is below the 1920px movie minimum"
+        );
+
+        let season = filtered_candidate_images(&images, ScraperItemType::Season, "SEASON", policy);
+        assert_eq!(
+            season.get("FANART"),
+            Some(&vec!["https://images.example/backdrop".to_owned()])
+        );
     }
 }
