@@ -1,13 +1,15 @@
 import "./detail.css";
 import { useInfiniteQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import { ArrowLeft, Play } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { useState } from "react";
 import { Link, useParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { GLOBAL_COLLECTION_LIBRARY_ID, type CollectionMember, type CollectionSourceCopy, type CollectionSourceVersion } from "../../lib/api/types";
-import { mediaTitle, posterUrlWithFallback } from "../home/media";
-import { useImageVariants } from "../home/image-variants";
+import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRail";
+import { mediaTitle, MediaPlaceholder } from "../home/media-display";
+import { MediaCardCopy, MediaCardVisual } from "../home/media-card-visual";
+import { MediaDetailArtwork } from "./MediaDetailHero";
 
 const COLLECTION_PAGE_SIZE = 24;
 
@@ -26,7 +28,6 @@ type SourcePreferenceChange = {
 
 export function CollectionDetailPage() {
   const { collectionId = "" } = useParams();
-  const { enabled } = useImageVariants();
   const queryClient = useQueryClient();
   const [selectedChoices, setSelectedChoices] = useState<Record<string, string>>({});
   const collectionQuery = useInfiniteQuery({
@@ -63,55 +64,76 @@ export function CollectionDetailPage() {
   if (!firstPage) return null;
   const collection = firstPage.collection;
   const members = collectionQuery.data.pages.flatMap((page) => page.items ?? []);
-  const poster = posterUrlWithFallback(collection, undefined, enabled ? 720 : undefined);
+  const title = mediaTitle(collection);
+  const originalTitle = collection.originalTitle?.trim();
 
   return (
-    <main className="lux-page lux-collection-detail">
-      <Link className="lux-button lux-button-secondary lux-collection-back" to={`/libraries/${GLOBAL_COLLECTION_LIBRARY_ID}`}>
-        <ArrowLeft size={16} aria-hidden="true" /> 返回合集库
-      </Link>
-      <header className="lux-collection-heading">
-        {poster ? <img className="lux-collection-poster" src={poster} alt={`${mediaTitle(collection)} 海报`} /> : <div className="lux-collection-poster lux-collection-poster-placeholder" aria-hidden="true">合集</div>}
-        <div>
-          <span className="lux-eyebrow">系列合集</span>
-          <h1>{mediaTitle(collection)}</h1>
-          <p>{collection.productionYear ? `${collection.productionYear} · ` : ""}{firstPage.total} 部影片 · 按影片上映顺序排列</p>
-          {collection.overview ? <p className="lux-collection-overview">{collection.overview}</p> : null}
-        </div>
-      </header>
+    <main className="lux-detail-page lux-collection-detail">
+      <MediaDetailArtwork media={collection} placement="backdrop" />
+      <div className="lux-detail-overlay" />
+      <div className="lux-detail-content">
+        <Link className="lux-detail-collection-return lux-collection-back" to={`/libraries/${GLOBAL_COLLECTION_LIBRARY_ID}`}>
+          <ArrowLeft size={16} aria-hidden="true" /> 返回合集库
+        </Link>
+        <header className="lux-detail-grid">
+          <MediaDetailArtwork media={collection} placement="poster" />
+          <div className="lux-detail-copy">
+            <div className="lux-detail-title-row">
+              <div className="lux-detail-title-names">
+                <h1>{title}</h1>
+                {originalTitle && originalTitle !== title ? <span className="lux-detail-original-title">{originalTitle}</span> : null}
+              </div>
+            </div>
+            <div className="lux-detail-meta">
+              <span>系列合集</span>
+              {collection.productionYear ? <span>{collection.productionYear}</span> : null}
+              <span>{firstPage.total} 部影片</span>
+            </div>
+            <p className="lux-detail-overview lux-collection-overview">{collection.overview?.trim() || "暂无简介。"}</p>
+          </div>
+        </header>
 
-      {members.length ? (
-        <ol className="lux-collection-work-list" aria-label={`${mediaTitle(collection)} 影片列表`}>
-          {members.map((member) => (
-            <CollectionWorkRow
-              key={member.id}
-              collectionId={collectionId}
-              member={member}
-              selectedValue={selectedChoices[member.id]}
-              isSaving={preference.isPending}
-              saveError={preference.variables?.workItemId === member.id ? preference.error?.message : undefined}
-              onSelect={(change) => preference.mutate(change)}
-            />
-          ))}
-        </ol>
-      ) : (
-        <div className="lux-empty-card" role="status">
-          <span>这个系列目前没有可见影片。</span>
-          <Link to={`/libraries/${GLOBAL_COLLECTION_LIBRARY_ID}`}>返回合集库</Link>
-        </div>
-      )}
+        <section className="lux-section lux-collection-members" aria-labelledby="collection-members-heading">
+          <div className="lux-section-heading">
+            <h2 id="collection-members-heading">合集影片</h2>
+            <span>按影片上映顺序排列</span>
+          </div>
+          {members.length ? (
+            <HorizontalScrollRail className="lux-home-rail" ariaLabel="合集影片">
+              <ol className="lux-media-rail lux-collection-work-list" aria-label={`${title} 影片列表`}>
+                {members.map((member) => (
+                  <CollectionWorkCard
+                    key={member.id}
+                    collectionId={collectionId}
+                    member={member}
+                    selectedValue={selectedChoices[member.id]}
+                    isSaving={preference.isPending}
+                    saveError={preference.variables?.workItemId === member.id ? preference.error?.message : undefined}
+                    onSelect={(change) => preference.mutate(change)}
+                  />
+                ))}
+              </ol>
+            </HorizontalScrollRail>
+          ) : (
+            <div className="lux-empty-card" role="status">
+              <span>这个系列目前没有可见影片。</span>
+              <Link to={`/libraries/${GLOBAL_COLLECTION_LIBRARY_ID}`}>返回合集库</Link>
+            </div>
+          )}
 
-      {collectionQuery.hasNextPage ? (
-        <button className="lux-button lux-button-secondary lux-collection-load-more" type="button" disabled={collectionQuery.isFetchingNextPage} onClick={() => void collectionQuery.fetchNextPage()}>
-          {collectionQuery.isFetchingNextPage ? "正在加载…" : "加载更多影片"}
-        </button>
-      ) : null}
-      {collectionQuery.isFetchNextPageError ? <p className="lux-error-copy" role="alert">加载更多影片失败，请稍后重试。</p> : null}
+          {collectionQuery.hasNextPage ? (
+            <button className="lux-button lux-button-secondary lux-collection-load-more" type="button" disabled={collectionQuery.isFetchingNextPage} onClick={() => void collectionQuery.fetchNextPage()}>
+              {collectionQuery.isFetchingNextPage ? "正在加载…" : "加载更多影片"}
+            </button>
+          ) : null}
+          {collectionQuery.isFetchNextPageError ? <p className="lux-error-copy" role="alert">加载更多影片失败，请稍后重试。</p> : null}
+        </section>
+      </div>
     </main>
   );
 }
 
-function CollectionWorkRow({
+function CollectionWorkCard({
   collectionId,
   member,
   selectedValue,
@@ -133,9 +155,13 @@ function CollectionWorkRow({
   );
   const currentValue = selectedValue ?? preferred?.value ?? choices[0]?.value ?? "";
   const selected = choices.find((choice) => choice.value === currentValue);
-  const poster = selected?.source.posterImageTag
-    ? `/api/v1/items/${encodeURIComponent(selected.source.itemId)}/images/poster?tag=${encodeURIComponent(selected.source.posterImageTag)}`
-    : undefined;
+  const sourceItem = selected ? {
+    ...member,
+    id: selected.source.itemId,
+    libraryId: selected.source.libraryId,
+    posterItemId: undefined,
+    imageTags: { poster: selected.source.posterImageTag ?? undefined },
+  } : undefined;
   const detailQuery = new URLSearchParams({ collectionId });
   if (selected?.version) detailQuery.set("sourceId", selected.version.id);
   const detailHref = selected
@@ -154,24 +180,24 @@ function CollectionWorkRow({
   }
 
   return (
-    <li className="lux-collection-work">
-      <div className="lux-collection-work-art">
-        {poster ? <img src={poster} alt="" loading="lazy" decoding="async" /> : <span aria-hidden="true">{mediaTitle(member).slice(0, 1)}</span>}
-      </div>
-      <div className="lux-collection-work-copy">
-        <h2>{mediaTitle(member)}</h2>
-        <p>{member.productionYear ?? "年份未知"}{member.runtimeTicks ? ` · ${Math.max(1, Math.round(member.runtimeTicks / 600_000_000))} 分钟` : ""}</p>
-        {choices.length ? (
-          <label className="lux-collection-source-control">
-            <span>来源与版本</span>
-            <select aria-label={`选择《${mediaTitle(member)}》的可访问来源`} value={currentValue} disabled={isSaving} onChange={(event) => handleSourceChange(event.target.value)}>
-              {choices.map((choice) => <option key={choice.value} value={choice.value}>{sourceChoiceLabel(choice.source, choice.version)}</option>)}
-            </select>
-          </label>
-        ) : <p role="status">该影片目前没有可访问的播放副本。</p>}
-        {saveError ? <p className="lux-error-copy" role="alert">来源保存失败：{saveError}</p> : null}
-        {detailHref ? <Link className="lux-button lux-button-primary lux-collection-open-movie" data-action="open-selected-movie" to={detailHref}><Play size={15} fill="currentColor" aria-hidden="true" /> 打开影片详情</Link> : null}
-      </div>
+    <li className="lux-media-card lux-collection-work">
+      {sourceItem && detailHref ? <>
+        <MediaCardVisual item={sourceItem} landscape={false} href={detailHref} />
+        <MediaCardCopy item={sourceItem} metadataAttention={false} href={detailHref} />
+      </> : <>
+        <div className="lux-media-art"><MediaPlaceholder item={member} /></div>
+        <div className="lux-media-copy"><strong>{mediaTitle(member)}</strong></div>
+        <p className="lux-muted-copy" role="status">该影片目前没有可访问的播放副本。</p>
+      </>}
+      {choices.length > 1 ? (
+        <label className="lux-collection-source-control">
+          <span>来源与版本</span>
+          <select aria-label={`选择《${mediaTitle(member)}》的可访问来源`} value={currentValue} disabled={isSaving} onChange={(event) => handleSourceChange(event.target.value)}>
+            {choices.map((choice) => <option key={choice.value} value={choice.value}>{sourceChoiceLabel(choice.source, choice.version)}</option>)}
+          </select>
+        </label>
+      ) : null}
+      {saveError ? <p className="lux-error-copy" role="alert">来源保存失败：{saveError}</p> : null}
     </li>
   );
 }

@@ -11582,6 +11582,12 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 补充实现（2026-10-18）：虚拟合集库的 Web 入口封面优先使用当前用户可访问合集自身的海报，再以成员电影海报补足；首页和媒体库列表一致，无可用海报时显示专属合集封面样式。封面仅在客户端组合，不写入共享库数据，避免跨用户 ACL 泄露。Web 生产构建通过；本次未运行自动化测试或浏览器视觉验收。
 
+界面调整（2026-10-23）：合集详情复用普通资源详情的背景图、海报和标题布局，显示原始标题、年份、可见影片数及简介（缺失时显示“暂无简介。”），窄屏保留简介。成员按服务端上映顺序以普通影片海报卡片横向排列，复用横向滚动轨道和左右箭头；海报与片名直接进入选定原资源，保留 `collectionId`、版本 `sourceId` 以及原有分页。多个来源或版本时才显示选择器，保存成功后更新卡片海报与详情链接；不可访问的成员不生成链接。
+
+本次文件（5 个）：`web/src/features/detail/CollectionDetailPage.tsx`、`web/src/features/detail/detail.css`、`web/tests/collection-detail.test.tsx`、`scripts/collection-browser-smoke.mjs`、本文档。短计划：先写合集详情和卡片跳转的失败回归，再替换布局并复用现有组件，最后检查 Web 构建、完整单测及隔离浏览器响应式流程。
+
+验证（本机 macOS `arm64`）：合集组件回归先 RED 后 GREEN，4/4 通过；冻结依赖安装与生产构建通过。完整 Web 检查为 Node 150/150、Vitest 847 passed / 1 failed；失败是未由本任务修改的 `account-settings.test.tsx` 头像裁切用例，随后连同合集定向重跑 39/39 通过，不将完整测试记为全绿。Playwright 使用合成 API 与海报，检查明暗主题下 320/768/1024/1440 宽度、简介可见、横向卡片且页面无横向溢出、左右滚动、追加分页、来源保存、键盘打开原资源及返回合集，控制台无新增 error/warning，API 无意外请求。截图在 `output/playwright/collection-*.png`。未修改 Rust/API/数据库，未部署或验证 FNOS/NAS。
+
 #### LUX-543：接入 Emby 合集库与系列浏览
 
 范围：Emby 用户库列表提供 `CollectionType=boxsets` 的系统入口；合集显示为 `BoxSet`，成员显示为唯一逻辑 `Movie`。不同媒体库的同片副本不重复显示为多个系列成员。

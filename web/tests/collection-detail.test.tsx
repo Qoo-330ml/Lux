@@ -102,9 +102,55 @@ describe("CollectionDetailPage", () => {
       mediaSourceId: "version-2",
     }));
 
-    expect(rendered.querySelector<HTMLAnchorElement>("[data-action='open-selected-movie']")?.getAttribute("href"))
+    expect(rendered.querySelector<HTMLAnchorElement>(".lux-media-card-link")?.getAttribute("href"))
       .toBe("/items/movie-2?collectionId=collection-1&sourceId=version-2");
+    expect(rendered.querySelector(".lux-media-art img")?.getAttribute("src"))
+      .toBe("/api/v1/items/movie-2/images/poster?tag=movie-poster-2");
     expect(rendered.textContent).toContain("按影片上映顺序排列");
+  });
+
+  it("shows collection identity and overview above a rail of original movie cards", async () => {
+    const rendered = await renderCollection({
+      collection: {
+        id: "collection-1", title: "飞驰人生（系列）", originalTitle: "Pegasus Collection", itemType: "BOX_SET",
+        overview: "一群热爱赛车的朋友，在赛道上追逐梦想的故事。", productionYear: 2019,
+        posterItemId: "movie-1", imageTags: { poster: "poster", fanart: "backdrop" },
+      },
+      items: [1, 2].map((number) => ({
+        id: `work-${number}`, title: `飞驰人生 ${number}`, itemType: "MOVIE", productionYear: 2019 + number,
+        sources: [{
+          itemId: `movie-${number}`, libraryId: "movies", libraryName: "电影", title: `飞驰人生 ${number}`,
+          posterImageTag: `poster-${number}`, versions: [{ id: `version-${number}`, qualityLabel: "1080p" }],
+        }],
+      })),
+      page: 1, pageSize: 24, total: 2,
+    });
+
+    expect(rendered.querySelector(".lux-detail-page .lux-detail-grid h1")?.textContent).toBe("飞驰人生（系列）");
+    expect(rendered.querySelector(".lux-detail-original-title")?.textContent).toBe("Pegasus Collection");
+    expect(rendered.querySelector(".lux-detail-overview")?.textContent).toContain("在赛道上追逐梦想");
+    expect(rendered.querySelector(".lux-detail-poster img")?.getAttribute("src")).toBe("/api/v1/items/movie-1/images/poster?tag=poster");
+    expect(rendered.querySelector(".lux-detail-backdrop")?.getAttribute("src")).toBe("/api/v1/items/collection-1/images/fanart?tag=backdrop");
+    const rail = rendered.querySelector(".lux-horizontal-scroll-viewport .lux-media-rail");
+    expect(rail?.querySelectorAll(".lux-media-card")).toHaveLength(2);
+    expect(Array.from(rail?.querySelectorAll(".lux-media-copy strong") ?? [], (node) => node.textContent))
+      .toEqual(["飞驰人生 1", "飞驰人生 2"]);
+    expect(rail?.querySelector("a")?.getAttribute("href")).toBe("/items/movie-1?collectionId=collection-1&sourceId=version-1");
+    expect(rendered.querySelector("select")).toBeNull();
+    expect(rendered.textContent).not.toContain("打开影片详情");
+  });
+
+  it("keeps unavailable members unlinked and provides an overview fallback", async () => {
+    const rendered = await renderCollection({
+      collection: { id: "collection-1", title: "飞驰人生", itemType: "BOX_SET" },
+      items: [{ id: "work-1", title: "飞驰人生", sources: [] }],
+      page: 1, pageSize: 24, total: 1,
+    });
+
+    expect(rendered.querySelector(".lux-detail-overview")?.textContent).toContain("暂无简介。");
+    const card = rendered.querySelector(".lux-media-card");
+    expect(card?.textContent).toContain("该影片目前没有可访问的播放副本。");
+    expect(card?.querySelector("a")).toBeNull();
   });
 
   it("shows a useful empty state for a collection with no visible movies", async () => {
