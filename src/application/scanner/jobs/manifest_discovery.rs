@@ -1423,14 +1423,17 @@ impl ScanJobService {
                     }
                     Err(
                         error @ (ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_)),
-                    ) => {
-                        // Keep the conservative root-level handling, but leave a trace of which
-                        // directory failed so an operator can act on it.
+                    ) if relative_directory.is_empty()
+                        || matches!(error, ScannerError::RootIdentityChanged(_)) =>
+                    {
+                        // The root itself is unreadable or was replaced, so every directory below
+                        // it is suspect: keep the conservative root-level handling and leave a
+                        // trace of which directory failed.
                         tracing::warn!(
                             root_id = %root.id,
                             job_id = %job.id,
                             %error,
-                            "manifest discovery could not read a directory; marking the root unavailable"
+                            "manifest discovery could not read the library root; marking it unavailable"
                         );
                         self.database
                             .update_library_root_availability(&root.id, false)
@@ -1438,7 +1441,7 @@ impl ScanJobService {
                         self.database
                             .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
                             .await?;
-                        self.remove_lite_manifest_root(manifest_id, &root.id);
+                        self.remove_lite_manifest_root(manifest_id, &root_id);
                         self.record_event(
                             &job.id,
                             "WARN",
@@ -1448,6 +1451,29 @@ impl ScanJobService {
                         )
                         .await;
                         break;
+                    }
+                    Err(error @ ScannerError::Io { .. }) => {
+                        // One unreadable subdirectory must not discard the rest of the root: the
+                        // remaining directories of this batch are still readable, and marking the
+                        // root unavailable would skip missing-file detection for the whole library.
+                        tracing::warn!(
+                            root_id = %root.id,
+                            job_id = %job.id,
+                            directory = %relative_directory,
+                            %error,
+                            "manifest discovery could not read a directory; skipping it"
+                        );
+                        let details =
+                            serde_json::json!({ "directory": relative_directory }).to_string();
+                        self.record_event(
+                            &job.id,
+                            "WARN",
+                            "DIRECTORY_UNAVAILABLE",
+                            "目录不可读，已跳过该目录",
+                            &details,
+                        )
+                        .await;
+                        continue;
                     }
                     Err(error) => {
                         return self

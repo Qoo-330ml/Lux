@@ -9148,6 +9148,76 @@ async fn scan_job_marks_inaccessible_root_unavailable_and_recovers_after_restore
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_subdirectory_does_not_disable_the_library_root()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let readable = root.join("Readable");
+    let blocked = root.join("Blocked");
+    tokio::fs::create_dir_all(&readable).await?;
+    tokio::fs::write(readable.join("Readable.Movie.2024.mkv"), b"fixture").await?;
+    tokio::fs::create_dir_all(&blocked).await?;
+    tokio::fs::write(blocked.join("Blocked.Movie.2025.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let baseline = jobs.create_movie_scan_job(library.id).await?;
+    finish_scan(&jobs, &baseline.id).await?;
+
+    let mut permissions = tokio::fs::metadata(&blocked).await?.permissions();
+    permissions.set_mode(0o000);
+    tokio::fs::set_permissions(&blocked, permissions).await?;
+    tokio::fs::write(readable.join("Another.Movie.2026.mkv"), b"fixture").await?;
+
+    let scan = jobs.create_movie_scan_job(library.id).await?;
+    finish_scan(&jobs, &scan.id).await?;
+
+    let root_available: i64 =
+        sqlx::query_scalar("SELECT is_available FROM library_roots WHERE library_id = ?")
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        root_available, 1,
+        "one unreadable subdirectory must not disable the whole library root"
+    );
+    let manifest_root_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_roots
+         WHERE manifest_id = (SELECT id FROM scan_manifests WHERE job_id = ?)",
+    )
+    .bind(&scan.id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_ne!(manifest_root_state, "UNAVAILABLE");
+    let readable_items: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE title = 'Another Movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        readable_items, 1,
+        "directories next to an unreadable one are still discovered"
+    );
+
+    let mut permissions = tokio::fs::metadata(&blocked).await?.permissions();
+    permissions.set_mode(0o755);
+    tokio::fs::set_permissions(&blocked, permissions).await?;
+    Ok(())
+}
+
 #[tokio::test]
 async fn scans_from_different_libraries_are_serialized() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
