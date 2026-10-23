@@ -8,6 +8,13 @@ import {
   updateArtworkPolicy,
   updateLevelEpisodePolicy,
 } from "../src/features/admin/ImageLevelPolicyEditor";
+import {
+  countPresets,
+  flatCountOptions,
+  flatWidthOptions,
+  presetsWithCurrent,
+  widthPresets,
+} from "../src/features/admin/image-policy-presets";
 import type { MediaImageStrategySettings } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
@@ -120,5 +127,103 @@ describe("image level policy editor", () => {
     expect(labels.some((label) => label.includes("单集"))).toBe(true);
     expect(container!.querySelectorAll("select[aria-label='单集图片来源']")).toHaveLength(1);
     expect(container!.querySelectorAll("select[aria-label='电影图片来源']")).toHaveLength(0);
+  });
+});
+describe("image policy preset tiers", () => {
+  it("offers wheel-friendly tiers instead of free typing", () => {
+    expect(presetsWithCurrent(countPresets, undefined).map((option) => option.value)).toEqual([
+      "",
+      "0",
+      "1",
+      "2",
+      "3",
+      "4",
+    ]);
+    expect(presetsWithCurrent(widthPresets, undefined).map((option) => option.value)).toEqual([
+      "",
+      "0",
+      "360",
+      "720",
+      "1080",
+      "1280",
+      "1920",
+      "2160",
+      "3840",
+    ]);
+  });
+
+  it("keeps an existing non-tier value selectable", () => {
+    const options = presetsWithCurrent(widthPresets, 640);
+    expect(options.map((option) => option.value)).toContain("640");
+    expect(options.at(-1)).toEqual({ value: "640", label: "当前 640" });
+  });
+
+  it("drops the inherit option for flat settings", () => {
+    expect(flatCountOptions(4).map((option) => option.value)).toEqual(["0", "1", "2", "3", "4"]);
+    expect(flatWidthOptions(1280).map((option) => option.value)).not.toContain("");
+  });
+});
+
+describe("image level policy editor preset controls", () => {
+  let container: HTMLDivElement | null = null;
+  let root: Root | null = null;
+
+  afterEach(() => {
+    if (root) act(() => root!.unmount());
+    container?.remove();
+    root = null;
+    container = null;
+  });
+
+  function render(node: React.ReactNode) {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root!.render(node));
+  }
+
+  it("writes the selected count tier", () => {
+    let latest: MediaImageStrategySettings = base;
+    render(
+      <ImageLevelPolicyEditor
+        images={base}
+        onChange={(next) => {
+          latest = next;
+        }}
+      />,
+    );
+
+    const select = container!.querySelector(
+      'select[aria-label="季度海报张数"]',
+    ) as HTMLSelectElement;
+    expect(select.tagName).toBe("SELECT");
+    select.value = "2";
+    act(() => {
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(latest.levels?.season?.artworks?.poster?.maxCount).toBe(2);
+  });
+
+  it("writes the selected width tier", () => {
+    let latest: MediaImageStrategySettings = base;
+    render(
+      <ImageLevelPolicyEditor
+        images={base}
+        onChange={(next) => {
+          latest = next;
+        }}
+      />,
+    );
+
+    const select = container!.querySelector(
+      'select[aria-label="单集背景图最小宽度"]',
+    ) as HTMLSelectElement;
+    select.value = "1920";
+    act(() => {
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+    });
+
+    expect(latest.levels?.episode?.artworks?.backdrop?.minWidth).toBe(1920);
   });
 });

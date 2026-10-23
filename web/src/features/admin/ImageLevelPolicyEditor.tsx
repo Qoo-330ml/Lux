@@ -1,3 +1,8 @@
+import {
+  countPresets,
+  presetsWithCurrent,
+  widthPresets,
+} from "./image-policy-presets";
 import type {
   MediaArtworkOverwrite,
   MediaArtworkPolicySettings,
@@ -263,12 +268,8 @@ export function ImageLevelPolicyEditor({
                         </select>
                       </td>
                       <td>
-                        <input
+                        <select
                           aria-label={`${level.label}${type.label}张数`}
-                          type="number"
-                          min="0"
-                          max="4"
-                          placeholder="继承"
                           value={policy.maxCount ?? ""}
                           onChange={(event) =>
                             onChange(
@@ -276,20 +277,21 @@ export function ImageLevelPolicyEditor({
                                 maxCount:
                                   event.target.value === ""
                                     ? undefined
-                                    : Math.min(4, Math.max(0, Number(event.target.value))),
+                                    : Number(event.target.value),
                               }),
                             )
                           }
-                        />
+                        >
+                          {presetsWithCurrent(countPresets, policy.maxCount).map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
                       </td>
                       <td>
-                        <input
+                        <select
                           aria-label={`${level.label}${type.label}最小宽度`}
-                          type="number"
-                          min="0"
-                          max="8192"
-                          step="128"
-                          placeholder="继承"
                           value={policy.minWidth ?? ""}
                           onChange={(event) =>
                             onChange(
@@ -297,11 +299,17 @@ export function ImageLevelPolicyEditor({
                                 minWidth:
                                   event.target.value === ""
                                     ? undefined
-                                    : Math.min(8192, Math.max(0, Number(event.target.value))),
+                                    : Number(event.target.value),
                               }),
                             )
                           }
-                        />
+                        >
+                          {presetsWithCurrent(widthPresets, policy.minWidth).map((option) => (
+                            <option key={option.value} value={option.value}>
+                              {option.label}
+                            </option>
+                          ))}
+                        </select>
                       </td>
                       <td>
                         <select

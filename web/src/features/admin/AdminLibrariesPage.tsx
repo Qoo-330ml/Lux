@@ -24,6 +24,7 @@ import type { LucideIcon } from "lucide-react";
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
 import { ImageLevelPolicyEditor } from "./ImageLevelPolicyEditor";
+import { flatCountOptions, flatWidthOptions } from "./image-policy-presets";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminLibraryDeletionJob, AdminLibraryDeletionJobsPage, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaImageVariantCacheSettings, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
@@ -338,8 +339,8 @@ function GlobalStrategyPanel({
             onChange={(thumbnailScrapingMode) => updateImages("thumbnailScrapingMode", thumbnailScrapingMode)}
           />
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
-            <label>每项最大背景图数量<input type="number" min="0" max="4" value={strategy.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Math.min(4, Math.max(0, Number(event.target.value))))} /><small>0 – 4 张，0 表示不下载背景图</small></label>
-            <label>最小下载宽度<input type="number" min="0" max="8192" step="128" value={strategy.images.minDownloadWidth} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))} /><small>设为 0 表示不限制</small></label>
+            <label>每项最大背景图数量<select aria-label="每项最大背景图数量" value={String(strategy.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(strategy.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>0 张表示不下载背景图</small></label>
+            <label>最小下载宽度<select aria-label="最小下载宽度" value={String(strategy.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(strategy.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>“不限”表示不限制</small></label>
           </div>
           <div className="lux-setting-divider" />
           <div className="lux-library-strategy-image-variants">
@@ -712,8 +713,8 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
       />
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />
-        <label>最大背景图数量<input type="number" min="0" max="4" value={draft.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Math.min(4, Math.max(0, Number(event.target.value))))} /></label>
-        <label>最小下载宽度<input type="number" min="0" max="8192" step="128" value={draft.images.minDownloadWidth} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))} /></label>
+        <label>最大背景图数量<select aria-label="媒体库最大背景图数量" value={String(draft.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(draft.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        <label>最小下载宽度<select aria-label="媒体库最小下载宽度" value={String(draft.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(draft.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
       </div>
       <ImageLevelPolicyEditor
         images={draft.images}

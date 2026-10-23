@@ -354,7 +354,7 @@
 
 .lux-level-policy-table select, .lux-level-policy-table input { width: 100%; min-width: 0; font-size: .72rem; padding: 3px 4px; }
 
-.lux-level-policy-table td:nth-child(5), .lux-level-policy-table td:nth-child(6) { max-width: 74px; }
+.lux-level-policy-table td:nth-child(5), .lux-level-policy-table td:nth-child(6) { max-width: 112px; }
 
 .lux-library-strategy-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 15px; color: var(--lux-muted); font-size: .73rem; }
 
