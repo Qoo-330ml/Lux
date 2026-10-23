@@ -225,6 +225,79 @@ fn order_identity_merge_items(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        Ok((temp_dir, database))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_item(
+        database: &Database,
+        library_id: &str,
+        id: &str,
+        item_type: &str,
+        parent_id: Option<&str>,
+        series_id: Option<&str>,
+        season_number: Option<i64>,
+        episode_number: Option<i64>,
+        title: &str,
+        production_year: Option<i64>,
+        provider_ids_json: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+                 title, sort_title, production_year, provider_ids_json, identification_status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(item_type)
+        .bind(parent_id)
+        .bind(series_id)
+        .bind(season_number)
+        .bind(episode_number)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .bind(production_year)
+        .bind(provider_ids_json)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn insert_source(
+        database: &Database,
+        id: &str,
+        item_id: &str,
+        edition_name: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, edition_name, is_default, probe_status
+             ) VALUES (?, ?, 'LOCAL_FILE', ?, 1, 'PENDING')",
+        )
+        .bind(id)
+        .bind(item_id)
+        .bind(edition_name)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn merged_into(database: &Database, id: &str) -> Result<Option<String>, sqlx::Error> {
+        sqlx::query_scalar("SELECT merged_into_item_id FROM media_items WHERE id = ?")
+            .bind(id)
+            .fetch_one(database.pool())
+            .await
+    }
 
     fn candidate(
         id: &str,
@@ -251,5 +324,227 @@ mod tests {
         ]);
         let ids = ordered.into_iter().map(|item| item.id).collect::<Vec<_>>();
         assert_eq!(ids, vec!["c", "a", "d", "b"]);
+    }
+
+    #[tokio::test]
+    async fn provider_identity_merges_series_and_reports_zero_on_the_next_pass()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let provider = Some(r#"{"tmdb":"77"}"#);
+        for (series_id, title) in [("series-a", "Show A"), ("series-b", "Show B")] {
+            insert_item(
+                &database,
+                &library_id,
+                series_id,
+                "SERIES",
+                None,
+                None,
+                None,
+                None,
+                title,
+                None,
+                provider,
+            )
+            .await?;
+            let season_id = format!("{series_id}-season-1");
+            insert_item(
+                &database,
+                &library_id,
+                &season_id,
+                "SEASON",
+                Some(series_id),
+                Some(series_id),
+                Some(1),
+                None,
+                "Season 01",
+                None,
+                None,
+            )
+            .await?;
+            let episode_id = format!("{series_id}-s01e01");
+            insert_item(
+                &database,
+                &library_id,
+                &episode_id,
+                "EPISODE",
+                Some(&season_id),
+                Some(series_id),
+                Some(1),
+                Some(1),
+                "Pilot",
+                None,
+                None,
+            )
+            .await?;
+            insert_source(
+                &database,
+                &format!("{episode_id}-source"),
+                &episode_id,
+                None,
+            )
+            .await?;
+        }
+
+        let service = ItemMergeService::new(database.clone());
+        let report = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(report.groups_merged, 1);
+        assert_eq!(report.items_merged, 1);
+        assert_eq!(
+            merged_into(&database, "series-b").await?.as_deref(),
+            Some("series-a")
+        );
+        let episode_sources: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_sources WHERE item_id = 'series-a-s01e01'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(episode_sources, 2);
+        let auto_records: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_merge_records WHERE source = 'AUTO'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(auto_records, 1);
+
+        let second = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(second.groups_merged, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn title_and_year_fallback_merges_only_items_without_provider_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        insert_item(
+            &database,
+            &library_id,
+            "movie-a",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Same Movie",
+            Some(2001),
+            None,
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "movie-b",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Same Movie",
+            Some(2001),
+            None,
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "movie-other-year",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Same Movie",
+            Some(2002),
+            None,
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "movie-identified",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Same Movie",
+            Some(2001),
+            Some(r#"{"tmdb":"9"}"#),
+        )
+        .await?;
+        insert_source(&database, "source-a", "movie-a", None).await?;
+        insert_source(&database, "source-b", "movie-b", None).await?;
+        insert_source(&database, "source-other", "movie-other-year", None).await?;
+        insert_source(&database, "source-identified", "movie-identified", None).await?;
+
+        let service = ItemMergeService::new(database.clone());
+        let report = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(report.groups_merged, 1);
+        assert_eq!(
+            merged_into(&database, "movie-b").await?.as_deref(),
+            Some("movie-a")
+        );
+        assert_eq!(merged_into(&database, "movie-other-year").await?, None);
+        assert_eq!(merged_into(&database, "movie-identified").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn explicit_editions_are_never_auto_merged() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let provider = Some(r#"{"tmdb":"12"}"#);
+        insert_item(
+            &database,
+            &library_id,
+            "theatrical",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Cut Movie",
+            Some(1999),
+            provider,
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "extended",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Cut Movie",
+            Some(1999),
+            provider,
+        )
+        .await?;
+        insert_source(&database, "source-theatrical", "theatrical", None).await?;
+        insert_source(
+            &database,
+            "source-extended",
+            "extended",
+            Some("Extended Cut"),
+        )
+        .await?;
+
+        let service = ItemMergeService::new(database.clone());
+        let report = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(report.groups_merged, 0);
+        assert!(report.groups_skipped >= 1);
+        assert_eq!(merged_into(&database, "extended").await?, None);
+        Ok(())
     }
 }

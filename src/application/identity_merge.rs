@@ -23,6 +23,8 @@ use uuid::Uuid;
 /// Automatic convergence is a background sweep: it never runs on a user request path.
 const IDENTITY_MERGE_INTERVAL: Duration = Duration::from_secs(120);
 const IDENTITY_MERGE_RETRY_INTERVAL: Duration = Duration::from_secs(300);
+/// Pause between consecutive passes while a large backfill is still producing merges.
+const IDENTITY_MERGE_DRAIN_PAUSE: Duration = Duration::from_millis(250);
 
 #[derive(Clone)]
 pub(crate) struct IdentityMergeWorker {
@@ -106,7 +108,12 @@ async fn run_identity_merge_worker(
             }
         }
         if drained {
-            // Keep converging immediately until no duplicate group remains.
+            // Keep converging until no duplicate group remains, but yield between passes so a large
+            // backfill does not monopolize the database or the background budget.
+            tokio::select! {
+                _ = tokio::time::sleep(IDENTITY_MERGE_DRAIN_PAUSE) => {}
+                _ = shutdown_receiver.changed() => return,
+            }
             continue;
         }
         if *shutdown_receiver.borrow() {
