@@ -7,7 +7,10 @@ use crate::{
         images::{ImageWriteError, ImageWriteService},
         item_merge::ItemMergeService,
     },
-    storage::{Database, StorageError, StoredItemImage, StoredMediaMerge},
+    storage::{
+        Database, StorageError, StoredItemImage, StoredMediaMerge, StoredMediaMergeRecord,
+        StoredMediaMergeUndo,
+    },
 };
 
 pub(crate) enum AdminItemImageListError {
@@ -55,4 +58,25 @@ pub(crate) async fn merge_media_items(
     let result = merge.merge(primary_item_id, item_ids).await?;
     admin_cache::invalidate_media_catalog(home, catalog);
     Ok(result)
+}
+
+pub(crate) async fn unmerge_media_items(
+    merge: &ItemMergeService,
+    home: Option<&HomeService>,
+    catalog: Option<&CatalogService>,
+    primary_item_id: &str,
+    merged_item_id: &str,
+) -> Result<StoredMediaMergeUndo, StorageError> {
+    let result = merge.unmerge(primary_item_id, merged_item_id).await?;
+    admin_cache::invalidate_media_catalog(home, catalog);
+    Ok(result)
+}
+
+pub(crate) async fn list_media_merge_records(
+    merge: &ItemMergeService,
+    primary_item_id: &str,
+    offset: i64,
+    limit: i64,
+) -> Result<Vec<StoredMediaMergeRecord>, StorageError> {
+    merge.list_records(primary_item_id, offset, limit).await
 }
