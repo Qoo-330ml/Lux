@@ -1,0 +1,1146 @@
+use super::*;
+
+/// One statement stays below SQLite's historical 999-variable limit while keeping merges batched.
+pub(crate) const MAX_MERGE_RECORD_ROWS_PER_STATEMENT: usize = 100;
+/// Merge accepts at most 100 roots, so a candidate group never needs more items than this.
+pub(crate) const MAX_IDENTITY_MERGE_GROUP_ITEMS: i64 = 100;
+/// Upper bound for one page of identity keys or administrator merge records.
+pub(crate) const MAX_IDENTITY_MERGE_KEY_PAGE_SIZE: i64 = 100;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MediaMergeOrigin {
+    Manual,
+    Automatic,
+}
+
+impl MediaMergeOrigin {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::Manual => "MANUAL",
+            Self::Automatic => "AUTO",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMediaMergeRecord {
+    pub(crate) id: String,
+    pub(crate) library_id: String,
+    pub(crate) item_type: String,
+    pub(crate) primary_item_id: String,
+    pub(crate) merged_item_id: String,
+    pub(crate) merged_item_title: String,
+    pub(crate) origin: String,
+    pub(crate) merged_at: i64,
+    pub(crate) undone_at: Option<i64>,
+    pub(crate) source_count: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredMediaMergeUndo {
+    pub(crate) library_id: String,
+    pub(crate) item_type: String,
+    pub(crate) primary_item_id: String,
+    pub(crate) merged_item_id: String,
+    pub(crate) restored_item_ids: Vec<String>,
+    pub(crate) restored_source_count: usize,
+}
+
+/// Identity of one automatic-merge candidate group.
+///
+/// Provider keys carry `provider`/`provider_id`; the title fallback carries
+/// `sort_title`/`production_year`. Exactly one pair is populated.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredIdentityMergeCandidateKey {
+    pub(crate) library_id: String,
+    pub(crate) item_type: String,
+    pub(crate) provider: Option<String>,
+    pub(crate) provider_id: Option<String>,
+    pub(crate) sort_title: Option<String>,
+    pub(crate) production_year: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct StoredIdentityMergeCandidateItem {
+    pub(crate) id: String,
+    pub(crate) added_at: i64,
+    pub(crate) source_count: i64,
+    pub(crate) default_source_count: i64,
+    /// Explicit edition markers (`Director's Cut`, ...) protect an item from being auto-merged.
+    pub(crate) edition_source_count: i64,
+}
+
+struct MergeItemStateRow {
+    record_id: String,
+    item_id: String,
+    item_type: String,
+    parent_id: Option<String>,
+    series_id: Option<String>,
+    merged_into_item_id: Option<String>,
+}
+
+impl Database {
+    /// Records one merge record per merged root in a single pass: records, the hierarchy fields a
+    /// merge is about to change, and the media sources it is about to move.
+    pub(super) async fn record_media_merges_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        library_id: &str,
+        item_type: &str,
+        primary_item_id: &str,
+        merged_item_ids: &[String],
+        origin: MediaMergeOrigin,
+    ) -> Result<(), StorageError> {
+        if merged_item_ids.is_empty() {
+            return Ok(());
+        }
+        let records = merged_item_ids
+            .iter()
+            .map(|merged_item_id| (Uuid::now_v7().to_string(), merged_item_id.clone()))
+            .collect::<Vec<_>>();
+        for chunk in records.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, unixepoch())", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO media_merge_records (
+                     id, library_id, item_type, primary_item_id, merged_item_id, source, merged_at
+                 ) VALUES {values}"
+            )));
+            for (record_id, merged_item_id) in chunk {
+                query = query
+                    .bind(record_id)
+                    .bind(library_id)
+                    .bind(item_type)
+                    .bind(primary_item_id)
+                    .bind(merged_item_id)
+                    .bind(origin.as_sql());
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        // Seasons and episodes carry the merged series in `series_id`; the root carries itself.
+        let mut owners = std::collections::HashMap::<String, String>::new();
+        for (record_id, merged_item_id) in &records {
+            owners.insert(merged_item_id.clone(), record_id.clone());
+        }
+        let mut states = Vec::<MergeItemStateRow>::new();
+        for chunk in merged_item_ids.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT id, item_type, parent_id, series_id, merged_into_item_id,
+                        CASE WHEN series_id IS NULL THEN id ELSE series_id END AS owner_id
+                 FROM media_items
+                 WHERE id IN ({placeholders}) OR series_id IN ({placeholders})"
+            )));
+            for merged_item_id in chunk {
+                query = query.bind(merged_item_id);
+            }
+            for merged_item_id in chunk {
+                query = query.bind(merged_item_id);
+            }
+            for row in query
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let owner_id: String = row.get("owner_id");
+                let Some(record_id) = owners.get(&owner_id).cloned() else {
+                    continue;
+                };
+                states.push(MergeItemStateRow {
+                    record_id,
+                    item_id: row.get("id"),
+                    item_type: row.get("item_type"),
+                    parent_id: row.get("parent_id"),
+                    series_id: row.get("series_id"),
+                    merged_into_item_id: row.get("merged_into_item_id"),
+                });
+            }
+        }
+
+        for chunk in states.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO media_merge_item_states (
+                     record_id, item_id, item_type, parent_id, series_id, merged_into_item_id
+                 ) VALUES {values}"
+            )));
+            for state in chunk {
+                query = query
+                    .bind(&state.record_id)
+                    .bind(&state.item_id)
+                    .bind(&state.item_type)
+                    .bind(state.parent_id.as_deref())
+                    .bind(state.series_id.as_deref())
+                    .bind(state.merged_into_item_id.as_deref());
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let mut sources = Vec::<(String, String, String, i64)>::new();
+        for chunk in states.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "SELECT id, item_id, CAST(is_default AS BIGINT) AS is_default
+                 FROM media_sources WHERE item_id IN ({placeholders})"
+            )));
+            for state in chunk {
+                query = query.bind(&state.item_id);
+            }
+            let record_by_item = chunk
+                .iter()
+                .map(|state| (state.item_id.clone(), state.record_id.clone()))
+                .collect::<std::collections::HashMap<_, _>>();
+            for row in query
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let item_id: String = row.get("item_id");
+                let Some(record_id) = record_by_item.get(&item_id).cloned() else {
+                    continue;
+                };
+                sources.push((record_id, row.get("id"), item_id, row.get("is_default")));
+            }
+        }
+
+        for chunk in sources.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "INSERT INTO media_merge_source_states (record_id, source_id, item_id, is_default)
+                 VALUES {values}"
+            )));
+            for (record_id, source_id, item_id, is_default) in chunk {
+                query = query
+                    .bind(record_id)
+                    .bind(source_id)
+                    .bind(item_id)
+                    .bind(is_default);
+            }
+            query
+                .execute(&mut **transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn list_media_merge_records_for_item(
+        &self,
+        primary_item_id: &str,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredMediaMergeRecord>, StorageError> {
+        let limit = limit.clamp(1, MAX_IDENTITY_MERGE_KEY_PAGE_SIZE);
+        self.query(
+            "SELECT record.id, record.library_id, record.item_type,
+                    record.primary_item_id, record.merged_item_id,
+                    merged_item.title AS merged_item_title, record.source,
+                    record.merged_at, record.undone_at,
+                    (SELECT COUNT(*) FROM media_merge_source_states state
+                     WHERE state.record_id = record.id) AS source_count
+             FROM media_merge_records record
+             JOIN media_items merged_item ON merged_item.id = record.merged_item_id
+             WHERE record.primary_item_id = ?
+             ORDER BY record.merged_at DESC, record.id DESC
+             LIMIT ? OFFSET ?",
+        )
+        .bind(primary_item_id)
+        .bind(limit)
+        .bind(offset.max(0))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredMediaMergeRecord {
+                    id: row.get("id"),
+                    library_id: row.get("library_id"),
+                    item_type: row.get("item_type"),
+                    primary_item_id: row.get("primary_item_id"),
+                    merged_item_id: row.get("merged_item_id"),
+                    merged_item_title: row.get("merged_item_title"),
+                    origin: row.get("source"),
+                    merged_at: row.get("merged_at"),
+                    undone_at: row.get("undone_at"),
+                    source_count: row.get("source_count"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn unmerge_media_items(
+        &self,
+        primary_item_id: &str,
+        merged_item_id: &str,
+    ) -> Result<StoredMediaMergeUndo, StorageError> {
+        if primary_item_id == merged_item_id {
+            return Err(StorageError::Conflict(
+                "主条目和被合并条目不能相同".to_owned(),
+            ));
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let record = self
+            .query(
+                "SELECT id, library_id, item_type FROM media_merge_records
+                 WHERE primary_item_id = ? AND merged_item_id = ? AND undone_at IS NULL
+                 ORDER BY merged_at DESC, id DESC
+                 LIMIT 1",
+            )
+            .bind(primary_item_id)
+            .bind(merged_item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(record) = record else {
+            return Err(StorageError::Conflict("没有可撤销的合并记录".to_owned()));
+        };
+        let record_id: String = record.get("id");
+        let library_id: String = record.get("library_id");
+        let item_type: String = record.get("item_type");
+        let still_merged = self
+            .query_scalar::<i64>(
+                "SELECT CAST(CASE WHEN EXISTS (
+                     SELECT 1 FROM media_items WHERE id = ? AND merged_into_item_id = ?
+                 ) THEN 1 ELSE 0 END AS BIGINT)",
+            )
+            .bind(merged_item_id)
+            .bind(primary_item_id)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if still_merged == 0 {
+            return Err(StorageError::Conflict("条目已不处于合并状态".to_owned()));
+        }
+
+        let item_rows = self
+            .query(
+                "SELECT item_id, parent_id, series_id, merged_into_item_id
+                 FROM media_merge_item_states WHERE record_id = ?",
+            )
+            .bind(&record_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut restored_item_ids = Vec::with_capacity(item_rows.len());
+        for chunk in item_rows.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
+            let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let id_placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH merge_map(item_id, parent_id, series_id, merged_into_item_id) AS
+                     (VALUES {values})
+                 UPDATE media_items
+                 SET parent_id = (SELECT parent_id FROM merge_map WHERE item_id = media_items.id),
+                     series_id = (SELECT series_id FROM merge_map WHERE item_id = media_items.id),
+                     merged_into_item_id = (
+                         SELECT merged_into_item_id FROM merge_map WHERE item_id = media_items.id
+                     ),
+                     updated_at = unixepoch()
+                 WHERE id IN ({id_placeholders})"
+            )));
+            for row in chunk {
+                let item_id: String = row.get("item_id");
+                restored_item_ids.push(item_id.clone());
+                query = query
+                    .bind(item_id)
+                    .bind(row.get::<Option<String>, _>("parent_id"))
+                    .bind(row.get::<Option<String>, _>("series_id"))
+                    .bind(row.get::<Option<String>, _>("merged_into_item_id"));
+            }
+            for row in chunk {
+                query = query.bind(row.get::<String, _>("item_id"));
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        let source_rows = self
+            .query(
+                "SELECT source_id, item_id, CAST(is_default AS BIGINT) AS is_default
+                 FROM media_merge_source_states WHERE record_id = ?",
+            )
+            .bind(&record_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let restored_source_count = source_rows.len();
+        let mut normalize_ids = Vec::<String>::new();
+        for row in &source_rows {
+            let item_id: String = row.get("item_id");
+            if !normalize_ids.contains(&item_id) {
+                normalize_ids.push(item_id);
+            }
+        }
+        for chunk in source_rows.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
+            let values = std::iter::repeat_n("(?, ?, ?)", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let id_placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+                "WITH merge_map(source_id, item_id, is_default) AS (VALUES {values})
+                 UPDATE media_sources
+                 SET item_id = (SELECT item_id FROM merge_map WHERE source_id = media_sources.id),
+                     is_default = (
+                         SELECT is_default FROM merge_map WHERE source_id = media_sources.id
+                     ),
+                     updated_at = unixepoch()
+                 WHERE id IN ({id_placeholders})"
+            )));
+            for row in chunk {
+                query = query
+                    .bind(row.get::<String, _>("source_id"))
+                    .bind(row.get::<String, _>("item_id"))
+                    .bind(row.get::<i64, _>("is_default"));
+            }
+            for row in chunk {
+                query = query.bind(row.get::<String, _>("source_id"));
+            }
+            query
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+
+        normalize_ids.push(primary_item_id.to_owned());
+        self.normalize_default_sources_in_transaction(&mut transaction, &normalize_ids)
+            .await?;
+        self.query("UPDATE media_merge_records SET undone_at = unixepoch() WHERE id = ?")
+            .bind(&record_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(StoredMediaMergeUndo {
+            library_id,
+            item_type,
+            primary_item_id: primary_item_id.to_owned(),
+            merged_item_id: merged_item_id.to_owned(),
+            restored_item_ids,
+            restored_source_count,
+        })
+    }
+
+    pub(crate) async fn list_provider_identity_merge_keys(
+        &self,
+        after: Option<(&str, &str, &str, &str)>,
+        limit: i64,
+    ) -> Result<Vec<StoredIdentityMergeCandidateKey>, StorageError> {
+        let limit = limit.clamp(1, MAX_IDENTITY_MERGE_KEY_PAGE_SIZE);
+        let condition = if after.is_some() {
+            "AND (mi.library_id, mi.item_type, provider.provider, provider.provider_id)
+                 > (?, ?, ?, ?)"
+        } else {
+            ""
+        };
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT mi.library_id AS library_id, mi.item_type AS item_type,
+                    provider.provider AS provider, provider.provider_id AS provider_id
+             FROM media_item_provider_ids provider
+             JOIN media_items mi ON mi.id = provider.media_item_id
+             JOIN libraries library ON library.id = mi.library_id AND library.is_enabled = 1
+             WHERE provider.item_type = mi.item_type
+               AND mi.item_type IN ('MOVIE', 'SERIES')
+               AND mi.merged_into_item_id IS NULL
+               AND mi.removed_at IS NULL
+               {condition}
+             GROUP BY mi.library_id, mi.item_type, provider.provider, provider.provider_id
+             HAVING COUNT(*) > 1
+             ORDER BY mi.library_id, mi.item_type, provider.provider, provider.provider_id
+             LIMIT ?"
+        )));
+        if let Some((library_id, item_type, provider, provider_id)) = after {
+            query = query
+                .bind(library_id)
+                .bind(item_type)
+                .bind(provider)
+                .bind(provider_id);
+        }
+        query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredIdentityMergeCandidateKey {
+                        library_id: row.get("library_id"),
+                        item_type: row.get("item_type"),
+                        provider: row.get("provider"),
+                        provider_id: row.get("provider_id"),
+                        sort_title: None,
+                        production_year: None,
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_title_identity_merge_keys(
+        &self,
+        after: Option<(&str, &str, &str, i64)>,
+        limit: i64,
+    ) -> Result<Vec<StoredIdentityMergeCandidateKey>, StorageError> {
+        let limit = limit.clamp(1, MAX_IDENTITY_MERGE_KEY_PAGE_SIZE);
+        let condition = if after.is_some() {
+            "AND (mi.library_id, mi.item_type, mi.sort_title, mi.production_year) > (?, ?, ?, ?)"
+        } else {
+            ""
+        };
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT mi.library_id AS library_id, mi.item_type AS item_type,
+                    mi.sort_title AS sort_title, mi.production_year AS production_year
+             FROM media_items mi
+             JOIN libraries library ON library.id = mi.library_id AND library.is_enabled = 1
+             WHERE mi.item_type IN ('MOVIE', 'SERIES')
+               AND mi.merged_into_item_id IS NULL
+               AND mi.removed_at IS NULL
+               AND mi.production_year IS NOT NULL
+               {condition}
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_item_provider_ids provider
+                   WHERE provider.media_item_id = mi.id
+               )
+             GROUP BY mi.library_id, mi.item_type, mi.sort_title, mi.production_year
+             HAVING COUNT(*) > 1
+             ORDER BY mi.library_id, mi.item_type, mi.sort_title, mi.production_year
+             LIMIT ?"
+        )));
+        if let Some((library_id, item_type, sort_title, production_year)) = after {
+            query = query
+                .bind(library_id)
+                .bind(item_type)
+                .bind(sort_title)
+                .bind(production_year);
+        }
+        query
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| StoredIdentityMergeCandidateKey {
+                        library_id: row.get("library_id"),
+                        item_type: row.get("item_type"),
+                        provider: None,
+                        provider_id: None,
+                        sort_title: row.get("sort_title"),
+                        production_year: row.get("production_year"),
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn list_provider_identity_group_items(
+        &self,
+        key: &StoredIdentityMergeCandidateKey,
+    ) -> Result<Vec<StoredIdentityMergeCandidateItem>, StorageError> {
+        let (Some(provider), Some(provider_id)) =
+            (key.provider.as_deref(), key.provider_id.as_deref())
+        else {
+            return Ok(Vec::new());
+        };
+        self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT mi.id AS id, mi.added_at AS added_at,
+                    (SELECT COUNT(*) FROM media_sources source
+                     WHERE source.item_id = mi.id) AS source_count,
+                    (SELECT COUNT(*) FROM media_sources source
+                     WHERE source.item_id = mi.id AND source.is_default = 1)
+                        AS default_source_count,
+                    {edition_count} AS edition_source_count
+             FROM media_item_provider_ids provider
+             JOIN media_items mi ON mi.id = provider.media_item_id
+             WHERE provider.provider = ? AND provider.provider_id = ?
+               AND mi.library_id = ? AND mi.item_type = ?
+               AND mi.merged_into_item_id IS NULL
+               AND mi.removed_at IS NULL
+             ORDER BY mi.id
+             LIMIT ?",
+            edition_count = EDITION_SOURCE_COUNT_SQL
+        )))
+        .bind(provider)
+        .bind(provider_id)
+        .bind(&key.library_id)
+        .bind(&key.item_type)
+        .bind(MAX_IDENTITY_MERGE_GROUP_ITEMS)
+        .fetch_all(&self.pool)
+        .await
+        .map(stored_identity_group_items)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn list_title_identity_group_items(
+        &self,
+        key: &StoredIdentityMergeCandidateKey,
+    ) -> Result<Vec<StoredIdentityMergeCandidateItem>, StorageError> {
+        let (Some(sort_title), Some(production_year)) =
+            (key.sort_title.as_deref(), key.production_year)
+        else {
+            return Ok(Vec::new());
+        };
+        self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT mi.id AS id, mi.added_at AS added_at,
+                    (SELECT COUNT(*) FROM media_sources source
+                     WHERE source.item_id = mi.id) AS source_count,
+                    (SELECT COUNT(*) FROM media_sources source
+                     WHERE source.item_id = mi.id AND source.is_default = 1)
+                        AS default_source_count,
+                    {edition_count} AS edition_source_count
+             FROM media_items mi
+             WHERE mi.library_id = ? AND mi.item_type = ?
+               AND mi.sort_title = ? AND mi.production_year = ?
+               AND mi.merged_into_item_id IS NULL
+               AND mi.removed_at IS NULL
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_item_provider_ids provider
+                   WHERE provider.media_item_id = mi.id
+               )
+             ORDER BY mi.id
+             LIMIT ?",
+            edition_count = EDITION_SOURCE_COUNT_SQL
+        )))
+        .bind(&key.library_id)
+        .bind(&key.item_type)
+        .bind(sort_title)
+        .bind(production_year)
+        .bind(MAX_IDENTITY_MERGE_GROUP_ITEMS)
+        .fetch_all(&self.pool)
+        .await
+        .map(stored_identity_group_items)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
+
+const EDITION_SOURCE_COUNT_SQL: &str = "CASE WHEN mi.item_type = 'SERIES' THEN (
+        SELECT COUNT(*) FROM media_sources episode_source
+        JOIN media_items episode ON episode.id = episode_source.item_id
+        WHERE episode.series_id = mi.id
+          AND episode_source.edition_name IS NOT NULL
+          AND episode_source.edition_name <> ''
+    ) ELSE (
+        SELECT COUNT(*) FROM media_sources source
+        WHERE source.item_id = mi.id
+          AND source.edition_name IS NOT NULL
+          AND source.edition_name <> ''
+    ) END";
+
+fn stored_identity_group_items(
+    rows: Vec<sqlx::any::AnyRow>,
+) -> Vec<StoredIdentityMergeCandidateItem> {
+    rows.into_iter()
+        .map(|row| StoredIdentityMergeCandidateItem {
+            id: row.get("id"),
+            added_at: row.get("added_at"),
+            source_count: row.get("source_count"),
+            default_source_count: row.get("default_source_count"),
+            edition_source_count: row.get("edition_source_count"),
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        Ok((temp_dir, database))
+    }
+
+    async fn insert_item(
+        database: &Database,
+        library_id: &str,
+        id: &str,
+        item_type: &str,
+        parent_id: Option<&str>,
+        series_id: Option<&str>,
+        season_number: Option<i64>,
+        episode_number: Option<i64>,
+        provider_ids_json: Option<&str>,
+        production_year: Option<i64>,
+        title: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+                 title, sort_title, production_year, provider_ids_json, identification_status
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(item_type)
+        .bind(parent_id)
+        .bind(series_id)
+        .bind(season_number)
+        .bind(episode_number)
+        .bind(title)
+        .bind(title.to_lowercase())
+        .bind(production_year)
+        .bind(provider_ids_json)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn insert_source(
+        database: &Database,
+        source_id: &str,
+        item_id: &str,
+        edition_name: Option<&str>,
+        is_default: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, edition_name, is_default, probe_status
+             ) VALUES (?, ?, 'LOCAL_FILE', ?, ?, 'PENDING')",
+        )
+        .bind(source_id)
+        .bind(item_id)
+        .bind(edition_name)
+        .bind(is_default)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn movie_merge_records_provenance_and_unmerge_restores_sources()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        insert_item(
+            &database,
+            &library_id,
+            "movie-a",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(2020),
+            "movie-a",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "movie-b",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(2021),
+            "movie-b",
+        )
+        .await?;
+        insert_source(&database, "source-a", "movie-a", None, 1).await?;
+        insert_source(&database, "source-b", "movie-b", None, 1).await?;
+
+        database
+            .merge_media_items("movie-a", &["movie-a".to_owned(), "movie-b".to_owned()])
+            .await?;
+
+        let records = database
+            .list_media_merge_records_for_item("movie-a", 0, 50)
+            .await?;
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].merged_item_id, "movie-b");
+        assert_eq!(records[0].origin, "MANUAL");
+        assert_eq!(records[0].source_count, 1);
+        assert!(records[0].undone_at.is_none());
+        let state_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_merge_item_states WHERE record_id = ?")
+                .bind(&records[0].id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(state_count, 1);
+
+        let undo = database.unmerge_media_items("movie-a", "movie-b").await?;
+        assert_eq!(undo.restored_source_count, 1);
+        assert_eq!(undo.item_type, "MOVIE");
+        assert_eq!(undo.library_id, library_id);
+        let restored_item: Option<String> =
+            sqlx::query_scalar("SELECT item_id FROM media_sources WHERE id = 'source-b'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(restored_item.as_deref(), Some("movie-b"));
+        let merged_into: Option<String> =
+            sqlx::query_scalar("SELECT merged_into_item_id FROM media_items WHERE id = 'movie-b'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(merged_into, None);
+        let is_default: i64 = sqlx::query_scalar(
+            "SELECT CAST(is_default AS BIGINT) FROM media_sources WHERE id = 'source-b'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(is_default, 1);
+        let undone: Option<i64> =
+            sqlx::query_scalar("SELECT undone_at FROM media_merge_records WHERE id = ?")
+                .bind(&records[0].id)
+                .fetch_one(database.pool())
+                .await?;
+        assert!(undone.is_some());
+
+        let repeated = database.unmerge_media_items("movie-a", "movie-b").await;
+        assert!(matches!(repeated, Err(StorageError::Conflict(_))));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_merge_records_hierarchy_and_unmerge_restores_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Shows", LibraryKind::Series, false)
+            .await?;
+        let library_id = library.id.to_string();
+        insert_item(
+            &database,
+            &library_id,
+            "series-a",
+            "SERIES",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "series-a",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "series-b",
+            "SERIES",
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            "series-b",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "season-a1",
+            "SEASON",
+            Some("series-a"),
+            Some("series-a"),
+            Some(1),
+            None,
+            None,
+            None,
+            "season-a1",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "season-b1",
+            "SEASON",
+            Some("series-b"),
+            Some("series-b"),
+            Some(1),
+            None,
+            None,
+            None,
+            "season-b1",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "episode-a1",
+            "EPISODE",
+            Some("season-a1"),
+            Some("series-a"),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            "episode-a1",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "episode-b1",
+            "EPISODE",
+            Some("season-b1"),
+            Some("series-b"),
+            Some(1),
+            Some(1),
+            None,
+            None,
+            "episode-b1",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "episode-b2",
+            "EPISODE",
+            Some("season-b1"),
+            Some("series-b"),
+            Some(1),
+            Some(2),
+            None,
+            None,
+            "episode-b2",
+        )
+        .await?;
+        insert_source(&database, "source-a1", "episode-a1", None, 1).await?;
+        insert_source(&database, "source-b1", "episode-b1", None, 1).await?;
+        insert_source(&database, "source-b2", "episode-b2", None, 1).await?;
+
+        database
+            .merge_media_items("series-a", &["series-a".to_owned(), "series-b".to_owned()])
+            .await?;
+        let merged_episode_sources: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_sources WHERE item_id = 'episode-a1'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(merged_episode_sources, 2);
+        let unmatched_episode_series: Option<String> =
+            sqlx::query_scalar("SELECT series_id FROM media_items WHERE id = 'episode-b2'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(unmatched_episode_series.as_deref(), Some("series-a"));
+
+        let undo = database.unmerge_media_items("series-a", "series-b").await?;
+        assert_eq!(undo.restored_source_count, 2);
+        let episode_b1: Option<String> =
+            sqlx::query_scalar("SELECT item_id FROM media_sources WHERE id = 'source-b1'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(episode_b1.as_deref(), Some("episode-b1"));
+        let season_b1: (Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT parent_id, merged_into_item_id FROM media_items WHERE id = 'season-b1'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(season_b1, (Some("series-b".to_owned()), None));
+        let episode_b2: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT parent_id, series_id FROM media_items WHERE id = 'episode-b2'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            episode_b2,
+            (Some("season-b1".to_owned()), Some("series-b".to_owned()))
+        );
+        let series_b: Option<String> =
+            sqlx::query_scalar("SELECT merged_into_item_id FROM media_items WHERE id = 'series-b'")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(series_b, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_candidates_group_by_provider_then_title_without_provider_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        insert_item(
+            &database,
+            &library_id,
+            "provider-a",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            Some(r#"{"tmdb":"42"}"#),
+            Some(2020),
+            "provider-a",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "provider-b",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            Some(r#"{"tmdb":"42"}"#),
+            Some(2020),
+            "provider-b",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "title-a",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1999),
+            "Same Title",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "title-b",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1999),
+            "Same Title",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "single",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1988),
+            "single",
+        )
+        .await?;
+        insert_source(&database, "provider-a-source", "provider-a", None, 1).await?;
+        insert_source(
+            &database,
+            "director-cut",
+            "provider-b",
+            Some("Director's Cut"),
+            1,
+        )
+        .await?;
+
+        let provider_keys = database.list_provider_identity_merge_keys(None, 50).await?;
+        assert_eq!(provider_keys.len(), 1);
+        assert_eq!(provider_keys[0].provider.as_deref(), Some("tmdb"));
+        assert_eq!(provider_keys[0].provider_id.as_deref(), Some("42"));
+
+        let title_keys = database.list_title_identity_merge_keys(None, 50).await?;
+        assert_eq!(title_keys.len(), 1);
+        assert_eq!(title_keys[0].sort_title.as_deref(), Some("same title"));
+        assert_eq!(title_keys[0].production_year, Some(1999));
+
+        let group_items = database
+            .list_provider_identity_group_items(&provider_keys[0])
+            .await?;
+        assert_eq!(group_items.len(), 2);
+        let edition_flags = group_items
+            .iter()
+            .map(|item| (item.id.as_str(), item.edition_source_count))
+            .collect::<std::collections::HashMap<_, _>>();
+        assert_eq!(edition_flags.get("provider-a"), Some(&0));
+        assert_eq!(edition_flags.get("provider-b"), Some(&1));
+        Ok(())
+    }
+}

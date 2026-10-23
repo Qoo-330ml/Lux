@@ -73,6 +73,12 @@ mod subtitles;
 mod media;
 #[path = "media_merge.rs"]
 mod media_merge;
+#[path = "media_merge_records.rs"]
+mod media_merge_records;
+pub(crate) use media_merge_records::{
+    MediaMergeOrigin, StoredIdentityMergeCandidateItem, StoredIdentityMergeCandidateKey,
+    StoredMediaMergeRecord, StoredMediaMergeUndo,
+};
 #[path = "scan_fingerprint_migration.rs"]
 mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;

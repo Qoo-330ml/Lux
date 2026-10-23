@@ -48,6 +48,16 @@ impl Database {
         primary_item_id: &str,
         item_ids: &[String],
     ) -> Result<StoredMediaMerge, StorageError> {
+        self.merge_media_items_with_origin(primary_item_id, item_ids, MediaMergeOrigin::Manual)
+            .await
+    }
+
+    pub(crate) async fn merge_media_items_with_origin(
+        &self,
+        primary_item_id: &str,
+        item_ids: &[String],
+        origin: MediaMergeOrigin,
+    ) -> Result<StoredMediaMerge, StorageError> {
         if item_ids.len() < 2 {
             return Err(StorageError::Conflict(
                 "至少需要选择两个媒体条目".to_owned(),
@@ -117,6 +127,16 @@ impl Database {
             .filter(|root| root.id != primary_item_id)
             .map(|root| root.id.clone())
             .collect::<Vec<_>>();
+
+        self.record_media_merges_in_transaction(
+            &mut transaction,
+            &primary.library_id,
+            &primary.item_type,
+            primary_item_id,
+            &merged_item_ids,
+            origin,
+        )
+        .await?;
 
         if primary.item_type == "MOVIE" {
             let primary_has_default =
@@ -510,7 +530,7 @@ impl Database {
             .await
     }
 
-    async fn normalize_default_sources_in_transaction(
+    pub(super) async fn normalize_default_sources_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         item_ids: &[String],
@@ -980,8 +1000,8 @@ mod tests {
 
         assert_eq!(
             database.query_count(),
-            8,
-            "expected batched root, season, and episode writes"
+            12,
+            "expected batched root, season, and episode writes plus one provenance pass"
         );
         Ok(())
     }
@@ -1067,7 +1087,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(database.query_count(), 9);
+        assert_eq!(database.query_count(), 13);
         let moved_episode_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM media_items
              WHERE parent_id = ? AND series_id = ? AND item_type = 'EPISODE'",
@@ -1161,7 +1181,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(database.query_count(), 11);
+        assert_eq!(database.query_count(), 19);
         let moved_season_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM media_items
              WHERE parent_id = ? AND series_id = ? AND item_type = 'SEASON'",
@@ -1270,7 +1290,7 @@ mod tests {
             )
             .await?;
 
-        assert_eq!(database.query_count(), 15);
+        assert_eq!(database.query_count(), 19);
         let merged_episode_count: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM media_items
              WHERE item_type = 'EPISODE' AND merged_into_item_id LIKE 'merge-matched-target-episode-%'",
@@ -1533,8 +1553,8 @@ mod tests {
         assert_eq!(merged_state, (200, 1, 1, 3, 20));
         assert_eq!(
             database.query_count(),
-            7,
-            "movie merge should batch source, user-state, and root updates"
+            12,
+            "movie merge should batch source, user-state, and root updates plus one provenance pass"
         );
         Ok(())
     }
