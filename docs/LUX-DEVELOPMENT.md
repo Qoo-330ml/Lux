@@ -2972,6 +2972,36 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 
 依赖：LUX-083、LUX-106。
 
+#### LUX-841：媒体库按身份自动合并与撤销
+
+描述：同一启用媒体库内的电影或剧集根条目，在已确认 provider ID 完全一致时自动合并为一个逻辑条目；两边都没有 provider ID 时，只有规范化标题和年份完全一致才合并。扫描完成、在线识别完成后由后台 worker 自动收敛，升级后对已入库数据做一次性回填。合并关系保存可撤销的溯源记录，管理员可拆分恢复。
+
+验收：
+
+- 自动合并只处理同一启用媒体库、同一 `MOVIE`/`SERIES` 根类型、未移除且未合并的条目，沿用既有合并约束。
+- provider ID 完全一致优先；任一条目存在非空 `edition_name` 媒体源时跳过自动合并，导演剪辑版等仍可作为独立条目。
+- 后台 worker 按游标分页有界执行，不在请求路径扫描全库；回填以 `lux_meta` 标记只跑一次，重复执行幂等。
+- 合并写入 `media_merge_records`、条目状态和媒体源状态；撤销恢复条目层级、媒体源归属和默认源，不恢复被合并条目的用户状态原值。
+- `GET /api/v1/admin/items/{itemId}/merges` 与 `POST /api/v1/admin/items/unmerge` 需要管理员会话和 CSRF，成功使目录/首页缓存失效并写不含路径和 URL 的审计事件。
+- Web 详情页为管理员显示合并来源与撤销入口，具备加载、成功、失败和键盘语义。
+
+验证：storage 合并/撤销/候选查询回归，`tests/item_merge.rs`、`tests/item_unmerge.rs`，Web 组件测试。
+
+依赖：LUX-083、LUX-251。
+
+结果（2026-10-23）：SQLite 0223 / PostgreSQL 0225 增加 `media_merge_records`、`media_merge_item_states`
+和 `media_merge_source_states`；`merge_media_items` 在同一事务内写入溯源，`unmerge_media_items` 恢复
+条目层级、媒体源归属和默认源。自动合并按 provider ID 分组优先、无 provider ID 时回退规范化标题+
+年份，任一条目存在显式剪辑版时跳过；后台 worker 启动后连续收敛并在扫描完成后唤醒，同时按 120 秒
+定时运行，审计事件只记录数量。管理 API 为 `GET /api/v1/admin/items/{itemId}/merges` 与
+`POST /api/v1/admin/items/unmerge`，详情页为管理员显示合并来源和拆分入口。
+`cargo test --locked --lib storage::repository::media_merge`（6 项）、
+`--lib storage::repository::media_merge_records`（3 项）、`--lib application::item_merge`（4 项）、
+`cargo test --locked --test item_merge`、`--test item_unmerge` 和
+`web/tests/media-merge-sources.test.tsx`（3 项）通过；本机 `uname -m=arm64`，未验证 PostgreSQL 运行时、
+NAS/x86 性能或第三方客户端表现。撤销不恢复被合并条目的用户状态原值，升级前没有溯源记录的历史合并
+无法拆分。
+
 #### LUX-084：TMDb 自动合集
 
 验收：
