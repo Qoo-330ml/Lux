@@ -66,6 +66,7 @@ pub struct ScheduledTaskService {
     danmaku: Option<DanmakuService>,
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
     thumbnail_retry_semaphore: Arc<Semaphore>,
+    worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
 }
 
 struct TaskCursor {
@@ -156,6 +157,27 @@ impl From<StorageError> for ScheduledTaskError {
     }
 }
 
+async fn run_scheduled_task_worker(
+    service: ScheduledTaskService,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut ticker = interval(POLL_INTERVAL);
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {}
+            result = shutdown.changed() => {
+                if result.is_err() || *shutdown.borrow() {
+                    return;
+                }
+            }
+        }
+        if *shutdown.borrow() {
+            return;
+        }
+        service.run_once().await;
+    }
+}
+
 impl ScheduledTaskService {
     pub fn new(
         database: Database,
@@ -178,6 +200,7 @@ impl ScheduledTaskService {
             thumbnail_retry_semaphore: Arc::new(Semaphore::new(
                 THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE as usize,
             )),
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
 
@@ -205,15 +228,28 @@ impl ScheduledTaskService {
         self
     }
 
-    pub fn spawn(&self) {
-        let worker = self.clone();
-        tokio::spawn(async move {
-            let mut ticker = interval(POLL_INTERVAL);
-            loop {
-                ticker.tick().await;
-                worker.run_once().await;
-            }
-        });
+    /// Starts the scheduler loop once and records its stop handle.
+    pub async fn spawn(&self) {
+        let mut worker = self.worker.lock().await;
+        if worker.is_some() {
+            return;
+        }
+        let service = self.clone();
+        *worker = Some(super::background_loop::BackgroundLoop::spawn(
+            "scheduled_tasks",
+            move |shutdown| {
+                let service = service.clone();
+                async move { run_scheduled_task_worker(service, shutdown).await }
+            },
+        ));
+    }
+
+    /// Stops the scheduler loop and waits for the current pass.
+    pub async fn shutdown(&self) {
+        let worker = self.worker.lock().await.take();
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
     }
 
     pub async fn run_once(&self) {

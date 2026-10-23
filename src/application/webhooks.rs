@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet, time::sleep};
+use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet};
 use url::{Host, Url};
 
 use crate::application::{
@@ -149,6 +149,41 @@ pub struct WebhookService {
     secret_lock: Arc<Mutex<()>>,
     server_id: String,
     plugins: Option<PluginService>,
+    worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
+}
+
+async fn run_webhook_delivery_worker(
+    service: WebhookService,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut last_retention_sweep: Option<Instant> = None;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if last_retention_sweep.is_none_or(|last| last.elapsed() >= HISTORY_RETENTION_INTERVAL) {
+            service.prune_history().await;
+            last_retention_sweep = Some(Instant::now());
+        }
+        match service.process_ready_deliveries().await {
+            Ok(count) if count == 0 => {
+                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
+                    .await
+                {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "webhook delivery worker iteration failed");
+                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
+                    .await
+                {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl WebhookService {
@@ -160,6 +195,7 @@ impl WebhookService {
             secret_lock: Arc::new(Mutex::new(())),
             server_id,
             plugins: None,
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -583,27 +619,28 @@ impl WebhookService {
         }
     }
 
-    pub fn spawn_worker(&self) {
+    /// Starts the delivery worker once and records its stop handle.
+    pub async fn spawn_worker(&self) {
+        let mut worker = self.worker.lock().await;
+        if worker.is_some() {
+            return;
+        }
         let service = self.clone();
-        tokio::spawn(async move {
-            let mut last_retention_sweep: Option<Instant> = None;
-            loop {
-                if last_retention_sweep
-                    .is_none_or(|last| last.elapsed() >= HISTORY_RETENTION_INTERVAL)
-                {
-                    service.prune_history().await;
-                    last_retention_sweep = Some(Instant::now());
-                }
-                match service.process_ready_deliveries().await {
-                    Ok(0) => sleep(DELIVERY_POLL_INTERVAL).await,
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "webhook delivery worker iteration failed");
-                        sleep(DELIVERY_POLL_INTERVAL).await;
-                    }
-                }
-            }
-        });
+        *worker = Some(super::background_loop::BackgroundLoop::spawn(
+            "webhook_delivery",
+            move |shutdown| {
+                let service = service.clone();
+                async move { run_webhook_delivery_worker(service, shutdown).await }
+            },
+        ));
+    }
+
+    /// Stops the delivery worker and waits for its current iteration.
+    pub async fn shutdown(&self) {
+        let worker = self.worker.lock().await.take();
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
     }
 
     async fn prune_history(&self) {

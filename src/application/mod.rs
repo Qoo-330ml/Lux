@@ -14,6 +14,7 @@ pub(crate) mod admin_scheduled_tasks;
 pub(crate) mod admin_task_activity;
 pub(crate) mod admin_user_access;
 pub(crate) mod admin_user_lifecycle;
+pub(crate) mod background_loop;
 pub(crate) mod background_work;
 pub mod candidates;
 pub mod catalog;

@@ -248,6 +248,12 @@ impl AppState {
         if let Some(worker) = &self.global_collection_sync_worker {
             worker.shutdown().await;
         }
+        if let Some(webhooks) = &self.webhooks {
+            webhooks.shutdown().await;
+        }
+        if let Some(scheduled_tasks) = &self.scheduled_tasks {
+            scheduled_tasks.shutdown().await;
+        }
         Ok(())
     }
 
@@ -684,13 +690,13 @@ impl AppState {
             tracing::error!(%error, "failed to synchronize manifest scheduled tasks");
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
-            scheduled_tasks.spawn();
+            scheduled_tasks.spawn().await;
         }
     }
 
-    pub fn start_webhook_worker(&self) {
+    pub async fn start_webhook_worker(&self) {
         if let Some(webhooks) = self.webhooks.as_ref() {
-            webhooks.spawn_worker();
+            webhooks.spawn_worker().await;
         }
     }
 
