@@ -1516,6 +1516,81 @@ async fn keep_and_fill_overwrite_policies_protect_existing_images()
 }
 
 #[tokio::test]
+async fn backdrop_max_count_limits_downloaded_images() -> Result<(), Box<dyn std::error::Error>> {
+    for (max_count, expected) in [(2_i64, 2_i64), (0, 0)] {
+        let fixture = prepare_fixture(false).await?;
+        let (image_url, image_server) = start_image_stub().await?;
+        set_library_image_strategy(
+            &fixture.database,
+            &fixture.item_id,
+            json!({
+                "poster": true,
+                "backdrop": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 4,
+                "minDownloadWidth": 0,
+                "levels": {
+                    "movie": {
+                        "artworks": {
+                            "backdrop": { "enabled": true, "maxCount": max_count }
+                        }
+                    }
+                }
+            }),
+        )
+        .await?;
+        let candidate_id = insert_candidate(
+            &fixture.database,
+            &fixture.item_id,
+            json!({
+                "title": "Online Movie",
+                "images": {
+                    "FANART": [
+                        format!("{image_url}/fanart"),
+                        format!("{image_url}/fanart-supplement-1"),
+                        format!("{image_url}/fanart-supplement-2")
+                    ]
+                }
+            }),
+        )
+        .await?;
+        let selection = MetadataSelectionService::new(
+            fixture.database.clone(),
+            ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+        );
+
+        selection
+            .select(
+                &fixture.item_id,
+                &candidate_id,
+                MetadataSelectionMode::FillMissing,
+            )
+            .await
+            .map_err(|error| format!("selection failed for maxCount {max_count}: {error:?}"))?;
+
+        let backdrops: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+        )
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+        assert_eq!(
+            backdrops, expected,
+            "maxCount {max_count} must cap the stored backdrops"
+        );
+        image_server.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn overwrite_policy_replaces_existing_image_on_full_refresh()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_fixture(false).await?;

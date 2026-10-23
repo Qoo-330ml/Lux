@@ -242,7 +242,7 @@ impl Default for MediaStrategySettings {
                 disc: false,
                 wallpaper: false,
                 write_to_metadata: false,
-                max_backdrop_count: 1,
+                max_backdrop_count: 4,
                 min_download_width: 1280,
                 variant_cache: ImageVariantCacheSettings::default(),
                 levels: BTreeMap::new(),

@@ -3182,9 +3182,19 @@ impl MetadataSelectionService {
                 }
             };
         }
+        let max_count_for = |image_type: &str| {
+            image_policy
+                .type_policy_for_item_type(item_type, image_type)
+                .max_count
+                .min(MAX_IMAGE_VARIANTS)
+        };
         if payload.typed_images_present {
             for image_type in image_policy.enabled_types_for_item_type(item_type) {
                 if screenshot_fallback_types.contains(image_type) || !scraper_allowed(image_type) {
+                    continue;
+                }
+                let max_count = max_count_for(image_type);
+                if max_count == 0 {
                     continue;
                 }
                 if let Some(urls) = payload.images.get(image_type).cloned() {
@@ -3193,7 +3203,9 @@ impl MetadataSelectionService {
                             .filter_new_supplemental_image_urls(item_id, image_type, urls)
                             .await?;
                         let start = self.images.next_image_index(item_id, image_type).await?;
-                        for (offset, url) in urls.into_iter().take(MAX_IMAGE_VARIANTS).enumerate() {
+                        let remaining =
+                            max_count.saturating_sub(usize::try_from(start).unwrap_or(usize::MAX));
+                        for (offset, url) in urls.into_iter().take(remaining).enumerate() {
                             specs.push((
                                 image_type,
                                 vec![url],
@@ -3201,7 +3213,7 @@ impl MetadataSelectionService {
                             ));
                         }
                     } else if image_type == "FANART" {
-                        for (offset, url) in urls.into_iter().take(MAX_IMAGE_VARIANTS).enumerate() {
+                        for (offset, url) in urls.into_iter().take(max_count).enumerate() {
                             specs.push((image_type, vec![url], i64::try_from(offset).unwrap_or(0)));
                         }
                     } else {
@@ -3217,15 +3229,18 @@ impl MetadataSelectionService {
                 && scraper_allowed("FANART")
                 && !screenshot_fallback_types.contains("FANART")
             {
+                let max_count = max_count_for("FANART");
                 if supplemental {
                     let mut urls = self
                         .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
                         .await?;
                     if let Some(url) = urls.pop() {
                         let start = self.images.next_image_index(item_id, "FANART").await?;
-                        specs.push(("FANART", vec![url], start));
+                        if usize::try_from(start).unwrap_or(usize::MAX) < max_count {
+                            specs.push(("FANART", vec![url], start));
+                        }
                     }
-                } else {
+                } else if max_count > 0 {
                     specs.push(("FANART", vec![url], 0));
                 }
             }
@@ -4406,7 +4421,9 @@ fn default_true() -> bool {
     true
 }
 
-const DEFAULT_BACKDROP_MAX_COUNT: i64 = 1;
+/// Built-in cap for multi-image artwork; matches `MAX_IMAGE_VARIANTS` so the
+/// legacy "append several backdrops" behaviour stays the default.
+const DEFAULT_BACKDROP_MAX_COUNT: i64 = MAX_IMAGE_VARIANTS as i64;
 const DEFAULT_MIN_DOWNLOAD_WIDTH: i64 = 1280;
 
 fn default_image_selection_policy() -> ImageSelectionPolicy {
