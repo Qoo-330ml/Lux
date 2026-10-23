@@ -3188,9 +3188,19 @@ impl MetadataSelectionService {
                 .max_count
                 .min(MAX_IMAGE_VARIANTS)
         };
+        // Episode stills only belong to FANART, and only when the episode image
+        // policy wants an online still instead of a local screenshot.
+        let episode_still_allowed = item_type != "EPISODE"
+            || matches!(
+                image_policy.episode_image_policy(),
+                EpisodeImagePolicy::ScraperStill
+            );
         if payload.typed_images_present {
             for image_type in image_policy.enabled_types_for_item_type(item_type) {
                 if screenshot_fallback_types.contains(image_type) || !scraper_allowed(image_type) {
+                    continue;
+                }
+                if image_type == "FANART" && !episode_still_allowed {
                     continue;
                 }
                 let max_count = max_count_for(image_type);
@@ -3227,6 +3237,7 @@ impl MetadataSelectionService {
             }
             if let Some(url) = payload.fanart_url.clone()
                 && scraper_allowed("FANART")
+                && episode_still_allowed
                 && !screenshot_fallback_types.contains("FANART")
             {
                 let max_count = max_count_for("FANART");
@@ -4199,7 +4210,7 @@ pub(crate) struct ImageSelectionPolicy {
 }
 
 impl ImageSelectionPolicy {
-    fn from_json(library: Option<&str>, global: Option<&str>) -> Self {
+    pub(crate) fn from_json(library: Option<&str>, global: Option<&str>) -> Self {
         library
             .and_then(parse_image_selection_policy)
             .or_else(|| global.and_then(parse_image_selection_policy))

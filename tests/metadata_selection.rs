@@ -1884,6 +1884,76 @@ async fn episode_selection_downloads_fanart_when_ffmpeg_thumbnail_is_indexed()
 }
 
 #[tokio::test]
+async fn episode_image_policy_skips_online_stills() -> Result<(), Box<dyn std::error::Error>> {
+    for policy in ["LOCAL_SCREENSHOT", "NONE"] {
+        let fixture = prepare_series_fixture().await?;
+        let episode_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+                .fetch_one(fixture.database.pool())
+                .await?;
+        let (image_url, image_server) = start_image_stub().await?;
+        set_library_image_strategy(
+            &fixture.database,
+            &fixture.series_id,
+            json!({
+                "poster": true,
+                "backdrop": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 4,
+                "minDownloadWidth": 0,
+                "levels": {
+                    "episode": { "episodeImagePolicy": policy }
+                }
+            }),
+        )
+        .await?;
+        let candidate_id = insert_candidate(
+            &fixture.database,
+            &episode_id,
+            json!({
+                "title": "Online Episode",
+                "images": { "FANART": [format!("{image_url}/fanart")] }
+            }),
+        )
+        .await?;
+        let selection = MetadataSelectionService::new(
+            fixture.database.clone(),
+            ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+        );
+
+        let report = selection
+            .select(
+                &episode_id,
+                &candidate_id,
+                MetadataSelectionMode::FillMissing,
+            )
+            .await
+            .map_err(|error| format!("selection failed for {policy}: {error:?}"))?;
+
+        assert!(
+            report.image_types.is_empty(),
+            "{policy} must not download online stills"
+        );
+        let stills: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+        )
+        .bind(&episode_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+        assert_eq!(stills, 0, "{policy} must not store FANART stills");
+        image_server.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
 async fn series_candidate_search_persists_cast_data() -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_series_fixture().await?;
     let tmdb_app = Router::new().fallback(any(|request: Request<Body>| async move {

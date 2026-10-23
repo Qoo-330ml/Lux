@@ -7814,6 +7814,7 @@ pub(crate) struct NewDanmakuMatchJob<'a> {
 #[derive(Debug)]
 pub(crate) struct StoredThumbnailSource {
     pub(crate) item_id: String,
+    pub(crate) item_type: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
     pub(crate) library_media_strategy_json: Option<String>,

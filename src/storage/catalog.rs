@@ -504,7 +504,7 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -522,6 +522,7 @@ impl Database {
         .map(|row| {
             row.map(|row| StoredThumbnailSource {
                 item_id: row.get("item_id"),
+                item_type: row.get("item_type"),
                 root_path: row.get("root_path"),
                 relative_path: row.get("relative_path"),
                 library_media_strategy_json: row.get("library_media_strategy_json"),
@@ -4383,7 +4384,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -4404,6 +4405,7 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredThumbnailSource {
                     item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
@@ -4424,7 +4426,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(sqlx::AssertSqlSafe(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -4448,6 +4450,7 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredThumbnailSource {
                     item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
@@ -4468,7 +4471,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT t.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM scan_job_targets t
              JOIN media_items mi ON mi.id = t.item_id
@@ -4500,6 +4503,7 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredThumbnailSource {
                     item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),

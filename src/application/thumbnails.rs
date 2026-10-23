@@ -23,6 +23,7 @@ use crate::{
             BackgroundWorkStage, process_background_child_cleanup_pending,
             run_process_background_supervised,
         },
+        candidates::{EpisodeImagePolicy, ImageSelectionPolicy},
         images::{
             acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
             is_fallback_image_source, read_image_dimensions_from_bytes, write_image_atomically,
@@ -309,9 +310,16 @@ impl ThumbnailService {
             if !seen_items.insert(candidate.item_id.clone()) {
                 continue;
             }
-            let mode = ThumbnailScrapingMode::from_strategy_json(
-                candidate.library_media_strategy_json.as_deref(),
-                global_strategy,
+            let mode = effective_thumbnail_mode(
+                &candidate.item_type,
+                ImageSelectionPolicy::from_json(
+                    candidate.library_media_strategy_json.as_deref(),
+                    global_strategy,
+                ),
+                ThumbnailScrapingMode::from_strategy_json(
+                    candidate.library_media_strategy_json.as_deref(),
+                    global_strategy,
+                ),
             );
             if !mode.allows_screenshots() {
                 report.skipped_policy += 1;
@@ -1146,6 +1154,23 @@ impl From<ThumbnailFileError> for ThumbnailError {
     }
 }
 
+/// Episodes follow the three-way `episodeImagePolicy`: scraper still, local
+/// screenshot, or neither. Other item types keep the shared thumbnail mode.
+pub(crate) fn effective_thumbnail_mode(
+    item_type: &str,
+    policy: ImageSelectionPolicy,
+    mode: ThumbnailScrapingMode,
+) -> ThumbnailScrapingMode {
+    if item_type != "EPISODE" {
+        return mode;
+    }
+    match policy.episode_image_policy() {
+        EpisodeImagePolicy::ScraperStill => ThumbnailScrapingMode::ScraperFirst,
+        EpisodeImagePolicy::LocalScreenshot => ThumbnailScrapingMode::ScreenshotFirst,
+        EpisodeImagePolicy::None => ThumbnailScrapingMode::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ThumbnailService;
@@ -1199,5 +1224,60 @@ mod tests {
         assert!(state.images_missing);
         assert_eq!(database.query_count(), 3);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod episode_image_mode_tests {
+    use super::{EpisodeImagePolicy, ImageSelectionPolicy, effective_thumbnail_mode};
+    use crate::application::thumbnail_policy::ThumbnailScrapingMode;
+
+    fn policy(episode_policy: &str) -> ImageSelectionPolicy {
+        ImageSelectionPolicy::from_json(
+            Some(&format!(
+                r#"{{"images":{{"levels":{{"episode":{{"episodeImagePolicy":"{episode_policy}"}}}}}}}}"#
+            )),
+            None,
+        )
+    }
+
+    #[test]
+    fn episode_policies_map_to_the_expected_screenshot_mode() {
+        let cases = [
+            (
+                "SCRAPER_STILL",
+                ThumbnailScrapingMode::ScraperFirst,
+                EpisodeImagePolicy::ScraperStill,
+            ),
+            (
+                "LOCAL_SCREENSHOT",
+                ThumbnailScrapingMode::ScreenshotFirst,
+                EpisodeImagePolicy::LocalScreenshot,
+            ),
+            (
+                "NONE",
+                ThumbnailScrapingMode::None,
+                EpisodeImagePolicy::None,
+            ),
+        ];
+        for (raw, expected_mode, expected_policy) in cases {
+            let policy = policy(raw);
+            assert_eq!(policy.episode_image_policy(), expected_policy);
+            assert_eq!(
+                effective_thumbnail_mode("EPISODE", policy, ThumbnailScrapingMode::ScraperFirst),
+                expected_mode
+            );
+        }
+    }
+
+    #[test]
+    fn non_episode_items_keep_the_shared_mode() {
+        let policy = policy("NONE");
+        for item_type in ["MOVIE", "SERIES", "SEASON"] {
+            assert_eq!(
+                effective_thumbnail_mode(item_type, policy, ThumbnailScrapingMode::ScraperFirst),
+                ThumbnailScrapingMode::ScraperFirst
+            );
+        }
     }
 }
