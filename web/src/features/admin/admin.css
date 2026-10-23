@@ -330,6 +330,32 @@
 
 .lux-library-strategy-image-limits label { max-width: 340px; }
 
+.lux-level-policy { display: grid; gap: 10px; margin-top: 12px; }
+
+.lux-level-policy-group { border: 1px solid var(--lux-border); border-radius: 10px; background: var(--lux-surface-raised); padding: 0 10px; }
+
+.lux-level-policy-group[open] { padding-bottom: 10px; }
+
+.lux-level-policy-group > summary { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 9px 2px; cursor: pointer; font-weight: 600; font-size: .82rem; }
+
+.lux-level-policy-group > summary small { color: var(--lux-muted); font-weight: 500; font-size: .7rem; }
+
+.lux-level-policy-episode { display: flex; align-items: center; gap: 10px; margin: 4px 0 10px; font-size: .76rem; color: var(--lux-muted); }
+
+.lux-level-policy-episode select { max-width: 240px; }
+
+.lux-level-policy-table { width: 100%; border-collapse: collapse; font-size: .72rem; }
+
+.lux-level-policy-table th, .lux-level-policy-table td { padding: 4px 6px; text-align: left; border-bottom: 1px solid var(--lux-border); vertical-align: middle; }
+
+.lux-level-policy-table thead th { color: var(--lux-muted); font-weight: 600; font-size: .68rem; white-space: nowrap; }
+
+.lux-level-policy-table tbody th { font-weight: 600; white-space: nowrap; }
+
+.lux-level-policy-table select, .lux-level-policy-table input { width: 100%; min-width: 0; font-size: .72rem; padding: 3px 4px; }
+
+.lux-level-policy-table td:nth-child(5), .lux-level-policy-table td:nth-child(6) { max-width: 74px; }
+
 .lux-library-strategy-footer { display: flex; align-items: center; justify-content: space-between; gap: 18px; margin-top: 15px; color: var(--lux-muted); font-size: .73rem; }
 
 .lux-library-strategy-footer > span { min-width: 0; }
@@ -2337,6 +2363,9 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
   .lux-library-strategy-grid { grid-template-columns: 1fr; }
   .lux-library-strategy-card-wide { grid-column: auto; }
   .lux-library-strategy-form-grid, .lux-library-strategy-image-limits, .lux-library-strategy-toggle-grid { grid-template-columns: 1fr; }
+  .lux-level-policy-table, .lux-level-policy-table thead, .lux-level-policy-table tbody, .lux-level-policy-table tr, .lux-level-policy-table th, .lux-level-policy-table td { display: block; width: 100%; }
+  .lux-level-policy-table td { padding-left: 0; }
+  .lux-level-policy-table td:nth-child(5), .lux-level-policy-table td:nth-child(6) { max-width: none; }
   .lux-library-strategy-footer { align-items: stretch; flex-direction: column; }
   .lux-library-strategy-footer-actions { justify-content: stretch; }
   .lux-library-strategy-footer-actions .lux-library-toolbar-button { flex: 1; }

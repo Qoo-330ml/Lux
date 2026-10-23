@@ -1754,8 +1754,42 @@ export type MediaImageVariantCacheSettings = {
   concurrency: number;
 };
 
+export type MediaImageLevelKey = "movie" | "series" | "season" | "episode";
+
+export type MediaArtworkTypeKey =
+  | "poster"
+  | "backdrop"
+  | "artwork"
+  | "logo"
+  | "thumbnail"
+  | "banner"
+  | "disc"
+  | "wallpaper";
+
+export type MediaArtworkSource = "SCRAPER" | "SCREENSHOT";
+
+export type MediaArtworkOverwrite = "INHERIT" | "KEEP" | "FILL" | "OVERWRITE";
+
+export type MediaScraperRole = "PRIMARY" | "BACKUP" | "SUPPLEMENT";
+
+export type MediaArtworkPolicySettings = {
+  enabled?: boolean;
+  sources?: MediaArtworkSource[];
+  scraperRoles?: MediaScraperRole[];
+  overwrite?: MediaArtworkOverwrite;
+  maxCount?: number;
+  minWidth?: number;
+};
+
+export type MediaImageLevelSettings = {
+  thumbnailScrapingMode?: "NONE" | "SCREENSHOT_FIRST" | "SCRAPER_FIRST";
+  episodeImagePolicy?: "SCRAPER_STILL" | "LOCAL_SCREENSHOT" | "NONE";
+  artworks?: Partial<Record<MediaArtworkTypeKey, MediaArtworkPolicySettings>>;
+};
+
 export type MediaImageStrategySettings = {
   poster: boolean;
+  backdrop?: boolean;
   artwork: boolean;
   banner: boolean;
   logo: boolean;
@@ -1767,6 +1801,7 @@ export type MediaImageStrategySettings = {
   maxBackdropCount: number;
   minDownloadWidth: number;
   variantCache?: MediaImageVariantCacheSettings;
+  levels?: Partial<Record<MediaImageLevelKey, MediaImageLevelSettings>>;
 };
 
 export type MediaSubtitleStrategySettings = {
