@@ -31556,3 +31556,103 @@ async fn chapter_detection_season_source_counts_match_paged_source_filters()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn user_batch_reads_match_single_user_reads() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let user_ids = ["batch-user-1", "batch-user-2", "batch-user-3"];
+    for user_id in user_ids {
+        database
+            .insert_user(user_id, user_id, user_id, "test-hash", false, false)
+            .await
+            .expect("user");
+    }
+    for library_id in ["batch-library-1", "batch-library-2", "batch-library-3"] {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(library_id)
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .expect("library");
+    }
+    database
+        .replace_user_library_order(
+            user_ids[0],
+            &["batch-library-2".to_owned(), "batch-library-1".to_owned()],
+        )
+        .await
+        .expect("first order");
+    database
+        .replace_user_library_order(user_ids[2], &["batch-library-3".to_owned()])
+        .await
+        .expect("third order");
+    sqlx::query(
+        "INSERT INTO user_library_order_preferences (user_id, use_admin_library_order)
+         VALUES (?, 0)",
+    )
+    .bind(user_ids[0])
+    .execute(database.pool())
+    .await
+    .expect("preference");
+    sqlx::query("INSERT INTO user_emby_configuration (user_id, configuration_json) VALUES (?, ?)")
+        .bind(user_ids[1])
+        .bind(r#"{"DisplayPreferencesId":"stored"}"#)
+        .execute(database.pool())
+        .await
+        .expect("configuration");
+
+    let ids = user_ids
+        .iter()
+        .map(|id| (*id).to_owned())
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    let orders = database
+        .user_library_orders(&ids)
+        .await
+        .expect("batch orders");
+    assert_eq!(database.query_count(), 1);
+    let flags = database
+        .user_admin_library_order_flags(&ids)
+        .await
+        .expect("batch flags");
+    let configurations = database
+        .list_user_emby_configurations(&ids)
+        .await
+        .expect("batch configurations");
+    assert_eq!(database.query_count(), 3);
+
+    for user_id in user_ids {
+        assert_eq!(
+            orders.get(user_id).cloned().unwrap_or_default(),
+            database
+                .user_library_order(user_id)
+                .await
+                .expect("single order")
+        );
+        assert_eq!(
+            flags.get(user_id).copied(),
+            Some(
+                database
+                    .user_uses_admin_library_order(user_id)
+                    .await
+                    .expect("single preference"),
+            )
+        );
+        assert_eq!(
+            configurations.get(user_id).cloned(),
+            database
+                .find_user_emby_configuration(user_id)
+                .await
+                .expect("single configuration")
+        );
+    }
+    assert!(orders.get("batch-unknown-user").is_none());
+    assert!(flags.get("batch-unknown-user").is_none());
+    assert!(configurations.get("batch-unknown-user").is_none());
+    database.close().await;
+}

@@ -4334,6 +4334,130 @@ impl Database {
         })
     }
 
+    /// Loads the saved library order of several users in one query per bounded chunk.
+    ///
+    /// Listing users used to read the order one user at a time, so the query count grew with the
+    /// page size.
+    pub(crate) async fn user_library_orders(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, StorageError> {
+        let mut orders = std::collections::HashMap::<String, Vec<String>>::new();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT user_id, library_id FROM user_library_order
+                 WHERE user_id IN ({placeholders})
+                 ORDER BY user_id, position, library_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                orders
+                    .entry(row.get("user_id"))
+                    .or_default()
+                    .push(row.get("library_id"));
+            }
+        }
+        Ok(orders)
+    }
+
+    /// Loads the "use the administrator order" preference of several users in one bounded batch.
+    ///
+    /// Users without a preference row keep the single-user default (enabled), so every requested
+    /// id is present in the result.
+    pub(crate) async fn user_admin_library_order_flags(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, bool>, StorageError> {
+        let mut flags = std::collections::HashMap::<String, bool>::new();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT user_id, use_admin_library_order FROM user_library_order_preferences
+                 WHERE user_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                flags.insert(
+                    row.get("user_id"),
+                    row.get::<i64, _>("use_admin_library_order") != 0,
+                );
+            }
+        }
+        for user_id in user_ids {
+            flags.entry(user_id.clone()).or_insert(true);
+        }
+        Ok(flags)
+    }
+
+    /// Loads the stored Emby configuration of several users in one bounded batch.
+    pub(crate) async fn list_user_emby_configurations(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, StorageError> {
+        let mut configurations = std::collections::HashMap::<String, String>::new();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT user_id, configuration_json FROM user_emby_configuration
+                 WHERE user_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                configurations.insert(row.get("user_id"), row.get("configuration_json"));
+            }
+        }
+        Ok(configurations)
+    }
+
     pub(crate) async fn replace_user_library_order(
         &self,
         user_id: &str,

@@ -1010,16 +1010,62 @@ pub(super) async fn emby_query_users(
     };
     let server_name = current_emby_server_name(&state).await;
     let snapshots = emby_user_access_snapshots(&state, &users).await;
+    let user_ids = users
+        .iter()
+        .map(|user| user.id.to_string())
+        .collect::<Vec<_>>();
+    // Reading the order and the Emby configuration per user made this listing cost a handful of
+    // queries per page entry. Resolve both for the whole page instead.
+    let mut order_requests = Vec::with_capacity(users.len());
+    for user in &users {
+        let principal = AccessPrincipal::new(user.id, user.is_admin);
+        let Ok((order_scope, _)) =
+            super::emby_catalog::emby_library_order_scope(&state, principal).await
+        else {
+            continue;
+        };
+        order_requests.push((user.id.to_string(), user.is_admin, order_scope));
+    }
+    let ordered_views = match state.libraries.as_ref() {
+        Some(libraries) => libraries
+            .saved_library_orders_for_users(&order_requests)
+            .await
+            .unwrap_or_default(),
+        None => std::collections::HashMap::new(),
+    };
+    let stored_configurations = match state.database.as_ref() {
+        Some(database) => database
+            .list_user_emby_configurations(&user_ids)
+            .await
+            .unwrap_or_default(),
+        None => std::collections::HashMap::new(),
+    };
+    let force_admin_library_order = match state.database.as_ref() {
+        Some(database) => database.force_admin_library_order().await.unwrap_or(false),
+        None => false,
+    };
     let mut items = Vec::with_capacity(users.len());
     for user in users {
-        let ordered_views = emby_ordered_views(&state, &user).await;
-        let configuration = emby_user_configuration(&state, &user, &ordered_views).await;
+        let user_id = user.id.to_string();
+        let views = ordered_views
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|library_id| emby_public_id(&library_id))
+            .collect::<Vec<_>>();
+        let configuration = emby_user_configuration_from_stored(
+            stored_configurations.get(&user_id).map(String::as_str),
+            &user,
+            &views,
+            force_admin_library_order,
+        );
         items.push(emby_user_json(
             &user,
             &state.server_id,
             &server_name,
             configuration,
-            snapshots.get(&user.id.to_string()),
+            snapshots.get(&user_id),
         ));
     }
     Json(json!({
@@ -2830,22 +2876,41 @@ async fn emby_user_configuration(
     user: &UserRecord,
     ordered_views: &[String],
 ) -> Value {
-    let mut configuration = emby_user_configuration_json(ordered_views);
     let Some(database) = state.database.as_ref() else {
-        return configuration;
+        return emby_user_configuration_json(ordered_views);
     };
-    let Ok(Some(serialized)) = database
+    let stored = database
         .find_user_emby_configuration(&user.id.to_string())
         .await
-    else {
-        return configuration;
+        .ok()
+        .flatten();
+    let force_admin_library_order = if user.is_admin {
+        false
+    } else {
+        database.force_admin_library_order().await.unwrap_or(false)
     };
-    let Ok(stored) = serde_json::from_str::<Value>(&serialized) else {
-        return configuration;
-    };
-    merge_emby_json_object(&mut configuration, stored);
+    emby_user_configuration_from_stored(
+        stored.as_deref(),
+        user,
+        ordered_views,
+        force_admin_library_order,
+    )
+}
+
+fn emby_user_configuration_from_stored(
+    serialized: Option<&str>,
+    user: &UserRecord,
+    ordered_views: &[String],
+    force_admin_library_order: bool,
+) -> Value {
+    let mut configuration = emby_user_configuration_json(ordered_views);
+    if let Some(serialized) = serialized
+        && let Ok(stored) = serde_json::from_str::<Value>(serialized)
+    {
+        merge_emby_json_object(&mut configuration, stored);
+    }
     if !user.is_admin
-        && matches!(database.force_admin_library_order().await, Ok(true))
+        && force_admin_library_order
         && let Some(object) = configuration.as_object_mut()
     {
         object.insert("OrderedViews".to_owned(), json!(ordered_views));
@@ -3014,6 +3079,63 @@ fn emby_login_session_json(result: &crate::auth::emby::EmbyAuthResult, server_id
         "PlayState": {},
         "Capabilities": {},
     })
+}
+
+#[cfg(test)]
+mod user_configuration_tests {
+    use super::emby_user_configuration_from_stored;
+    use crate::auth::users::UserRecord;
+    use crate::domain::ids::UserId;
+    use serde_json::json;
+
+    fn user(is_admin: bool) -> UserRecord {
+        UserRecord {
+            id: UserId::new(),
+            username_normalized: "watcher".to_owned(),
+            display_name: "Watcher".to_owned(),
+            has_password: true,
+            is_disabled: false,
+            is_admin,
+            can_manage_server: is_admin,
+            can_remote_access: true,
+            can_download: true,
+            last_login_at: None,
+            last_activity_at: None,
+        }
+    }
+
+    #[test]
+    fn stored_configuration_is_merged_and_the_forced_order_replaces_views() {
+        let views = vec!["view-a".to_owned(), "view-b".to_owned()];
+        let stored = r#"{"DisplayMissingEpisodes":true,"OrderedViews":["stored-view"]}"#;
+
+        let configuration =
+            emby_user_configuration_from_stored(Some(stored), &user(false), &views, true);
+        assert_eq!(configuration["DisplayMissingEpisodes"], json!(true));
+        assert_eq!(configuration["OrderedViews"], json!(views));
+
+        let configuration =
+            emby_user_configuration_from_stored(Some(stored), &user(false), &views, false);
+        assert_eq!(
+            configuration["OrderedViews"],
+            json!(["stored-view"]),
+            "the stored order survives unless the server forces the administrator order"
+        );
+
+        let configuration =
+            emby_user_configuration_from_stored(Some(stored), &user(true), &views, true);
+        assert_eq!(
+            configuration["OrderedViews"],
+            json!(["stored-view"]),
+            "administrators always keep their own stored order"
+        );
+
+        let configuration = emby_user_configuration_from_stored(None, &user(false), &views, false);
+        assert_eq!(configuration["OrderedViews"], json!(views));
+        let configuration =
+            emby_user_configuration_from_stored(Some("not-json"), &user(false), &views, false);
+        assert_eq!(configuration["OrderedViews"], json!(views));
+    }
 }
 
 #[cfg(test)]
