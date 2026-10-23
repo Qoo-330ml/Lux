@@ -41,6 +41,8 @@ pub struct ScanJobService {
     pub(super) local_metadata_outbox_worker_started: Arc<AtomicBool>,
     pub(super) local_metadata_outbox_notify: Arc<Notify>,
     pub(super) lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
+    /// Wake-up handle for the automatic media identity merge worker (LUX-841).
+    pub(super) identity_merge_notify: Option<Arc<tokio::sync::Notify>>,
 }
 
 #[derive(Default)]

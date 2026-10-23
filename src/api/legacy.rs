@@ -66,6 +66,7 @@ use crate::{
         emby_migration_service::{
             CreateMigrationRequest, EmbyMigrationService, EmbyMigrationServiceError,
         },
+        identity_merge::IdentityMergeWorker,
         image_variants::ImageVariantService,
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
@@ -212,6 +213,7 @@ pub struct AppState {
     collections: Option<CollectionService>,
     global_collection_sync_worker: Option<GlobalCollectionSyncWorker>,
     content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
+    identity_merge_worker: Option<IdentityMergeWorker>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     user_avatars: Option<UserAvatarService>,
@@ -237,6 +239,9 @@ impl AppState {
 
     pub async fn shutdown_background_workers_checked(&self) -> Result<(), String> {
         if let Some(worker) = &self.content_restriction_index_worker {
+            worker.shutdown().await;
+        }
+        if let Some(worker) = &self.identity_merge_worker {
             worker.shutdown().await;
         }
         crate::application::probe::shutdown_probe_runtime()
@@ -434,13 +439,15 @@ impl AppState {
         );
         let embedded_subtitle = Some(EmbeddedSubtitleService::new());
         let thumbnails = Some(ThumbnailService::new(database.clone()));
+        let identity_merge_notify = Arc::new(tokio::sync::Notify::new());
         let scan_jobs = {
             let service = ScanJobService::new(database.clone())
                 .with_admin_events(admin_events.clone())
                 .with_user_events(user_events.clone())
                 .with_log_store(log_store.clone())
                 .with_resource_metrics(resources.clone())
-                .with_home(home.clone());
+                .with_home(home.clone())
+                .with_identity_merge_notify(identity_merge_notify.clone());
             let service = match library_covers.clone() {
                 Some(covers) => service.with_library_covers(covers),
                 None => service,
@@ -481,6 +488,14 @@ impl AppState {
         .with_danmaku(danmaku.clone());
         let global_collection_sync_worker =
             Some(GlobalCollectionSyncWorker::start(database.clone()));
+        let identity_merge_worker = Some(IdentityMergeWorker::start(
+            database.clone(),
+            Some(home.clone()),
+            Some(catalog.clone()),
+            admin_events.clone(),
+            config_dir.clone(),
+            identity_merge_notify,
+        ));
         Self {
             admin_health_probe_cache: AdminHealthProbeCache::default(),
             database: Some(database.clone()),
@@ -545,6 +560,7 @@ impl AppState {
             collections,
             global_collection_sync_worker,
             content_restriction_index_worker: None,
+            identity_merge_worker,
             people: Some(people),
             local_nfo: Some(local_nfo),
             user_avatars,

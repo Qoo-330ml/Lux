@@ -109,6 +109,7 @@ impl ScanJobService {
             )
             .await;
             self.clear_cancellation_flag(&job.id);
+            self.notify_identity_merge();
             return Ok(ScanBatchReport {
                 status: "COMPLETED".to_owned(),
                 processed: 0,
