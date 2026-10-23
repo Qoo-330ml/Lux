@@ -815,3 +815,17 @@ html[data-lux-theme="light"] .lux-detail-watched-status.is-played { border-color
   .lux-media-file-summary { gap: 8px 15px; }
   .lux-media-address-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 }
+
+.lux-detail-merge-sources { order: 0; margin-bottom: 24px; }
+
+.lux-detail-page .lux-detail-merge-sources h2 { font-size: 1.15rem; font-weight: 700; letter-spacing: .02em; line-height: 1.2; }
+
+.lux-detail-merge-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+
+.lux-detail-merge-item { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--lux-line, rgba(255,255,255,.12)); border-radius: 10px; }
+
+.lux-detail-merge-title { font-weight: 600; }
+
+.lux-detail-merge-meta { color: var(--lux-muted); font-size: .78rem; }
+
+.lux-detail-merge-confirm { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }

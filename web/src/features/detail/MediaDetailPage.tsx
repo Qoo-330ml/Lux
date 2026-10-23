@@ -6,6 +6,7 @@ import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
 import { MediaSourcePanel, MediaSourceProvider, useMediaSource } from "./MediaSourcePanel";
 import { MediaCastSection, MediaNfoSection, MediaStillsSection } from "./MediaDetailSections";
+import { MediaMergeSourcesSection } from "./MediaMergeSourcesSection";
 import { mediaTitle } from "../home/media-display";
 import { MediaDetailActions, MediaDetailActionControls, MediaDetailMobileHeader } from "./MediaDetailActions";
 import { MediaEpisodesProvider, MediaEpisodesSection } from "./MediaEpisodesSection";
@@ -60,6 +61,7 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
           </div>
         </div>
         <div className="lux-detail-sections">
+          <MediaMergeSourcesSection item={media} />
           <MediaEpisodesSection item={media}>
           {mediaTagline ? (
             <div className="lux-detail-tagline-wrap">

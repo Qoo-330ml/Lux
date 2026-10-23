@@ -423,6 +423,27 @@ export type AdminItemMergeResult = {
   mergedItemIds: string[];
 };
 
+export type AdminItemMergeRecord = {
+  id: string;
+  mergedItemId: string;
+  mergedItemTitle: string;
+  itemType: string;
+  origin: string;
+  mergedAt: number;
+  undoneAt: number | null;
+  sourceCount: number;
+};
+
+export type AdminItemUnmergeResult = {
+  primaryItemId: string;
+  mergedItemId: string;
+  libraryId: string;
+  itemType: string;
+  restoredItemIds: string[];
+  restoredSourceCount: number;
+  userStateRestored: boolean;
+};
+
 export type PlaybackState = {
   itemId?: string;
   isFavorite?: boolean;
