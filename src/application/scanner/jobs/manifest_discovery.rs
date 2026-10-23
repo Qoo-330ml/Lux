@@ -1362,6 +1362,9 @@ impl ScanJobService {
             if cancellation.load(Ordering::Acquire) {
                 return self.cancel_running_job(&job.id).await;
             }
+            // A root that hit an unreadable directory stays conservative for this pass: missing
+            // detection is skipped for the whole root even if later directories are readable.
+            let mut root_failed = false;
             let Some(root) = roots_by_id.get(&root_id).cloned() else {
                 self.database
                     .mark_scan_manifest_root_unavailable(manifest_id, &root_id)
@@ -1407,7 +1410,7 @@ impl ScanJobService {
                             has_filesystem_entries,
                             discovered.child_directories,
                         );
-                        if !root.is_available {
+                        if !root.is_available && !root_failed {
                             self.database
                                 .update_library_root_availability(&root.id, true)
                                 .await?;
@@ -1424,30 +1427,28 @@ impl ScanJobService {
                     Err(
                         error @ (ScannerError::Io { .. } | ScannerError::RootIdentityChanged(_)),
                     ) => {
-                        // Keep the conservative root-level handling, but leave a trace of which
-                        // directory failed so an operator can act on it.
+                        root_failed = true;
                         tracing::warn!(
                             root_id = %root.id,
                             job_id = %job.id,
+                            directory = %relative_directory,
                             %error,
-                            "manifest discovery could not read a directory; marking the root unavailable"
+                            "manifest discovery could not read a directory; the root will be marked unavailable"
                         );
-                        self.database
-                            .update_library_root_availability(&root.id, false)
-                            .await?;
-                        self.database
-                            .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
-                            .await?;
-                        self.remove_lite_manifest_root(manifest_id, &root.id);
+                        let details = serde_json::json!({
+                            "directory": relative_directory,
+                            "error": error.to_string(),
+                        })
+                        .to_string();
                         self.record_event(
                             &job.id,
                             "WARN",
                             "ROOT_UNAVAILABLE",
-                            "媒体库根路径不可用，已跳过本轮缺失判定",
-                            "{}",
+                            "目录不可读，本轮将跳过该媒体库根路径的缺失判定",
+                            &details,
                         )
                         .await;
-                        break;
+                        continue;
                     }
                     Err(error) => {
                         return self
@@ -1455,6 +1456,17 @@ impl ScanJobService {
                             .await;
                     }
                 }
+            }
+            if root_failed {
+                // Apply the conservative root state only after every directory of this root has
+                // been read, so readable siblings are still discovered in the same pass.
+                self.database
+                    .update_library_root_availability(&root.id, false)
+                    .await?;
+                self.database
+                    .mark_scan_manifest_root_unavailable(manifest_id, &root.id)
+                    .await?;
+                self.remove_lite_manifest_root(manifest_id, &root_id);
             }
         }
 
