@@ -6949,35 +6949,14 @@ impl Database {
             )
         };
         let visible_collection_filter = visible_source("visible_member.item_id");
-        let mut total_statement = self
-            .query_scalar::<i64>(sqlx::AssertSqlSafe(format!(
-                "SELECT COUNT(DISTINCT collection.id)
-                 FROM collections collection
-                 JOIN media_items collection_item ON collection_item.id = collection.item_id
-                 JOIN collection_items visible_member ON visible_member.collection_id = collection.id
-                 WHERE collection.library_id = ?
-                   AND collection_item.item_type = 'BOX_SET'
-                   AND collection_item.removed_at IS NULL
-                   AND collection_item.has_available_source = 1
-                   AND {visible_collection_filter}"
-            )))
-            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
-            .bind(database_flag(is_admin))
-            .bind(user_id);
-        for bind in &content_restriction_binds {
-            total_statement = match bind {
-                CatalogBind::Text(value) => total_statement.bind(*value),
-                CatalogBind::Integer(value) => total_statement.bind(*value),
-                CatalogBind::Real(value) => total_statement.bind(*value),
-            };
-        }
-        let total = total_statement
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let total = self
+            .count_visible_global_collections_with_restrictions(
+                user_id,
+                is_admin,
+                None,
+                content_restrictions,
+            )
+            .await?;
         let visible_member_count = visible_source("member.item_id");
         let visible_fallback_poster = |poster_column: &str| {
             format!(
@@ -11147,6 +11126,18 @@ mod tests {
             .list_global_collection_cards_page(&viewer.id.to_string(), false, 0, 1)
             .await?;
         assert_eq!(first_total, 2);
+        assert_eq!(
+            database
+                .count_visible_global_collections_with_restrictions(
+                    &viewer.id.to_string(),
+                    false,
+                    None,
+                    None
+                )
+                .await?,
+            first_total,
+            "the count-only query must agree with the paged total"
+        );
         assert_eq!(first_page.len(), 1);
         assert_eq!(first_page[0].title, "Alpha Collection");
         assert_eq!(first_page[0].member_count, 1);
@@ -11239,6 +11230,17 @@ mod tests {
             .await?;
         assert!(hidden_cards.is_empty());
         assert_eq!(hidden_total, 0);
+        assert_eq!(
+            database
+                .count_visible_global_collections_with_restrictions(
+                    &isolated_user.id.to_string(),
+                    false,
+                    None,
+                    None
+                )
+                .await?,
+            0
+        );
         let (_, hidden_members_total) = database
             .list_global_collection_member_ids_page(
                 &first_page[0].item_id,
@@ -11253,6 +11255,17 @@ mod tests {
             .list_global_collection_cards_page(&viewer.id.to_string(), true, 0, 10)
             .await?;
         assert_eq!(admin_total, 2);
+        assert_eq!(
+            database
+                .count_visible_global_collections_with_restrictions(
+                    &viewer.id.to_string(),
+                    true,
+                    None,
+                    None
+                )
+                .await?,
+            admin_total
+        );
         assert_eq!(admin_cards[0].member_count, 2);
 
         sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = ?")

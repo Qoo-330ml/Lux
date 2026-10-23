@@ -943,14 +943,16 @@ pub(super) async fn emby_library_order_scope(
         .catalog
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let collections = catalog
-        .list_global_collection_cards(principal, 0, 1)
+    // Only the total decides whether the collection library is part of the scope; building a
+    // card for it would assemble catalog rows nobody reads.
+    let collection_count = catalog
+        .count_global_collection_cards(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if collections.total > 0 {
+    if collection_count > 0 {
         library_ids.push(GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
     }
-    Ok((library_ids, collections.total))
+    Ok((library_ids, collection_count))
 }
 
 fn emby_global_collection_library_json(server_id: &str, child_count: i64) -> Value {

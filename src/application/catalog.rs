@@ -457,6 +457,23 @@ impl CatalogService {
             .await
     }
 
+    /// Counts the global collections the principal can see without building any card.
+    pub async fn count_global_collection_cards(
+        &self,
+        principal: AccessPrincipal,
+    ) -> Result<i64, CatalogError> {
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        Ok(self
+            .database
+            .count_visible_global_collections_with_restrictions(
+                &principal.user_id_string(),
+                principal.is_admin,
+                None,
+                content_restrictions.as_ref(),
+            )
+            .await?)
+    }
+
     pub async fn list_recent_global_collection_cards(
         &self,
         principal: AccessPrincipal,
