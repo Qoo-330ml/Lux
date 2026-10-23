@@ -6532,7 +6532,7 @@ mod tests {
             ])
         );
         assert!(
-            movie.get("FANART").is_none(),
+            !movie.contains_key("FANART"),
             "a 1280px backdrop is below the 1920px movie minimum"
         );
 
