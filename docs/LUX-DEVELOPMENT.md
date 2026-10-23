@@ -3002,6 +3002,13 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 NAS/x86 性能或第三方客户端表现。撤销不恢复被合并条目的用户状态原值，升级前没有溯源记录的历史合并
 无法拆分。
 
+全量 `cargo test --locked --all-targets` 后仍有 11 个目标失败：`admin_api_key`、`admin_health`、
+`image_api`、`people_api`、`scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、
+`scheduled_tasks`、`watch`、`web_playback`、`web_static`。这些目标在父提交 `f35f55c4` 上以相同用例
+复现失败，因此不是本任务引入；lib 目标 1268 项通过、32 项忽略。`cargo clippy --all-targets
+--all-features -- -D warnings` 在当前 stable（clippy 1.97）下仍有 7 个既存 lint（`emby_catalog.rs`、
+`media.rs`、playback、webhooks、`repository.rs`），本任务改动的文件没有新增诊断。
+
 #### LUX-084：TMDb 自动合集
 
 验收：
