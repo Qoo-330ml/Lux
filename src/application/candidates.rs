@@ -188,7 +188,7 @@ fn completeness_capabilities(
     }
     let mut capabilities = vec![("METADATA".to_owned(), plan.needs_metadata)];
     if let Some(image_policy) = plan.image_policy {
-        for image_type in image_policy.enabled_types() {
+        for image_type in image_policy.enabled_types_for_item_type(&current.item_type) {
             let missing = SCRAPER_IMAGE_TYPES
                 .iter()
                 .position(|candidate| *candidate == image_type)
@@ -2465,7 +2465,7 @@ impl MetadataSelectionService {
                     library_strategy.as_deref(),
                     global_strategy.as_deref(),
                 );
-                let image_types = image_policy.enabled_types().collect::<Vec<_>>();
+                let image_types = image_policy.enabled_types_for_item_type(&current.item_type);
                 let indexed_item_images = indexed_images.get(item_id).cloned().unwrap_or_default();
                 let writeback_context = writeback_contexts
                     .get(item_id)
@@ -2482,7 +2482,9 @@ impl MetadataSelectionService {
                             .local_image_types_with_indexed_images_and_context(
                                 &item_id,
                                 &image_types,
-                                image_policy.thumbnail_scraping_mode.prefers_screenshots(),
+                                image_policy
+                                    .thumbnail_scraping_mode_for_item_type(&current.item_type)
+                                    .prefers_screenshots(),
                                 &indexed_item_images,
                                 &writeback_context,
                             )
@@ -2680,8 +2682,11 @@ impl MetadataSelectionService {
             return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full(), 0));
         }
         let image_policy = self.image_selection_policy(item_id).await?;
-        let image_types = image_policy.enabled_types().collect::<Vec<_>>();
-        let local_image_types = if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
+        let image_types = image_policy.enabled_types_for_item_type(&current.item_type);
+        let local_image_types = if image_policy
+            .thumbnail_scraping_mode_for_item_type(&current.item_type)
+            .prefers_screenshots()
+        {
             self.images
                 .local_image_types_including_fallback(item_id, &image_types)
                 .await?
@@ -2998,6 +3003,7 @@ impl MetadataSelectionService {
         let image_types = self
             .write_selected_images(
                 item_id,
+                &current.item_type,
                 &payload,
                 image_policy,
                 image_source,
@@ -3005,14 +3011,16 @@ impl MetadataSelectionService {
                 options.supplemental,
             )
             .await?;
-        let screenshot_fallback_types =
-            if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
-                self.images
-                    .fallback_image_types(item_id, &["POSTER", "THUMB"])
-                    .await?
-            } else {
-                BTreeSet::new()
-            };
+        let screenshot_fallback_types = if image_policy
+            .thumbnail_scraping_mode_for_item_type(&current.item_type)
+            .prefers_screenshots()
+        {
+            self.images
+                .fallback_image_types(item_id, &["POSTER", "THUMB"])
+                .await?
+        } else {
+            BTreeSet::new()
+        };
         let has_primary_artwork = image_types
             .iter()
             .any(|image_type| matches!(*image_type, "POSTER" | "THUMB"))
@@ -3134,6 +3142,7 @@ impl MetadataSelectionService {
     async fn write_selected_images(
         &self,
         item_id: &str,
+        item_type: &str,
         payload: &CandidatePayload,
         image_policy: ImageSelectionPolicy,
         source: &str,
@@ -3141,25 +3150,41 @@ impl MetadataSelectionService {
         supplemental: bool,
     ) -> Result<Vec<&'static str>, MetadataSelectionError> {
         let mut specs = Vec::new();
-        let screenshot_fallback_types =
-            if image_policy.thumbnail_scraping_mode.prefers_screenshots() {
-                self.images
-                    .fallback_image_types(item_id, &["POSTER", "THUMB"])
-                    .await?
-            } else {
-                BTreeSet::new()
-            };
+        let screenshot_fallback_types = if image_policy
+            .thumbnail_scraping_mode_for_item_type(item_type)
+            .prefers_screenshots()
+        {
+            self.images
+                .fallback_image_types(item_id, &["POSTER", "THUMB"])
+                .await?
+        } else {
+            BTreeSet::new()
+        };
+        // A level/type cell may forbid online images; local-only cells keep
+        // whatever the media directory already has.
+        let scraper_allowed = |image_type: &str| {
+            image_policy
+                .type_policy_for_item_type(item_type, image_type)
+                .sources
+                .scraper
+        };
         macro_rules! add_spec {
             ($image_type:expr, $urls:expr) => {
                 let urls = $urls;
-                if !urls.is_empty() && !screenshot_fallback_types.contains($image_type) {
+                if !urls.is_empty()
+                    && !screenshot_fallback_types.contains($image_type)
+                    && scraper_allowed($image_type)
+                    && image_policy
+                        .type_policy_for_item_type(item_type, $image_type)
+                        .enabled
+                {
                     specs.push(($image_type, urls, 0_i64));
                 }
             };
         }
         if payload.typed_images_present {
-            for image_type in image_policy.enabled_types() {
-                if screenshot_fallback_types.contains(image_type) {
+            for image_type in image_policy.enabled_types_for_item_type(item_type) {
+                if screenshot_fallback_types.contains(image_type) || !scraper_allowed(image_type) {
                     continue;
                 }
                 if let Some(urls) = payload.images.get(image_type).cloned() {
@@ -3188,7 +3213,10 @@ impl MetadataSelectionService {
             if let Some(url) = payload.poster_url.clone() {
                 add_spec!("POSTER", vec![url]);
             }
-            if let Some(url) = payload.fanart_url.clone() {
+            if let Some(url) = payload.fanart_url.clone()
+                && scraper_allowed("FANART")
+                && !screenshot_fallback_types.contains("FANART")
+            {
                 if supplemental {
                     let mut urls = self
                         .filter_new_supplemental_image_urls(item_id, "FANART", vec![url])
@@ -4175,7 +4203,6 @@ impl ImageSelectionPolicy {
 
     /// Resolved scraping mode for one media level; a level may override the
     /// global thumbnail mode.
-    #[allow(dead_code)]
     pub(crate) fn thumbnail_scraping_mode_for(self, level: ImageLevel) -> ThumbnailScrapingMode {
         self.levels[level.index()]
             .thumbnail_scraping_mode
@@ -4183,7 +4210,7 @@ impl ImageSelectionPolicy {
     }
 
     /// Episode image semantics: scraper still, local screenshot, or nothing.
-    #[allow(dead_code)]
+    #[allow(dead_code)] // consumed by the thumbnail writers in LUX-843d
     pub(crate) fn episode_image_policy(self) -> EpisodeImagePolicy {
         let level = &self.levels[ImageLevel::Episode.index()];
         level.episode_image_policy.unwrap_or_else(|| {
@@ -4195,8 +4222,26 @@ impl ImageSelectionPolicy {
         })
     }
 
+    /// Cell derived only from the flat switches, used when a media level has no
+    /// override for that image type.
+    fn flat_type_policy(self, image_type: &str) -> ImageTypePolicy {
+        let max_count = if is_multi_image_type(image_type) {
+            usize::try_from(self.max_backdrop_count.clamp(0, MAX_IMAGE_VARIANTS as i64))
+                .unwrap_or_default()
+        } else {
+            1
+        };
+        ImageTypePolicy {
+            enabled: self.flat_type_enabled(image_type),
+            sources: ArtworkSources::default(),
+            scraper_roles: ScraperRoles::default(),
+            overwrite: ArtworkOverwrite::default(),
+            max_count,
+            min_width: self.min_download_width,
+        }
+    }
+
     /// Resolved cell for one (level, image type) pair.
-    #[allow(dead_code)]
     pub(crate) fn type_policy(
         self,
         level: ImageLevel,
@@ -4205,30 +4250,53 @@ impl ImageSelectionPolicy {
         let index = image_type_index(image_type)?;
         let level_overrides = &self.levels[level.index()];
         let overrides = &level_overrides.artworks[index];
-        let enabled = self.resolved_type_enabled(level, image_type);
-        let max_count = overrides.max_count.map(usize::from).unwrap_or_else(|| {
-            if is_multi_image_type(image_type) {
-                usize::try_from(self.max_backdrop_count.clamp(0, MAX_IMAGE_VARIANTS as i64))
-                    .unwrap_or_default()
-            } else {
-                1
-            }
-        });
+        let flat = self.flat_type_policy(image_type);
         Some(ImageTypePolicy {
-            enabled,
-            sources: overrides.sources.unwrap_or_default(),
-            scraper_roles: overrides.scraper_roles.unwrap_or_default(),
-            overwrite: overrides.overwrite.unwrap_or_default(),
-            max_count,
-            min_width: overrides
-                .min_width
-                .map(i64::from)
-                .unwrap_or(self.min_download_width),
+            enabled: self.resolved_type_enabled(level, image_type),
+            sources: overrides.sources.unwrap_or(flat.sources),
+            scraper_roles: overrides.scraper_roles.unwrap_or(flat.scraper_roles),
+            overwrite: overrides.overwrite.unwrap_or(flat.overwrite),
+            max_count: overrides
+                .max_count
+                .map(usize::from)
+                .unwrap_or(flat.max_count),
+            min_width: overrides.min_width.map(i64::from).unwrap_or(flat.min_width),
         })
     }
 
+    /// Resolved cell for an item type that may fall outside the artwork levels
+    /// (VIDEO/HOMEVIDEOS and other unscraped types keep the flat switches).
+    pub(crate) fn type_policy_for_item_type(
+        self,
+        item_type: &str,
+        image_type: &str,
+    ) -> ImageTypePolicy {
+        match ImageLevel::from_item_type(item_type) {
+            Some(level) => self
+                .type_policy(level, image_type)
+                .unwrap_or_else(|| self.flat_type_policy(image_type)),
+            None => self.flat_type_policy(image_type),
+        }
+    }
+
+    pub(crate) fn enabled_types_for_item_type(self, item_type: &str) -> Vec<&'static str> {
+        match ImageLevel::from_item_type(item_type) {
+            Some(level) => self.enabled_types_for(level).collect(),
+            None => self.enabled_types().collect(),
+        }
+    }
+
+    pub(crate) fn thumbnail_scraping_mode_for_item_type(
+        self,
+        item_type: &str,
+    ) -> ThumbnailScrapingMode {
+        match ImageLevel::from_item_type(item_type) {
+            Some(level) => self.thumbnail_scraping_mode_for(level),
+            None => self.thumbnail_scraping_mode,
+        }
+    }
+
     /// Resolved enabled image types for one media level.
-    #[allow(dead_code)]
     pub(crate) fn enabled_types_for(self, level: ImageLevel) -> impl Iterator<Item = &'static str> {
         IMAGE_TYPE_KEYS
             .into_iter()

@@ -1456,6 +1456,164 @@ async fn series_and_season_selection_writes_to_their_media_directories()
 }
 
 #[tokio::test]
+async fn level_overrides_enable_and_disable_posters_per_media_level()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture().await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 1,
+            "minDownloadWidth": 0,
+            "levels": {
+                "series": { "artworks": { "poster": { "enabled": false } } },
+                "season": { "artworks": { "poster": { "enabled": true } } }
+            }
+        }),
+    )
+    .await?;
+    let series_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.series_id,
+        json!({ "title": "Online Series", "posterUrl": format!("{image_url}/poster") }),
+    )
+    .await?;
+    let season_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.season_id,
+        json!({ "title": "Online Season", "posterUrl": format!("{image_url}/poster") }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    selection
+        .select(
+            &fixture.series_id,
+            &series_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("series selection failed: {error:?}"))?;
+    selection
+        .select(
+            &fixture.season_id,
+            &season_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("season selection failed: {error:?}"))?;
+
+    assert!(
+        !fixture.series_dir.join("poster.png").exists(),
+        "the series level disabled posters, so no series poster may be written"
+    );
+    assert!(
+        fixture.season_dir.join("poster.png").exists(),
+        "the season level enabled posters, so the season poster must be written"
+    );
+    let season_posters: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&fixture.season_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    let series_posters: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&fixture.series_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(season_posters, 1);
+    assert_eq!(series_posters, 0);
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_only_source_policy_skips_online_images() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture().await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 1,
+            "minDownloadWidth": 0,
+            "levels": {
+                "series": {
+                    "artworks": {
+                        "poster": { "enabled": true, "sources": ["LOCAL"] },
+                        "backdrop": { "enabled": true, "sources": ["LOCAL"] }
+                    }
+                }
+            }
+        }),
+    )
+    .await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "title": "Online Series",
+            "posterUrl": format!("{image_url}/poster"),
+            "fanartUrl": format!("{image_url}/fanart")
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    selection
+        .select(
+            &fixture.series_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("series selection failed: {error:?}"))?;
+
+    let online_images: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND source <> 'LOCAL'",
+    )
+    .bind(&fixture.series_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(online_images, 0);
+    assert!(!fixture.series_dir.join("poster.png").exists());
+    assert!(!fixture.series_dir.join("backdrop.png").exists());
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn episode_selection_downloads_fanart_when_ffmpeg_thumbnail_is_indexed()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_series_fixture().await?;
@@ -2857,6 +3015,23 @@ async fn configure_image_strategy(
             })
             .to_string(),
         )
+        .bind(library_id)
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
+async fn set_library_image_strategy(
+    database: &Database,
+    item_id: &str,
+    images: Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(json!({ "images": images }).to_string())
         .bind(library_id)
         .execute(database.pool())
         .await?;
