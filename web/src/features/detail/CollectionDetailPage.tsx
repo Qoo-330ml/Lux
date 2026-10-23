@@ -171,6 +171,7 @@ function CollectionSourceDialog({ collectionId, member, onClose }: { collectionI
   useEffect(() => {
     const dialog = dialogRef.current;
     if (!dialog) return;
+    const trigger = document.activeElement instanceof HTMLElement ? document.activeElement : undefined;
     activeRef.current = true;
     dialog.showModal();
     const previousOverflow = document.body.style.overflow;
@@ -179,6 +180,7 @@ function CollectionSourceDialog({ collectionId, member, onClose }: { collectionI
       activeRef.current = false;
       dialog.close();
       document.body.style.overflow = previousOverflow;
+      if (trigger?.isConnected) trigger.focus({ preventScroll: true });
     };
   }, []);
 

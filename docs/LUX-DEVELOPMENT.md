@@ -11582,11 +11582,11 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 
 补充实现（2026-10-18）：虚拟合集库的 Web 入口封面优先使用当前用户可访问合集自身的海报，再以成员电影海报补足；首页和媒体库列表一致，无可用海报时显示专属合集封面样式。封面仅在客户端组合，不写入共享库数据，避免跨用户 ACL 泄露。Web 生产构建通过；本次未运行自动化测试或浏览器视觉验收。
 
-界面调整（2026-10-23）：合集详情复用普通资源详情的背景图、海报和标题布局，显示原始标题、年份、可见影片数及简介（缺失时显示“暂无简介。”），窄屏保留简介。成员按服务端上映顺序以普通影片海报卡片横向排列，复用横向滚动轨道和左右箭头；海报与片名直接进入选定原资源，保留 `collectionId`、版本 `sourceId` 以及原有分页。多个来源或版本时才显示选择器，保存成功后更新卡片海报与详情链接；不可访问的成员不生成链接。
+界面调整（2026-10-23）：合集详情复用普通资源详情的背景图、海报和标题布局，显示原始标题、年份、可见影片数及简介（缺失时显示“暂无简介。”），窄屏保留简介。成员按服务端上映顺序以普通影片海报卡片横向排列，复用横向滚动轨道和左右箭头，保留原有分页。卡片下方不展示来源/版本表单：单一来源直接进入原资源详情，即使该来源有多个版本也不弹窗，并保留偏好 `sourceId`；多个来源时点击海报或片名打开原生模态弹窗，列出各来源库、片名和版本信息，选择并保存成功后携带 `collectionId`、`sourceId` 进入对应原资源。不可访问的成员不生成链接或按钮。
 
-本次文件（5 个）：`web/src/features/detail/CollectionDetailPage.tsx`、`web/src/features/detail/detail.css`、`web/tests/collection-detail.test.tsx`、`scripts/collection-browser-smoke.mjs`、本文档。短计划：先写合集详情和卡片跳转的失败回归，再替换布局并复用现有组件，最后检查 Web 构建、完整单测及隔离浏览器响应式流程。
+后续交互调整拆为两个增量：卡片/弹窗、样式和组件回归（`web/src/features/detail/CollectionDetailPage.tsx`、`web/src/features/detail/detail.css`、`web/src/features/home/media-card-visual.tsx`、`web/tests/collection-detail.test.tsx`，4 文件）；浏览器流程、关闭后焦点返回修正及验收记录（合集页、`scripts/collection-browser-smoke.mjs`、本文档，3 文件）。先写失败回归，再实现最小变更；弹窗支持 Escape、关闭按钮和点击遮罩取消，关闭后恢复卡片焦点及页面滚动。保存失败留在弹窗重试，保存中禁止重复选择；用户取消后，即使已提交的偏好保存稍后成功，也不会自动导航。
 
-验证（本机 macOS `arm64`）：合集组件回归先 RED 后 GREEN，4/4 通过；冻结依赖安装与生产构建通过。完整 Web 检查为 Node 150/150、Vitest 847 passed / 1 failed；失败是未由本任务修改的 `account-settings.test.tsx` 头像裁切用例，随后连同合集定向重跑 39/39 通过，不将完整测试记为全绿。Playwright 使用合成 API 与海报，检查明暗主题下 320/768/1024/1440 宽度、简介可见、横向卡片且页面无横向溢出、左右滚动、追加分页、来源保存、键盘打开原资源及返回合集，控制台无新增 error/warning，API 无意外请求。截图在 `output/playwright/collection-*.png`。未修改 Rust/API/数据库，未部署或验证 FNOS/NAS。
+验证（本机 macOS `arm64`）：合集回归先 RED 后 GREEN，当前 9/9 通过，覆盖海报/片名开窗、选择后保存并进入正确原资源、单来源多版本直达、失败重试、取消及保存中取消。合集/普通卡片定向合计 23/23、完整 Web 检查 Node 150/150 和 Vitest 853/853、生产构建通过；浏览器发现的 Escape 关闭后焦点丢失修正后，再跑合集 9/9、构建及浏览器验证均通过。冻结依赖安装和 Cargo fmt 沿用同日先前检查；未改变锁文件或 Rust 代码。Playwright 使用合成 API 与海报，检查明暗主题下 320/768/1024/1440 宽度、简介可见、横向卡片且页面无横向溢出、左右滚动、追加分页；来源弹窗另查桌面/手机尺寸、键盘焦点、Escape 关闭及焦点恢复、片名开窗、遮罩关闭、选择后导航、单来源多版本直达及返回合集，控制台无 error/warning，API 无意外请求。截图在 `output/playwright/collection-*.png` 和 `output/playwright/collection-source-*.png`。未修改 Rust/API/数据库，未部署或验证 FNOS/NAS。
 
 #### LUX-543：接入 Emby 合集库与系列浏览
 
