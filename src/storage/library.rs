@@ -3233,19 +3233,12 @@ impl Database {
 #[cfg(test)]
 mod scheduled_task_plan_mirror_tests {
     use super::*;
-    use crate::config::Config;
     use crate::{application::libraries::LibraryService, library::LibraryKind};
 
     async fn test_database() -> (tempfile::TempDir, Database) {
-        let temp_dir = tempfile::tempdir().expect("temporary database directory should exist");
-        let config = Config {
-            http_addr: "127.0.0.1:8097".parse().expect("test address should parse"),
-            config_dir: temp_dir.path().join("config"),
-        };
-        let database = Database::connect(&config)
+        crate::storage::test_database()
             .await
-            .expect("test database should connect");
-        (temp_dir, database)
+            .expect("test database should connect")
     }
 
     #[tokio::test]

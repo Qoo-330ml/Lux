@@ -8531,16 +8531,7 @@ impl std::error::Error for StorageError {
 #[cfg(test)]
 mod mail_outbox_tests {
     use super::*;
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8100".parse()?,
-            config_dir: directory.path().join("config"),
-        })
-        .await?;
-        Ok((directory, database))
-    }
+    use crate::storage::test_database;
 
     fn new_message<'a>(
         idempotency_key: &'a str,

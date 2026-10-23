@@ -409,9 +409,9 @@ fn snapshot_version(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::test_database;
     use crate::{
         application::libraries::LibraryService,
-        config::Config,
         domain::ids::UserId,
         library::LibraryKind,
         storage::{
@@ -419,16 +419,6 @@ mod tests {
             UserPlaybackPolicy,
         },
     };
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: temp_dir.path().join("config"),
-        })
-        .await?;
-        Ok((temp_dir, database))
-    }
 
     async fn insert_user(database: &Database, id: &str) -> Result<(), Box<dyn std::error::Error>> {
         database

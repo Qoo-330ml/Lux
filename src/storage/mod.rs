@@ -926,3 +926,16 @@ pub(crate) use repository::{
     UserInvitationStatus, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
     is_lite_manifest_discovery, movie_parent_folder_identity, recommendation_batch_key_at,
 };
+
+/// Opens a throwaway SQLite database for unit tests.
+#[cfg(test)]
+pub(crate) async fn test_database()
+-> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&crate::config::Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    Ok((temp_dir, database))
+}

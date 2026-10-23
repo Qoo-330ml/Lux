@@ -401,17 +401,8 @@ fn normalize_email(value: &str) -> Result<String, UserInvitationError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, storage::MailOutboxStatus};
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: directory.path().join("config"),
-        })
-        .await?;
-        Ok((directory, database))
-    }
+    use crate::storage::MailOutboxStatus;
+    use crate::storage::test_database;
 
     async fn create(
         database: &Database,

@@ -4933,19 +4933,8 @@ fn is_sqlite_lock_error(error: &StorageError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::Config;
+    use crate::storage::test_database;
     use uuid::Uuid;
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: temp_dir.path().join("config"),
-        })
-        .await?;
-        Ok((temp_dir, database))
-    }
 
     #[tokio::test]
     async fn login_background_plugin_cache_upserts_and_reads_latest_payload()

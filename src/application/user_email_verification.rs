@@ -298,6 +298,7 @@ fn normalize_email(value: &str) -> Result<String, UserEmailVerificationError> {
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::test_database;
     use std::error::Error;
 
     use crate::{
@@ -308,20 +309,9 @@ mod tests {
                 verify_user_email_change,
             },
         },
-        config::Config,
         security::DevicePairingRateLimiter,
         storage::{Database, MailChallengeKind, NewStoredUser},
     };
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn Error>> {
-        let directory = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: directory.path().join("config"),
-        })
-        .await?;
-        Ok((directory, database))
-    }
 
     async fn add_user(database: &Database, id: &str, email: &str) -> Result<(), Box<dyn Error>> {
         database
