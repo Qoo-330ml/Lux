@@ -362,6 +362,8 @@ function GlobalStrategyPanel({
           <div className="lux-library-strategy-card-heading"><div><h3>分层图片策略</h3><small>电影 / 剧集 / 季度 / 单集</small></div><Settings2 size={19} aria-hidden="true" /></div>
           <ImageLevelPolicyEditor
             images={strategy.images}
+            inheritLabel="默认"
+            emptySummary="全部默认"
             onChange={(images) => onChange({ ...strategy, images })}
           />
         </section>
@@ -718,6 +720,8 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
       </div>
       <ImageLevelPolicyEditor
         images={draft.images}
+        inheritLabel="跟随本库"
+        emptySummary="全部跟随本库"
         onChange={(images) => setDraft((current) => ({ ...current, images }))}
       />
     </> : <p className="lux-admin-muted lux-library-override-inherit-copy">当前使用全局默认：{globalStrategy.metadataLanguage} · {globalStrategy.images.minDownloadWidth || "不限"} px · {globalStrategy.images.maxBackdropCount} 张背景图。</p>}

@@ -227,3 +227,60 @@ describe("image level policy editor preset controls", () => {
     expect(latest.levels?.episode?.artworks?.backdrop?.minWidth).toBe(1920);
   });
 });
+describe("inherit label follows the settings level", () => {
+  let container: HTMLDivElement | null = null;
+  let root: Root | null = null;
+
+  afterEach(() => {
+    if (root) act(() => root!.unmount());
+    container?.remove();
+    root = null;
+    container = null;
+  });
+
+  function render(node: React.ReactNode) {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root!.render(node));
+  }
+
+  it("uses 默认 when the global strategy has no parent layer", () => {
+    render(
+      <ImageLevelPolicyEditor
+        images={base}
+        inheritLabel="默认"
+        emptySummary="全部默认"
+        onChange={() => {}}
+      />,
+    );
+
+    const enabled = container!.querySelector(
+      'select[aria-label="电影海报开关"]',
+    ) as HTMLSelectElement;
+    expect(enabled.querySelectorAll("option")[0]?.textContent).toBe("默认");
+
+    const count = container!.querySelector(
+      'select[aria-label="电影海报张数"]',
+    ) as HTMLSelectElement;
+    expect(count.querySelectorAll("option")[0]?.textContent).toBe("默认");
+
+    const width = container!.querySelector(
+      'select[aria-label="电影海报最小宽度"]',
+    ) as HTMLSelectElement;
+    expect(width.querySelectorAll("option")[0]?.textContent).toBe("默认");
+
+    expect(container!.textContent).toContain("全部默认");
+    expect(container!.textContent).not.toContain("全部继承");
+  });
+
+  it("keeps 继承 for a library override panel", () => {
+    render(<ImageLevelPolicyEditor images={base} onChange={() => {}} />);
+
+    const enabled = container!.querySelector(
+      'select[aria-label="电影海报开关"]',
+    ) as HTMLSelectElement;
+    expect(enabled.querySelectorAll("option")[0]?.textContent).toBe("继承");
+    expect(container!.textContent).toContain("全部继承");
+  });
+});

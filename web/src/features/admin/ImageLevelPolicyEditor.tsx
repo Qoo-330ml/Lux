@@ -152,14 +152,23 @@ function levelOverrideCount(level?: MediaImageLevelSettings): number {
 export function ImageLevelPolicyEditor({
   images,
   onChange,
+  inheritLabel = "继承",
+  emptySummary = "全部继承",
 }: {
   images: MediaImageStrategySettings;
   onChange: (images: MediaImageStrategySettings) => void;
+  /** Label for "no override set" — global settings has no parent layer, so it
+   * uses 默认 instead of 继承. */
+  inheritLabel?: string;
+  emptySummary?: string;
 }) {
+  const optionLabel = (option: { value: string; label: string }) =>
+    option.value === "" ? inheritLabel : option.label;
+
   return (
     <div className="lux-level-policy">
       <p className="lux-library-strategy-help">
-        逐层逐类型覆盖上面的默认开关。未选择的项目保持“继承”，本地已有图片始终优先且不会被静默覆盖。
+        逐层逐类型覆盖上面的默认设置。未选择的项目显示“{inheritLabel}”，按上层取值；本地已有图片始终优先，且不会被静默覆盖。
       </p>
       {levels.map((level) => {
         const levelSettings = images.levels?.[level.key];
@@ -168,7 +177,7 @@ export function ImageLevelPolicyEditor({
           <details className="lux-level-policy-group" key={level.key}>
             <summary>
               <span>{level.label}</span>
-              <small>{overrides > 0 ? `${overrides} 项自定义` : "全部继承"}</small>
+              <small>{overrides > 0 ? `${overrides} 项自定义` : emptySummary}</small>
             </summary>
             {level.key === "episode" ? (
               <label className="lux-level-policy-episode">
@@ -182,7 +191,7 @@ export function ImageLevelPolicyEditor({
                 >
                   {episodeImageOptions.map((option) => (
                     <option key={option.value} value={option.value}>
-                      {option.label}
+                      {option.value === "" ? inheritLabel : option.label}
                     </option>
                   ))}
                 </select>
@@ -223,7 +232,7 @@ export function ImageLevelPolicyEditor({
                         >
                           {enabledOptions.map((option) => (
                             <option key={option.value} value={option.value}>
-                              {option.label}
+                              {optionLabel(option)}
                             </option>
                           ))}
                         </select>
@@ -242,7 +251,7 @@ export function ImageLevelPolicyEditor({
                         >
                           {sourceOptions.map((option) => (
                             <option key={option.value} value={option.value}>
-                              {option.label}
+                              {optionLabel(option)}
                             </option>
                           ))}
                         </select>
@@ -262,7 +271,7 @@ export function ImageLevelPolicyEditor({
                         >
                           {overwriteOptions.map((option) => (
                             <option key={option.value} value={option.value}>
-                              {option.label}
+                              {optionLabel(option)}
                             </option>
                           ))}
                         </select>
@@ -284,7 +293,7 @@ export function ImageLevelPolicyEditor({
                         >
                           {presetsWithCurrent(countPresets, policy.maxCount).map((option) => (
                             <option key={option.value} value={option.value}>
-                              {option.label}
+                              {optionLabel(option)}
                             </option>
                           ))}
                         </select>
@@ -306,7 +315,7 @@ export function ImageLevelPolicyEditor({
                         >
                           {presetsWithCurrent(widthPresets, policy.minWidth).map((option) => (
                             <option key={option.value} value={option.value}>
-                              {option.label}
+                              {optionLabel(option)}
                             </option>
                           ))}
                         </select>
@@ -325,7 +334,7 @@ export function ImageLevelPolicyEditor({
                         >
                           {roleOptions.map((option) => (
                             <option key={option.value} value={option.value}>
-                              {option.label}
+                              {optionLabel(option)}
                             </option>
                           ))}
                         </select>
