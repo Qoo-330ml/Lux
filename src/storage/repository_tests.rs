@@ -31656,3 +31656,111 @@ async fn user_batch_reads_match_single_user_reads() {
     assert!(configurations.get("batch-unknown-user").is_none());
     database.close().await;
 }
+
+#[tokio::test]
+async fn batched_accessible_library_ids_match_single_user_queries() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let users = [
+        ("accessible-admin", true, "SELECTED"),
+        ("accessible-all", false, "ALL"),
+        ("accessible-selected", false, "SELECTED"),
+    ];
+    for (user_id, is_admin, mode) in users {
+        database
+            .insert_user(
+                user_id,
+                user_id,
+                user_id,
+                "test-hash",
+                is_admin,
+                mode == "ALL",
+            )
+            .await
+            .expect("user");
+        sqlx::query("UPDATE users SET library_access_mode = ? WHERE id = ?")
+            .bind(mode)
+            .bind(user_id)
+            .execute(database.pool())
+            .await
+            .expect("library access mode");
+    }
+    for (library_id, enabled, deletion_state) in [
+        ("accessible-active", 1_i64, "ACTIVE"),
+        ("accessible-disabled", 0, "ACTIVE"),
+        ("accessible-deleting", 1, "DELETING"),
+    ] {
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind, is_enabled, deletion_state)
+             VALUES (?, ?, 'MOVIE', ?, ?)",
+        )
+        .bind(library_id)
+        .bind(library_id)
+        .bind(enabled)
+        .bind(deletion_state)
+        .execute(database.pool())
+        .await
+        .expect("library");
+    }
+    for (user_id, library_id, can_view) in [
+        ("accessible-admin", "accessible-active", 1_i64),
+        ("accessible-all", "accessible-active", 0),
+        ("accessible-selected", "accessible-active", 1),
+        ("accessible-selected", "accessible-disabled", 1),
+        ("accessible-selected", "accessible-deleting", 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_library_access (user_id, library_id, can_view)
+             VALUES (?, ?, ?)",
+        )
+        .bind(user_id)
+        .bind(library_id)
+        .bind(can_view)
+        .execute(database.pool())
+        .await
+        .expect("library access");
+    }
+
+    let ids = users
+        .iter()
+        .map(|(user_id, _, _)| (*user_id).to_owned())
+        .collect::<Vec<_>>();
+    database.reset_query_count();
+    let batched = database
+        .list_accessible_library_ids_for_users(&ids)
+        .await
+        .expect("batch accessible libraries");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(batched.len(), ids.len());
+    for user_id in &ids {
+        assert_eq!(
+            batched.get(user_id).cloned().unwrap_or_default(),
+            database
+                .list_accessible_library_ids(user_id)
+                .await
+                .expect("single accessible libraries"),
+            "batched accessible libraries must match the single-user query for {user_id}"
+        );
+    }
+    assert_eq!(
+        batched.get("accessible-admin").cloned().unwrap_or_default(),
+        vec!["accessible-active".to_owned()],
+        "the batched query only applies the access mode; administrators are resolved above it"
+    );
+    assert_eq!(
+        batched.get("accessible-all").cloned().unwrap_or_default(),
+        vec!["accessible-active".to_owned()]
+    );
+    assert_eq!(
+        batched
+            .get("accessible-selected")
+            .cloned()
+            .unwrap_or_default(),
+        vec!["accessible-active".to_owned()]
+    );
+    database.close().await;
+}

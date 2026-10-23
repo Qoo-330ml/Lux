@@ -2820,6 +2820,62 @@ impl Database {
         })
     }
 
+    /// Resolves the accessible media libraries of several users in one bounded batch.
+    ///
+    /// Mirrors [`Self::list_accessible_library_ids`] per user but reads the whole page at once.
+    /// Administrators are resolved by the caller, which knows the administrator flag.
+    pub(crate) async fn list_accessible_library_ids_for_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, StorageError> {
+        let mut accessible = user_ids
+            .iter()
+            .map(|user_id| (user_id.clone(), Vec::new()))
+            .collect::<std::collections::HashMap<_, _>>();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT access_user.id AS user_id, media_library.id AS library_id
+                 FROM users access_user
+                 JOIN libraries media_library
+                   ON media_library.is_enabled = 1 AND media_library.system_kind IS NULL
+                 WHERE access_user.id IN ({placeholders})
+                   AND media_library.deletion_state = 'ACTIVE'
+                   AND (access_user.library_access_mode = 'ALL'
+                        OR (access_user.library_access_mode = 'SELECTED' AND EXISTS (
+                            SELECT 1 FROM user_library_access allowed_library
+                            WHERE allowed_library.user_id = access_user.id
+                              AND allowed_library.library_id = media_library.id
+                              AND allowed_library.can_view = 1
+                        )))
+                 ORDER BY access_user.id, media_library.name, media_library.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                if let Some(library_ids) = accessible.get_mut(&row.get::<String, _>("user_id")) {
+                    library_ids.push(row.get("library_id"));
+                }
+            }
+        }
+        Ok(accessible)
+    }
+
     pub(crate) async fn list_enabled_media_library_ids(&self) -> Result<Vec<String>, StorageError> {
         self.query_scalar(
             "SELECT id FROM libraries

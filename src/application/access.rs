@@ -148,6 +148,49 @@ impl MediaAccessService {
             .await?)
     }
 
+    /// Resolves accessible library ids for several users with one bounded batch.
+    ///
+    /// Administrators see every enabled media library, exactly like [`Self::accessible_library_ids`];
+    /// the remaining users are resolved in one batched query.
+    pub async fn accessible_library_ids_for_users(
+        &self,
+        users: &[(String, bool)],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, AccessError> {
+        if users.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let admin_ids = users
+            .iter()
+            .filter(|(_, is_admin)| *is_admin)
+            .map(|(user_id, _)| user_id.clone())
+            .collect::<Vec<_>>();
+        let member_ids = users
+            .iter()
+            .filter(|(_, is_admin)| !*is_admin)
+            .map(|(user_id, _)| user_id.clone())
+            .collect::<Vec<_>>();
+        let mut accessible = std::collections::HashMap::with_capacity(users.len());
+        if !admin_ids.is_empty() {
+            let enabled_library_ids = self.database.list_enabled_media_library_ids().await?;
+            for user_id in admin_ids {
+                accessible.insert(user_id, enabled_library_ids.clone());
+            }
+        }
+        if !member_ids.is_empty() {
+            let member_accessible = self
+                .database
+                .list_accessible_library_ids_for_users(&member_ids)
+                .await?;
+            for user_id in member_ids {
+                accessible.insert(
+                    user_id.clone(),
+                    member_accessible.get(&user_id).cloned().unwrap_or_default(),
+                );
+            }
+        }
+        Ok(accessible)
+    }
+
     pub(crate) async fn authorized_playback_source(
         &self,
         principal: AccessPrincipal,
@@ -213,6 +256,73 @@ mod tests {
     };
 
     use super::{AccessPrincipal, MediaAccessService};
+
+    #[tokio::test]
+    async fn batched_accessible_library_ids_match_single_principals()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let users = UserStore::new(database.clone())?;
+        let admin = users
+            .create_user("batch-scope-admin", "Admin", "test password", true)
+            .await?;
+        let all_user = users
+            .create_user("batch-scope-all", "All", "test password", false)
+            .await?;
+        let selected_user = users
+            .create_user("batch-scope-selected", "Selected", "test password", false)
+            .await?;
+        let libraries = LibraryService::new(database.clone());
+        libraries
+            .create_library("Batch scope A", LibraryKind::Movie, false)
+            .await?;
+        let library_b = libraries
+            .create_library("Batch scope B", LibraryKind::Movie, false)
+            .await?;
+        database
+            .set_user_library_access(
+                &selected_user.id.to_string(),
+                &library_b.id.to_string(),
+                true,
+            )
+            .await?;
+        let service = MediaAccessService::new(database.clone());
+        let requests = vec![
+            (admin.id.to_string(), true),
+            (all_user.id.to_string(), false),
+            (selected_user.id.to_string(), false),
+        ];
+        let batched = service.accessible_library_ids_for_users(&requests).await?;
+        for (user_id, is_admin) in &requests {
+            let single = service
+                .accessible_library_ids(AccessPrincipal::new(
+                    (*user_id).parse::<crate::domain::ids::UserId>()?,
+                    *is_admin,
+                ))
+                .await?;
+            assert_eq!(
+                batched.get(user_id).cloned().unwrap_or_default(),
+                single,
+                "batched accessible libraries must match the single lookup for {user_id}"
+            );
+        }
+        assert_eq!(
+            batched.get(&admin.id.to_string()).map(Vec::len),
+            Some(2),
+            "administrators see every enabled media library"
+        );
+        assert_eq!(
+            batched.get(&selected_user.id.to_string()).map(Vec::len),
+            Some(1),
+            "selected users see only their granted libraries"
+        );
+        database.close().await;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn content_policy_denies_direct_item_access_and_inherits_parent_restrictions()

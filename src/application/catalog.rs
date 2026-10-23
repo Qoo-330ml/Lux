@@ -463,13 +463,29 @@ impl CatalogService {
         principal: AccessPrincipal,
     ) -> Result<i64, CatalogError> {
         let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        self.count_global_collection_cards_with_restrictions(
+            principal,
+            content_restrictions.as_ref(),
+        )
+        .await
+    }
+
+    /// Counts the visible global collections with already resolved content restrictions.
+    ///
+    /// Listings that batch user access snapshots already hold the restrictions, so they can skip
+    /// the extra per-user restriction lookup.
+    pub(crate) async fn count_global_collection_cards_with_restrictions(
+        &self,
+        principal: AccessPrincipal,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<i64, CatalogError> {
         Ok(self
             .database
             .count_visible_global_collections_with_restrictions(
                 &principal.user_id_string(),
                 principal.is_admin,
                 None,
-                content_restrictions.as_ref(),
+                content_restrictions,
             )
             .await?)
     }

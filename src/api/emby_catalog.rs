@@ -935,7 +935,7 @@ pub(super) async fn emby_library_order_scope(
         .access
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut library_ids = access
+    let library_ids = access
         .accessible_library_ids(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -943,12 +943,38 @@ pub(super) async fn emby_library_order_scope(
         .catalog
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let content_restrictions = catalog
+        .content_restrictions_for_principal(principal)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    emby_library_order_scope_with_access(
+        state,
+        principal,
+        library_ids,
+        content_restrictions.as_ref(),
+    )
+    .await
+}
+
+/// Resolves the Emby library scope when the caller already batched the accessible libraries and
+/// the content restrictions of the page.
+pub(super) async fn emby_library_order_scope_with_access(
+    state: &AppState,
+    principal: AccessPrincipal,
+    accessible_library_ids: Vec<String>,
+    content_restrictions: Option<&crate::storage::UserContentRestrictions>,
+) -> Result<(Vec<String>, i64), StatusCode> {
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     // Only the total decides whether the collection library is part of the scope; building a
     // card for it would assemble catalog rows nobody reads.
     let collection_count = catalog
-        .count_global_collection_cards(principal)
+        .count_global_collection_cards_with_restrictions(principal, content_restrictions)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut library_ids = accessible_library_ids;
     if collection_count > 0 {
         library_ids.push(GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
     }

@@ -1016,15 +1016,37 @@ pub(super) async fn emby_query_users(
         .collect::<Vec<_>>();
     // Reading the order and the Emby configuration per user made this listing cost a handful of
     // queries per page entry. Resolve both for the whole page instead.
+    let access_requests = users
+        .iter()
+        .map(|user| (user.id.to_string(), user.is_admin))
+        .collect::<Vec<_>>();
+    let accessible_libraries = match state.access.as_ref() {
+        Some(access) => access
+            .accessible_library_ids_for_users(&access_requests)
+            .await
+            .unwrap_or_default(),
+        None => std::collections::HashMap::new(),
+    };
     let mut order_requests = Vec::with_capacity(users.len());
     for user in &users {
+        let user_id = user.id.to_string();
         let principal = AccessPrincipal::new(user.id, user.is_admin);
-        let Ok((order_scope, _)) =
-            super::emby_catalog::emby_library_order_scope(&state, principal).await
+        let snapshot = snapshots.get(&user_id);
+        let accessible = accessible_libraries
+            .get(&user_id)
+            .cloned()
+            .unwrap_or_default();
+        let Ok((order_scope, _)) = super::emby_catalog::emby_library_order_scope_with_access(
+            &state,
+            principal,
+            accessible,
+            snapshot.and_then(|snapshot| snapshot.restrictions.as_ref()),
+        )
+        .await
         else {
             continue;
         };
-        order_requests.push((user.id.to_string(), user.is_admin, order_scope));
+        order_requests.push((user_id, user.is_admin, order_scope));
     }
     let ordered_views = match state.libraries.as_ref() {
         Some(libraries) => libraries
