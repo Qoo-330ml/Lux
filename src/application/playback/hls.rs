@@ -15,7 +15,7 @@ use tokio::{
     fs,
     io::AsyncReadExt,
     process::{Child, Command},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
     time::sleep,
 };
 
@@ -212,7 +212,7 @@ impl SessionQuotaCache {
 #[derive(Clone)]
 pub(crate) struct HlsManager {
     base_directory: PathBuf,
-    processes: Arc<Mutex<HashMap<String, Arc<HlsProcess>>>>,
+    processes: Arc<RwLock<HashMap<String, Arc<HlsProcess>>>>,
     remux_slots: Arc<Semaphore>,
     hardware_slots: Arc<Semaphore>,
     software_slots: Arc<Semaphore>,
@@ -245,7 +245,7 @@ impl HlsManager {
             .filter(|value| is_allowed_hardware_encoder(value));
         Self {
             base_directory: config_dir.join("web-playback"),
-            processes: Arc::new(Mutex::new(HashMap::new())),
+            processes: Arc::new(RwLock::new(HashMap::new())),
             remux_slots: Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)),
             hardware_slots: Arc::new(Semaphore::new(MAX_HARDWARE_SESSIONS)),
             software_slots: Arc::new(Semaphore::new(MAX_SOFTWARE_SESSIONS)),
@@ -404,7 +404,7 @@ impl HlsManager {
         });
         let previous = self
             .processes
-            .lock()
+            .write()
             .await
             .insert(session_id.to_owned(), process);
         if let Some(previous) = previous {
@@ -495,7 +495,7 @@ impl HlsManager {
     ) -> Result<(), HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -543,7 +543,7 @@ impl HlsManager {
     pub(crate) async fn wait_for_manifest(&self, session_id: &str) -> Result<PathBuf, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -584,7 +584,7 @@ impl HlsManager {
     ) -> Result<PathBuf, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -608,7 +608,7 @@ impl HlsManager {
         let segment_number = asset_segment_number(asset)?;
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -662,7 +662,7 @@ impl HlsManager {
             }
             let current_process = self
                 .processes
-                .lock()
+                .read()
                 .await
                 .get(session_id)
                 .cloned()
@@ -719,7 +719,7 @@ impl HlsManager {
         let _restart = process.restart.lock().await;
         let is_current_process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .is_some_and(|current| Arc::ptr_eq(current, process));
@@ -900,7 +900,7 @@ impl HlsManager {
     pub(crate) async fn vod_manifest(&self, session_id: &str) -> Result<Option<String>, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -917,7 +917,7 @@ impl HlsManager {
     pub(crate) async fn session_directory(&self, session_id: &str) -> Result<PathBuf, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -928,7 +928,7 @@ impl HlsManager {
     pub(crate) async fn has_started(&self, session_id: &str) -> Result<bool, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -943,7 +943,7 @@ impl HlsManager {
     ) -> Result<HlsSegmentContainer, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -954,7 +954,7 @@ impl HlsManager {
     pub(crate) async fn within_quota(&self, session_id: &str) -> Result<bool, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -993,7 +993,7 @@ impl HlsManager {
 
     pub(crate) async fn stop(&self, session_id: &str) -> Result<(), HlsError> {
         let directory = self.validated_session_directory(session_id)?;
-        let process = self.processes.lock().await.remove(session_id);
+        let process = self.processes.write().await.remove(session_id);
         if let Some(process) = process {
             stop_process(process).await;
         } else if fs::metadata(&directory).await.is_ok() {
