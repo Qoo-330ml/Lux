@@ -17695,14 +17695,30 @@ PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播�
 
 验收：
 
-- [ ] 右键、`i` 键与控制栏按钮可打开和关闭面板，`Esc` 关闭；打开时才轮询，关闭后不再请求。
-- [ ] 直放会话显示直放方式、源容器/codec/码率与客户端解码指标，并明确“未转码”；`.strm` 保持直放语义。
-- [ ] `SERVER_HLS` 会话显示档位（封装转换 / 音频转码 / 硬件转码 / 软件转码）、输出容器与 codec、
+- [x] 右键、`i` 键与控制栏按钮可打开和关闭面板，`Esc` 关闭；打开时才轮询，关闭后不再请求。
+- [x] 直放会话显示直放方式、源容器/codec/码率与客户端解码指标，并明确“未转码”；`.strm` 保持直放语义。
+- [x] `SERVER_HLS` 会话显示档位（封装转换 / 音频转码 / 硬件转码 / 软件转码）、输出容器与 codec、
   服务端实时 fps、speed、输出码率、已输出字节、丢帧和最后一次进度时间。
-- [ ] FFmpeg `-progress` 解析只保留最新快照、按行有界处理，不阻塞事件循环，不影响 HLS 起播与 seek 重启。
-- [ ] 统计端点只允许会话所属用户访问；他人会话、不存在、已过期会话返回 404；GET 不写库、不续租。
-- [ ] Web 播放 HLS 会话写入转码详情后，管理看板 `output` 显示实际输出而非回退猜测。
-- [ ] `hls` 单测、`web_playback` 与 `playback` 定向集成测试、Web vitest 与构建通过。
+- [x] FFmpeg `-progress` 解析只保留最新快照、按行有界处理，不阻塞事件循环，不影响 HLS 起播与 seek 重启。
+- [x] 统计端点只允许会话所属用户访问；他人会话、不存在、已过期会话返回 404；GET 不写库、不续租。
+- [x] Web 播放 HLS 会话写入转码详情后，管理看板 `output` 显示实际输出而非回退猜测。
+- [x] `hls` 单测、`web_playback` 与 `playback` 定向集成测试、Web vitest 与构建通过。
+
+结果（2026-10-25；本机 macOS `arm64`）：`cargo test --locked --lib hls` 55/55、`--lib playback` 135/135、
+`--test admin_settings` 2/2、`--test playback` 5/5；新增的 `--test web_playback web_playback_stats_report_the_plan_and_live_transcode_progress`
+通过，覆盖直放计划、软件转码计划的 `output` 与实时 `progress`、未知会话 404 与匿名请求 401。
+`web_playback_uses_signed_direct_urls_and_monotonic_events` 仍会在 `tests/web_playback.rs:1609`（可信代理
+`invalid-json` 期望 503 得到 200）或 webhook 顺序断言处间歇失败，该失败在 LUX-847 改动前的基线提交上同样复现，
+与本任务无关，记录为既有不稳定用例。Web 侧 `vitest run` 885/885（含新增 `player-stats` 7 项、
+`player-info-panel` 3 项）、`node --test tests/*.test.mjs` 150/150、`tsc --noEmit` 与 `pnpm --dir web build` 通过。
+浏览器验证（2026-10-25，本机 Chrome headless + 临时 SQLite 实例）：直放样例面板显示
+`H.264 · 1920×1080 · 24.0 fps`、`5.1 Mbps`、`未转码（服务端只读取字节）`、`Range 直读` 与客户端缓冲；
+MPEG-2/AC-3 的 MKV 样例进入档位 4 软件转码，面板显示 `H.264`/`AAC 192 kbps`、`425.8 fps`、`17.70×`、
+`输出码率 7.5 Mbps`、`平均码率 3.1 Mbps`、`已输出 7.4 MB`、`编码位置 00:20`。截图见
+`output/playwright/lux-847/player-info-panel.png` 与 `player-info-transcode.png`。由于 HLS 封装下 FFmpeg 把
+`bitrate`/`total_size` 报告为 `N/A`，统计接口额外由服务端按最新 4 秒分片实测码率，并实时统计会话目录字节。
+限制：未在真实浏览器中对 4K/HEVC 做端到端目视验证；来源分组依赖媒体已完成 ffprobe，探测完成前相关列显示 `—`；
+服务端进度约每 0.5 秒刷新，不是逐帧统计。
 
 依赖：LUX-254（Emby 服务端转码）、LUX-827（播放会话策略）。
 
@@ -17726,12 +17742,23 @@ PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播�
 
 验收：
 
-- [ ] 并发上限、磁盘配额、码率与分辨率越界值被拒绝且不落库；0 值语义明确（0 = 不限制或关闭）。
-- [ ] 全局关闭转码后，本地媒体不再创建 HLS 会话，直放与既有客户端 fallback 不受影响；`.strm` 行为不变。
-- [ ] 硬件编码器仅接受允许列表；未配置时硬件档位降级到软件档位，且看板/日志不出现伪造的硬件转码。
-- [ ] 保存设置后新会话使用新参数，已启动会话不被中断；重启后设置保持。
-- [ ] 管理界面可读取、修改并保存全部设置项，非法输入显示固定文案且保留草稿。
-- [ ] `settings` 单测、`playback`/`web_playback` 定向测试、Web vitest 与构建通过。
+- [x] 并发上限、磁盘配额、码率与分辨率越界值被拒绝且不落库；0 值语义明确（0 = 不限制或关闭）。
+- [x] 全局关闭转码后，本地媒体不再创建 HLS 会话，直放与既有客户端 fallback 不受影响；`.strm` 行为不变。
+- [x] 硬件编码器仅接受允许列表；未配置时硬件档位降级到软件档位，且看板/日志不出现伪造的硬件转码。
+- [x] 保存设置后新会话使用新参数，已启动会话不被中断；重启后设置保持。
+- [x] 管理界面可读取、修改并保存全部设置项，非法输入显示固定文案且保留草稿。
+- [x] `settings` 单测、`playback`/`web_playback` 定向测试、Web vitest 与构建通过。
+
+结果（2026-10-25；本机 macOS `arm64`）：新增 `src/application/transcoding.rs` 的 4 项单测（默认值、缺省字段、
+归一化与拒绝、数据库往返与损坏回退）通过；`--lib hls` 55/55 覆盖 `-preset`/`-vf scale`/`-b:a`/`-b:v` 上限、
+运行时限额映射、0 并发禁用档位与关闭策略拒绝启动；`--lib playback` 135/135 覆盖 `SERVER_TRANSCODING_DISABLED`
+降级与直放保留；`--test admin_settings` 2/2 覆盖管理员越权 403、非法 preset 400 不落库、保存后重新读取一致。
+真实 ffmpeg 验证 `scale=-2:min(ih\,1080)` 对 320×240 不放大、对 1920×1080 输出 854×480。Web 新增
+`admin-transcoding` 4 项测试，`vitest run` 885/885、`tsc --noEmit` 与构建通过。`cargo clippy --locked
+--all-targets --all-features -- -D warnings` 在本任务引入的代码上清零，仍报告 9 项既有诊断（`emby_catalog`、
+`media.rs`、`session.rs` 的 `too_many_arguments`，`webhooks.rs` 冗余守卫，`repository.rs` 循环写法，
+`media_merge_records.rs` 参数数量，`users.rs` 测试模块之后的项，`repository_tests.rs` 多余 clone）。未在
+FNOS/NAS 上验证硬件编码器路径；`h264_vaapi` 等需要设备映射，虚拟机与 CI 无法覆盖。
 
 依赖：LUX-254、LUX-847（统计端点用于确认输出参数）。
 

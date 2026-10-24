@@ -123,6 +123,13 @@ docker buildx bake --load --set app.tags=pdzhou/lux:latest app
 docker compose up -d --force-recreate lux
 ```
 
+服务端转码的并发上限、磁盘配额、码率与画质参数默认由管理员在“服务器设置 → 服务端转码”配置，保存在数据库 `server_settings.transcoding`，保存后对新建播放会话生效，正在播放的会话保持启动时的参数。两个部署级环境变量仍然优先于后台设置，用于设备/驱动相关的紧急覆盖：
+
+- `LUX_HLS_HW_ENCODER`：显式指定硬件编码器（`h264_nvenc`、`h264_qsv`、`h264_vaapi`、`h264_videotoolbox`）。设置后忽略后台选择的编码器；未设置时使用后台设置，后台为 `NONE` 时硬件档位不可用并降级为软件转码。
+- `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES`：覆盖全局 HLS 磁盘预算；未设置时使用后台的“全局磁盘预算”（0 表示不限制）。
+
+转码临时目录位于配置目录下的 `web-playback/`，只保存当前会话的分片，会话停止、过期或服务重启后会回收。
+
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
 反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。
