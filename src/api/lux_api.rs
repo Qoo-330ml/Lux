@@ -101,6 +101,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(lux_web_playback_heartbeat),
         )
         .route(
+            "/api/v1/playback/sessions/{session_id}/stats",
+            get(lux_web_playback_stats),
+        )
+        .route(
             "/api/v1/playback/sessions/{session_id}/direct",
             get(lux_web_playback_direct).head(lux_web_playback_direct),
         )

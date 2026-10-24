@@ -31,7 +31,10 @@ use super::decision::{
     PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier,
     UnsupportedReason, choose_plan,
 };
-use super::hls::{HlsError, HlsManager, HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions};
+use super::hls::{
+    HlsError, HlsManager, HlsProgressSnapshot, HlsSegmentContainer, HlsStartOptions,
+    HlsWebStartOptions,
+};
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -114,6 +117,13 @@ pub struct CreatedWebPlaybackSession {
 pub struct SignedResource {
     pub expires_at: i64,
     pub signature: String,
+}
+
+/// One session's stored plan plus whatever the running FFmpeg has reported so far.
+#[derive(Debug)]
+pub(crate) struct WebPlaybackStats {
+    pub(crate) session: StoredWebPlaybackSession,
+    pub(crate) progress: Option<HlsProgressSnapshot>,
 }
 
 #[derive(Debug)]
@@ -1182,6 +1192,32 @@ impl WebPlaybackSessionService {
         Ok(self.hls.within_quota(session_id).await?)
     }
 
+    /// Read-only statistics for one live Web playback session.
+    ///
+    /// Only the owning user may read them; expired, stopped and unknown sessions are reported as
+    /// missing so the endpoint cannot be used to probe another account's session identifiers.
+    pub(crate) async fn stats(
+        &self,
+        session_id: &str,
+        user_id: &str,
+    ) -> Result<WebPlaybackStats, WebPlaybackSessionError> {
+        let now = unix_timestamp();
+        let session = self
+            .database
+            .find_web_playback_session(session_id)
+            .await?
+            .filter(|session| {
+                session.user_id == user_id && session.state == "ACTIVE" && session.expires_at > now
+            })
+            .ok_or(WebPlaybackSessionError::NotFound)?;
+        let progress = if session.plan == "SERVER_HLS" {
+            self.hls.progress(session_id).await
+        } else {
+            None
+        };
+        Ok(WebPlaybackStats { session, progress })
+    }
+
     pub(crate) async fn heartbeat(
         &self,
         session_id: &str,
@@ -1991,6 +2027,97 @@ mod tests {
             .await?
             .expect("session is still stored");
         assert_eq!(stored.state, "ACTIVE");
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stats_are_scoped_to_the_owning_user_and_live_sessions()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let other = crate::auth::users::UserStore::new(database.clone())?
+            .create_user("other", "Other", "correct password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+        };
+        let owner_id = owner.id.to_string();
+        let now = unix_timestamp();
+        service
+            .database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "stats-session",
+                user_id: &owner_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:stats-session",
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at: now + 900,
+                now,
+            })
+            .await?;
+        service
+            .database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "expired-session",
+                user_id: &owner_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:expired-session",
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at: now - 1,
+                now: now - 900,
+            })
+            .await?;
+
+        let stats = service.stats("stats-session", &owner_id).await?;
+        assert_eq!(stats.session.plan, "SERVER_HLS");
+        assert!(
+            stats.progress.is_none(),
+            "a session without a running FFmpeg has no live progress"
+        );
+
+        for (session_id, user_id) in [
+            ("stats-session", other.id.to_string()),
+            ("expired-session", owner_id.clone()),
+            ("unknown-session", owner_id.clone()),
+        ] {
+            let error = service
+                .stats(session_id, &user_id)
+                .await
+                .expect_err("only the owner's live session exposes statistics");
+            assert!(matches!(error, super::WebPlaybackSessionError::NotFound));
+        }
         Ok(())
     }
 

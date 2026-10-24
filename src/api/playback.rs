@@ -3083,6 +3083,32 @@ fn emby_transcoding_audio_bitrate(
         .find_map(|stream| stream_detail_i64(stream, "BitRate"))
 }
 
+/// The output description for a Lux Web HLS session.
+///
+/// Copied tracks (remux and audio-transcode) intentionally leave their codec empty: the Web
+/// session row does not duplicate the source streams, and the player reads those from the media
+/// source. Only codecs the server actually re-encodes are asserted here.
+fn web_transcoding_output(
+    tier: ServerTier,
+    segment_container: HlsSegmentContainer,
+) -> WebPlaybackTranscodingDetails {
+    let video_transcoded = matches!(
+        tier,
+        ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    );
+    let audio_transcoded = matches!(
+        tier,
+        ServerTier::AudioTranscode | ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+    );
+    WebPlaybackTranscodingDetails {
+        video_codec: video_transcoded.then(|| "h264".to_owned()),
+        audio_codec: audio_transcoded.then(|| "aac".to_owned()),
+        video_bitrate: None,
+        audio_bitrate: audio_transcoded.then_some(192_000),
+        transcoding_container: Some(segment_container.emby_container().to_owned()),
+    }
+}
+
 fn emby_transcoding_output(
     source: &crate::application::catalog::CatalogSource,
     request: &EmbyPlaybackInfoRequest,
@@ -3700,6 +3726,16 @@ async fn create_web_playback_session_json(
         };
         if let Err(error) = service
             .start_hls_with_audio(&created.id, *tier, &input, None, None, audio_stream_index)
+            .await
+        {
+            let _ = service.stop(&created.id, &user_id).await;
+            return Err(web_playback_error(headers, error));
+        }
+        // Persist what the server actually produces so the admin dashboard and the player's
+        // information panel describe the same session instead of guessing.
+        let output = web_transcoding_output(*tier, HlsSegmentContainer::FragmentedMp4);
+        if let Err(error) = service
+            .set_transcoding_details(&created.id, &user_id, &output)
             .await
         {
             let _ = service.stop(&created.id, &user_id).await;
@@ -4489,6 +4525,65 @@ pub(super) async fn lux_web_playback_heartbeat(
         }
         Err(error) => web_playback_error(&headers, error),
     }
+}
+
+/// Read-only live statistics for the player's information panel.
+///
+/// This is a `GET`, so it carries no CSRF token and performs no writes: it never extends the
+/// session, never starts FFmpeg and never admits a playback request.
+pub(super) async fn lux_web_playback_stats(
+    headers: HeaderMap,
+    Path(session_id): Path<String>,
+    State(state): State<AppState>,
+) -> Response {
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    match service.stats(&session_id, &user.id.to_string()).await {
+        Ok(stats) => Json(web_playback_stats_json(&stats)).into_response(),
+        Err(error) => web_playback_error(&headers, error),
+    }
+}
+
+pub(super) fn web_playback_stats_json(
+    stats: &crate::application::playback::session::WebPlaybackStats,
+) -> Value {
+    let session = &stats.session;
+    json!({
+        "sessionId": session.id,
+        "playSessionId": session.play_session_id,
+        "sourceId": session.media_source_id,
+        "plan": session.plan,
+        "tier": session.tier,
+        "state": session.state,
+        "expiresAt": session.expires_at,
+        "output": {
+            "container": session.transcoding_container,
+            "videoCodec": session.video_codec,
+            "audioCodec": session.audio_codec,
+            "videoBitrate": session.video_bitrate,
+            "audioBitrate": session.audio_bitrate,
+        },
+        "progress": stats.progress.as_ref().map(|progress| json!({
+            "generation": progress.generation,
+            "frame": progress.frame,
+            "fps": progress.fps,
+            "bitrateKbps": progress.bitrate_kbps,
+            "totalSize": progress.total_size,
+            "outTimeSeconds": progress
+                .out_time_us
+                .map(|micros| micros as f64 / 1_000_000.0),
+            "speed": progress.speed,
+            "duplicatedFrames": progress.duplicated_frames,
+            "droppedFrames": progress.dropped_frames,
+            "finished": progress.finished,
+            "updatedAt": progress.updated_at_ms,
+        })),
+    })
 }
 
 pub(super) async fn lux_delete_web_playback_session(

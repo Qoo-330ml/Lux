@@ -1617,3 +1617,202 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     strm_proxy.await?;
     Ok(())
 }
+
+#[tokio::test]
+async fn web_playback_stats_report_the_plan_and_live_transcode_progress()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Stats Playback Movie 2026.mp4"), b"stats-bytes").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+
+    let fake_ffmpeg = temp_dir.path().join("fake-ffmpeg");
+    let fake_ffmpeg_source = [
+        "#!/bin/sh",
+        "set -eu",
+        "manifest=\"\"",
+        "segment=\"\"",
+        "init=\"init.mp4\"",
+        "while [ \"$#\" -gt 0 ]; do",
+        "  case \"$1\" in",
+        "    -hls_segment_filename) segment=\"$2\"; shift 2 ;;",
+        "    -hls_fmp4_init_filename) init=\"$2\"; shift 2 ;;",
+        "    *.m3u8) manifest=\"$1\"; shift ;;",
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        "directory=$(dirname \"$manifest\")",
+        "mkdir -p \"$directory\"",
+        "printf '#EXTM3U\\n#EXT-X-MAP:URI=\"%s\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' \"$init\" > \"$manifest\"",
+        "printf init > \"$directory/$init\"",
+        "printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"",
+        "printf 'frame=240\\nfps=24.00\\nbitrate=2048.5kbits/s\\ntotal_size=1048576\\n'",
+        "printf 'out_time_us=10000000\\nspeed=2.00x\\ndup_frames=0\\ndrop_frames=3\\n'",
+        "printf 'progress=continue\\n'",
+        "sleep 2",
+    ]
+    .join("\n");
+    tokio::fs::write(&fake_ffmpeg, fake_ffmpeg_source).await?;
+    let mut permissions = tokio::fs::metadata(&fake_ffmpeg).await?.permissions();
+    permissions.set_mode(0o700);
+    tokio::fs::set_permissions(&fake_ffmpeg, permissions).await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let state = AppState::ready(config, database.clone(), setup, auth, emby_auth)
+        .with_hls_executable(fake_ffmpeg);
+    let app = app_with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session_cookie = cookie_value(login.headers(), "lux_session").ok_or("missing session")?;
+    let csrf_cookie = cookie_value(login.headers(), "lux_csrf").ok_or("missing csrf")?;
+    let cookies = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
+
+    let direct = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": item_id,
+            "sourceId": source_id,
+            "capabilities": {
+                "directPlay": true,
+                "hls": true,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(direct.status(), reqwest::StatusCode::OK);
+    let direct = direct.json::<Value>().await?;
+    let direct_id = direct["sessionId"]
+        .as_str()
+        .ok_or("missing direct session id")?;
+    let direct_stats = client
+        .get(format!(
+            "{base_url}/api/v1/playback/sessions/{direct_id}/stats"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(direct_stats.status(), reqwest::StatusCode::OK);
+    let direct_stats = direct_stats.json::<Value>().await?;
+    assert_eq!(direct_stats["plan"], json!("DIRECT"));
+    assert_eq!(direct_stats["tier"], json!(0));
+    assert_eq!(direct_stats["output"]["container"], Value::Null);
+    assert_eq!(direct_stats["progress"], Value::Null);
+
+    let transcode = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": item_id,
+            "sourceId": source_id,
+            "capabilities": {
+                "directPlay": false,
+                "hls": true,
+                "videoCopyToFmp4": false,
+                "audioCopyToFmp4": false,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(transcode.status(), reqwest::StatusCode::OK);
+    let transcode = transcode.json::<Value>().await?;
+    assert_eq!(transcode["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(transcode["plan"]["tier"], json!(4));
+    let transcode_id = transcode["sessionId"]
+        .as_str()
+        .ok_or("missing transcode session id")?;
+
+    let mut stats = Value::Null;
+    for _ in 0..100 {
+        let response = client
+            .get(format!(
+                "{base_url}/api/v1/playback/sessions/{transcode_id}/stats"
+            ))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK);
+        stats = response.json::<Value>().await?;
+        if stats["progress"].is_object() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(stats["plan"], json!("SERVER_HLS"));
+    assert_eq!(stats["tier"], json!(4));
+    assert_eq!(stats["state"], json!("ACTIVE"));
+    assert_eq!(stats["output"]["container"], json!("mp4"));
+    assert_eq!(stats["output"]["videoCodec"], json!("h264"));
+    assert_eq!(stats["output"]["audioCodec"], json!("aac"));
+    assert_eq!(stats["output"]["audioBitrate"], json!(192_000));
+    assert_eq!(stats["progress"]["fps"], json!(24.0));
+    assert_eq!(stats["progress"]["bitrateKbps"], json!(2048.5));
+    assert_eq!(stats["progress"]["totalSize"], json!(1_048_576));
+    assert_eq!(stats["progress"]["outTimeSeconds"], json!(10.0));
+    assert_eq!(stats["progress"]["speed"], json!(2.0));
+    assert_eq!(stats["progress"]["droppedFrames"], json!(3));
+    assert_eq!(stats["progress"]["finished"], json!(false));
+
+    let unknown = client
+        .get(format!(
+            "{base_url}/api/v1/playback/sessions/unknown-session/stats"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(unknown.status(), reqwest::StatusCode::NOT_FOUND);
+    let anonymous = client
+        .get(format!(
+            "{base_url}/api/v1/playback/sessions/{transcode_id}/stats"
+        ))
+        .send()
+        .await?;
+    assert_eq!(anonymous.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    server.abort();
+    Ok(())
+}
