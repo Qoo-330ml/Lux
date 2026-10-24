@@ -17760,6 +17760,12 @@ MPEG-2/AC-3 的 MKV 样例进入档位 4 软件转码，面板显示 `H.264`/`AA
 `media_merge_records.rs` 参数数量，`users.rs` 测试模块之后的项，`repository_tests.rs` 多余 clone）。未在
 FNOS/NAS 上验证硬件编码器路径；`h264_vaapi` 等需要设备映射，虚拟机与 CI 无法覆盖。
 
+完整 `cargo test --locked --all-targets` 未记为通过：`tests/admin_api_key.rs` 的
+`shared_admin_key_authenticates_lux_and_emby_requests_without_csrf` 与
+`shared_admin_key_can_follow_emby_library_discovery_flow` 在本机稳定返回 401，已用干净基线提交
+`5fca6b52` 的 worktree 复现，属既有失败；`tests/web_playback.rs` 的长场景用例另有既有间歇失败（见 LUX-847）。
+本任务改动范围内的定向目标全部通过。
+
 依赖：LUX-254、LUX-847（统计端点用于确认输出参数）。
 
 ## 29. 参考资料
