@@ -475,8 +475,17 @@ export function buildPlayerInfoGroups(input: PlayerInfoInput): PlayerInfoGroup[]
   if (isServerHls) {
     push(liveRows, "编码帧率", formatFrameRate(progress?.fps));
     push(liveRows, "编码速度", formatSpeed(progress?.speed));
-    push(liveRows, "输出码率", formatKbps(progress?.bitrateKbps));
-    push(liveRows, "已输出", formatBytes(progress?.totalSize));
+    push(
+      liveRows,
+      "输出码率",
+      formatKbps(progress?.latestSegmentBitrateKbps ?? progress?.bitrateKbps),
+    );
+    push(liveRows, "平均码率", formatKbps(progress?.averageBitrateKbps));
+    push(
+      liveRows,
+      "已输出",
+      formatBytes(progress?.directoryBytes ?? progress?.totalSize),
+    );
     push(
       liveRows,
       "丢帧 / 重复",

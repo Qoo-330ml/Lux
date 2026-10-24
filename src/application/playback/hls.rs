@@ -1377,10 +1377,28 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
+        Ok(self.cached_session_bytes(&process).await? <= limit)
+    }
+
+    /// Total bytes written by one session, measured fresh for the statistics response.
+    ///
+    /// Admission reuses the quota cache, but a one-second panel poll must not report the zero
+    /// bytes that were measured before FFmpeg wrote its first segment.
+    pub(crate) async fn session_bytes(&self, session_id: &str) -> Result<Option<u64>, HlsError> {
+        let Some(process) = self.processes.read().await.get(session_id).cloned() else {
+            return Ok(None);
+        };
+        let limit = self.runtime_snapshot().session_quota_bytes;
+        session_directory_bytes(&process.directory, limit)
+            .await
+            .map(Some)
+    }
+
+    async fn cached_session_bytes(&self, process: &HlsProcess) -> Result<u64, HlsError> {
+        let limit = self.runtime_snapshot().session_quota_bytes;
         let mut quota = process.quota.lock().await;
-        let now = Instant::now();
-        if quota.is_fresh(now) {
-            return Ok(quota.total_bytes <= limit);
+        if quota.is_fresh(Instant::now()) {
+            return Ok(quota.total_bytes);
         }
         let total = match session_directory_bytes(&process.directory, limit).await {
             Ok(total) => total,
@@ -1391,7 +1409,53 @@ impl HlsManager {
         };
         quota.total_bytes = total;
         quota.checked_at = Some(Instant::now());
-        Ok(total <= limit)
+        Ok(total)
+    }
+
+    /// Bitrate of the newest media segment, measured from the file FFmpeg just closed.
+    ///
+    /// The HLS muxer reports `bitrate=N/A` through `-progress`, so the encoded bitrate has to be
+    /// derived from the segment itself: every segment covers [`HLS_SEGMENT_DURATION_TICKS`].
+    pub(crate) async fn latest_segment_bitrate_kbps(&self, session_id: &str) -> Option<f64> {
+        let (directory, extension) = {
+            let processes = self.processes.read().await;
+            let process = processes.get(session_id)?;
+            (
+                process.directory.clone(),
+                process.specification.segment_container.segment_extension(),
+            )
+        };
+        let suffix = format!(".{extension}");
+        let bytes = tokio::task::spawn_blocking(move || -> Option<u64> {
+            let mut newest: Option<(i64, u64)> = None;
+            let entries = std::fs::read_dir(&directory).ok()?;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if !name.ends_with(&suffix) {
+                    continue;
+                }
+                let Ok(Some(number)) = asset_segment_number(name) else {
+                    continue;
+                };
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if !metadata.is_file() || metadata.len() == 0 {
+                    continue;
+                }
+                if newest.is_none_or(|(newest_number, _)| number >= newest_number) {
+                    newest = Some((number, metadata.len()));
+                }
+            }
+            newest.map(|(_, bytes)| bytes)
+        })
+        .await
+        .ok()??;
+        let seconds = HLS_SEGMENT_DURATION_TICKS as f64 / 10_000_000.0;
+        (bytes > 0).then(|| bytes as f64 * 8.0 / seconds / 1_000.0)
     }
 
     /// Resolves the per-session directory without ever escaping the HLS root.

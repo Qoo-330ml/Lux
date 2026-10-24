@@ -1796,6 +1796,24 @@ async fn web_playback_stats_report_the_plan_and_live_transcode_progress()
     assert_eq!(stats["progress"]["speed"], json!(2.0));
     assert_eq!(stats["progress"]["droppedFrames"], json!(3));
     assert_eq!(stats["progress"]["finished"], json!(false));
+    // Real HLS muxing reports `bitrate=N/A`, so the server also measures the newest segment.
+    assert!(
+        stats["progress"]["latestSegmentBitrateKbps"]
+            .as_f64()
+            .is_some_and(|kbps| kbps > 0.0),
+        "segment bitrate must be measured from the segment file: {stats}"
+    );
+    assert!(
+        stats["progress"]["directoryBytes"]
+            .as_u64()
+            .is_some_and(|bytes| bytes > 0),
+        "session output size must be measured: {stats}"
+    );
+    assert!(
+        stats["progress"]["averageBitrateKbps"]
+            .as_f64()
+            .is_some_and(|kbps| kbps > 0.0)
+    );
 
     let unknown = client
         .get(format!(

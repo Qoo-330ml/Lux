@@ -61,6 +61,9 @@ const SERVER_HLS: WebPlaybackSessionStats = {
     droppedFrames: 3,
     finished: false,
     updatedAt: 1_000,
+    latestSegmentBitrateKbps: 2_048.5,
+    directoryBytes: 1_048_576,
+    averageBitrateKbps: 1_600,
   },
 };
 
@@ -155,6 +158,7 @@ describe("player information groups", () => {
     expect(live["编码帧率"]).toBe("24.0 fps");
     expect(live["编码速度"]).toBe("1.53×");
     expect(live["输出码率"]).toBe("2.0 Mbps");
+    expect(live["平均码率"]).toBe("1.6 Mbps");
     expect(live["已输出"]).toBe("1.0 MB");
     expect(live["丢帧 / 重复"]).toBe("3 / 0");
     expect(live["编码位置"]).toBe("00:10");

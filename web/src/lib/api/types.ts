@@ -494,6 +494,11 @@ export type WebPlaybackProgress = {
   droppedFrames: number | null;
   finished: boolean;
   updatedAt: number;
+  /** Measured from the newest closed segment; `bitrateKbps` is usually null for HLS muxing. */
+  latestSegmentBitrateKbps: number | null;
+  /** Total bytes written by the session directory. */
+  directoryBytes: number | null;
+  averageBitrateKbps: number | null;
 };
 
 export type WebPlaybackSessionStats = {

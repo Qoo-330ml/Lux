@@ -4592,6 +4592,13 @@ pub(super) fn web_playback_stats_json(
             "droppedFrames": progress.dropped_frames,
             "finished": progress.finished,
             "updatedAt": progress.updated_at_ms,
+            "latestSegmentBitrateKbps": stats.latest_segment_bitrate_kbps,
+            "directoryBytes": stats.directory_bytes,
+            "averageBitrateKbps": stats
+                .directory_bytes
+                .zip(progress.out_time_us)
+                .filter(|(_, micros)| *micros > 0)
+                .map(|(bytes, micros)| bytes as f64 * 8.0 * 1_000.0 / micros as f64),
         })),
     })
 }

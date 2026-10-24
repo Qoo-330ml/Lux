@@ -124,6 +124,10 @@ pub struct SignedResource {
 pub(crate) struct WebPlaybackStats {
     pub(crate) session: StoredWebPlaybackSession,
     pub(crate) progress: Option<HlsProgressSnapshot>,
+    /// Measured from the newest closed segment, because the HLS muxer reports no bitrate.
+    pub(crate) latest_segment_bitrate_kbps: Option<f64>,
+    /// Total bytes written by this session, from the quota cache when it is fresh.
+    pub(crate) directory_bytes: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -1241,12 +1245,22 @@ impl WebPlaybackSessionService {
                 session.user_id == user_id && session.state == "ACTIVE" && session.expires_at > now
             })
             .ok_or(WebPlaybackSessionError::NotFound)?;
-        let progress = if session.plan == "SERVER_HLS" {
-            self.hls.progress(session_id).await
-        } else {
-            None
-        };
-        Ok(WebPlaybackStats { session, progress })
+        let (progress, latest_segment_bitrate_kbps, directory_bytes) =
+            if session.plan == "SERVER_HLS" {
+                (
+                    self.hls.progress(session_id).await,
+                    self.hls.latest_segment_bitrate_kbps(session_id).await,
+                    self.hls.session_bytes(session_id).await.ok().flatten(),
+                )
+            } else {
+                (None, None, None)
+            };
+        Ok(WebPlaybackStats {
+            session,
+            progress,
+            latest_segment_bitrate_kbps,
+            directory_bytes,
+        })
     }
 
     pub(crate) async fn heartbeat(
