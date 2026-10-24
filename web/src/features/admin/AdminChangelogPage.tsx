@@ -15,6 +15,17 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.18",
+    date: "2026-10-24",
+    sections: [
+      { kind: "fixed", items: [
+        "后台任务历史清理按表独立执行，单张表遇到错误时会记录失败并继续清理其他表，避免一个故障阻断整轮回收。",
+        "为历史清理轮次和 PostgreSQL 单条清理语句设置时间上限，并拆分元数据候选清理步骤，降低大批量积压时长时间占用连接或阻塞后续回收的风险。",
+        "清理已不存在扫描任务留下的孤儿目标记录，并报告回收数量，避免 scan_job_targets 长期累积无用数据。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.17",
     date: "2026-10-24",
     sections: [
