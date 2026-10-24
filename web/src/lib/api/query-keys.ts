@@ -35,6 +35,7 @@ export const queryKeys = {
     ["playback-bootstrap", itemId, sourceId ?? "default", audioStreamIndex ?? "default", subtitleStreamIndex ?? "default", attempt] as const,
   webPlaybackSession: (itemId: string, sourceId: string, attempt: number, audioStreamIndex?: string | null, subtitleStreamIndex?: string | null) =>
     ["web-playback-session", itemId, sourceId, audioStreamIndex ?? "default", subtitleStreamIndex ?? "default", attempt] as const,
+  webPlaybackStats: (sessionId: string) => ["web-playback-stats", sessionId] as const,
   adminDashboard: ["admin", "dashboard"] as const,
   adminHealth: ["admin", "health"] as const,
   adminLibraries: ["admin", "libraries"] as const,

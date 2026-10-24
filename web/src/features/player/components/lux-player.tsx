@@ -1,9 +1,11 @@
-import type { ReactNode, RefObject } from "react";
+import type { MouseEvent, ReactNode, RefObject } from "react";
 
 type LuxPlayerProps = {
   controlsVisible: boolean;
   containerRef: RefObject<HTMLElement | null>;
   onActivity: () => void;
+  /** Right-click inside the player opens the information panel instead of the browser menu. */
+  onContextMenu?: (event: MouseEvent<HTMLElement>) => void;
   surface?: ReactNode;
   topBar?: ReactNode;
   settings?: ReactNode;
@@ -21,6 +23,7 @@ export function LuxPlayer({
   controlsVisible,
   containerRef,
   onActivity,
+  onContextMenu,
   surface,
   topBar,
   settings,
@@ -36,6 +39,7 @@ export function LuxPlayer({
       onMouseMove={onActivity}
       onTouchStart={onActivity}
       onClick={onActivity}
+      onContextMenu={onContextMenu}
     >
       {children ?? (
         <>

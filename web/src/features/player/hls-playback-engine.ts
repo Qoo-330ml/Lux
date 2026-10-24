@@ -1,4 +1,4 @@
-import type { PlaybackEngine, PlaybackPerformance, PlaybackSnapshot } from "./playback-engine";
+import type { PlaybackEngine, PlaybackEngineStats, PlaybackPerformance, PlaybackSnapshot } from "./playback-engine";
 import type Hls from "hls.js";
 export { canUseHls } from "./hls-capabilities";
 
@@ -66,6 +66,18 @@ export class HlsVideoEngine implements PlaybackEngine {
 
   seek(seconds: number) {
     if (Number.isFinite(seconds) && seconds >= 0) this.element.currentTime = seconds;
+  }
+
+  stats(): PlaybackEngineStats | null {
+    const hls = this.hls;
+    if (!hls) return null;
+    const level = hls.currentLevel >= 0 ? hls.levels[hls.currentLevel] : undefined;
+    const bandwidth = hls.bandwidthEstimate;
+    return {
+      bandwidthBitsPerSecond: Number.isFinite(bandwidth) && bandwidth > 0 ? bandwidth : null,
+      levelBitrate: level && Number.isFinite(level.bitrate) && level.bitrate > 0 ? level.bitrate : null,
+      levelLabel: level && level.width > 0 && level.height > 0 ? `${level.width}×${level.height}` : null,
+    };
   }
 
   snapshot(): PlaybackSnapshot {

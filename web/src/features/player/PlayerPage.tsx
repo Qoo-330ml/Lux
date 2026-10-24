@@ -37,6 +37,14 @@ import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
 import type { PlayerEpisodeNavigation } from "./components/player-controls";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
+import { PlayerInfoPanel } from "./components/player-info-panel";
+import {
+  buildPlayerInfoGroups,
+  createClientStatsSampler,
+  playerInfoCopyText,
+  summarizeSource,
+  type PlayerClientStats,
+} from "./player-stats";
 import type { PlayerSettingsSourceOption } from "./components/player-settings-panel";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
 import { LuxPlayer } from "./components/lux-player";
@@ -207,6 +215,8 @@ export function PlayerPage() {
   const [flip, setFlip] = useState<PlayerFlip>("normal");
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [showInfo, setShowInfo] = useState(false);
+  const [clientStats, setClientStats] = useState<PlayerClientStats | null>(null);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
@@ -342,6 +352,17 @@ export function PlayerPage() {
     ? webPlaybackSession.data
     : playbackBootstrap.data?.session ?? webPlaybackSession.data;
   const playbackPlan = playbackSession?.plan;
+  // The information panel polls the server only while it is open: one request per second reads a
+  // stored row plus the in-memory FFmpeg snapshot, so it never touches media files.
+  const playbackSessionId = playbackSession?.sessionId ?? null;
+  const infoStats = useQuery({
+    queryKey: queryKeys.webPlaybackStats(playbackSessionId ?? ""),
+    queryFn: ({ signal }) => api.webPlaybackStats(playbackSessionId ?? "", signal),
+    enabled: showInfo && Boolean(playbackSessionId),
+    retry: false,
+    refetchInterval: showInfo ? 1_000 : false,
+    staleTime: 0,
+  });
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const remoteDirectUrl = remoteHttpSource ? source?.externalUrl ?? null : null;
   const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
@@ -395,6 +416,23 @@ export function PlayerPage() {
   const remoteCaptionReaderRef = useRef<RemoteMkvCaptionReader | null>(null);
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
+
+  useEffect(() => {
+    if (!showInfo) {
+      setClientStats(null);
+      return;
+    }
+    const sampler = createClientStatsSampler();
+    const sample = () => {
+      setClientStats(sampler({
+        engine: engineRef.current,
+        video: videoRef.current ?? lastVideoRef.current,
+      }));
+    };
+    sample();
+    const interval = window.setInterval(sample, 1_000);
+    return () => window.clearInterval(interval);
+  }, [showInfo, playbackKey]);
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
     if (!video) {
@@ -1213,6 +1251,11 @@ export function PlayerPage() {
           e.preventDefault();
           changeVolume(volume - 0.05);
           break;
+        case "i":
+        case "I":
+          e.preventDefault();
+          setShowInfo((visible) => !visible);
+          break;
         case "m":
         case "M":
           e.preventDefault();
@@ -1224,7 +1267,10 @@ export function PlayerPage() {
           toggleFullscreen();
           break;
         case "Escape":
-          if (showSettings) {
+          if (showInfo) {
+            e.preventDefault();
+            setShowInfo(false);
+          } else if (showSettings) {
             e.preventDefault();
             setShowSettings(false);
           } else if (!document.fullscreenElement) {
@@ -1249,6 +1295,7 @@ export function PlayerPage() {
     navigate,
     resetControlsTimeout,
     seekRelative,
+    showInfo,
     showSettings,
     toggleFullscreen,
     toggleMute,
@@ -1393,6 +1440,25 @@ export function PlayerPage() {
   const surfaceFailure = playbackFailure
     ?? planFailure
     ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
+  const infoGroups = showInfo
+    ? buildPlayerInfoGroups({
+      plan: playbackPlan?.type ?? null,
+      tier: playbackSession?.tier ?? null,
+      source: summarizeSource(source),
+      server: infoStats.data ?? null,
+      serverPending: infoStats.isPending,
+      serverError: infoStats.error instanceof Error ? infoStats.error.message : null,
+      client: clientStats,
+      playback: {
+        positionSeconds: currentTime,
+        durationSeconds: duration,
+        rate: playbackRate,
+        volume,
+        muted: isMuted,
+        paused: !playing,
+      },
+    })
+    : [];
   const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
@@ -1404,6 +1470,13 @@ export function PlayerPage() {
       containerRef={playerContainerRef}
       controlsVisible={controlsVisible}
       onActivity={resetControlsTimeout}
+      onContextMenu={(event) => {
+        const target = event.target as HTMLElement | null;
+        // Text inputs keep their own context menu (paste).
+        if (target?.closest("input, textarea, select, [contenteditable='true']")) return;
+        event.preventDefault();
+        setShowInfo((visible) => !visible);
+      }}
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
@@ -1516,6 +1589,14 @@ export function PlayerPage() {
         />
       ) : null}
 
+      {showInfo ? (
+        <PlayerInfoPanel
+          groups={infoGroups}
+          copyText={playerInfoCopyText(infoGroups)}
+          onClose={() => setShowInfo(false)}
+        />
+      ) : null}
+
       {screenshotStatus ? (
         <div className="lux-player-screenshot-status" role="status">
           {screenshotStatus}
@@ -1537,6 +1618,7 @@ export function PlayerPage() {
         chapters={chapterTimeline.segments}
         introSkip={activeIntroRange}
         settingsOpen={showSettings}
+        infoOpen={showInfo}
         remainingTime={isRemainingTime}
         hoverTime={hoverTime}
         hoverPercent={hoverPercent}
@@ -1562,6 +1644,7 @@ export function PlayerPage() {
         onSkipIntro={seekTo}
         onTakeScreenshot={takeScreenshot}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
+        onToggleInfo={() => setShowInfo((visible) => !visible)}
         onTogglePictureInPicture={togglePictureInPicture}
         onToggleFullscreen={toggleFullscreen}
       />

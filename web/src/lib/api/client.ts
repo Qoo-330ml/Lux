@@ -130,6 +130,7 @@ import type {
   PlaybackEventState,
   WebPlaybackCapabilities,
   WebPlaybackSession,
+  WebPlaybackSessionStats,
   WebPlaybackBootstrap,
   WebPlaybackTrackSelection,
   WebDanmakuInfo,
@@ -935,6 +936,13 @@ export class LuxApiClient {
     return this.request<{ sessionId: string; expiresAt: number }>(
       `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}/heartbeat`,
       { method: "POST", body: JSON.stringify({}) },
+    );
+  }
+
+  webPlaybackStats(sessionId: string, signal?: AbortSignal) {
+    return this.request<WebPlaybackSessionStats>(
+      `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}/stats`,
+      { signal },
     );
   }
 

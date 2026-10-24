@@ -481,6 +481,39 @@ export type WebPlaybackSession = {
   plan: WebPlaybackPlan;
 };
 
+/** Live `ffmpeg -progress` values for a running server-side HLS transcode. */
+export type WebPlaybackProgress = {
+  generation: number;
+  frame: number | null;
+  fps: number | null;
+  bitrateKbps: number | null;
+  totalSize: number | null;
+  outTimeSeconds: number | null;
+  speed: number | null;
+  duplicatedFrames: number | null;
+  droppedFrames: number | null;
+  finished: boolean;
+  updatedAt: number;
+};
+
+export type WebPlaybackSessionStats = {
+  sessionId: string;
+  playSessionId: string;
+  sourceId: string | null;
+  plan: "DIRECT" | "SERVER_HLS" | string;
+  tier: number;
+  state: string;
+  expiresAt: number;
+  output: {
+    container: string | null;
+    videoCodec: string | null;
+    audioCodec: string | null;
+    videoBitrate: number | null;
+    audioBitrate: number | null;
+  };
+  progress: WebPlaybackProgress | null;
+};
+
 export type WebPlaybackTrackSelection = {
   audioStreamIndex?: number;
   subtitleStreamIndex?: number;
