@@ -901,6 +901,10 @@ const ORPHAN_TARGET_PRUNE_BATCH: i64 = 2_000;
 /// single unbounded batch can run for minutes, so the round also stops once this budget is spent
 /// and resumes on the next scheduled run.
 const TASK_HISTORY_PRUNE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-statement cap for one retention batch. It matches the round budget so a statement that is
+/// unexpectedly slow is cancelled inside its own batch instead of holding a pooled connection for
+/// the connection-wide 30 minute statement timeout.
+const RETENTION_STATEMENT_TIMEOUT: &str = "SET LOCAL statement_timeout = '30s'";
 
 /// Retention statements, one table each.
 ///
@@ -1291,6 +1295,67 @@ impl Database {
         Ok(repaired)
     }
 
+    /// Runs one prune batch with a statement timeout that cannot exceed the round's remaining
+    /// budget.
+    ///
+    /// The connection setting is a 30 minute timeout, which is far longer than a retention round
+    /// should ever need: one unindexed statement could hold a connection for half an hour before it
+    /// was cancelled. PostgreSQL gets the remaining budget as `SET LOCAL`, so a slow statement fails
+    /// inside its own batch and the other tables still run.
+    async fn run_prune_batch(
+        &self,
+        sql: &'static str,
+        cutoff: Option<i64>,
+        batch: i64,
+    ) -> Result<u64, StorageError> {
+        let mut query = self.query(sql);
+        if let Some(cutoff) = cutoff {
+            query = query.bind(cutoff);
+        }
+        let query = query.bind(batch);
+        if self.backend != DatabaseBackend::Postgres {
+            return query
+                .execute(&self.pool)
+                .await
+                .map(|result| result.rows_affected())
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(RETENTION_STATEMENT_TIMEOUT)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let deleted = query
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(deleted)
+    }
+
     async fn prune_task_history_batches(
         &self,
         sql: &'static str,
@@ -1304,17 +1369,7 @@ impl Database {
             if std::time::Instant::now() >= deadline {
                 break;
             }
-            let deleted = self
-                .query(sql)
-                .bind(cutoff)
-                .bind(batch)
-                .execute(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .rows_affected();
+            let deleted = self.run_prune_batch(sql, Some(cutoff), batch).await?;
             total = total.saturating_add(deleted);
             if deleted < u64::try_from(batch).unwrap_or(u64::MAX) {
                 break;
@@ -1337,16 +1392,7 @@ impl Database {
             if std::time::Instant::now() >= deadline {
                 break;
             }
-            let deleted = self
-                .query(sql)
-                .bind(batch)
-                .execute(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .rows_affected();
+            let deleted = self.run_prune_batch(sql, None, batch).await?;
             total = total.saturating_add(deleted);
             if deleted < u64::try_from(batch).unwrap_or(u64::MAX) {
                 break;
