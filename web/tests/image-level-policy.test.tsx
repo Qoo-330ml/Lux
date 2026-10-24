@@ -106,13 +106,13 @@ describe("image level policy editor", () => {
       />,
     );
 
-    const seasonSelect = container!.querySelector(
-      'select[aria-label="季度海报开关"]',
-    ) as HTMLSelectElement;
-    expect(seasonSelect).toBeTruthy();
-    seasonSelect.value = "false";
+    const seasonSwitch = container!.querySelector(
+      'input[role="switch"][aria-label="季度海报开关"]',
+    ) as HTMLInputElement;
+    expect(seasonSwitch).toBeTruthy();
+    expect(seasonSwitch.checked).toBe(true);
     act(() => {
-      seasonSelect.dispatchEvent(new Event("change", { bubbles: true }));
+      seasonSwitch.click();
     });
 
     expect(latest.levels?.season?.artworks?.poster?.enabled).toBe(false);
@@ -256,9 +256,12 @@ describe("inherit label follows the settings level", () => {
     );
 
     const enabled = container!.querySelector(
-      'select[aria-label="电影海报开关"]',
-    ) as HTMLSelectElement;
-    expect(enabled.querySelectorAll("option")[0]?.textContent).toBe("默认");
+      'input[role="switch"][aria-label="电影海报开关"]',
+    ) as HTMLInputElement;
+    expect(enabled.checked).toBe(true);
+    expect(
+      enabled.parentElement?.querySelector(".lux-level-policy-inherit")?.textContent,
+    ).toBe("默认");
 
     const count = container!.querySelector(
       'select[aria-label="电影海报张数"]',
@@ -278,9 +281,70 @@ describe("inherit label follows the settings level", () => {
     render(<ImageLevelPolicyEditor images={base} onChange={() => {}} />);
 
     const enabled = container!.querySelector(
-      'select[aria-label="电影海报开关"]',
-    ) as HTMLSelectElement;
-    expect(enabled.querySelectorAll("option")[0]?.textContent).toBe("继承");
+      'input[role="switch"][aria-label="电影海报开关"]',
+    ) as HTMLInputElement;
+    expect(
+      enabled.parentElement?.querySelector(".lux-level-policy-inherit")?.textContent,
+    ).toBe("继承");
     expect(container!.textContent).toContain("全部继承");
+  });
+});
+describe("level switch is a plain on/off toggle", () => {
+  let container: HTMLDivElement | null = null;
+  let root: Root | null = null;
+
+  afterEach(() => {
+    if (root) act(() => root!.unmount());
+    container?.remove();
+    root = null;
+    container = null;
+  });
+
+  function render(node: React.ReactNode) {
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root!.render(node));
+  }
+
+  it("follows the flat switch until it is toggled", () => {
+    render(<ImageLevelPolicyEditor images={{ ...base, poster: false }} onChange={() => {}} />);
+    const poster = container!.querySelector(
+      'input[role="switch"][aria-label="电影海报开关"]',
+    ) as HTMLInputElement;
+    expect(poster.checked).toBe(false);
+  });
+
+  it("clears the explicit value back to the inherited state", () => {
+    let latest: MediaImageStrategySettings = base;
+    const withOverride = updateArtworkPolicy(base, "series", "poster", { enabled: false });
+    render(
+      <ImageLevelPolicyEditor
+        images={withOverride}
+        onChange={(next) => {
+          latest = next;
+        }}
+      />,
+    );
+
+    const reset = container!.querySelector(
+      'button[aria-label="剧集海报恢复继承"]',
+    ) as HTMLButtonElement;
+    expect(reset).toBeTruthy();
+    act(() => {
+      reset.click();
+    });
+
+    expect(latest.levels).toBeUndefined();
+  });
+
+  it("marks explicitly set cells without a hint", () => {
+    const withOverride = updateArtworkPolicy(base, "movie", "logo", { enabled: true });
+    render(<ImageLevelPolicyEditor images={withOverride} onChange={() => {}} />);
+    const logo = container!.querySelector(
+      'input[role="switch"][aria-label="电影徽标开关"]',
+    ) as HTMLInputElement;
+    expect(logo.checked).toBe(true);
+    expect(logo.parentElement?.querySelector(".lux-level-policy-inherit")).toBeNull();
   });
 });

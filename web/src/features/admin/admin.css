@@ -352,7 +352,17 @@
 
 .lux-level-policy-table tbody th { font-weight: 600; white-space: nowrap; }
 
-.lux-level-policy-table select, .lux-level-policy-table input { width: 100%; min-width: 0; font-size: .72rem; padding: 3px 4px; }
+.lux-level-policy-table select, .lux-level-policy-table input[type="number"] { width: 100%; min-width: 0; font-size: .72rem; padding: 3px 4px; }
+
+.lux-level-policy-switch-cell { display: flex; align-items: center; gap: 5px; }
+
+.lux-level-policy-switch { width: 16px; height: 16px; flex: 0 0 auto; accent-color: var(--lux-accent); cursor: pointer; }
+
+.lux-level-policy-inherit { color: var(--lux-muted); font-size: .64rem; white-space: nowrap; }
+
+.lux-level-policy-reset { border: 0; background: transparent; color: var(--lux-muted); cursor: pointer; font-size: .8rem; line-height: 1; padding: 2px; border-radius: 4px; }
+
+.lux-level-policy-reset:hover { color: var(--lux-text); background: var(--lux-surface); }
 
 .lux-level-policy-table td:nth-child(5), .lux-level-policy-table td:nth-child(6) { max-width: 112px; }
 

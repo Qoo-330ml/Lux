@@ -55,12 +55,6 @@ const roleOptions: Array<{ value: string; label: string }> = [
   { value: "SUPPLEMENT", label: "仅补充" },
 ];
 
-const enabledOptions: Array<{ value: string; label: string }> = [
-  { value: "", label: "继承" },
-  { value: "true", label: "抓取" },
-  { value: "false", label: "不抓" },
-];
-
 const episodeImageOptions: Array<{ value: string; label: string }> = [
   { value: "", label: "继承缩略图方式" },
   { value: "SCRAPER_STILL", label: "在线剧照" },
@@ -137,6 +131,33 @@ function parseSources(value: string): MediaArtworkSource[] | undefined {
 function parseRoles(value: string): MediaScraperRole[] | undefined {
   if (!value) return undefined;
   return value.split(",") as MediaScraperRole[];
+}
+
+/** Inherited on/off state of one (level, type) cell, mirroring the backend:
+ * flat switches first, then the level thumbnail mode gate, then an explicit
+ * cell value. */
+export function resolvedEnabled(
+  images: MediaImageStrategySettings,
+  levelKey: MediaImageLevelKey,
+  typeKey: MediaArtworkTypeKey,
+): boolean {
+  const level = images.levels?.[levelKey];
+  const mode = level?.thumbnailScrapingMode ?? images.thumbnailScrapingMode ?? "SCRAPER_FIRST";
+  const flatEnabled: Record<MediaArtworkTypeKey, boolean> = {
+    poster: images.poster,
+    backdrop: images.backdrop !== false,
+    artwork: images.artwork,
+    logo: images.logo,
+    thumbnail: images.thumbnail,
+    banner: images.banner,
+    disc: images.disc,
+    wallpaper: images.wallpaper,
+  };
+  const base =
+    (typeKey === "poster" || typeKey === "thumbnail") && mode === "NONE"
+      ? false
+      : flatEnabled[typeKey];
+  return level?.artworks?.[typeKey]?.enabled ?? base;
 }
 
 function levelOverrideCount(level?: MediaImageLevelSettings): number {
@@ -216,26 +237,40 @@ export function ImageLevelPolicyEditor({
                     <tr key={type.key}>
                       <th scope="row">{type.label}</th>
                       <td>
-                        <select
-                          aria-label={`${level.label}${type.label}开关`}
-                          value={policy.enabled === undefined ? "" : String(policy.enabled)}
-                          onChange={(event) =>
-                            onChange(
-                              updateArtworkPolicy(images, level.key, type.key, {
-                                enabled:
-                                  event.target.value === ""
-                                    ? undefined
-                                    : event.target.value === "true",
-                              }),
-                            )
-                          }
-                        >
-                          {enabledOptions.map((option) => (
-                            <option key={option.value} value={option.value}>
-                              {optionLabel(option)}
-                            </option>
-                          ))}
-                        </select>
+                        <div className="lux-level-policy-switch-cell">
+                          <input
+                            type="checkbox"
+                            role="switch"
+                            className="lux-level-policy-switch"
+                            aria-label={`${level.label}${type.label}开关`}
+                            checked={policy.enabled ?? resolvedEnabled(images, level.key, type.key)}
+                            onChange={(event) =>
+                              onChange(
+                                updateArtworkPolicy(images, level.key, type.key, {
+                                  enabled: event.target.checked,
+                                }),
+                              )
+                            }
+                          />
+                          {policy.enabled === undefined ? (
+                            <small className="lux-level-policy-inherit">{inheritLabel}</small>
+                          ) : (
+                            <button
+                              type="button"
+                              className="lux-level-policy-reset"
+                              aria-label={`${level.label}${type.label}恢复${inheritLabel}`}
+                              onClick={() =>
+                                onChange(
+                                  updateArtworkPolicy(images, level.key, type.key, {
+                                    enabled: undefined,
+                                  }),
+                                )
+                              }
+                            >
+                              ↺
+                            </button>
+                          )}
+                        </div>
                       </td>
                       <td>
                         <select
