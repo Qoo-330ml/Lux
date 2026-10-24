@@ -25,6 +25,72 @@ const LIBRARY_DELETION_JOB_COLUMNS: &str =
     "id, library_id, library_name, status, stage, processed_count, error_code,
      created_at, updated_at, started_at, finished_at";
 
+/// SQLite keeps the original batch size: with the deletion connection at
+/// `synchronous = NORMAL` a commit no longer fsyncs, and a longer batch only holds
+/// the database write lock for longer. PostgreSQL still pays real per-commit cost,
+/// so it batches more rows per transaction.
+const SQLITE_MEDIA_ITEM_DELETION_BATCH: i64 = 500;
+const POSTGRES_MEDIA_ITEM_DELETION_BATCH: i64 = 5_000;
+const SQLITE_FILESYSTEM_ENTRY_DELETION_BATCH: i64 = 500;
+const POSTGRES_FILESYSTEM_ENTRY_DELETION_BATCH: i64 = 5_000;
+const SCAN_ROW_DELETION_BATCH: i64 = 500;
+const JOB_ROW_DELETION_BATCH: i64 = 50;
+
+/// SQLite defaults to `synchronous = FULL`, which fsyncs once per batch. The
+/// deletion job is restartable and every batch is idempotent, so the worker may
+/// run at `NORMAL`: WAL stays crash-safe and only the tail of an interrupted run
+/// can be lost. The pragmas are applied to a checked-out connection and restored
+/// before it returns to the pool.
+const SQLITE_DELETION_DURABILITY_PRAGMAS: &[&str] = &[
+    "PRAGMA synchronous = NORMAL",
+    "PRAGMA wal_autocheckpoint = 20000",
+];
+const SQLITE_DELETION_RESTORE_PRAGMAS: &[&str] = &[
+    "PRAGMA synchronous = FULL",
+    "PRAGMA wal_autocheckpoint = 1000",
+];
+
+/// Batch size for one library-deletion statement. Every statement binds only the
+/// library identifier and the limit, so these sizes are bounded by lock hold time
+/// rather than by a bind-parameter budget.
+pub(crate) fn resolve_library_deletion_batch_size(
+    backend: DatabaseBackend,
+    batch: LibraryDeletionBatch,
+) -> i64 {
+    match (batch, backend) {
+        (LibraryDeletionBatch::MediaItems, DatabaseBackend::Sqlite) => {
+            SQLITE_MEDIA_ITEM_DELETION_BATCH
+        }
+        (LibraryDeletionBatch::MediaItems, DatabaseBackend::Postgres) => {
+            POSTGRES_MEDIA_ITEM_DELETION_BATCH
+        }
+        (LibraryDeletionBatch::FilesystemEntries, DatabaseBackend::Sqlite) => {
+            SQLITE_FILESYSTEM_ENTRY_DELETION_BATCH
+        }
+        (LibraryDeletionBatch::FilesystemEntries, DatabaseBackend::Postgres) => {
+            POSTGRES_FILESYSTEM_ENTRY_DELETION_BATCH
+        }
+        (LibraryDeletionBatch::ScanJobs, _) => JOB_ROW_DELETION_BATCH,
+        (LibraryDeletionBatch::ScanManifests, _) => JOB_ROW_DELETION_BATCH,
+        (LibraryDeletionBatch::StrmProbeJobs, _) => JOB_ROW_DELETION_BATCH,
+        _ => SCAN_ROW_DELETION_BATCH,
+    }
+}
+
+fn deletion_durability_pragmas(backend: DatabaseBackend) -> &'static [&'static str] {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_DELETION_DURABILITY_PRAGMAS,
+        DatabaseBackend::Postgres => &[],
+    }
+}
+
+fn deletion_restore_pragmas(backend: DatabaseBackend) -> &'static [&'static str] {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_DELETION_RESTORE_PRAGMAS,
+        DatabaseBackend::Postgres => &[],
+    }
+}
+
 fn stored_library_deletion_job(row: sqlx::any::AnyRow) -> StoredLibraryDeletionJob {
     StoredLibraryDeletionJob {
         id: row.get("id"),
@@ -42,6 +108,11 @@ fn stored_library_deletion_job(row: sqlx::any::AnyRow) -> StoredLibraryDeletionJ
 }
 
 impl Database {
+    /// Batch size for one library-deletion statement on this database.
+    pub(crate) fn library_deletion_batch_size(&self, batch: LibraryDeletionBatch) -> i64 {
+        resolve_library_deletion_batch_size(self.backend(), batch)
+    }
+
     pub(crate) async fn request_library_deletion(
         &self,
         library_id: &str,
@@ -312,6 +383,18 @@ impl Database {
         })
     }
 
+    /// Best-effort WAL trimming between stages. `PASSIVE` never blocks readers, so
+    /// it is safe while the server keeps serving requests.
+    pub(crate) async fn checkpoint_library_deletion_wal(&self) {
+        if self.backend() != DatabaseBackend::Sqlite {
+            return;
+        }
+        let _ = self
+            .query("PRAGMA wal_checkpoint(PASSIVE)")
+            .fetch_optional(&self.pool)
+            .await;
+    }
+
     pub(crate) async fn fail_library_deletion_job(
         &self,
         job_id: &str,
@@ -341,8 +424,45 @@ impl Database {
         batch: LibraryDeletionBatch,
         limit: i64,
     ) -> Result<Option<u64>, StorageError> {
-        let mut transaction = self
+        // One checked-out connection per batch: the reduced-durability pragmas must
+        // never be inherited by a pooled connection that a later request reuses.
+        let mut connection = self
             .pool
+            .acquire()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        for &pragma in deletion_durability_pragmas(self.backend()) {
+            self.query(pragma)
+                .execute(&mut *connection)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        let result = self
+            .delete_library_deletion_batch_on(&mut connection, job_id, library_id, batch, limit)
+            .await;
+        for &pragma in deletion_restore_pragmas(self.backend()) {
+            // A failed restore must not hide the batch outcome, but it must also not
+            // leave reduced durability behind for the next borrower.
+            let _ = self.query(pragma).execute(&mut *connection).await;
+        }
+        result
+    }
+
+    async fn delete_library_deletion_batch_on(
+        &self,
+        connection: &mut sqlx::AnyConnection,
+        job_id: &str,
+        library_id: &str,
+        batch: LibraryDeletionBatch,
+        limit: i64,
+    ) -> Result<Option<u64>, StorageError> {
+        let mut transaction = connection
             .begin()
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -350,6 +470,15 @@ impl Database {
                 source,
             })?;
         if self.backend() == DatabaseBackend::Postgres {
+            // Every batch is idempotent and the job restarts from committed data,
+            // so the commit fsync is not worth paying for on a multi-hour deletion.
+            self.query("SET LOCAL synchronous_commit = off")
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
             self.query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *transaction)
                 .await
@@ -756,5 +885,98 @@ impl Database {
                 source,
             })?;
         Ok(Some(deleted))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn deletion_batch_sizes_are_backend_specific_and_bounded() {
+        let sqlite_media = resolve_library_deletion_batch_size(
+            DatabaseBackend::Sqlite,
+            LibraryDeletionBatch::MediaItems,
+        );
+        let postgres_media = resolve_library_deletion_batch_size(
+            DatabaseBackend::Postgres,
+            LibraryDeletionBatch::MediaItems,
+        );
+        assert_eq!(sqlite_media, SQLITE_MEDIA_ITEM_DELETION_BATCH);
+        assert_eq!(postgres_media, POSTGRES_MEDIA_ITEM_DELETION_BATCH);
+        assert!(postgres_media > sqlite_media);
+        assert!(
+            sqlite_media >= 500,
+            "SQLite must keep its bounded write lock"
+        );
+        assert_eq!(
+            resolve_library_deletion_batch_size(
+                DatabaseBackend::Sqlite,
+                LibraryDeletionBatch::FilesystemEntries
+            ),
+            SQLITE_FILESYSTEM_ENTRY_DELETION_BATCH
+        );
+        assert_eq!(
+            resolve_library_deletion_batch_size(
+                DatabaseBackend::Postgres,
+                LibraryDeletionBatch::ScanManifestEntries
+            ),
+            SCAN_ROW_DELETION_BATCH
+        );
+        assert_eq!(
+            resolve_library_deletion_batch_size(
+                DatabaseBackend::Postgres,
+                LibraryDeletionBatch::ScanJobs
+            ),
+            JOB_ROW_DELETION_BATCH
+        );
+        for batch in [
+            LibraryDeletionBatch::MediaItems,
+            LibraryDeletionBatch::FilesystemEntries,
+            LibraryDeletionBatch::StrmProbeJobs,
+            LibraryDeletionBatch::ScanManifestDeltas,
+            LibraryDeletionBatch::ScanManifestEntries,
+            LibraryDeletionBatch::ScanManifestDirectories,
+            LibraryDeletionBatch::ScanManifestSeenPaths,
+            LibraryDeletionBatch::ScanManifestRoots,
+            LibraryDeletionBatch::ScanManifests,
+            LibraryDeletionBatch::ScanJobTargets,
+            LibraryDeletionBatch::ScanJobPaths,
+            LibraryDeletionBatch::ReconciliationEntries,
+            LibraryDeletionBatch::ScanJobFileChanges,
+            LibraryDeletionBatch::ScanJobProcessedMediaItems,
+            LibraryDeletionBatch::ScanJobEvents,
+            LibraryDeletionBatch::ScanLocalMetadataBatches,
+            LibraryDeletionBatch::ScanJobs,
+        ] {
+            for backend in [DatabaseBackend::Sqlite, DatabaseBackend::Postgres] {
+                let size = resolve_library_deletion_batch_size(backend, batch);
+                assert!(size > 0, "{batch:?} must delete at least one row per batch");
+                assert!(
+                    size <= POSTGRES_MEDIA_ITEM_DELETION_BATCH,
+                    "{batch:?} holds the write lock for too long"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn deletion_durability_pragmas_are_sqlite_only_and_restored() {
+        assert!(deletion_durability_pragmas(DatabaseBackend::Postgres).is_empty());
+        assert!(deletion_restore_pragmas(DatabaseBackend::Postgres).is_empty());
+        assert_eq!(
+            deletion_durability_pragmas(DatabaseBackend::Sqlite),
+            [
+                "PRAGMA synchronous = NORMAL",
+                "PRAGMA wal_autocheckpoint = 20000"
+            ]
+        );
+        assert_eq!(
+            deletion_restore_pragmas(DatabaseBackend::Sqlite),
+            [
+                "PRAGMA synchronous = FULL",
+                "PRAGMA wal_autocheckpoint = 1000"
+            ]
+        );
     }
 }

@@ -24,6 +24,8 @@ impl EmbyRouteBuilder {
             .iter()
             .any(|registered| registered.eq_ignore_ascii_case(path))
         {
+            // Two registrations for one path would silently drop a handler; make it visible.
+            tracing::warn!(path, "duplicate Emby route registration was ignored");
             return self;
         }
         self.path_templates.push(path.to_owned());
@@ -72,7 +74,10 @@ pub(super) fn api_routes() -> (Router<AppState>, Vec<String>) {
             get(emby_library_selectable_media_folders),
         )
         .route("/Library/MediaFolders", get(emby_library_media_folders))
-        .route("/Library/Media/Updated", post(emby_media_updated))
+        .route(
+            "/Library/Media/Updated",
+            post(emby_media_updated).layer(DefaultBodyLimit::max(64 * 1024)),
+        )
         .route("/ScheduledTasks", get(emby_scheduled_tasks))
         .route("/Persons", get(emby_persons))
         .route("/Persons/{person_id}", get(emby_person))

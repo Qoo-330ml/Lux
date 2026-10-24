@@ -457,6 +457,39 @@ impl CatalogService {
             .await
     }
 
+    /// Counts the global collections the principal can see without building any card.
+    pub async fn count_global_collection_cards(
+        &self,
+        principal: AccessPrincipal,
+    ) -> Result<i64, CatalogError> {
+        let content_restrictions = self.content_restrictions_for_principal(principal).await?;
+        self.count_global_collection_cards_with_restrictions(
+            principal,
+            content_restrictions.as_ref(),
+        )
+        .await
+    }
+
+    /// Counts the visible global collections with already resolved content restrictions.
+    ///
+    /// Listings that batch user access snapshots already hold the restrictions, so they can skip
+    /// the extra per-user restriction lookup.
+    pub(crate) async fn count_global_collection_cards_with_restrictions(
+        &self,
+        principal: AccessPrincipal,
+        content_restrictions: Option<&UserContentRestrictions>,
+    ) -> Result<i64, CatalogError> {
+        Ok(self
+            .database
+            .count_visible_global_collections_with_restrictions(
+                &principal.user_id_string(),
+                principal.is_admin,
+                None,
+                content_restrictions,
+            )
+            .await?)
+    }
+
     pub async fn list_recent_global_collection_cards(
         &self,
         principal: AccessPrincipal,
@@ -2287,10 +2320,12 @@ pub fn normalize_search_like_query(value: &str) -> Option<String> {
     if value.is_empty() {
         return None;
     }
+    // The SQL side declares `ESCAPE '!'`, which is portable across SQLite and PostgreSQL
+    // (a backslash is a plain character in SQLite LIKE).
     let escaped = value
-        .replace('\\', "\\\\")
-        .replace('%', "\\%")
-        .replace('_', "\\_");
+        .replace('!', "!!")
+        .replace('%', "!%")
+        .replace('_', "!_");
     Some(format!("%{escaped}%"))
 }
 
@@ -2852,6 +2887,23 @@ mod tests {
             quality_label: quality.map(str::to_owned),
             ..catalog_source(id, None, is_default)
         }
+    }
+
+    #[test]
+    fn search_like_patterns_escape_wildcards_with_the_sql_escape_character() {
+        assert_eq!(
+            super::normalize_search_like_query("100%"),
+            Some("%100!%%".to_owned())
+        );
+        assert_eq!(
+            super::normalize_search_like_query("a_b"),
+            Some("%a!_b%".to_owned())
+        );
+        assert_eq!(
+            super::normalize_search_like_query("a!b"),
+            Some("%a!!b%".to_owned())
+        );
+        assert_eq!(super::normalize_search_like_query("   "), None);
     }
 
     #[test]

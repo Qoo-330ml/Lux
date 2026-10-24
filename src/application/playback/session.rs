@@ -1,4 +1,5 @@
 use std::{
+    collections::HashMap,
     fmt,
     net::IpAddr,
     sync::Arc,
@@ -35,6 +36,9 @@ use super::hls::{HlsError, HlsManager, HlsSegmentContainer, HlsStartOptions, Hls
 type HmacSha256 = Hmac<Sha256>;
 
 pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
+/// Signed asset URLs are embedded in a playlist the client fetches once, so they must outlive
+/// several heartbeat-extended session windows. Access is still gated on the live session row.
+pub const WEB_PLAYBACK_RESOURCE_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub(crate) const EMBY_DIRECT_STREAM_TICKET_VERSION: &str = "2";
 const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
@@ -175,7 +179,40 @@ pub struct WebPlaybackSessionService {
     database: Database,
     signer: Arc<ResourceSigner>,
     hls: HlsManager,
-    emby_start_lock: Arc<tokio::sync::Mutex<()>>,
+    start_locks: SessionStartLocks,
+}
+
+/// Upper bound for the per-source start locks kept in memory.
+const MAX_SESSION_START_LOCKS: usize = 4096;
+
+/// Serializes HLS starts that can replace one another.
+///
+/// Starting a session stops any other active session of the same user, item, and media source,
+/// so those starts must not interleave. Unrelated sources start concurrently: a single global
+/// start lock serialized every HLS start on the server behind database work and an ffmpeg spawn.
+#[derive(Clone, Default)]
+struct SessionStartLocks {
+    locks: Arc<tokio::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+}
+
+impl SessionStartLocks {
+    async fn lock(&self, key: &str) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut locks = self.locks.lock().await;
+            if locks.len() >= MAX_SESSION_START_LOCKS && !locks.contains_key(key) {
+                locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+            }
+            locks
+                .entry(key.to_owned())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+                .clone()
+        };
+        lock.lock_owned().await
+    }
+}
+
+fn emby_hls_start_key(user_id: &str, item_id: &str, media_source_id: &str) -> String {
+    format!("{user_id}\u{1f}{item_id}\u{1f}{media_source_id}")
 }
 
 impl WebPlaybackSessionService {
@@ -217,7 +254,7 @@ impl WebPlaybackSessionService {
             database,
             signer: Arc::new(ResourceSigner::random()),
             hls,
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         }
     }
 
@@ -366,7 +403,14 @@ impl WebPlaybackSessionService {
         video_bitrate: Option<i64>,
         options: HlsStartOptions,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
-        let _start_guard = self.emby_start_lock.lock().await;
+        let _start_guard = self
+            .start_locks
+            .lock(&emby_hls_start_key(
+                input.user_id,
+                input.item_id,
+                input.media_source_id,
+            ))
+            .await;
         let user_id = input.user_id.to_owned();
         let created = self.create(input).await?;
         let WebPlaybackPlan::ServerHls { tier } = created.plan else {
@@ -1078,10 +1122,6 @@ impl WebPlaybackSessionService {
         if self.hls.has_started(session_id).await? {
             return Ok(());
         }
-        let _start_guard = self.emby_start_lock.lock().await;
-        if self.hls.has_started(session_id).await? {
-            return Ok(());
-        }
         let session = self
             .database
             .find_web_playback_session(session_id)
@@ -1089,14 +1129,25 @@ impl WebPlaybackSessionService {
             .ok_or(WebPlaybackSessionError::NotFound)?;
         let source_id = session
             .media_source_id
-            .as_deref()
+            .clone()
             .ok_or(WebPlaybackSessionError::NotFound)?;
+        let _start_guard = self
+            .start_locks
+            .lock(&emby_hls_start_key(
+                &session.user_id,
+                &session.item_id,
+                &source_id,
+            ))
+            .await;
+        if self.hls.has_started(session_id).await? {
+            return Ok(());
+        }
         let active_sessions = self
             .database
             .find_active_web_playback_sessions_for_source(
                 &session.user_id,
                 &session.item_id,
-                source_id,
+                &source_id,
                 "lux-emby",
             )
             .await?;
@@ -1172,25 +1223,31 @@ impl WebPlaybackSessionService {
         user_id: &str,
     ) -> Result<(), WebPlaybackSessionError> {
         let session = self.database.find_web_playback_session(session_id).await?;
+        // Stopping also removes the HLS working directory, so the session identifier must be
+        // resolved to a stored session owned by the caller before it is used.
+        let Some(session) = session else {
+            return Ok(());
+        };
+        if session.user_id != user_id {
+            return Err(WebPlaybackSessionError::NotFound);
+        }
         let _ = self.hls.stop(session_id).await;
         let now = unix_timestamp();
         self.database
             .stop_web_playback_session(session_id, user_id, "STOPPED", now)
             .await?;
-        if let Some(session) = session.filter(|session| session.user_id == user_id) {
-            if let Some(playback) = self
-                .database
-                .find_playback_session(user_id, &session.play_session_id)
-                .await?
-            {
-                self.database
-                    .stop_playback_session(&playback.id, now)
-                    .await?;
-            }
+        if let Some(playback) = self
+            .database
+            .find_playback_session(user_id, &session.play_session_id)
+            .await?
+        {
             self.database
-                .release_playback_admission(user_id, &session.play_session_id, now)
+                .stop_playback_session(&playback.id, now)
                 .await?;
         }
+        self.database
+            .release_playback_admission(user_id, &session.play_session_id, now)
+            .await?;
         Ok(())
     }
 
@@ -1432,7 +1489,21 @@ impl ResourceSigner {
         let Some(expected) = self.sign(session_id, resource, expires_at) else {
             return false;
         };
-        expected.as_bytes().ct_eq(signature.as_bytes()).into()
+        if bool::from(expected.as_bytes().ct_eq(signature.as_bytes())) {
+            return true;
+        }
+        // URLs signed before the length-prefixed format still work until they expire.
+        let Some(legacy) = self.sign_legacy(session_id, resource, expires_at) else {
+            return false;
+        };
+        legacy.as_bytes().ct_eq(signature.as_bytes()).into()
+    }
+
+    /// Legacy (unprefixed) format, kept only to let in-flight URLs finish.
+    fn sign_legacy(&self, session_id: &str, resource: &str, expires_at: i64) -> Option<String> {
+        let mut mac = HmacSha256::new_from_slice(&self.key).ok()?;
+        mac.update(format!("lux-web-playback\n{session_id}\n{resource}\n{expires_at}").as_bytes());
+        Some(URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes()))
     }
 }
 
@@ -1444,8 +1515,19 @@ pub fn unix_timestamp() -> i64 {
         .unwrap_or_default()
 }
 
+/// Length-prefixes every field so a resource name containing a newline cannot shift the
+/// boundaries between the signed components.
 fn signed_message(session_id: &str, resource: &str, expires_at: i64) -> String {
-    format!("lux-web-playback\n{session_id}\n{resource}\n{expires_at}")
+    let mut message = String::with_capacity(session_id.len() + resource.len() + 64);
+    message.push_str("lux-web-playback\n");
+    for field in [session_id, resource] {
+        message.push_str(&field.len().to_string());
+        message.push(':');
+        message.push_str(field);
+        message.push('\n');
+    }
+    message.push_str(&expires_at.to_string());
+    message
 }
 
 fn emby_direct_stream_resource(
@@ -1478,8 +1560,8 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
     use super::{
-        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, apply_server_capabilities,
-        choose_plan_for_policy, unix_timestamp,
+        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, SessionStartLocks,
+        apply_server_capabilities, choose_plan_for_policy, emby_hls_start_key, unix_timestamp,
     };
     use crate::{
         application::{
@@ -1502,6 +1584,83 @@ mod tests {
         storage::{NewWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim},
     };
     use uuid::Uuid;
+
+    #[tokio::test]
+    async fn session_start_locks_serialize_one_source_without_blocking_others() {
+        let locks = SessionStartLocks::default();
+        let first = locks
+            .lock(&emby_hls_start_key("user", "item", "source-a"))
+            .await;
+        let other = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            locks.lock(&emby_hls_start_key("user", "item", "source-b")),
+        )
+        .await
+        .expect("an unrelated source must not wait for another start");
+        drop(other);
+        assert!(
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                locks.lock(&emby_hls_start_key("user", "item", "source-a")),
+            )
+            .await
+            .is_err(),
+            "the same source must serialize its starts"
+        );
+        drop(first);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            locks.lock(&emby_hls_start_key("user", "item", "source-a")),
+        )
+        .await
+        .expect("a released source start lock is available again");
+    }
+
+    #[test]
+    fn session_start_keys_keep_their_fields_separate() {
+        assert_ne!(
+            emby_hls_start_key("user", "item", "source"),
+            emby_hls_start_key("user", "item-s", "ource")
+        );
+        assert_ne!(
+            emby_hls_start_key("user", "item", "source"),
+            emby_hls_start_key("user-item", "", "source")
+        );
+    }
+
+    #[test]
+    fn legacy_signatures_still_verify_until_the_format_is_retired() {
+        let signer = ResourceSigner::random();
+        let expires_at = unix_timestamp() + 60;
+        let legacy = signer
+            .sign_legacy("session-1", "direct", expires_at)
+            .expect("sign");
+        assert!(signer.verify("session-1", "direct", expires_at, &legacy, unix_timestamp()));
+        assert!(!signer.verify("session-2", "direct", expires_at, &legacy, unix_timestamp()));
+    }
+
+    #[test]
+    fn signature_fields_cannot_be_shifted_by_embedded_newlines() {
+        let signer = ResourceSigner::random();
+        let expires_at = unix_timestamp() + 60;
+        let signature = signer
+            .sign("session-1", "direct\n1:x", expires_at)
+            .expect("sign");
+        assert!(!signer.verify(
+            "session-1",
+            "direct",
+            expires_at,
+            &signature,
+            unix_timestamp()
+        ));
+        assert!(signer.verify(
+            "session-1",
+            "direct\n1:x",
+            expires_at,
+            &signature,
+            unix_timestamp()
+        ));
+    }
 
     #[test]
     fn signatures_are_bound_to_the_session_resource_and_expiry() {
@@ -1770,6 +1929,72 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
+    async fn stop_refuses_sessions_owned_by_another_user() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let other = crate::auth::users::UserStore::new(database.clone())?
+            .create_user("other", "Other", "correct password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+        };
+        let owner_id = owner.id.to_string();
+        service
+            .database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "owned-session",
+                user_id: &owner_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:owned-session",
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at: unix_timestamp() + 900,
+                now: unix_timestamp(),
+            })
+            .await?;
+
+        let error = service
+            .stop("owned-session", &other.id.to_string())
+            .await
+            .expect_err("another user must not stop the session");
+        assert!(matches!(error, super::WebPlaybackSessionError::NotFound));
+        let stored = service
+            .database
+            .find_web_playback_session("owned-session")
+            .await?
+            .expect("session is still stored");
+        assert_eq!(stored.state, "ACTIVE");
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn stopped_events_release_server_hls_resources() -> Result<(), Box<dyn std::error::Error>>
     {
         let temp_dir = tempfile::tempdir()?;
@@ -1811,7 +2036,7 @@ mod tests {
                 config.config_dir.clone(),
                 script.to_string_lossy().into_owned(),
             ),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         service
@@ -1888,7 +2113,7 @@ mod tests {
             database: database.clone(),
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         let now = unix_timestamp();
@@ -2012,7 +2237,7 @@ while :; do sleep 1; done
                 config.config_dir.clone(),
                 script.to_string_lossy().into_owned(),
             ),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         let created = service
@@ -2160,7 +2385,7 @@ while :; do sleep 1; done
                 config.config_dir.clone(),
                 script.to_string_lossy().into_owned(),
             ),
-            emby_start_lock: Arc::new(tokio::sync::Mutex::new(())),
+            start_locks: SessionStartLocks::default(),
         };
         let user_id = user.id.to_string();
         let capabilities = PlaybackCapabilities {

@@ -23,6 +23,8 @@ import {
 import type { LucideIcon } from "lucide-react";
 import { ChangeEvent, DragEvent, FormEvent, useEffect, useRef, useState } from "react";
 import { LuxSelect } from "../../components/LuxSelect";
+import { ImageLevelPolicyEditor } from "./ImageLevelPolicyEditor";
+import { flatCountOptions, flatWidthOptions } from "./image-policy-presets";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminLibraryDeletionJob, AdminLibraryDeletionJobsPage, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaImageVariantCacheSettings, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
@@ -325,7 +327,8 @@ function GlobalStrategyPanel({
         <section className="lux-library-strategy-card lux-library-strategy-card-wide">
           <div className="lux-library-strategy-card-heading"><div><h3>图像抓取</h3></div><Image size={19} aria-hidden="true" /></div>
           <div className="lux-library-strategy-toggle-grid">
-            <StrategyToggle label="艺术图" description="背景和横向构图" checked={strategy.images.artwork} onChange={(checked) => updateImages("artwork", checked)} />
+            <StrategyToggle label="背景图" description="详情页背景与剧照栏（FANART/backdrop）" checked={strategy.images.backdrop !== false} onChange={(checked) => updateImages("backdrop", checked)} />
+            <StrategyToggle label="艺术图 Art" description="Emby Art 类型；Web 不展示，仅部分客户端使用" checked={strategy.images.artwork} onChange={(checked) => updateImages("artwork", checked)} />
             <StrategyToggle label="横幅图" description="宽屏入口和合集" checked={strategy.images.banner} onChange={(checked) => updateImages("banner", checked)} />
             <StrategyToggle label="徽标" description="透明标题标识" checked={strategy.images.logo} onChange={(checked) => updateImages("logo", checked)} />
             <StrategyToggle label="光盘封面" description="光盘样式封面图" checked={strategy.images.disc} onChange={(checked) => updateImages("disc", checked)} />
@@ -336,8 +339,8 @@ function GlobalStrategyPanel({
             onChange={(thumbnailScrapingMode) => updateImages("thumbnailScrapingMode", thumbnailScrapingMode)}
           />
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
-            <label>每项最大背景图数量<input type="number" min="0" max="20" value={strategy.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))} /></label>
-            <label>最小下载宽度<input type="number" min="0" max="8192" step="128" value={strategy.images.minDownloadWidth} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))} /><small>设为 0 表示不限制</small></label>
+            <label>每项最大背景图数量<select aria-label="每项最大背景图数量" value={String(strategy.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(strategy.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>0 张表示不下载背景图</small></label>
+            <label>最小下载宽度<select aria-label="最小下载宽度" value={String(strategy.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(strategy.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>“不限”表示不限制</small></label>
           </div>
           <div className="lux-setting-divider" />
           <div className="lux-library-strategy-image-variants">
@@ -353,6 +356,16 @@ function GlobalStrategyPanel({
               <label>生成并发<input type="number" min="1" max="4" value={variantCache.concurrency} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ concurrency: Math.min(4, Math.max(1, Number(event.target.value) || 1)) })} /><small>1 – 4，默认 2</small></label>
             </div>
           </div>
+        </section>
+
+        <section className="lux-library-strategy-card lux-library-strategy-card-wide">
+          <div className="lux-library-strategy-card-heading"><div><h3>分层图片策略</h3><small>电影 / 剧集 / 季度 / 单集</small></div><Settings2 size={19} aria-hidden="true" /></div>
+          <ImageLevelPolicyEditor
+            images={strategy.images}
+            inheritLabel="默认"
+            emptySummary="全部默认"
+            onChange={(images) => onChange({ ...strategy, images })}
+          />
         </section>
 
         <section className="lux-library-strategy-card">
@@ -414,9 +427,10 @@ function StrategySelect({ label, value, options, onChange }: { label: string; va
 
 function estimateStrategyStorage(strategy: MediaStrategySettings) {
   const thumbnailsEnabled = (strategy.images.thumbnailScrapingMode ?? "SCRAPER_FIRST") !== "NONE";
-  const enabledTypes = [strategy.images.poster && thumbnailsEnabled, strategy.images.artwork, strategy.images.banner, strategy.images.logo, strategy.images.thumbnail && thumbnailsEnabled, strategy.images.disc, strategy.images.wallpaper].filter(Boolean).length;
-  const extraBackdrops = strategy.images.artwork || strategy.images.banner || strategy.images.wallpaper ? Math.max(0, strategy.images.maxBackdropCount - 1) : 0;
-  const imagesPerItem = enabledTypes + extraBackdrops;
+  const enabledTypes = [strategy.images.poster && thumbnailsEnabled, strategy.images.backdrop !== false, strategy.images.artwork, strategy.images.banner, strategy.images.logo, strategy.images.thumbnail && thumbnailsEnabled, strategy.images.disc, strategy.images.wallpaper].filter(Boolean).length;
+  const extraBackdrops = strategy.images.backdrop !== false ? Math.max(0, Math.min(4, strategy.images.maxBackdropCount) - 1) : 0;
+  const levelOverrides = Object.values(strategy.images.levels ?? {}).reduce((total, level) => total + Object.keys(level?.artworks ?? {}).length, 0);
+  const imagesPerItem = enabledTypes + extraBackdrops + (levelOverrides > 0 ? 0.5 : 0);
   return { imagesPerItem, storage: `${Math.max(0.1, imagesPerItem * 1.8).toFixed(1)} GB` };
 }
 
@@ -687,7 +701,8 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
     </div>
     {mode === "custom" ? <>
       <div className="lux-library-override-toggles">
-        <StrategyToggle label="艺术图" checked={draft.images.artwork} onChange={(checked) => updateImages("artwork", checked)} />
+        <StrategyToggle label="背景图" checked={draft.images.backdrop !== false} onChange={(checked) => updateImages("backdrop", checked)} />
+        <StrategyToggle label="艺术图 Art" checked={draft.images.artwork} onChange={(checked) => updateImages("artwork", checked)} />
         <StrategyToggle label="横幅图" checked={draft.images.banner} onChange={(checked) => updateImages("banner", checked)} />
         <StrategyToggle label="徽标" checked={draft.images.logo} onChange={(checked) => updateImages("logo", checked)} />
         <StrategyToggle label="光盘封面" checked={draft.images.disc} onChange={(checked) => updateImages("disc", checked)} />
@@ -700,9 +715,15 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
       />
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />
-        <label>最大背景图数量<input type="number" min="0" max="20" value={draft.images.maxBackdropCount} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))} /></label>
-        <label>最小下载宽度<input type="number" min="0" max="8192" step="128" value={draft.images.minDownloadWidth} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))} /></label>
+        <label>最大背景图数量<select aria-label="媒体库最大背景图数量" value={String(draft.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(draft.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        <label>最小下载宽度<select aria-label="媒体库最小下载宽度" value={String(draft.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(draft.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
       </div>
+      <ImageLevelPolicyEditor
+        images={draft.images}
+        inheritLabel="跟随本库"
+        emptySummary="全部跟随本库"
+        onChange={(images) => setDraft((current) => ({ ...current, images }))}
+      />
     </> : <p className="lux-admin-muted lux-library-override-inherit-copy">当前使用全局默认：{globalStrategy.metadataLanguage} · {globalStrategy.images.minDownloadWidth || "不限"} px · {globalStrategy.images.maxBackdropCount} 张背景图。</p>}
     {error ? <p className="lux-error-copy">{error}</p> : null}
     <div className="lux-library-override-actions"><span>{saved ? "策略覆盖已保存" : "覆盖只影响当前媒体库"}</span><button className="lux-library-toolbar-button" type="button" onClick={() => void save()} disabled={saved && mode === "inherit"}><Save size={14} /> {saved ? "已保存" : "保存策略"}</button></div>

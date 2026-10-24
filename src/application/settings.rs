@@ -1,4 +1,8 @@
-use std::{collections::HashSet, io::Write, path::Path};
+use std::{
+    collections::{BTreeMap, HashSet},
+    io::Write,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +94,8 @@ pub(crate) struct MediaStrategySettings {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MediaImageStrategySettings {
     pub(crate) poster: bool,
+    #[serde(default = "default_backdrop_enabled")]
+    pub(crate) backdrop: bool,
     pub(crate) artwork: bool,
     pub(crate) banner: bool,
     pub(crate) logo: bool,
@@ -106,6 +112,63 @@ pub(crate) struct MediaImageStrategySettings {
     pub(crate) min_download_width: i64,
     #[serde(default)]
     pub(crate) variant_cache: ImageVariantCacheSettings,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) levels: BTreeMap<String, MediaImageLevelSettings>,
+}
+
+pub(crate) const IMAGE_LEVEL_KEYS: [&str; 4] = ["movie", "series", "season", "episode"];
+pub(crate) const IMAGE_TYPE_KEYS: [&str; 8] = [
+    "poster",
+    "backdrop",
+    "artwork",
+    "logo",
+    "thumbnail",
+    "banner",
+    "disc",
+    "wallpaper",
+];
+pub(crate) const ARTWORK_SOURCE_KEYS: [&str; 2] = ["SCRAPER", "SCREENSHOT"];
+pub(crate) const SCRAPER_ROLE_KEYS: [&str; 3] = ["PRIMARY", "BACKUP", "SUPPLEMENT"];
+pub(crate) const ARTWORK_OVERWRITE_KEYS: [&str; 4] = ["INHERIT", "KEEP", "FILL", "OVERWRITE"];
+pub(crate) const EPISODE_IMAGE_POLICY_KEYS: [&str; 3] =
+    ["SCRAPER_STILL", "LOCAL_SCREENSHOT", "NONE"];
+pub(crate) const THUMBNAIL_SCRAPING_MODE_KEYS: [&str; 3] =
+    ["NONE", "SCREENSHOT_FIRST", "SCRAPER_FIRST"];
+
+/// Per image-type overrides for one media level (movie/series/season/episode).
+///
+/// Every field is optional so an unset field keeps inheriting the flat image
+/// settings, which are the pre-existing global/per-library switches.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ArtworkPolicySettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) sources: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) scraper_roles: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) overwrite: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_count: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) min_width: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct MediaImageLevelSettings {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) thumbnail_scraping_mode: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) episode_image_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub(crate) artworks: BTreeMap<String, ArtworkPolicySettings>,
+}
+
+pub(crate) fn default_backdrop_enabled() -> bool {
+    true
 }
 
 pub(crate) const MIN_IMAGE_VARIANT_CACHE_FILES: u64 = 100;
@@ -169,6 +232,7 @@ impl Default for MediaStrategySettings {
             apply_scope: "NEW_CONTENT".to_owned(),
             images: MediaImageStrategySettings {
                 poster: true,
+                backdrop: true,
                 artwork: false,
                 banner: false,
                 logo: true,
@@ -178,9 +242,10 @@ impl Default for MediaStrategySettings {
                 disc: false,
                 wallpaper: false,
                 write_to_metadata: false,
-                max_backdrop_count: 1,
+                max_backdrop_count: 4,
                 min_download_width: 1280,
                 variant_cache: ImageVariantCacheSettings::default(),
+                levels: BTreeMap::new(),
             },
             subtitles: MediaSubtitleStrategySettings {
                 auto_download: false,
@@ -807,19 +872,62 @@ pub(crate) fn validate_media_strategy(settings: &MediaStrategySettings) -> bool 
             .as_deref()
             .map(valid_plugin_id)
             .unwrap_or(true)
-        && matches!(
-            settings.images.thumbnail_scraping_mode.as_str(),
-            "NONE" | "SCREENSHOT_FIRST" | "SCRAPER_FIRST"
-        )
+        && THUMBNAIL_SCRAPING_MODE_KEYS.contains(&settings.images.thumbnail_scraping_mode.as_str())
         && (0..=20).contains(&settings.images.max_backdrop_count)
         && (0..=8192).contains(&settings.images.min_download_width)
         && settings.images.variant_cache.is_valid()
+        && settings
+            .images
+            .levels
+            .iter()
+            .all(|(level, value)| valid_image_level(level, value))
         && (1..=8).contains(&settings.subtitles.languages.len())
         && settings
             .subtitles
             .languages
             .iter()
             .all(|value| valid_strategy_code(value, 32))
+}
+
+fn valid_image_level(level: &str, value: &MediaImageLevelSettings) -> bool {
+    IMAGE_LEVEL_KEYS.contains(&level)
+        && value
+            .thumbnail_scraping_mode
+            .as_deref()
+            .is_none_or(|mode| THUMBNAIL_SCRAPING_MODE_KEYS.contains(&mode))
+        && value
+            .episode_image_policy
+            .as_deref()
+            .is_none_or(|policy| EPISODE_IMAGE_POLICY_KEYS.contains(&policy))
+        && (level == "episode" || value.episode_image_policy.is_none())
+        && value
+            .artworks
+            .iter()
+            .all(|(image_type, policy)| valid_artwork_policy(image_type, policy))
+}
+
+fn valid_artwork_policy(image_type: &str, policy: &ArtworkPolicySettings) -> bool {
+    IMAGE_TYPE_KEYS.contains(&image_type)
+        && valid_key_list(policy.sources.as_deref(), &ARTWORK_SOURCE_KEYS)
+        && valid_key_list(policy.scraper_roles.as_deref(), &SCRAPER_ROLE_KEYS)
+        && policy
+            .overwrite
+            .as_deref()
+            .is_none_or(|overwrite| ARTWORK_OVERWRITE_KEYS.contains(&overwrite))
+        && policy
+            .max_count
+            .is_none_or(|count| (0..=20).contains(&count))
+        && policy
+            .min_width
+            .is_none_or(|width| (0..=8192).contains(&width))
+}
+
+fn valid_key_list(value: Option<&[String]>, allowed: &[&str]) -> bool {
+    value.is_none_or(|values| {
+        !values.is_empty()
+            && values.iter().all(|value| allowed.contains(&value.as_str()))
+            && values.iter().collect::<HashSet<_>>().len() == values.len()
+    })
 }
 
 pub(crate) struct AdminSettingsWrite<'a> {
@@ -1030,5 +1138,194 @@ mod variant_cache_tests {
         assert!(!validate_media_strategy(&settings));
         settings.images.variant_cache.concurrency = 4;
         assert!(validate_media_strategy(&settings));
+    }
+}
+
+#[cfg(test)]
+mod image_level_tests {
+    use super::*;
+
+    fn policy(enabled: Option<bool>) -> ArtworkPolicySettings {
+        ArtworkPolicySettings {
+            enabled,
+            ..ArtworkPolicySettings::default()
+        }
+    }
+
+    #[test]
+    fn legacy_image_settings_default_the_backdrop_switch_on() {
+        let value = serde_json::json!({
+            "metadataLanguage": "zh-CN",
+            "imageLanguage": "zh-CN",
+            "region": "CN",
+            "scraperId": null,
+            "applyScope": "NEW_CONTENT",
+            "images": {
+                "poster": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 1,
+                "minDownloadWidth": 1280
+            },
+            "subtitles": {
+                "autoDownload": false,
+                "languages": ["zh-CN"],
+                "forcedOnly": false,
+                "hearingImpaired": false
+            }
+        });
+        let settings: MediaStrategySettings = serde_json::from_value(value).expect("legacy json");
+        assert!(settings.images.backdrop);
+        assert!(settings.images.levels.is_empty());
+        assert!(validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn default_settings_keep_backdrops_on_and_artwork_off() {
+        let settings = MediaStrategySettings::default();
+        assert!(settings.images.backdrop);
+        assert!(!settings.images.artwork);
+        assert!(settings.images.levels.is_empty());
+        assert!(validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn empty_levels_are_omitted_from_serialized_settings() {
+        let value = serde_json::to_value(MediaStrategySettings::default()).expect("serialize");
+        assert!(value["images"].get("levels").is_none());
+        assert_eq!(value["images"]["backdrop"], serde_json::Value::Bool(true));
+    }
+
+    #[test]
+    fn valid_level_overrides_are_accepted() {
+        let mut settings = MediaStrategySettings::default();
+        settings.images.levels.insert(
+            "episode".to_owned(),
+            MediaImageLevelSettings {
+                thumbnail_scraping_mode: Some("SCREENSHOT_FIRST".to_owned()),
+                episode_image_policy: Some("LOCAL_SCREENSHOT".to_owned()),
+                artworks: BTreeMap::from([(
+                    "poster".to_owned(),
+                    ArtworkPolicySettings {
+                        enabled: Some(false),
+                        sources: Some(vec!["SCRAPER".to_owned(), "SCREENSHOT".to_owned()]),
+                        scraper_roles: Some(vec!["PRIMARY".to_owned()]),
+                        overwrite: Some("FILL".to_owned()),
+                        max_count: Some(1),
+                        min_width: Some(720),
+                    },
+                )]),
+            },
+        );
+        settings.images.levels.insert(
+            "season".to_owned(),
+            MediaImageLevelSettings {
+                artworks: BTreeMap::from([("backdrop".to_owned(), policy(Some(false)))]),
+                ..MediaImageLevelSettings::default()
+            },
+        );
+        assert!(validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn unknown_levels_and_types_are_rejected() {
+        let mut settings = MediaStrategySettings::default();
+        settings
+            .images
+            .levels
+            .insert("collection".to_owned(), MediaImageLevelSettings::default());
+        assert!(!validate_media_strategy(&settings));
+
+        let mut settings = MediaStrategySettings::default();
+        settings.images.levels.insert(
+            "movie".to_owned(),
+            MediaImageLevelSettings {
+                artworks: BTreeMap::from([("scene".to_owned(), policy(Some(true)))]),
+                ..MediaImageLevelSettings::default()
+            },
+        );
+        assert!(!validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn invalid_override_values_are_rejected() {
+        let invalid = [
+            ArtworkPolicySettings {
+                sources: Some(vec!["EMBEDDED".to_owned()]),
+                ..ArtworkPolicySettings::default()
+            },
+            ArtworkPolicySettings {
+                sources: Some(Vec::new()),
+                ..ArtworkPolicySettings::default()
+            },
+            ArtworkPolicySettings {
+                sources: Some(vec!["SCRAPER".to_owned(), "SCRAPER".to_owned()]),
+                ..ArtworkPolicySettings::default()
+            },
+            ArtworkPolicySettings {
+                scraper_roles: Some(vec!["FALLBACK".to_owned()]),
+                ..ArtworkPolicySettings::default()
+            },
+            ArtworkPolicySettings {
+                overwrite: Some("REPLACE".to_owned()),
+                ..ArtworkPolicySettings::default()
+            },
+            ArtworkPolicySettings {
+                max_count: Some(21),
+                ..ArtworkPolicySettings::default()
+            },
+            ArtworkPolicySettings {
+                min_width: Some(8193),
+                ..ArtworkPolicySettings::default()
+            },
+        ];
+        for policy in invalid {
+            let mut settings = MediaStrategySettings::default();
+            settings.images.levels.insert(
+                "movie".to_owned(),
+                MediaImageLevelSettings {
+                    artworks: BTreeMap::from([("poster".to_owned(), policy)]),
+                    ..MediaImageLevelSettings::default()
+                },
+            );
+            assert!(!validate_media_strategy(&settings));
+        }
+    }
+
+    #[test]
+    fn episode_image_policy_is_only_allowed_on_the_episode_level() {
+        let mut settings = MediaStrategySettings::default();
+        settings.images.levels.insert(
+            "season".to_owned(),
+            MediaImageLevelSettings {
+                episode_image_policy: Some("NONE".to_owned()),
+                ..MediaImageLevelSettings::default()
+            },
+        );
+        assert!(!validate_media_strategy(&settings));
+
+        let mut settings = MediaStrategySettings::default();
+        settings.images.levels.insert(
+            "episode".to_owned(),
+            MediaImageLevelSettings {
+                episode_image_policy: Some("SCRAPER_STILL".to_owned()),
+                ..MediaImageLevelSettings::default()
+            },
+        );
+        assert!(validate_media_strategy(&settings));
+    }
+
+    #[test]
+    fn unknown_override_fields_are_rejected() {
+        let raw = serde_json::json!({
+            "artworks": { "poster": { "enable": true } }
+        });
+        assert!(serde_json::from_value::<MediaImageLevelSettings>(raw).is_err());
     }
 }

@@ -3143,6 +3143,14 @@ async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
 
     let database = Database::connect(&config).await?;
     assert!(database.schema_version().await? >= 190);
+    // 0165 stamps the legacy cooldown relative to the migration time. Read it right away: the
+    // assertions below can take seconds under parallel test load and would shrink the window.
+    let legacy_retry_cooldown: i64 = sqlx::query_scalar(
+        "SELECT CAST(value AS INTEGER) - unixepoch() FROM server_settings
+         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
+    )
+    .fetch_one(database.pool())
+    .await?;
     let jobs: Vec<(String, String, i64, i64, i64, i64)> = sqlx::query_as(
         "SELECT jobs.id, jobs.status, jobs.processed_count, jobs.total_count,
                 items.automatic_retry_count, items.automatic_retry_consumed
@@ -3205,13 +3213,13 @@ async fn sqlite_fill_missing_retry_migration_uses_single_legacy_cooldown_state()
         item_update_count, 0,
         "0165 must not rewrite historical job items"
     );
-    let legacy_retry_cooldown: i64 = sqlx::query_scalar(
-        "SELECT CAST(value AS INTEGER) - unixepoch() FROM server_settings
-         WHERE key = 'metadata_fill_missing_legacy_retry_after'",
-    )
-    .fetch_one(database.pool())
-    .await?;
-    assert!((299..=300).contains(&legacy_retry_cooldown));
+    // 0165 records one shared cooldown of 300 seconds. Creating and migrating the database can
+    // take seconds while other tests run in parallel, so allow for elapsed time instead of
+    // pinning the remaining seconds to 299..=300.
+    assert!(
+        (280..=300).contains(&legacy_retry_cooldown),
+        "cooldown={legacy_retry_cooldown}"
+    );
     database.close().await;
     Ok(())
 }

@@ -10,6 +10,8 @@ use crate::{
     storage::{Database, StorageError, StoredItemImage, StoredItemImagePathConflict},
 };
 
+const EPISODE_IMAGE_PATH_REPAIR_MARKER: &str = "startup_repair_episode_image_paths_v1";
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct EpisodeImagePathRepairReport {
     pub repaired: usize,
@@ -19,6 +21,12 @@ pub struct EpisodeImagePathRepairReport {
 pub async fn repair_episode_image_path_conflicts(
     database: &Database,
 ) -> Result<EpisodeImagePathRepairReport, StorageError> {
+    if database
+        .startup_repair_completed(EPISODE_IMAGE_PATH_REPAIR_MARKER)
+        .await?
+    {
+        return Ok(EpisodeImagePathRepairReport::default());
+    }
     let conflicts = database.list_item_image_path_conflicts().await?;
     let mut groups = HashMap::<(String, String), Vec<StoredItemImagePathConflict>>::new();
     for conflict in conflicts {
@@ -127,6 +135,9 @@ pub async fn repair_episode_image_path_conflicts(
             report.skipped = report.skipped.saturating_add(1);
         }
     }
+    database
+        .mark_startup_repair_completed(EPISODE_IMAGE_PATH_REPAIR_MARKER)
+        .await?;
     Ok(report)
 }
 

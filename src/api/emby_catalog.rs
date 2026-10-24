@@ -3,7 +3,7 @@ use crate::application::playback::session::EMBY_DIRECT_STREAM_TICKET_VERSION;
 use tokio::{sync::Semaphore, task::JoinSet};
 
 const EMBY_ITEM_EXTRA_CONCURRENCY: usize = 8;
-const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = 4_096;
+const EMBY_SHOW_EPISODE_DEFAULT_LIMIT: i64 = EMBY_MAX_PAGE_LIMIT;
 const EMBY_MAX_PAGE_LIMIT: i64 = 1_000;
 
 use crate::application::catalog::CatalogItemCounts;
@@ -935,7 +935,7 @@ pub(super) async fn emby_library_order_scope(
         .access
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let mut library_ids = access
+    let library_ids = access
         .accessible_library_ids(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -943,14 +943,42 @@ pub(super) async fn emby_library_order_scope(
         .catalog
         .as_ref()
         .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
-    let collections = catalog
-        .list_global_collection_cards(principal, 0, 1)
+    let content_restrictions = catalog
+        .content_restrictions_for_principal(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    if collections.total > 0 {
+    emby_library_order_scope_with_access(
+        state,
+        principal,
+        library_ids,
+        content_restrictions.as_ref(),
+    )
+    .await
+}
+
+/// Resolves the Emby library scope when the caller already batched the accessible libraries and
+/// the content restrictions of the page.
+pub(super) async fn emby_library_order_scope_with_access(
+    state: &AppState,
+    principal: AccessPrincipal,
+    accessible_library_ids: Vec<String>,
+    content_restrictions: Option<&crate::storage::UserContentRestrictions>,
+) -> Result<(Vec<String>, i64), StatusCode> {
+    let catalog = state
+        .catalog
+        .as_ref()
+        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    // Only the total decides whether the collection library is part of the scope; building a
+    // card for it would assemble catalog rows nobody reads.
+    let collection_count = catalog
+        .count_global_collection_cards_with_restrictions(principal, content_restrictions)
+        .await
+        .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    let mut library_ids = accessible_library_ids;
+    if collection_count > 0 {
         library_ids.push(GLOBAL_COLLECTION_LIBRARY_ID.to_owned());
     }
-    Ok((library_ids, collections.total))
+    Ok((library_ids, collection_count))
 }
 
 fn emby_global_collection_library_json(server_id: &str, child_count: i64) -> Value {
@@ -1830,6 +1858,32 @@ async fn load_emby_item_extras(
     if items.is_empty() || (!include_nfo && !include_people) {
         return extras;
     }
+
+    // One query for the whole page instead of one per item.
+    if include_nfo && let Some(store) = local_nfo.as_ref() {
+        let item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        match store.read_items(&item_ids).await {
+            Ok(details) => {
+                for (index, item) in items.iter().enumerate() {
+                    extras[index].0 = details.get(&item.id).cloned();
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "derived local NFO cache is unavailable for Emby list response"
+                );
+            }
+        }
+    }
+
+    if !include_people {
+        return extras;
+    }
+    let Some(people) = people else {
+        return extras;
+    };
+    // Actor relations are file-backed, so they stay per item but remain concurrency-bounded.
     let semaphore = Arc::new(Semaphore::new(EMBY_ITEM_EXTRA_CONCURRENCY));
     let mut tasks = JoinSet::new();
     for (index, item) in items.iter().enumerate() {
@@ -1838,53 +1892,27 @@ async fn load_emby_item_extras(
             Err(_) => break,
         };
         let item_id = item.id.clone();
-        let local_nfo = local_nfo.clone();
         let people = people.clone();
         tasks.spawn(async move {
             let _permit = permit;
-            let nfo = if include_nfo {
-                match local_nfo {
-                    Some(store) => match store.read_item(&item_id).await {
-                        Ok(details) => details,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %item_id,
-                                %error,
-                                "derived local NFO cache is unavailable for Emby list response"
-                            );
-                            None
-                        }
-                    },
-                    None => None,
+            let actors = match people.list_item_actors(&item_id).await {
+                Ok(actors) => actors,
+                Err(error) => {
+                    tracing::warn!(
+                        item_id = %item_id,
+                        %error,
+                        "derived actor relation is unavailable for Emby list response"
+                    );
+                    Vec::new()
                 }
-            } else {
-                None
             };
-            let actors = if include_people {
-                match people {
-                    Some(people) => match people.list_item_actors(&item_id).await {
-                        Ok(actors) => actors,
-                        Err(error) => {
-                            tracing::warn!(
-                                item_id = %item_id,
-                                %error,
-                                "derived actor relation is unavailable for Emby list response"
-                            );
-                            Vec::new()
-                        }
-                    },
-                    None => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            };
-            (index, nfo, actors)
+            (index, actors)
         });
     }
     while let Some(result) = tasks.join_next().await {
         match result {
-            Ok((index, nfo, actors)) if index < extras.len() => {
-                extras[index] = (nfo, actors);
+            Ok((index, actors)) if index < extras.len() => {
+                extras[index].1 = actors;
             }
             Ok(_) => {}
             Err(error) => {
@@ -3308,8 +3336,17 @@ pub(super) fn emby_person_image_tag(person_id: &str) -> String {
 
 pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(50);
-    let count_only = limit == 0 && query.enable_total_record_count == Some(true);
+    // `Limit=0` means "no explicit limit": count-only when totals were requested, otherwise the
+    // endpoint default. Rejecting it would break clients that send the Emby default verbatim.
+    let count_only = query.limit == Some(0) && query.enable_total_record_count == Some(true);
+    let limit = if count_only {
+        0
+    } else {
+        match query.limit {
+            Some(value) if value > 0 => value,
+            _ => 50,
+        }
+    };
     if offset < 0 || (!count_only && !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit)) {
         return Err(StatusCode::BAD_REQUEST);
     }
@@ -3317,13 +3354,8 @@ pub(super) fn emby_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), Sta
 }
 
 fn emby_catalog_items_page_params(query: &EmbyItemsQuery) -> Result<(i64, i64), StatusCode> {
-    let offset = query.start_index.unwrap_or(0);
-    if offset < 0 {
-        return Err(StatusCode::BAD_REQUEST);
-    }
-    if query.limit == Some(0) && query.enable_total_record_count != Some(true) {
-        return Ok((offset, EMBY_MAX_PAGE_LIMIT));
-    }
+    // `Limit=0` is handled exactly once, by `emby_page_params`, so every item endpoint agrees:
+    // it is a count-only request when totals are requested and a bad request otherwise.
     emby_page_params(query)
 }
 
@@ -3331,12 +3363,11 @@ pub(super) fn emby_show_episode_page_params(
     query: &EmbyItemsQuery,
 ) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(EMBY_SHOW_EPISODE_DEFAULT_LIMIT);
-    if offset < 0
-        || query
-            .limit
-            .is_some_and(|limit| !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit))
-    {
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => EMBY_SHOW_EPISODE_DEFAULT_LIMIT,
+    };
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -3344,8 +3375,11 @@ pub(super) fn emby_show_episode_page_params(
 
 pub(super) fn emby_person_page_params(query: &EmbyPersonsQuery) -> Result<(i64, i64), StatusCode> {
     let offset = query.start_index.unwrap_or(0);
-    let limit = query.limit.unwrap_or(50);
-    if offset < 0 || limit < 1 {
+    let limit = match query.limit {
+        Some(value) if value > 0 => value,
+        _ => 50,
+    };
+    if offset < 0 || !(1..=EMBY_MAX_PAGE_LIMIT).contains(&limit) {
         return Err(StatusCode::BAD_REQUEST);
     }
     Ok((offset, limit))
@@ -3552,7 +3586,6 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         ("Id".to_owned(), json!(emby_public_id(&item.id))),
         ("ServerId".to_owned(), json!(server_id)),
         ("Type".to_owned(), json!(emby_item_type(&item.item_type))),
-        ("MediaType".to_owned(), json!("Video")),
         (
             "IsFolder".to_owned(),
             json!(matches!(
@@ -3575,6 +3608,11 @@ pub(super) fn emby_catalog_item_json_with_state_and_aspect_ratio(
         ),
         ("UserData".to_owned(), Value::Object(user_data)),
     ]);
+    // Emby reports a media type only for playable items; folders, series and box sets leave it
+    // null so clients do not treat them as videos.
+    if let Some(media_type) = emby_media_type(&item.item_type) {
+        object.insert("MediaType".to_owned(), json!(media_type));
+    }
 
     if fields.is_none() {
         object.extend([
@@ -4719,12 +4757,16 @@ pub(super) fn normalize_strm_http_location(value: &str) -> Option<HeaderValue> {
     HeaderValue::from_str(url.as_str()).ok()
 }
 
+/// Emby's `MediaType` is only set for playable items.
+fn emby_media_type(item_type: &str) -> Option<&'static str> {
+    match item_type {
+        "MOVIE" | "EPISODE" | "UNRESOLVED" | "VIDEO" => Some("Video"),
+        _ => None,
+    }
+}
+
 pub(super) fn emby_media_stream_json(stream: &crate::application::catalog::CatalogStream) -> Value {
-    let language = stream
-        .language
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("und");
+    let language = emby_language_code(stream.language.as_deref());
     let display_title = emby_media_stream_display_title(stream);
     let mut value = json!({
         "Index": stream.index,
@@ -4867,33 +4909,65 @@ fn emby_media_stream_display_title(stream: &crate::application::catalog::Catalog
     }
 }
 
+/// ISO 639-2/B code, ISO 639-1 alias and English name for the languages Lux maps explicitly.
+const EMBY_LANGUAGE_TABLE: &[(&str, &[&str], &str)] = &[
+    ("eng", &["en"], "English"),
+    ("chi", &["zh", "zho"], "Chinese"),
+    ("jpn", &["ja"], "Japanese"),
+    ("kor", &["ko"], "Korean"),
+    ("ara", &["ar"], "Arabic"),
+    ("deu", &["de", "ger"], "German"),
+    ("spa", &["es"], "Spanish"),
+    ("fra", &["fr", "fre"], "French"),
+    ("hin", &["hi"], "Hindi"),
+    ("ind", &["id"], "Indonesian"),
+    ("ita", &["it"], "Italian"),
+    ("nld", &["nl", "dut"], "Dutch"),
+    ("pol", &["pl"], "Polish"),
+    ("por", &["pt"], "Portuguese"),
+    ("rus", &["ru"], "Russian"),
+    ("tha", &["th"], "Thai"),
+    ("tur", &["tr"], "Turkish"),
+    ("vie", &["vi"], "Vietnamese"),
+];
+
+fn emby_language_entry(value: &str) -> Option<(&'static str, &'static str)> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let value = value.to_ascii_lowercase();
+    EMBY_LANGUAGE_TABLE
+        .iter()
+        .find_map(|(code, aliases, name)| {
+            (*code == value || aliases.contains(&value.as_str())).then_some((*code, *name))
+        })
+}
+
 fn emby_language_name(language: &str) -> Option<String> {
     let language = language.trim();
     if language.is_empty() || language.eq_ignore_ascii_case("und") {
         return None;
     }
-    let name = match language.to_ascii_lowercase().as_str() {
-        "en" | "eng" => "English",
-        "zh" | "chi" | "zho" => "Chinese",
-        "ja" | "jpn" => "Japanese",
-        "ko" | "kor" => "Korean",
-        "ar" | "ara" => "Arabic",
-        "de" | "deu" | "ger" => "German",
-        "es" | "spa" => "Spanish",
-        "fr" | "fra" | "fre" => "French",
-        "hi" | "hin" => "Hindi",
-        "id" | "ind" => "Indonesian",
-        "it" | "ita" => "Italian",
-        "nl" | "nld" | "dut" => "Dutch",
-        "pl" | "pol" => "Polish",
-        "pt" | "por" => "Portuguese",
-        "ru" | "rus" => "Russian",
-        "th" | "tha" => "Thai",
-        "tr" | "tur" => "Turkish",
-        "vi" | "vie" => "Vietnamese",
-        _ => return Some(language.to_owned()),
+    Some(
+        emby_language_entry(language)
+            .map(|(_, name)| name.to_owned())
+            .unwrap_or_else(|| language.to_owned()),
+    )
+}
+
+/// Emby clients expect an ISO 639-2/B code in `Language`; values outside the table are kept
+/// verbatim so unusual tracks are not mislabelled as undetermined.
+fn emby_language_code(language: Option<&str>) -> String {
+    let Some(language) = language.map(str::trim).filter(|value| !value.is_empty()) else {
+        return "und".to_owned();
     };
-    Some(name.to_owned())
+    if language.eq_ignore_ascii_case("und") {
+        return "und".to_owned();
+    }
+    emby_language_entry(language)
+        .map(|(code, _)| code.to_owned())
+        .unwrap_or_else(|| language.to_owned())
 }
 
 pub(super) fn normalize_emby_media_stream_detail(key: &str, value: &Value) -> Option<Value> {
@@ -5201,7 +5275,7 @@ pub(super) fn emby_library_type_options_json(
             "MinWidth": media_strategy.images.min_download_width,
         }));
     }
-    if media_strategy.images.max_backdrop_count > 0 {
+    if media_strategy.images.backdrop && media_strategy.images.max_backdrop_count > 0 {
         image_options.push(json!({
             "Type": "Backdrop",
             "Limit": media_strategy.images.max_backdrop_count,
@@ -5265,6 +5339,83 @@ pub(super) fn emby_stream_type(stream_type: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod page_params_tests {
+    use super::{
+        EMBY_MAX_PAGE_LIMIT, EmbyItemsQuery, EmbyPersonsQuery, emby_catalog_items_page_params,
+        emby_page_params, emby_person_page_params, emby_show_episode_page_params,
+    };
+    use axum::http::StatusCode;
+
+    #[test]
+    fn episode_pages_default_to_the_global_cap() {
+        let query = EmbyItemsQuery::default();
+        assert_eq!(
+            emby_show_episode_page_params(&query),
+            Ok((0, EMBY_MAX_PAGE_LIMIT))
+        );
+        let too_large = EmbyItemsQuery {
+            limit: Some(EMBY_MAX_PAGE_LIMIT + 1),
+            ..EmbyItemsQuery::default()
+        };
+        assert_eq!(
+            emby_show_episode_page_params(&too_large),
+            Err(StatusCode::BAD_REQUEST)
+        );
+    }
+
+    #[test]
+    fn zero_limit_is_count_only_or_the_endpoint_default_everywhere() {
+        let count_only = EmbyItemsQuery {
+            limit: Some(0),
+            enable_total_record_count: Some(true),
+            ..EmbyItemsQuery::default()
+        };
+        assert_eq!(emby_page_params(&count_only), Ok((0, 0)));
+        assert_eq!(emby_catalog_items_page_params(&count_only), Ok((0, 0)));
+
+        let zero = EmbyItemsQuery {
+            limit: Some(0),
+            ..EmbyItemsQuery::default()
+        };
+        assert_eq!(emby_page_params(&zero), Ok((0, 50)));
+        assert_eq!(
+            emby_catalog_items_page_params(&zero),
+            Ok((0, 50)),
+            "catalog items must agree with the shared page contract"
+        );
+        assert_eq!(
+            emby_show_episode_page_params(&zero),
+            Ok((0, EMBY_MAX_PAGE_LIMIT))
+        );
+    }
+
+    #[test]
+    fn person_pages_are_capped_like_every_other_list() {
+        let query = EmbyPersonsQuery {
+            limit: Some(EMBY_MAX_PAGE_LIMIT + 1),
+            ..EmbyPersonsQuery::default()
+        };
+        assert_eq!(
+            emby_person_page_params(&query),
+            Err(StatusCode::BAD_REQUEST)
+        );
+        let zero = EmbyPersonsQuery {
+            limit: Some(0),
+            ..EmbyPersonsQuery::default()
+        };
+        assert_eq!(emby_person_page_params(&zero), Ok((0, 50)));
+        let allowed = EmbyPersonsQuery {
+            limit: Some(EMBY_MAX_PAGE_LIMIT),
+            ..EmbyPersonsQuery::default()
+        };
+        assert_eq!(
+            emby_person_page_params(&allowed),
+            Ok((0, EMBY_MAX_PAGE_LIMIT))
+        );
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
@@ -5273,10 +5424,33 @@ mod tests {
 
     use super::{
         EmbyItemsQuery, catalog_filter_from_emby, emby_media_source_json_with_resolver,
-        emby_media_stream_json, emby_page_params, emby_playback_container_name,
+        emby_media_stream_json, emby_media_type, emby_page_params, emby_playback_container_name,
     };
 
     use crate::application::catalog::{CatalogSource, CatalogStream};
+
+    #[test]
+    fn languages_are_reported_with_iso639_2_codes() {
+        assert_eq!(super::emby_language_code(Some("en")), "eng");
+        assert_eq!(super::emby_language_code(Some("ENG")), "eng");
+        assert_eq!(super::emby_language_code(Some("zho")), "chi");
+        assert_eq!(super::emby_language_code(Some("de")), "deu");
+        assert_eq!(super::emby_language_code(Some("und")), "und");
+        assert_eq!(super::emby_language_code(None), "und");
+        assert_eq!(super::emby_language_code(Some("  ")), "und");
+        assert_eq!(super::emby_language_code(Some("tlh")), "tlh");
+    }
+
+    #[test]
+    fn only_playable_items_report_a_media_type() {
+        assert_eq!(emby_media_type("MOVIE"), Some("Video"));
+        assert_eq!(emby_media_type("EPISODE"), Some("Video"));
+        assert_eq!(emby_media_type("VIDEO"), Some("Video"));
+        assert_eq!(emby_media_type("SERIES"), None);
+        assert_eq!(emby_media_type("SEASON"), None);
+        assert_eq!(emby_media_type("BOX_SET"), None);
+        assert_eq!(emby_media_type("FOLDER"), None);
+    }
 
     #[test]
     fn emby_media_source_uses_filename_and_reports_quality_on_video_stream() {

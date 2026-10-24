@@ -2291,18 +2291,8 @@ fn sql_is_distinct(left: &str, right: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{config::Config, storage::Database};
+    use crate::storage::{Database, test_database};
     use uuid::Uuid;
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: temp_dir.path().join("config"),
-        })
-        .await?;
-        Ok((temp_dir, database))
-    }
 
     #[tokio::test]
     async fn unchanged_user_binding_does_not_refresh_its_timestamp()

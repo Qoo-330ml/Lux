@@ -19,6 +19,43 @@ use crate::{
 
 const SESSION_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 
+/// Upper bound for one access-rule snapshot; the per-user rule list is tiny in practice.
+const ACCESS_RULE_SNAPSHOT_LIMIT: i64 = 400;
+
+fn authenticated_session_from_stored(
+    stored: crate::storage::StoredWebSession,
+) -> Result<AuthenticatedSession, WebAuthError> {
+    let id = stored
+        .user_id
+        .parse()
+        .map_err(|error: uuid::Error| WebAuthError::InvalidUserId(error.to_string()))?;
+    Ok(AuthenticatedSession {
+        user: UserRecord {
+            id,
+            username_normalized: stored.username_normalized,
+            display_name: stored.display_name,
+            has_password: stored.has_password,
+            is_disabled: stored.is_disabled,
+            is_admin: stored.is_admin,
+            can_manage_server: stored.can_manage_server,
+            can_remote_access: stored.can_remote_access,
+            can_download: stored.can_download,
+            last_login_at: stored.last_login_at,
+            last_activity_at: stored.last_activity_at,
+        },
+        csrf_token_hash: stored.csrf_token_hash,
+        device_id: stored.device_id,
+    })
+}
+
+/// Outcome of resolving a web request principal.
+pub(crate) enum PrincipalResolution {
+    Unauthenticated,
+    /// A device or client rule blocks this session.
+    AccessDenied,
+    Session(AuthenticatedSession),
+}
+
 #[derive(Clone)]
 pub struct WebAuthService {
     database: Database,
@@ -144,11 +181,22 @@ impl WebAuthService {
         user_id: &UserId,
         current_password: &str,
         new_password: &str,
+        keep_session_token_hash: Option<&[u8]>,
     ) -> Result<bool, WebAuthError> {
         Ok(self
             .users
-            .change_password(user_id, current_password, new_password)
+            .change_password(
+                user_id,
+                current_password,
+                new_password,
+                keep_session_token_hash,
+            )
             .await?)
+    }
+
+    /// Hash of a raw web session token, used to keep the caller's session on password change.
+    pub(crate) fn session_token_hash(token: &str) -> Vec<u8> {
+        hash_token(token)
     }
 
     pub async fn resolve(
@@ -190,27 +238,66 @@ impl WebAuthService {
             self.logout(session_token).await?;
             return Ok(None);
         }
-        let id = stored
-            .user_id
-            .parse()
-            .map_err(|error: uuid::Error| WebAuthError::InvalidUserId(error.to_string()))?;
-        Ok(Some(AuthenticatedSession {
-            user: UserRecord {
-                id,
-                username_normalized: stored.username_normalized,
-                display_name: stored.display_name,
-                has_password: stored.has_password,
-                is_disabled: stored.is_disabled,
-                is_admin: stored.is_admin,
-                can_manage_server: stored.can_manage_server,
-                can_remote_access: stored.can_remote_access,
-                can_download: stored.can_download,
-                last_login_at: stored.last_login_at,
-                last_activity_at: stored.last_activity_at,
-            },
-            csrf_token_hash: stored.csrf_token_hash,
-            device_id: stored.device_id,
-        }))
+        Ok(Some(authenticated_session_from_stored(stored)?))
+    }
+
+    /// Resolves a request principal and evaluates every access rule in a single rules query.
+    ///
+    /// IP rules log the session out (as before); device and client rules deny the request but
+    /// keep the session, which is what the admin UI shows as a blocked client.
+    pub(crate) async fn resolve_principal(
+        &self,
+        session_token: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<PrincipalResolution, WebAuthError> {
+        let Some(stored) = self
+            .database
+            .find_web_session(&hash_token(session_token))
+            .await?
+        else {
+            return Ok(PrincipalResolution::Unauthenticated);
+        };
+        if stored.is_disabled {
+            return Ok(PrincipalResolution::Unauthenticated);
+        }
+        let rules = self
+            .database
+            .user_access_blacklist_rules_for_user(&stored.user_id, ACCESS_RULE_SNAPSHOT_LIMIT)
+            .await?;
+        let ip_rules = rules
+            .iter()
+            .filter(|(rule_type, _)| rule_type == "IP_CIDR")
+            .map(|(_, value)| value.clone())
+            .collect::<Vec<_>>();
+        if ip_rules.len() > MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST {
+            return Err(WebAuthError::AccessRulesUnavailable);
+        }
+        if !ip_rules.is_empty() {
+            let blocked = match client_ip {
+                Some(client_ip) => ip_blacklist_rules_match_address(client_ip, &ip_rules)
+                    .map_err(|_| WebAuthError::AccessRulesUnavailable)?,
+                // Without a resolvable client address the rule cannot be proven satisfied.
+                None => true,
+            };
+            if blocked {
+                self.logout(session_token).await?;
+                return Ok(PrincipalResolution::Unauthenticated);
+            }
+        }
+        let device_id = stored.device_id.as_deref();
+        let denied = rules
+            .iter()
+            .any(|(rule_type, value)| match rule_type.as_str() {
+                "DEVICE" => device_id == Some(value.as_str()),
+                "CLIENT" => "lux web" == value,
+                _ => false,
+            });
+        if denied {
+            return Ok(PrincipalResolution::AccessDenied);
+        }
+        Ok(PrincipalResolution::Session(
+            authenticated_session_from_stored(stored)?,
+        ))
     }
 
     async fn is_user_ip_blacklisted(
@@ -415,5 +502,106 @@ impl std::error::Error for WebAuthError {
             | Self::InvalidUserId(_)
             | Self::TokenGeneration(_) => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod principal_tests {
+    use super::{PrincipalResolution, WebAuthService};
+    use crate::{
+        application::setup::SetupService,
+        config::Config,
+        storage::{Database, NewUserAccessBlacklistRule},
+    };
+
+    async fn fixture()
+    -> Result<(Database, WebAuthService, String, String), Box<dyn std::error::Error>> {
+        let temp = Box::leak(Box::new(tempfile::tempdir()?));
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        })
+        .await?;
+        let admin = SetupService::new(database.clone())?
+            .complete("Admin", "Admin", "admin password")
+            .await?;
+        let service = WebAuthService::new(database.clone())?;
+        let session = service
+            .login_with_device("admin", "admin password", Some("device-1"))
+            .await?
+            .ok_or("login failed")?;
+        Ok((
+            database,
+            service,
+            session.session_token,
+            admin.id.to_string(),
+        ))
+    }
+
+    async fn add_rule(database: &Database, user_id: &str, rule_type: &str, value: &str) {
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: Box::leak(format!("rule-{rule_type}-{value}").into_boxed_str()),
+                user_id: Some(user_id),
+                rule_type,
+                match_value: value,
+                is_enabled: true,
+                created_by: Some(user_id),
+                created_at: 1,
+            })
+            .await
+            .expect("rule insert");
+    }
+
+    #[tokio::test]
+    async fn principal_resolution_evaluates_device_and_client_rules()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        let ip = Some("127.0.0.1".parse().expect("loopback"));
+
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+
+        add_rule(&database, &user_id, "CLIENT", "lux web").await;
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::AccessDenied
+        ));
+
+        database
+            .set_user_access_blacklist_rule_enabled(
+                crate::storage::UserAccessBlacklistRuleScope::User(&user_id),
+                "rule-CLIENT-lux web",
+                false,
+            )
+            .await?;
+        add_rule(&database, &user_id, "DEVICE", "device-1").await;
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::AccessDenied
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_resolution_logs_out_on_a_matching_ip_rule()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        add_rule(&database, &user_id, "IP_CIDR", "127.0.0.1/32").await;
+        assert!(matches!(
+            service
+                .resolve_principal(&token, Some("127.0.0.1".parse()?))
+                .await?,
+            PrincipalResolution::Unauthenticated
+        ));
+        assert!(
+            service
+                .resolve_principal(&token, Some("127.0.0.1".parse()?))
+                .await
+                .is_ok()
+        );
+        Ok(())
     }
 }

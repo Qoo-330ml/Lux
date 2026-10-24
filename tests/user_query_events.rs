@@ -78,7 +78,10 @@ async fn user_mutations_notify_other_web_sessions_after_persistence()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base}/api/v1/auth/login"))
         .json(&json!({"username":"admin", "password":"correct password"}))

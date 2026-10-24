@@ -4,7 +4,7 @@ use std::{
     net::{IpAddr, SocketAddr},
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -14,7 +14,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet, time::sleep};
+use tokio::{fs, net::lookup_host, sync::Mutex, task::JoinSet};
 use url::{Host, Url};
 
 use crate::application::{
@@ -36,7 +36,10 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_DELIVERY_ATTEMPTS: i64 = 8;
 const MAX_RETRY_DELAY_SECONDS: i64 = 7_200;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
-const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(1);
+const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+const HISTORY_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
+const HISTORY_RETENTION_SECONDS: i64 = 30 * 86_400;
+const HISTORY_RETENTION_BATCH_SIZE: i64 = 500;
 const DELIVERY_TIMEOUT: Duration = Duration::from_secs(10);
 const DELIVERY_CONCURRENCY: usize = 4;
 
@@ -146,6 +149,41 @@ pub struct WebhookService {
     secret_lock: Arc<Mutex<()>>,
     server_id: String,
     plugins: Option<PluginService>,
+    worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
+}
+
+async fn run_webhook_delivery_worker(
+    service: WebhookService,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    let mut last_retention_sweep: Option<Instant> = None;
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        if last_retention_sweep.is_none_or(|last| last.elapsed() >= HISTORY_RETENTION_INTERVAL) {
+            service.prune_history().await;
+            last_retention_sweep = Some(Instant::now());
+        }
+        match service.process_ready_deliveries().await {
+            Ok(count) if count == 0 => {
+                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
+                    .await
+                {
+                    return;
+                }
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::error!(%error, "webhook delivery worker iteration failed");
+                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
+                    .await
+                {
+                    return;
+                }
+            }
+        }
+    }
 }
 
 impl WebhookService {
@@ -157,6 +195,7 @@ impl WebhookService {
             secret_lock: Arc::new(Mutex::new(())),
             server_id,
             plugins: None,
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 
@@ -580,20 +619,62 @@ impl WebhookService {
         }
     }
 
-    pub fn spawn_worker(&self) {
+    /// Starts the delivery worker once and records its stop handle.
+    pub async fn spawn_worker(&self) {
+        let mut worker = self.worker.lock().await;
+        if worker.is_some() {
+            return;
+        }
         let service = self.clone();
-        tokio::spawn(async move {
-            loop {
-                match service.process_ready_deliveries().await {
-                    Ok(0) => sleep(DELIVERY_POLL_INTERVAL).await,
-                    Ok(_) => {}
-                    Err(error) => {
-                        tracing::error!(%error, "webhook delivery worker iteration failed");
-                        sleep(DELIVERY_POLL_INTERVAL).await;
+        *worker = Some(super::background_loop::BackgroundLoop::spawn(
+            "webhook_delivery",
+            move |shutdown| {
+                let service = service.clone();
+                async move { run_webhook_delivery_worker(service, shutdown).await }
+            },
+        ));
+    }
+
+    /// Stops the delivery worker and waits for its current iteration.
+    pub async fn shutdown(&self) {
+        let worker = self.worker.lock().await.take();
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
+    }
+
+    async fn prune_history(&self) {
+        let cutoff = unix_now().saturating_sub(HISTORY_RETENTION_SECONDS);
+        let mut deliveries = 0_u64;
+        let mut events = 0_u64;
+        for _ in 0..10 {
+            match self
+                .database
+                .prune_notification_history(cutoff, HISTORY_RETENTION_BATCH_SIZE)
+                .await
+            {
+                Ok((deleted_deliveries, deleted_events)) => {
+                    deliveries = deliveries.saturating_add(deleted_deliveries);
+                    events = events.saturating_add(deleted_events);
+                    if deleted_deliveries < u64::try_from(HISTORY_RETENTION_BATCH_SIZE).unwrap_or(0)
+                        && deleted_events < u64::try_from(HISTORY_RETENTION_BATCH_SIZE).unwrap_or(0)
+                    {
+                        break;
                     }
                 }
+                Err(error) => {
+                    tracing::warn!(%error, "webhook history retention sweep failed");
+                    break;
+                }
             }
-        });
+        }
+        if deliveries > 0 || events > 0 {
+            tracing::info!(
+                deliveries,
+                events,
+                "pruned expired webhook notification history"
+            );
+        }
     }
 
     pub async fn process_ready_deliveries(&self) -> Result<usize, WebhookError> {

@@ -14,6 +14,27 @@ use crate::storage::{
     PlaybackAdmissionResult, StoredWebPlaybackSession, WebPlaybackTranscodingDetails,
 };
 
+/// Resolves the privilege snapshot for a signed playback resource.
+///
+/// Signed asset URLs stay valid for twelve hours, far longer than a login session, so the
+/// `is_admin` column captured when the playback session was created must not outlive an
+/// administrator demotion. Read the user's current role instead: a demoted user loses the
+/// administrator bypass immediately and a disabled user loses the resource entirely.
+async fn playback_resource_principal(
+    database: Option<&crate::storage::Database>,
+    session: &StoredWebPlaybackSession,
+) -> Result<AccessPrincipal, StatusCode> {
+    let Some(database) = database else {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    };
+    let users = UserStore::new(database.clone()).map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    match users.find_by_id(&session.user_id).await {
+        Ok(Some(user)) if !user.is_disabled => Ok(AccessPrincipal::new(user.id, user.is_admin)),
+        Ok(Some(_)) | Ok(None) => Err(StatusCode::NOT_FOUND),
+        Err(_) => Err(StatusCode::SERVICE_UNAVAILABLE),
+    }
+}
+
 pub(super) async fn emby_playback_info(
     headers: HeaderMap,
     method: Method,
@@ -1717,7 +1738,7 @@ pub(super) async fn handle_emby_playback_event(
             occurred_at,
         ),
     );
-    let remote_ip = request_client_ip(&headers, &state.remote_access);
+    let remote_ip = request_client_ip(&headers, &state).await;
     let activity_remote_ip = remote_ip.as_deref().or_else(|| {
         previous_session
             .as_ref()
@@ -1911,11 +1932,7 @@ pub(super) fn playback_client_label(value: Option<&str>) -> &'static str {
 const PLAYBACK_WEBHOOK_PROGRESS_INTERVAL_SECONDS: i64 = 30;
 
 pub(super) fn current_unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or_default()
+    crate::clock::unix_timestamp()
 }
 
 pub(super) fn should_publish_playback_progress(
@@ -2809,6 +2826,15 @@ async fn web_playback_authorization_context(
     Ok((device_id, client_name))
 }
 
+/// Expiry stamped into signed asset URLs.
+///
+/// A playlist is fetched once and embeds these URLs, so the signature has to outlive a single
+/// heartbeat window; the live session row stays the actual authorization gate.
+fn web_playback_resource_expiry() -> i64 {
+    crate::application::playback::session::unix_timestamp()
+        .saturating_add(crate::application::playback::session::WEB_PLAYBACK_RESOURCE_TTL_SECONDS)
+}
+
 pub(super) fn web_playback_resource_url(
     service: &WebPlaybackSessionService,
     session_id: &str,
@@ -2868,7 +2894,7 @@ fn emby_transcoding_url(
     let signature = service.sign_resource(
         &session.id,
         &emby_hls_resource(segment_container, "index.m3u8"),
-        session.expires_at,
+        web_playback_resource_expiry(),
     )?;
     let public_item_id = emby_public_id(item_id);
     let tier = match &session.plan {
@@ -3402,7 +3428,7 @@ async fn serve_emby_transcoding_asset(
                     play_session_id: &session.play_session_id,
                     asset,
                     segment_container,
-                    expires_at: session.expires_at,
+                    expires_at: web_playback_resource_expiry(),
                 },
             )
         }) else {
@@ -3700,13 +3726,13 @@ async fn create_web_playback_session_json(
             };
             json!({
                 "type": "DIRECT",
-                "url": web_playback_resource_url(service, &created.id, "direct", created.expires_at),
+                "url": web_playback_resource_url(service, &created.id, "direct", web_playback_resource_expiry()),
                 "proxyUrl": proxy_url,
                 "rangeUrl": (source.source_kind == "STRM_URL"
                     && source.external_url.as_deref().is_some_and(|target| {
                         matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
                     }))
-                    .then(|| web_playback_range_url(service, &created.id, created.expires_at))
+                    .then(|| web_playback_range_url(service, &created.id, web_playback_resource_expiry()))
                     .flatten(),
             })
         }
@@ -3974,12 +4000,13 @@ pub(super) async fn lux_web_playback_direct(
     {
         return response;
     }
-    let Ok(user_id) = session.user_id.parse::<crate::domain::ids::UserId>() else {
-        return StatusCode::NOT_FOUND.into_response();
+    let principal = match playback_resource_principal(state.database.as_ref(), &session).await {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
     let response = serve_media_file(
         &state,
-        AccessPrincipal::new(user_id, session.is_admin),
+        principal,
         &headers,
         &method,
         &session.item_id,
@@ -4026,10 +4053,10 @@ pub(super) async fn lux_web_playback_range(
     let Some(range) = headers.get("range").and_then(|value| value.to_str().ok()) else {
         return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
     };
-    let Ok(user_id) = session.user_id.parse::<crate::domain::ids::UserId>() else {
-        return StatusCode::NOT_FOUND.into_response();
+    let principal = match playback_resource_principal(state.database.as_ref(), &session).await {
+        Ok(principal) => principal,
+        Err(status) => return status.into_response(),
     };
-    let principal = AccessPrincipal::new(user_id, session.is_admin);
     let Some(access) = state.access.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -4146,7 +4173,7 @@ pub(super) async fn lux_web_playback_hls(
             return StatusCode::BAD_GATEWAY.into_response();
         };
         let Some(manifest) = rewrite_hls_manifest(&manifest, |asset| {
-            web_playback_hls_url(service, &session_id, asset, session.expires_at)
+            web_playback_hls_url(service, &session_id, asset, web_playback_resource_expiry())
         }) else {
             if method == Method::GET {
                 let _ = service.stop(&session_id, &session.user_id).await;
@@ -4317,7 +4344,7 @@ pub(super) async fn lux_web_playback_event(
                 occurred_at,
             ),
         );
-        let remote_ip = request_client_ip(&headers, &state.remote_access);
+        let remote_ip = request_client_ip(&headers, &state).await;
         let activity_remote_ip = remote_ip.as_deref().or_else(|| {
             previous_session
                 .as_ref()
@@ -4568,7 +4595,7 @@ pub(super) async fn lux_post_progress(
             occurred_at,
         ),
     );
-    let remote_ip = request_client_ip(&headers, &state.remote_access);
+    let remote_ip = request_client_ip(&headers, &state).await;
     let activity_remote_ip = remote_ip.as_deref().or_else(|| {
         previous_session
             .as_ref()
@@ -4921,6 +4948,101 @@ mod emby_playback_tests {
     use crate::application::playback::hls::HlsSegmentContainer;
     use axum::{body::Bytes, extract::RawQuery};
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn signed_playback_resources_follow_the_current_administrator_role()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let users = crate::auth::users::UserStore::new(database.clone())?;
+        let user = users
+            .create_user(
+                "signed-resource",
+                "Signed Resource",
+                "password-for-tests",
+                true,
+            )
+            .await?;
+        let user_id = user.id.to_string();
+        let library = crate::application::libraries::LibraryService::new(database.clone())
+            .create_library("Signed playback", crate::library::LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('signed-resource-item', ?, 'MOVIE', 'Signed', 'signed', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let now = time::OffsetDateTime::now_utc().unix_timestamp();
+        database
+            .insert_web_playback_session(crate::storage::NewWebPlaybackSession {
+                id: "signed-resource-session",
+                user_id: &user_id,
+                item_id: "signed-resource-item",
+                media_source_id: None,
+                play_session_id: "lux-web:signed-resource-session",
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "DIRECT",
+                temp_dir: None,
+                is_admin: true,
+                expires_at: now + 900,
+                now,
+            })
+            .await?;
+        let session = database
+            .find_web_playback_session("signed-resource-session")
+            .await?
+            .ok_or("playback session")?;
+        assert!(session.is_admin);
+
+        let principal = super::playback_resource_principal(Some(&database), &session)
+            .await
+            .expect("active administrator keeps the resource");
+        assert!(principal.is_admin);
+
+        users
+            .create_user("other-admin", "Other Admin", "password-for-tests", true)
+            .await?;
+        users
+            .update_user(
+                &user_id,
+                crate::auth::users::UserUpdate {
+                    is_admin: Some(false),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let principal = super::playback_resource_principal(Some(&database), &session)
+            .await
+            .expect("demoted administrator keeps playback access");
+        assert!(
+            !principal.is_admin,
+            "the stored administrator snapshot must not outlive a demotion"
+        );
+
+        users
+            .update_user(
+                &user_id,
+                crate::auth::users::UserUpdate {
+                    is_disabled: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        assert!(
+            super::playback_resource_principal(Some(&database), &session)
+                .await
+                .is_err(),
+            "a disabled user loses signed playback resources"
+        );
+        Ok(())
+    }
 
     fn profile_source(container: &str, video_codec: &str, audio_codec: &str) -> CatalogSource {
         CatalogSource {
@@ -5571,5 +5693,29 @@ mod emby_playback_tests {
                 tier: ServerTier::HardwareTranscode,
             }
         );
+    }
+
+    #[test]
+    fn signed_asset_urls_outlive_one_heartbeat_window() {
+        use super::web_playback_resource_expiry;
+        use crate::application::playback::session::{
+            ResourceSigner, WEB_PLAYBACK_SESSION_TTL_SECONDS,
+        };
+
+        let signer = ResourceSigner::random();
+        let expires_at = web_playback_resource_expiry();
+        let signature = signer
+            .sign("session-1", "hls:segment_000000.m4s", expires_at)
+            .expect("resource signature");
+        // A playlist fetched at playback start is still usable after the first session window.
+        assert!(signer.verify(
+            "session-1",
+            "hls:segment_000000.m4s",
+            expires_at,
+            &signature,
+            crate::application::playback::session::unix_timestamp()
+                + WEB_PLAYBACK_SESSION_TTL_SECONDS
+                + 60,
+        ));
     }
 }

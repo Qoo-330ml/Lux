@@ -49,7 +49,10 @@ async fn login_me_logout_and_csrf_are_session_backed() -> Result<(), Box<dyn std
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -205,7 +208,10 @@ async fn authenticated_user_can_change_own_password() -> Result<(), Box<dyn std:
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -339,7 +345,10 @@ async fn avatar_upload_requires_csrf_and_survives_a_second_login()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server) = test_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let avatar = png_fixture()?;
 
     let setup = client

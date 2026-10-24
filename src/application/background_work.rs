@@ -49,6 +49,14 @@ impl BackgroundWorkStage {
         }
     }
 
+    /// Stages that walk the filesystem share a lane with the other directory pipeline stages.
+    const fn is_discovery_lane(self) -> bool {
+        matches!(
+            self,
+            Self::Discovery | Self::Fingerprint | Self::ManifestPreparation
+        )
+    }
+
     const fn as_str(self) -> &'static str {
         match self {
             Self::Discovery => "discovery",
@@ -136,17 +144,35 @@ impl Default for BudgetMetrics {
 pub(crate) struct BackgroundWorkBudget {
     capacity: usize,
     capacity_source: &'static str,
-    semaphore: Arc<Semaphore>,
+    /// Directory walking, fingerprinting, and manifest preparation can stall on a slow mount;
+    /// keeping them in their own lane stops them from starving probe/NFO/thumbnail work.
+    discovery_semaphore: Arc<Semaphore>,
+    media_semaphore: Arc<Semaphore>,
     metrics: Mutex<BudgetMetrics>,
 }
 
 impl BackgroundWorkBudget {
     fn with_capacity(capacity: usize, capacity_source: &'static str) -> Self {
         let capacity = capacity.clamp(1, MAX_BACKGROUND_BUDGET);
+        // Three fifths for the directory pipeline, the rest for per-item media work. A single
+        // slot cannot be split, so both lanes share it.
+        let (discovery_capacity, media_capacity) = if capacity < 2 {
+            (capacity, capacity)
+        } else {
+            let discovery = (capacity * 3 / 5).max(1);
+            (discovery, (capacity - discovery).max(1))
+        };
+        let discovery_semaphore = Arc::new(Semaphore::new(discovery_capacity));
+        let media_semaphore = if capacity < 2 {
+            Arc::clone(&discovery_semaphore)
+        } else {
+            Arc::new(Semaphore::new(media_capacity))
+        };
         Self {
             capacity,
             capacity_source,
-            semaphore: Arc::new(Semaphore::new(capacity)),
+            discovery_semaphore,
+            media_semaphore,
             metrics: Mutex::new(BudgetMetrics::default()),
         }
     }
@@ -156,7 +182,12 @@ impl BackgroundWorkBudget {
         stage: BackgroundWorkStage,
     ) -> Result<BackgroundWorkPermit, BackgroundWorkError> {
         let mut waiter = BackgroundWorkWaiter::new(Arc::clone(self), stage);
-        let permit = Arc::clone(&self.semaphore)
+        let semaphore = if stage.is_discovery_lane() {
+            Arc::clone(&self.discovery_semaphore)
+        } else {
+            Arc::clone(&self.media_semaphore)
+        };
+        let permit = semaphore
             .acquire_owned()
             .await
             .map_err(|_| BackgroundWorkError::Closed)?;
@@ -903,6 +934,41 @@ mod tests {
         assert!(snapshot.work_p50_ms.is_some());
         assert_eq!(snapshot.active_by_stage[0].0, "discovery");
         assert_eq!(snapshot.active_by_stage[5].0, "probe");
+    }
+
+    #[tokio::test]
+    async fn a_saturated_discovery_lane_does_not_starve_media_work() {
+        let budget = Arc::new(BackgroundWorkBudget::with_capacity(4, "test"));
+        let mut discovery_permits = Vec::new();
+        for _ in 0..2 {
+            discovery_permits.push(
+                budget
+                    .acquire(BackgroundWorkStage::Discovery)
+                    .await
+                    .expect("discovery permit"),
+            );
+        }
+        let waiting_budget = Arc::clone(&budget);
+        let blocked = tokio::spawn(async move {
+            waiting_budget
+                .acquire(BackgroundWorkStage::Discovery)
+                .await
+                .map(|_permit| ())
+        });
+
+        // The media lane keeps its own share even while the directory lane is full.
+        let media_permit = budget
+            .acquire(BackgroundWorkStage::Probe)
+            .await
+            .expect("probe permit");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), blocked)
+                .await
+                .is_err(),
+            "a third discovery permit must wait for the lane"
+        );
+        drop(media_permit);
+        drop(discovery_permits);
     }
 
     #[tokio::test]

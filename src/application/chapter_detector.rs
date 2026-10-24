@@ -32,7 +32,7 @@ use crate::{
     storage::{
         ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate, Database,
         NewChapterDetectionJob, NewChapterDetectionJobItem, NewMediaChapterMarker,
-        StoredChapterDetectionItem, StoredChapterDetectionJob,
+        StoredChapterDetectionItem, StoredChapterDetectionJob, StoredChapterDetectionSource,
     },
 };
 
@@ -92,6 +92,53 @@ impl ChapterDetectionOptions {
 
     fn threshold(self) -> f64 {
         f64::from(self.match_threshold) / 100.0
+    }
+}
+
+/// Adds one already-detected episode as context for every season that has fewer than two
+/// candidates of its own.
+///
+/// `context_by_season` holds at most two state-matching sources per season, collected while the
+/// source pages were streamed. Such a season contributes at most one candidate, so at least one
+/// kept source is never a candidate and can serve as the context donor.
+fn append_context_candidates(
+    candidates: &mut Vec<EligibleChapterDetectionSource>,
+    context_by_season: &HashMap<String, Vec<StoredChapterDetectionSource>>,
+    options: ChapterDetectionOptions,
+) {
+    let candidate_ids = candidates
+        .iter()
+        .map(|source| source.source_id.clone())
+        .collect::<HashSet<_>>();
+    let candidate_seasons = candidates.iter().filter(|source| !source.is_context).fold(
+        HashMap::<String, usize>::new(),
+        |mut counts, source| {
+            *counts.entry(source.season_id.clone()).or_default() += 1;
+            counts
+        },
+    );
+    for (season_id, count) in candidate_seasons {
+        if count >= 2 {
+            continue;
+        }
+        let Some(context) = context_by_season.get(&season_id).and_then(|sources| {
+            sources
+                .iter()
+                .find(|source| !candidate_ids.contains(&source.source_id))
+        }) else {
+            continue;
+        };
+        let Some(input_fingerprint) = chapter_input_fingerprint(context, false, options) else {
+            continue;
+        };
+        candidates.push(EligibleChapterDetectionSource {
+            source_id: context.source_id.clone(),
+            item_id: context.item_id.clone(),
+            season_id: context.season_id.clone(),
+            fingerprint: context.fingerprint.clone(),
+            input_fingerprint,
+            is_context: true,
+        });
     }
 }
 
@@ -232,7 +279,23 @@ impl ChapterDetectionService {
         options: ChapterDetectionOptions,
         force_refresh: bool,
     ) -> Result<Vec<EligibleChapterDetectionSource>, ChapterDetectionError> {
-        let mut sources = Vec::new();
+        let minimum = minimum_episode_count(remote_lookup);
+        // Only the per-season source totals are needed to reject seasons that are too small, so
+        // they come from one aggregate query instead of accumulating every source row in memory.
+        let season_counts = self
+            .database
+            .chapter_detection_source_season_counts(
+                library_id,
+                !remote_lookup,
+                supported_media_source_kinds,
+            )
+            .await?;
+        let now = OffsetDateTime::now_utc().unix_timestamp();
+        let mut candidates = Vec::new();
+        // A season with fewer than two candidates may borrow one already-detected episode as
+        // context. Two state-matching sources per season are enough to find it: such a season
+        // contributes at most one candidate, so at least one kept source stays available.
+        let mut context_by_season = HashMap::<String, Vec<StoredChapterDetectionSource>>::new();
         let mut after_source_id = None;
         loop {
             let page = self
@@ -249,26 +312,38 @@ impl ChapterDetectionService {
             let Some(last_source_id) = page.last().map(|source| source.source_id.clone()) else {
                 break;
             };
-            sources.extend(page);
-            after_source_id = Some(last_source_id);
-        }
-        let minimum = minimum_episode_count(remote_lookup);
-        let mut season_counts = HashMap::<String, usize>::new();
-        for source in &sources {
-            *season_counts.entry(source.season_id.clone()).or_default() += 1;
-        }
-        let now = OffsetDateTime::now_utc().unix_timestamp();
-        let mut candidates = sources
-            .iter()
-            .filter_map(|source| {
-                if season_counts.get(&source.season_id).copied().unwrap_or(0) < minimum {
-                    return None;
+            for source in page {
+                if !remote_lookup
+                    && source.state.as_ref().is_some_and(|state| {
+                        state.intro_fingerprint.is_some()
+                            && state.credits_fingerprint.is_some()
+                            && chapter_source_state_matches(
+                                &source,
+                                false,
+                                options,
+                                &state.input_fingerprint,
+                            )
+                    })
+                {
+                    let season_sources = context_by_season
+                        .entry(source.season_id.clone())
+                        .or_default();
+                    if season_sources.len() < 2 {
+                        season_sources.push(source.clone());
+                    }
                 }
-                let input_fingerprint = chapter_input_fingerprint(source, remote_lookup, options)?;
+                if season_counts.get(&source.season_id).copied().unwrap_or(0) < minimum as i64 {
+                    continue;
+                }
+                let Some(input_fingerprint) =
+                    chapter_input_fingerprint(&source, remote_lookup, options)
+                else {
+                    continue;
+                };
                 let state = source.state.as_ref();
                 let input_changed = state.is_none_or(|value| {
                     !chapter_source_state_matches(
-                        source,
+                        &source,
                         remote_lookup,
                         options,
                         &value.input_fingerprint,
@@ -287,64 +362,22 @@ impl ChapterDetectionService {
                             force_refresh,
                         ))
                 {
-                    return None;
+                    continue;
                 }
-                Some(EligibleChapterDetectionSource {
-                    source_id: source.source_id.clone(),
-                    item_id: source.item_id.clone(),
-                    season_id: source.season_id.clone(),
-                    fingerprint: source.fingerprint.clone(),
+                candidates.push(EligibleChapterDetectionSource {
+                    source_id: source.source_id,
+                    item_id: source.item_id,
+                    season_id: source.season_id,
+                    fingerprint: source.fingerprint,
                     input_fingerprint,
                     is_context: false,
-                })
-            })
-            .collect::<Vec<_>>();
-
-        if !remote_lookup {
-            let candidate_ids = candidates
-                .iter()
-                .map(|source| source.source_id.clone())
-                .collect::<HashSet<_>>();
-            let candidate_seasons = candidates.iter().filter(|source| !source.is_context).fold(
-                HashMap::<String, usize>::new(),
-                |mut counts, source| {
-                    *counts.entry(source.season_id.clone()).or_default() += 1;
-                    counts
-                },
-            );
-            for (season_id, count) in candidate_seasons {
-                if count >= 2 {
-                    continue;
-                }
-                let Some(context) = sources.iter().find(|source| {
-                    source.season_id == season_id
-                        && !candidate_ids.contains(&source.source_id)
-                        && source.state.as_ref().is_some_and(|state| {
-                            state.intro_fingerprint.is_some()
-                                && state.credits_fingerprint.is_some()
-                                && chapter_source_state_matches(
-                                    source,
-                                    false,
-                                    options,
-                                    &state.input_fingerprint,
-                                )
-                        })
-                }) else {
-                    continue;
-                };
-                let Some(input_fingerprint) = chapter_input_fingerprint(context, false, options)
-                else {
-                    continue;
-                };
-                candidates.push(EligibleChapterDetectionSource {
-                    source_id: context.source_id.clone(),
-                    item_id: context.item_id.clone(),
-                    season_id: context.season_id.clone(),
-                    fingerprint: context.fingerprint.clone(),
-                    input_fingerprint,
-                    is_context: true,
                 });
             }
+            after_source_id = Some(last_source_id);
+        }
+
+        if !remote_lookup {
+            append_context_candidates(&mut candidates, &context_by_season, options);
         }
         candidates.sort_by(|left, right| {
             left.season_id
@@ -1686,10 +1719,11 @@ fn should_refresh_source(
 #[cfg(test)]
 mod tests {
     use super::{
-        ChapterDetectionOptions, FingerprintError, StoredChapterDetectionItem,
-        canonicalize_raw_fingerprint, chapter_batch_ranges, chapter_batch_ranges_with_limit,
-        chapter_input_fingerprint, chapter_source_state_matches, minimum_episode_count,
-        provider_ids, remote_lookup_episode, should_refresh_source,
+        ChapterDetectionOptions, EligibleChapterDetectionSource, FingerprintError,
+        StoredChapterDetectionItem, append_context_candidates, canonicalize_raw_fingerprint,
+        chapter_batch_ranges, chapter_batch_ranges_with_limit, chapter_input_fingerprint,
+        chapter_source_state_matches, minimum_episode_count, provider_ids, remote_lookup_episode,
+        should_refresh_source,
     };
 
     #[test]
@@ -1842,6 +1876,101 @@ mod tests {
         assert_eq!(
             provider_ids(Some(r#"{"tmdb":123}"#)).tmdb.as_deref(),
             Some("123")
+        );
+    }
+
+    fn context_candidate(source_id: &str, season_id: &str) -> EligibleChapterDetectionSource {
+        EligibleChapterDetectionSource {
+            source_id: source_id.to_owned(),
+            item_id: format!("item-{source_id}"),
+            season_id: season_id.to_owned(),
+            fingerprint: Some(vec![1]),
+            input_fingerprint: vec![7],
+            is_context: false,
+        }
+    }
+
+    fn context_donor(
+        source_id: &str,
+        season_id: &str,
+    ) -> crate::storage::StoredChapterDetectionSource {
+        crate::storage::StoredChapterDetectionSource {
+            source_id: source_id.to_owned(),
+            item_id: format!("item-{source_id}"),
+            season_id: season_id.to_owned(),
+            fingerprint: Some(vec![2]),
+            relative_path: format!("{source_id}.mkv"),
+            size: 1_024,
+            modified_at: 1_000,
+            device: None,
+            inode: None,
+            duration_ticks: Some(1_800_000_000),
+            provider_ids_json: None,
+            series_provider_ids_json: None,
+            season_number: Some(1),
+            episode_number: Some(1),
+            state: None,
+        }
+    }
+
+    #[test]
+    fn context_candidates_pair_only_seasons_with_fewer_than_two_candidates() {
+        let options = ChapterDetectionOptions::default();
+        let mut candidates = vec![
+            context_candidate("solo-candidate", "season-solo"),
+            context_candidate("pair-one", "season-pair"),
+            context_candidate("pair-two", "season-pair"),
+            context_candidate("self-only", "season-self"),
+            context_candidate("candidate-first", "season-ordered"),
+        ];
+        let context_by_season = std::collections::HashMap::from([
+            (
+                "season-solo".to_owned(),
+                vec![context_donor("solo-donor", "season-solo")],
+            ),
+            (
+                "season-pair".to_owned(),
+                vec![context_donor("pair-donor", "season-pair")],
+            ),
+            (
+                "season-self".to_owned(),
+                vec![context_donor("self-only", "season-self")],
+            ),
+            (
+                "season-ordered".to_owned(),
+                vec![
+                    context_donor("candidate-first", "season-ordered"),
+                    context_donor("second-donor", "season-ordered"),
+                ],
+            ),
+        ]);
+
+        append_context_candidates(&mut candidates, &context_by_season, options);
+
+        let mut contexts = candidates
+            .iter()
+            .filter(|source| source.is_context)
+            .map(|source| source.source_id.as_str())
+            .collect::<Vec<_>>();
+        contexts.sort_unstable();
+        assert_eq!(
+            contexts,
+            vec!["second-donor", "solo-donor"],
+            "the first kept source of a one-candidate season is that candidate, so the second \
+             kept source donates instead"
+        );
+        assert!(
+            !candidates
+                .iter()
+                .any(|source| source.source_id == "self-only" && source.is_context),
+            "a lone candidate cannot be its own context"
+        );
+        assert_eq!(
+            candidates
+                .iter()
+                .filter(|source| !source.is_context)
+                .count(),
+            5
         );
     }
 }

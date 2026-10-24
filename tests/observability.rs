@@ -21,7 +21,10 @@ mod unix {
         child: &mut tokio::process::Child,
         health_url: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 match client.get(health_url).send().await {
@@ -85,7 +88,10 @@ mod unix {
             return Err(error);
         }
 
-        let client = reqwest::Client::new();
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
         let response = client.get(&health_url).send().await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
         let request_id = response
@@ -220,7 +226,11 @@ mod unix {
             return Err(error);
         }
 
-        let response = reqwest::get(&health_url).await?;
+        let client = reqwest::Client::builder()
+            .no_proxy()
+            .build()
+            .expect("test client");
+        let response = client.get(&health_url).send().await?;
         assert_eq!(response.status(), reqwest::StatusCode::OK);
 
         send_signal("TERM", pid).await?;

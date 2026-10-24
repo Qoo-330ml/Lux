@@ -423,6 +423,27 @@ export type AdminItemMergeResult = {
   mergedItemIds: string[];
 };
 
+export type AdminItemMergeRecord = {
+  id: string;
+  mergedItemId: string;
+  mergedItemTitle: string;
+  itemType: string;
+  origin: string;
+  mergedAt: number;
+  undoneAt: number | null;
+  sourceCount: number;
+};
+
+export type AdminItemUnmergeResult = {
+  primaryItemId: string;
+  mergedItemId: string;
+  libraryId: string;
+  itemType: string;
+  restoredItemIds: string[];
+  restoredSourceCount: number;
+  userStateRestored: boolean;
+};
+
 export type PlaybackState = {
   itemId?: string;
   isFavorite?: boolean;
@@ -1733,8 +1754,42 @@ export type MediaImageVariantCacheSettings = {
   concurrency: number;
 };
 
+export type MediaImageLevelKey = "movie" | "series" | "season" | "episode";
+
+export type MediaArtworkTypeKey =
+  | "poster"
+  | "backdrop"
+  | "artwork"
+  | "logo"
+  | "thumbnail"
+  | "banner"
+  | "disc"
+  | "wallpaper";
+
+export type MediaArtworkSource = "SCRAPER" | "SCREENSHOT";
+
+export type MediaArtworkOverwrite = "INHERIT" | "KEEP" | "FILL" | "OVERWRITE";
+
+export type MediaScraperRole = "PRIMARY" | "BACKUP" | "SUPPLEMENT";
+
+export type MediaArtworkPolicySettings = {
+  enabled?: boolean;
+  sources?: MediaArtworkSource[];
+  scraperRoles?: MediaScraperRole[];
+  overwrite?: MediaArtworkOverwrite;
+  maxCount?: number;
+  minWidth?: number;
+};
+
+export type MediaImageLevelSettings = {
+  thumbnailScrapingMode?: "NONE" | "SCREENSHOT_FIRST" | "SCRAPER_FIRST";
+  episodeImagePolicy?: "SCRAPER_STILL" | "LOCAL_SCREENSHOT" | "NONE";
+  artworks?: Partial<Record<MediaArtworkTypeKey, MediaArtworkPolicySettings>>;
+};
+
 export type MediaImageStrategySettings = {
   poster: boolean;
+  backdrop?: boolean;
   artwork: boolean;
   banner: boolean;
   logo: boolean;
@@ -1746,6 +1801,7 @@ export type MediaImageStrategySettings = {
   maxBackdropCount: number;
   minDownloadWidth: number;
   variantCache?: MediaImageVariantCacheSettings;
+  levels?: Partial<Record<MediaImageLevelKey, MediaImageLevelSettings>>;
 };
 
 export type MediaSubtitleStrategySettings = {

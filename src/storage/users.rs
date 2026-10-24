@@ -75,6 +75,9 @@ fn normalize_user_content_restriction_tags(tags: &[String]) -> Result<Vec<String
     Ok(normalized)
 }
 
+/// Upper bound for an unpaginated user-directory listing.
+const MAX_USER_DIRECTORY_ENTRIES: i64 = 1000;
+
 impl Database {
     // LUX-645 wires this storage primitive into the application preset service.
     #[allow(dead_code)]
@@ -845,6 +848,8 @@ impl Database {
         } else {
             " WHERE is_disabled = 0"
         };
+        // A directory listing is bounded: past this many accounts the caller should page.
+        let limit = MAX_USER_DIRECTORY_ENTRIES + 1;
         let query = format!(
             "SELECT id, username_normalized, display_name, password_hash,
                     has_password,
@@ -856,16 +861,31 @@ impl Database {
                          FROM access_tokens at WHERE at.user_id = users.id),
                         last_login_at
                     ) AS last_activity_at
-             FROM users{where_clause} ORDER BY username_normalized"
+             FROM users{where_clause} ORDER BY username_normalized LIMIT ?"
         );
-        self.query(sqlx::AssertSqlSafe(query))
+        let mut users: Vec<StoredUser> = self
+            .query(sqlx::AssertSqlSafe(query))
+            .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map(|rows| rows.into_iter().map(stored_user).collect())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?
+            .into_iter()
+            .map(stored_user)
+            .collect();
+        if users.len() as i64 > MAX_USER_DIRECTORY_ENTRIES {
+            tracing::warn!(
+                limit = MAX_USER_DIRECTORY_ENTRIES,
+                "user directory exceeded its bound; the listing is truncated"
+            );
+            users.truncate(MAX_USER_DIRECTORY_ENTRIES as usize);
+        }
+        Ok(users).map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn query_users(
@@ -1025,14 +1045,7 @@ impl Database {
         user_id: &str,
         update: &UpdateUser<'_>,
     ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
             .query(
                 "SELECT is_disabled, can_manage_server, deleted_at
@@ -1200,14 +1213,7 @@ impl Database {
     }
 
     pub(crate) async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
             .query(
                 "SELECT is_disabled, can_manage_server
@@ -1264,14 +1270,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Option<Vec<String>>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
             .query(
                 "SELECT is_disabled, can_manage_server, deleted_at
@@ -1611,9 +1610,13 @@ impl Database {
 
     pub(crate) async fn touch_access_token(&self, token_hash: &[u8]) -> Result<(), StorageError> {
         self.query(
-            "UPDATE access_tokens SET last_seen_at = unixepoch(), updated_at = unixepoch()
-             WHERE token_hash = ? AND revoked_at IS NULL",
+            "UPDATE access_tokens
+                SET last_seen_at = unixepoch(),
+                    updated_at = unixepoch(),
+                    expires_at = unixepoch() + ?
+              WHERE token_hash = ? AND revoked_at IS NULL",
         )
+        .bind(EMBY_ACCESS_TOKEN_TTL_SECONDS)
         .bind(token_hash)
         .execute(&self.pool)
         .await
@@ -2349,7 +2352,8 @@ impl Database {
                     ) AS last_activity_at
              FROM access_tokens at
              JOIN users u ON u.id = at.user_id
-             WHERE at.token_hash = ? AND at.revoked_at IS NULL",
+             WHERE at.token_hash = ? AND at.revoked_at IS NULL
+               AND (at.expires_at IS NULL OR at.expires_at > unixepoch())",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -2368,7 +2372,8 @@ impl Database {
         self.query(
             "SELECT device_id, client_name, device_name, client_version
              FROM access_tokens
-             WHERE token_hash = ? AND revoked_at IS NULL",
+             WHERE token_hash = ? AND revoked_at IS NULL
+               AND (expires_at IS NULL OR expires_at > unixepoch())",
         )
         .bind(token_hash)
         .fetch_optional(&self.pool)
@@ -2466,6 +2471,14 @@ impl Database {
     }
 
     pub(crate) async fn revoke_all_user_emby_login_sessions_for_admin(
+        &self,
+        user_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.revoke_all_access_tokens_for_user(user_id).await
+    }
+
+    /// Revokes every active Emby access token of a user.
+    pub(crate) async fn revoke_all_access_tokens_for_user(
         &self,
         user_id: &str,
     ) -> Result<u64, StorageError> {
@@ -2805,6 +2818,62 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    /// Resolves the accessible media libraries of several users in one bounded batch.
+    ///
+    /// Mirrors [`Self::list_accessible_library_ids`] per user but reads the whole page at once.
+    /// Administrators are resolved by the caller, which knows the administrator flag.
+    pub(crate) async fn list_accessible_library_ids_for_users(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, StorageError> {
+        let mut accessible = user_ids
+            .iter()
+            .map(|user_id| (user_id.clone(), Vec::new()))
+            .collect::<std::collections::HashMap<_, _>>();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT access_user.id AS user_id, media_library.id AS library_id
+                 FROM users access_user
+                 JOIN libraries media_library
+                   ON media_library.is_enabled = 1 AND media_library.system_kind IS NULL
+                 WHERE access_user.id IN ({placeholders})
+                   AND media_library.deletion_state = 'ACTIVE'
+                   AND (access_user.library_access_mode = 'ALL'
+                        OR (access_user.library_access_mode = 'SELECTED' AND EXISTS (
+                            SELECT 1 FROM user_library_access allowed_library
+                            WHERE allowed_library.user_id = access_user.id
+                              AND allowed_library.library_id = media_library.id
+                              AND allowed_library.can_view = 1
+                        )))
+                 ORDER BY access_user.id, media_library.name, media_library.id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                if let Some(library_ids) = accessible.get_mut(&row.get::<String, _>("user_id")) {
+                    library_ids.push(row.get("library_id"));
+                }
+            }
+        }
+        Ok(accessible)
     }
 
     pub(crate) async fn list_enabled_media_library_ids(&self) -> Result<Vec<String>, StorageError> {
@@ -4038,7 +4107,7 @@ impl Database {
                     .execute(&mut *transaction)
                     .await
                 {
-                    let _ = transaction.rollback().await;
+                    Self::rollback_write_transaction(transaction, "write failed").await;
                     return Err(StorageError::Sqlx {
                         path: self.path.clone(),
                         source,
@@ -4212,7 +4281,7 @@ impl Database {
                 .execute(&mut *transaction)
                 .await
             {
-                let _ = transaction.rollback().await;
+                Self::rollback_write_transaction(transaction, "write failed").await;
                 return Err(StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
@@ -4224,7 +4293,7 @@ impl Database {
                 .replace_user_library_order_in_transaction(user_id, library_order, &mut transaction)
                 .await
             {
-                let _ = transaction.rollback().await;
+                Self::rollback_write_transaction(transaction, "write failed").await;
                 return Err(error);
             }
         }
@@ -4319,6 +4388,130 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    /// Loads the saved library order of several users in one query per bounded chunk.
+    ///
+    /// Listing users used to read the order one user at a time, so the query count grew with the
+    /// page size.
+    pub(crate) async fn user_library_orders(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, StorageError> {
+        let mut orders = std::collections::HashMap::<String, Vec<String>>::new();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT user_id, library_id FROM user_library_order
+                 WHERE user_id IN ({placeholders})
+                 ORDER BY user_id, position, library_id"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                orders
+                    .entry(row.get("user_id"))
+                    .or_default()
+                    .push(row.get("library_id"));
+            }
+        }
+        Ok(orders)
+    }
+
+    /// Loads the "use the administrator order" preference of several users in one bounded batch.
+    ///
+    /// Users without a preference row keep the single-user default (enabled), so every requested
+    /// id is present in the result.
+    pub(crate) async fn user_admin_library_order_flags(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, bool>, StorageError> {
+        let mut flags = std::collections::HashMap::<String, bool>::new();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT user_id, use_admin_library_order FROM user_library_order_preferences
+                 WHERE user_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                flags.insert(
+                    row.get("user_id"),
+                    row.get::<i64, _>("use_admin_library_order") != 0,
+                );
+            }
+        }
+        for user_id in user_ids {
+            flags.entry(user_id.clone()).or_insert(true);
+        }
+        Ok(flags)
+    }
+
+    /// Loads the stored Emby configuration of several users in one bounded batch.
+    pub(crate) async fn list_user_emby_configurations(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, StorageError> {
+        let mut configurations = std::collections::HashMap::<String, String>::new();
+        for chunk in user_ids.chunks(200) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT user_id, configuration_json FROM user_emby_configuration
+                 WHERE user_id IN ({placeholders})"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for user_id in chunk {
+                statement = statement.bind(user_id);
+            }
+            for row in
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?
+            {
+                configurations.insert(row.get("user_id"), row.get("configuration_json"));
+            }
+        }
+        Ok(configurations)
     }
 
     pub(crate) async fn replace_user_library_order(
@@ -4740,19 +4933,8 @@ fn is_sqlite_lock_error(error: &StorageError) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::config::Config;
+    use crate::storage::test_database;
     use uuid::Uuid;
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: temp_dir.path().join("config"),
-        })
-        .await?;
-        Ok((temp_dir, database))
-    }
 
     #[tokio::test]
     async fn login_background_plugin_cache_upserts_and_reads_latest_payload()
@@ -5028,5 +5210,161 @@ mod tests {
             .expect("batched lookup should include Bob");
         assert!(bob.is_disabled);
         Ok(())
+    }
+}
+
+impl Database {
+    /// Loads restriction and library-access state for several users with one query each.
+    ///
+    /// Used by list endpoints so reporting a user's policy does not become an N+1 query.
+    pub(crate) async fn list_user_access_snapshots(
+        &self,
+        user_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, UserAccessSnapshot>, StorageError> {
+        let mut snapshots = std::collections::HashMap::new();
+        for chunk in user_ids.chunks(200) {
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mode_query =
+                format!("SELECT id, library_access_mode FROM users WHERE id IN ({placeholders})");
+            let mut mode_statement = self.query(sqlx::AssertSqlSafe(mode_query));
+            for user_id in chunk {
+                mode_statement = mode_statement.bind(user_id);
+            }
+            for row in mode_statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let user_id: String = row.get("id");
+                let mode: Option<String> = row.get("library_access_mode");
+                snapshots.insert(
+                    user_id,
+                    UserAccessSnapshot {
+                        library_access_mode: mode.unwrap_or_else(|| "ALL".to_owned()),
+                        library_ids: Vec::new(),
+                        restrictions: None,
+                    },
+                );
+            }
+
+            let access_query = format!(
+                "SELECT user_id, library_id FROM user_library_access
+                 WHERE user_id IN ({placeholders}) AND can_view = 1
+                 ORDER BY user_id, library_id"
+            );
+            let mut access_statement = self.query(sqlx::AssertSqlSafe(access_query));
+            for user_id in chunk {
+                access_statement = access_statement.bind(user_id);
+            }
+            for row in access_statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let user_id: String = row.get("user_id");
+                let library_id: String = row.get("library_id");
+                if let Some(snapshot) = snapshots.get_mut(&user_id) {
+                    snapshot.library_ids.push(library_id);
+                }
+            }
+
+            let restriction_query = format!(
+                "SELECT restrictions.user_id, restrictions.rating_system,
+                        restrictions.maximum_rating, restrictions.allow_unrated,
+                        restrictions.version, restrictions.updated_at,
+                        tags.tag_kind, tags.tag
+                 FROM user_content_restrictions restrictions
+                 LEFT JOIN user_content_restriction_tags tags
+                   ON tags.user_id = restrictions.user_id
+                 WHERE restrictions.user_id IN ({placeholders})
+                 ORDER BY restrictions.user_id, tags.tag_kind, tags.tag"
+            );
+            let mut restriction_statement = self.query(sqlx::AssertSqlSafe(restriction_query));
+            for user_id in chunk {
+                restriction_statement = restriction_statement.bind(user_id);
+            }
+            let mut restrictions_by_user =
+                std::collections::HashMap::<String, UserContentRestrictions>::new();
+            for row in restriction_statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+            {
+                let user_id: String = row.get("user_id");
+                let entry = restrictions_by_user.entry(user_id).or_insert_with(|| {
+                    UserContentRestrictions {
+                        rating_system: row.get("rating_system"),
+                        maximum_rating: row.get("maximum_rating"),
+                        allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
+                        allowed_tags: Vec::new(),
+                        blocked_tags: Vec::new(),
+                        version: row.get("version"),
+                        updated_at: row.get("updated_at"),
+                    }
+                });
+                let tag_kind: Option<String> = row.get("tag_kind");
+                let tag: Option<String> = row.get("tag");
+                match (tag_kind.as_deref(), tag) {
+                    (None, None) => {}
+                    (Some("ALLOW"), Some(tag)) => entry.allowed_tags.push(tag),
+                    (Some("BLOCK"), Some(tag)) => entry.blocked_tags.push(tag),
+                    _ => {
+                        return Err(StorageError::Serialization(
+                            "invalid user content restriction tag row".to_owned(),
+                        ));
+                    }
+                }
+            }
+            for (user_id, restrictions) in restrictions_by_user {
+                if let Some(snapshot) = snapshots.get_mut(&user_id) {
+                    snapshot.restrictions = Some(restrictions);
+                }
+            }
+        }
+        Ok(snapshots)
+    }
+}
+
+impl Database {
+    /// All enabled access rules that apply to `user_id` (including global rules), in one query.
+    ///
+    /// Callers evaluate the rule types themselves so one round trip covers the IP, device and
+    /// client checks that would otherwise each query this table.
+    pub(crate) async fn user_access_blacklist_rules_for_user(
+        &self,
+        user_id: &str,
+        limit: i64,
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT rule_type, match_value
+                 FROM user_access_blacklist_rules
+                 WHERE is_enabled = 1 AND (user_id IS NULL OR user_id = ?)
+                 ORDER BY rule_type, match_value
+                 LIMIT ?",
+            )
+            .bind(user_id)
+            .bind(limit.clamp(1, 1000))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get("rule_type"), row.get("match_value")))
+            .collect())
     }
 }

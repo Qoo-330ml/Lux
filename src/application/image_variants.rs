@@ -605,6 +605,20 @@ impl std::fmt::Display for VariantGenerationError {
     }
 }
 
+/// Validates decoded dimensions before any pixel data is allocated.
+fn check_variant_dimensions(
+    (width, height): (u32, u32),
+) -> Result<(u32, u32), VariantGenerationError> {
+    let pixels = u64::from(width) * u64::from(height);
+    if pixels == 0 {
+        return Err(VariantGenerationError::Decode);
+    }
+    if pixels > IMAGE_VARIANT_MAX_PIXELS {
+        return Err(VariantGenerationError::TooManyPixels);
+    }
+    Ok((width, height))
+}
+
 fn generate_variant_blocking(
     source_path: &Path,
     target_path: &Path,
@@ -622,16 +636,20 @@ fn generate_variant_blocking(
         .into_decoder()
         .map_err(|_| VariantGenerationError::Decode)?;
     let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    // Reject oversized images from their header and cap the decoder allocation before any
+    // pixel data is materialized; checking after DynamicImage::from_decoder would let a small
+    // file with huge declared dimensions allocate hundreds of megabytes first.
+    let (width, height) = check_variant_dimensions(decoder.dimensions())?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(width);
+    limits.max_image_height = Some(height);
+    limits.max_alloc = Some(IMAGE_VARIANT_MAX_PIXELS.saturating_mul(4));
+    decoder
+        .set_limits(limits)
+        .map_err(|_| VariantGenerationError::Decode)?;
     let mut image =
         DynamicImage::from_decoder(decoder).map_err(|_| VariantGenerationError::Decode)?;
     image.apply_orientation(orientation);
-    let pixels = u64::from(image.width()) * u64::from(image.height());
-    if pixels == 0 {
-        return Err(VariantGenerationError::Decode);
-    }
-    if pixels > IMAGE_VARIANT_MAX_PIXELS {
-        return Err(VariantGenerationError::TooManyPixels);
-    }
     if image.width().max(image.height()) <= target_width {
         return Err(VariantGenerationError::NoResize);
     }
@@ -707,6 +725,22 @@ mod tests {
             width: Some(i64::from(width)),
             height: Some(i64::from(height)),
         }
+    }
+
+    #[test]
+    fn oversized_dimensions_are_rejected_before_decoding() {
+        assert!(matches!(
+            check_variant_dimensions((0, 120)),
+            Err(VariantGenerationError::Decode)
+        ));
+        assert!(matches!(
+            check_variant_dimensions((8_000, 6_000)),
+            Err(VariantGenerationError::TooManyPixels)
+        ));
+        assert_eq!(
+            check_variant_dimensions((1_920, 1_080)).expect("supported dimensions"),
+            (1_920, 1_080)
+        );
     }
 
     #[tokio::test]

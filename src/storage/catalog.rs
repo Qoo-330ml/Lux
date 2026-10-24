@@ -1,4 +1,6 @@
 use super::*;
+
+const NFO_METADATA_BATCH_SIZE: usize = 400;
 use crate::storage::{
     CatalogSearchQuery, GlobalCollectionSourcePreference, GlobalMovieCollectionReference,
     GlobalMovieCollectionReferenceUpdate, StoredMovieNfoCollectionReferenceReconciliation,
@@ -6,10 +8,14 @@ use crate::storage::{
 };
 use crate::{
     domain::content_restrictions::ContentRestrictionIndexProjection,
-    storage::{CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, MediaContentRestrictionIndexCandidate},
+    storage::{
+        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexBatchOutcome,
+        ContentRestrictionIndexWrite, MediaContentRestrictionIndexCandidate,
+    },
 };
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
+const RECOMMENDATION_STATS_MAX_IDLE_REFRESH_SECONDS: i64 = 7 * 86_400;
 const CHAPTER_DETECTION_JOB_ITEM_INSERT_BATCH_SIZE: usize = 100;
 const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
@@ -79,6 +85,7 @@ const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_ite
                    AND media_items.item_type IN ('MOVIE', 'SERIES')
              )";
 
+#[derive(Clone, Copy)]
 struct CatalogSearchPageBindings<'a> {
     fts_query: Option<&'a str>,
     like_query: Option<&'a str>,
@@ -98,16 +105,25 @@ fn postgres_recent_catalog_rows_by_library_query(
         .join(", ");
     format!(
         "WITH episode_latest_by_root AS MATERIALIZED (
-             SELECT episode_roots.root_id, MAX(episode.added_at) AS latest_added_at
-             FROM media_items episode
-             CROSS JOIN LATERAL (
-                 VALUES (episode.series_id), (episode.parent_id)
-             ) AS episode_roots(root_id)
-             WHERE episode.item_type = 'EPISODE'
-               AND episode.removed_at IS NULL
-               AND episode.has_available_source = 1
-               AND episode_roots.root_id IS NOT NULL
-             GROUP BY episode_roots.root_id
+             SELECT roots.root_id, MAX(roots.latest_added_at) AS latest_added_at
+             FROM (
+                 SELECT episode.series_id AS root_id, MAX(episode.added_at) AS latest_added_at
+                 FROM media_items episode
+                 WHERE episode.item_type = 'EPISODE'
+                   AND episode.removed_at IS NULL
+                   AND episode.has_available_source = 1
+                   AND episode.series_id IS NOT NULL
+                 GROUP BY episode.series_id
+                 UNION ALL
+                 SELECT episode.parent_id AS root_id, MAX(episode.added_at) AS latest_added_at
+                 FROM media_items episode
+                 WHERE episode.item_type = 'EPISODE'
+                   AND episode.removed_at IS NULL
+                   AND episode.has_available_source = 1
+                   AND episode.parent_id IS NOT NULL
+                 GROUP BY episode.parent_id
+             ) roots
+             GROUP BY roots.root_id
          ), requested_libraries(library_id) AS (
              SELECT DISTINCT library_id FROM (VALUES {values}) requested(library_id)
          ), home_candidates AS MATERIALIZED (
@@ -488,7 +504,7 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -506,6 +522,7 @@ impl Database {
         .map(|row| {
             row.map(|row| StoredThumbnailSource {
                 item_id: row.get("item_id"),
+                item_type: row.get("item_type"),
                 root_path: row.get("root_path"),
                 relative_path: row.get("relative_path"),
                 library_media_strategy_json: row.get("library_media_strategy_json"),
@@ -524,9 +541,9 @@ impl Database {
         let _refresh_guard = self.recommendation_stats_refresh_lock.lock().await;
         let now = current_unix_timestamp();
         let batch_key = recommendation_batch_key_at(now);
-        let current_batch = self
-            .query_scalar::<i64>(
-                "SELECT batch_key
+        let state = self
+            .query_as::<(i64, Option<String>, i64)>(
+                "SELECT batch_key, source_fingerprint, refreshed_at
                  FROM recommendation_stats_state
                  WHERE id = 1",
             )
@@ -536,10 +553,77 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        if current_batch == Some(batch_key) {
+        let Some((stored_batch_key, stored_fingerprint, refreshed_at)) = state else {
+            // A missing state row is handled by the full refresh below.
+            return self
+                .refresh_recommendation_stats(now, batch_key, None)
+                .await;
+        };
+        if stored_batch_key == batch_key {
             return Ok(false);
         }
+        let fingerprint = self.recommendation_stats_source_fingerprint(now).await?;
+        if stored_fingerprint.as_deref() == Some(fingerprint.as_str())
+            && now.saturating_sub(refreshed_at) < RECOMMENDATION_STATS_MAX_IDLE_REFRESH_SECONDS
+        {
+            // The daily batch key changed but nothing that affects scores did.
+            // Advance the batch key so the 15-second scheduler check stays cheap;
+            // refreshed_at remains the last real recomputation time.
+            self.query("UPDATE recommendation_stats_state SET batch_key = ? WHERE id = 1")
+                .bind(batch_key)
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            return Ok(false);
+        }
+        self.refresh_recommendation_stats(now, batch_key, Some(&fingerprint))
+            .await
+    }
 
+    async fn recommendation_stats_source_fingerprint(
+        &self,
+        now: i64,
+    ) -> Result<String, StorageError> {
+        let window_start = now - RECOMMENDATION_PLAYBACK_WINDOW_SECONDS;
+        let (playback_count, playback_last_event_at, favorite_count, version_sum, visible_item_count, item_updated_at): (
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+            i64,
+        ) = self
+            .query_as(
+                "SELECT
+                    (SELECT COUNT(*) FROM playback_sessions WHERE last_event_at > ?),
+                    (SELECT COALESCE(MAX(last_event_at), 0) FROM playback_sessions WHERE last_event_at > ?),
+                    (SELECT COUNT(*) FROM user_item_state WHERE is_favorite = 1),
+                    (SELECT COALESCE(SUM(version), 0) FROM user_item_state),
+                    (SELECT COUNT(*) FROM media_items WHERE removed_at IS NULL),
+                    (SELECT COALESCE(MAX(updated_at), 0) FROM media_items)",
+            )
+            .bind(window_start)
+            .bind(window_start)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(format!(
+            "{playback_count}:{playback_last_event_at}:{favorite_count}:{version_sum}:{visible_item_count}:{item_updated_at}"
+        ))
+    }
+
+    async fn refresh_recommendation_stats(
+        &self,
+        now: i64,
+        batch_key: i64,
+        source_fingerprint: Option<&str>,
+    ) -> Result<bool, StorageError> {
         let min_function = self.scalar_min_function();
         let mut transaction = self
             .pool
@@ -605,14 +689,18 @@ impl Database {
                 source,
             })?;
         self.query(
-            "INSERT INTO recommendation_stats_state (id, batch_key, refreshed_at)
-             VALUES (1, ?, ?)
+            "INSERT INTO recommendation_stats_state (
+                 id, batch_key, refreshed_at, source_fingerprint
+             )
+             VALUES (1, ?, ?, ?)
              ON CONFLICT(id) DO UPDATE SET
                  batch_key = excluded.batch_key,
-                 refreshed_at = excluded.refreshed_at",
+                 refreshed_at = excluded.refreshed_at,
+                 source_fingerprint = excluded.source_fingerprint",
         )
         .bind(batch_key)
         .bind(now)
+        .bind(source_fingerprint)
         .execute(&mut *transaction)
         .await
         .map_err(|source| StorageError::Sqlx {
@@ -976,26 +1064,44 @@ impl Database {
     }
 
     pub(crate) async fn dashboard_stats(&self) -> Result<DashboardStats, StorageError> {
-        self.query(
-            "SELECT
-                COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
-                COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
-                (SELECT COUNT(*) FROM users WHERE is_disabled = 0) AS user_count
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             WHERE mi.removed_at IS NULL",
-        )
-        .fetch_one(&self.pool)
-        .await
-        .map(|row| DashboardStats {
-            movie_count: row.get("movie_count"),
-            series_count: row.get("series_count"),
-            user_count: row.get("user_count"),
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        const CACHE_TTL_SECONDS: i64 = 60;
+        let now = current_unix_timestamp();
+        {
+            // The lock only guards the cached value; holding it across the query would serialize
+            // every dashboard request behind one database round trip.
+            let cache = self.dashboard_stats_cache.lock().await;
+            if let Some(cached) = cache.as_ref()
+                && now.saturating_sub(cached.computed_at) < CACHE_TTL_SECONDS
+            {
+                return Ok(cached.stats.clone());
+            }
+        }
+        let stats = self
+            .query(
+                "SELECT
+                    COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
+                    COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
+                    (SELECT COUNT(*) FROM users WHERE is_disabled = 0) AS user_count
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.removed_at IS NULL",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map(|row| DashboardStats {
+                movie_count: row.get("movie_count"),
+                series_count: row.get("series_count"),
+                user_count: row.get("user_count"),
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        *self.dashboard_stats_cache.lock().await = Some(CachedDashboardStats {
+            computed_at: now,
+            stats: stats.clone(),
+        });
+        Ok(stats)
     }
 
     pub(crate) async fn search_catalog_item_ids(
@@ -1079,9 +1185,9 @@ impl Database {
             "SELECT mi.id FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
-             WHERE (mi.title LIKE ? OR COALESCE(mi.original_title, '') LIKE ?
+             WHERE (mi.title LIKE ? ESCAPE '!' OR COALESCE(mi.original_title, '') LIKE ? ESCAPE '!'
                     OR EXISTS (SELECT 1 FROM item_aliases ia
-                               WHERE ia.item_id = mi.id AND ia.alias LIKE ?))
+                               WHERE ia.item_id = mi.id AND ia.alias LIKE ? ESCAPE '!'))
              AND mi.removed_at IS NULL
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
@@ -1169,8 +1275,8 @@ impl Database {
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
-             WHERE (ms.title ILIKE ? ESCAPE '\\' OR ms.original_title ILIKE ? ESCAPE '\\'
-                    OR ms.aliases ILIKE ? ESCAPE '\\')
+             WHERE (ms.title ILIKE ? OR ms.original_title ILIKE ?
+                    OR ms.aliases ILIKE ?)
                AND mi.removed_at IS NULL
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
@@ -1246,6 +1352,14 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        if rows.is_empty() && bindings.offset > 0 {
+            // `COUNT(*) OVER()` only appears on returned rows, so a page past the end would
+            // report a total of zero. Ask for the first page to learn the real total.
+            let mut first_page = bindings;
+            first_page.offset = 0;
+            let (_, total) = Box::pin(self.fetch_catalog_search_page(query, first_page)).await?;
+            return Ok((Vec::new(), total));
+        }
         let total = rows.first().map(|row| row.get("total")).unwrap_or(0);
         Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
     }
@@ -1909,7 +2023,20 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM media_items mi
+             FROM (
+                 -- Page over items first: joining sources and streams before LIMIT would
+                 -- paginate the joined rows, so a multi-source item could push other items
+                 -- off the page and appear again on the next one.
+                 SELECT mi.id AS item_id
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders})
+                   AND mi.removed_at IS NULL
+                   {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}
+                 ORDER BY {item_order}
+                 LIMIT ? OFFSET ?
+             ) page
+             JOIN media_items mi ON mi.id = page.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
@@ -1918,10 +2045,7 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE mi.parent_id = ? AND mi.item_type IN ({placeholders}) AND mi.removed_at IS NULL
-               {CATALOG_VISIBLE_PREDICATE}{content_restriction_predicate}
-             ORDER BY {item_order}, ms.id, mt.stream_index
-             LIMIT ? OFFSET ?"
+             ORDER BY {item_order}, ms.id, mt.stream_index"
         );
         let mut binds = Vec::with_capacity(item_types.len() + content_restriction_binds.len() + 3);
         binds.push(CatalogBind::Text(parent_id));
@@ -2480,9 +2604,23 @@ impl Database {
                     mt.is_external AS stream_is_external,
                     mt.is_default AS stream_is_default,
                     mt.is_forced AS stream_is_forced
-             FROM media_items mi
+             FROM (
+                 -- Page over items first: the source/stream join would otherwise consume page
+                 -- slots for multi-source items and repeat or skip entries between pages.
+                 SELECT mi.id AS item_id,
+                        us.last_played_at AS progress_order
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+                   AND us.is_played = 0 AND us.position_ticks > 0
+                   AND mi.library_id IN ({library_placeholders}){series_predicate}
+                 ORDER BY us.last_played_at DESC, mi.series_id, mi.season_number,
+                          mi.episode_number, mi.id
+                 LIMIT ? OFFSET ?
+             ) page
+             JOIN media_items mi ON mi.id = page.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
              LEFT JOIN media_sources ms
                ON ms.item_id = mi.id
               AND EXISTS (
@@ -2490,12 +2628,8 @@ impl Database {
                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
               )
              LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-             WHERE mi.item_type IN ({item_type_placeholders}) AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-               AND us.is_played = 0 AND us.position_ticks > 0
-               AND mi.library_id IN ({library_placeholders}){series_predicate}
-             ORDER BY us.last_played_at DESC, mi.series_id, mi.season_number,
-                      mi.episode_number, mi.id
-             LIMIT ? OFFSET ?"
+             ORDER BY page.progress_order DESC, mi.series_id, mi.season_number,
+                      mi.episode_number, mi.id, ms.id, mt.stream_index"
         );
         let mut binds = Vec::with_capacity(item_types.len() + library_ids.len() + 4);
         binds.push(CatalogBind::Text(user_id));
@@ -4250,7 +4384,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -4271,6 +4405,7 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredThumbnailSource {
                     item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
@@ -4291,7 +4426,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(sqlx::AssertSqlSafe(
-            "SELECT ms.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
@@ -4315,6 +4450,7 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredThumbnailSource {
                     item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
@@ -4335,7 +4471,7 @@ impl Database {
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
         self.query(
-            "SELECT t.item_id, lr.canonical_path AS root_path, fe.relative_path,
+            "SELECT t.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM scan_job_targets t
              JOIN media_items mi ON mi.id = t.item_id
@@ -4367,6 +4503,7 @@ impl Database {
             rows.into_iter()
                 .map(|row| StoredThumbnailSource {
                     item_id: row.get("item_id"),
+                    item_type: row.get("item_type"),
                     root_path: row.get("root_path"),
                     relative_path: row.get("relative_path"),
                     library_media_strategy_json: row.get("library_media_strategy_json"),
@@ -4573,7 +4710,8 @@ impl Database {
             let mut query = self.query(sqlx::AssertSqlSafe(format!(
                 "SELECT l.id, COUNT(fe.id) AS total_count
                  FROM libraries l
-                 LEFT JOIN media_items mi ON mi.library_id = l.id
+                 LEFT JOIN media_items mi
+                   ON mi.library_id = l.id AND mi.removed_at IS NULL
                  LEFT JOIN media_sources ms
                    ON ms.item_id = mi.id AND ms.source_kind = 'STRM_URL'
                  LEFT JOIN filesystem_entries fe
@@ -5788,6 +5926,74 @@ impl Database {
         })
     }
 
+    /// Counts the eligible chapter-detection sources of every season in one aggregate query.
+    ///
+    /// The caller streams sources with [`Self::list_chapter_detection_sources_page`] and needs
+    /// the per-season source total only to reject seasons that are too small. Accumulating every
+    /// source row just to compute those totals made chapter detection memory proportional to the
+    /// whole library; this query keeps it proportional to the season count instead.
+    pub(crate) async fn chapter_detection_source_season_counts(
+        &self,
+        library_id: &str,
+        require_fingerprint: bool,
+        supported_media_source_kinds: &[String],
+    ) -> Result<HashMap<String, i64>, StorageError> {
+        let source_kind_placeholders = if supported_media_source_kinds.is_empty() {
+            "NULL".to_owned()
+        } else {
+            std::iter::repeat_n("?", supported_media_source_kinds.len())
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let fingerprint_predicate = if require_fingerprint {
+            "AND fe.fingerprint IS NOT NULL"
+        } else {
+            ""
+        };
+        let query = format!(
+            "SELECT season.id AS season_id, COUNT(*) AS source_count
+             FROM media_sources ms
+             JOIN media_items episode ON episode.id = ms.item_id
+             JOIN media_items season ON season.id = episode.parent_id
+             JOIN media_items series ON series.id = episode.series_id
+             JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+             WHERE episode.library_id = ?
+               AND episode.item_type = 'EPISODE'
+               AND season.item_type = 'SEASON'
+               AND series.item_type = 'SERIES'
+               AND ms.source_kind IN ({source_kind_placeholders})
+               AND episode.removed_at IS NULL
+               AND fe.is_missing = 0
+               {fingerprint_predicate}
+               AND (ms.is_default = 1 OR NOT EXISTS (
+                   SELECT 1 FROM media_sources preferred
+                   WHERE preferred.item_id = episode.id AND preferred.is_default = 1
+               ))
+             GROUP BY season.id"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+        for source_kind in supported_media_source_kinds {
+            statement = statement.bind(source_kind);
+        }
+        statement
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| {
+                        (
+                            row.get::<String, _>("season_id"),
+                            row.get::<i64, _>("source_count"),
+                        )
+                    })
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
     pub(crate) async fn create_chapter_detection_job(
         &self,
         job: NewChapterDetectionJob<'_>,
@@ -6747,35 +6953,14 @@ impl Database {
             )
         };
         let visible_collection_filter = visible_source("visible_member.item_id");
-        let mut total_statement = self
-            .query_scalar::<i64>(sqlx::AssertSqlSafe(format!(
-                "SELECT COUNT(DISTINCT collection.id)
-                 FROM collections collection
-                 JOIN media_items collection_item ON collection_item.id = collection.item_id
-                 JOIN collection_items visible_member ON visible_member.collection_id = collection.id
-                 WHERE collection.library_id = ?
-                   AND collection_item.item_type = 'BOX_SET'
-                   AND collection_item.removed_at IS NULL
-                   AND collection_item.has_available_source = 1
-                   AND {visible_collection_filter}"
-            )))
-            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
-            .bind(database_flag(is_admin))
-            .bind(user_id);
-        for bind in &content_restriction_binds {
-            total_statement = match bind {
-                CatalogBind::Text(value) => total_statement.bind(*value),
-                CatalogBind::Integer(value) => total_statement.bind(*value),
-                CatalogBind::Real(value) => total_statement.bind(*value),
-            };
-        }
-        let total = total_statement
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let total = self
+            .count_visible_global_collections_with_restrictions(
+                user_id,
+                is_admin,
+                None,
+                content_restrictions,
+            )
+            .await?;
         let visible_member_count = visible_source("member.item_id");
         let visible_fallback_poster = |poster_column: &str| {
             format!(
@@ -7257,6 +7442,9 @@ impl Database {
         expected_generation: i64,
     ) -> Result<bool, StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
+        // One transaction on purpose: a collection's membership and references become visible
+        // together. Batching the rows would expose half-synced collections and transient orphan
+        // references to readers while the worker is running.
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let lock_clause = if self.backend == DatabaseBackend::Postgres {
             " FOR UPDATE"
@@ -8349,8 +8537,45 @@ impl Database {
         })
     }
 
+    /// Batch variant of [`Self::media_item_nfo_metadata_json`] for list endpoints.
+    pub(crate) async fn media_item_nfo_metadata_json_batch(
+        &self,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, String>, StorageError> {
+        let mut cached = std::collections::HashMap::new();
+        for chunk in item_ids.chunks(NFO_METADATA_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT id, nfo_metadata_json
+                 FROM media_items
+                 WHERE id IN ({placeholders}) AND nfo_metadata_json IS NOT NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                cached.insert(row.get("id"), row.get("nfo_metadata_json"));
+            }
+        }
+        Ok(cached)
+    }
+
     // LUX-684 consumes these bounded candidates in the background index worker.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn media_content_restriction_index_candidates(
         &self,
         after_item_id: Option<&str>,
@@ -8386,6 +8611,43 @@ impl Database {
             )
         };
         let rows: Vec<(String, Option<String>)> = query
+            .bind(bounded_limit)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(item_id, nfo_metadata_json)| MediaContentRestrictionIndexCandidate {
+                    item_id,
+                    nfo_metadata_json,
+                },
+            )
+            .collect())
+    }
+
+    /// Reads the durable queue filled by the media-item triggers. Empty queues
+    /// cost one indexed lookup instead of a scan over every visible item.
+    pub(crate) async fn media_content_restriction_index_queued_candidates(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<MediaContentRestrictionIndexCandidate>, StorageError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let bounded_limit = limit.min(CONTENT_RESTRICTION_INDEX_BATCH_LIMIT) as i64;
+        let rows: Vec<(String, Option<String>)> = self
+            .query_as(
+                "SELECT item.id, item.nfo_metadata_json
+                 FROM media_content_restriction_index_queue queue
+                 JOIN media_items item ON item.id = queue.item_id
+                 WHERE item.removed_at IS NULL
+                 ORDER BY queue.queued_at, queue.item_id
+                 LIMIT ?",
+            )
             .bind(bounded_limit)
             .fetch_all(&self.pool)
             .await
@@ -8552,6 +8814,14 @@ impl Database {
                 source,
             })?;
         }
+        self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         transaction
             .commit()
             .await
@@ -8560,6 +8830,152 @@ impl Database {
                 source,
             })?;
         Ok(true)
+    }
+
+    /// Applies one batch of prepared projections in a single transaction. The
+    /// worker computes the projections from the NFO snapshots outside the write
+    /// transaction; this method re-checks each snapshot and only then writes the
+    /// index, tags and queue consumption together.
+    pub(crate) async fn apply_content_restriction_index_batch(
+        &self,
+        writes: &[ContentRestrictionIndexWrite],
+        invalid_item_ids: &[String],
+    ) -> Result<ContentRestrictionIndexBatchOutcome, StorageError> {
+        let mut outcome = ContentRestrictionIndexBatchOutcome::default();
+        if writes.is_empty() && invalid_item_ids.is_empty() {
+            return Ok(outcome);
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        for item_id in invalid_item_ids {
+            self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+                .bind(item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        let snapshot_query = match self.backend() {
+            DatabaseBackend::Sqlite => {
+                "SELECT nfo_metadata_json, removed_at FROM media_items WHERE id = ?"
+            }
+            DatabaseBackend::Postgres => {
+                "SELECT nfo_metadata_json, removed_at FROM media_items WHERE id = ? FOR UPDATE"
+            }
+        };
+        for write in writes {
+            let current: Option<(Option<String>, Option<i64>)> = self
+                .query_as(snapshot_query)
+                .bind(&write.item_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            let (current_nfo_json, removed_at) = match current {
+                Some(row) => row,
+                None => {
+                    self.query(
+                        "DELETE FROM media_content_restriction_index_queue WHERE item_id = ?",
+                    )
+                    .bind(&write.item_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                    outcome.removed += 1;
+                    continue;
+                }
+            };
+            if removed_at.is_some() {
+                self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+                    .bind(&write.item_id)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+                outcome.removed += 1;
+                continue;
+            }
+            if current_nfo_json != write.expected_nfo_json {
+                // The NFO changed after the worker read it; move the queued item
+                // to the back so the next batch retries with a fresh snapshot.
+                self.query(
+                    "UPDATE media_content_restriction_index_queue
+                     SET queued_at = unixepoch() WHERE item_id = ?",
+                )
+                .bind(&write.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                outcome.stale += 1;
+                continue;
+            }
+            self.query("DELETE FROM media_content_restriction_tags WHERE item_id = ?")
+                .bind(&write.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES (?, ?)
+                 ON CONFLICT (item_id) DO UPDATE SET
+                     certification_code = excluded.certification_code,
+                     indexed_at = unixepoch()",
+            )
+            .bind(&write.item_id)
+            .bind(write.certification_code.as_deref())
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            for tag in &write.tags {
+                self.query(
+                    "INSERT INTO media_content_restriction_tags (item_id, tag)
+                     VALUES (?, ?)",
+                )
+                .bind(&write.item_id)
+                .bind(tag)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+            self.query("DELETE FROM media_content_restriction_index_queue WHERE item_id = ?")
+                .bind(&write.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            outcome.indexed += 1;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(outcome)
     }
 
     pub(crate) async fn media_item_nfo_metadata_snapshot(
@@ -9075,7 +9491,7 @@ impl Database {
                 statement = statement.bind(item_id);
             }
             if let Err(source) = statement.execute(&mut *transaction).await {
-                let _ = transaction.rollback().await;
+                Self::rollback_write_transaction(transaction, "write failed").await;
                 return Err(StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
@@ -9638,11 +10054,12 @@ impl Database {
         &self,
         token: NewAccessToken<'_>,
     ) -> Result<(), StorageError> {
+        let expires_at = current_unix_timestamp().saturating_add(EMBY_ACCESS_TOKEN_TTL_SECONDS);
         self.query(
             "INSERT INTO access_tokens (
                 id, token_hash, user_id, device_id, client_name,
-                device_name, client_version, device_type
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                device_name, client_version, device_type, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(token.id)
         .bind(token.token_hash)
@@ -9652,6 +10069,7 @@ impl Database {
         .bind(token.device_name)
         .bind(token.client_version)
         .bind(token.device_type)
+        .bind(expires_at)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -9685,6 +10103,7 @@ impl Database {
             "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM access_tokens
                 WHERE token_hash = ? AND revoked_at IS NULL
+                  AND (expires_at IS NULL OR expires_at > unixepoch())
             ) THEN 1 ELSE 0 END",
         )
         .bind(token_hash)
@@ -9808,6 +10227,39 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    /// Revokes every active web session of a user, optionally keeping the caller's own session.
+    pub(crate) async fn revoke_all_web_sessions_for_user(
+        &self,
+        user_id: &str,
+        keep_session_token_hash: Option<&[u8]>,
+    ) -> Result<u64, StorageError> {
+        let statement = match keep_session_token_hash {
+            Some(keep) => self
+                .query(
+                    "UPDATE web_sessions
+                     SET revoked_at = unixepoch(), updated_at = unixepoch()
+                     WHERE user_id = ? AND revoked_at IS NULL AND session_token_hash <> ?",
+                )
+                .bind(user_id)
+                .bind(keep),
+            None => self
+                .query(
+                    "UPDATE web_sessions
+                     SET revoked_at = unixepoch(), updated_at = unixepoch()
+                     WHERE user_id = ? AND revoked_at IS NULL",
+                )
+                .bind(user_id),
+        };
+        statement
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_web_session_summaries(
@@ -9950,9 +10402,40 @@ impl Database {
 fn filtered_catalog_list_query<'a>(
     filter: &CatalogFilterQuery<'a>,
 ) -> (String, Vec<CatalogBind<'a>>) {
-    let (where_clause, mut binds) = catalog_filter_where_clause(filter);
+    let (where_clause, binds) = catalog_filter_where_clause(filter);
     let item_order = catalog_item_order(filter.sort_by, filter.descending);
-    let query = format!(
+    let fetch_limit = if filter.include_total {
+        filter.limit
+    } else {
+        filter.limit.saturating_add(1)
+    };
+    if let Some((selected_sql, union_binds)) =
+        catalog_list_union_selected_sql(filter, &where_clause, &binds, item_order, fetch_limit)
+    {
+        return (
+            catalog_list_query_from_selected(&selected_sql, item_order),
+            union_binds,
+        );
+    }
+    let selected_sql = format!(
+        "SELECT mi.id
+         FROM media_items mi
+         JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+         {where_clause}
+         ORDER BY {item_order}
+         LIMIT ? OFFSET ?"
+    );
+    let mut binds = binds;
+    binds.push(CatalogBind::Integer(fetch_limit));
+    binds.push(CatalogBind::Integer(filter.offset));
+    (
+        catalog_list_query_from_selected(&selected_sql, item_order),
+        binds,
+    )
+}
+
+fn catalog_list_query_from_selected(selected_sql: &str, item_order: &str) -> String {
+    format!(
         "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                 mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
                 mi.title, mi.sort_title, mi.original_title, mi.overview,
@@ -9977,14 +10460,7 @@ fn filtered_catalog_list_query<'a>(
                 mt.is_external AS stream_is_external,
                 mt.is_default AS stream_is_default,
                 mt.is_forced AS stream_is_forced
-         FROM (
-             SELECT mi.id
-             FROM media_items mi
-             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-             {where_clause}
-             ORDER BY {item_order}
-             LIMIT ? OFFSET ?
-         ) selected
+         FROM ({selected_sql}) selected
          JOIN media_items mi ON mi.id = selected.id
          LEFT JOIN media_sources ms
            ON ms.item_id = mi.id
@@ -9994,15 +10470,83 @@ fn filtered_catalog_list_query<'a>(
           )
          LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
          ORDER BY {item_order}, ms.id, mt.stream_index"
+    )
+}
+
+/// For the default "recently added" view over multiple libraries, each library
+/// contributes at most `offset + limit` rows to the global page. Querying each
+/// library separately keeps the existing per-library sort index usable and
+/// avoids sorting the whole catalog. Other filters keep the single-query plan.
+fn catalog_list_union_selected_sql<'a>(
+    filter: &CatalogFilterQuery<'a>,
+    where_clause: &str,
+    binds: &[CatalogBind<'a>],
+    item_order: &str,
+    fetch_limit: i64,
+) -> Option<(String, Vec<CatalogBind<'a>>)> {
+    if filter.library_ids.len() <= 1
+        || filter.offset > 200
+        || filter.parent_id_scope.is_some()
+        || filter.item_ids.is_some()
+        || filter.person_id.is_some()
+        || filter.media_source_ids.is_some()
+        || filter.provider_id_equals.is_some()
+        || !filter.excluded_item_types.is_empty()
+        || !filter.years.is_empty()
+        || filter.is_played.is_some()
+        || filter.is_favorite.is_some()
+        || filter.min_date_last_saved.is_some()
+        || filter.metadata_pending
+        || filter.sort_by != CatalogSort::DateCreated
+        || !filter.descending
+    {
+        return None;
+    }
+    let library_count = filter.library_ids.len();
+    let rest_binds = binds.get(library_count..)?.to_vec();
+    let marker = "AND mi.library_id IN (";
+    let start = where_clause.find(marker)?;
+    let values_start = start + marker.len();
+    let values_end = where_clause[values_start..].find(')')? + values_start;
+    let branch_where = format!(
+        "{}AND mi.library_id = ?{}",
+        &where_clause[..start],
+        &where_clause[values_end + 1..]
     );
-    let fetch_limit = if filter.include_total {
-        filter.limit
-    } else {
-        filter.limit.saturating_add(1)
-    };
-    binds.push(CatalogBind::Integer(fetch_limit));
-    binds.push(CatalogBind::Integer(filter.offset));
-    (query, binds)
+    let branch_limit = filter.offset.saturating_add(fetch_limit);
+    let mut branches = Vec::with_capacity(library_count);
+    let mut union_binds = Vec::with_capacity(library_count * (rest_binds.len() + 2) + 2);
+    for (index, library_id) in filter.library_ids.iter().enumerate() {
+        // The branch columns carry the sort keys so the union can be ordered and paged
+        // globally before the per-source detail join runs.
+        branches.push(format!(
+            "SELECT * FROM (
+                 SELECT mi.id AS id, mi.added_at AS added_at, mi.title AS title
+                 FROM media_items mi
+                 JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+                 {branch_where}
+                 ORDER BY {item_order}
+                 LIMIT ? OFFSET 0
+             ) AS branch_{index}"
+        ));
+        union_binds.push(CatalogBind::Text(library_id.as_str()));
+        union_binds.extend(rest_binds.iter().copied());
+        union_binds.push(CatalogBind::Integer(branch_limit));
+    }
+    // Page on item ids, not on the joined media_source/media_stream rows: one item can expand
+    // into several detail rows, so the row-level LIMIT would drop items from a full page.
+    let paged_sql = format!(
+        "SELECT paged.id
+         FROM (
+             {}
+         ) paged
+         ORDER BY paged.added_at DESC, LOWER(paged.title) ASC, paged.id ASC
+         LIMIT ? OFFSET ?",
+        branches.join("\nUNION ALL\n")
+    );
+    union_binds.push(CatalogBind::Integer(fetch_limit));
+    union_binds.push(CatalogBind::Integer(filter.offset));
+    Some((paged_sql, union_binds))
 }
 
 fn global_generated_identity_key(kind: &str, provider: &str, provider_id: &str) -> String {
@@ -10064,8 +10608,10 @@ fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
 mod tests {
     use super::{
         Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
-        postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
+        filtered_catalog_list_query, postgres_recent_catalog_rows_by_library_query,
+        sqlite_recent_catalog_rows_by_library_query,
     };
+    use crate::storage::repository::{CatalogFilterQuery, CatalogSort};
 
     #[test]
     fn recommendation_stats_cleanup_uses_an_indexable_exists_lookup() {
@@ -10087,14 +10633,162 @@ mod tests {
     }
 
     #[test]
-    fn postgres_recent_catalog_aggregates_episode_dates_once() {
+    fn postgres_recent_catalog_aggregates_series_and_parent_episode_dates() {
         let query = postgres_recent_catalog_rows_by_library_query(2, "");
 
         assert!(query.contains("episode_latest_by_root AS MATERIALIZED"));
-        assert_eq!(query.matches("MAX(episode.added_at)").count(), 1);
+        assert_eq!(query.matches("MAX(episode.added_at)").count(), 2);
         assert_eq!(query.matches("LEFT JOIN episode_latest_by_root").count(), 1);
-        assert!(query.contains("roots.root_id IS NOT NULL"));
+        assert!(query.contains("GROUP BY episode.series_id"));
+        assert!(query.contains("GROUP BY episode.parent_id"));
+        assert!(!query.contains("episode_roots"));
         assert!(!query.contains("MAX(child.added_at)"));
+    }
+
+    #[tokio::test]
+    async fn multi_library_union_list_preserves_global_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES
+                     ('union-a', 'A', 'MOVIE'), ('union-b', 'B', 'MOVIE')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items
+                     (id, library_id, item_type, title, sort_title, added_at,
+                      has_available_source, identification_status)
+                 VALUES
+                     ('old', 'union-a', 'MOVIE', 'Old', 'old', 100, 1, 'LOCAL_CONFIRMED'),
+                     ('newest', 'union-b', 'MOVIE', 'Newest', 'newest', 300, 1, 'LOCAL_CONFIRMED'),
+                     ('middle', 'union-a', 'MOVIE', 'Middle', 'middle', 200, 1, 'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        let libraries = vec!["union-a".to_owned(), "union-b".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &libraries,
+            user_id: "user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 0,
+            limit: 2,
+            include_total: true,
+        };
+        let (rows, total) = database.list_filtered_catalog_rows(&filter).await?;
+        assert_eq!(total, 3);
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["newest", "middle"]
+        );
+
+        let second_page = CatalogFilterQuery {
+            offset: 2,
+            ..filter
+        };
+        let (rows, _) = database.list_filtered_catalog_rows(&second_page).await?;
+        assert_eq!(
+            rows.iter()
+                .map(|row| row.item_id.as_str())
+                .collect::<Vec<_>>(),
+            ["old"]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multi_library_default_date_page_binds_match_placeholders() {
+        let libraries = vec!["library-a".to_owned(), "library-b".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &libraries,
+            user_id: "user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 50,
+            limit: 24,
+            include_total: false,
+        };
+        let (query, binds) = filtered_catalog_list_query(&filter);
+        assert!(query.contains("UNION ALL"));
+        assert_eq!(
+            query.matches('?').count(),
+            binds.len(),
+            "every placeholder must have exactly one bound value"
+        );
+    }
+
+    #[test]
+    fn multi_library_default_date_list_queries_each_library_separately() {
+        let libraries = vec!["library-a".to_owned(), "library-b".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &libraries,
+            user_id: "user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 0,
+            limit: 24,
+            include_total: true,
+        };
+        let (query, binds) = filtered_catalog_list_query(&filter);
+        assert!(query.contains("UNION ALL"));
+        assert_eq!(query.matches("mi.library_id = ?").count(), 2);
+        assert_eq!(binds.len(), 6);
+
+        let deep = CatalogFilterQuery {
+            offset: 201,
+            ..filter
+        };
+        let (query, _) = filtered_catalog_list_query(&deep);
+        assert!(!query.contains("UNION ALL"));
     }
 
     #[test]
@@ -10105,6 +10799,89 @@ mod tests {
         assert!(!query.contains("ROW_NUMBER()"));
         assert_eq!(query.matches("LIMIT ?").count(), 6);
         assert_eq!(query.matches("UNION ALL").count(), 3);
+    }
+
+    #[tokio::test]
+    async fn recommendation_refresh_skips_unchanged_inputs_within_the_idle_window()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Recommendations", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES ('recommendation-skip-item', ?, 'MOVIE', 'Skip', 'skip',
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "UPDATE recommendation_stats_state
+                 SET batch_key = batch_key - 1, refreshed_at = 0",
+            )
+            .execute(database.pool())
+            .await?;
+        assert!(database.refresh_recommendation_stats_if_needed().await?);
+        let fingerprint: Option<String> = sqlx::query_scalar(
+            "SELECT source_fingerprint FROM recommendation_stats_state WHERE id = 1",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert!(fingerprint.is_some());
+
+        // Next batch, same inputs: skip the materialization.
+        sqlx::query("UPDATE recommendation_stats_state SET batch_key = batch_key - 1")
+            .execute(database.pool())
+            .await?;
+        assert!(!database.refresh_recommendation_stats_if_needed().await?);
+
+        // A new item changes the fingerprint and forces a refresh.
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES ('recommendation-skip-item-2', ?, 'MOVIE', 'Skip 2', 'skip 2',
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE recommendation_stats_state SET batch_key = batch_key - 1")
+            .execute(database.pool())
+            .await?;
+        assert!(database.refresh_recommendation_stats_if_needed().await?);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn dashboard_stats_reuses_a_recent_cache_entry() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database.reset_query_count();
+        let first = database.dashboard_stats().await?;
+        assert_eq!(database.query_count(), 1);
+        let second = database.dashboard_stats().await?;
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(first, second);
+        Ok(())
     }
 
     #[tokio::test]
@@ -10356,6 +11133,18 @@ mod tests {
             .list_global_collection_cards_page(&viewer.id.to_string(), false, 0, 1)
             .await?;
         assert_eq!(first_total, 2);
+        assert_eq!(
+            database
+                .count_visible_global_collections_with_restrictions(
+                    &viewer.id.to_string(),
+                    false,
+                    None,
+                    None
+                )
+                .await?,
+            first_total,
+            "the count-only query must agree with the paged total"
+        );
         assert_eq!(first_page.len(), 1);
         assert_eq!(first_page[0].title, "Alpha Collection");
         assert_eq!(first_page[0].member_count, 1);
@@ -10448,6 +11237,17 @@ mod tests {
             .await?;
         assert!(hidden_cards.is_empty());
         assert_eq!(hidden_total, 0);
+        assert_eq!(
+            database
+                .count_visible_global_collections_with_restrictions(
+                    &isolated_user.id.to_string(),
+                    false,
+                    None,
+                    None
+                )
+                .await?,
+            0
+        );
         let (_, hidden_members_total) = database
             .list_global_collection_member_ids_page(
                 &first_page[0].item_id,
@@ -10462,6 +11262,17 @@ mod tests {
             .list_global_collection_cards_page(&viewer.id.to_string(), true, 0, 10)
             .await?;
         assert_eq!(admin_total, 2);
+        assert_eq!(
+            database
+                .count_visible_global_collections_with_restrictions(
+                    &viewer.id.to_string(),
+                    true,
+                    None,
+                    None
+                )
+                .await?,
+            admin_total
+        );
         assert_eq!(admin_cards[0].member_count, 2);
 
         sqlx::query("UPDATE users SET library_access_mode = 'NONE' WHERE id = ?")

@@ -291,7 +291,10 @@ async fn lux_people_search_and_items_enforce_acl_and_aggregate_series_episodes()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let base_url = format!("http://{address}");
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -511,7 +514,10 @@ async fn lux_person_favorites_are_user_scoped_and_require_person_acl_and_csrf()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let base_url = format!("http://{address}");
 
     let viewer_login = client
@@ -1198,7 +1204,10 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let rebuilds = client
         .get(format!(
             "http://{address}/api/v1/admin/people/index-rebuild"
@@ -1639,7 +1648,10 @@ async fn people_index_rebuild_admin_api_supports_csrf_pagination_cancel_and_requ
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let base_url = format!("http://{address}");
 
     let login = client
@@ -1826,7 +1838,10 @@ async fn emby_item_update_accepts_local_only_actor() -> Result<(), Box<dyn std::
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let person_update = client
         .post(format!(

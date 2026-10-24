@@ -72,6 +72,8 @@ mod tests {
         });
 
         let client = reqwest::Client::builder()
+            // The stub listens on loopback; a developer machine proxy must not intercept it.
+            .no_proxy()
             .timeout(Duration::from_millis(100))
             .build()
             .expect("test client should build");

@@ -203,6 +203,7 @@ pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Va
             "status": "ready",
             "schemaVersion": schema_version,
             "databaseWritable": true,
+            "fileLogging": crate::observability::file_logging_available(),
         })),
     )
 }
@@ -316,11 +317,32 @@ impl SetupDatabaseRequest {
     }
 }
 
+/// The pre-setup database probe must not be reachable from the public internet: it lets the
+/// caller make the server connect to an arbitrary PostgreSQL endpoint.
+fn setup_endpoint_allows_peer(headers: &HeaderMap) -> bool {
+    header_str(headers, "x-lux-peer-ip")
+        .and_then(|value| value.parse::<std::net::IpAddr>().ok())
+        .is_some_and(crate::application::user_access_rules::is_private_or_loopback)
+}
+
+fn setup_remote_peer_rejected(headers: &HeaderMap) -> Response {
+    api_error(
+        headers,
+        StatusCode::FORBIDDEN,
+        lux::ApiErrorCode::PermissionDenied,
+        "只能在局域网内完成数据库初始化",
+    )
+    .into_response()
+}
+
 pub(super) async fn setup_database_test(
     headers: HeaderMap,
     State(state): State<AppState>,
     Json(request): Json<SetupDatabaseRequest>,
 ) -> Response {
+    if !setup_endpoint_allows_peer(&headers) {
+        return setup_remote_peer_rejected(&headers);
+    }
     let Some(setup) = state.setup.as_ref() else {
         return api_error(
             &headers,
@@ -376,6 +398,9 @@ pub(super) async fn setup_database_select(
     State(state): State<AppState>,
     Json(request): Json<SetupDatabaseRequest>,
 ) -> Response {
+    if !setup_endpoint_allows_peer(&headers) {
+        return setup_remote_peer_rejected(&headers);
+    }
     let Some(setup) = state.setup.as_ref() else {
         return api_error(
             &headers,
@@ -802,15 +827,14 @@ fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn record_web_device_observation(
-    headers: &HeaderMap,
     state: &AppState,
     user_id: &str,
     device_id: Option<&str>,
+    remote_ip: Option<String>,
 ) {
     let (Some(device_id), Some(database)) = (device_id, state.database.as_ref()) else {
         return;
     };
-    let remote_ip = request_client_ip(headers, &state.remote_access);
     if let Err(error) = database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
@@ -946,7 +970,7 @@ pub(super) async fn auth_login(
                 &state.admin_events,
                 &user_id,
                 "LUX_WEB",
-                request_client_ip(&headers, &state.remote_access),
+                request_client_ip(&headers, &state).await,
             )
             .await;
         }
@@ -975,7 +999,14 @@ pub(super) async fn auth_login(
     }
 
     let user_id = session.user.id.to_string();
-    record_web_device_observation(&headers, &state, &user_id, login_device_id.as_deref()).await;
+    let login_remote_ip = request_client_ip(&headers, &state).await;
+    record_web_device_observation(
+        &state,
+        &user_id,
+        login_device_id.as_deref(),
+        login_remote_ip,
+    )
+    .await;
     record_activity_event(
         state.database.as_ref(),
         &state.admin_events,
@@ -983,7 +1014,7 @@ pub(super) async fn auth_login(
         "AUTH_LOGIN",
         None,
         json!({
-            "remoteIp": request_client_ip(&headers, &state.remote_access),
+            "remoteIp": request_client_ip(&headers, &state).await,
         }),
     )
     .await;
@@ -1719,7 +1750,7 @@ pub(super) async fn auth_create_device_pairing(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let client_ip = pairing_rate_limit_client_ip(&headers, &state.remote_access);
+    let client_ip = pairing_rate_limit_client_ip(&headers, &state).await;
     let rate_key = format!("create:{}:{client_ip}", session.user.id);
     if !state
         .device_pairing_rate_limiter
@@ -1823,7 +1854,7 @@ pub(super) async fn redeem_device_pairing(
     State(state): State<AppState>,
     Json(request): Json<DevicePairingRedeemRequest>,
 ) -> Response {
-    let client_ip = pairing_rate_limit_client_ip(&headers, &state.remote_access);
+    let client_ip = pairing_rate_limit_client_ip(&headers, &state).await;
     if !state
         .device_pairing_rate_limiter
         .try_acquire(&format!("redeem:{client_ip}"), DEVICE_PAIRING_REDEEM_LIMIT)
@@ -1962,7 +1993,8 @@ async fn require_web_session_csrf(
         .device_id
         .clone()
         .or_else(|| web_login_device_id(headers));
-    record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
+    let remote_ip = request_client_ip(headers, state).await;
+    record_web_device_observation(state, &user_id, device_id.as_deref(), remote_ip).await;
     Ok(session)
 }
 
@@ -1971,13 +2003,9 @@ fn bounded_non_empty(value: &str, max_bytes: usize) -> Option<&str> {
     (!value.is_empty() && value.len() <= max_bytes).then_some(value)
 }
 
-fn pairing_rate_limit_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> String {
-    policy
-        .client_ip(
-            header_str(headers, "x-lux-peer-ip"),
-            header_str(headers, "x-forwarded-for"),
-        )
-        .map(|address| address.to_string())
+async fn pairing_rate_limit_client_ip(headers: &HeaderMap, state: &AppState) -> String {
+    request_client_ip(headers, state)
+        .await
         .unwrap_or_else(|| "local".to_owned())
 }
 
@@ -2319,11 +2347,15 @@ pub(super) async fn auth_update_password(
         )
         .into_response();
     };
+    // Keep the caller's own session usable after the change; every other credential is revoked.
+    let keep_session_token_hash = request_cookie(&headers, "lux_session")
+        .map(|token| crate::auth::sessions::WebAuthService::session_token_hash(&token));
     match auth
         .change_password(
             &session.user.id,
             &request.current_password,
             &request.new_password,
+            keep_session_token_hash.as_deref(),
         )
         .await
     {
@@ -2829,10 +2861,27 @@ async fn resolve_web_session_for_request(
     auth: &crate::auth::sessions::WebAuthService,
     session_token: &str,
 ) -> Result<Option<AuthenticatedSession>, crate::auth::sessions::WebAuthError> {
+    Ok(
+        resolve_web_session_with_ip(headers, state, auth, session_token)
+            .await?
+            .0,
+    )
+}
+
+async fn resolve_web_session_with_ip(
+    headers: &HeaderMap,
+    state: &AppState,
+    auth: &crate::auth::sessions::WebAuthService,
+    session_token: &str,
+) -> Result<
+    (Option<AuthenticatedSession>, Option<std::net::IpAddr>),
+    crate::auth::sessions::WebAuthError,
+> {
     let client_ip = super::request_access_ip(headers, state)
         .await
         .map_err(|_| crate::auth::sessions::WebAuthError::AccessRulesUnavailable)?;
-    auth.resolve_with_ip(session_token, client_ip).await
+    let session = auth.resolve_with_ip(session_token, client_ip).await?;
+    Ok((session, client_ip))
 }
 
 pub(super) async fn require_web_principal(
@@ -2945,8 +2994,22 @@ pub(super) async fn require_web_principal(
         )
         .into_response());
     };
-    match resolve_web_session_for_request(headers, state, auth, &session_token).await {
-        Ok(Some(session)) => {
+    // One rules query covers the IP, device and client checks the request would otherwise run
+    // as two separate statements.
+    let client_ip = match super::request_access_ip(headers, state).await {
+        Ok(client_ip) => client_ip,
+        Err(_) => {
+            return Err(api_error(
+                headers,
+                StatusCode::SERVICE_UNAVAILABLE,
+                lux::ApiErrorCode::DatabaseUnavailable,
+                "访问规则暂时无法读取",
+            )
+            .into_response());
+        }
+    };
+    match auth.resolve_principal(&session_token, client_ip).await {
+        Ok(crate::auth::sessions::PrincipalResolution::Session(session)) => {
             if state.remote_access.is_remote(
                 header_str(headers, "x-lux-peer-ip"),
                 header_str(headers, "x-forwarded-for"),
@@ -2961,49 +3024,40 @@ pub(super) async fn require_web_principal(
                 .into_response());
             }
             let user_id = session.user.id.to_string();
-            match auth
-                .is_user_access_blacklisted(&user_id, session.device_id.as_deref())
-                .await
-            {
-                Ok(false) => {}
-                Ok(true) => {
-                    if auth.logout(&session_token).await.is_err() {
-                        return Err(api_error(
-                            headers,
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            lux::ApiErrorCode::DatabaseUnavailable,
-                            "登录状态暂时无法更新",
-                        )
-                        .into_response());
-                    }
-                    return Err(api_error(
-                        headers,
-                        StatusCode::FORBIDDEN,
-                        lux::ApiErrorCode::PermissionDenied,
-                        "当前设备或客户端已被禁止访问",
-                    )
-                    .into_response());
-                }
-                Err(_) => {
-                    return Err(api_error(
-                        headers,
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        lux::ApiErrorCode::DatabaseUnavailable,
-                        "访问规则暂时无法读取",
-                    )
-                    .into_response());
-                }
-            }
             let device_id = session
                 .device_id
                 .clone()
                 .or_else(|| web_login_device_id(headers));
-            record_web_device_observation(headers, state, &user_id, device_id.as_deref()).await;
+            record_web_device_observation(
+                state,
+                &user_id,
+                device_id.as_deref(),
+                client_ip.map(|address| address.to_string()),
+            )
+            .await;
             Ok(crate::auth::users::AuthenticationPrincipal::User(
                 session.user,
             ))
         }
-        Ok(None) => Err(api_error(
+        Ok(crate::auth::sessions::PrincipalResolution::AccessDenied) => {
+            if auth.logout(&session_token).await.is_err() {
+                return Err(api_error(
+                    headers,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    lux::ApiErrorCode::DatabaseUnavailable,
+                    "登录状态暂时无法更新",
+                )
+                .into_response());
+            }
+            Err(api_error(
+                headers,
+                StatusCode::FORBIDDEN,
+                lux::ApiErrorCode::PermissionDenied,
+                "当前设备或客户端已被禁止访问",
+            )
+            .into_response())
+        }
+        Ok(crate::auth::sessions::PrincipalResolution::Unauthenticated) => Err(api_error(
             headers,
             StatusCode::UNAUTHORIZED,
             lux::ApiErrorCode::AuthenticationRequired,
@@ -3146,7 +3200,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(users::setup_database_restart),
         )
         .route("/api/v1/setup/complete", post(users::setup_complete))
-        .route("/api/v1/auth/login", post(users::auth_login))
+        .route(
+            "/api/v1/auth/login",
+            post(users::auth_login).layer(DefaultBodyLimit::max(8 * 1024)),
+        )
         .route(
             "/api/v1/auth/invitations/accept",
             post(users::auth_accept_user_invitation).layer(DefaultBodyLimit::max(16 * 1024)),
@@ -3220,4 +3277,27 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/auth/sessions/{session_id}",
             delete(users::auth_revoke_session),
         )
+}
+
+#[cfg(test)]
+mod setup_peer_tests {
+    use super::setup_endpoint_allows_peer;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    #[test]
+    fn setup_endpoints_only_accept_loopback_or_private_peers() {
+        let mut headers = HeaderMap::new();
+        assert!(
+            !setup_endpoint_allows_peer(&headers),
+            "a missing peer must fail closed"
+        );
+        for peer in ["127.0.0.1", "10.1.2.3", "192.168.1.20", "::1", "fd00::1"] {
+            headers.insert("x-lux-peer-ip", HeaderValue::from_str(peer).unwrap());
+            assert!(setup_endpoint_allows_peer(&headers), "{peer}");
+        }
+        for peer in ["203.0.113.5", "2001:db8::1"] {
+            headers.insert("x-lux-peer-ip", HeaderValue::from_str(peer).unwrap());
+            assert!(!setup_endpoint_allows_peer(&headers), "{peer}");
+        }
+    }
 }

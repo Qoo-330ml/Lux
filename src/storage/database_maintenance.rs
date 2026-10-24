@@ -1,5 +1,5 @@
 use super::*;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Maximum number of tables one maintenance round may touch. Keeps the daily
 /// pass bounded even on libraries with many large tables.
@@ -22,10 +22,26 @@ const TRIGGER_FRACTION_DENOMINATOR: i64 = 10;
 const DEFAULT_VACUUM_THRESHOLD: i64 = 50;
 const DEFAULT_VACUUM_SCALE_PERCENT: i64 = 20;
 const MIN_LIVE_TUPLES_FOR_OVERRIDE: i64 = 10_000;
+/// SQLite never reclaims free pages on its own. A full `VACUUM` rewrites the
+/// whole database, so only run it when the freelist is both large in absolute
+/// terms and a meaningful share of the file.
+const SQLITE_VACUUM_MIN_FREELIST_PAGES: i64 = 256;
+const SQLITE_VACUUM_MIN_FREELIST_PERCENT: i64 = 5;
+/// `PRAGMA auto_vacuum` value for incremental mode. Only databases created by this
+/// build reserve it; older databases stay at 0 until an operator runs a full VACUUM.
+const SQLITE_AUTO_VACUUM_INCREMENTAL: i64 = 2;
+/// Pages truncated per incremental step. Small steps keep the write lock short even
+/// when a deletion of a whole library freed hundreds of thousands of pages.
+const SQLITE_INCREMENTAL_VACUUM_PAGES_PER_STEP: i64 = 2_048;
 
 const MAINTENANCE_ENV: &str = "LUX_DATABASE_MAINTENANCE";
 const MAINTENANCE_INTERVAL_ENV: &str = "LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS";
 const MAINTENANCE_INITIAL_DELAY_ENV: &str = "LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS";
+/// A full SQLite `VACUUM` rewrites the entire file and holds the write lock for the
+/// whole rewrite, so the default budget stays short. Operators who accept the lock
+/// for an offline compaction can raise it.
+const SQLITE_VACUUM_TIMEOUT_ENV: &str = "LUX_SQLITE_VACUUM_TIMEOUT_SECONDS";
+const DEFAULT_SQLITE_VACUUM_TIMEOUT_SECONDS: u64 = 120;
 
 static MAINTENANCE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -48,6 +64,7 @@ pub struct MaintenanceReport {
     pub vacuumed: Vec<String>,
     pub parameters_applied: Vec<String>,
     pub skipped_untrusted: Vec<String>,
+    pub skipped_below_threshold: Vec<String>,
     pub failed: Vec<String>,
 }
 
@@ -79,9 +96,38 @@ impl MaintenanceCandidate {
             && self.live_tuples >= MIN_LIVE_TUPLES_FOR_OVERRIDE
             && self.exceeds_vacuum_trigger()
     }
+
+    /// SQLite candidate: `dead_tuples` stores freelist pages and
+    /// `live_tuples` stores total pages. A handful of freelist pages is not
+    /// worth rewriting a multi-gigabyte file.
+    pub fn sqlite_freelist_worth_vacuum(&self) -> bool {
+        self.statistics_trusted
+            && self.dead_tuples >= SQLITE_VACUUM_MIN_FREELIST_PAGES
+            && self.live_tuples > 0
+            && self.dead_tuples.saturating_mul(100)
+                >= self
+                    .live_tuples
+                    .saturating_mul(SQLITE_VACUUM_MIN_FREELIST_PERCENT)
+    }
 }
 
 /// Maintenance is on unless explicitly disabled.
+/// Resolves the SQLite maintenance budget. Invalid or empty input falls back to the
+/// default rather than disabling the bound.
+pub(crate) fn resolve_sqlite_vacuum_timeout(configured: Option<&str>) -> Duration {
+    let seconds = configured
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SQLITE_VACUUM_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds)
+}
+
+fn sqlite_vacuum_timeout() -> Duration {
+    resolve_sqlite_vacuum_timeout(std::env::var(SQLITE_VACUUM_TIMEOUT_ENV).ok().as_deref())
+}
+
 pub fn maintenance_enabled() -> bool {
     match std::env::var(MAINTENANCE_ENV) {
         Ok(value) => !matches!(
@@ -193,44 +239,140 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        let page_count: i64 = self
+            .query_scalar("PRAGMA page_count")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
         // SQLite tracks no per-table dead tuples. Model the database-wide
         // freelist as one synthetic candidate so the round can run `VACUUM` when
         // enough pages are reclaimable, and skip it otherwise.
-
-        let table = "sqlite-main".to_owned();
-        Ok(vec![MaintenanceCandidate {
-            table,
+        let candidate = MaintenanceCandidate {
+            table: "sqlite-main".to_owned(),
             dead_tuples: freelist,
-            live_tuples: 0,
-            statistics_trusted: freelist > 0,
-        }])
+            live_tuples: page_count,
+            statistics_trusted: freelist > 0 && page_count > 0,
+        };
+        Ok(candidate
+            .sqlite_freelist_worth_vacuum()
+            .then_some(candidate)
+            .into_iter()
+            .collect())
+    }
+
+    async fn sqlite_auto_vacuum_mode(&self) -> Result<i64, StorageError> {
+        self.query_scalar("PRAGMA auto_vacuum")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Returns free pages to the filesystem in bounded steps. Incremental vacuum only
+    /// truncates what sits at the tail of the file, so it stops as soon as a step no
+    /// longer shrinks the freelist instead of spinning.
+    async fn run_sqlite_incremental_vacuum(
+        &self,
+        table: &str,
+        report: &mut MaintenanceReport,
+    ) -> bool {
+        let deadline = Instant::now() + sqlite_vacuum_timeout();
+        loop {
+            let freelist = match self.sqlite_freelist_count().await {
+                Ok(freelist) => freelist,
+                Err(error) => {
+                    tracing::warn!(%error, table, "sqlite incremental vacuum could not read the freelist");
+                    report.failed.push(table.to_owned());
+                    return false;
+                }
+            };
+            if freelist <= 0 {
+                report.vacuumed.push(table.to_owned());
+                return true;
+            }
+            if Instant::now() >= deadline {
+                tracing::warn!(
+                    table,
+                    freelist,
+                    "sqlite incremental vacuum stopped at its time budget"
+                );
+                report.failed.push(table.to_owned());
+                return false;
+            }
+            let statement =
+                format!("PRAGMA incremental_vacuum({SQLITE_INCREMENTAL_VACUUM_PAGES_PER_STEP})");
+            if let Err(error) = self
+                .query(sqlx::AssertSqlSafe(statement))
+                .execute(&self.pool)
+                .await
+            {
+                tracing::warn!(%error, table, "sqlite incremental vacuum failed");
+                report.failed.push(table.to_owned());
+                return false;
+            }
+            let remaining = self.sqlite_freelist_count().await.unwrap_or(freelist);
+            if remaining >= freelist {
+                // Only live pages sit at the tail now; a full VACUUM would be needed to
+                // move them, and that is an offline decision.
+                report.vacuumed.push(table.to_owned());
+                return true;
+            }
+        }
+    }
+
+    async fn sqlite_freelist_count(&self) -> Result<i64, StorageError> {
+        self.query_scalar("PRAGMA freelist_count")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     async fn run_maintenance_vacuum(&self, table: &str, report: &mut MaintenanceReport) -> bool {
         match self.backend {
-            DatabaseBackend::Sqlite => match tokio::time::timeout(
-                PER_TABLE_TIMEOUT,
-                self.query("VACUUM").execute(&self.pool),
-            )
-            .await
-            {
-                Ok(Ok(_)) => {
-                    report.vacuumed.push(table.to_owned());
-                    true
+            DatabaseBackend::Sqlite => {
+                if self.sqlite_auto_vacuum_mode().await.unwrap_or_default()
+                    == SQLITE_AUTO_VACUUM_INCREMENTAL
+                {
+                    return self.run_sqlite_incremental_vacuum(table, report).await;
                 }
-                Ok(Err(error)) => {
-                    tracing::warn!(%error, table, "sqlite vacuum failed");
-                    report.failed.push(table.to_owned());
-                    false
+                match tokio::time::timeout(
+                    sqlite_vacuum_timeout(),
+                    self.query("VACUUM").execute(&self.pool),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        report.vacuumed.push(table.to_owned());
+                        true
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, table, "sqlite vacuum failed");
+                        report.failed.push(table.to_owned());
+                        false
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            table,
+                            "sqlite vacuum timed out; this database predates incremental                              auto-vacuum, so reclaiming the space needs an offline VACUUM"
+                        );
+                        report.failed.push(table.to_owned());
+                        false
+                    }
                 }
-                Err(_) => {
-                    tracing::warn!(table, "sqlite vacuum timed out");
-                    report.failed.push(table.to_owned());
-                    false
-                }
-            },
+            }
             DatabaseBackend::Postgres => {
-                let statement = format!("VACUUM (ANALYZE) {}", quote_identifier(table));
+                // Parallel index vacuum needs shared memory beyond Docker's 64 MB
+                // default /dev/shm. Keep maintenance single-process so it cannot
+                // fail with "could not resize shared memory segment".
+                let statement = format!("VACUUM (ANALYZE, PARALLEL 0) {}", quote_identifier(table));
                 match tokio::time::timeout(
                     PER_TABLE_TIMEOUT,
                     self.query(sqlx::AssertSqlSafe(statement))
@@ -317,6 +459,7 @@ impl Database {
                     vacuumed = report.vacuumed.len(),
                     parameters_applied = report.parameters_applied.len(),
                     skipped_untrusted = report.skipped_untrusted.len(),
+                    skipped_below_threshold = report.skipped_below_threshold.len(),
                     failed = report.failed.len(),
                     "database maintenance round finished"
                 );
@@ -352,6 +495,23 @@ impl Database {
                 return report;
             }
         }
+        if self.backend == DatabaseBackend::Postgres {
+            // media_search is populated by triggers and can remain "untrusted"
+            // forever because autovacuum has never analyzed it. Refresh its
+            // statistics before selecting maintenance candidates.
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                self.query("ANALYZE media_search").execute(&self.pool),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "media_search analyze failed");
+                }
+                Err(_) => tracing::warn!("media_search analyze timed out"),
+            }
+        }
         let candidates = match self.maintenance_candidates().await {
             Ok(candidates) => candidates,
             Err(error) => {
@@ -362,6 +522,14 @@ impl Database {
         for candidate in candidates.into_iter().take(MAX_MAINTENANCE_TABLES) {
             if !candidate.can_be_evaluated() {
                 report.skipped_untrusted.push(candidate.table.clone());
+                continue;
+            }
+            let worth_vacuum = match self.backend {
+                DatabaseBackend::Sqlite => candidate.sqlite_freelist_worth_vacuum(),
+                DatabaseBackend::Postgres => candidate.exceeds_vacuum_trigger(),
+            };
+            if !worth_vacuum {
+                report.skipped_below_threshold.push(candidate.table.clone());
                 continue;
             }
             if !self
@@ -427,6 +595,20 @@ mod tests {
         assert!(!small.deserves_parameter_override());
         let large = candidate(50_000, 10_000, true);
         assert!(large.deserves_parameter_override());
+    }
+
+    #[test]
+    fn sqlite_vacuum_requires_absolute_and_relative_freelist() {
+        let below_absolute = candidate(10_000, 255, true);
+        assert!(!below_absolute.sqlite_freelist_worth_vacuum());
+        let below_ratio = candidate(100_000, 4_999, true);
+        assert!(!below_ratio.sqlite_freelist_worth_vacuum());
+        let worth = candidate(10_000, 1_000, true);
+        assert!(worth.sqlite_freelist_worth_vacuum());
+        let untrusted = candidate(10_000, 1_000, false);
+        assert!(!untrusted.sqlite_freelist_worth_vacuum());
+        let empty = candidate(0, 1_000, true);
+        assert!(!empty.sqlite_freelist_worth_vacuum());
     }
 
     #[test]

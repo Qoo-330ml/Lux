@@ -309,7 +309,9 @@ pub(crate) async fn submit_public_user_registration(
     .map_err(|_| UserRegistrationError::SettingsUnavailable)?;
 
     let password_hash = PasswordService::new()
-        .and_then(|passwords| passwords.hash_password(input.password))
+        .map_err(|_| UserRegistrationError::PasswordUnavailable)?
+        .hash_password(input.password)
+        .await
         .map_err(|_| UserRegistrationError::PasswordUnavailable)?;
     let user_id = Uuid::now_v7().to_string();
     let challenge_id = Uuid::now_v7().to_string();
@@ -477,26 +479,16 @@ pub(crate) async fn verify_public_user_registration_email(
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::test_database;
     use std::net::{IpAddr, Ipv4Addr};
 
     use crate::{
         application::{
             mail::MailChallengeSigner, settings::NewUserPermissions, user_registration::*,
         },
-        config::Config,
         security::DevicePairingRateLimiter,
         storage::{Database, MailChallengeKind, MailOutboxTemplateKind},
     };
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: directory.path().join("config"),
-        })
-        .await?;
-        Ok((directory, database))
-    }
 
     async fn token_for_email(
         database: &Database,

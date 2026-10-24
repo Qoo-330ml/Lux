@@ -130,6 +130,118 @@ async fn advance_postgres_manifest_to_applying(
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_content_restriction_queue_migration_upgrades_v207_and_preserves_triggers()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let url = connection.postgres_url()?.ok_or("missing PostgreSQL URL")?;
+    let pool = PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&url)
+        .await?;
+    let result = async {
+        let source_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations-postgres");
+        let migrator = Migrator::new(source_dir.as_path()).await?;
+        let old = Migrator::with_migrations(
+            migrator.iter().filter(|m| m.version <= 207).cloned().collect(),
+        );
+        old.run(&pool).await?;
+        sqlx::raw_sql(
+            "INSERT INTO libraries (id, name, kind) VALUES ('queue-library', 'Queue', 'MOVIE');
+             INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status, removed_at)
+             VALUES ('queue-missing', 'queue-library', 'MOVIE', 'Missing', 'missing', 'LOCAL_CONFIRMED', NULL),
+                    ('queue-indexed', 'queue-library', 'MOVIE', 'Indexed', 'indexed', 'LOCAL_CONFIRMED', NULL),
+                    ('queue-removed', 'queue-library', 'MOVIE', 'Removed', 'removed', 'LOCAL_CONFIRMED', 1);
+             INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('queue-indexed', 'PG');
+             INSERT INTO media_content_restriction_tags (item_id, tag)
+             VALUES ('queue-indexed', 'family');",
+        )
+        .execute(&pool)
+        .await?;
+
+        migrator.run(&pool).await?;
+        // A normal restart must accept the recorded migrations without reapplying them.
+        migrator.run(&pool).await?;
+        let queued: Vec<String> = sqlx::query_scalar(
+            "SELECT item_id FROM media_content_restriction_index_queue ORDER BY item_id",
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(queued, ["queue-missing"]);
+
+        sqlx::query(
+            "UPDATE media_items SET nfo_metadata_json = nfo_metadata_json
+             WHERE id = 'queue-indexed'",
+        )
+        .execute(&pool)
+        .await?;
+        let unchanged_index: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index WHERE item_id = 'queue-indexed'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(unchanged_index, 1);
+
+        sqlx::raw_sql(
+            "UPDATE media_items SET nfo_metadata_json = '{\"certification\":\"R\"}'
+             WHERE id = 'queue-indexed';
+             UPDATE media_content_restriction_index_queue SET queued_at = -1
+             WHERE item_id = 'queue-indexed';
+             UPDATE media_items SET nfo_metadata_json = '{\"certification\":\"PG\"}'
+             WHERE id = 'queue-indexed';",
+        )
+        .execute(&pool)
+        .await?;
+        let invalidated_rows: i64 = sqlx::query_scalar(
+            "SELECT (SELECT COUNT(*) FROM media_content_restriction_index
+                     WHERE item_id = 'queue-indexed')
+                  + (SELECT COUNT(*) FROM media_content_restriction_tags
+                     WHERE item_id = 'queue-indexed')",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(invalidated_rows, 0);
+        let requeued_at: i64 = sqlx::query_scalar(
+            "SELECT queued_at FROM media_content_restriction_index_queue
+             WHERE item_id = 'queue-indexed'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(requeued_at > 0);
+
+        sqlx::query(
+            "INSERT INTO media_items
+                 (id, library_id, item_type, title, sort_title, identification_status)
+             VALUES ('queue-new', 'queue-library', 'MOVIE', 'New', 'new', 'LOCAL_CONFIRMED')",
+        )
+        .execute(&pool)
+        .await?;
+        let inserted_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index_queue WHERE item_id = 'queue-new'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(inserted_rows, 1);
+        sqlx::query("DELETE FROM media_items WHERE id = 'queue-new'")
+            .execute(&pool)
+            .await?;
+        let deleted_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_content_restriction_index_queue WHERE item_id = 'queue-new'",
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(deleted_rows, 0);
+        Ok::<(), Box<dyn std::error::Error>>(())
+    }
+    .await;
+    pool.close().await;
+    drop_postgres_test_database(&database_name).await?;
+    result
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_media_content_restriction_index_migration()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -1271,7 +1383,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(provider_row_triggers, 0);
+    assert_eq!(provider_row_triggers, 1);
     let merged_media_search_triggers: i64 = sqlx::query_scalar(
         "SELECT COUNT(*)
          FROM pg_trigger trigger_row
@@ -3231,7 +3343,10 @@ async fn postgres_resume_visibility_preserves_progress_and_recent_order()
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login: serde_json::Value = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(
@@ -4489,6 +4604,122 @@ async fn postgres_removes_personal_image_preference_without_changing_other_prefe
     .await?;
     assert_eq!(columns, 0);
     database.pool().close().await;
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_media_item_update_triggers_are_column_specific()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind) VALUES ('trigger-library', 'Trigger', 'MOVIE')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items
+            (id, library_id, item_type, title, sort_title, identification_status, provider_ids_json)
+         VALUES ('trigger-item', 'trigger-library', 'MOVIE', 'Before', 'before',
+                 'LOCAL_CONFIRMED', '{\"tmdb\":\"1\"}')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let triggers: Vec<(String, String)> = sqlx::query_as(
+        "SELECT tgname::text, pg_get_triggerdef(oid)
+         FROM pg_trigger
+         WHERE tgrelid = 'media_items'::regclass
+           AND tgname IN ('media_items_search_au', 'media_item_provider_ids_au')
+         ORDER BY tgname",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    let search_trigger = triggers
+        .iter()
+        .find(|(name, _)| name == "media_items_search_au")
+        .map(|(_, definition)| definition)
+        .ok_or("missing media_items_search_au")?;
+    let provider_trigger = triggers
+        .iter()
+        .find(|(name, _)| name == "media_item_provider_ids_au")
+        .map(|(_, definition)| definition)
+        .ok_or("missing media_item_provider_ids_au")?;
+    assert!(search_trigger.contains("FOR EACH ROW"));
+    assert!(search_trigger.contains("UPDATE OF title, sort_title, original_title"));
+    assert!(provider_trigger.contains("FOR EACH ROW"));
+    assert!(provider_trigger.contains("UPDATE OF item_type, provider_ids_json"));
+
+    sqlx::query("UPDATE media_items SET title = 'After' WHERE id = 'trigger-item'")
+        .execute(database.pool())
+        .await?;
+    let search_title: String =
+        sqlx::query_scalar("SELECT title FROM media_search WHERE item_id = 'trigger-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(search_title, "After");
+
+    sqlx::query(
+        "UPDATE media_items SET provider_ids_json = '{\"tmdb\":\"2\"}'
+         WHERE id = 'trigger-item'",
+    )
+    .execute(database.pool())
+    .await?;
+    let provider_ids: Vec<String> = sqlx::query_scalar(
+        "SELECT provider_id FROM media_item_provider_ids
+         WHERE media_item_id = 'trigger-item' ORDER BY provider_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(provider_ids, ["2"]);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_home_index_and_statement_timestamp_defaults_exist()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    let index_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pg_indexes
+         WHERE schemaname = current_schema()
+           AND indexname = 'idx_media_items_home_unavailable_series'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(index_count, 1, "the home query needs its partial index");
+
+    let default_expression: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns
+         WHERE table_schema = current_schema()
+           AND table_name = 'user_access_blacklist_rules'
+           AND column_name = 'created_at'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(
+        default_expression.contains("unixepoch"),
+        "statement-timestamp defaults must use unixepoch(), found {default_expression}"
+    );
+
+    database.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }

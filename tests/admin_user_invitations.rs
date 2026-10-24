@@ -50,6 +50,7 @@ async fn admin_invitation_api_enforces_auth_csrf_and_redacts_sensitive_fields()
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(12))
         .no_proxy()
         .build()?;

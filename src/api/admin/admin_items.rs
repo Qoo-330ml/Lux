@@ -15,6 +15,11 @@ pub(super) fn api_routes() -> Router<AppState> {
             "/api/v1/admin/items/{item_id}/collection/refresh",
             post(admin_refresh_collection),
         )
+        .route(
+            "/api/v1/admin/items/{item_id}/merges",
+            get(admin_list_item_merge_records),
+        )
+        .route("/api/v1/admin/items/unmerge", post(admin_unmerge_items))
 }
 
 #[derive(Deserialize)]
@@ -365,4 +370,144 @@ pub(crate) async fn admin_refresh_collection(
         )
         .into_response(),
     }
+}
+
+#[derive(Deserialize, Default)]
+pub(crate) struct ItemMergeRecordsQuery {
+    pub(crate) offset: Option<i64>,
+    pub(crate) limit: Option<i64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct UnmergeItemsRequest {
+    pub(crate) primary_item_id: String,
+    pub(crate) merged_item_id: String,
+}
+
+pub(crate) async fn admin_list_item_merge_records(
+    headers: HeaderMap,
+    Path(item_id): Path<String>,
+    Query(query): Query<ItemMergeRecordsQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, false).await {
+        return response;
+    }
+    if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(merge) = state.item_merge.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let offset = query.offset.unwrap_or(0).max(0);
+    let limit = query.limit.unwrap_or(50).clamp(1, 100);
+    match crate::application::admin_media_mutations::list_media_merge_records(
+        merge, &item_id, offset, limit,
+    )
+    .await
+    {
+        Ok(records) => Json(json!({
+            "offset": offset,
+            "limit": limit,
+            "records": records
+                .into_iter()
+                .map(|record| json!({
+                    "id": record.id,
+                    "mergedItemId": record.merged_item_id,
+                    "mergedItemTitle": record.merged_item_title,
+                    "itemType": record.item_type,
+                    "origin": record.origin,
+                    "mergedAt": record.merged_at,
+                    "undoneAt": record.undone_at,
+                    "sourceCount": record.source_count,
+                }))
+                .collect::<Vec<_>>(),
+        }))
+        .into_response(),
+        Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    }
+}
+
+pub(crate) async fn admin_unmerge_items(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+    Json(request): Json<UnmergeItemsRequest>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    if request
+        .primary_item_id
+        .parse::<crate::domain::ids::ItemId>()
+        .is_err()
+        || request
+            .merged_item_id
+            .parse::<crate::domain::ids::ItemId>()
+            .is_err()
+    {
+        return api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "媒体条目 ID 无效",
+        )
+        .into_response();
+    }
+    let Some(merge) = state.item_merge.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let result = match crate::application::admin_media_mutations::unmerge_media_items(
+        merge,
+        state.home.as_ref(),
+        state.catalog.as_ref(),
+        &request.primary_item_id,
+        &request.merged_item_id,
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(StorageError::Conflict(message)) => {
+            return api_error(
+                &headers,
+                StatusCode::CONFLICT,
+                lux::ApiErrorCode::InvalidRequest,
+                &message,
+            )
+            .into_response();
+        }
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
+    record_audit_event(
+        &state,
+        &headers,
+        "MEDIA_ITEM_UNMERGED",
+        Some("media_items"),
+        Some(&result.primary_item_id),
+        &json!({
+            "libraryId": result.library_id,
+            "itemType": result.item_type,
+            "mergedItemId": result.merged_item_id,
+            "restoredItemCount": result.restored_item_ids.len(),
+            "restoredSourceCount": result.restored_source_count,
+        })
+        .to_string(),
+    )
+    .await;
+    Json(json!({
+        "primaryItemId": result.primary_item_id,
+        "mergedItemId": result.merged_item_id,
+        "libraryId": result.library_id,
+        "itemType": result.item_type,
+        "restoredItemIds": result.restored_item_ids,
+        "restoredSourceCount": result.restored_source_count,
+        "userStateRestored": false,
+    }))
+    .into_response()
 }

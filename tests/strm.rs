@@ -181,7 +181,10 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(
@@ -490,6 +493,7 @@ async fn strm_sources_store_first_non_empty_line_and_returns_url_to_the_client()
     );
 
     let no_redirect_client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let remote_url_without_api_key = remote_direct_url.replace(&format!("&api_key={token}"), "");

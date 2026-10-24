@@ -817,10 +817,9 @@ function LibraryDeletionJobRow({ job, retrying, onRetry }: { job: AdminLibraryDe
     <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
     <div className="lux-admin-job-main">
       <div className="lux-admin-job-heading"><strong>{job.libraryName}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{libraryDeletionStatusLabel(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{job.status === "PENDING" ? "等待后台处理" : libraryDeletionStageLabel(job.stage)}</span><span className="lux-admin-job-count">已清理 {job.processedCount.toLocaleString("zh-CN")} 条数据库记录</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{job.status === "PENDING" ? "等待后台处理" : libraryDeletionStageLabel(job.stage)}</span></div>
       {message ? <div className="lux-admin-job-error" role="alert"><strong>{message}</strong><code>{job.errorCode}</code></div> : null}
       <time className="lux-admin-job-finished-at">{active ? `最近更新：${formatAdminDate(job.updatedAt)}` : `完成时间：${job.finishedAt == null ? "—" : formatAdminDate(job.finishedAt)}`}</time>
-      {job.status === "RUNNING" ? <div className="lux-job-progress is-indeterminate" aria-label="正在后台清理"><span /></div> : null}
     </div>
     <div className="lux-admin-job-actions">{retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={`重试删除媒体库“${job.libraryName}”`} onClick={onRetry} disabled={retrying}><RotateCcw size={15} /></button> : null}</div>
   </article>;

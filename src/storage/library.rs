@@ -1055,19 +1055,19 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        if self.backend() == DatabaseBackend::Postgres {
-            self.query(
-                "DELETE FROM scan_job_targets
-                 WHERE job_id IN (SELECT id FROM scan_jobs WHERE library_id = ?)",
-            )
-            .bind(id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
+        // Delete targets explicitly on both backends: PostgreSQL has no cascade from scan_jobs
+        // here, and the explicit delete is a harmless no-op where SQLite already cascades.
+        self.query(
+            "DELETE FROM scan_job_targets
+             WHERE job_id IN (SELECT id FROM scan_jobs WHERE library_id = ?)",
+        )
+        .bind(id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
         let deleted = self
             .query("DELETE FROM libraries WHERE id = ?")
             .bind(id)
@@ -3233,19 +3233,12 @@ impl Database {
 #[cfg(test)]
 mod scheduled_task_plan_mirror_tests {
     use super::*;
-    use crate::config::Config;
     use crate::{application::libraries::LibraryService, library::LibraryKind};
 
     async fn test_database() -> (tempfile::TempDir, Database) {
-        let temp_dir = tempfile::tempdir().expect("temporary database directory should exist");
-        let config = Config {
-            http_addr: "127.0.0.1:8097".parse().expect("test address should parse"),
-            config_dir: temp_dir.path().join("config"),
-        };
-        let database = Database::connect(&config)
+        crate::storage::test_database()
             .await
-            .expect("test database should connect");
-        (temp_dir, database)
+            .expect("test database should connect")
     }
 
     #[tokio::test]

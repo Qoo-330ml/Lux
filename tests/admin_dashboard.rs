@@ -91,6 +91,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let unauthenticated_retention_update = client
@@ -553,7 +554,8 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
     assert_eq!(body["nowPlaying"][0]["output"]["videoBitrate"], 1_000_000);
     assert_eq!(body["nowPlaying"][0]["output"]["audioBitrate"], 192_000);
     assert_eq!(body["nowPlaying"][0]["output"]["container"], "ts");
-    assert_eq!(body["nowPlaying"][0]["remoteIp"], "203.0.113.10");
+    // Trusted proxies were cleared above, so the raw X-Forwarded-For header must be ignored.
+    assert_eq!(body["nowPlaying"][0]["remoteIp"], "127.0.0.1");
     assert!(body["nowPlaying"][0]["remoteIpLocation"].is_null());
     let events = body["activity"].as_array().ok_or("missing activity")?;
     assert!(
@@ -561,9 +563,11 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
             .iter()
             .any(|event| event["eventType"] == "AUTH_LOGIN")
     );
-    assert!(events.iter().any(|event| {
-        event["eventType"] == "AUTH_LOGIN" && event["remoteIp"] == "203.0.113.10"
-    }));
+    assert!(
+        events.iter().any(|event| {
+            event["eventType"] == "AUTH_LOGIN" && event["remoteIp"] == "127.0.0.1"
+        })
+    );
     assert!(
         events
             .iter()
@@ -578,8 +582,8 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
         .iter()
         .find(|event| event["eventType"] == "PLAYBACK_STARTED")
         .ok_or("missing playback activity")?;
-    assert_eq!(playback_activity["remoteIp"], "203.0.113.10");
-    assert_eq!(playback_activity["metadata"]["remoteIp"], "203.0.113.10");
+    assert_eq!(playback_activity["remoteIp"], "127.0.0.1");
+    assert_eq!(playback_activity["metadata"]["remoteIp"], "127.0.0.1");
     assert_eq!(playback_activity["targetSeriesTitle"], "九门");
     assert_eq!(playback_activity["targetSeasonNumber"], 1);
     assert_eq!(playback_activity["targetSeriesSeasonCount"], 2);
@@ -672,7 +676,7 @@ async fn admin_dashboard_returns_server_playback_and_activity_data()
                 .find(|event| event["eventType"] == "PLAYBACK_STOPPED")
         })
         .ok_or("missing stopped activity")?;
-    assert_eq!(stopped_activity["remoteIp"], "203.0.113.10");
+    assert_eq!(stopped_activity["remoteIp"], "127.0.0.1");
 
     server.abort();
     Ok(())

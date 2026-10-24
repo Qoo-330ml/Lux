@@ -286,6 +286,57 @@ impl LibraryService {
             .collect())
     }
 
+    /// Resolves the effective library order of many users with a bounded number of queries.
+    ///
+    /// `users` carries the user id, the administrator flag, and the accessible library ids. The
+    /// result matches [`Self::saved_library_order_for_user`] per user but reads every order and
+    /// preference in one batch, so listing users no longer costs a handful of queries per user.
+    pub async fn saved_library_orders_for_users(
+        &self,
+        users: &[(String, bool, Vec<String>)],
+    ) -> Result<std::collections::HashMap<String, Vec<String>>, LibraryServiceError> {
+        if users.is_empty() {
+            return Ok(std::collections::HashMap::new());
+        }
+        let forced = self.database.force_admin_library_order().await?;
+        let admin_user_id = self.database.admin_user_id().await?;
+        let mut lookup_ids = users
+            .iter()
+            .map(|(user_id, _, _)| user_id.clone())
+            .collect::<Vec<_>>();
+        if let Some(admin_user_id) = admin_user_id.as_ref() {
+            lookup_ids.push(admin_user_id.clone());
+        }
+        lookup_ids.sort_unstable();
+        lookup_ids.dedup();
+        let flags = self
+            .database
+            .user_admin_library_order_flags(&lookup_ids)
+            .await?;
+        let orders = self.database.user_library_orders(&lookup_ids).await?;
+        let mut resolved = std::collections::HashMap::with_capacity(users.len());
+        for (user_id, is_admin, accessible_library_ids) in users {
+            let use_admin = forced || flags.get(user_id).copied().unwrap_or(true);
+            let order = if use_admin && !is_admin {
+                match admin_user_id.as_ref().and_then(|id| orders.get(id)) {
+                    Some(order) => order.clone(),
+                    None => orders.get(user_id).cloned().unwrap_or_default(),
+                }
+            } else {
+                orders.get(user_id).cloned().unwrap_or_default()
+            };
+            let accessible = accessible_library_ids.iter().collect::<HashSet<_>>();
+            resolved.insert(
+                user_id.clone(),
+                order
+                    .into_iter()
+                    .filter(|library_id| accessible.contains(library_id))
+                    .collect(),
+            );
+        }
+        Ok(resolved)
+    }
+
     pub(crate) async fn uses_admin_library_order(
         &self,
         user_id: &str,
@@ -498,8 +549,10 @@ impl LibraryService {
             if existing.library_id == library_id_text {
                 return Err(match overlap {
                     RootOverlap::Exact => LibraryServiceError::DuplicateRoot,
-                    RootOverlap::Nested => LibraryServiceError::OverlappingRoot,
-                    RootOverlap::Disjoint => unreachable!(),
+                    // Disjoint roots were skipped above; keep the arm total without panicking.
+                    RootOverlap::Nested | RootOverlap::Disjoint => {
+                        LibraryServiceError::OverlappingRoot
+                    }
                 });
             }
             warnings.push(LibraryWarningCode::CrossLibraryOverlap);
@@ -1017,6 +1070,135 @@ mod tests {
             .await?;
 
         assert_eq!(library.probe_concurrency, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn batched_library_orders_match_single_user_lookups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = LibraryService::new(database.clone());
+        let libraries = [
+            service
+                .create_library("A", LibraryKind::Movie, false)
+                .await?,
+            service
+                .create_library("B", LibraryKind::Movie, false)
+                .await?,
+            service
+                .create_library("C", LibraryKind::Movie, false)
+                .await?,
+        ];
+        let library_ids = libraries
+            .iter()
+            .map(|library| library.id.to_string())
+            .collect::<Vec<_>>();
+        let admin_id = "batched-order-admin";
+        let order_user_id = "batched-order-user";
+        let plain_user_id = "batched-order-plain";
+        database
+            .insert_user(admin_id, admin_id, admin_id, "test-hash", true, true)
+            .await?;
+        database
+            .insert_user(
+                order_user_id,
+                order_user_id,
+                order_user_id,
+                "test-hash",
+                false,
+                true,
+            )
+            .await?;
+        database
+            .insert_user(
+                plain_user_id,
+                plain_user_id,
+                plain_user_id,
+                "test-hash",
+                false,
+                true,
+            )
+            .await?;
+        database
+            .replace_user_library_order(
+                admin_id,
+                &[
+                    library_ids[2].clone(),
+                    library_ids[1].clone(),
+                    library_ids[0].clone(),
+                ],
+            )
+            .await?;
+        database
+            .replace_user_library_order(order_user_id, &[library_ids[1].clone()])
+            .await?;
+        for (user_id, is_admin, accessible) in [
+            (admin_id.to_owned(), true, library_ids.clone()),
+            (order_user_id.to_owned(), false, library_ids.clone()),
+            (
+                plain_user_id.to_owned(),
+                false,
+                vec![library_ids[1].clone()],
+            ),
+        ] {
+            let batched = service
+                .saved_library_orders_for_users(&[(user_id.clone(), is_admin, accessible.clone())])
+                .await?;
+            assert_eq!(
+                batched.get(&user_id).cloned().unwrap_or_default(),
+                service
+                    .saved_library_order_for_user(&user_id, is_admin, &accessible)
+                    .await?,
+                "batched order must match the single-user lookup for {user_id}"
+            );
+        }
+        // A plain user who follows the administrator order sees the administrator's order,
+        // including when the server forces it for everyone.
+        let followed = service
+            .saved_library_orders_for_users(&[(
+                plain_user_id.to_owned(),
+                false,
+                library_ids.clone(),
+            )])
+            .await?;
+        assert_eq!(
+            followed.get(plain_user_id).cloned(),
+            Some(vec![
+                library_ids[2].clone(),
+                library_ids[1].clone(),
+                library_ids[0].clone(),
+            ]),
+            "a plain user following the administrator order sees the administrator's order"
+        );
+        sqlx::query(
+            "INSERT INTO server_settings (key, value) VALUES ('force_admin_library_order', '1')
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .execute(database.pool())
+        .await?;
+        let forced = service
+            .saved_library_orders_for_users(&[(
+                order_user_id.to_owned(),
+                false,
+                vec![library_ids[0].clone(), library_ids[2].clone()],
+            )])
+            .await?;
+        assert_eq!(
+            forced.get(order_user_id).cloned().unwrap_or_default(),
+            service
+                .saved_library_order_for_user(
+                    order_user_id,
+                    false,
+                    &[library_ids[0].clone(), library_ids[2].clone()],
+                )
+                .await?
+        );
+        database.close().await;
         Ok(())
     }
 

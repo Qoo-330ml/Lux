@@ -139,6 +139,7 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let login = client

@@ -210,7 +210,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -600,6 +603,7 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .header("User-Agent", "Filmly/2.12.3-423")
         .send()
         .await?;
+    // The image tag itself is the capability, so a tagged request needs no credential.
     assert_eq!(
         filmly_primary_image_without_auth.status(),
         reqwest::StatusCode::OK
@@ -614,13 +618,10 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .header("User-Agent", "Filmly/2.12.3-423")
         .send()
         .await?;
+    // Without a tag the Filmly UA is only honoured when the compat mode is explicitly enabled.
     assert_eq!(
         filmly_primary_image_without_tag.status(),
-        reqwest::StatusCode::OK
-    );
-    assert_eq!(
-        filmly_primary_image_without_tag.bytes().await?.as_ref(),
-        b"episode-thumbnail"
+        reqwest::StatusCode::UNAUTHORIZED
     );
 
     let episodes_with_empty_season = client
@@ -663,8 +664,8 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         .header("User-Agent", "Mozilla/5.0 Edg/131.0.0.0")
         .send()
         .await?;
-    assert_eq!(browser_backdrop.status(), reqwest::StatusCode::OK);
-    assert_eq!(browser_backdrop.bytes().await?.as_ref(), b"series-fanart");
+    // Untagged backdrop artwork is no longer served anonymously (compat mode is opt-in).
+    assert_eq!(browser_backdrop.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let children = client
         .get(format!(

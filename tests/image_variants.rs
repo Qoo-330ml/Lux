@@ -106,6 +106,7 @@ async fn start_harness() -> Result<VariantHarness, Box<dyn std::error::Error>> {
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()?;
     let login = client

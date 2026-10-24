@@ -998,7 +998,10 @@ async fn admin_can_manage_users_and_last_manager_is_protected()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -2289,7 +2292,10 @@ async fn admin_user_creation_applies_configured_permission_snapshot()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -2413,7 +2419,10 @@ async fn admin_can_apply_permission_preset_to_user_with_audit_and_guards()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -2702,7 +2711,10 @@ async fn admin_can_batch_apply_permission_presets_with_per_user_results()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let batch_url = format!("{base_url}/api/v1/admin/users/batch/permission-preset");
 
     let login = client
@@ -2893,7 +2905,10 @@ async fn admin_can_batch_enable_and_disable_users_with_per_user_results()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let batch_url = format!("{base_url}/api/v1/admin/users/batch/status");
 
     let admin_login = client
@@ -3102,7 +3117,10 @@ async fn admin_can_preview_and_copy_account_preferences() -> Result<(), Box<dyn 
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let preview_url = format!("{base_url}/api/v1/admin/users/account-preferences/copy/preview");
 
     let preview_request = json!({
@@ -3660,7 +3678,10 @@ async fn admin_user_profile_api_normalizes_email_and_preserves_verification_stat
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
@@ -4337,7 +4358,10 @@ async fn admin_can_read_content_restriction_index_readiness()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let url = format!("{base_url}/api/v1/admin/content-restriction-index");
 
     let anonymous = client.get(&url).send().await?;
@@ -4463,7 +4487,10 @@ async fn admin_can_preview_and_apply_user_permission_groups()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let preview_url = format!("{base_url}/api/v1/admin/users/permission-copy/preview");
     let apply_url = format!("{base_url}/api/v1/admin/users/permission-copy");
     let preview_request = json!({
@@ -4679,7 +4706,10 @@ async fn admin_can_manage_user_content_restrictions() -> Result<(), Box<dyn std:
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let url = format!("{base_url}/api/v1/admin/users/{reader_id}/content-restrictions");
 
     let anonymous = client.get(&url).send().await?;
@@ -6463,7 +6493,10 @@ async fn admin_can_list_user_web_sessions_without_exposing_tokens()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let unauthenticated = client
         .get(format!(
@@ -6616,7 +6649,10 @@ async fn admin_can_revoke_user_web_sessions_without_affecting_other_sessions()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -6837,7 +6873,10 @@ async fn admin_can_manage_emby_login_sessions() -> Result<(), Box<dyn std::error
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("{base_url}/api/v1/auth/login"))
@@ -7864,6 +7903,110 @@ async fn public_invitation_acceptance_api_creates_verified_login_once()
     let unavailable_body = unavailable.text().await?;
     assert!(!unavailable_body.contains(&unavailable_token));
     assert!(!unavailable_body.contains("unavailable password"));
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn admin_avatar_upload_accepts_bodies_up_to_the_documented_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use reqwest::header::CONTENT_TYPE;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let login = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cookie = cookie_pair(login.headers());
+    let csrf = cookie_value(login.headers(), "lux_csrf");
+
+    // Three mebibytes is above axum's 2 MiB default body limit but below the documented 5 MiB
+    // avatar limit; the payload itself is invalid so the handler answers 400, not 413.
+    let response = client
+        .put(format!(
+            "http://{address}/api/v1/admin/users/{}/avatar",
+            admin.id
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .body(vec![0_u8; 3 * 1024 * 1024])
+        .send()
+        .await?;
+    assert_ne!(
+        response.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "the avatar route must accept bodies up to MAX_USER_AVATAR_BYTES"
+    );
+    assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn login_rejects_oversized_bodies_before_authentication()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let response = client
+        .post(format!("http://{address}/api/v1/auth/login"))
+        .json(&json!({
+            "username": "admin",
+            "password": "x".repeat(2 * 1024 * 1024)
+        }))
+        .send()
+        .await?;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::PAYLOAD_TOO_LARGE,
+        "the login route must cap the request body"
+    );
 
     server.abort();
     Ok(())

@@ -66,7 +66,10 @@ async fn admin_can_start_and_list_strm_probe_jobs() -> Result<(), Box<dyn std::e
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -313,6 +316,7 @@ async fn only_authorized_strm_media_get_triggers_playback_probe()
     });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let unauthorized = client

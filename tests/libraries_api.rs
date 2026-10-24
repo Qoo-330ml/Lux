@@ -22,6 +22,24 @@ const PNG_1X1: &[u8] = &[
     0x42, 0x60, 0x82,
 ];
 
+/// Library deletion is asynchronous: the request enqueues a job and a worker removes the row.
+async fn wait_for_library_deletion(
+    database: &Database,
+    library_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for _ in 0..200 {
+        let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM libraries WHERE id = ?")
+            .bind(library_id)
+            .fetch_one(database.pool())
+            .await?;
+        if remaining == 0 {
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    Err(format!("library {library_id} was not deleted within 10 seconds").into())
+}
+
 async fn start_server(
     config: Config,
 ) -> Result<
@@ -87,8 +105,9 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         http_addr: "127.0.0.1:8097".parse()?,
         config_dir: temp_dir.path().join("config"),
     };
-    let (base_url, server, _) = start_server(config).await?;
+    let (base_url, server, database) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
 
@@ -325,7 +344,8 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .header("x-csrf-token", &csrf)
         .send()
         .await?;
-    assert_eq!(deleted_library.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(deleted_library.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_library_deletion(&database, &library_id).await?;
     let after_delete = client
         .get(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookies)
@@ -352,7 +372,10 @@ async fn admin_library_pipeline_activity_is_authorized_bounded_and_sanitized()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let endpoint = format!("{base_url}/api/v1/admin/library-pipeline-activity");
 
     let unauthorized = client.get(&endpoint).send().await?;
@@ -597,7 +620,10 @@ async fn admin_can_delete_disabled_library_with_active_scan_and_probe_jobs()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -658,7 +684,8 @@ async fn admin_can_delete_disabled_library_with_active_scan_and_probe_jobs()
         .header("x-csrf-token", &csrf)
         .send()
         .await?;
-    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(deleted.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_library_deletion(&database, &library_id).await?;
 
     let remaining_libraries: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM libraries WHERE id = ?")
@@ -691,7 +718,10 @@ async fn deleting_library_removes_it_from_strm_media_info_plugin_config()
         config_dir: config_dir.clone(),
     };
     let (base_url, server, _) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -752,12 +782,22 @@ async fn deleting_library_removes_it_from_strm_media_info_plugin_config()
         .header("x-csrf-token", &csrf)
         .send()
         .await?;
-    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(deleted.status(), reqwest::StatusCode::ACCEPTED);
 
-    let config_values: Value = serde_json::from_slice(
-        &tokio::fs::read(plugin_config_dir.join("org.lux.strm-media-info.json")).await?,
-    )?;
-    assert_eq!(config_values["libraryIds"], json!([remaining_library_id]));
+    // The deletion worker rewrites the plugin configuration once the library is gone.
+    let mut configured_library_ids = Value::Null;
+    for _ in 0..200 {
+        if let Ok(bytes) =
+            tokio::fs::read(plugin_config_dir.join("org.lux.strm-media-info.json")).await
+            && let Ok(config_values) = serde_json::from_slice::<Value>(&bytes)
+            && config_values["libraryIds"] == json!([remaining_library_id])
+        {
+            configured_library_ids = config_values["libraryIds"].clone();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(configured_library_ids, json!([remaining_library_id]));
 
     server.abort();
     Ok(())
@@ -778,6 +818,7 @@ async fn admin_can_browse_server_directories_with_bounded_pagination()
 
     let (base_url, server, _) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let setup = client
@@ -879,7 +920,10 @@ async fn library_cover_survives_server_restart() -> Result<(), Box<dyn std::erro
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config.clone()).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -948,6 +992,7 @@ async fn admin_can_run_registered_auto_library_cover_task_manually()
     };
     let (base_url, server, database) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let setup = client
@@ -1032,7 +1077,10 @@ async fn non_admin_cannot_manage_libraries() -> Result<(), Box<dyn std::error::E
     users
         .create_user("viewer", "Viewer", "viewer password", false)
         .await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url, "viewer", "viewer password").await?;
 
     let response = client
@@ -1057,7 +1105,10 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1307,7 +1358,8 @@ async fn admin_can_update_independent_library_schedules_without_restart()
         .header("x-csrf-token", &csrf)
         .send()
         .await?;
-    assert_eq!(deleted.status(), reqwest::StatusCode::NO_CONTENT);
+    assert_eq!(deleted.status(), reqwest::StatusCode::ACCEPTED);
+    wait_for_library_deletion(&database, &library_ids[0]).await?;
     let orphaned_tasks: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scheduled_task_configs WHERE owner_type = 'LIBRARY' AND owner_id = ?",
     )
@@ -1329,7 +1381,10 @@ async fn admin_task_activity_includes_scan_postprocessing() -> Result<(), Box<dy
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1392,7 +1447,10 @@ async fn admin_task_activity_includes_current_media_title_for_chapter_jobs()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1514,7 +1572,10 @@ async fn admin_can_list_and_update_library_schedules_from_operations_page()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
@@ -1839,7 +1900,10 @@ async fn admin_can_group_library_schedules_into_plans() -> Result<(), Box<dyn st
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
         .json(&json!({
@@ -2013,7 +2077,10 @@ async fn admin_plan_run_continues_after_one_library_rejection()
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server, database) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let setup = client
         .post(format!("{base_url}/api/v1/setup/complete"))
         .json(&json!({

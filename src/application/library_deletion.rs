@@ -12,10 +12,6 @@ use crate::{
     storage::{Database, LibraryDeletionBatch, StorageError, StoredLibraryDeletionJob},
 };
 
-const MEDIA_ITEM_BATCH_SIZE: i64 = 500;
-const FILESYSTEM_ENTRY_BATCH_SIZE: i64 = 500;
-const SCAN_ROW_BATCH_SIZE: i64 = 500;
-const JOB_ROW_BATCH_SIZE: i64 = 50;
 const MAX_CONCURRENT_LIBRARY_DELETIONS: usize = 1;
 
 static LIBRARY_DELETION_WORKERS: OnceLock<Semaphore> = OnceLock::new();
@@ -241,7 +237,7 @@ impl LibraryDeletionService {
                 job_id,
                 library_id,
                 "MEDIA_ITEMS",
-                &[(LibraryDeletionBatch::MediaItems, MEDIA_ITEM_BATCH_SIZE)],
+                &[LibraryDeletionBatch::MediaItems],
             )
             .await?
         {
@@ -252,10 +248,7 @@ impl LibraryDeletionService {
                 job_id,
                 library_id,
                 "FILESYSTEM_ENTRIES",
-                &[(
-                    LibraryDeletionBatch::FilesystemEntries,
-                    FILESYSTEM_ENTRY_BATCH_SIZE,
-                )],
+                &[LibraryDeletionBatch::FilesystemEntries],
             )
             .await?
         {
@@ -266,7 +259,7 @@ impl LibraryDeletionService {
                 job_id,
                 library_id,
                 "STRM_PROBE_JOBS",
-                &[(LibraryDeletionBatch::StrmProbeJobs, JOB_ROW_BATCH_SIZE)],
+                &[LibraryDeletionBatch::StrmProbeJobs],
             )
             .await?
         {
@@ -278,43 +271,19 @@ impl LibraryDeletionService {
                 library_id,
                 "SCAN_JOB_DATA",
                 &[
-                    (
-                        LibraryDeletionBatch::ScanManifestDeltas,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
-                    (
-                        LibraryDeletionBatch::ScanManifestEntries,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
-                    (
-                        LibraryDeletionBatch::ScanManifestDirectories,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
-                    (
-                        LibraryDeletionBatch::ScanManifestSeenPaths,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
-                    (LibraryDeletionBatch::ScanManifestRoots, SCAN_ROW_BATCH_SIZE),
-                    (LibraryDeletionBatch::ScanManifests, JOB_ROW_BATCH_SIZE),
-                    (LibraryDeletionBatch::ScanJobTargets, SCAN_ROW_BATCH_SIZE),
-                    (LibraryDeletionBatch::ScanJobPaths, SCAN_ROW_BATCH_SIZE),
-                    (
-                        LibraryDeletionBatch::ReconciliationEntries,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
-                    (
-                        LibraryDeletionBatch::ScanJobFileChanges,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
-                    (
-                        LibraryDeletionBatch::ScanJobProcessedMediaItems,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
-                    (LibraryDeletionBatch::ScanJobEvents, SCAN_ROW_BATCH_SIZE),
-                    (
-                        LibraryDeletionBatch::ScanLocalMetadataBatches,
-                        SCAN_ROW_BATCH_SIZE,
-                    ),
+                    LibraryDeletionBatch::ScanManifestDeltas,
+                    LibraryDeletionBatch::ScanManifestEntries,
+                    LibraryDeletionBatch::ScanManifestDirectories,
+                    LibraryDeletionBatch::ScanManifestSeenPaths,
+                    LibraryDeletionBatch::ScanManifestRoots,
+                    LibraryDeletionBatch::ScanManifests,
+                    LibraryDeletionBatch::ScanJobTargets,
+                    LibraryDeletionBatch::ScanJobPaths,
+                    LibraryDeletionBatch::ReconciliationEntries,
+                    LibraryDeletionBatch::ScanJobFileChanges,
+                    LibraryDeletionBatch::ScanJobProcessedMediaItems,
+                    LibraryDeletionBatch::ScanJobEvents,
+                    LibraryDeletionBatch::ScanLocalMetadataBatches,
                 ],
             )
             .await?
@@ -326,7 +295,7 @@ impl LibraryDeletionService {
                 job_id,
                 library_id,
                 "SCAN_JOBS",
-                &[(LibraryDeletionBatch::ScanJobs, JOB_ROW_BATCH_SIZE)],
+                &[LibraryDeletionBatch::ScanJobs],
             )
             .await?
         {
@@ -340,7 +309,7 @@ impl LibraryDeletionService {
         job_id: &str,
         library_id: &str,
         stage: &str,
-        batches: &[(LibraryDeletionBatch, i64)],
+        batches: &[LibraryDeletionBatch],
     ) -> Result<bool, StorageError> {
         if !self
             .database
@@ -349,11 +318,12 @@ impl LibraryDeletionService {
         {
             return Ok(false);
         }
-        for (batch, batch_size) in batches {
+        for batch in batches {
+            let batch_size = self.database.library_deletion_batch_size(*batch);
             loop {
                 let Some(deleted) = self
                     .database
-                    .delete_library_deletion_batch(job_id, library_id, *batch, *batch_size)
+                    .delete_library_deletion_batch(job_id, library_id, *batch, batch_size)
                     .await?
                 else {
                     return Ok(false);
@@ -364,6 +334,9 @@ impl LibraryDeletionService {
                 tokio::task::yield_now().await;
             }
         }
+        // Trimming the WAL between stages keeps the file from carrying every dirty
+        // page of a multi-hour deletion while still letting readers proceed.
+        self.database.checkpoint_library_deletion_wal().await;
         Ok(true)
     }
 

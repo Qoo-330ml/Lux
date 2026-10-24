@@ -47,8 +47,8 @@ async fn maintenance_never_reports_parameter_overrides_for_sqlite()
         .await?;
     sqlx::query(
         "INSERT INTO maintenance_probe (payload)
-         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500)
-         SELECT hex(randomblob(64)) FROM n",
+         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000)
+         SELECT hex(randomblob(2048)) FROM n",
     )
     .execute(database.pool())
     .await?;
@@ -84,8 +84,8 @@ async fn concurrent_maintenance_rounds_do_not_overlap() -> Result<(), Box<dyn st
         .await?;
     sqlx::query(
         "INSERT INTO overlap_probe (payload)
-         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500)
-         SELECT hex(randomblob(64)) FROM n",
+         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000)
+         SELECT hex(randomblob(2048)) FROM n",
     )
     .execute(database.pool())
     .await?;
@@ -135,8 +135,8 @@ async fn maintenance_skips_round_while_a_scan_is_running() -> Result<(), Box<dyn
         .await?;
     sqlx::query(
         "INSERT INTO scan_guard_probe (payload)
-         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500)
-         SELECT hex(randomblob(64)) FROM n",
+         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000)
+         SELECT hex(randomblob(2048)) FROM n",
     )
     .execute(database.pool())
     .await?;
@@ -166,8 +166,8 @@ async fn maintenance_skips_round_while_a_scan_is_running() -> Result<(), Box<dyn
         .await?;
     sqlx::query(
         "INSERT INTO scan_guard_probe_2 (payload)
-         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 500)
-         SELECT hex(randomblob(64)) FROM n",
+         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000)
+         SELECT hex(randomblob(2048)) FROM n",
     )
     .execute(database.pool())
     .await?;

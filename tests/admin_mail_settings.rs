@@ -43,6 +43,7 @@ async fn admin_mail_settings_keep_credentials_private_and_check_connection_safel
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(12))
         .build()?;
 

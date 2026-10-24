@@ -96,7 +96,15 @@ impl LibraryWatcher {
             };
             for change in classify_event(&root_for_callback, event) {
                 if sender.try_send(change).is_err() {
-                    dropped_for_callback.fetch_add(1, Ordering::Relaxed);
+                    let dropped = dropped_for_callback.fetch_add(1, Ordering::Relaxed) + 1;
+                    // A full queue means the scanner is behind: report periodically instead of
+                    // silently dropping filesystem changes.
+                    if dropped == 1 || dropped % 500 == 0 {
+                        tracing::warn!(
+                            dropped,
+                            "filesystem watch queue is full; change events are being dropped"
+                        );
+                    }
                 }
             }
         })
@@ -149,6 +157,8 @@ impl LibraryWatcher {
         EVENT_CHANNEL_CAPACITY
     }
 
+    /// The notifier has no liveness API, so this only reports that the handle is still owned.
+    /// `dropped_events` is the signal that actually reflects a struggling watcher.
     pub fn watcher_alive(&self) -> bool {
         let _ = &self.watcher;
         true
@@ -474,13 +484,33 @@ fn merge_kind(previous: ChangeKind, next: ChangeKind) -> ChangeKind {
 }
 
 fn classify_event(root: &Path, event: Event) -> Vec<FileChange> {
+    if let EventKind::Modify(ModifyKind::Name(RenameMode::Both)) = event.kind {
+        // A paired rename carries `[from, to]`. Reporting both as renames made the scanner rescan
+        // the vanished source and the new target of a single move; the move is one removal plus
+        // one creation instead.
+        let mut paths = event
+            .paths
+            .into_iter()
+            .filter_map(|path| normalize_event_path(root, path));
+        let Some(from) = paths.next() else {
+            return Vec::new();
+        };
+        let mut changes = vec![FileChange {
+            path: from,
+            kind: ChangeKind::Remove,
+        }];
+        if let Some(to) = paths.next() {
+            changes.push(FileChange {
+                path: to,
+                kind: ChangeKind::Create,
+            });
+        }
+        return changes;
+    }
     let kind = match event.kind {
         EventKind::Create(_) => ChangeKind::Create,
         EventKind::Remove(_) => ChangeKind::Remove,
-        EventKind::Modify(ModifyKind::Name(RenameMode::Both))
-        | EventKind::Modify(ModifyKind::Name(RenameMode::From))
-        | EventKind::Modify(ModifyKind::Name(RenameMode::To))
-        | EventKind::Modify(ModifyKind::Name(RenameMode::Any)) => ChangeKind::Rename,
+        EventKind::Modify(ModifyKind::Name(_)) => ChangeKind::Rename,
         EventKind::Modify(_) => ChangeKind::Modify,
         _ => return Vec::new(),
     };
@@ -638,6 +668,69 @@ mod tests {
             Some(WatcherToken(2))
         );
         watcher_tasks.abort_all();
+    }
+
+    #[test]
+    fn paired_rename_events_become_a_removal_and_a_creation() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let from = root.path().join("Movie (2024)/Movie.mkv");
+        let to = root.path().join("Movie (2025)/Movie.mkv");
+        let changes = super::classify_event(
+            root.path(),
+            super::Event::new(super::EventKind::Modify(super::ModifyKind::Name(
+                super::RenameMode::Both,
+            )))
+            .add_path(from.clone())
+            .add_path(to.clone()),
+        );
+
+        assert_eq!(
+            changes,
+            vec![
+                FileChange {
+                    path: from,
+                    kind: ChangeKind::Remove,
+                },
+                FileChange {
+                    path: to,
+                    kind: ChangeKind::Create,
+                },
+            ],
+            "one move must not queue two rescans of the same file"
+        );
+    }
+
+    #[test]
+    fn single_sided_rename_events_remain_renames() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let path = root.path().join("Movie/Movie.mkv");
+        let changes = super::classify_event(
+            root.path(),
+            super::Event::new(super::EventKind::Modify(super::ModifyKind::Name(
+                super::RenameMode::To,
+            )))
+            .add_path(path.clone()),
+        );
+
+        assert_eq!(
+            changes,
+            vec![FileChange {
+                path,
+                kind: ChangeKind::Rename,
+            }]
+        );
+    }
+
+    #[test]
+    fn events_outside_the_watched_root_are_ignored() {
+        let root = tempfile::tempdir().expect("temporary root");
+        let changes = super::classify_event(
+            root.path(),
+            super::Event::new(super::EventKind::Create(notify::event::CreateKind::File))
+                .add_path(std::path::PathBuf::from("/elsewhere/Movie.mkv")),
+        );
+
+        assert!(changes.is_empty());
     }
 
     #[test]

@@ -12,7 +12,14 @@ async fn ready_requires_a_database() -> Result<(), Box<dyn std::error::Error>> {
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app()).await });
-    let response = reqwest::get(format!("http://{address}/health/ready")).await?;
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let response = client
+        .get(format!("http://{address}/health/ready"))
+        .send()
+        .await?;
 
     assert_eq!(response.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
     assert!(response.text().await?.contains("database_unavailable"));
@@ -30,6 +37,8 @@ async fn ready_and_version_report_migrated_state_without_paths()
         config_dir: temp_dir.path().join("config"),
     };
     let database = Database::connect(&config).await?;
+    // Track the applied schema instead of a hardcoded migration number.
+    let expected_schema_version = database.schema_version().await?;
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
@@ -44,7 +53,10 @@ async fn ready_and_version_report_migrated_state_without_paths()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
 
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let ready = client
         .get(format!("http://{address}/health/ready"))
         .send()
@@ -52,8 +64,12 @@ async fn ready_and_version_report_migrated_state_without_paths()
     assert_eq!(ready.status(), reqwest::StatusCode::OK);
     let ready_body: serde_json::Value = ready.json().await?;
     assert_eq!(ready_body["status"], "ready");
-    assert_eq!(ready_body["schemaVersion"], 187);
+    assert_eq!(ready_body["schemaVersion"], expected_schema_version);
     assert_eq!(ready_body["databaseWritable"], true);
+    assert!(
+        ready_body.get("fileLogging").is_some(),
+        "readiness must expose whether file logging is active (null before initialisation)"
+    );
 
     let version = client
         .get(format!("http://{address}/api/v1/version"))
@@ -63,7 +79,7 @@ async fn ready_and_version_report_migrated_state_without_paths()
     let version_text = version.text().await?;
     let version_body: serde_json::Value = serde_json::from_str(&version_text)?;
     assert_eq!(version_body["luxVersion"], env!("CARGO_PKG_VERSION"));
-    assert_eq!(version_body["schemaVersion"], 187);
+    assert_eq!(version_body["schemaVersion"], expected_schema_version);
     assert!(
         version_body["commit"]
             .as_str()

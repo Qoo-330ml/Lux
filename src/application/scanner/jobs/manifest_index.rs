@@ -1412,6 +1412,7 @@ impl ScanJobService {
             home.invalidate_scan_batch().await;
         }
         self.flush_home_after_scan_terminal().await;
+        self.notify_identity_merge();
         Ok(ScanBatchReport {
             status: "COMPLETED".to_owned(),
             processed: 0,

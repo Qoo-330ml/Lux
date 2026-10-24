@@ -347,7 +347,10 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let peer_listener = TcpListener::bind("127.0.0.1:0").await?;
     let peer_address = peer_listener.local_addr()?;
     let peer_server = tokio::spawn(async move {
@@ -358,7 +361,10 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         .await
     });
     let peer_base_url = format!("http://{peer_address}");
-    let peer_client = reqwest::Client::new();
+    let peer_client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))

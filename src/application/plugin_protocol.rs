@@ -1,7 +1,5 @@
 use std::{collections::BTreeMap, fmt, path::Path};
 
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
-use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use url::{Host, Url};
@@ -99,6 +97,10 @@ pub struct PluginManifest {
     pub permissions: PluginPermissions,
     #[serde(default)]
     pub files: Vec<PluginFile>,
+    /// Recorded plugin signature metadata.
+    ///
+    /// Lux does not verify plugin signatures: the first release deliberately ships no signing
+    /// authority or trust store, so a signature must not be read as a security guarantee.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<PluginSignature>,
 }
@@ -495,21 +497,6 @@ impl PluginManifest {
         })?;
         object.remove("signature");
         serde_json::to_vec(&value).map_err(|error| PluginManifestError::Invalid(error.to_string()))
-    }
-
-    pub fn verify_signature(&self, key: &VerifyingKey) -> Result<(), PluginManifestError> {
-        let signature = self.signature.as_ref().ok_or_else(|| {
-            PluginManifestError::Invalid("plugin manifest has no signature".to_owned())
-        })?;
-        let signature_bytes = BASE64.decode(&signature.value).map_err(|error| {
-            PluginManifestError::Invalid(format!("invalid signature encoding: {error}"))
-        })?;
-        let signature = Signature::from_slice(&signature_bytes)
-            .map_err(|error| PluginManifestError::Invalid(format!("invalid signature: {error}")))?;
-        let payload = self.signing_payload()?;
-        key.verify(&payload, &signature).map_err(|error| {
-            PluginManifestError::Invalid(format!("signature verification failed: {error}"))
-        })
     }
 }
 

@@ -87,8 +87,9 @@ async fn selecting_candidate_without_credits_preserves_existing_people_relation(
     .await?;
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new_with_config_dir(
+        ImageWriteService::with_config_and_config_dir(
             fixture.database.clone(),
+            local_image_config(),
             fixture.config.config_dir.clone(),
         )?,
         fixture.config.config_dir.clone(),
@@ -174,7 +175,10 @@ async fn admin_selection_fills_missing_fields_and_writes_nfo_and_images()
     .await?;
     let item_id = fixture.item_id.clone();
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let response = client
@@ -304,7 +308,10 @@ async fn metadata_selection_refreshes_cached_catalog_and_home_images()
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
     let list_url = format!("{base_url}/api/v1/libraries/{library_id}/items?pageSize=10");
 
@@ -413,7 +420,7 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
         }),
     )
     .await?;
-    let service = ImageWriteService::new(fixture.database.clone())?;
+    let service = ImageWriteService::with_config(fixture.database.clone(), local_image_config())?;
     let selection = MetadataSelectionService::new(fixture.database.clone(), service);
 
     let report = selection
@@ -468,7 +475,7 @@ async fn full_refresh_keeps_nfo_when_image_download_fails() -> Result<(), Box<dy
     .await?;
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
         fixture.config.config_dir.clone(),
     );
 
@@ -548,7 +555,7 @@ async fn one_media_image_selection_is_bounded_to_four_concurrent_downloads()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     let report = selection
@@ -575,7 +582,7 @@ async fn fill_missing_selection_preserves_existing_actor_relation_without_credit
         .with_database(fixture.database.clone());
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
         fixture.config.config_dir.clone(),
     );
     let first_candidate_id = insert_candidate(
@@ -661,8 +668,9 @@ async fn fill_missing_skips_a_backoff_image_and_uses_the_next_candidate()
 
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new_with_config_dir(
+        ImageWriteService::with_config_and_config_dir(
             fixture.database.clone(),
+            local_image_config(),
             fixture.config.config_dir.clone(),
         )?,
         fixture.config.config_dir.clone(),
@@ -695,7 +703,7 @@ async fn selection_records_the_scraper_that_confirmed_identity()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     selection
@@ -738,7 +746,7 @@ async fn supplemental_selection_preserves_existing_rich_nfo_and_fills_missing_li
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     selection
@@ -780,7 +788,7 @@ async fn supplemental_selection_appends_multiple_backdrops_after_main_image()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
     selection
         .select(
@@ -864,7 +872,7 @@ async fn batch_confirmation_selects_the_highest_scored_pending_candidate()
         .execute(fixture.database.pool())
         .await?;
     }
-    let service = ImageWriteService::new(fixture.database.clone())?;
+    let service = ImageWriteService::with_config(fixture.database.clone(), local_image_config())?;
     let selection = MetadataSelectionService::new(fixture.database.clone(), service);
 
     let report = selection.confirm_best_pending(&fixture.item_id).await?;
@@ -898,7 +906,10 @@ async fn admin_can_batch_confirm_pending_metadata_items() -> Result<(), Box<dyn 
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let response = client
@@ -953,7 +964,10 @@ async fn admin_selection_persists_cast_in_config_and_detail_api()
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let selected = client
@@ -1048,7 +1062,10 @@ async fn local_nfo_cast_is_exposed_by_detail_api_without_selection()
         .await?;
 
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, _) = login(&client, &base_url).await?;
     let detail = client
         .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
@@ -1090,7 +1107,10 @@ async fn local_nfo_cast_exposes_all_one_hundred_actors_in_detail_api()
         .await?;
 
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, _) = login(&client, &base_url).await?;
     let detail = client
         .get(format!("{base_url}/api/v1/items/{}", fixture.item_id))
@@ -1136,7 +1156,7 @@ async fn admin_selection_writes_only_configured_candidate_image_types()
         }),
     )
     .await?;
-    let service = ImageWriteService::new(fixture.database.clone())?;
+    let service = ImageWriteService::with_config(fixture.database.clone(), local_image_config())?;
     let selection = MetadataSelectionService::new(fixture.database.clone(), service);
 
     let report = selection
@@ -1201,7 +1221,10 @@ async fn image_failure_does_not_block_selection_or_nfo_writeback()
     .await?;
     let item_id = fixture.item_id.clone();
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
     let path = format!(
         "{base_url}/api/v1/admin/items/{item_id}/identify/candidates/{candidate_id}/select"
@@ -1268,7 +1291,10 @@ async fn selection_failure_after_writeback_checks_does_not_confirm_candidate()
     )
     .await?;
     let (base_url, lux_server) = start_lux(&fixture).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = login(&client, &base_url).await?;
 
     let response = client
@@ -1352,7 +1378,7 @@ async fn series_and_season_selection_writes_to_their_media_directories()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     selection
@@ -1430,6 +1456,468 @@ async fn series_and_season_selection_writes_to_their_media_directories()
 }
 
 #[tokio::test]
+async fn scraper_role_policy_limits_which_source_may_supply_artwork()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    for (position, scraper_id, role) in [
+        (0_i64, "org.lux.tmdb", "PRIMARY"),
+        (1, "org.lux.supplement", "SUPPLEMENT"),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(&library_id)
+        .bind(scraper_id)
+        .bind(position)
+        .bind(role)
+        .execute(fixture.database.pool())
+        .await?;
+    }
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 4,
+            "minDownloadWidth": 0,
+            "levels": {
+                "movie": {
+                    "artworks": {
+                        "poster": { "scraperRoles": ["PRIMARY"] },
+                        "backdrop": { "scraperRoles": ["PRIMARY"] }
+                    }
+                }
+            }
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    let supplement_candidate = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Supplement Movie",
+            "posterUrl": format!("{image_url}/poster"),
+            "fanartUrl": format!("{image_url}/fanart")
+        }),
+    )
+    .await?;
+    selection
+        .select_with_scraper(
+            &fixture.item_id,
+            &supplement_candidate,
+            MetadataSelectionMode::FillMissing,
+            Some("org.lux.supplement"),
+            true,
+        )
+        .await
+        .map_err(|error| format!("supplement selection failed: {error:?}"))?;
+    assert!(
+        !fixture.movie_dir.join("poster.png").exists(),
+        "a SUPPLEMENT source must not supply PRIMARY-only artwork"
+    );
+    let written: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type IN ('POSTER', 'FANART')",
+    )
+    .bind(&fixture.item_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(written, 0);
+
+    let primary_candidate = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "title": "Primary Movie",
+            "posterUrl": format!("{image_url}/poster")
+        }),
+    )
+    .await?;
+    selection
+        .select_with_scraper(
+            &fixture.item_id,
+            &primary_candidate,
+            MetadataSelectionMode::FillMissing,
+            Some("org.lux.tmdb"),
+            false,
+        )
+        .await
+        .map_err(|error| format!("primary selection failed: {error:?}"))?;
+    assert!(fixture.movie_dir.join("poster.png").exists());
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn keep_and_fill_overwrite_policies_protect_existing_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    for (overwrite, mode) in [
+        ("KEEP", MetadataSelectionMode::RefreshUnlocked),
+        ("FILL", MetadataSelectionMode::RefreshUnlocked),
+        ("OVERWRITE", MetadataSelectionMode::FillMissing),
+    ] {
+        let fixture = prepare_fixture(false).await?;
+        let (image_url, image_server) = start_image_stub().await?;
+        let poster_path = fixture.movie_dir.join("poster.png");
+        tokio::fs::write(&poster_path, b"old-poster").await?;
+        set_library_image_strategy(
+            &fixture.database,
+            &fixture.item_id,
+            json!({
+                "poster": true,
+                "backdrop": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 1,
+                "minDownloadWidth": 0,
+                "levels": {
+                    "movie": { "artworks": { "poster": { "overwrite": overwrite } } }
+                }
+            }),
+        )
+        .await?;
+        let candidate_id = insert_candidate(
+            &fixture.database,
+            &fixture.item_id,
+            json!({ "title": "Online Movie", "posterUrl": format!("{image_url}/poster") }),
+        )
+        .await?;
+        let selection = MetadataSelectionService::new(
+            fixture.database.clone(),
+            ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+        );
+
+        selection
+            .select(&fixture.item_id, &candidate_id, mode)
+            .await
+            .map_err(|error| format!("selection failed for {overwrite}: {error:?}"))?;
+
+        assert_eq!(
+            tokio::fs::read(&poster_path).await?,
+            b"old-poster",
+            "{overwrite} policy must not replace an existing poster in {mode:?} mode"
+        );
+        image_server.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn backdrop_max_count_limits_downloaded_images() -> Result<(), Box<dyn std::error::Error>> {
+    for (max_count, expected) in [(2_i64, 2_i64), (0, 0)] {
+        let fixture = prepare_fixture(false).await?;
+        let (image_url, image_server) = start_image_stub().await?;
+        set_library_image_strategy(
+            &fixture.database,
+            &fixture.item_id,
+            json!({
+                "poster": true,
+                "backdrop": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 4,
+                "minDownloadWidth": 0,
+                "levels": {
+                    "movie": {
+                        "artworks": {
+                            "backdrop": { "enabled": true, "maxCount": max_count }
+                        }
+                    }
+                }
+            }),
+        )
+        .await?;
+        let candidate_id = insert_candidate(
+            &fixture.database,
+            &fixture.item_id,
+            json!({
+                "title": "Online Movie",
+                "images": {
+                    "FANART": [
+                        format!("{image_url}/fanart"),
+                        format!("{image_url}/fanart-supplement-1"),
+                        format!("{image_url}/fanart-supplement-2")
+                    ]
+                }
+            }),
+        )
+        .await?;
+        let selection = MetadataSelectionService::new(
+            fixture.database.clone(),
+            ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+        );
+
+        selection
+            .select(
+                &fixture.item_id,
+                &candidate_id,
+                MetadataSelectionMode::FillMissing,
+            )
+            .await
+            .map_err(|error| format!("selection failed for maxCount {max_count}: {error:?}"))?;
+
+        let backdrops: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+        )
+        .bind(&fixture.item_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+        assert_eq!(
+            backdrops, expected,
+            "maxCount {max_count} must cap the stored backdrops"
+        );
+        image_server.abort();
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn overwrite_policy_replaces_existing_image_on_full_refresh()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_fixture(false).await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    let poster_path = fixture.movie_dir.join("poster.png");
+    tokio::fs::write(&poster_path, b"old-poster").await?;
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.item_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 1,
+            "minDownloadWidth": 0,
+            "levels": {
+                "movie": { "artworks": { "poster": { "overwrite": "OVERWRITE" } } }
+            }
+        }),
+    )
+    .await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.item_id,
+        json!({ "title": "Online Movie", "posterUrl": format!("{image_url}/poster") }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    selection
+        .select(
+            &fixture.item_id,
+            &candidate_id,
+            MetadataSelectionMode::RefreshUnlocked,
+        )
+        .await
+        .map_err(|error| format!("selection failed: {error:?}"))?;
+
+    assert_eq!(tokio::fs::read(&poster_path).await?, PNG_1X1);
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn level_overrides_enable_and_disable_posters_per_media_level()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture().await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 1,
+            "minDownloadWidth": 0,
+            "levels": {
+                "series": { "artworks": { "poster": { "enabled": false } } },
+                "season": { "artworks": { "poster": { "enabled": true } } }
+            }
+        }),
+    )
+    .await?;
+    let series_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.series_id,
+        json!({ "title": "Online Series", "posterUrl": format!("{image_url}/poster") }),
+    )
+    .await?;
+    let season_candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.season_id,
+        json!({ "title": "Online Season", "posterUrl": format!("{image_url}/poster") }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    selection
+        .select(
+            &fixture.series_id,
+            &series_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("series selection failed: {error:?}"))?;
+    selection
+        .select(
+            &fixture.season_id,
+            &season_candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("season selection failed: {error:?}"))?;
+
+    assert!(
+        !fixture.series_dir.join("poster.png").exists(),
+        "the series level disabled posters, so no series poster may be written"
+    );
+    assert!(
+        fixture.season_dir.join("poster.png").exists(),
+        "the season level enabled posters, so the season poster must be written"
+    );
+    let season_posters: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&fixture.season_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    let series_posters: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&fixture.series_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(season_posters, 1);
+    assert_eq!(series_posters, 0);
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn screenshot_only_source_policy_skips_online_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = prepare_series_fixture().await?;
+    let (image_url, image_server) = start_image_stub().await?;
+    set_library_image_strategy(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "poster": true,
+            "backdrop": true,
+            "artwork": false,
+            "banner": false,
+            "logo": true,
+            "thumbnail": true,
+            "thumbnailScrapingMode": "SCRAPER_FIRST",
+            "disc": false,
+            "wallpaper": false,
+            "writeToMetadata": false,
+            "maxBackdropCount": 1,
+            "minDownloadWidth": 0,
+            "levels": {
+                "series": {
+                    "artworks": {
+                        "poster": { "enabled": true, "sources": ["SCREENSHOT"] },
+                        "backdrop": { "enabled": true, "sources": ["SCREENSHOT"] }
+                    }
+                }
+            }
+        }),
+    )
+    .await?;
+    let candidate_id = insert_candidate(
+        &fixture.database,
+        &fixture.series_id,
+        json!({
+            "title": "Online Series",
+            "posterUrl": format!("{image_url}/poster"),
+            "fanartUrl": format!("{image_url}/fanart")
+        }),
+    )
+    .await?;
+    let selection = MetadataSelectionService::new(
+        fixture.database.clone(),
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+    );
+
+    selection
+        .select(
+            &fixture.series_id,
+            &candidate_id,
+            MetadataSelectionMode::FillMissing,
+        )
+        .await
+        .map_err(|error| format!("series selection failed: {error:?}"))?;
+
+    let online_images: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND source <> 'LOCAL'",
+    )
+    .bind(&fixture.series_id)
+    .fetch_one(fixture.database.pool())
+    .await?;
+    assert_eq!(online_images, 0);
+    assert!(!fixture.series_dir.join("poster.png").exists());
+    assert!(!fixture.series_dir.join("backdrop.png").exists());
+
+    image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
 async fn episode_selection_downloads_fanart_when_ffmpeg_thumbnail_is_indexed()
 -> Result<(), Box<dyn std::error::Error>> {
     let fixture = prepare_series_fixture().await?;
@@ -1478,7 +1966,7 @@ async fn episode_selection_downloads_fanart_when_ffmpeg_thumbnail_is_indexed()
     .await?;
     let selection = MetadataSelectionService::new(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
     );
 
     let report = selection
@@ -1506,6 +1994,76 @@ async fn episode_selection_downloads_fanart_when_ffmpeg_thumbnail_is_indexed()
     );
 
     image_server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn episode_image_policy_skips_online_stills() -> Result<(), Box<dyn std::error::Error>> {
+    for policy in ["LOCAL_SCREENSHOT", "NONE"] {
+        let fixture = prepare_series_fixture().await?;
+        let episode_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'EPISODE' LIMIT 1")
+                .fetch_one(fixture.database.pool())
+                .await?;
+        let (image_url, image_server) = start_image_stub().await?;
+        set_library_image_strategy(
+            &fixture.database,
+            &fixture.series_id,
+            json!({
+                "poster": true,
+                "backdrop": true,
+                "artwork": false,
+                "banner": false,
+                "logo": true,
+                "thumbnail": true,
+                "thumbnailScrapingMode": "SCRAPER_FIRST",
+                "disc": false,
+                "wallpaper": false,
+                "writeToMetadata": false,
+                "maxBackdropCount": 4,
+                "minDownloadWidth": 0,
+                "levels": {
+                    "episode": { "episodeImagePolicy": policy }
+                }
+            }),
+        )
+        .await?;
+        let candidate_id = insert_candidate(
+            &fixture.database,
+            &episode_id,
+            json!({
+                "title": "Online Episode",
+                "images": { "FANART": [format!("{image_url}/fanart")] }
+            }),
+        )
+        .await?;
+        let selection = MetadataSelectionService::new(
+            fixture.database.clone(),
+            ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
+        );
+
+        let report = selection
+            .select(
+                &episode_id,
+                &candidate_id,
+                MetadataSelectionMode::FillMissing,
+            )
+            .await
+            .map_err(|error| format!("selection failed for {policy}: {error:?}"))?;
+
+        assert!(
+            report.image_types.is_empty(),
+            "{policy} must not download online stills"
+        );
+        let stills: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+        )
+        .bind(&episode_id)
+        .fetch_one(fixture.database.pool())
+        .await?;
+        assert_eq!(stills, 0, "{policy} must not store FANART stills");
+        image_server.abort();
+    }
     Ok(())
 }
 
@@ -2181,8 +2739,9 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
         retry_jitter: Duration::ZERO,
         requests_per_second: 0,
     })?;
-    let images = ImageWriteService::new_with_config_dir(
+    let images = ImageWriteService::with_config_and_config_dir(
         fixture.database.clone(),
+        local_image_config(),
         fixture.config.config_dir.clone(),
     )?;
     let selection = MetadataSelectionService::with_config_dir(
@@ -2440,8 +2999,9 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
     };
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new_with_config_dir(
+        ImageWriteService::with_config_and_config_dir(
             fixture.database.clone(),
+            local_image_config(),
             fixture.config.config_dir.clone(),
         )?,
         fixture.config.config_dir.clone(),
@@ -2585,7 +3145,7 @@ async fn workflow_two_scan_automatically_matches_and_writes_metadata()
     })?;
     let selection = MetadataSelectionService::with_config_dir(
         fixture.database.clone(),
-        ImageWriteService::new(fixture.database.clone())?,
+        ImageWriteService::with_config(fixture.database.clone(), local_image_config())?,
         fixture.config.config_dir.clone(),
     );
     let metadata = MetadataReidentifyService::with_selection(
@@ -2835,6 +3395,23 @@ async fn configure_image_strategy(
     Ok(())
 }
 
+async fn set_library_image_strategy(
+    database: &Database,
+    item_id: &str,
+    images: Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let library_id: String = sqlx::query_scalar("SELECT library_id FROM media_items WHERE id = ?")
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query("UPDATE libraries SET media_strategy_json = ? WHERE id = ?")
+        .bind(json!({ "images": images }).to_string())
+        .bind(library_id)
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
 async fn start_image_stub()
 -> Result<(String, tokio::task::JoinHandle<Result<(), std::io::Error>>), Box<dyn std::error::Error>>
 {
@@ -2885,12 +3462,14 @@ async fn start_lux(
 {
     let auth = WebAuthService::new(fixture.database.clone())?;
     let emby_auth = EmbyAuthService::new(fixture.database.clone())?;
-    let app = app_with_state(AppState::ready(
+    let app = app_with_state(AppState::ready_with_proxy_and_image_config(
         fixture.config.clone(),
         fixture.database.clone(),
         fixture.setup.clone(),
         auth,
         emby_auth,
+        None,
+        local_image_config(),
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
@@ -2926,4 +3505,13 @@ fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
             (cookie_name == name).then(|| cookie_value.to_owned())
         })
         .expect("expected cookie")
+}
+
+/// The metadata fixtures serve images from a loopback stub, which production downloads reject.
+fn local_image_config() -> luxd::application::images::ImageDownloadConfig {
+    luxd::application::images::ImageDownloadConfig {
+        allow_loopback_http: true,
+        direct_connection_only: true,
+        ..Default::default()
+    }
 }

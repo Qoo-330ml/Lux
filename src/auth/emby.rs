@@ -1,4 +1,9 @@
-use std::net::IpAddr;
+use std::{
+    collections::HashMap,
+    net::IpAddr,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
@@ -20,10 +25,65 @@ use crate::{
     },
 };
 
+/// Activity columns (`access_tokens.last_seen_at`, `user_devices.last_seen_at`)
+/// do not need second-level precision. Refreshing them on every Emby request
+/// turns browsing and image loads into one write transaction per request, so
+/// keep a short in-process throttle and let the database see at most one
+/// refresh per window.
+const ACCESS_TOKEN_TOUCH_INTERVAL: Duration = Duration::from_secs(60);
+const DEVICE_ACCESS_REFRESH_INTERVAL: Duration = Duration::from_secs(5 * 60);
+const ACTIVITY_CACHE_MAX_ENTRIES: usize = 4_096;
+const ACTIVITY_CACHE_RETENTION: Duration = Duration::from_secs(60 * 60);
+
+#[derive(Debug, Default)]
+struct EmbyActivityCache {
+    token_touches: HashMap<Vec<u8>, Instant>,
+    device_refreshes: HashMap<Vec<u8>, Instant>,
+}
+
+impl EmbyActivityCache {
+    fn should_touch(&self, token_hash: &[u8], now: Instant) -> bool {
+        self.token_touches
+            .get(token_hash)
+            .is_none_or(|last| now.duration_since(*last) >= ACCESS_TOKEN_TOUCH_INTERVAL)
+    }
+
+    fn mark_touched(&mut self, token_hash: &[u8], now: Instant) {
+        self.token_touches.insert(token_hash.to_vec(), now);
+        self.prune(now);
+    }
+
+    fn device_refresh_due(&self, token_hash: &[u8], now: Instant) -> bool {
+        self.device_refreshes
+            .get(token_hash)
+            .is_none_or(|last| now.duration_since(*last) >= DEVICE_ACCESS_REFRESH_INTERVAL)
+    }
+
+    fn mark_device_refreshed(&mut self, token_hash: &[u8], now: Instant) {
+        self.device_refreshes.insert(token_hash.to_vec(), now);
+        self.prune(now);
+    }
+
+    fn prune(&mut self, now: Instant) {
+        if self.token_touches.len() + self.device_refreshes.len() <= ACTIVITY_CACHE_MAX_ENTRIES {
+            return;
+        }
+        self.token_touches
+            .retain(|_, last| now.duration_since(*last) < ACTIVITY_CACHE_RETENTION);
+        self.device_refreshes
+            .retain(|_, last| now.duration_since(*last) < ACTIVITY_CACHE_RETENTION);
+        if self.token_touches.len() + self.device_refreshes.len() > ACTIVITY_CACHE_MAX_ENTRIES {
+            self.token_touches.clear();
+            self.device_refreshes.clear();
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct EmbyAuthService {
     database: Database,
     users: UserStore,
+    activity_cache: Arc<Mutex<EmbyActivityCache>>,
 }
 
 impl EmbyAuthService {
@@ -31,6 +91,7 @@ impl EmbyAuthService {
         Ok(Self {
             users: UserStore::new(database.clone())?,
             database,
+            activity_cache: Arc::new(Mutex::new(EmbyActivityCache::default())),
         })
     }
 
@@ -299,8 +360,9 @@ impl EmbyAuthService {
         client_ip: Option<IpAddr>,
     ) -> Result<Option<UserRecord>, EmbyAuthError> {
         let token_hash = hash_token(token);
-        self.database.touch_access_token(&token_hash).await?;
         let Some(stored) = self.database.find_user_by_access_token(&token_hash).await? else {
+            // Unknown tokens must not reach the activity UPDATE below; otherwise any random
+            // string would still open a write transaction on every request.
             return Ok(None);
         };
         if stored.is_disabled {
@@ -318,7 +380,41 @@ impl EmbyAuthService {
             self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
+        if self.should_touch_access_token(&token_hash) {
+            self.database.touch_access_token(&token_hash).await?;
+            self.mark_access_token_touched(&token_hash);
+        }
         user_record(stored).map(Some)
+    }
+
+    fn should_touch_access_token(&self, token_hash: &[u8]) -> bool {
+        let now = Instant::now();
+        self.with_activity_cache(|cache| cache.should_touch(token_hash, now))
+    }
+
+    fn mark_access_token_touched(&self, token_hash: &[u8]) {
+        let now = Instant::now();
+        self.with_activity_cache(|cache| cache.mark_touched(token_hash, now));
+    }
+
+    pub(crate) fn device_access_refresh_due(&self, token: &str) -> bool {
+        let token_hash = hash_token(token);
+        let now = Instant::now();
+        self.with_activity_cache(|cache| cache.device_refresh_due(&token_hash, now))
+    }
+
+    pub(crate) fn mark_device_access_refreshed(&self, token: &str) {
+        let token_hash = hash_token(token);
+        let now = Instant::now();
+        self.with_activity_cache(|cache| cache.mark_device_refreshed(&token_hash, now));
+    }
+
+    fn with_activity_cache<T>(&self, operation: impl FnOnce(&mut EmbyActivityCache) -> T) -> T {
+        let mut cache = self
+            .activity_cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        operation(&mut cache)
     }
 }
 
@@ -475,5 +571,51 @@ impl std::error::Error for EmbyAuthError {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod activity_throttle_tests {
+    use super::*;
+
+    #[test]
+    fn token_touch_is_throttled_per_token() {
+        let mut cache = EmbyActivityCache::default();
+        let now = Instant::now();
+
+        assert!(cache.should_touch(b"token-a", now));
+        cache.mark_touched(b"token-a", now);
+        assert!(!cache.should_touch(b"token-a", now + Duration::from_secs(1)));
+        assert!(cache.should_touch(b"token-a", now + ACCESS_TOKEN_TOUCH_INTERVAL));
+        assert!(cache.should_touch(b"token-b", now));
+    }
+
+    #[test]
+    fn device_refresh_is_throttled_per_token() {
+        let mut cache = EmbyActivityCache::default();
+        let now = Instant::now();
+
+        assert!(cache.device_refresh_due(b"token-a", now));
+        cache.mark_device_refreshed(b"token-a", now);
+        assert!(!cache.device_refresh_due(b"token-a", now + Duration::from_secs(30)));
+        assert!(cache.device_refresh_due(b"token-a", now + DEVICE_ACCESS_REFRESH_INTERVAL));
+    }
+
+    #[test]
+    fn activity_cache_prunes_old_entries_before_clearing() {
+        let mut cache = EmbyActivityCache::default();
+        let now = Instant::now();
+        let old = now
+            .checked_sub(ACTIVITY_CACHE_RETENTION + Duration::from_secs(1))
+            .expect("test instant is older than the retention window");
+        cache.token_touches.insert(b"token-old".to_vec(), old);
+        for index in 0..(ACTIVITY_CACHE_MAX_ENTRIES - 1) {
+            cache
+                .token_touches
+                .insert(format!("token-{index}").into_bytes(), now);
+        }
+        cache.mark_touched(b"token-new", now);
+        assert_eq!(cache.token_touches.len(), ACTIVITY_CACHE_MAX_ENTRIES);
+        assert!(!cache.token_touches.contains_key(b"token-old".as_slice()));
     }
 }

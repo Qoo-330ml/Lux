@@ -2,6 +2,7 @@ use super::*;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const DATABASE_CLEANUP_MARKER: &str = "database_lifecycle_cleanup_v1";
+const MEDIA_SOURCE_DEFAULT_REPAIR_MARKER: &str = "startup_repair_media_source_defaults_v1";
 const DATABASE_CLEANUP_PENDING: &str = "PENDING";
 const DATABASE_CLEANUP_RUNNING: &str = "RUNNING";
 const DATABASE_CLEANUP_COMPLETED: &str = "COMPLETED";
@@ -884,6 +885,123 @@ const REMOVED_ITEM_PURGE_BATCH_SIZE: i64 = 200;
 const REMOVED_ITEM_PURGE_MAX_BATCHES: u32 = 500;
 const REMOVED_ITEM_PURGE_PAUSE: std::time::Duration = std::time::Duration::from_millis(200);
 const SECONDS_PER_DAY: i64 = 86_400;
+const TASK_HISTORY_RETENTION_ENV: &str = "LUX_TASK_HISTORY_RETENTION_DAYS";
+const DEFAULT_TASK_HISTORY_RETENTION_DAYS: i64 = 14;
+const TASK_HISTORY_RETENTION_INITIAL_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(15 * 60);
+const TASK_HISTORY_RETENTION_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(24 * 60 * 60);
+const TASK_HISTORY_PRUNE_BATCH: i64 = 500;
+const TASK_HISTORY_PRUNE_MAX_BATCHES: u32 = 100;
+const METADATA_CANDIDATE_PRUNE_BATCH: i64 = 2_000;
+/// Orphaned targets are tiny rows, so a larger batch drains a leftover backlog within a few rounds
+/// while each statement still stops as soon as it has collected its batch.
+const ORPHAN_TARGET_PRUNE_BATCH: i64 = 2_000;
+/// Wall-clock budget for one retention round. The batch count alone does not bound the work: a
+/// single unbounded batch can run for minutes, so the round also stops once this budget is spent
+/// and resumes on the next scheduled run.
+const TASK_HISTORY_PRUNE_TIME_BUDGET: std::time::Duration = std::time::Duration::from_secs(30);
+/// Per-statement cap for one retention batch. It matches the round budget so a statement that is
+/// unexpectedly slow is cancelled inside its own batch instead of holding a pooled connection for
+/// the connection-wide 30 minute statement timeout.
+const RETENTION_STATEMENT_TIMEOUT: &str = "SET LOCAL statement_timeout = '30s'";
+
+/// Retention statements, one table each.
+///
+/// Every statement must be able to satisfy its `ORDER BY ... LIMIT` from an index range. The
+/// metadata candidate backlog previously used one statement that OR'ed a status filter with a
+/// correlated `EXISTS`, which made the planner switch to a bitmap scan plus a full sort of the
+/// whole backlog for every batch; on a 1.3M row backlog that exceeded the database statement
+/// timeout even for the first batch.
+mod prune_sql {
+    pub(super) const STRM_PROBE_JOBS: &str = "DELETE FROM strm_probe_jobs
+         WHERE id IN (
+             SELECT id FROM strm_probe_jobs
+             WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+               AND created_at < ?
+             ORDER BY created_at, id
+             LIMIT ?
+         )";
+    pub(super) const CHAPTER_DETECTION_JOBS: &str = "DELETE FROM chapter_detection_jobs
+         WHERE id IN (
+             SELECT id FROM chapter_detection_jobs
+             WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+               AND created_at < ?
+             ORDER BY created_at, id
+             LIMIT ?
+         )";
+    pub(super) const DANMAKU_MATCH_JOBS: &str = "DELETE FROM danmaku_match_jobs
+         WHERE id IN (
+             SELECT id FROM danmaku_match_jobs
+             WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+               AND created_at < ?
+             ORDER BY created_at, id
+             LIMIT ?
+         )";
+    pub(super) const METADATA_REIDENTIFY_JOBS: &str = "DELETE FROM metadata_reidentify_jobs
+         WHERE id IN (
+             SELECT id FROM metadata_reidentify_jobs
+             WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+               AND created_at < ?
+             ORDER BY created_at, id
+             LIMIT ?
+         )";
+    pub(super) const SCAN_JOBS: &str = "DELETE FROM scan_jobs
+         WHERE id IN (
+             SELECT job.id FROM scan_jobs job
+             WHERE job.status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+               AND job.scan_phase <> 'POSTPROCESSING'
+               AND job.created_at < ?
+               AND NOT EXISTS (
+                   SELECT 1 FROM strm_probe_jobs probe
+                   WHERE probe.target_scan_job_id = job.id
+               )
+             ORDER BY job.created_at, job.id
+             LIMIT ?
+         )";
+    /// Rejected or expired candidates are gated by status and age only, so one ordered index range
+    /// answers the whole batch.
+    pub(super) const METADATA_CANDIDATE_REJECTIONS: &str = "DELETE FROM metadata_candidates
+         WHERE id IN (
+             SELECT id FROM metadata_candidates
+             WHERE status IN ('REJECTED', 'EXPIRED')
+               AND created_at < ?
+             ORDER BY created_at, id
+             LIMIT ?
+         )";
+    /// Orphaned targets belong to a job that no longer exists. The anti-join is bounded by the
+    /// batch size, so the sweep finishes its first batches on the pages that still hold orphans.
+    pub(super) const ORPHAN_SCAN_JOB_TARGETS: &str = "DELETE FROM scan_job_targets
+         WHERE (job_id, target_type, target_id) IN (
+             SELECT target.job_id, target.target_type, target.target_id
+             FROM scan_job_targets target
+             LEFT JOIN scan_jobs job ON job.id = target.job_id
+             WHERE job.id IS NULL
+             LIMIT ?
+         )";
+    /// Superseded selections are gated by one status plus the `item_id` lookup, which keeps the
+    /// driving scan on the status range and lets the correlated lookup stay index-only.
+    pub(super) const METADATA_CANDIDATE_SUPERSEDED: &str = "DELETE FROM metadata_candidates
+         WHERE id IN (
+             SELECT candidate.id FROM metadata_candidates candidate
+             WHERE candidate.status = 'SELECTED'
+               AND candidate.created_at < ?
+               AND EXISTS (
+                   SELECT 1 FROM metadata_candidates newer
+                   WHERE newer.item_id = candidate.item_id
+                     AND newer.status = 'SELECTED'
+                     AND (
+                         newer.created_at > candidate.created_at
+                         OR (
+                             newer.created_at = candidate.created_at
+                             AND newer.id > candidate.id
+                         )
+                     )
+               )
+             ORDER BY candidate.created_at, candidate.id
+             LIMIT ?
+         )";
+}
 
 static REMOVED_ITEM_PURGE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -895,6 +1013,32 @@ pub fn removed_item_retention_days() -> i64 {
         .and_then(|value| value.trim().parse::<i64>().ok())
         .filter(|days| *days >= 0)
         .unwrap_or(DEFAULT_REMOVED_ITEM_RETENTION_DAYS)
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct TaskHistoryRetentionReport {
+    pub scan_jobs: u64,
+    pub metadata_reidentify_jobs: u64,
+    pub chapter_detection_jobs: u64,
+    pub danmaku_match_jobs: u64,
+    pub strm_probe_jobs: u64,
+    pub metadata_candidates: u64,
+    /// Targets left behind by jobs that no longer exist. `scan_job_targets` has no foreign key to
+    /// `scan_jobs`, so these rows are never removed by a cascade.
+    pub scan_job_targets: u64,
+    /// Tables whose prune statement failed in this round. A failing table never stops the other
+    /// tables: the previous implementation propagated the first error and left every later table
+    /// unpruned, which silently accumulated expired history.
+    pub failed: Vec<&'static str>,
+}
+
+/// Retention window for finished background-job history, in days. `0` disables pruning.
+pub fn task_history_retention_days() -> i64 {
+    std::env::var(TASK_HISTORY_RETENTION_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|days| *days >= 0)
+        .unwrap_or(DEFAULT_TASK_HISTORY_RETENTION_DAYS)
 }
 
 impl Database {
@@ -1060,7 +1204,44 @@ impl Database {
     /// defaults (and merges or removals could leave none). The oldest of the current
     /// defaults wins, which keeps today's effective choice; with no default the oldest
     /// source becomes one. Returns the number of repaired items.
+    pub(crate) async fn startup_repair_completed(&self, key: &str) -> Result<bool, StorageError> {
+        let value: Option<String> = self
+            .query_scalar("SELECT value FROM lux_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(value.as_deref() == Some("1"))
+    }
+
+    pub(crate) async fn mark_startup_repair_completed(
+        &self,
+        key: &str,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO lux_meta (key, value) VALUES (?, '1')
+             ON CONFLICT(key) DO UPDATE SET value = '1'",
+        )
+        .bind(key)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub async fn normalize_media_source_defaults(&self) -> Result<u64, StorageError> {
+        if self
+            .startup_repair_completed(MEDIA_SOURCE_DEFAULT_REPAIR_MARKER)
+            .await?
+        {
+            return Ok(0);
+        }
         let mut repaired = 0_u64;
         loop {
             let item_ids = self
@@ -1109,6 +1290,556 @@ impl Database {
                 break;
             }
         }
+        self.mark_startup_repair_completed(MEDIA_SOURCE_DEFAULT_REPAIR_MARKER)
+            .await?;
         Ok(repaired)
+    }
+
+    /// Runs one prune batch with a statement timeout that cannot exceed the round's remaining
+    /// budget.
+    ///
+    /// The connection setting is a 30 minute timeout, which is far longer than a retention round
+    /// should ever need: one unindexed statement could hold a connection for half an hour before it
+    /// was cancelled. PostgreSQL gets the remaining budget as `SET LOCAL`, so a slow statement fails
+    /// inside its own batch and the other tables still run.
+    async fn run_prune_batch(
+        &self,
+        sql: &'static str,
+        cutoff: Option<i64>,
+        batch: i64,
+    ) -> Result<u64, StorageError> {
+        let mut query = self.query(sql);
+        if let Some(cutoff) = cutoff {
+            query = query.bind(cutoff);
+        }
+        let query = query.bind(batch);
+        if self.backend != DatabaseBackend::Postgres {
+            return query
+                .execute(&self.pool)
+                .await
+                .map(|result| result.rows_affected())
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+        }
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        sqlx::query(RETENTION_STATEMENT_TIMEOUT)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let deleted = query
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(deleted)
+    }
+
+    async fn prune_task_history_batches(
+        &self,
+        sql: &'static str,
+        cutoff: i64,
+        batch: i64,
+        max_batches: u32,
+        deadline: std::time::Instant,
+    ) -> Result<u64, StorageError> {
+        let mut total = 0_u64;
+        for _ in 0..max_batches {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let deleted = self.run_prune_batch(sql, Some(cutoff), batch).await?;
+            total = total.saturating_add(deleted);
+            if deleted < u64::try_from(batch).unwrap_or(u64::MAX) {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    /// Same bounded loop as `prune_task_history_batches`, for statements that only take the batch
+    /// size; the orphan sweep has no retention cutoff because an orphan is already expired.
+    async fn prune_orphan_batches(
+        &self,
+        sql: &'static str,
+        batch: i64,
+        max_batches: u32,
+        deadline: std::time::Instant,
+    ) -> Result<u64, StorageError> {
+        let mut total = 0_u64;
+        for _ in 0..max_batches {
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            let deleted = self.run_prune_batch(sql, None, batch).await?;
+            total = total.saturating_add(deleted);
+            if deleted < u64::try_from(batch).unwrap_or(u64::MAX) {
+                break;
+            }
+        }
+        Ok(total)
+    }
+
+    async fn prune_orphan_table(
+        &self,
+        failed: &mut Vec<&'static str>,
+        table: &'static str,
+        sql: &'static str,
+        batch: i64,
+        deadline: std::time::Instant,
+    ) -> u64 {
+        match self
+            .prune_orphan_batches(sql, batch, TASK_HISTORY_PRUNE_MAX_BATCHES, deadline)
+            .await
+        {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    table,
+                    "task history retention could not prune a table; continuing with the others"
+                );
+                failed.push(table);
+                0
+            }
+        }
+    }
+
+    /// Prunes one table and records the table name when its statement fails.
+    ///
+    /// The round must survive a single slow or broken table: reporting the failure and moving on
+    /// keeps every later table pruned, while the returned count stays usable for logging.
+    async fn prune_table(
+        &self,
+        failed: &mut Vec<&'static str>,
+        table: &'static str,
+        sql: &'static str,
+        cutoff: i64,
+        batch: i64,
+        deadline: std::time::Instant,
+    ) -> u64 {
+        match self
+            .prune_task_history_batches(
+                sql,
+                cutoff,
+                batch,
+                TASK_HISTORY_PRUNE_MAX_BATCHES,
+                deadline,
+            )
+            .await
+        {
+            Ok(deleted) => deleted,
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    table,
+                    "task history retention could not prune a table; continuing with the others"
+                );
+                failed.push(table);
+                0
+            }
+        }
+    }
+
+    /// Deletes one bounded pass of finished job history and resolved candidates.
+    ///
+    /// Each table is pruned independently within a shared wall-clock budget, so one failing table
+    /// neither aborts the round nor hides which table failed.
+    pub async fn prune_task_history(
+        &self,
+        retention_seconds: i64,
+        batch_limit: i64,
+    ) -> Result<TaskHistoryRetentionReport, StorageError> {
+        let cutoff = current_unix_timestamp().saturating_sub(retention_seconds.max(0));
+        let batch = batch_limit.clamp(1, 5_000);
+        let deadline = std::time::Instant::now() + TASK_HISTORY_PRUNE_TIME_BUDGET;
+        let mut failed = Vec::new();
+        let strm_probe_jobs = self
+            .prune_table(
+                &mut failed,
+                "strm_probe_jobs",
+                prune_sql::STRM_PROBE_JOBS,
+                cutoff,
+                batch,
+                deadline,
+            )
+            .await;
+        let chapter_detection_jobs = self
+            .prune_table(
+                &mut failed,
+                "chapter_detection_jobs",
+                prune_sql::CHAPTER_DETECTION_JOBS,
+                cutoff,
+                batch,
+                deadline,
+            )
+            .await;
+        let danmaku_match_jobs = self
+            .prune_table(
+                &mut failed,
+                "danmaku_match_jobs",
+                prune_sql::DANMAKU_MATCH_JOBS,
+                cutoff,
+                batch,
+                deadline,
+            )
+            .await;
+        let metadata_reidentify_jobs = self
+            .prune_table(
+                &mut failed,
+                "metadata_reidentify_jobs",
+                prune_sql::METADATA_REIDENTIFY_JOBS,
+                cutoff,
+                batch,
+                deadline,
+            )
+            .await;
+        let scan_jobs = self
+            .prune_table(
+                &mut failed,
+                "scan_jobs",
+                prune_sql::SCAN_JOBS,
+                cutoff,
+                batch,
+                deadline,
+            )
+            .await;
+        let scan_job_targets = self
+            .prune_orphan_table(
+                &mut failed,
+                "scan_job_targets",
+                prune_sql::ORPHAN_SCAN_JOB_TARGETS,
+                ORPHAN_TARGET_PRUNE_BATCH.max(batch),
+                deadline,
+            )
+            .await;
+        let rejected = self
+            .prune_table(
+                &mut failed,
+                "metadata_candidate_rejections",
+                prune_sql::METADATA_CANDIDATE_REJECTIONS,
+                cutoff,
+                METADATA_CANDIDATE_PRUNE_BATCH.max(batch),
+                deadline,
+            )
+            .await;
+        let superseded = self
+            .prune_table(
+                &mut failed,
+                "metadata_candidate_superseded",
+                prune_sql::METADATA_CANDIDATE_SUPERSEDED,
+                cutoff,
+                METADATA_CANDIDATE_PRUNE_BATCH.max(batch),
+                deadline,
+            )
+            .await;
+        Ok(TaskHistoryRetentionReport {
+            strm_probe_jobs,
+            chapter_detection_jobs,
+            danmaku_match_jobs,
+            metadata_reidentify_jobs,
+            scan_jobs,
+            scan_job_targets,
+            metadata_candidates: rejected.saturating_add(superseded),
+            failed,
+        })
+    }
+
+    /// Starts the daily retention pass for finished job history. This is
+    /// independent from database maintenance so disabling VACUUM does not
+    /// retain every historical scan and metadata job forever.
+    pub fn spawn_task_history_retention(&self) {
+        let retention_days = task_history_retention_days();
+        if retention_days == 0 {
+            return;
+        }
+        let database = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(TASK_HISTORY_RETENTION_INITIAL_DELAY).await;
+            let mut ticker = tokio::time::interval(TASK_HISTORY_RETENTION_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                match database
+                    .prune_task_history(
+                        retention_days.saturating_mul(SECONDS_PER_DAY),
+                        TASK_HISTORY_PRUNE_BATCH,
+                    )
+                    .await
+                {
+                    Ok(report) => {
+                        if !report.failed.is_empty() {
+                            tracing::warn!(
+                                failed = ?report.failed,
+                                "task history retention left some tables unpruned"
+                            );
+                        }
+                        if report.scan_jobs > 0
+                            || report.metadata_reidentify_jobs > 0
+                            || report.chapter_detection_jobs > 0
+                            || report.danmaku_match_jobs > 0
+                            || report.strm_probe_jobs > 0
+                            || report.metadata_candidates > 0
+                            || report.scan_job_targets > 0
+                        {
+                            tracing::info!(
+                                scan_jobs = report.scan_jobs,
+                                metadata_reidentify_jobs = report.metadata_reidentify_jobs,
+                                chapter_detection_jobs = report.chapter_detection_jobs,
+                                danmaku_match_jobs = report.danmaku_match_jobs,
+                                strm_probe_jobs = report.strm_probe_jobs,
+                                metadata_candidates = report.metadata_candidates,
+                                scan_job_targets = report.scan_job_targets,
+                                failed = report.failed.len(),
+                                "pruned expired task history"
+                            );
+                        }
+                    }
+                    Err(error) => tracing::warn!(%error, "task history retention failed"),
+                }
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+mod task_history_retention_tests {
+    use super::*;
+    use crate::config::Config;
+
+    #[tokio::test]
+    async fn retention_deletes_only_expired_terminal_scan_jobs()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('retention-library', 'Retention', 'MOVIE')")
+            .execute(&database.pool)
+            .await?;
+        let now = current_unix_timestamp();
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, created_at)
+                 VALUES ('old-completed', 'retention-library', 'RECONCILE_LIBRARY', 'COMPLETED', 'g1', 1),
+                        ('new-completed', 'retention-library', 'RECONCILE_LIBRARY', 'COMPLETED', 'g2', ?),
+                        ('old-running', 'retention-library', 'RECONCILE_LIBRARY', 'RUNNING', 'g3', 1)",
+            )
+            .bind(now)
+            .execute(&database.pool)
+            .await?;
+
+        let report = database.prune_task_history(100, 10).await?;
+        assert!(report.scan_jobs >= 1);
+        let old_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE id = 'old-completed'")
+            .fetch_one(&database.pool)
+            .await?;
+        let new_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE id = 'new-completed'")
+            .fetch_one(&database.pool)
+            .await?;
+        let running_count: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs WHERE id = 'old-running'")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(old_count, 0);
+        assert_eq!(new_count, 1);
+        assert_eq!(running_count, 1);
+        Ok(())
+    }
+
+    /// Candidates were previously pruned by one statement that OR'ed two unrelated predicates, so
+    /// the planner could not keep `created_at` ordering and had to sort the whole backlog for every
+    /// batch. The passes are now separate so each can follow its own index range.
+    #[tokio::test]
+    async fn retention_prunes_rejected_and_superseded_candidates_in_separate_passes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('retention-library', 'Retention', 'MOVIE')")
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (id, library_id, item_type, title, sort_title, identification_status)
+                 VALUES ('retention-item', 'retention-library', 'MOVIE', 'Retention', 'retention', 'LOCAL_CONFIRMED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO metadata_candidates (
+                     id, item_id, provider, provider_id, candidate_json, score, status, created_at
+                 ) VALUES
+                     ('old-selected', 'retention-item', 'TMDB', '1', '{}', 90, 'SELECTED', 1),
+                     ('mid-selected', 'retention-item', 'TMDB', '2', '{}', 91, 'SELECTED', 2),
+                     ('new-selected', 'retention-item', 'TMDB', '3', '{}', 92, 'SELECTED', 3),
+                     ('old-rejected', 'retention-item', 'TMDB', '4', '{}', 10, 'REJECTED', 1)",
+            )
+            .execute(&database.pool)
+            .await?;
+
+        let report = database.prune_task_history(100, 10).await?;
+        assert!(report.failed.is_empty());
+        assert_eq!(report.metadata_candidates, 3);
+        let remaining: Vec<String> = database
+            .query_scalar("SELECT id FROM metadata_candidates ORDER BY id")
+            .fetch_all(&database.pool)
+            .await?;
+        assert_eq!(remaining, vec!["new-selected".to_owned()]);
+        Ok(())
+    }
+
+    /// One failing table must not stop the other tables from being pruned, and the caller has to be
+    /// able to see which table failed instead of only a single warn line.
+    #[tokio::test]
+    async fn retention_records_a_failing_table_and_keeps_pruning_others()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('retention-library', 'Retention', 'MOVIE')")
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, created_at)
+                 VALUES ('old-completed', 'retention-library', 'RECONCILE_LIBRARY', 'COMPLETED', 'g1', 1)",
+            )
+            .execute(&database.pool)
+            .await?;
+
+        let mut failed = Vec::new();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        let broken = database
+            .prune_table(
+                &mut failed,
+                "broken",
+                "DELETE FROM retention_missing_table WHERE id IN (SELECT id FROM retention_missing_table LIMIT ?)",
+                1,
+                10,
+                deadline,
+            )
+            .await;
+        assert_eq!(broken, 0);
+        assert_eq!(failed, vec!["broken"]);
+
+        let deleted = database
+            .prune_table(
+                &mut failed,
+                "scan_jobs",
+                super::prune_sql::SCAN_JOBS,
+                100,
+                10,
+                deadline,
+            )
+            .await;
+        assert_eq!(deleted, 1);
+        assert_eq!(failed, vec!["broken"]);
+        let remaining: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(remaining, 0);
+        Ok(())
+    }
+
+    /// `scan_job_targets` carries no foreign key to `scan_jobs` in the current schema, so deleting
+    /// a finished job leaves its targets behind. The retention round has to sweep those orphans
+    /// instead of relying on a cascade that does not exist.
+    #[tokio::test]
+    async fn retention_sweeps_orphaned_scan_job_targets() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES ('retention-library', 'Retention', 'MOVIE')")
+            .execute(&database.pool)
+            .await?;
+        let now = current_unix_timestamp();
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, created_at)
+                 VALUES ('live-job', 'retention-library', 'RECONCILE_LIBRARY', 'RUNNING', 'g1', ?)",
+            )
+            .bind(now)
+            .execute(&database.pool)
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_job_targets (job_id, target_type, target_id, item_id, change_kind)
+                 VALUES ('live-job', 'ITEM', 'live-target', 'live-item', 'CHANGED')",
+            )
+            .execute(&database.pool)
+            .await?;
+        // SQLite enforces the foreign key that PostgreSQL deliberately drops on `job_id`, so the
+        // orphan row is created on a connection with constraint enforcement disabled.
+        let mut connection = database.pool.acquire().await?;
+        sqlx::query("PRAGMA foreign_keys = OFF")
+            .execute(&mut *connection)
+            .await?;
+        sqlx::query(
+            "INSERT INTO scan_job_targets (job_id, target_type, target_id, item_id, change_kind)
+             VALUES ('gone-job', 'ITEM', 'orphan-target', 'orphan-item', 'NEW')",
+        )
+        .execute(&mut *connection)
+        .await?;
+        sqlx::query("PRAGMA foreign_keys = ON")
+            .execute(&mut *connection)
+            .await?;
+        drop(connection);
+
+        let report = database.prune_task_history(100, 10).await?;
+        assert!(report.failed.is_empty());
+        assert_eq!(report.scan_job_targets, 1);
+        let remaining: Vec<String> = database
+            .query_scalar("SELECT target_id FROM scan_job_targets ORDER BY target_id")
+            .fetch_all(&database.pool)
+            .await?;
+        assert_eq!(remaining, vec!["live-target".to_owned()]);
+        let jobs: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM scan_jobs")
+            .fetch_one(&database.pool)
+            .await?;
+        assert_eq!(jobs, 1);
+        Ok(())
     }
 }

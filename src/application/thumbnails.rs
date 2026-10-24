@@ -23,6 +23,7 @@ use crate::{
             BackgroundWorkStage, process_background_child_cleanup_pending,
             run_process_background_supervised,
         },
+        candidates::{EpisodeImagePolicy, ImageSelectionPolicy},
         images::{
             acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
             is_fallback_image_source, read_image_dimensions_from_bytes, write_image_atomically,
@@ -309,10 +310,20 @@ impl ThumbnailService {
             if !seen_items.insert(candidate.item_id.clone()) {
                 continue;
             }
-            let mode = ThumbnailScrapingMode::from_strategy_json(
+            let image_policy = ImageSelectionPolicy::from_json(
                 candidate.library_media_strategy_json.as_deref(),
                 global_strategy,
             );
+            let mode = effective_thumbnail_mode(
+                &candidate.item_type,
+                image_policy,
+                ThumbnailScrapingMode::from_strategy_json(
+                    candidate.library_media_strategy_json.as_deref(),
+                    global_strategy,
+                ),
+            );
+            let (poster_screenshots, thumb_screenshots) =
+                screenshot_permissions(&candidate.item_type, image_policy);
             if !mode.allows_screenshots() {
                 report.skipped_policy += 1;
                 continue;
@@ -338,7 +349,9 @@ impl ThumbnailService {
             let service = self.clone();
             pending.spawn(async move {
                 let item_id = candidate.item_id.clone();
-                let result = service.generate_for_source(&candidate, mode).await;
+                let result = service
+                    .generate_for_source(&candidate, mode, (poster_screenshots, thumb_screenshots))
+                    .await;
                 (item_id, result)
             });
         }
@@ -397,6 +410,7 @@ impl ThumbnailService {
         &self,
         source: &StoredThumbnailSource,
         mode: ThumbnailScrapingMode,
+        screenshots: (bool, bool),
     ) -> Result<ThumbnailOutcome, ThumbnailFileError> {
         let (source_path, _target_path, root_path) = resolve_media_paths(source).await?;
         let _image_write_lock = acquire_image_write_lock(&source.item_id).await;
@@ -414,7 +428,7 @@ impl ThumbnailService {
             indexed_image_availability(&indexed_images, "POSTER", &root_path).await?;
         let thumbnail_availability =
             indexed_image_availability(&indexed_images, "THUMB", &root_path).await?;
-        let poster_plan = self
+        let mut poster_plan = self
             .plan_artwork(
                 "POSTER",
                 poster_target,
@@ -423,7 +437,7 @@ impl ThumbnailService {
                 mode,
             )
             .await?;
-        let thumbnail_plan = self
+        let mut thumbnail_plan = self
             .plan_artwork(
                 "THUMB",
                 thumbnail_target,
@@ -432,6 +446,13 @@ impl ThumbnailService {
                 mode,
             )
             .await?;
+        let (poster_screenshots, thumb_screenshots) = screenshots;
+        if !poster_screenshots {
+            poster_plan.action = ArtworkAction::Keep;
+        }
+        if !thumb_screenshots {
+            thumbnail_plan.action = ArtworkAction::Keep;
+        }
 
         if poster_availability == ImageAvailability::Missing
             && thumbnail_availability == ImageAvailability::Missing
@@ -1146,6 +1167,41 @@ impl From<ThumbnailFileError> for ThumbnailError {
     }
 }
 
+/// Episodes follow the three-way `episodeImagePolicy`: scraper still, local
+/// screenshot, or neither. Other item types keep the shared thumbnail mode.
+/// Per-type permission for generating ffmpeg screenshots. A cell can turn
+/// screenshots off for POSTER or THUMB while keeping scraper artwork.
+pub(crate) fn screenshot_permissions(
+    item_type: &str,
+    policy: ImageSelectionPolicy,
+) -> (bool, bool) {
+    (
+        policy
+            .type_policy_for_item_type(item_type, "POSTER")
+            .sources
+            .screenshot,
+        policy
+            .type_policy_for_item_type(item_type, "THUMB")
+            .sources
+            .screenshot,
+    )
+}
+
+pub(crate) fn effective_thumbnail_mode(
+    item_type: &str,
+    policy: ImageSelectionPolicy,
+    mode: ThumbnailScrapingMode,
+) -> ThumbnailScrapingMode {
+    if item_type != "EPISODE" {
+        return mode;
+    }
+    match policy.episode_image_policy() {
+        EpisodeImagePolicy::ScraperStill => ThumbnailScrapingMode::ScraperFirst,
+        EpisodeImagePolicy::LocalScreenshot => ThumbnailScrapingMode::ScreenshotFirst,
+        EpisodeImagePolicy::None => ThumbnailScrapingMode::None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::ThumbnailService;
@@ -1199,5 +1255,75 @@ mod tests {
         assert!(state.images_missing);
         assert_eq!(database.query_count(), 3);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod episode_image_mode_tests {
+    use super::{EpisodeImagePolicy, ImageSelectionPolicy, effective_thumbnail_mode};
+    use crate::application::thumbnail_policy::ThumbnailScrapingMode;
+
+    fn policy(episode_policy: &str) -> ImageSelectionPolicy {
+        ImageSelectionPolicy::from_json(
+            Some(&format!(
+                r#"{{"images":{{"levels":{{"episode":{{"episodeImagePolicy":"{episode_policy}"}}}}}}}}"#
+            )),
+            None,
+        )
+    }
+
+    #[test]
+    fn episode_policies_map_to_the_expected_screenshot_mode() {
+        let cases = [
+            (
+                "SCRAPER_STILL",
+                ThumbnailScrapingMode::ScraperFirst,
+                EpisodeImagePolicy::ScraperStill,
+            ),
+            (
+                "LOCAL_SCREENSHOT",
+                ThumbnailScrapingMode::ScreenshotFirst,
+                EpisodeImagePolicy::LocalScreenshot,
+            ),
+            (
+                "NONE",
+                ThumbnailScrapingMode::None,
+                EpisodeImagePolicy::None,
+            ),
+        ];
+        for (raw, expected_mode, expected_policy) in cases {
+            let policy = policy(raw);
+            assert_eq!(policy.episode_image_policy(), expected_policy);
+            assert_eq!(
+                effective_thumbnail_mode("EPISODE", policy, ThumbnailScrapingMode::ScraperFirst),
+                expected_mode
+            );
+        }
+    }
+
+    #[test]
+    fn screenshot_permissions_follow_the_cell_sources() {
+        let policy = ImageSelectionPolicy::from_json(
+            Some(
+                r#"{"images":{"levels":{"series":{"artworks":{"poster":{"sources":["SCRAPER"]},"thumbnail":{"sources":["SCREENSHOT"]}}}}}}"#,
+            ),
+            None,
+        );
+        assert_eq!(
+            super::screenshot_permissions("SERIES", policy),
+            (false, true)
+        );
+        assert_eq!(super::screenshot_permissions("MOVIE", policy), (true, true));
+    }
+
+    #[test]
+    fn non_episode_items_keep_the_shared_mode() {
+        let policy = policy("NONE");
+        for item_type in ["MOVIE", "SERIES", "SEASON"] {
+            assert_eq!(
+                effective_thumbnail_mode(item_type, policy, ThumbnailScrapingMode::ScraperFirst),
+                ThumbnailScrapingMode::ScraperFirst
+            );
+        }
     }
 }

@@ -81,7 +81,10 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
     let lux_listener = TcpListener::bind("127.0.0.1:0").await?;
     let lux_address = lux_listener.local_addr()?;
     let lux_server = tokio::spawn(async move { axum::serve(lux_listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("http://{lux_address}/api/v1/auth/login"))

@@ -4,16 +4,26 @@ use luxd::{
     storage::Database,
 };
 
-#[test]
-fn argon2id_hashes_and_verifies_without_plaintext_storage() -> Result<(), Box<dyn std::error::Error>>
-{
+#[tokio::test]
+async fn argon2id_hashes_and_verifies_without_plaintext_storage()
+-> Result<(), Box<dyn std::error::Error>> {
     let passwords = PasswordService::new()?;
-    let hash = passwords.hash_password("correct horse battery staple")?;
+    let hash = passwords
+        .hash_password("correct horse battery staple")
+        .await?;
 
     assert!(hash.starts_with("$argon2id$"));
-    assert!(passwords.verify_password(Some(&hash), "correct horse battery staple")?);
-    assert!(!passwords.verify_password(Some(&hash), "wrong password")?);
-    assert!(!passwords.verify_password(None, "wrong password")?);
+    assert!(
+        passwords
+            .verify_password(Some(&hash), "correct horse battery staple")
+            .await?
+    );
+    assert!(
+        !passwords
+            .verify_password(Some(&hash), "wrong password")
+            .await?
+    );
+    assert!(!passwords.verify_password(None, "wrong password").await?);
     assert!(!hash.contains("correct horse battery staple"));
     Ok(())
 }

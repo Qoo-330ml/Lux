@@ -7,7 +7,10 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app()).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let base_url = format!("http://{address}");
 
     let index = client.get(format!("{base_url}/")).send().await?;
@@ -101,7 +104,10 @@ async fn media_detail_navigation_is_served_as_html_while_json_uses_emby()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app()).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let base_url = format!("http://{address}");
 
     let media_detail_page = client

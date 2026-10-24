@@ -759,6 +759,7 @@ fn nfo_write_error_code(error: &NfoWriteError) -> &'static str {
         NfoWriteError::SymlinkTarget(_) => "SYMLINK_TARGET",
         NfoWriteError::PathOutsideRoot(_) => "PATH_OUTSIDE_ROOT",
         NfoWriteError::ConcurrentModification(_) => "CONCURRENT_MODIFICATION",
+        NfoWriteError::TooLarge(_) => "NFO_TOO_LARGE",
         NfoWriteError::Storage(_) => "STORAGE",
     }
 }
@@ -1026,6 +1027,12 @@ impl MediaProbeService {
         let mut sidecar_inputs = VecDeque::new();
         for source in sources {
             let path = safe_media_path(&source.root_path, &source.relative_path)?;
+            let Some(path) = confine_to_root(&source.root_path, path).await else {
+                // A symlink escaping the library root must never be probed.
+                report.skipped += 1;
+                states.push((source.source_id, ProbeTargetState::Skipped));
+                continue;
+            };
             if is_strm_path(&path) {
                 if source.probe_status != "PENDING"
                     && !(source.probe_status == "NOT_CONFIGURED" && has_strm_sidecar(&path).await)
@@ -1317,6 +1324,28 @@ impl MediaProbeService {
         Ok(read_media_info_sidecar(path)
             .await
             .or(read_nfo_streamdetails(path).await))
+    }
+}
+
+/// Resolves symlinks and refuses a target that leaves the library root.
+///
+/// Unresolvable paths are returned unchanged so the probe still reports the I/O error the way it
+/// did before; only a confirmed escape is skipped.
+async fn confine_to_root(root_path: &str, path: PathBuf) -> Option<PathBuf> {
+    let (Ok(root), Ok(canonical)) = (
+        fs::canonicalize(root_path).await,
+        fs::canonicalize(&path).await,
+    ) else {
+        return Some(path);
+    };
+    if canonical.starts_with(&root) {
+        Some(canonical)
+    } else {
+        tracing::warn!(
+            root = %root_path,
+            "probe target resolves outside its library root and was skipped"
+        );
+        None
     }
 }
 
@@ -1868,6 +1897,42 @@ impl From<StorageError> for ProbeServiceError {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probe_targets_that_escape_the_root_through_symlinks_are_rejected() {
+        let root = tempfile::tempdir().expect("root");
+        let outside = tempfile::tempdir().expect("outside");
+        let external = outside.path().join("movie.mkv");
+        tokio::fs::write(&external, b"x").await.expect("write");
+        std::os::unix::fs::symlink(&external, root.path().join("escape.mkv")).expect("symlink");
+        tokio::fs::write(root.path().join("inside.mkv"), b"x")
+            .await
+            .expect("write");
+
+        assert!(
+            super::confine_to_root(
+                root.path().to_str().unwrap(),
+                root.path().join("escape.mkv")
+            )
+            .await
+            .is_none(),
+            "a symlink leaving the root must be refused"
+        );
+        let inside = super::confine_to_root(
+            root.path().to_str().unwrap(),
+            root.path().join("inside.mkv"),
+        )
+        .await
+        .expect("inside file");
+        assert!(inside.starts_with(tokio::fs::canonicalize(root.path()).await.unwrap()));
+        // Missing files pass through so the probe can report the I/O error as before.
+        assert!(
+            super::confine_to_root(root.path().to_str().unwrap(), root.path().join("gone.mkv"))
+                .await
+                .is_some()
+        );
+    }
+
     use std::collections::BTreeMap;
 
     use serde_json::json;

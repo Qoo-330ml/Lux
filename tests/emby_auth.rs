@@ -58,7 +58,10 @@ async fn emby_users_requires_server_manager_and_supports_both_prefixes()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     for path in ["/Users", "/emby/Users"] {
         let response = client
@@ -107,10 +110,19 @@ async fn emby_users_requires_server_manager_and_supports_both_prefixes()
         .to_owned();
     let viewer_response = client
         .get(format!("http://{address}/Users"))
-        .header("X-Emby-Token", viewer_token)
+        .header("X-Emby-Token", &viewer_token)
         .send()
         .await?;
     assert_eq!(viewer_response.status(), reqwest::StatusCode::FORBIDDEN);
+
+    // A non-administrator must not reach the media-info import route even with an empty body.
+    let viewer_sync = client
+        .post(format!("http://{address}/Items/SyncMediaInfo"))
+        .header("X-Emby-Token", &viewer_token)
+        .body("")
+        .send()
+        .await?;
+    assert_eq!(viewer_sync.status(), reqwest::StatusCode::FORBIDDEN);
 
     let missing_key = client.get(format!("http://{address}/Users")).send().await?;
     assert_eq!(missing_key.status(), reqwest::StatusCode::UNAUTHORIZED);
@@ -162,7 +174,10 @@ async fn emby_users_query_returns_paginated_admin_user_result()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     for path in ["/Users/Query", "/emby/Users/Query"] {
         let response = client
@@ -245,7 +260,10 @@ async fn emby_public_users_login_and_logout_use_hashed_device_tokens()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let public = client
         .get(format!("http://{address}/emby/Users/Public"))
@@ -442,7 +460,10 @@ async fn emby_user_id_authentication_matches_avdb_request() -> Result<(), Box<dy
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     for prefix in ["", "/emby"] {
         let path = format!("{prefix}/Users/{}/Authenticate", admin.id);
@@ -508,7 +529,10 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -664,11 +688,24 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
     assert_eq!(avatar_upload_as_base64.status(), reqwest::StatusCode::OK);
     assert!(avatar_upload_as_base64.bytes().await?.is_empty());
 
+    let avatar_read_anonymous = client
+        .get(format!(
+            "http://{address}/emby/Users/{}/Images/Primary",
+            viewer.id
+        ))
+        .send()
+        .await?;
+    assert_eq!(
+        avatar_read_anonymous.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
+
     let avatar_read = client
         .get(format!(
             "http://{address}/emby/Users/{}/Images/Primary",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_read.status(), reqwest::StatusCode::OK);
@@ -686,6 +723,7 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
             "http://{address}/emby/Users/{}/Images/Primary/0",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_read_at_index.status(), reqwest::StatusCode::OK);
@@ -699,6 +737,7 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
             "http://{address}/emby/Users/{}/Images/Primary",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_head.status(), reqwest::StatusCode::OK);
@@ -720,6 +759,7 @@ async fn emby_user_routes_match_official_request_and_response_contracts()
             "http://{address}/emby/Users/{}/Images/Primary",
             viewer.id
         ))
+        .header(&admin_auth.0, &admin_auth.1)
         .send()
         .await?;
     assert_eq!(avatar_after_delete.status(), reqwest::StatusCode::NOT_FOUND);
@@ -848,7 +888,10 @@ async fn emby_create_user_accepts_query_name_without_a_request_body()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let created = client
         .post(format!("http://{address}/emby/Users/New"))
@@ -964,7 +1007,10 @@ async fn emby_user_creation_deletion_and_configuration_are_persistent()
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -1149,8 +1195,18 @@ async fn emby_authenticated_access_refreshes_device_activity()
         )
         .await
     }));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let device_id = "emby-activity-device";
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(
@@ -1202,6 +1258,36 @@ async fn emby_authenticated_access_refreshes_device_activity()
     assert_eq!(refreshed_device.0, first_seen_at);
     assert!(refreshed_device.1 > 1);
     assert_eq!(refreshed_device.2.as_deref(), Some("203.0.113.11"));
+
+    // Once the proxy allowlist is gone the forwarded header must not be believed: the recorded
+    // address has to fall back to the connection peer.
+    sqlx::query("DELETE FROM server_settings WHERE key = 'trusted_proxy_cidrs'")
+        .execute(database.pool())
+        .await?;
+    let untrusted_forward = client
+        .post(format!("http://{address}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="Infuse", Device="Apple TV", DeviceId="emby-untrusted-forward", Version="1.0""#,
+        )
+        .header("x-forwarded-for", "203.0.113.12")
+        .json(&json!({ "Username": "Admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(untrusted_forward.status(), reqwest::StatusCode::OK);
+    let untrusted_device: (Option<String>,) = sqlx::query_as(
+        "SELECT last_remote_ip FROM user_devices WHERE user_id = ? AND device_id = ?",
+    )
+    .bind(admin.id.to_string())
+    .bind("emby-untrusted-forward")
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(untrusted_device.0.as_deref(), Some("127.0.0.1"));
+    sqlx::query("DELETE FROM user_devices WHERE user_id = ? AND device_id = ?")
+        .bind(admin.id.to_string())
+        .bind("emby-untrusted-forward")
+        .execute(database.pool())
+        .await?;
 
     let login_without_device = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -1419,9 +1505,19 @@ async fn emby_password_logins_update_device_inventory_without_blocking_auth()
         )
         .await
     }));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let device_id = "emby-shared-device";
     let remote_ip = "203.0.113.10";
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .bind("[\"127.0.0.1/32\"]")
+    .execute(database.pool())
+    .await?;
 
     let first_login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -1566,7 +1662,10 @@ async fn emby_credentials_follow_server_precedence_without_query_alias_conflicts
     let _server = AbortOnDrop(tokio::spawn(
         async move { axum::serve(listener, app).await },
     ));
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let invalid = "invalid-test-credential";
     for prefix in ["", "/emby"] {
         // Public discovery and password login do not authenticate with query tokens.
@@ -1854,7 +1953,15 @@ async fn emby_credentials_follow_server_precedence_without_query_alias_conflicts
         .query(&[("api_key", key.as_str())])
         .send()
         .await?;
-    assert_eq!(native_baseline.status(), reqwest::StatusCode::FORBIDDEN);
+    // The query-string key no longer authenticates admin routes at all, so the request is
+    // simply unauthenticated (401) instead of being rejected as a client token (403).
+    assert!(
+        matches!(
+            native_baseline.status(),
+            reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::FORBIDDEN
+        ),
+        "admin routes must not accept a query-string key"
+    );
     assert_eq!(response.status(), native_baseline.status());
     Ok(())
 }

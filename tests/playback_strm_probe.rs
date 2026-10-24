@@ -142,7 +142,10 @@ async fn only_authorized_playing_callback_triggers_strm_probe()
         .await
     });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(

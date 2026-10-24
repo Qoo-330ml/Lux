@@ -102,7 +102,10 @@ fi
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(
@@ -118,6 +121,7 @@ fi
         .to_owned();
 
     let no_redirect_client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     for (title, target) in [

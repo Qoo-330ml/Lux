@@ -1214,6 +1214,7 @@ impl ScanJobService {
             self.publish_webhook_event(completed_job, WebhookEventType::ScanCompleted, None)
                 .await;
         }
+        self.notify_identity_merge();
         Ok(ScanBatchReport {
             status: "COMPLETED".to_owned(),
             processed: 0,

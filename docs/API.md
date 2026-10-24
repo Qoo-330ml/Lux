@@ -64,7 +64,7 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 附带这些请求头。`X-Lux-Api-Key` 和 `api_key` 查询参数仍只表示 LUX-182 的共享管理员 API Key，不能
 用来冒充普通用户。
 
-数据库连接池的 `maxConnections` 默认值为 SQLite 8、PostgreSQL 20；可通过进程环境变量
+数据库连接池的 `maxConnections` 默认值为 SQLite 8、PostgreSQL 8；可通过进程环境变量
 `LUX_DB_MAX_CONNECTIONS` 在 1-100 范围内覆盖，未设置或为空时使用默认值。管理员健康接口的
 `database.pool.maxConnections` 返回当前生效值。
 
@@ -281,6 +281,9 @@ Lux 电影查询要求有效 Web session 或用户级客户端令牌：
 - `GET /api/v1/admin/jobs/{jobId}`：管理员读取单个扫描任务详情，包括状态、进度、游标和错误。
 - `GET /api/v1/admin/items/{itemId}/images`、`DELETE /api/v1/admin/items/{itemId}/images/{imageId}`：管理员查看图片索引并删除媒体根目录内的图片及索引；删除要求 CSRF，响应不暴露本地路径。
 - `DELETE /api/v1/admin/items/{itemId}`：管理员删除指定媒体源及其同名旁车文件；若媒体文件已被外部删除，仍会清理 Lux 中的媒体源记录，没有其他媒体源时同时标记逻辑条目移除。支持通过 `sourceId` 选择版本，要求 CSRF。
+- `POST /api/v1/admin/items/merge`：管理员把同一启用媒体库中 2–100 个同类型（`MOVIE` 或 `SERIES`）条目合并为一个多版本条目，发送 `{ "itemIds": ["..."], "primaryItemId": "..." }`，需要 CSRF。媒体文件不删除；媒体源、播放进度、收藏和已看状态并入主条目，剧集按季号和集号合并层级，主剧集缺少的季或集重新挂到主剧集；被合并的根条目从目录、首页和搜索隐藏，后续扫描仍归入主条目。合并写入可撤销的溯源记录；数量、重复 ID 或 ID 格式无效返回 400，跨库、类型不同或条目已被合并返回 409。
+- `GET /api/v1/admin/items/{itemId}/merges?offset=0&limit=50`：管理员读取该主条目的合并记录，返回 `records[]`，每项含 `id`、`mergedItemId`、`mergedItemTitle`、`itemType`、`origin`（`MANUAL` 或 `AUTO`）、`mergedAt`、`undoneAt` 和 `sourceCount`。只读接口，不返回路径或 URL；页大小服务端限制为 1–100，默认 50。
+- `POST /api/v1/admin/items/unmerge`：管理员拆分一次合并，发送 `{ "primaryItemId": "...", "mergedItemId": "..." }`，需要 CSRF。恢复被合并根条目、季/集层级、媒体源归属和默认源；被合并条目自身的用户状态原值不恢复，进度、已看和收藏保留在主条目，响应中 `userStateRestored` 为 `false`。ID 无效返回 400，没有活动合并记录或条目已不处于合并状态返回 409。
 - `GET /api/v1/auth/sessions`、`DELETE /api/v1/auth/sessions/{sessionId}`：当前用户查看并撤销其他 Web 会话；删除要求 CSRF，当前会话必须通过退出登录撤销。
 - `GET|HEAD /api/v1/items/{itemId}/images/{type}`、`/{type}/{index}`：读取本地 poster/fanart，支持 ETag 和 `If-None-Match`。可选 `w=360|720|1280` 请求按长边缩放的派生 JPEG 变体：仅当管理员全局 `variantCache.enabled` 开启时对所有用户生效，且只对 POSTER、THUMB、FANART 按需生成；未开启、宽度非法但开关关闭、尺寸本就更小、生成失败或缓存不可写时一律回退原图。变体成功响应为 `image/jpeg`、`ETag: "<content_tag>-w<width>"`、`Cache-Control: private, max-age=31536000, immutable`；原图响应保持 `private, max-age=3600`。主开关开启时非法 `w` 返回 `400 INVALID_REQUEST`；关闭时忽略 `w` 以兼容第三方客户端。Emby 兼容图片路由始终返回原图。缓存位置为 `/config/image-cache/v1/<SHA256(item_id)前两位>/<item_id>/<content_tag>-w<width>.jpg`，分片与 `metadata/library` 一致；同一条目的不同图片/原图版本用内容标签区分。启动时清理可识别的旧版扁平变体，之后按需重新生成。
 

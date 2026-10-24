@@ -247,6 +247,7 @@ async fn admin_can_page_search_and_preview_pending_candidates()
     })?;
     let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
@@ -407,7 +408,10 @@ async fn admin_can_read_and_edit_item_metadata_with_field_locks()
             .await?;
 
     let (base_url, server) = start_server(config, database, setup, None).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
 
@@ -496,7 +500,10 @@ async fn series_candidate_search_uses_tmdb_tv_endpoint_and_cleaned_year()
         ..TestScraperConfig::default()
     })?;
     let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
     let response = client
@@ -566,7 +573,10 @@ async fn season_and_episode_candidate_search_uses_parent_series_details()
         ..TestScraperConfig::default()
     })?;
     let (base_url, server) = start_server(config, database, setup, Some(tmdb)).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
 
@@ -643,7 +653,10 @@ async fn admin_can_start_a_scan_from_an_item_action() -> Result<(), Box<dyn std:
             .await?;
 
     let (base_url, server) = start_server(config, database, setup, None).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
     let response = client
@@ -705,7 +718,10 @@ async fn admin_can_edit_an_external_subtitle_stream() -> Result<(), Box<dyn std:
     .await?;
 
     let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
     let response = client
@@ -798,7 +814,10 @@ async fn admin_can_delete_a_media_source_and_matching_sidecars()
         .await?;
 
     let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -898,7 +917,10 @@ async fn admin_can_remove_a_missing_media_source_from_lux() -> Result<(), Box<dy
     tokio::fs::remove_file(&media).await?;
 
     let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
     let response = client
@@ -976,7 +998,10 @@ async fn admin_can_delete_a_series_and_all_episode_media() -> Result<(), Box<dyn
     assert_eq!(source_count, 2);
 
     let (base_url, server) = start_server(config, database.clone(), setup, None).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let admin_cookie = login(&client, &base_url, "admin", "correct password").await?;
     let csrf = cookie_from_request(&admin_cookie, "lux_csrf");
     let response = client

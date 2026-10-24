@@ -15,7 +15,7 @@ use tokio::{
     fs,
     io::AsyncReadExt,
     process::{Child, Command},
-    sync::{Mutex, OwnedSemaphorePermit, Semaphore},
+    sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
     time::sleep,
 };
 
@@ -26,12 +26,23 @@ const MAX_HARDWARE_SESSIONS: usize = 2;
 const MAX_SOFTWARE_SESSIONS: usize = 1;
 const MAX_SESSION_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MIN_FREE_BYTES: u64 = 512 * 1024 * 1024;
+/// Default cap for all Web HLS session directories together.
+///
+/// Four sessions of the per-session ceiling fit inside it, so the disk cannot be filled by
+/// playback even when every transcode slot is busy. Override with `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES`.
+const DEFAULT_MAX_GLOBAL_SESSION_BYTES: u64 = 8 * 1024 * 1024 * 1024;
 const MANIFEST_WAIT_ATTEMPTS: usize = 50;
 const HLS_ASSET_WAIT_ATTEMPTS: usize = 600;
 const HLS_SEGMENT_DURATION_TICKS: i64 = 4 * 10_000_000;
 const HLS_SEGMENT_RESTART_GAP: i64 = 6;
+/// Upper bound for the per-session segment-to-generation map.
+const HLS_MAX_TRACKED_SEGMENTS: usize = 4_096;
 const MAX_EMBY_VOD_SEGMENTS: i64 = 1_000_000;
-const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_millis(250);
+const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
+/// Upper bound for inspecting the process table while reclaiming orphans at startup.
+const ORPHAN_PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
+/// Session identifiers become directory names, so they stay within one predictable segment.
+const MAX_SESSION_ID_BYTES: usize = 128;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsSegmentContainer {
@@ -150,6 +161,15 @@ struct HlsProcessSpecification {
     segment_container: HlsSegmentContainer,
 }
 
+/// Remembers which generation served a segment without letting the map grow without bound.
+fn remember_segment_generation(state: &mut HlsProcessState, segment: i64, generation: u64) {
+    if state.emby_segment_generations.len() >= HLS_MAX_TRACKED_SEGMENTS {
+        // The map only avoids needless restarts; dropping it costs at most one extra restart.
+        state.emby_segment_generations.clear();
+    }
+    state.emby_segment_generations.insert(segment, generation);
+}
+
 struct HlsProcessState {
     child: Option<Child>,
     generation: u64,
@@ -197,13 +217,14 @@ impl SessionQuotaCache {
 #[derive(Clone)]
 pub(crate) struct HlsManager {
     base_directory: PathBuf,
-    processes: Arc<Mutex<HashMap<String, Arc<HlsProcess>>>>,
+    processes: Arc<RwLock<HashMap<String, Arc<HlsProcess>>>>,
     remux_slots: Arc<Semaphore>,
     hardware_slots: Arc<Semaphore>,
     software_slots: Arc<Semaphore>,
     hardware_encoder: Option<String>,
     ffmpeg_executable: String,
     min_free_bytes: u64,
+    max_global_session_bytes: u64,
 }
 
 impl HlsManager {
@@ -220,6 +241,12 @@ impl HlsManager {
         Self::new_with_limits(config_dir, ffmpeg_executable, 0)
     }
 
+    #[cfg(test)]
+    fn with_global_session_budget(mut self, bytes: u64) -> Self {
+        self.max_global_session_bytes = bytes;
+        self
+    }
+
     fn new_with_limits(
         config_dir: PathBuf,
         ffmpeg_executable: String,
@@ -230,13 +257,15 @@ impl HlsManager {
             .filter(|value| is_allowed_hardware_encoder(value));
         Self {
             base_directory: config_dir.join("web-playback"),
-            processes: Arc::new(Mutex::new(HashMap::new())),
+            processes: Arc::new(RwLock::new(HashMap::new())),
             remux_slots: Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)),
             hardware_slots: Arc::new(Semaphore::new(MAX_HARDWARE_SESSIONS)),
             software_slots: Arc::new(Semaphore::new(MAX_SOFTWARE_SESSIONS)),
             hardware_encoder,
             ffmpeg_executable,
             min_free_bytes,
+            max_global_session_bytes: global_session_budget_from_env()
+                .unwrap_or(DEFAULT_MAX_GLOBAL_SESSION_BYTES),
         }
     }
 
@@ -338,10 +367,18 @@ impl HlsManager {
         fs::create_dir_all(&self.base_directory)
             .await
             .map_err(HlsError::Io)?;
-        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes) {
+        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes).await {
             return Err(HlsError::Limit);
         }
-        let directory = self.base_directory.join(session_id);
+        if !self.session_bytes_within_global_budget().await? {
+            tracing::warn!(
+                budget_bytes = self.max_global_session_bytes,
+                session_id = %session_id,
+                "refusing to start Web HLS: the global disk budget is exhausted"
+            );
+            return Err(HlsError::Limit);
+        }
+        let directory = self.validated_session_directory(session_id)?;
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
         let segment_start_number = hls_start_number(start_time_ticks);
         let generation = 0;
@@ -389,7 +426,7 @@ impl HlsManager {
         });
         let previous = self
             .processes
-            .lock()
+            .write()
             .await
             .insert(session_id.to_owned(), process);
         if let Some(previous) = previous {
@@ -480,7 +517,7 @@ impl HlsManager {
     ) -> Result<(), HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -528,7 +565,7 @@ impl HlsManager {
     pub(crate) async fn wait_for_manifest(&self, session_id: &str) -> Result<PathBuf, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -569,7 +606,7 @@ impl HlsManager {
     ) -> Result<PathBuf, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -593,7 +630,7 @@ impl HlsManager {
         let segment_number = asset_segment_number(asset)?;
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -647,7 +684,7 @@ impl HlsManager {
             }
             let current_process = self
                 .processes
-                .lock()
+                .read()
                 .await
                 .get(session_id)
                 .cloned()
@@ -704,7 +741,7 @@ impl HlsManager {
         let _restart = process.restart.lock().await;
         let is_current_process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .is_some_and(|current| Arc::ptr_eq(current, process));
@@ -770,9 +807,7 @@ impl HlsManager {
         {
             if process.specification.emby_vod {
                 let generation = state.generation;
-                state
-                    .emby_segment_generations
-                    .insert(requested_segment, generation);
+                remember_segment_generation(&mut state, requested_segment, generation);
             }
             return Ok(SegmentSchedule {
                 generation: state.generation,
@@ -793,9 +828,7 @@ impl HlsManager {
         let Some(restart_reason) = restart_reason else {
             if process.specification.emby_vod {
                 let generation = state.generation;
-                state
-                    .emby_segment_generations
-                    .insert(requested_segment, generation);
+                remember_segment_generation(&mut state, requested_segment, generation);
             }
             return Ok(SegmentSchedule {
                 generation: state.generation,
@@ -873,7 +906,7 @@ impl HlsManager {
     }
 
     async fn check_restart_resources(&self, process: &HlsProcess) -> Result<(), HlsError> {
-        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes) {
+        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes).await {
             return Err(HlsError::Limit);
         }
         let total_bytes = session_directory_bytes(&process.directory).await?;
@@ -889,7 +922,7 @@ impl HlsManager {
     pub(crate) async fn vod_manifest(&self, session_id: &str) -> Result<Option<String>, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -906,7 +939,7 @@ impl HlsManager {
     pub(crate) async fn session_directory(&self, session_id: &str) -> Result<PathBuf, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -917,7 +950,7 @@ impl HlsManager {
     pub(crate) async fn has_started(&self, session_id: &str) -> Result<bool, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -932,7 +965,7 @@ impl HlsManager {
     ) -> Result<HlsSegmentContainer, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -943,7 +976,7 @@ impl HlsManager {
     pub(crate) async fn within_quota(&self, session_id: &str) -> Result<bool, HlsError> {
         let process = self
             .processes
-            .lock()
+            .read()
             .await
             .get(session_id)
             .cloned()
@@ -965,20 +998,34 @@ impl HlsManager {
         Ok(total <= MAX_SESSION_BYTES)
     }
 
+    /// Resolves the per-session directory without ever escaping the HLS root.
+    ///
+    /// Session identifiers arrive from HTTP paths and Emby playback callbacks, so they are
+    /// validated before they are joined into a path that later gets recursively deleted.
+    fn validated_session_directory(&self, session_id: &str) -> Result<PathBuf, HlsError> {
+        if !is_safe_session_id(session_id) {
+            return Err(HlsError::NotFound);
+        }
+        let directory = self.base_directory.join(session_id);
+        if directory.parent() != Some(self.base_directory.as_path()) {
+            return Err(HlsError::NotFound);
+        }
+        Ok(directory)
+    }
+
     pub(crate) async fn stop(&self, session_id: &str) -> Result<(), HlsError> {
-        let process = self.processes.lock().await.remove(session_id);
+        let directory = self.validated_session_directory(session_id)?;
+        let process = self.processes.write().await.remove(session_id);
         if let Some(process) = process {
             stop_process(process).await;
-        } else {
-            let directory = self.base_directory.join(session_id);
-            if fs::metadata(&directory).await.is_ok() {
-                fs::remove_dir_all(directory).await.map_err(HlsError::Io)?;
-            }
+        } else if fs::metadata(&directory).await.is_ok() {
+            fs::remove_dir_all(directory).await.map_err(HlsError::Io)?;
         }
         Ok(())
     }
 
     pub(crate) async fn cleanup_orphans(&self) -> Result<(), HlsError> {
+        self.terminate_orphan_processes().await;
         fs::create_dir_all(&self.base_directory)
             .await
             .map_err(HlsError::Io)?;
@@ -993,6 +1040,92 @@ impl HlsManager {
             }
         }
         Ok(())
+    }
+
+    /// Kills the ffmpeg children a crashed process left behind.
+    ///
+    /// Startup drops every session directory, but an ffmpeg process started by a previous
+    /// incarnation keeps encoding into its deleted output paths, burning CPU until the host is
+    /// rebooted. Session ids are regenerated per process, so any process whose command line
+    /// mentions both our ffmpeg executable and the session directory base at startup is stale.
+    async fn terminate_orphan_processes(&self) {
+        let executable = escape_pgrep_pattern(&self.ffmpeg_executable);
+        let base_directory = escape_pgrep_pattern(&self.base_directory.to_string_lossy().as_ref());
+        let (Some(by_executable), Some(by_directory)) = (
+            process_ids_matching(&executable).await,
+            process_ids_matching(&base_directory).await,
+        ) else {
+            tracing::warn!(
+                "could not inspect the process table for orphaned Web HLS ffmpeg processes"
+            );
+            return;
+        };
+        let own_pid = std::process::id();
+        let orphans = by_executable
+            .intersection(&by_directory)
+            .copied()
+            .filter(|pid| *pid != own_pid)
+            .collect::<Vec<_>>();
+        for pid in &orphans {
+            #[cfg(unix)]
+            if let Ok(pid) = libc::pid_t::try_from(*pid) {
+                // The process is unrelated to this incarnation, so it cannot be reaped normally.
+                let _ = unsafe { libc::kill(pid, libc::SIGKILL) };
+            }
+        }
+        if !orphans.is_empty() {
+            tracing::warn!(
+                processes = orphans.len(),
+                "terminated orphaned Web HLS ffmpeg processes"
+            );
+        }
+    }
+
+    /// Checks that the existing session directories still fit the global disk budget.
+    ///
+    /// Uses the cached per-session quota totals when they are fresh and walks the session
+    /// directory otherwise, so admitting a playback start never walks every segment on the hot
+    /// path. Existing sessions are never evicted: a new start is refused instead.
+    async fn session_bytes_within_global_budget(&self) -> Result<bool, HlsError> {
+        let processes = self
+            .processes
+            .read()
+            .await
+            .values()
+            .cloned()
+            .collect::<Vec<_>>();
+        let now = Instant::now();
+        let mut total_bytes = 0_u64;
+        for process in processes {
+            let cached = {
+                let quota = process.quota.lock().await;
+                quota.is_fresh(now).then_some(quota.total_bytes)
+            };
+            let bytes = match cached {
+                Some(bytes) => bytes,
+                None => {
+                    let bytes = match session_directory_bytes(&process.directory).await {
+                        Ok(bytes) => bytes,
+                        // A registered process whose directory is already gone holds no space.
+                        Err(HlsError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            0
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    let mut quota = process.quota.lock().await;
+                    quota.total_bytes = bytes;
+                    quota.checked_at = Some(Instant::now());
+                    bytes
+                }
+            };
+            total_bytes = total_bytes.saturating_add(bytes);
+            if total_bytes >= self.max_global_session_bytes {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     fn acquire_permit(&self, tier: ServerTier) -> Result<OwnedSemaphorePermit, HlsError> {
@@ -1015,17 +1148,25 @@ impl HlsManager {
 }
 
 async fn session_directory_bytes(directory: &Path) -> Result<u64, HlsError> {
-    let mut entries = fs::read_dir(directory).await.map_err(HlsError::Io)?;
-    let mut total = 0_u64;
-    while let Some(entry) = entries.next_entry().await.map_err(HlsError::Io)? {
-        let metadata = entry.metadata().await.map_err(HlsError::Io)?;
-        if metadata.is_file() {
-            total = total.saturating_add(metadata.len());
-            if total > MAX_SESSION_BYTES {
-                return Ok(total);
+    let directory = directory.to_owned();
+    // One blocking hop for the whole walk: per-entry `tokio::fs` calls would schedule a
+    // separate blocking task for every segment file on every quota check.
+    let total = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        let mut total = 0_u64;
+        for entry in std::fs::read_dir(&directory)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                total = total.saturating_add(entry.metadata()?.len());
+                if total > MAX_SESSION_BYTES {
+                    break;
+                }
             }
         }
-    }
+        Ok(total)
+    })
+    .await
+    .map_err(|error| HlsError::Io(std::io::Error::other(error)))?
+    .map_err(HlsError::Io)?;
     Ok(total)
 }
 
@@ -1212,6 +1353,49 @@ fn kill_process_group(pid: u32) {
 
 fn ffmpeg_executable() -> String {
     std::env::var("LUX_FFMPEG_PATH").unwrap_or_else(|_| "ffmpeg".to_owned())
+}
+
+fn global_session_budget_from_env() -> Option<u64> {
+    std::env::var("LUX_HLS_GLOBAL_DISK_BUDGET_BYTES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|bytes| *bytes > 0)
+}
+
+/// Returns the pids whose command line matches `pattern`, or `None` when the process table cannot
+/// be inspected at all.
+async fn process_ids_matching(pattern: &str) -> Option<std::collections::HashSet<u32>> {
+    let output = tokio::time::timeout(
+        ORPHAN_PROCESS_SCAN_TIMEOUT,
+        Command::new("pgrep").arg("-f").arg(pattern).output(),
+    )
+    .await
+    .ok()?
+    .ok()?;
+    // `pgrep` exits with 1 when nothing matches, which is not an inspection failure.
+    if !output.status.success() && output.status.code() != Some(1) {
+        return None;
+    }
+    Some(
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .filter_map(|line| line.trim().parse::<u32>().ok())
+            .collect(),
+    )
+}
+
+fn escape_pgrep_pattern(value: &str) -> String {
+    let mut escaped = String::with_capacity(value.len());
+    for character in value.chars() {
+        if matches!(
+            character,
+            '.' | '\\' | '+' | '*' | '?' | '(' | ')' | '[' | ']' | '{' | '}' | '^' | '$' | '|'
+        ) {
+            escaped.push('\\');
+        }
+        escaped.push(character);
+    }
+    escaped
 }
 
 #[cfg(test)]
@@ -1411,7 +1595,9 @@ fn ffmpeg_args_for_output_with_audio(
                 "192k".to_owned(),
             ]);
         }
-        ServerTier::Direct => unreachable!(),
+        // Direct play never transcodes; the caller only builds these arguments for transcode
+        // tiers, so emitting no codec arguments is the safe fallback.
+        ServerTier::Direct => {}
     }
     if matches!(
         tier,
@@ -1586,16 +1772,27 @@ fn hls_duration_seconds(ticks: i64) -> String {
     format!("{seconds}.{micros:06}")
 }
 
+/// Session identifiers must stay a single portable path segment: they are joined into the HLS
+/// root and the resulting directory is later removed recursively.
+fn is_safe_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_SESSION_ID_BYTES
+        && value != "."
+        && value != ".."
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+}
+
 fn is_valid_asset(asset: &str, segment_container: HlsSegmentContainer) -> bool {
     if asset.is_empty() || asset.len() > 128 {
         return false;
     }
+    // Every artifact ffmpeg writes for a session sits directly in the session directory, so a
+    // single normal component is the whole contract (this also rejects `.`/`..` and any `/`).
     let path = Path::new(asset);
-    if path.is_absolute()
-        || path
-            .components()
-            .any(|component| !matches!(component, Component::Normal(_)))
-    {
+    let mut components = path.components();
+    if !matches!(components.next(), Some(Component::Normal(_))) || components.next().is_some() {
         return false;
     }
     if asset == "index.m3u8" {
@@ -1636,8 +1833,14 @@ fn is_allowed_hardware_encoder(value: &str) -> bool {
     )
 }
 
-fn has_sufficient_free_space(path: &Path, minimum: u64) -> bool {
-    available_free_bytes(path).is_ok_and(|available| available >= minimum)
+async fn has_sufficient_free_space(path: &Path, minimum: u64) -> bool {
+    let path = path.to_owned();
+    // statvfs is a synchronous syscall that can block on a slow NAS mount.
+    tokio::task::spawn_blocking(move || {
+        available_free_bytes(&path).is_ok_and(|available| available >= minimum)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 #[cfg(unix)]
@@ -1666,16 +1869,260 @@ fn available_free_bytes(_path: &Path) -> Result<u64, std::io::Error> {
 #[cfg(test)]
 mod tests {
     use std::{
-        path::Path,
+        path::{Path, PathBuf},
+        sync::Arc,
         time::{Duration, Instant},
     };
 
+    use tokio::sync::Mutex;
+
     use super::{
-        HLS_SEGMENT_DURATION_TICKS, HlsSegmentContainer, HlsStartOptions, SESSION_QUOTA_CACHE_TTL,
-        ServerTier, SessionQuotaCache, asset_segment_number, emby_init_segment_number, ffmpeg_args,
-        ffmpeg_args_for_output, ffmpeg_args_with_audio, ffmpeg_args_with_timeline,
-        hls_segment_path, hls_start_number, is_valid_asset, vod_manifest,
+        HLS_SEGMENT_DURATION_TICKS, HlsError, HlsSegmentContainer, HlsStartOptions,
+        SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, asset_segment_number,
+        emby_init_segment_number, ffmpeg_args, ffmpeg_args_for_output, ffmpeg_args_with_audio,
+        ffmpeg_args_with_timeline, hls_segment_path, hls_start_number, is_valid_asset,
+        vod_manifest,
     };
+
+    fn fake_process(directory: PathBuf, total_bytes: Option<u64>) -> super::HlsProcess {
+        super::HlsProcess {
+            directory: directory.clone(),
+            initial_manifest: directory.join("index.m3u8"),
+            runtime_ticks: None,
+            specification: super::HlsProcessSpecification {
+                input: PathBuf::from("/media/movie.mkv"),
+                tier: ServerTier::Remux,
+                video_bitrate: None,
+                audio_stream_index: None,
+                emby_vod: false,
+                segment_container: HlsSegmentContainer::MpegTs,
+            },
+            state: Mutex::new(super::HlsProcessState {
+                child: None,
+                generation: 0,
+                emby_segment_generations: std::collections::HashMap::new(),
+                init: directory.join("init.mp4"),
+                manifest: directory.join("index.m3u8"),
+                permit: None,
+                segment_start_number: 0,
+            }),
+            restart: Mutex::new(()),
+            quota: Mutex::new(super::SessionQuotaCache {
+                checked_at: total_bytes.map(|_| Instant::now()),
+                total_bytes: total_bytes.unwrap_or_default(),
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn global_session_budget_accounts_for_every_session_directory() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config_dir = temp_dir.path().join("config");
+        let manager =
+            super::HlsManager::new_for_tests(config_dir.clone(), "/usr/bin/false".to_owned())
+                .with_global_session_budget(1_000);
+        assert!(
+            manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("empty budget check"),
+            "no session directory means no usage"
+        );
+
+        let session_directory = config_dir.join("web-playback/session-a");
+        std::fs::create_dir_all(&session_directory).expect("session directory");
+        std::fs::write(session_directory.join("segment_000000.ts"), vec![0_u8; 600])
+            .expect("segment");
+        manager.processes.write().await.insert(
+            "session-a".to_owned(),
+            Arc::new(fake_process(session_directory.clone(), None)),
+        );
+        assert!(
+            manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("stale budget check"),
+            "the stale cache must fall back to measuring the directory"
+        );
+        let measured = {
+            let processes = manager.processes.read().await;
+            let process = processes.get("session-a").expect("process").clone();
+            drop(processes);
+            let quota = process.quota.lock().await;
+            assert!(quota.is_fresh(Instant::now()));
+            quota.total_bytes
+        };
+        assert_eq!(measured, 600);
+
+        let second_directory = config_dir.join("web-playback/session-b");
+        std::fs::create_dir_all(&second_directory).expect("session directory");
+        std::fs::write(second_directory.join("segment_000000.ts"), vec![0_u8; 600])
+            .expect("segment");
+        manager.processes.write().await.insert(
+            "session-b".to_owned(),
+            Arc::new(fake_process(second_directory, Some(600))),
+        );
+        assert!(
+            !manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("over-budget check"),
+            "two sessions above the shared budget must refuse another start"
+        );
+
+        manager.processes.write().await.clear();
+        manager.processes.write().await.insert(
+            "gone".to_owned(),
+            Arc::new(fake_process(config_dir.join("web-playback/gone"), None)),
+        );
+        assert!(
+            manager
+                .session_bytes_within_global_budget()
+                .await
+                .expect("missing directory check"),
+            "a registered session whose directory vanished must not block new starts"
+        );
+    }
+
+    #[tokio::test]
+    async fn exhausted_global_budget_refuses_to_start_a_session() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config_dir = temp_dir.path().join("config");
+        let manager =
+            super::HlsManager::new_for_tests(config_dir.clone(), "/usr/bin/false".to_owned())
+                .with_global_session_budget(100);
+        let session_directory = config_dir.join("web-playback/existing");
+        std::fs::create_dir_all(&session_directory).expect("session directory");
+        std::fs::write(session_directory.join("segment_000000.ts"), vec![0_u8; 200])
+            .expect("segment");
+        manager.processes.write().await.insert(
+            "existing".to_owned(),
+            Arc::new(fake_process(session_directory, Some(200))),
+        );
+
+        let error = manager
+            .start_emby_vod(
+                "new-session",
+                ServerTier::Remux,
+                Path::new("/media/movie.mkv"),
+                None,
+                super::HlsStartOptions {
+                    segment_container: HlsSegmentContainer::MpegTs,
+                    start_time_ticks: None,
+                    runtime_ticks: None,
+                },
+            )
+            .await
+            .expect_err("the global budget must refuse a new session");
+        assert!(matches!(error, HlsError::Limit));
+        assert!(
+            !manager.processes.read().await.contains_key("new-session"),
+            "a refused session must not be registered"
+        );
+    }
+
+    #[test]
+    fn pgrep_patterns_escape_regex_metacharacters() {
+        assert_eq!(
+            super::escape_pgrep_pattern("/tmp/lux+config/ffmpeg.bin"),
+            "/tmp/lux\\+config/ffmpeg\\.bin"
+        );
+        assert_eq!(super::escape_pgrep_pattern("ffmpeg"), "ffmpeg");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cleanup_orphans_terminates_stale_ffmpeg_processes() {
+        use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
+
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config_dir = temp_dir.path().join("config");
+        let base_directory = config_dir.join("web-playback");
+        let stale_session = base_directory.join("stale-session");
+        std::fs::create_dir_all(&stale_session).expect("stale session directory");
+        let script = base_directory.join("ffmpeg");
+        std::fs::write(&script, "#!/bin/sh\nsleep 60\n").expect("write fake ffmpeg");
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700))
+            .expect("make fake ffmpeg executable");
+        let manager = super::HlsManager::new_for_tests(
+            config_dir.clone(),
+            script.to_string_lossy().into_owned(),
+        );
+        let mut child = super::Command::new(&script)
+            .spawn()
+            .expect("spawn stale fake ffmpeg");
+        let child_pid = child.id().expect("child pid");
+        let pattern = super::escape_pgrep_pattern(&script.to_string_lossy());
+        let mut visible = false;
+        for _ in 0..100 {
+            if super::process_ids_matching(&pattern)
+                .await
+                .is_some_and(|pids| pids.contains(&child_pid))
+            {
+                visible = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(visible, "the stale process must be visible to pgrep");
+
+        manager.cleanup_orphans().await.expect("cleanup orphans");
+
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .expect("the orphaned ffmpeg process must be terminated")
+            .expect("wait for the orphaned process");
+        assert_eq!(status.signal(), Some(libc::SIGKILL));
+        assert!(
+            !stale_session.exists(),
+            "stale session directories are removed"
+        );
+    }
+
+    #[test]
+    fn tracked_segment_generations_stay_within_their_budget() {
+        let mut state = super::HlsProcessState {
+            child: None,
+            generation: 3,
+            emby_segment_generations: std::collections::HashMap::new(),
+            init: std::path::PathBuf::new(),
+            manifest: std::path::PathBuf::new(),
+            permit: None,
+            segment_start_number: 0,
+        };
+        for segment in 0..super::HLS_MAX_TRACKED_SEGMENTS as i64 {
+            super::remember_segment_generation(&mut state, segment, 1);
+        }
+        assert_eq!(
+            state.emby_segment_generations.len(),
+            super::HLS_MAX_TRACKED_SEGMENTS
+        );
+        // One more entry resets the map instead of growing past the bound.
+        super::remember_segment_generation(&mut state, 9_999, 2);
+        assert_eq!(state.emby_segment_generations.len(), 1);
+        assert_eq!(state.emby_segment_generations.get(&9_999), Some(&2));
+    }
+
+    #[test]
+    fn hls_assets_are_single_file_names() {
+        let container = HlsSegmentContainer::FragmentedMp4;
+        assert!(is_valid_asset("index.m3u8", container));
+        assert!(is_valid_asset("init_000001.mp4", container));
+        assert!(is_valid_asset("segment_000001.m4s", container));
+        for rejected in [
+            "nested/segment_000001.m4s",
+            "../segment_000001.m4s",
+            "./segment_000001.m4s",
+            "/tmp/segment_000001.m4s",
+            "..",
+            "",
+        ] {
+            assert!(
+                !is_valid_asset(rejected, container),
+                "{rejected} must be rejected"
+            );
+        }
+    }
 
     #[test]
     fn vod_manifest_declares_the_complete_runtime() {
@@ -2039,6 +2486,30 @@ mod tests {
 
         assert!(cache.is_fresh(checked_at + Duration::from_millis(100)));
         assert!(!cache.is_fresh(checked_at + SESSION_QUOTA_CACHE_TTL));
+    }
+
+    #[tokio::test]
+    async fn manager_refuses_session_ids_that_escape_the_session_root() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let config_dir = temp_dir.path().join("config");
+        let base_directory = config_dir.join("web-playback");
+        tokio::fs::create_dir_all(&base_directory).await.unwrap();
+        let sentinel = config_dir.join("lux.db");
+        tokio::fs::write(&sentinel, b"database").await.unwrap();
+        let manager = super::HlsManager::new_for_tests(config_dir.clone(), "ffmpeg".to_owned());
+
+        for session_id in ["", ".", "..", "../..", "a/b", "a\\b", "../outside"] {
+            let result = manager.stop(session_id).await;
+            assert!(
+                matches!(result, Err(super::HlsError::NotFound)),
+                "session id {session_id:?} must be rejected"
+            );
+            assert!(
+                sentinel.exists(),
+                "session id {session_id:?} must not delete files outside the session root"
+            );
+        }
+        assert!(base_directory.exists());
     }
 
     #[cfg(unix)]

@@ -406,6 +406,13 @@ impl PeopleService {
                 "actor profile URL must be a valid HTTPS scraper image URL".to_owned(),
             ));
         }
+        crate::application::images::ensure_public_image_host(&url, false)
+            .await
+            .map_err(|_| {
+                PeopleError::InvalidUrl(
+                    "actor profile URL must not resolve to a private address".to_owned(),
+                )
+            })?;
         let response = self
             .client
             .get(url)

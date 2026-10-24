@@ -95,7 +95,9 @@ import type {
   AdminUserListResponse,
   AdminMetadataCandidate,
   AdminMetadataBatchConfirmation,
+  AdminItemMergeRecord,
   AdminItemMergeResult,
+  AdminItemUnmergeResult,
   AdminMetadataReidentifyStart,
   AdminPlugin,
   AdminPluginConfigImageUpload,
@@ -2064,6 +2066,19 @@ export class LuxApiClient {
 
   mergeAdminItems(input: { itemIds: string[]; primaryItemId: string }) {
     return this.request<AdminItemMergeResult>("/api/v1/admin/items/merge", {
+      method: "POST",
+      body: JSON.stringify(input),
+    });
+  }
+
+  adminItemMerges(itemId: string) {
+    return this.request<{ records?: AdminItemMergeRecord[] }>(
+      `/api/v1/admin/items/${encodeURIComponent(itemId)}/merges?offset=0&limit=50`,
+    );
+  }
+
+  unmergeAdminItems(input: { primaryItemId: string; mergedItemId: string }) {
+    return this.request<AdminItemUnmergeResult>("/api/v1/admin/items/unmerge", {
       method: "POST",
       body: JSON.stringify(input),
     });

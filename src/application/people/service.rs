@@ -707,7 +707,12 @@ impl PeopleService {
 
     fn with_proxy(config_dir: PathBuf, proxy_url: Option<String>) -> Self {
         let client = match crate::network::client_builder_from_env_or(proxy_url.as_deref()) {
-            Ok(builder) => match builder.build() {
+            Ok(builder) => match builder
+                .timeout(std::time::Duration::from_secs(10))
+                // A redirect would bypass the HTTPS/private-host checks done by the caller.
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+            {
                 Ok(client) => client,
                 Err(_) => Client::new(),
             },

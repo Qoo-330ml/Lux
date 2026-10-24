@@ -111,7 +111,8 @@ Lux 的核心价值不是功能数量，而是：
 - 剧集库和混合库可各自选择一个已安装、已启用且可用的片头片尾数据源；未选择表示不为该库生成或输出片头片尾标记。
   片头片尾数据源必须声明 chapters.detect 或 chapters.lookup；电影库不能选择该来源。混合库只对其中的剧集/分集参与检测。
 - 管理员可在“全局策略”中设置媒体库的默认元数据、图像和字幕策略；媒体库可以继承全局默认值，也可以单独覆盖。
-- 全局图像策略包括海报、艺术图、横幅图、徽标、缩略图、光盘封面、壁纸开关、每项最大背景图数量和最小下载宽度；媒体库可覆盖这些开关。
+- 全局图像策略包括海报、背景图（FANART/backdrop）、艺术图（Emby `Art`）、横幅图、徽标、缩略图、光盘封面、壁纸开关、每项最大背景图数量和最小下载宽度；媒体库可覆盖这些开关。
+- 图像策略支持“层级 × 类型”覆盖：电影、剧集、季度、单集四个层级都可以为每种图片类型单独设置是否抓取、允许来源（在线刮削 / 本地截图）、允许的刮削器角色（主 / 备用 / 补充）、覆盖策略（继承 / 保留 / 仅补缺 / 覆盖）、张数上限和最小宽度；单集另有“在线剧照 / 本地截图 / 都不要”三选一。未设置的字段逐级继承上层默认值。本地已有图片始终优先，任何配置都不能让“仅补全”覆盖本地图片。
 - 全局策略支持保守的存储预估，并明确应用范围：仅新内容、刷新选中内容或后台刷新全部内容；全局刮削可选择仅补全或完整刮削，批量刷新必须进入任务队列。
 - 不在用户请求路径中扫描目录、读取 NFO、调用 ffprobe 或访问 TMDb。
 
@@ -236,6 +237,23 @@ Lux 的核心价值不是功能数量，而是：
 - 季条目没有自己的海报时，Lux Web 可以临时展示父剧集海报作为视觉回退；该回退不创建季的
   `item_images` 记录、不写回季目录，也不改变季自身图片的来源。季自身海报后来补全后，必须优先
   展示真实季海报。
+
+分层图片策略的具体规则：
+
+- 层级覆盖只影响解析结果，不新增数据库迁移：配置保存在现有 `media_strategy` JSON 与
+  `libraries.media_strategy_json` 的 `images.levels` 中，旧配置（无 `levels`）解析结果与升级前一致。
+- `backdrop` 开关负责 FANART/backdrop。旧配置缺少该字段时按开启处理，因此升级不改变既有产出；
+  `artwork` 只负责 Emby `Art` 类型，Web 详情页不展示该类型。
+- 覆盖策略与任务模式取更保守的一方：`KEEP` 永不改动已有图片；`FILL` 只补缺失；`OVERWRITE`
+  仅在“完整刮削”任务中生效，“仅补全”时自动降级。默认 `INHERIT` 保持原有语义（仅补全不覆盖、
+  完整刮削替换）。
+- 张数上限只作用于背景图、艺术图和壁纸；上限为 4 张，0 表示该类型不下载。补充来源追加时按
+  剩余名额截断。
+- 最小宽度在候选入库前按层级/类型过滤；上游未提供宽度时保留该候选，避免误删。
+- 刮削器角色过滤只在配置了具体角色时查询一次条目所属媒体库的角色；来源角色未知时保持原有放行
+  行为。本地图始终优先，因此不提供“不使用本地图”的开关。
+- 单集图片三选一：`SCRAPER_STILL` 使用在线剧照（写入 FANART），`LOCAL_SCREENSHOT` 使用 ffmpeg
+  截图并跳过在线剧照，`NONE` 两者都不要。
 
 首版不阻塞但数据模型需预留：
 
@@ -530,7 +548,7 @@ Lux 的核心价值不是功能数量，而是：
 - PostgreSQL 地址、用户名和密码属于敏感配置，不得进入日志、普通 API 响应或错误详情。
 - PostgreSQL 连接失败时不得自动回退到 SQLite，避免形成两套数据。
 - SQLite 和 PostgreSQL 必须各自从空数据库运行完整 migration；搜索实现可以使用后端专用索引，但不得改变 Lux API 语义。
-- 数据库连接池默认上限为 SQLite 8、PostgreSQL 20；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
+- 数据库连接池默认上限为 SQLite 8、PostgreSQL 8；`LUX_DB_MAX_CONNECTIONS` 可在 1-100 范围内覆盖当前进程的后端连接池上限，未设置或为空时使用默认值，其他非法值必须在启动时报告配置错误。SQLite 增加连接不会改变单写者约束，PostgreSQL 部署还必须确保数据库实例和账号的连接配额足够。
 - 本地文件索引并发默认 4 路；Docker 镜像和 Compose 默认注入 `LUX_SCAN_CONCURRENCY=4`、`LUX_FFMPEG_CONCURRENCY=2`。ffprobe 默认按有效 CPU 容量自动设置进程预算为 `ceil(CPU 核数 × 4)`，上限 512；Compose 未设置 `LUX_PROBE_CONCURRENCY` 时传空值启用自动预算。活动并发从约 CPU 核数起步，再按本地 ffprobe 成功完成速率自适应调整；首页延迟或 cgroup 内存压力升高时保护性降档，不依赖 CPU 使用率。管理员可通过 `LUX_PROBE_CONCURRENCY` 显式覆盖预算。`LUX_SCAN_CONCURRENCY` 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；`LUX_PROBE_CONCURRENCY` 和 `LUX_FFMPEG_CONCURRENCY` 独立控制 ffprobe 和 ffmpeg 子进程。`LUX_SCAN_CONCURRENCY` 的范围为 1-1024，`LUX_PROBE_CONCURRENCY` 为 1-512，`LUX_FFMPEG_CONCURRENCY` 为 1-4；设置扫描环境变量后优先于媒体库保存的 `scanConcurrency`。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路，SQLite 入库继续遵循单写者约束。
 
 ### 6.4 Docker
@@ -2971,6 +2989,74 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 验证：电影/剧集合并 API 集成测试、扫描重扫回归测试、Web 多选流程测试。
 
 依赖：LUX-083、LUX-106。
+
+#### LUX-841：媒体库按身份自动合并与撤销
+
+描述：同一启用媒体库内的电影或剧集根条目，在已确认 provider ID 完全一致时自动合并为一个逻辑条目；两边都没有 provider ID 时，只有规范化标题和年份完全一致才合并。扫描完成、在线识别完成后由后台 worker 自动收敛，升级后对已入库数据做一次性回填。合并关系保存可撤销的溯源记录，管理员可拆分恢复。
+
+验收：
+
+- 自动合并只处理同一启用媒体库、同一 `MOVIE`/`SERIES` 根类型、未移除且未合并的条目，沿用既有合并约束。
+- provider ID 完全一致优先；任一条目存在非空 `edition_name` 媒体源时跳过自动合并，导演剪辑版等仍可作为独立条目。
+- 后台 worker 按游标分页有界执行，不在请求路径扫描全库；回填以 `lux_meta` 标记只跑一次，重复执行幂等。
+- 合并写入 `media_merge_records`、条目状态和媒体源状态；撤销恢复条目层级、媒体源归属和默认源，不恢复被合并条目的用户状态原值。
+- `GET /api/v1/admin/items/{itemId}/merges` 与 `POST /api/v1/admin/items/unmerge` 需要管理员会话和 CSRF，成功使目录/首页缓存失效并写不含路径和 URL 的审计事件。
+- Web 详情页为管理员显示合并来源与撤销入口，具备加载、成功、失败和键盘语义。
+
+验证：storage 合并/撤销/候选查询回归，`tests/item_merge.rs`、`tests/item_unmerge.rs`，Web 组件测试。
+
+依赖：LUX-083、LUX-251。
+
+结果（2026-10-23）：SQLite 0223 / PostgreSQL 0225 增加 `media_merge_records`、`media_merge_item_states`
+和 `media_merge_source_states`；`merge_media_items` 在同一事务内写入溯源，`unmerge_media_items` 恢复
+条目层级、媒体源归属和默认源。自动合并按 provider ID 分组优先、无 provider ID 时回退规范化标题+
+年份，任一条目存在显式剪辑版时跳过；后台 worker 启动后连续收敛并在扫描完成后唤醒，同时按 120 秒
+定时运行，审计事件只记录数量。管理 API 为 `GET /api/v1/admin/items/{itemId}/merges` 与
+`POST /api/v1/admin/items/unmerge`，详情页为管理员显示合并来源和拆分入口。
+`cargo test --locked --lib storage::repository::media_merge`（6 项）、
+`--lib storage::repository::media_merge_records`（3 项）、`--lib application::item_merge`（4 项）、
+`cargo test --locked --test item_merge`、`--test item_unmerge` 和
+`web/tests/media-merge-sources.test.tsx`（3 项）通过；本机 `uname -m=arm64`，未验证 PostgreSQL 运行时、
+NAS/x86 性能或第三方客户端表现。撤销不恢复被合并条目的用户状态原值，升级前没有溯源记录的历史合并
+无法拆分。
+
+全量 `cargo test --locked --all-targets` 后仍有 11 个目标失败：`admin_api_key`、`admin_health`、
+`image_api`、`people_api`、`scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、
+`scheduled_tasks`、`watch`、`web_playback`、`web_static`。这些目标在父提交 `f35f55c4` 上以相同用例
+复现失败，因此不是本任务引入；lib 目标 1268 项通过、32 项忽略。`cargo clippy --all-targets
+--all-features -- -D warnings` 在当前 stable（clippy 1.97）下仍有 7 个既存 lint（`emby_catalog.rs`、
+`media.rs`、playback、webhooks、`repository.rs`），本任务改动的文件没有新增诊断。
+
+#### LUX-842 ~ LUX-846：分层图片策略矩阵
+
+范围：把图片策略从“一维类型开关”扩展为“层级 × 类型 × 来源 × 覆盖”的可配置矩阵，并让设置真正生效。
+层级为电影 / 剧集 / 季度 / 单集；类型为海报、背景图（FANART）、艺术图（Emby `Art`）、徽标、
+缩略图、横幅、光盘、壁纸。每个单元格可设置是否抓取、允许来源（在线刮削 / 本地截图）、允许的刮削器
+角色、覆盖策略、张数上限和最小宽度；单集另有在线剧照 / 本地截图 / 都不要三选一。
+配置保存在现有 `media_strategy` JSON 的 `images.levels` 中，不新增数据库迁移。
+
+验收：
+
+- 旧配置（无 `levels`、无 `backdrop`）解析结果与升级前逐字段一致；新装默认值保持既有产出。
+- `backdrop` 开关控制 FANART 下载；`artwork` 只控制 Emby `Art`。关闭“艺术图”不再被误解为关闭背景图。
+- 覆盖策略与任务模式取更保守的一方：仅补全永不覆盖本地图片；`OVERWRITE` 只在完整刮削生效。
+- `maxBackdropCount` / 每格 `maxCount` 真正限制多图类型下载张数，0 表示不下载；上限 4 张。
+- 每格 `minWidth` 在候选入库前过滤低于阈值的上游图片；上游无宽度信息时保留。
+- 每格 `scraperRoles` 按条目所属媒体库的刮削器角色过滤；角色未知时保持原有放行行为。
+- 单集三选一分别控制在线剧照、ffmpeg 截图与两者都不要。
+- Web 全局策略与媒体库覆盖面板提供同一矩阵编辑器，未设置项显示“继承”并在清空后自动剪枝；
+  存储预估与 Emby `ImageOptions` 与真实行为一致。
+- HTTP 处理器不新增 SQL、全库扫描或第三方请求；改动保持在 `storage` 与 `application` 边界内。
+
+验证：`cargo test --locked --lib settings`（21 项）、`--lib candidates`（50 项）、
+`--lib thumbnails`（4 项）、`cargo test --locked --test metadata_selection`（38 项）、
+`--test image_writer`（20 项）、`--test reidentify`（25 项）、`--test thumbnails`（18 项）、
+`--test libraries_api`（14 项）、`--test resume_favorites`（5 项）、
+`cargo fmt --all -- --check`、`cargo build --locked`；
+Web 侧 `node --test tests/*.test.mjs`（150 项）、`vitest run`（861 项，含新增
+`web/tests/image-level-policy.test.tsx` 5 项）、`tsc --noEmit`、`vite build` 通过。
+
+依赖：LUX-041、LUX-083、LUX-231。
 
 #### LUX-084：TMDb 自动合集
 
@@ -11581,6 +11667,12 @@ credit 间歇失败和 watch SQLite 锁定；各自单独重跑通过，最终 a
 预计文件（不超过 5 个）：Web API client/types、库列表/合集页/详情组件、Web 测试及本文档。
 
 补充实现（2026-10-18）：虚拟合集库的 Web 入口封面优先使用当前用户可访问合集自身的海报，再以成员电影海报补足；首页和媒体库列表一致，无可用海报时显示专属合集封面样式。封面仅在客户端组合，不写入共享库数据，避免跨用户 ACL 泄露。Web 生产构建通过；本次未运行自动化测试或浏览器视觉验收。
+
+界面调整（2026-10-23）：合集详情复用普通资源详情的背景图、海报和标题布局，显示原始标题、年份、可见影片数及简介（缺失时显示“暂无简介。”），窄屏保留简介。成员按服务端上映顺序以普通影片海报卡片横向排列，复用横向滚动轨道和左右箭头，保留原有分页。卡片下方不展示来源/版本表单：单一来源直接进入原资源详情，即使该来源有多个版本也不弹窗，并保留偏好 `sourceId`；多个来源时点击海报或片名打开原生模态弹窗，列出各来源库、片名和版本信息，选择并保存成功后携带 `collectionId`、`sourceId` 进入对应原资源。不可访问的成员不生成链接或按钮。
+
+后续交互调整拆为两个增量：卡片/弹窗、样式和组件回归（`web/src/features/detail/CollectionDetailPage.tsx`、`web/src/features/detail/detail.css`、`web/src/features/home/media-card-visual.tsx`、`web/tests/collection-detail.test.tsx`，4 文件）；浏览器流程、关闭后焦点返回修正及验收记录（合集页、`scripts/collection-browser-smoke.mjs`、本文档，3 文件）。先写失败回归，再实现最小变更；弹窗支持 Escape、关闭按钮和点击遮罩取消，关闭后恢复卡片焦点及页面滚动。保存失败留在弹窗重试，保存中禁止重复选择；用户取消后，即使已提交的偏好保存稍后成功，也不会自动导航。
+
+验证（本机 macOS `arm64`）：合集回归先 RED 后 GREEN，当前 9/9 通过，覆盖海报/片名开窗、选择后保存并进入正确原资源、单来源多版本直达、失败重试、取消及保存中取消。合集/普通卡片定向合计 23/23、完整 Web 检查 Node 150/150 和 Vitest 853/853、生产构建通过；浏览器发现的 Escape 关闭后焦点丢失修正后，再跑合集 9/9、构建及浏览器验证均通过。冻结依赖安装和 Cargo fmt 沿用同日先前检查；未改变锁文件或 Rust 代码。Playwright 使用合成 API 与海报，检查明暗主题下 320/768/1024/1440 宽度、简介可见、横向卡片且页面无横向溢出、左右滚动、追加分页；来源弹窗另查桌面/手机尺寸、键盘焦点、Escape 关闭及焦点恢复、片名开窗、遮罩关闭、选择后导航、单来源多版本直达及返回合集，控制台无 error/warning，API 无意外请求。截图在 `output/playwright/collection-*.png` 和 `output/playwright/collection-source-*.png`。未修改 Rust/API/数据库，未部署或验证 FNOS/NAS。
 
 #### LUX-543：接入 Emby 合集库与系列浏览
 

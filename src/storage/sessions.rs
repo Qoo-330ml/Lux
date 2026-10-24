@@ -3,6 +3,12 @@ use crate::storage::{
     PlaybackAdmissionDecision, PlaybackAdmissionDenialReason, PlaybackAdmissionResult,
 };
 
+/// Upper bound for the session listing; live sessions on one server stay far below it.
+const MAX_LISTED_PLAYBACK_SESSIONS: i64 = 500;
+
+/// A single item source should never accumulate more active playback sessions than this.
+const MAX_SESSIONS_PER_SOURCE: i64 = 32;
+
 impl Database {
     // LUX-736 wires this bounded storage contract into the admin playback API.
     #[allow(dead_code)]
@@ -702,7 +708,8 @@ impl Database {
                  WHERE user_id = ?
                    AND state != 'STOPPED'
                    AND last_event_at > unixepoch() - ?
-                 ORDER BY last_event_at DESC, id",
+                 ORDER BY last_event_at DESC, id
+                 LIMIT ?",
                 user_id,
             )
         } else {
@@ -715,7 +722,8 @@ impl Database {
                  FROM playback_sessions
                  WHERE state != 'STOPPED'
                    AND last_event_at > unixepoch() - ?
-                 ORDER BY last_event_at DESC, id",
+                 ORDER BY last_event_at DESC, id
+                 LIMIT ?",
                 None,
             )
         };
@@ -723,7 +731,9 @@ impl Database {
         if let Some(user_id) = bind {
             statement = statement.bind(user_id);
         }
-        statement = statement.bind(active_within_seconds);
+        statement = statement
+            .bind(active_within_seconds)
+            .bind(MAX_LISTED_PLAYBACK_SESSIONS);
         statement
             .fetch_all(&self.pool)
             .await
@@ -1218,12 +1228,14 @@ impl Database {
              FROM web_playback_sessions
              WHERE user_id = ? AND item_id = ? AND media_source_id = ?
                AND state = 'ACTIVE' AND play_session_id LIKE ?
-             ORDER BY created_at ASC, id ASC",
+             ORDER BY created_at ASC, id ASC
+             LIMIT ?",
         )
         .bind(user_id)
         .bind(item_id)
         .bind(media_source_id)
         .bind(play_session_pattern)
+        .bind(MAX_SESSIONS_PER_SOURCE)
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
@@ -1489,5 +1501,15 @@ impl Database {
         } else {
             WebPlaybackEventClaim::Stale
         })
+    }
+}
+
+#[cfg(test)]
+mod session_bound_tests {
+    use super::MAX_LISTED_PLAYBACK_SESSIONS;
+
+    #[test]
+    fn session_listing_bound_is_small_enough_to_stay_cheap() {
+        assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
     }
 }

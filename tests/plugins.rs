@@ -323,6 +323,7 @@ async fn admin_can_install_tmdb_and_select_it_for_a_library()
     };
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(30))
         .build()?;
 
@@ -485,7 +486,10 @@ async fn admin_can_read_and_update_plugin_store_source() -> Result<(), Box<dyn s
         config_dir: temp_dir.path().join("config"),
     };
     let (base_url, server) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
 
     let initial = client
@@ -537,7 +541,10 @@ async fn admin_can_disable_an_installed_plugin_without_removing_it()
     };
     seed_local_tmdb_package(&config.config_dir).await?;
     let (base_url, server) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
 
     let installed = client
@@ -616,7 +623,10 @@ async fn admin_update_returns_no_update_for_a_plugin_newer_than_the_store_catalo
         config_dir,
     };
     let (base_url, server) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
 
     let installed = client
@@ -657,7 +667,10 @@ async fn admin_can_uninstall_an_installed_plugin_and_remove_its_package()
         config_dir: config_dir.clone(),
     };
     let (base_url, server) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
 
     let installed = client
@@ -705,7 +718,10 @@ async fn admin_can_configure_tmdb_key_and_reset_to_the_plugin_default()
     };
     seed_local_tmdb_package(&config.config_dir).await?;
     let (base_url, server) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
 
     let installed = client
@@ -846,6 +862,7 @@ async fn admin_can_discover_a_dynamic_plugin_package_after_startup()
     };
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
@@ -930,7 +947,10 @@ async fn admin_cannot_select_a_media_probe_plugin_as_a_library_scraper()
         config_dir,
     };
     let (base_url, server) = start_server(config).await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = admin_session(&client, &base_url).await?;
 
     let installed = client
@@ -976,6 +996,7 @@ async fn emby_route_plugin_is_only_exposed_when_installed_and_enabled()
     };
     let (base_url, server) = start_server(config).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(3))
         .build()?;
     let (cookies, csrf) = admin_session(&client, &base_url).await?;

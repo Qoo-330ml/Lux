@@ -209,7 +209,10 @@ printf '%s' '{"format":{"format_name":"matroska","duration":"10","bit_rate":"100
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(

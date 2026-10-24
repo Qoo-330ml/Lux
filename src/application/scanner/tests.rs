@@ -815,6 +815,92 @@ async fn lite_manifest_session_loads_root_baselines_with_one_query()
     Ok(())
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn unreadable_lite_directory_does_not_abandon_the_rest_of_the_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::PermissionsExt;
+
+    use crate::{
+        application::libraries::LibraryService, config::Config, library::LibraryKind,
+        storage::Database,
+    };
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Lite batch", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let blocked = root.join("0-blocked");
+    let readable = root.join("9-readable");
+    std::fs::create_dir_all(&blocked)?;
+    std::fs::create_dir_all(&readable)?;
+    std::fs::write(readable.join("Readable.Movie.2024.mkv"), b"fixture")?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    let manifest = database
+        .get_scan_manifest_by_job(&job.id)
+        .await?
+        .ok_or("scan manifest was not created")?;
+    // Discover the root baseline so both child directories are queued.
+    jobs.run_batch(&job.id, 1).await?;
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o000))?;
+    // Read the unreadable directory first and its readable sibling second.
+    while !jobs
+        .pop_lite_manifest_directories(&manifest.id, 64)
+        .is_empty()
+    {}
+    jobs.push_lite_manifest_directories(
+        &manifest.id,
+        &root_record.id.to_string(),
+        true,
+        ["0-blocked".to_owned(), "9-readable".to_owned()],
+    );
+    jobs.run_batch(&job.id, 10).await?;
+
+    let discovered_items: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE title = 'Readable Movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        discovered_items, 1,
+        "the sibling directory must still be discovered after an unreadable one"
+    );
+    let root_state: String = sqlx::query_scalar(
+        "SELECT state FROM scan_manifest_roots
+         WHERE manifest_id = ? AND library_root_id = ?",
+    )
+    .bind(&manifest.id)
+    .bind(root_record.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        root_state, "UNAVAILABLE",
+        "missing-file detection for the root stays conservative"
+    );
+    let root_available: i64 =
+        sqlx::query_scalar("SELECT is_available FROM library_roots WHERE id = ?")
+            .bind(root_record.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(root_available, 0);
+
+    std::fs::set_permissions(&blocked, std::fs::Permissions::from_mode(0o755))?;
+    database.close().await;
+    Ok(())
+}
+
 #[test]
 fn manifest_discovery_budget_stays_within_streamed_file_budget() {
     assert_eq!(MANIFEST_DISCOVERY_BATCH_SIZE, 80);

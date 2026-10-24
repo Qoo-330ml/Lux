@@ -27,6 +27,7 @@ export const queryKeys = {
   person: (personId: string) => ["person", personId] as const,
   personItems: (personId: string) => ["person", personId, "items"] as const,
   itemImages: (itemId: string) => ["item-images", itemId] as const,
+  adminItemMerges: (itemId: string) => ["admin", "item-merges", itemId] as const,
   children: (itemId: string, itemType?: string, seasonId?: string) =>
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,
   playback: (itemId: string) => ["playback", itemId] as const,

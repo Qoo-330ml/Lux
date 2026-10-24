@@ -130,7 +130,10 @@ fn redeem_payload(secret: &str) -> Value {
 async fn creating_pairing_requires_web_session_and_csrf() -> Result<(), Box<dyn std::error::Error>>
 {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let url = format!("{}/api/v1/auth/device-pairings", server.base_url);
 
     let anonymous = client.post(&url).send().await?;
@@ -172,7 +175,10 @@ async fn creating_pairing_requires_web_session_and_csrf() -> Result<(), Box<dyn 
 async fn pairing_redeem_returns_an_emby_access_token_once() -> Result<(), Box<dyn std::error::Error>>
 {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = setup_and_login(&client, &server.base_url).await?;
     let created_body = create_pairing(&client, &server.base_url, &cookies, &csrf).await?;
     let pairing_id = created_body["pairingId"].as_str().unwrap_or_default();
@@ -213,7 +219,10 @@ async fn pairing_redeem_returns_an_emby_access_token_once() -> Result<(), Box<dy
 async fn pairing_secret_is_hashed_and_invalid_secret_does_not_consume_it()
 -> Result<(), Box<dyn std::error::Error>> {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = setup_and_login(&client, &server.base_url).await?;
     let created = create_pairing(&client, &server.base_url, &cookies, &csrf).await?;
     let pairing_id = created["pairingId"].as_str().ok_or("missing pairing ID")?;
@@ -287,7 +296,10 @@ async fn pairing_secret_is_hashed_and_invalid_secret_does_not_consume_it()
 #[tokio::test]
 async fn pairing_expiry_and_cancellation_are_enforced() -> Result<(), Box<dyn std::error::Error>> {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = setup_and_login(&client, &server.base_url).await?;
 
     let expired = create_pairing(&client, &server.base_url, &cookies, &csrf).await?;
@@ -374,7 +386,10 @@ async fn pairing_expiry_and_cancellation_are_enforced() -> Result<(), Box<dyn st
 async fn pairing_cancellation_is_isolated_to_the_creator() -> Result<(), Box<dyn std::error::Error>>
 {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (admin_cookies, admin_csrf) = setup_and_login(&client, &server.base_url).await?;
     let users = UserStore::new(server.database.clone())?;
     users
@@ -410,7 +425,10 @@ async fn pairing_cancellation_is_isolated_to_the_creator() -> Result<(), Box<dyn
 async fn pairing_redeem_validates_device_fields_and_body_size()
 -> Result<(), Box<dyn std::error::Error>> {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = setup_and_login(&client, &server.base_url).await?;
     let pairing = create_pairing(&client, &server.base_url, &cookies, &csrf).await?;
     let pairing_id = pairing["pairingId"].as_str().ok_or("missing pairing ID")?;
@@ -454,7 +472,10 @@ async fn pairing_redeem_validates_device_fields_and_body_size()
 #[tokio::test]
 async fn pairing_endpoints_are_rate_limited() -> Result<(), Box<dyn std::error::Error>> {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = setup_and_login(&client, &server.base_url).await?;
     let create_url = format!("{}/api/v1/auth/device-pairings", server.base_url);
     let pairing = create_pairing(&client, &server.base_url, &cookies, &csrf).await?;
@@ -521,7 +542,10 @@ async fn pairing_endpoints_are_rate_limited() -> Result<(), Box<dyn std::error::
 async fn pairing_redeem_allows_only_one_concurrent_consumer()
 -> Result<(), Box<dyn std::error::Error>> {
     let server = test_server().await?;
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let (cookies, csrf) = setup_and_login(&client, &server.base_url).await?;
     let pairing = create_pairing(&client, &server.base_url, &cookies, &csrf).await?;
     let pairing_id = pairing["pairingId"].as_str().ok_or("missing pairing ID")?;

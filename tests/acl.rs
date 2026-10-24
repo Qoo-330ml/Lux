@@ -78,7 +78,10 @@ async fn library_acl_is_consistent_for_lists_details_and_images()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("{base_url}/api/v1/auth/login"))

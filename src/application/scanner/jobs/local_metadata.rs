@@ -873,6 +873,7 @@ async fn dispatch_local_metadata_fill_missing_jobs(
     }
 }
 
+#[derive(Clone)]
 struct ScanLocalMetadataOutboxWorkerContext {
     database: Database,
     local_nfo: Option<LocalNfoMetadataStore>,
@@ -1565,7 +1566,21 @@ impl ScanJobService {
             outbox_notify,
             image_notifications,
         };
-        tokio::spawn(run_scan_local_metadata_outbox_worker(worker_context));
+        let started = Arc::clone(&self.local_metadata_outbox_worker_started);
+        tokio::spawn(crate::application::background_loop::supervise_with_restart(
+            "scan_local_metadata_outbox",
+            move || {
+                let context = worker_context.clone();
+                let started = Arc::clone(&started);
+                async move {
+                    run_scan_local_metadata_outbox_worker(context).await;
+                    // The worker body only returns when it stops for good. Release the
+                    // single-flight guard so a later start request can run it again; a panic
+                    // keeps the guard set because the supervisor restarts the worker.
+                    started.store(false, std::sync::atomic::Ordering::Release);
+                }
+            },
+        ));
         Ok(())
     }
 }

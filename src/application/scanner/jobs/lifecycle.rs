@@ -35,6 +35,22 @@ impl ScanJobService {
             local_metadata_outbox_worker_started: Arc::new(AtomicBool::new(false)),
             local_metadata_outbox_notify: Arc::new(Notify::new()),
             lite_manifest_discovery: Arc::new(Mutex::new(HashMap::new())),
+            identity_merge_notify: None,
+        }
+    }
+
+    /// Lets scan completion request an immediate duplicate-identity merge pass.
+    pub(crate) fn with_identity_merge_notify(
+        mut self,
+        identity_merge_notify: Arc<tokio::sync::Notify>,
+    ) -> Self {
+        self.identity_merge_notify = Some(identity_merge_notify);
+        self
+    }
+
+    pub(super) fn notify_identity_merge(&self) {
+        if let Some(notify) = &self.identity_merge_notify {
+            notify.notify_one();
         }
     }
 

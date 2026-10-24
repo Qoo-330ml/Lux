@@ -671,14 +671,7 @@ impl Database {
         evidence_json: &str,
     ) -> Result<StoredCanonicalPerson, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
 
         if let Some(person) = self
             .query(
@@ -2023,14 +2016,7 @@ impl Database {
     ) -> Result<StoredCanonicalPerson, StorageError> {
         const IDENTITY_INSERT_CHUNK_SIZE: usize = 100;
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
         let person = self
             .query("SELECT id FROM people WHERE id = ?")
             .bind(person_id)
@@ -2132,11 +2118,17 @@ impl Database {
         Ok(stored_canonical_person(person))
     }
 
+    /// One page of item ids credited to a person, ordered by item id.
+    ///
+    /// Callers page with `after_item_id` (exclusive) so a prolific actor never turns into one
+    /// unbounded result set.
     pub(crate) async fn list_person_credit_item_ids(
         &self,
         library_ids: &[String],
         person_type: &str,
         person_id: &str,
+        after_item_id: Option<&str>,
+        limit: i64,
     ) -> Result<Vec<String>, StorageError> {
         if library_ids.is_empty() {
             return Ok(Vec::new());
@@ -2144,32 +2136,43 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", library_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
+        // Resolve each identity key through its own index instead of one
+        // cross-column OR that forces the planner to scan all credits.
         let query = format!(
-            "SELECT DISTINCT pc.item_id
-             FROM person_credits pc
-             JOIN media_items mi ON mi.id = pc.item_id
-             LEFT JOIN person_identities pi
-               ON pi.provider = pc.provider
-              AND pi.provider_id = pc.person_id
+            "SELECT candidate.item_id
+             FROM (
+                 SELECT pc.item_id
+                 FROM person_credits pc
+                 WHERE pc.person_type = ? AND pc.person_id = ?
+                 UNION
+                 SELECT pc.item_id
+                 FROM person_credits pc
+                 WHERE pc.person_type = ? AND pc.lux_person_id = ?
+                 UNION
+                 SELECT pc.item_id
+                 FROM person_credits pc
+                 JOIN person_identities pi
+                   ON pi.provider = pc.provider
+                  AND pi.provider_id = pc.person_id
+                 WHERE pc.person_type = ? AND pi.person_id = ?
+             ) candidate
+             JOIN media_items mi ON mi.id = candidate.item_id
              WHERE mi.library_id IN ({placeholders})
                AND mi.removed_at IS NULL
-               AND pc.person_type = ?
-               AND (
-                   pc.person_id = ?
-                   OR pc.lux_person_id = ?
-                   OR pi.person_id = ?
-               )
-             ORDER BY pc.item_id"
+               AND candidate.item_id > ?
+             ORDER BY candidate.item_id
+             LIMIT ?"
         );
         let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        for _ in 0..3 {
+            statement = statement.bind(person_type).bind(person_id);
+        }
         for library_id in library_ids {
             statement = statement.bind(library_id);
         }
         let rows = statement
-            .bind(person_type)
-            .bind(person_id)
-            .bind(person_id)
-            .bind(person_id)
+            .bind(after_item_id.unwrap_or(""))
+            .bind(limit.clamp(1, 1000))
             .fetch_all(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {

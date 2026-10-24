@@ -12,6 +12,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
     let resources = state.resources.clone();
     let (emby_routes, emby_path_templates) = emby::api_routes();
+    let request_rate_limiter = state.request_rate_limiter.clone();
     let catalog_request_slots =
         Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_CATALOG_REQUESTS));
     let catalog_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
@@ -30,6 +31,10 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 .fallback(ServeFile::new(web_root.join("index.html")).precompressed_gzip()),
         )
         .with_state(state)
+        .layer(middleware::from_fn_with_state(
+            request_rate_limiter,
+            limit_request_rate,
+        ))
         .layer(middleware::from_fn(
             move |request: Request<Body>, next: Next| {
                 let catalog_request_slots = catalog_request_slots.clone();
@@ -119,6 +124,9 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         ))
         .layer(
             tower::ServiceBuilder::new()
+                // A client-supplied request id must not become the server's own correlation
+                // id; keep it aside for diagnostics and always mint a fresh one.
+                .layer(middleware::from_fn(strip_client_request_id))
                 .set_x_request_id(MakeRequestUuid)
                 .layer(
                     TraceLayer::new_for_http()
@@ -155,6 +163,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 )
                 .propagate_x_request_id(),
         )
+        .layer(middleware::from_fn(security_response_headers))
         .layer(middleware::from_fn(web_asset_cache_policy));
     case_insensitive_emby_router(app, emby_path_templates)
 }
@@ -366,6 +375,94 @@ fn find_ascii_case_insensitive(value: &str, needle: &str) -> Option<usize> {
             .get(*start..*start + needle.len())
             .is_some_and(|candidate| candidate.eq_ignore_ascii_case(needle))
     })
+}
+
+async fn strip_client_request_id(mut request: Request<Body>, next: Next) -> Response {
+    if let Some(value) = request.headers_mut().remove("x-request-id") {
+        if let Some(value) = value
+            .to_str()
+            .ok()
+            .filter(|value| !value.is_empty() && value.len() <= 128)
+            && let Ok(value) = HeaderValue::from_str(value)
+        {
+            request.headers_mut().insert("x-client-request-id", value);
+        }
+    }
+    next.run(request).await
+}
+
+/// Same-origin policy for the bundled Web client.
+///
+/// The player needs blob workers (hls.js) and WebAssembly (HEVC), and the build has no inline
+/// scripts. `'wasm-unsafe-eval'` is ignored by browsers without it (Safari before 16.4), which
+/// then refuses WebAssembly; those clients fall back to the non-HEVC path.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'self'; \
+     img-src 'self' data: blob: https://www.themoviedb.org; \
+     media-src 'self' blob:; \
+     script-src 'self' 'wasm-unsafe-eval'; \
+     style-src 'self' 'unsafe-inline'; \
+     connect-src 'self'; \
+     worker-src 'self' blob:; \
+     frame-ancestors 'none'; \
+     base-uri 'self'; \
+     form-action 'self'; \
+     object-src 'none'";
+
+async fn limit_request_rate(
+    State(limiter): State<crate::security::RequestRateLimiter>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let peer = request
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|connect| connect.0.ip().to_string())
+        .unwrap_or_else(|| "local".to_owned());
+    if limiter.allow(&peer).await {
+        return next.run(request).await;
+    }
+    let mut response = api_error(
+        request.headers(),
+        StatusCode::TOO_MANY_REQUESTS,
+        super::lux::ApiErrorCode::RateLimited,
+        "请求过于频繁，请稍后重试",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("60"));
+    response
+}
+
+async fn security_response_headers(request: Request<Body>, next: Next) -> Response {
+    let forwarded_https = request
+        .headers()
+        .get("x-forwarded-proto")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.split(',').next())
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("https"));
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers
+        .entry("x-content-type-options")
+        .or_insert(HeaderValue::from_static("nosniff"));
+    headers
+        .entry("x-frame-options")
+        .or_insert(HeaderValue::from_static("DENY"));
+    headers
+        .entry("referrer-policy")
+        .or_insert(HeaderValue::from_static("no-referrer"));
+    headers
+        .entry("content-security-policy")
+        .or_insert(HeaderValue::from_static(CONTENT_SECURITY_POLICY));
+    if forwarded_https {
+        headers
+            .entry("strict-transport-security")
+            .or_insert(HeaderValue::from_static(
+                "max-age=31536000; includeSubDomains",
+            ));
+    }
+    response
 }
 
 async fn web_asset_cache_policy(request: Request<Body>, next: Next) -> Response {

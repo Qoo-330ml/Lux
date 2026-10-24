@@ -79,7 +79,10 @@ async fn danmaku_scheduled_task_api_updates_plugin_schedule()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))

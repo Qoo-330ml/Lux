@@ -1241,13 +1241,15 @@ impl Database {
             .chunks(item_batch_size)
             .zip(parent_ids.chunks(item_batch_size))
         {
-            let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, 1)", chunk.len())
-                .collect::<Vec<_>>()
-                .join(", ");
+            let values =
+                std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, unixepoch())", chunk.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
             let mut item_write = self.query(sqlx::AssertSqlSafe(format!(
                 "INSERT INTO media_items (
                      id, library_id, item_type, parent_id, title, sort_title,
-                     original_title, identification_status, identity_key, has_available_source
+                     original_title, identification_status, identity_key, has_available_source,
+                     updated_at
                  ) VALUES {values}
                  ON CONFLICT(identity_key) WHERE identity_key IS NOT NULL DO UPDATE SET
                      item_type = excluded.item_type, parent_id = excluded.parent_id,
@@ -1412,8 +1414,8 @@ impl Database {
                 self.query(
                     "INSERT INTO media_items (
                         id, library_id, item_type, parent_id, title, sort_title,
-                        original_title, identification_status, identity_key
-                    ) VALUES (?, ?, 'FOLDER', ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+                        original_title, identification_status, identity_key, updated_at
+                    ) VALUES (?, ?, 'FOLDER', ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, unixepoch())",
                 )
                 .bind(&folder_id)
                 .bind(library_id)
@@ -1671,7 +1673,7 @@ impl Database {
             }
             for chunk in folders[depth_start..depth_end].chunks(batch_size) {
                 let values = std::iter::repeat_n(
-                    "(?, ?, 'FOLDER', ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+                    "(?, ?, 'FOLDER', ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, unixepoch())",
                     chunk.len(),
                 )
                 .collect::<Vec<_>>()
@@ -1679,7 +1681,7 @@ impl Database {
                 let query = format!(
                     "INSERT INTO media_items (
                          id, library_id, item_type, parent_id, title, sort_title,
-                         original_title, identification_status, identity_key
+                         original_title, identification_status, identity_key, updated_at
                      ) VALUES {values}
                      ON CONFLICT(identity_key) WHERE identity_key IS NOT NULL DO NOTHING
                      RETURNING id, identity_key"
@@ -2315,7 +2317,7 @@ impl Database {
         let movie_item_insert_started = Instant::now();
         for chunk in new_items.chunks(batch_size) {
             let values = std::iter::repeat_n(
-                "(?, ?, 'MOVIE', ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+                "(?, ?, 'MOVIE', ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', 1, unixepoch())",
                 chunk.len(),
             )
             .collect::<Vec<_>>()
@@ -2324,7 +2326,7 @@ impl Database {
                 "INSERT INTO media_items (
                     id, library_id, item_type, parent_id, title, sort_title,
                     original_title, production_year, provider_ids_json, identification_status,
-                    has_available_source
+                    has_available_source, updated_at
                 ) VALUES {values}"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -2978,7 +2980,9 @@ impl Database {
                 .iter()
                 .map(|row| {
                     let has_available_source = i64::from(row.item_type == "EPISODE");
-                    format!("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {has_available_source})")
+                    format!(
+                        "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, {has_available_source}, unixepoch())"
+                    )
                 })
                 .collect::<Vec<_>>()
                 .join(", ");
@@ -2988,7 +2992,7 @@ impl Database {
                     season_number, episode_number, absolute_number,
                     title, sort_title, original_title, production_year,
                     provider_ids_json, identification_status, identity_key,
-                    has_available_source
+                    has_available_source, updated_at
                 ) VALUES {values}"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -3393,6 +3397,32 @@ impl Database {
                 source,
             })?;
         Ok(true)
+    }
+
+    /// Role the owning library assigned to one scraper. Unknown scrapers (for
+    /// example a provider name that is not a configured plugin) return `None`
+    /// so callers can keep their pre-existing permissive behaviour.
+    pub(crate) async fn find_item_scraper_role(
+        &self,
+        item_id: &str,
+        scraper_id: &str,
+    ) -> Result<Option<String>, StorageError> {
+        self.query(
+            "SELECT library_scrapers.role AS role
+             FROM library_scrapers
+             JOIN media_items ON media_items.library_id = library_scrapers.library_id
+             WHERE media_items.id = ? AND library_scrapers.scraper_id = ?
+             LIMIT 1",
+        )
+        .bind(item_id)
+        .bind(scraper_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(|row| row.get::<String, _>("role")))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     pub(crate) async fn find_media_item_metadata(

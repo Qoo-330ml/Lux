@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, HashMap, HashSet},
     path::{Component, Path as FsPath, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 use axum::{
@@ -66,6 +66,7 @@ use crate::{
         emby_migration_service::{
             CreateMigrationRequest, EmbyMigrationService, EmbyMigrationServiceError,
         },
+        identity_merge::IdentityMergeWorker,
         image_variants::ImageVariantService,
         images::{
             ImageCandidateError, ImageCandidateService, ImageError, ImageService, ImageWriteError,
@@ -147,6 +148,22 @@ mod routes;
 #[path = "users.rs"]
 mod users;
 
+/// Concurrency budget for server-sent-event streams; the default keeps resource use bounded.
+#[derive(Clone)]
+pub(crate) struct SseConnectionBudget(Arc<tokio::sync::Semaphore>);
+
+impl Default for SseConnectionBudget {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(MAX_SSE_CONNECTIONS)))
+    }
+}
+
+impl SseConnectionBudget {
+    fn try_acquire(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.0.clone().try_acquire_owned().ok()
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct AppState {
     admin_health_probe_cache: AdminHealthProbeCache,
@@ -196,6 +213,7 @@ pub struct AppState {
     collections: Option<CollectionService>,
     global_collection_sync_worker: Option<GlobalCollectionSyncWorker>,
     content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
+    identity_merge_worker: Option<IdentityMergeWorker>,
     people: Option<PeopleService>,
     local_nfo: Option<LocalNfoMetadataStore>,
     user_avatars: Option<UserAvatarService>,
@@ -207,6 +225,9 @@ pub struct AppState {
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
     device_pairing_rate_limiter: DevicePairingRateLimiter,
+    request_rate_limiter: crate::security::RequestRateLimiter,
+    /// Bounds the number of concurrent server-sent-event streams.
+    sse_permits: SseConnectionBudget,
 }
 
 impl AppState {
@@ -220,6 +241,9 @@ impl AppState {
         if let Some(worker) = &self.content_restriction_index_worker {
             worker.shutdown().await;
         }
+        if let Some(worker) = &self.identity_merge_worker {
+            worker.shutdown().await;
+        }
         crate::application::probe::shutdown_probe_runtime()
             .await
             .map_err(|error| error.to_string())?;
@@ -229,7 +253,25 @@ impl AppState {
         if let Some(worker) = &self.global_collection_sync_worker {
             worker.shutdown().await;
         }
+        if let Some(webhooks) = &self.webhooks {
+            webhooks.shutdown().await;
+        }
+        if let Some(scheduled_tasks) = &self.scheduled_tasks {
+            scheduled_tasks.shutdown().await;
+        }
         Ok(())
+    }
+
+    /// Overrides the concurrent SSE stream budget (tests use a small value).
+    pub fn with_sse_connection_limit(mut self, limit: usize) -> Self {
+        self.sse_permits = SseConnectionBudget(Arc::new(tokio::sync::Semaphore::new(limit)));
+        self
+    }
+
+    /// Overrides the per-peer request budget (tests use a small value).
+    pub fn with_request_rate_limit(mut self, limit: u32) -> Self {
+        self.request_rate_limiter = crate::security::RequestRateLimiter::new(limit);
+        self
     }
 
     pub fn ready(
@@ -250,10 +292,36 @@ impl AppState {
         emby_auth: EmbyAuthService,
         network_proxy_url: Option<String>,
     ) -> Self {
+        Self::ready_with_proxy_and_image_config(
+            config,
+            database,
+            setup,
+            auth,
+            emby_auth,
+            network_proxy_url,
+            crate::application::images::ImageDownloadConfig::default(),
+        )
+    }
+
+    pub fn ready_with_proxy_and_image_config(
+        config: Config,
+        database: Database,
+        setup: SetupService,
+        auth: WebAuthService,
+        emby_auth: EmbyAuthService,
+        network_proxy_url: Option<String>,
+        image_download_config: crate::application::images::ImageDownloadConfig,
+    ) -> Self {
         let server_id = database.server_id().to_owned();
         let filmly_image_compat_mode = filmly_image_compat_mode_from_env_value(
             std::env::var("LUX_FILMLY_IMAGE_MODE").ok().as_deref(),
         );
+        if filmly_image_compat_mode == FilmlyImageCompatMode::Compat {
+            tracing::warn!(
+                "LUX_FILMLY_IMAGE_MODE=compat serves untagged images without authentication; \
+                 enable it only on a trusted network"
+            );
+        }
         let config_dir = config.config_dir.clone();
         let log_store = LogStore::new(&config_dir);
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
@@ -291,10 +359,11 @@ impl AppState {
         let libraries = LibraryService::new(database.clone());
         let catalog = CatalogService::new(database.clone(), access.clone());
         let home = HomeService::new(catalog.clone(), libraries.clone());
-        let image_writes = ImageWriteService::new_with_proxy_and_config_dir(
+        let image_writes = ImageWriteService::with_config_proxy_and_config_dir(
             database.clone(),
-            config.config_dir.clone(),
+            image_download_config,
             network_proxy_url.clone(),
+            config.config_dir.clone(),
         )
         .ok()
         .map(|service| service.with_resource_metrics(resources.clone()));
@@ -370,13 +439,15 @@ impl AppState {
         );
         let embedded_subtitle = Some(EmbeddedSubtitleService::new());
         let thumbnails = Some(ThumbnailService::new(database.clone()));
+        let identity_merge_notify = Arc::new(tokio::sync::Notify::new());
         let scan_jobs = {
             let service = ScanJobService::new(database.clone())
                 .with_admin_events(admin_events.clone())
                 .with_user_events(user_events.clone())
                 .with_log_store(log_store.clone())
                 .with_resource_metrics(resources.clone())
-                .with_home(home.clone());
+                .with_home(home.clone())
+                .with_identity_merge_notify(identity_merge_notify.clone());
             let service = match library_covers.clone() {
                 Some(covers) => service.with_library_covers(covers),
                 None => service,
@@ -417,6 +488,14 @@ impl AppState {
         .with_danmaku(danmaku.clone());
         let global_collection_sync_worker =
             Some(GlobalCollectionSyncWorker::start(database.clone()));
+        let identity_merge_worker = Some(IdentityMergeWorker::start(
+            database.clone(),
+            Some(home.clone()),
+            Some(catalog.clone()),
+            admin_events.clone(),
+            config_dir.clone(),
+            identity_merge_notify,
+        ));
         Self {
             admin_health_probe_cache: AdminHealthProbeCache::default(),
             database: Some(database.clone()),
@@ -481,6 +560,7 @@ impl AppState {
             collections,
             global_collection_sync_worker,
             content_restriction_index_worker: None,
+            identity_merge_worker,
             people: Some(people),
             local_nfo: Some(local_nfo),
             user_avatars,
@@ -492,6 +572,8 @@ impl AppState {
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
+            request_rate_limiter: crate::security::RequestRateLimiter::default(),
+            sse_permits: SseConnectionBudget::default(),
         }
     }
 
@@ -624,13 +706,13 @@ impl AppState {
             tracing::error!(%error, "failed to synchronize manifest scheduled tasks");
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
-            scheduled_tasks.spawn();
+            scheduled_tasks.spawn().await;
         }
     }
 
-    pub fn start_webhook_worker(&self) {
+    pub async fn start_webhook_worker(&self) {
         if let Some(webhooks) = self.webhooks.as_ref() {
-            webhooks.spawn_worker();
+            webhooks.spawn_worker().await;
         }
     }
 
@@ -706,6 +788,8 @@ async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), R
 }
 
 const MAX_CONCURRENT_CATALOG_REQUESTS: usize = 16;
+/// Each stream holds a task and a 16 KiB buffer, so the cap keeps them bounded.
+const MAX_SSE_CONNECTIONS: usize = 64;
 const MAX_IN_FLIGHT_CATALOG_REQUESTS: usize = 64;
 
 fn is_catalog_aggregation_path(path: &str) -> bool {
@@ -1020,6 +1104,7 @@ async fn reject_unmatched_api_path(request: Request<Body>, next: Next) -> Respon
     if !is_api_or_emby_namespace_path(request.uri().path()) {
         return next.run(request).await;
     }
+    let is_lux_api = request.uri().path().starts_with("/api/");
     let request_headers = request.headers().clone();
     let response = next.run(request).await;
     let is_html_fallback = response.status().is_success()
@@ -1035,6 +1120,10 @@ async fn reject_unmatched_api_path(request: Request<Body>, next: Next) -> Respon
             .and_then(|value| value.to_str().ok())
             .is_some_and(|value| value.starts_with("application/json"));
     if is_html_fallback || is_non_json_not_found {
+        // Emby clients expect a bare status, so only the Lux API uses the error envelope.
+        if !is_lux_api {
+            return StatusCode::NOT_FOUND.into_response();
+        }
         return api_error(
             &request_headers,
             StatusCode::NOT_FOUND,
@@ -1071,15 +1160,29 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
     headers.get(name).and_then(|value| value.to_str().ok())
 }
 
-fn request_client_ip(headers: &HeaderMap, policy: &RemoteAccessPolicy) -> Option<String> {
-    policy
-        .reported_client_ip(
-            header_str(headers, "x-lux-peer-ip"),
-            header_str(headers, "x-forwarded-for"),
-            header_str(headers, "x-real-ip"),
-            header_str(headers, "forwarded"),
-        )
-        .map(|address| address.to_string())
+/// Client address for audit records and rate-limit keys.
+///
+/// Raw `X-Forwarded-For` values are attacker-controlled; only the trusted-proxy resolver may
+/// decide which address a request actually came from.
+pub(super) async fn request_client_ip(headers: &HeaderMap, state: &AppState) -> Option<String> {
+    match request_access_ip(headers, state).await {
+        Ok(address) => address.map(|address| address.to_string()),
+        Err(_) => None,
+    }
+}
+
+fn sse_capacity_response(headers: &HeaderMap) -> Response {
+    let mut response = api_error(
+        headers,
+        StatusCode::TOO_MANY_REQUESTS,
+        super::lux::ApiErrorCode::RateLimited,
+        "同时打开的事件流过多，请稍后重试",
+    )
+    .into_response();
+    response
+        .headers_mut()
+        .insert("retry-after", HeaderValue::from_static("30"));
+    response
 }
 
 async fn request_access_ip(
@@ -1092,6 +1195,15 @@ async fn request_access_ip(
     let peer = peer_value
         .parse::<std::net::IpAddr>()
         .map_err(|_| AccessIpResolutionError::InvalidPeerAddress)?;
+    let forwarded_for_values = headers
+        .get_all("x-forwarded-for")
+        .iter()
+        .map(|value| value.to_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    if forwarded_for_values.is_empty() {
+        // Without a forwarded chain the answer is the peer, so skip the settings read entirely.
+        return Ok(Some(peer));
+    }
     let database = state
         .database
         .as_ref()
@@ -1106,11 +1218,6 @@ async fn request_access_ip(
                 .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let forwarded_for_values = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .map(|value| value.to_str().unwrap_or_default())
-        .collect::<Vec<_>>();
     crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
         peer,
         &forwarded_for_values,
@@ -1988,6 +2095,21 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn access_ip_without_forwarded_headers_does_not_read_settings()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // No database at all: without a forwarded chain the peer is authoritative, so the
+        // resolver must not fail (or issue a query).
+        let state = AppState::default();
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("203.0.113.9"));
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("203.0.113.9".parse()?))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn access_ip_fails_closed_for_malformed_trusted_chain_or_settings()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp, database) = access_ip_test_database().await?;
@@ -2253,10 +2375,10 @@ mod tests {
     }
 
     #[test]
-    fn filmly_image_compat_mode_defaults_to_compat_and_accepts_generic_ab_value() {
+    fn filmly_image_compat_mode_is_opt_in() {
         assert_eq!(
             filmly_image_compat_mode_from_env_value(None),
-            FilmlyImageCompatMode::Compat
+            FilmlyImageCompatMode::Generic
         );
         assert_eq!(
             filmly_image_compat_mode_from_env_value(Some("generic")),
@@ -2268,7 +2390,7 @@ mod tests {
         );
         assert_eq!(
             filmly_image_compat_mode_from_env_value(Some("unexpected")),
-            FilmlyImageCompatMode::Compat
+            FilmlyImageCompatMode::Generic
         );
     }
 

@@ -7,35 +7,31 @@
 
 /* Route-only rules moved out of react.css so the shared sheet stays small (LUX-835). */
 
-.lux-collection-detail { max-width: 1120px; }
+.lux-collection-work button.lux-media-card-link { width: 100%; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-align: inherit; cursor: pointer; }
 
-.lux-collection-heading { display: grid; grid-template-columns: 132px minmax(0, 1fr); align-items: center; gap: 24px; margin-bottom: 34px; }
+.lux-collection-work .lux-media-card-link:focus-visible { outline: 2px solid var(--lux-text); outline-offset: 4px; border-radius: 10px; }
 
-.lux-collection-heading h1 { margin: 5px 0 8px; color: var(--lux-text); font-size: clamp(1.8rem, 4vw, 2.7rem); letter-spacing: -.06em; }
+.lux-collection-source-dialog { width: min(560px, calc(100vw - 32px)); max-height: calc(100dvh - 48px); margin: auto; padding: 0; overflow: auto; overscroll-behavior: contain; border: 1px solid var(--lux-line); border-radius: 16px; color: var(--lux-text); background: var(--lux-surface-strong); box-shadow: 0 24px 64px rgba(0,0,0,.35); }
 
-.lux-collection-heading p { margin: 0; color: var(--lux-muted); }
+.lux-collection-source-dialog::backdrop { background: rgba(0,0,0,.65); }
 
-.lux-collection-heading .lux-collection-overview { max-width: 72ch; margin-top: 14px; color: var(--lux-subtle); line-height: 1.7; }
+.lux-collection-source-dialog header p { margin: 10px 0 0; color: var(--lux-muted); font-size: .9rem; overflow-wrap: anywhere; }
 
-.lux-collection-poster { display: block; width: 132px; aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line); border-radius: 10px; object-fit: cover; background: var(--lux-surface); }
+.lux-collection-source-body { padding: 20px; }
 
-.lux-collection-work { display: grid; grid-template-columns: 92px minmax(0, 1fr); gap: 18px; padding: 18px 0; border-bottom: 1px solid var(--lux-line-soft); }
+.lux-collection-source-options { display: grid; gap: 12px; margin: 0; padding: 0; list-style: none; }
 
-.lux-collection-work-art { display: grid; place-items: center; width: 92px; aspect-ratio: 2 / 3; overflow: hidden; border: 1px solid var(--lux-line-soft); border-radius: 7px; color: var(--lux-muted); background: var(--lux-surface); }
+.lux-collection-source-option { display: flex; align-items: center; justify-content: space-between; gap: 16px; width: 100%; min-height: 64px; padding: 16px; border: 1px solid var(--lux-line); border-radius: 10px; color: var(--lux-text); background: var(--lux-surface); font: inherit; text-align: left; cursor: pointer; }
 
-.lux-collection-work-art img { display: block; width: 100%; height: 100%; object-fit: cover; }
+.lux-collection-source-option > span { display: grid; gap: 6px; min-width: 0; overflow-wrap: anywhere; }
 
-.lux-collection-work-copy { display: grid; justify-items: start; align-content: center; gap: 10px; min-width: 0; }
+.lux-collection-source-option small { color: var(--lux-muted); line-height: 1.5; }
 
-.lux-collection-work-copy h2 { margin: 0; color: var(--lux-text); font-size: 1.05rem; }
+.lux-collection-source-option > svg { flex: 0 0 auto; }
 
-.lux-collection-work-copy > p { margin: 0; color: var(--lux-muted); font-size: .8rem; }
+.lux-collection-source-option:hover, .lux-collection-source-option:focus-visible { border-color: var(--lux-text); }
 
-.lux-collection-source-control { display: grid; gap: 6px; width: min(100%, 560px); color: var(--lux-subtle); font-size: .75rem; }
-
-.lux-collection-source-control select { width: 100%; min-width: 0; min-height: 42px; padding: 8px 34px 8px 12px; border: 1px solid var(--lux-line); border-radius: 8px; color: var(--lux-text); background: var(--lux-surface); font: inherit; }
-
-.lux-collection-open-movie { min-height: 38px; }
+.lux-collection-source-option:disabled { opacity: .6; cursor: wait; }
 
 .lux-section-heading-sub { font-family: var(--lux-editorial-font-family); font-size: .74rem; font-weight: 300; letter-spacing: .14em; text-transform: uppercase; color: rgba(255,255,255,.52); font-style: normal; line-height: 1; }
 
@@ -135,9 +131,11 @@ html[data-lux-theme="light"] .lux-season-episode-arrow:hover { color: var(--lux-
 
 .lux-collection-back { margin-bottom: 24px; }
 
-.lux-collection-poster-placeholder { display: grid; place-items: center; color: var(--lux-muted); }
+.lux-collection-work-list { margin: 0; list-style: none; }
 
-.lux-collection-work-list { display: grid; gap: 0; margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--lux-line-soft); }
+.lux-collection-work { width: 174px; }
+
+.lux-collection-overview { white-space: pre-line; overflow-wrap: anywhere; }
 
 .lux-collection-load-more { display: flex; margin: 24px auto 0; }
 
@@ -785,17 +783,6 @@ html[data-lux-theme="light"] .lux-detail-watched-status.is-played { border-color
 }
 
 @media (max-width: 700px) {
-  .lux-collection-detail { width: 92%; padding-top: 20px; }
-  .lux-collection-heading { grid-template-columns: 84px minmax(0, 1fr); gap: 14px; margin-bottom: 24px; }
-  .lux-collection-poster { width: 84px; border-radius: 7px; }
-  .lux-collection-heading h1 { font-size: 1.65rem; }
-  .lux-collection-heading .lux-collection-overview { display: none; }
-  .lux-collection-work { grid-template-columns: 66px minmax(0, 1fr); gap: 12px; padding: 14px 0; }
-  .lux-collection-work-art { width: 66px; }
-  .lux-collection-work-copy { gap: 8px; }
-  .lux-collection-work-copy h2 { font-size: .94rem; }
-  .lux-collection-source-control select { min-height: var(--lux-button-height-touch); }
-  .lux-collection-open-movie { min-height: var(--lux-button-height-touch); }
   .lux-person-detail-page { width: 92%; box-sizing: border-box; padding-top: 0; }
   .lux-person-detail-grid { grid-template-columns: 1fr; gap: 28px; }
   .lux-person-detail-photo-frame { width: min(58vw, 220px); margin: 0 auto; }
@@ -803,6 +790,10 @@ html[data-lux-theme="light"] .lux-detail-watched-status.is-played { border-color
 }
 
 @media (max-width: 560px) {
+  .lux-collection-back { position: absolute; z-index: 3; top: calc(14px + env(safe-area-inset-top)); left: 4%; min-height: 44px; padding: 10px 14px; border: 1px solid var(--lux-line); border-radius: 999px; color: var(--lux-text); background: var(--lux-surface-strong); }
+  .lux-collection-members { width: 92%; margin: 32px auto 0; }
+  .lux-collection-members > .lux-section-heading { flex-wrap: wrap; gap: 8px; }
+  .lux-collection-work { width: 150px; flex-basis: 150px; }
   .lux-section-heading-sub { font-size: .68rem; letter-spacing: .11em; }
   .lux-media-cast { margin-top: 32px; padding-top: 12px; }
   .lux-season-episode-row { grid-template-columns: minmax(120px, 36vw) minmax(0, 1fr); gap: 12px; }
@@ -824,3 +815,17 @@ html[data-lux-theme="light"] .lux-detail-watched-status.is-played { border-color
   .lux-media-file-summary { gap: 8px 15px; }
   .lux-media-address-row { grid-template-columns: minmax(0, 1fr) auto; gap: 8px; }
 }
+
+.lux-detail-merge-sources { order: 0; margin-bottom: 24px; }
+
+.lux-detail-page .lux-detail-merge-sources h2 { font-size: 1.15rem; font-weight: 700; letter-spacing: .02em; line-height: 1.2; }
+
+.lux-detail-merge-list { display: grid; gap: 8px; margin: 12px 0 0; padding: 0; list-style: none; }
+
+.lux-detail-merge-item { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--lux-line, rgba(255,255,255,.12)); border-radius: 10px; }
+
+.lux-detail-merge-title { font-weight: 600; }
+
+.lux-detail-merge-meta { color: var(--lux-muted); font-size: .78rem; }
+
+.lux-detail-merge-confirm { display: inline-flex; flex-wrap: wrap; align-items: center; gap: 8px; }

@@ -1,0 +1,15 @@
+.lux-account-api-key-panel { display: grid; gap: 13px; padding: 17px 0; }
+
+.lux-account-api-key-panel .lux-setting-block-heading strong { display: inline-flex; align-items: center; gap: 7px; color: var(--lux-text); font-size: .84rem; font-weight: 600; }
+
+.lux-account-api-key-panel .lux-setting-block-heading p { display: block; margin: 5px 0 0; color: var(--lux-muted); font-size: .74rem; line-height: 1.55; }
+
+.lux-account-api-key-warning { padding: 10px 12px; border-left: 2px solid #d99a47; color: var(--lux-muted); background: rgba(217,154,71,.08); font-size: .72rem; line-height: 1.55; }
+
+.lux-account-api-key-status { margin: 0; color: var(--lux-subtle); font-size: .72rem; }
+
+.lux-account-api-key-value { display: grid; gap: 11px; padding: 13px; border: 1px solid var(--lux-settings-line); border-radius: 9px; background: rgba(255,255,255,.035); }
+
+.lux-account-api-key-value code { overflow-wrap: anywhere; color: var(--lux-text); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .74rem; line-height: 1.5; }
+
+.lux-account-api-key-actions { display: flex; flex-wrap: wrap; gap: 8px; }

@@ -1180,31 +1180,10 @@ async fn admin_request_access_ip(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<std::net::IpAddr, ()> {
-    let peer = headers
-        .get("x-lux-peer-ip")
-        .and_then(|value| value.to_str().ok())
-        .ok_or(())?
-        .parse::<std::net::IpAddr>()
-        .map_err(|_| ())?;
-    let database = state.database.as_ref().ok_or(())?;
-    let trusted_proxy_values = crate::application::settings::read_trusted_proxy_cidrs(database)
+    crate::api::legacy::request_access_ip(headers, state)
         .await
-        .map_err(|_| ())?;
-    let trusted_proxies = trusted_proxy_values
-        .iter()
-        .map(|value| crate::application::user_access_rules::IpCidr::parse(value).map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?;
-    let forwarded_for_values = headers
-        .get_all("x-forwarded-for")
-        .iter()
-        .map(|value| value.to_str().map_err(|_| ()))
-        .collect::<Result<Vec<_>, _>>()?;
-    crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
-        peer,
-        &forwarded_for_values,
-        &trusted_proxies,
-    )
-    .map_err(|_| ())
+        .map_err(|_| ())?
+        .ok_or(())
 }
 
 fn user_access_blacklist_conflict(headers: &HeaderMap) -> Response {
@@ -3365,7 +3344,11 @@ pub(super) fn api_routes() -> Router<AppState> {
         )
         .route(
             "/api/v1/admin/users/{user_id}/avatar",
-            get(admin_get_user_avatar).put(admin_update_user_avatar),
+            get(admin_get_user_avatar)
+                .put(admin_update_user_avatar)
+                .layer(axum::extract::DefaultBodyLimit::max(
+                    crate::application::user_avatars::MAX_USER_AVATAR_BYTES as usize,
+                )),
         )
         .route(
             "/api/v1/admin/users/{user_id}/restore",

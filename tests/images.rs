@@ -75,7 +75,10 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let emby_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -178,6 +181,8 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         reqwest::StatusCode::UNAUTHORIZED
     );
 
+    // The Filmly compatibility path is opt-in (LUX_FILMLY_IMAGE_MODE=compat) because it
+    // serves untagged images without authentication; by default the UA alone grants nothing.
     let emby_filmly_image = client
         .get(format!("{base_url}/emby/Items/{item_id}/Images/Primary"))
         .header(
@@ -186,8 +191,10 @@ async fn lux_and_emby_image_endpoints_share_etag_and_reject_escape()
         )
         .send()
         .await?;
-    assert_eq!(emby_filmly_image.status(), reqwest::StatusCode::OK);
-    assert_eq!(emby_filmly_image.bytes().await?, "poster-bytes".as_bytes());
+    assert_eq!(
+        emby_filmly_image.status(),
+        reqwest::StatusCode::UNAUTHORIZED
+    );
 
     let emby_capability_image = client
         .get(format!(
@@ -416,7 +423,10 @@ async fn serves_managed_image_when_media_root_is_temporarily_unavailable()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/api/v1/auth/login"))
         .json(&json!({ "username": "admin", "password": "correct password" }))
@@ -435,6 +445,63 @@ async fn serves_managed_image_when_media_root_is_temporarily_unavailable()
         .await?;
     assert_eq!(response.status(), reqwest::StatusCode::OK);
     assert_eq!(response.bytes().await?.as_ref(), b"managed-poster");
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn image_search_requires_server_management() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    luxd::auth::users::UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    assert_eq!(viewer_login.status(), reqwest::StatusCode::OK);
+    let session = cookie_value(viewer_login.headers(), "lux_session");
+    let csrf = cookie_value(viewer_login.headers(), "lux_csrf");
+    let denied = client
+        .post(format!(
+            "{base_url}/api/v1/items/{}/images/search",
+            uuid::Uuid::now_v7()
+        ))
+        .header(COOKIE, format!("lux_session={session}; lux_csrf={csrf}"))
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "imageType": "POSTER" }))
+        .send()
+        .await?;
+    assert_eq!(
+        denied.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "image search reaches the external scraper and must stay a management action"
+    );
 
     server.abort();
     Ok(())

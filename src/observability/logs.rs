@@ -63,6 +63,18 @@ pub(crate) struct NewAuditLogEvent<'a> {
     pub(crate) metadata_json: &'a str,
 }
 
+/// Opens the manager on first use inside an already-blocking context.
+fn open_manager<'a>(
+    slot: &'a mut Option<LogManager>,
+    config_dir: &Path,
+) -> io::Result<&'a mut LogManager> {
+    if slot.is_none() {
+        *slot = Some(LogManager::open(config_dir)?);
+    }
+    slot.as_mut()
+        .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))
+}
+
 impl LogStore {
     pub fn new(config_dir: &Path) -> Self {
         let manager_key = config_dir.to_path_buf();
@@ -128,37 +140,42 @@ impl LogStore {
     }
 
     pub async fn append_json(&self, record: Value) -> io::Result<()> {
-        self.initialize().await?;
+        // Redact here, not only at the call sites: any caller that writes a record must not be
+        // able to persist a token or cookie by forgetting the helper.
+        let record = redact_sensitive_log_values(record);
         let manager = Arc::clone(&self.manager);
+        let config_dir = self.config_dir.clone();
         tokio::task::spawn_blocking(move || {
             let mut line = serde_json::to_vec(&record)
                 .map_err(|error| io::Error::other(format!("日志记录编码失败: {error}")))?;
             line.push(b'\n');
-            let mut manager = manager
+            let mut slot = manager
                 .lock()
                 .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
-            let manager = manager
-                .as_mut()
-                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
-            manager.write_line(&line)
+            // Open on first use inside this blocking task: a separate initialize() would cost a
+            // second thread hop per record.
+            open_manager(&mut slot, &config_dir)?.write_line(&line)
         })
         .await
         .map_err(|error| io::Error::other(format!("日志写入任务失败: {error}")))?
     }
 
     pub(crate) async fn append_json_batch_and_sync(&self, records: Vec<Value>) -> io::Result<()> {
-        self.suspend_archive_pruning().await?;
         if records.is_empty() {
             return Ok(());
         }
+        let records = records
+            .into_iter()
+            .map(redact_sensitive_log_values)
+            .collect::<Vec<_>>();
         let manager = Arc::clone(&self.manager);
+        let config_dir = self.config_dir.clone();
         tokio::task::spawn_blocking(move || {
-            let mut manager = manager
+            let mut slot = manager
                 .lock()
                 .map_err(|_| io::Error::other("日志 writer 状态不可用"))?;
-            let manager = manager
-                .as_mut()
-                .ok_or_else(|| io::Error::other("日志 writer 尚未初始化"))?;
+            let manager = open_manager(&mut slot, &config_dir)?;
+            manager.defer_archive_pruning = true;
             for record in records {
                 let mut line = serde_json::to_vec(&record)
                     .map_err(|error| io::Error::other(format!("日志记录编码失败: {error}")))?;
@@ -1003,6 +1020,35 @@ struct LogManager {
     defer_archive_pruning: bool,
 }
 
+/// Creates a directory only its owner can traverse; also tightens legacy 0755 directories.
+fn create_private_directory(path: &Path) -> io::Result<()> {
+    fs::create_dir_all(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            permissions.set_mode(0o700);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
+/// Ensures a log file is owner-only, including files written by older versions as 0644.
+fn restrict_log_file_permissions(path: &Path) -> io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut permissions = fs::metadata(path)?.permissions();
+        if permissions.mode() & 0o077 != 0 {
+            permissions.set_mode(0o600);
+            fs::set_permissions(path, permissions)?;
+        }
+    }
+    Ok(())
+}
+
 impl LogManager {
     fn open(config_dir: &Path) -> io::Result<Self> {
         Self::open_with_limits(
@@ -1021,7 +1067,8 @@ impl LogManager {
     ) -> io::Result<Self> {
         let log_dir = log_dir(config_dir);
         let archive_dir = archive_dir(config_dir);
-        fs::create_dir_all(&archive_dir)?;
+        create_private_directory(&log_dir)?;
+        create_private_directory(&archive_dir)?;
         let active_path = log_dir.join(log_file_name(active_date));
         let mut manager = Self {
             log_dir,
@@ -1062,12 +1109,16 @@ impl LogManager {
     }
 
     fn open_active_file(&mut self) -> io::Result<()> {
-        fs::create_dir_all(&self.log_dir)?;
-        let file = fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .read(true)
-            .open(&self.active_path)?;
+        create_private_directory(&self.log_dir)?;
+        let mut options = fs::OpenOptions::new();
+        options.create(true).append(true).read(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let file = options.open(&self.active_path)?;
+        restrict_log_file_permissions(&self.active_path)?;
         self.active_bytes = repair_incomplete_jsonl_tail(&file)?;
         self.active_file = Some(file);
         Ok(())
@@ -1107,7 +1158,11 @@ impl LogManager {
             self.active_path = self.log_dir.join(log_file_name(date));
             self.open_active_file()?;
         }
-        if let Some(file) = self.active_file.as_ref() {
+        // `active_bytes` tracks every write, so a plain size comparison detects a torn tail left
+        // by another writer (or a previous crash) without re-reading the file per line.
+        if let Some(file) = self.active_file.as_ref()
+            && file.metadata()?.len() != self.active_bytes
+        {
             self.active_bytes = repair_incomplete_jsonl_tail(file)?;
         }
         let line_len = u64::try_from(line.len()).unwrap_or(u64::MAX);
@@ -1483,7 +1538,30 @@ fn read_log_files(
             Err(error) => return Err(LogExportError::Io(error)),
         }
     }
-    Ok(files)
+    // Export bundles leave the server, so redact every JSON line once here instead of trusting
+    // each producer (tracing lines included) to have done it.
+    Ok(files
+        .into_iter()
+        .map(|(name, bytes)| (name, redact_jsonl_bytes(&bytes)))
+        .collect())
+}
+
+fn redact_jsonl_bytes(bytes: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(bytes.len());
+    for chunk in bytes.split_inclusive(|byte| *byte == b'\n') {
+        let line = chunk.strip_suffix(b"\n").unwrap_or(chunk);
+        match serde_json::from_slice::<Value>(line) {
+            Ok(value) => match serde_json::to_vec(&redact_sensitive_log_values(value)) {
+                Ok(encoded) => {
+                    output.extend_from_slice(&encoded);
+                    output.push(b'\n');
+                }
+                Err(_) => output.extend_from_slice(chunk),
+            },
+            Err(_) => output.extend_from_slice(chunk),
+        }
+    }
+    output
 }
 
 fn add_export_file(
@@ -2017,5 +2095,77 @@ mod tests {
         assert_eq!(events[0].actor_username.as_deref(), Some("admin"));
         assert_eq!(events[0].event_type, "SETTINGS_UPDATED");
         Ok(())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod permission_tests {
+    use super::LogManager;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn log_files_and_directories_are_owner_only() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let manager = LogManager::open(temp.path()).expect("open log manager");
+        let log_dir = temp.path().join("logs");
+        let mode = std::fs::metadata(&log_dir)
+            .expect("log dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o700, "log directory must not be world readable");
+        let file_mode = std::fs::metadata(&manager.active_path)
+            .expect("active log file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(file_mode, 0o600, "log files must be owner only");
+    }
+
+    #[test]
+    fn legacy_world_readable_logs_are_tightened_on_open() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let log_dir = temp.path().join("logs");
+        std::fs::create_dir_all(&log_dir).expect("log dir");
+        std::fs::set_permissions(&log_dir, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod dir");
+        let first = LogManager::open(temp.path()).expect("open log manager");
+        let path = first.active_path.clone();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+        drop(first);
+        let second = LogManager::open(temp.path()).expect("reopen log manager");
+        assert_eq!(second.active_path, path);
+        let mode = std::fs::metadata(&path)
+            .expect("log file")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+        let dir_mode = std::fs::metadata(&log_dir)
+            .expect("log dir")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+    }
+}
+
+#[cfg(test)]
+mod export_redaction_tests {
+    use super::redact_jsonl_bytes;
+
+    #[test]
+    fn export_lines_are_redacted_and_non_json_lines_survive() {
+        let input = concat!(
+            "{\"message\":\"login\",\"password\":\"hunter2\",\"url\":\"https://example.com/a\"}\n",
+            "plain text line\n",
+            "{\"message\":\"ok\",\"requestId\":\"abc\"}\n",
+        );
+        let output = String::from_utf8(redact_jsonl_bytes(input.as_bytes())).expect("utf8");
+        assert!(!output.contains("hunter2"));
+        assert!(!output.contains("example.com"));
+        assert!(output.contains("plain text line"));
+        assert!(output.contains("\"requestId\":\"abc\""));
+        assert_eq!(output.lines().count(), 3);
     }
 }

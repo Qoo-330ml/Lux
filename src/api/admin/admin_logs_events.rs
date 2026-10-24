@@ -360,10 +360,15 @@ pub(crate) async fn admin_events(headers: HeaderMap, State(state): State<AppStat
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
+    let Some(connections) = state.sse_permits.try_acquire() else {
+        return super::sse_capacity_response(&headers);
+    };
 
     let mut receiver = state.admin_events.subscribe();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
+        // Held until the stream ends so the budget reflects live connections.
+        let _connections = connections;
         if writer
             .write_all(b"event: ready\ndata: {\"version\":1}\n\n")
             .await
@@ -422,10 +427,15 @@ pub(crate) async fn user_events(headers: HeaderMap, State(state): State<AppState
     if let Err(response) = require_web_user(&headers, &state).await {
         return response;
     }
+    let Some(connections) = state.sse_permits.try_acquire() else {
+        return super::sse_capacity_response(&headers);
+    };
 
     let mut receiver = state.user_events.subscribe();
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
+        // Held until the stream ends so the budget reflects live connections.
+        let _connections = connections;
         if writer
             .write_all(b"event: ready\ndata: {\"version\":1}\n\n")
             .await

@@ -113,7 +113,10 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
         .await
     });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -663,14 +666,29 @@ async fn local_file_stream_supports_full_head_range_acl_and_path_safety()
     assert_eq!(range.headers()[CONTENT_RANGE], "bytes 2-5/10");
     assert_eq!(range.bytes().await?.as_ref(), b"2345");
 
-    let invalid = client
+    // A multi-range request is not a single range: the server ignores the header and sends the
+    // full representation instead of answering 416.
+    let multi_range = client
         .get(&stream_url)
         .header("X-Emby-Token", &token)
         .header("Range", "bytes=0-1,3-4")
         .send()
         .await?;
-    assert_eq!(invalid.status(), reqwest::StatusCode::RANGE_NOT_SATISFIABLE);
-    assert_eq!(invalid.headers()[CONTENT_RANGE], "bytes */10");
+    assert_eq!(multi_range.status(), reqwest::StatusCode::OK);
+    assert_eq!(multi_range.headers()[CONTENT_LENGTH], "10");
+    assert_eq!(multi_range.bytes().await?.as_ref(), b"0123456789");
+
+    let unsatisfiable = client
+        .get(&stream_url)
+        .header("X-Emby-Token", &token)
+        .header("Range", "bytes=99-")
+        .send()
+        .await?;
+    assert_eq!(
+        unsatisfiable.status(),
+        reqwest::StatusCode::RANGE_NOT_SATISFIABLE
+    );
+    assert_eq!(unsatisfiable.headers()[CONTENT_RANGE], "bytes */10");
 
     let viewer_login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
@@ -778,6 +796,7 @@ async fn emby_direct_playback_admission() -> Result<(), Box<dyn std::error::Erro
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
     let client = reqwest::Client::builder()
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let login = client
@@ -1186,7 +1205,10 @@ async fn emby_playback_events_accept_vidhub_field_names_and_persist_progress()
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(
@@ -1541,7 +1563,10 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let base_url = format!("http://{address}");
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let login = client
         .post(format!("{base_url}/Users/AuthenticateByName"))
         .header(

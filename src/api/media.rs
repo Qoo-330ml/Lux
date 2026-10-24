@@ -768,11 +768,7 @@ pub(super) async fn lux_library_cover(
             | LibraryCoverError::TooLarge { .. },
         ) => return StatusCode::NOT_FOUND.into_response(),
     };
-    if headers
-        .get("if-none-match")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == cover.etag))
-    {
+    if if_none_match_matches(&headers, &cover.etag) {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", &cover.etag)
@@ -1117,9 +1113,15 @@ pub(super) async fn lux_get_item(
             "数据库暂时不可用",
         )
         .into_response(),
-        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-            unreachable!("inaccessible item is returned as not found")
-        }
+        // The catalog already maps inaccessible items to `Ok(None)`; treat any leak the same
+        // way rather than aborting the request.
+        Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => api_error(
+            &headers,
+            StatusCode::NOT_FOUND,
+            lux::ApiErrorCode::NotFound,
+            "媒体条目不存在",
+        )
+        .into_response(),
     }
 }
 
@@ -1787,6 +1789,20 @@ pub(super) async fn lux_search_item_images(
         Ok(user) => user,
         Err(response) => return response,
     };
+    if let Err(response) = require_web_csrf(&headers, &state).await {
+        return response;
+    }
+    // Image search fans out to the external scraper, so it is a management action: any other
+    // caller could otherwise drive arbitrary outbound metadata requests from a user session.
+    if !user.can_manage_server {
+        return api_error(
+            &headers,
+            StatusCode::FORBIDDEN,
+            lux::ApiErrorCode::PermissionDenied,
+            "需要管理员权限",
+        )
+        .into_response();
+    }
     if item_id.parse::<crate::domain::ids::ItemId>().is_err() {
         return api_error(
             &headers,
@@ -2204,18 +2220,19 @@ pub(super) fn is_filmly_image_request(headers: &HeaderMap) -> bool {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(super) enum FilmlyImageCompatMode {
-    Generic,
     #[default]
+    Generic,
     Compat,
 }
 
 pub(super) fn filmly_image_compat_mode_from_env_value(
     value: Option<&str>,
 ) -> FilmlyImageCompatMode {
-    if value.is_some_and(|value| value.trim().eq_ignore_ascii_case("generic")) {
-        FilmlyImageCompatMode::Generic
-    } else {
+    // The compat path serves untagged images without authentication, so it is opt-in only.
+    if value.is_some_and(|value| value.trim().eq_ignore_ascii_case("compat")) {
         FilmlyImageCompatMode::Compat
+    } else {
+        FilmlyImageCompatMode::Generic
     }
 }
 
@@ -3321,7 +3338,10 @@ pub(super) async fn serve_media_path(
         size,
     ) {
         Ok(range) => range,
-        Err(RangeError::Invalid | RangeError::Unsatisfiable) => {
+        // An unparseable Range header must be ignored (RFC 9113 §14.2 sends the full body);
+        // only a syntactically valid but unsatisfiable range earns a 416.
+        Err(RangeError::Invalid) => ByteRange::Full,
+        Err(RangeError::Unsatisfiable) => {
             let mut response = Response::builder()
                 .status(StatusCode::RANGE_NOT_SATISFIABLE)
                 .header("Accept-Ranges", "bytes")
@@ -3801,6 +3821,26 @@ pub(super) async fn serve_emby_library_cover(
     )
 }
 
+/// ETag comparison per RFC 9110 §13.1.2: the `If-None-Match` list is weak-comparison based, so
+/// `W/"x"` matches `"x"`, and `*` matches any current representation.
+pub(super) fn if_none_match_matches(headers: &HeaderMap, etag: &str) -> bool {
+    let Some(value) = headers
+        .get("if-none-match")
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let expected = strip_weak_prefix(etag.trim());
+    value
+        .split(',')
+        .map(str::trim)
+        .any(|candidate| candidate == "*" || strip_weak_prefix(candidate) == expected)
+}
+
+fn strip_weak_prefix(tag: &str) -> &str {
+    tag.strip_prefix("W/").unwrap_or(tag)
+}
+
 pub(super) async fn serve_image_file(
     path: &FsPath,
     content_type: &str,
@@ -3809,11 +3849,7 @@ pub(super) async fn serve_image_file(
     headers: &HeaderMap,
     method: &Method,
 ) -> Response {
-    if headers
-        .get("if-none-match")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == etag))
-    {
+    if if_none_match_matches(headers, etag) {
         return Response::builder()
             .status(StatusCode::NOT_MODIFIED)
             .header("ETag", etag)
@@ -3843,11 +3879,7 @@ async fn serve_variant_file(
     headers: &HeaderMap,
     method: &Method,
 ) -> Option<Response> {
-    if headers
-        .get("if-none-match")
-        .and_then(|value| value.to_str().ok())
-        .is_some_and(|value| value.split(',').any(|tag| tag.trim() == variant.etag))
-    {
+    if if_none_match_matches(headers, &variant.etag) {
         return Some(
             Response::builder()
                 .status(StatusCode::NOT_MODIFIED)
@@ -4534,5 +4566,30 @@ mod direct_ticket_tests {
 
         state.shutdown_background_workers().await;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use super::if_none_match_matches;
+    use axum::http::{HeaderMap, HeaderValue};
+
+    fn headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert("if-none-match", HeaderValue::from_str(value).unwrap());
+        headers
+    }
+
+    #[test]
+    fn weak_and_strong_validators_compare_equal() {
+        assert!(if_none_match_matches(&headers(r#"W/"abc""#), r#""abc""#));
+        assert!(if_none_match_matches(&headers(r#""abc""#), r#"W/"abc""#));
+        assert!(if_none_match_matches(
+            &headers(r#""other", W/"abc""#),
+            r#""abc""#
+        ));
+        assert!(if_none_match_matches(&headers("*"), r#""abc""#));
+        assert!(!if_none_match_matches(&headers(r#""other""#), r#""abc""#));
+        assert!(!if_none_match_matches(&HeaderMap::new(), r#""abc""#));
     }
 }

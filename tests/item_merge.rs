@@ -102,6 +102,7 @@ async fn start_app(
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let login = client
@@ -297,6 +298,7 @@ async fn admin_can_merge_movie_and_series_items_without_losing_sources_or_state(
 
     let (server, base_url, cookies, csrf) = start_app(config, database.clone()).await?;
     let client = reqwest::Client::builder()
+        .no_proxy()
         .timeout(Duration::from_secs(2))
         .build()?;
     let merge = client

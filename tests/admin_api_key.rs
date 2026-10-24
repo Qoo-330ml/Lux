@@ -97,7 +97,10 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let me = client
         .get(format!("http://{address}/api/v1/auth/me"))
@@ -250,7 +253,10 @@ async fn shared_admin_key_can_follow_emby_library_discovery_flow()
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
     let emby_library_id = emby_public_id(&library.id.to_string());
     let emby_root_id = emby_public_id(&library_root.root.id.to_string());
 
@@ -530,7 +536,10 @@ async fn only_web_admins_can_manage_the_shared_key() -> Result<(), Box<dyn std::
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
 
     let admin_login = client
         .post(format!("http://{address}/api/v1/auth/login"))

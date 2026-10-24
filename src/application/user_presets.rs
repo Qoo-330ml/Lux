@@ -494,25 +494,14 @@ async fn write_custom_presets(
 
 #[cfg(test)]
 mod tests {
+    use crate::storage::test_database;
     use crate::{
         application::{libraries::LibraryService, settings::NewUserPermissions},
-        config::Config,
         domain::ids::UserId,
         library::LibraryKind,
-        storage::Database,
     };
 
     use super::*;
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let temp_dir = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8097".parse()?,
-            config_dir: temp_dir.path().join("config"),
-        })
-        .await?;
-        Ok((temp_dir, database))
-    }
 
     fn preset_input(name: &str) -> NewUserPermissionPresetInput {
         NewUserPermissionPresetInput {

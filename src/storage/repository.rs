@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::{Instant, SystemTime, UNIX_EPOCH},
+    time::Instant,
 };
 
 #[cfg(test)]
@@ -73,6 +73,12 @@ mod subtitles;
 mod media;
 #[path = "media_merge.rs"]
 mod media_merge;
+#[path = "media_merge_records.rs"]
+mod media_merge_records;
+pub(crate) use media_merge_records::{
+    MediaMergeOrigin, StoredIdentityMergeCandidateItem, StoredIdentityMergeCandidateKey,
+    StoredMediaMergeRecord, StoredMediaMergeUndo,
+};
 #[path = "scan_fingerprint_migration.rs"]
 mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;
@@ -172,7 +178,10 @@ pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize 
 
 pub(crate) fn manifest_seen_filesystem_update_chunk_size(backend: DatabaseBackend) -> usize {
     match backend {
-        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS.saturating_sub(3) / 3,
+        // The SQLite presence path binds seven values per row when filling its
+        // temporary table; keep the chunk below SQLite's variable limit instead
+        // of assuming three binds per row.
+        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS.saturating_sub(2) / 7,
         DatabaseBackend::Postgres => manifest_path_query_chunk_size(backend),
     }
 }
@@ -252,12 +261,12 @@ mod manifest_positive_index_batch_tests {
         let sqlite_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Sqlite);
         let postgres_size = manifest_seen_filesystem_update_chunk_size(DatabaseBackend::Postgres);
 
-        assert_eq!(sqlite_size, 10_921);
+        assert_eq!(sqlite_size, 4_680);
         assert_eq!(
             postgres_size,
             manifest_path_query_chunk_size(DatabaseBackend::Postgres)
         );
-        assert!(sqlite_size * 3 + 3 <= SQLITE_MAX_BIND_PARAMETERS);
+        assert!(sqlite_size * 7 + 2 <= SQLITE_MAX_BIND_PARAMETERS);
     }
 
     #[test]
@@ -319,6 +328,8 @@ pub(crate) const PLAYBACK_SESSION_STALE_AFTER_SECONDS: i64 = 90;
 pub(crate) const MAX_PLAYBACK_SESSION_WINDOW_SECONDS: i64 = 30 * 24 * 60 * 60;
 pub(crate) const DEFAULT_PLAYED_PERCENT: i64 = 95;
 const MAX_BACKGROUND_PAGE_SIZE: i64 = 500;
+/// Sliding window for Emby access tokens; clients re-authenticate after it lapses.
+pub(crate) const EMBY_ACCESS_TOKEN_TTL_SECONDS: i64 = 180 * 24 * 60 * 60;
 const BATCH_INSERT_CHUNK_SIZE: usize = 100;
 // Four binds per reconciliation row keep 200 rows below SQLite's historical 999-variable limit.
 const SCAN_DML_CHUNK_SIZE: usize = 200;
@@ -327,9 +338,72 @@ const SCAN_MANIFEST_DELTA_BATCH_SIZE: usize = 100;
 const RECOMMENDATION_RATING_CACHE_TTL_SECONDS: i64 = 30 * 86_400;
 const DATABASE_POOL_MAX_CONNECTIONS_ENV: &str = "LUX_DB_MAX_CONNECTIONS";
 const SQLITE_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
-const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 20;
+const POSTGRES_DATABASE_POOL_MAX_CONNECTIONS: u32 = 8;
 const MIN_DATABASE_POOL_MAX_CONNECTIONS: u32 = 1;
 const MAX_DATABASE_POOL_MAX_CONNECTIONS: u32 = 100;
+
+/// Opt-in switch for incremental auto-vacuum. Measured on the deletion path, keeping
+/// the pointer map up to date costs about 1.7x (4.0M rows: 38 s without it, 64 s
+/// with it), so it is not a default: it buys bounded space reclamation at the price
+/// of a slower write path. Operators who would rather reclaim space after deleting a
+/// library than keep the fastest deletes can turn it on.
+const SQLITE_AUTO_VACUUM_ENV: &str = "LUX_SQLITE_AUTO_VACUUM";
+
+fn sqlite_incremental_auto_vacuum_requested() -> bool {
+    parse_sqlite_auto_vacuum_request(std::env::var(SQLITE_AUTO_VACUUM_ENV).ok().as_deref())
+}
+
+fn parse_sqlite_auto_vacuum_request(configured: Option<&str>) -> bool {
+    configured
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "incremental" | "1" | "true" | "on" | "yes"
+            )
+        })
+        .unwrap_or(false)
+}
+
+/// SQLite only honors `auto_vacuum` when it is set before the first table exists, so
+/// a brand-new database reserves incremental-vacuum mode here. Incremental mode lets
+/// a later large deletion return pages to the filesystem in bounded steps instead of
+/// one multi-hour full `VACUUM` that needs a second copy of the file. Existing
+/// databases keep their current mode: switching it requires a full `VACUUM`, which is
+/// an operator decision.
+async fn reserve_sqlite_incremental_vacuum(pool: &AnyPool) -> Result<(), sqlx::Error> {
+    // `auto_vacuum` is connection state until a `VACUUM` folds it into the file
+    // header, so both statements have to run on the same connection.
+    let mut connection = pool.acquire().await?;
+    // `after_connect` already switched the file to WAL, which writes the header and
+    // makes `page_count` non-zero, so emptiness is measured by user tables instead.
+    let user_tables: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%'",
+    )
+    .fetch_one(&mut *connection)
+    .await?;
+    if user_tables > 0 {
+        return Ok(());
+    }
+    sqlx::query("PRAGMA auto_vacuum = INCREMENTAL")
+        .execute(&mut *connection)
+        .await?;
+    sqlx::query("VACUUM").execute(&mut *connection).await?;
+    Ok(())
+}
+
+/// Timeouts applied to every pool so a saturated or half-dead database cannot hang requests.
+const DATABASE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const DATABASE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
+const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(1800);
+
+fn database_pool_options(max_connections: u32) -> AnyPoolOptions {
+    AnyPoolOptions::new()
+        .max_connections(max_connections)
+        .acquire_timeout(DATABASE_POOL_ACQUIRE_TIMEOUT)
+        .idle_timeout(Some(DATABASE_POOL_IDLE_TIMEOUT))
+        .max_lifetime(Some(DATABASE_POOL_MAX_LIFETIME))
+}
 
 fn resolve_database_pool_max_connections(
     backend: DatabaseBackend,
@@ -363,11 +437,7 @@ fn database_flag(value: bool) -> i64 {
 }
 
 fn current_unix_timestamp() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .ok()
-        .and_then(|duration| i64::try_from(duration.as_secs()).ok())
-        .unwrap_or_default()
+    crate::clock::unix_timestamp()
 }
 
 fn recommendation_rating_cache_is_fresh(now: i64, calculated_at: i64) -> bool {
@@ -411,6 +481,8 @@ pub struct Database {
     metadata_write_lock: Arc<AsyncMutex<()>>,
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
+    dashboard_stats_cache: Arc<AsyncMutex<Option<CachedDashboardStats>>>,
+    write_probe: Arc<AsyncMutex<Option<std::time::Instant>>>,
     filesystem_path_templates: Arc<SqlTemplateCache>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
@@ -927,10 +999,16 @@ impl Database {
             DatabaseBackend::Sqlite => {
                 "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"
             }
-            DatabaseBackend::Postgres => "SET TIME ZONE 'UTC'",
+            DatabaseBackend::Postgres => {
+                "SET TIME ZONE 'UTC';
+                 SET idle_in_transaction_session_timeout = '60s';
+                 SET work_mem = '16MB';
+                 SET jit = off;
+                 SET max_parallel_workers_per_gather = 1;
+                 SET statement_timeout = '1800s'"
+            }
         };
-        let pool = AnyPoolOptions::new()
-            .max_connections(pool_max_connections)
+        let pool = database_pool_options(pool_max_connections)
             .after_connect(move |connection, _| {
                 Box::pin(async move {
                     connection.execute(after_connect_sql).await?;
@@ -946,6 +1024,14 @@ impl Database {
                 path: path.clone(),
                 source,
             })?;
+        if backend == DatabaseBackend::Sqlite && sqlite_incremental_auto_vacuum_requested() {
+            reserve_sqlite_incremental_vacuum(&pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.clone(),
+                    source,
+                })?;
+        }
 
         if backend == DatabaseBackend::Postgres
             && let Err(error) = migration::validate_postgres_schema(&pool).await
@@ -999,10 +1085,24 @@ impl Database {
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
+            dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
+            write_probe: Arc::new(AsyncMutex::new(None)),
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
+    }
+
+    /// Rolls a failed write back, logging a rollback failure instead of discarding it.
+    ///
+    /// Callers must be finished with the transaction; it is consumed here.
+    pub(crate) async fn rollback_write_transaction(
+        transaction: sqlx::Transaction<'_, sqlx::Any>,
+        operation: &'static str,
+    ) {
+        if let Err(error) = transaction.rollback().await {
+            tracing::warn!(%error, operation, "failed to roll back a write transaction");
+        }
     }
 
     pub(crate) async fn acquire_metadata_write_lock(
@@ -1015,6 +1115,13 @@ impl Database {
         }
     }
 
+    /// Starts a SQLite write transaction that may read before it writes.
+    ///
+    /// A deferred transaction upgrades to the write lock on its first write; when another
+    /// connection committed in between, that upgrade fails with `SQLITE_BUSY_SNAPSHOT` and
+    /// `busy_timeout` does not help. Any transaction that reads a row it later updates must
+    /// start here. Transactions whose first statement is already a write keep the cheaper
+    /// deferred `begin()`.
     async fn begin_metadata_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
@@ -1171,8 +1278,7 @@ impl Database {
                 path: PathBuf::from("external PostgreSQL"),
                 source,
             })?;
-        let pool = AnyPoolOptions::new()
-            .max_connections(1)
+        let pool = database_pool_options(1)
             .after_connect(|connection, _| {
                 Box::pin(async move {
                     connection.execute("SET TIME ZONE 'UTC'").await?;
@@ -1248,12 +1354,16 @@ impl Database {
         let mut cache_key = library_ids.to_vec();
         cache_key.sort_unstable();
         cache_key.dedup();
-        let mut cache = self.recommendation_rating_median_cache.lock().await;
         let now = current_unix_timestamp();
-        if let Some(entry) = cache.values.get(&cache_key)
-            && recommendation_rating_cache_is_fresh(now, entry.calculated_at)
         {
-            return Ok(entry.value);
+            // Only the map lookup happens under the lock; the queries below run without it so a
+            // slow database does not serialize unrelated cache readers.
+            let cache = self.recommendation_rating_median_cache.lock().await;
+            if let Some(entry) = cache.values.get(&cache_key)
+                && recommendation_rating_cache_is_fresh(now, entry.calculated_at)
+            {
+                return Ok(entry.value);
+            }
         }
 
         let persistent_key = cache_key.join("\u{001f}");
@@ -1274,13 +1384,17 @@ impl Database {
             let calculated_at: i64 = row.get("calculated_at");
             if recommendation_rating_cache_is_fresh(now, calculated_at) {
                 let median: f64 = row.get("median_rating");
-                cache.values.insert(
-                    cache_key,
-                    RecommendationRatingMedianEntry {
-                        value: median,
-                        calculated_at,
-                    },
-                );
+                self.recommendation_rating_median_cache
+                    .lock()
+                    .await
+                    .values
+                    .insert(
+                        cache_key,
+                        RecommendationRatingMedianEntry {
+                            value: median,
+                            calculated_at,
+                        },
+                    );
                 return Ok(median);
             }
         }
@@ -1333,13 +1447,17 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
-        cache.values.insert(
-            cache_key,
-            RecommendationRatingMedianEntry {
-                value: median,
-                calculated_at,
-            },
-        );
+        self.recommendation_rating_median_cache
+            .lock()
+            .await
+            .values
+            .insert(
+                cache_key,
+                RecommendationRatingMedianEntry {
+                    value: median,
+                    calculated_at,
+                },
+            );
         Ok(median)
     }
 
@@ -1390,6 +1508,23 @@ impl Database {
     /// application data or the schema. Committing is intentional: a rollback
     /// can succeed even when the filesystem cannot persist a durable write.
     pub async fn probe_write(&self) -> Result<(), StorageError> {
+        /// Successful probes are cached so a k8s/LB liveness check does not turn into a write
+        /// on every poll. Failures are never cached: readiness must notice a read-only mount
+        /// immediately.
+        const SUCCESS_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+        let last_success = self.write_probe.lock().await;
+        if last_success.is_some_and(|checked_at| checked_at.elapsed() < SUCCESS_TTL) {
+            return Ok(());
+        }
+        drop(last_success);
+        let result = self.probe_write_once().await;
+        if result.is_ok() {
+            *self.write_probe.lock().await = Some(std::time::Instant::now());
+        }
+        result
+    }
+
+    async fn probe_write_once(&self) -> Result<(), StorageError> {
         let mut transaction = self
             .pool
             .begin()
@@ -4778,11 +4913,16 @@ fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {
     Some(Migrator::with_migrations(migrations))
 }
 
-#[derive(Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct DashboardStats {
     pub(crate) movie_count: i64,
     pub(crate) series_count: i64,
     pub(crate) user_count: i64,
+}
+
+pub(crate) struct CachedDashboardStats {
+    pub(crate) computed_at: i64,
+    pub(crate) stats: DashboardStats,
 }
 
 #[derive(Debug, Default, Eq, PartialEq)]
@@ -4873,6 +5013,13 @@ pub(crate) struct UserContentRestrictions {
     pub(crate) blocked_tags: Vec<String>,
     pub(crate) version: i64,
     pub(crate) updated_at: i64,
+}
+
+/// Everything the access layer (and Emby policy DTOs) needs about one user's restrictions.
+pub(crate) struct UserAccessSnapshot {
+    pub(crate) library_access_mode: String,
+    pub(crate) library_ids: Vec<String>,
+    pub(crate) restrictions: Option<UserContentRestrictions>,
 }
 
 #[allow(dead_code)]
@@ -6243,6 +6390,17 @@ pub(crate) struct StoredPersonCredit {
     pub(crate) taglines: Vec<String>,
 }
 
+/// Decodes a person-credit JSON column, reporting corruption instead of silently emptying it.
+fn person_credit_json<T: serde::de::DeserializeOwned + Default>(
+    value: &str,
+    column: &'static str,
+) -> T {
+    serde_json::from_str(value).unwrap_or_else(|error| {
+        tracing::warn!(%error, column, "person credit column holds invalid JSON");
+        T::default()
+    })
+}
+
 fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
     let provider_ids_json: String = row.get("provider_ids_json");
     let genres_json: String = row.get("genres_json");
@@ -6262,13 +6420,16 @@ fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
         deathday: row.get("deathday"),
         known_for_department: row.get("known_for_department"),
         place_of_birth: row.get("place_of_birth"),
-        provider_ids: serde_json::from_str(&provider_ids_json).unwrap_or_default(),
-        genres: serde_json::from_str(&genres_json).unwrap_or_default(),
-        tags: serde_json::from_str(&tags_json).unwrap_or_default(),
-        production_locations: serde_json::from_str(&production_locations_json).unwrap_or_default(),
+        provider_ids: person_credit_json(&provider_ids_json, "provider_ids_json"),
+        genres: person_credit_json(&genres_json, "genres_json"),
+        tags: person_credit_json(&tags_json, "tags_json"),
+        production_locations: person_credit_json(
+            &production_locations_json,
+            "production_locations_json",
+        ),
         premiere_date: row.get("premiere_date"),
         production_year: row.get("production_year"),
-        taglines: serde_json::from_str(&taglines_json).unwrap_or_default(),
+        taglines: person_credit_json(&taglines_json, "taglines_json"),
     }
 }
 
@@ -7532,7 +7693,7 @@ pub(crate) struct ResumeItemsQuery<'a> {
     pub(crate) limit: i64,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum CatalogSort {
     Name,
     SortName,
@@ -7653,6 +7814,7 @@ pub(crate) struct NewDanmakuMatchJob<'a> {
 #[derive(Debug)]
 pub(crate) struct StoredThumbnailSource {
     pub(crate) item_id: String,
+    pub(crate) item_type: String,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
     pub(crate) library_media_strategy_json: Option<String>,
@@ -7786,7 +7948,7 @@ pub(crate) struct StoredScanManifestPostprocessingState {
     pub(crate) roots: Vec<StoredScanManifestPostprocessingRoot>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct StoredChapterDetectionSource {
     pub(crate) source_id: String,
     pub(crate) item_id: String,
@@ -8322,6 +8484,33 @@ fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -
                 in_double_quote = !in_double_quote;
                 adapted.push(character);
             }
+            // Comments are copied verbatim: a `?` inside one is documentation, not a placeholder.
+            '-' if !in_single_quote && !in_double_quote && characters.peek() == Some(&'-') => {
+                adapted.push(character);
+                if let Some(next) = characters.next() {
+                    adapted.push(next);
+                }
+                for next in characters.by_ref() {
+                    adapted.push(next);
+                    if next == '\n' {
+                        break;
+                    }
+                }
+            }
+            '/' if !in_single_quote && !in_double_quote && characters.peek() == Some(&'*') => {
+                adapted.push(character);
+                if let Some(next) = characters.next() {
+                    adapted.push(next);
+                }
+                let mut previous = '\0';
+                while let Some(next) = characters.next() {
+                    adapted.push(next);
+                    if previous == '*' && next == '/' {
+                        break;
+                    }
+                    previous = next;
+                }
+            }
             '?' if !in_single_quote && !in_double_quote => {
                 adapted.push('$');
                 // Formatting into String cannot fail, but the formatting API returns Result.
@@ -8349,16 +8538,7 @@ impl std::error::Error for StorageError {
 #[cfg(test)]
 mod mail_outbox_tests {
     use super::*;
-
-    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
-        let directory = tempfile::tempdir()?;
-        let database = Database::connect(&Config {
-            http_addr: "127.0.0.1:8100".parse()?,
-            config_dir: directory.path().join("config"),
-        })
-        .await?;
-        Ok((directory, database))
-    }
+    use crate::storage::test_database;
 
     fn new_message<'a>(
         idempotency_key: &'a str,
