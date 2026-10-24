@@ -17752,7 +17752,9 @@ MPEG-2/AC-3 的 MKV 样例进入档位 4 软件转码，面板显示 `H.264`/`AA
 结果（2026-10-25；本机 macOS `arm64`）：新增 `src/application/transcoding.rs` 的 4 项单测（默认值、缺省字段、
 归一化与拒绝、数据库往返与损坏回退）通过；`--lib hls` 55/55 覆盖 `-preset`/`-vf scale`/`-b:a`/`-b:v` 上限、
 运行时限额映射、0 并发禁用档位与关闭策略拒绝启动；`--lib playback` 135/135 覆盖 `SERVER_TRANSCODING_DISABLED`
-降级与直放保留；`--test admin_settings` 2/2 覆盖管理员越权 403、非法 preset 400 不落库、保存后重新读取一致。
+降级与直放保留；`--test admin_settings` 2/2 覆盖管理员越权 403、非法 preset 400 不落库、保存后重新读取一致；新增
+`--test playback disabled_transcoding_policy_keeps_emby_playback_info_on_direct_play` 覆盖关闭策略时 Emby 不返回
+`TranscodingUrl`、保留直放、不创建 HLS 会话，并在删除策略后恢复转码 offer（`--test playback` 6/6）。
 真实 ffmpeg 验证 `scale=-2:min(ih\,1080)` 对 320×240 不放大、对 1920×1080 输出 854×480。Web 新增
 `admin-transcoding` 4 项测试，`vitest run` 885/885、`tsc --noEmit` 与构建通过。`cargo clippy --locked
 --all-targets --all-features -- -D warnings` 在本任务引入的代码上清零，仍报告 9 项既有诊断（`emby_catalog`、

@@ -2521,3 +2521,169 @@ printf 'segment-%s' \"$next_number\" > \"$next_segment_path\"
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn disabled_transcoding_policy_keeps_emby_playback_info_on_direct_play()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Policy Movie 2026.mkv"), b"not-a-real-video").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let (item_id, source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id
+         FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         WHERE mi.title = 'Policy Movie'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams
+         (id, media_source_id, stream_index, stream_type, codec, is_default)
+         VALUES (?, ?, 0, 'VIDEO', 'hevc', 1), (?, ?, 1, 'AUDIO', 'eac3', 1)",
+    )
+    .bind(format!("{source_id}-video"))
+    .bind(&source_id)
+    .bind(format!("{source_id}-audio"))
+    .bind(&source_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_sources SET probe_status = 'READY', bitrate = ? WHERE id = ?")
+        .bind(13_900_000_i64)
+        .bind(&source_id)
+        .execute(database.pool())
+        .await?;
+    let emby_item_id = emby_public_id(&item_id);
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('transcoding', '{\"enabled\":false}')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let app = app_with_state(
+        AppState::ready(
+            config,
+            database.clone(),
+            setup,
+            WebAuthService::new(database.clone())?,
+            EmbyAuthService::new(database.clone())?,
+        )
+        .with_hls_executable(std::path::PathBuf::from("/usr/bin/false")),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="PolicyTest", Device="Mac", DeviceId="policy-test", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    let login_body = login.json::<Value>().await?;
+    let token = login_body["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+
+    // The client insists on transcoding and its device profile rejects direct play; the server
+    // must still offer direct play instead of a transcoding URL it would refuse to honour.
+    let body = json!({
+        "MediaSourceId": source_id,
+        "EnableDirectPlay": false,
+        "EnableTranscoding": true,
+        "DeviceProfile": {
+            "DirectPlayProfiles": [{
+                "Container": "mp4",
+                "VideoCodec": "h264",
+                "AudioCodec": "aac",
+                "Type": "Video"
+            }],
+            "TranscodingProfiles": [{
+                "Container": "mp4",
+                "VideoCodec": "h264",
+                "AudioCodec": "aac",
+                "Protocol": "hls",
+                "Type": "Video"
+            }]
+        }
+    });
+    let disabled = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str()), ("ForceTranscode", "true")])
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(disabled.status(), reqwest::StatusCode::OK);
+    let disabled = disabled.json::<Value>().await?;
+    assert!(
+        disabled["MediaSources"][0].get("TranscodingUrl").is_none(),
+        "a disabled policy must not return a transcoding URL: {disabled}"
+    );
+    assert_ne!(
+        disabled["MediaSources"][0]["SupportsTranscoding"],
+        json!(true)
+    );
+    assert_ne!(
+        disabled["MediaSources"][0]["SupportsDirectPlay"],
+        json!(false),
+        "direct play must stay available when transcoding is disabled: {disabled}"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM web_playback_sessions WHERE plan = 'SERVER_HLS'",
+        )
+        .fetch_one(database.pool())
+        .await?,
+        0
+    );
+
+    // Re-enabling the policy restores the transcoding offer for the next request.
+    sqlx::query("DELETE FROM server_settings WHERE key = 'transcoding'")
+        .execute(database.pool())
+        .await?;
+    let enabled = client
+        .post(format!("{base_url}/Items/{emby_item_id}/PlaybackInfo"))
+        .query(&[("api_key", token.as_str())])
+        .json(&body)
+        .send()
+        .await?;
+    assert_eq!(enabled.status(), reqwest::StatusCode::OK);
+    let enabled = enabled.json::<Value>().await?;
+    assert_eq!(
+        enabled["MediaSources"][0]["SupportsTranscoding"],
+        json!(true)
+    );
+    assert!(
+        enabled["MediaSources"][0]["TranscodingUrl"].is_string(),
+        "the offer must come back once transcoding is enabled: {enabled}"
+    );
+
+    server.abort();
+    Ok(())
+}
