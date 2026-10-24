@@ -371,6 +371,12 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   `eventId` 和 `sequence` 在会话内幂等；重复事件返回 `duplicate`，乱序事件返回 `stale`，不会倒退播放位置。
   `STOPPED` 会停止会话并回收服务端 HLS 进程和临时目录。
 - `POST /api/v1/playback/sessions/{sessionId}/heartbeat`：延长活动会话 TTL，返回新的 `expiresAt`。
+- `GET /api/v1/playback/sessions/{sessionId}/stats`：只读播放统计，供电播放信息面板使用。只允许会话所属用户，
+  他人会话、不存在或已过期会话返回 404；`GET` 不写库、不续租、不启动 FFmpeg。响应包含 `plan`、`tier`、
+  `state`、`expiresAt`、`output`（`container`、`videoCodec`、`audioCodec`、`videoBitrate`、`audioBitrate`）
+  和 `progress`。`progress` 只在服务端 HLS 有 FFmpeg 进程时非空，字段为 `fps`、`speed`、`bitrateKbps`、
+  `totalSize`、`outTimeSeconds`、`duplicatedFrames`、`droppedFrames`、`finished`、`updatedAt`（毫秒时间戳），
+  数据来自 FFmpeg `-progress pipe:1`，约每 0.5 秒刷新，不代表整段媒体的最终统计。
 - `DELETE /api/v1/playback/sessions/{sessionId}`：停止当前用户的会话并回收服务端资源，成功返回 204。
 
 `.strm` 永远只允许档位 0；直连失败时返回 `UNSUPPORTED`，不进入 Remux、音频/视频转码、HLS 或媒体字节代理。
