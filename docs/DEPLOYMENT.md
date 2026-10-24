@@ -95,6 +95,9 @@ LUX_PROXY_URL=http://192.168.1.2:7890
 
 `LUX_PROXY_URL` 可选，用于 Lux 及其外置插件的出站网络请求，例如元数据、图片和人物头像下载。支持 `http://`、`https://`、`socks4://`、`socks4a://`、`socks5://` 和 `socks5h://` 代理地址；代理 URL 可包含用户名认证信息。留空时使用标准系统代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`）；这些变量也可使用小写形式。代理地址不参与入站反向代理，也不改变 `.strm` 直交行为。包含认证信息的代理 URL 应只通过受保护的环境变量或 secrets 注入，不能写入日志。TMDb/豆瓣凭据请在各自插件的专属配置中设置，不再通过 `LUX_TMDB_*` 环境变量注入 Lux 主进程。
 
+外置插件的请求由插件子进程自己发出，宿主只通过 `LUX_PROXY_URL` 下发代理，而且插件无法读取 `NO_PROXY` 按域名绕过。需要让某个插件不经代理直连时，在 `config/plugin_proxy_bypass` 中每行写一个插件 id（也接受逗号分隔；`#` 起注释），或用 `LUX_PLUGIN_PROXY_BYPASS` 提供同样的列表；文件优先于环境变量。名单内的插件启动时不会收到 `LUX_PROXY_URL`，并会移除继承的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`（含小写形式）。例如某些上游按代理出口 IP 拒绝访问（Cloudflare 403），而宿主自身地址可以正常访问，就应把该章节源加入此名单，而不是放宽全局代理规则。
+
+
 本地文件索引默认使用 4 路 worker，在线元数据刮削默认使用 4 路 worker；FILL_MISSING 的进程级上限也是 4。官方 Docker 镜像和 Compose 默认注入 LUX_SCAN_CONCURRENCY=4、LUX_FFMPEG_CONCURRENCY=2；LUX_PROBE_CONCURRENCY 留空时按有效 CPU 容量自动计算进程级探测预算 ceil(CPU 核数 × 4)，上限 512，运行中活动并发按本地 ffprobe 成功完成速率自适应调整。显式 LUX_PROBE_CONCURRENCY 仍覆盖自动预算。自适应调度不读取 CPU 使用率；首页延迟或 cgroup 内存压力只用于保护性降档。
 
 LUX_BACKGROUND_CPU_BUDGET 为扫描准备、指纹、后台 NFO/图片计算、ffprobe 和缩略图 ffmpeg 提供进程级共享准入；留空时按可见 CPU 与 cgroup CPU 限额推导 max(1, min(CPU 数) - 1)，自动值上限 16，显式整数范围为 1–32，进程启动时读取。它不构成 OS CPU 配额，单个 ffprobe/ffmpeg 仍可能使用多个 CPU 线程；探测器自适应预算与后台共享预算共同限制活动工作。

@@ -194,9 +194,11 @@ impl PluginService {
         let catalog = Arc::new(RwLock::new(PluginCatalog::discover(
             &config_dir.join("plugins"),
         )));
+        let proxy_bypass = crate::application::settings::read_plugin_proxy_bypass(&config_dir);
         let supervisor = PluginSupervisor::new_with_shared_catalog(catalog.clone())
             .with_config_dir(config_dir.clone())
-            .with_network_proxy_url(proxy_url.clone());
+            .with_network_proxy_url(proxy_url.clone())
+            .with_proxy_bypass(proxy_bypass);
         let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
         Self {
             database,

@@ -69,6 +69,16 @@ pub(crate) async fn update_registration_mode(
 }
 
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
+/// Plugins listed here are started without the configured outbound proxy: the supervisor does not
+/// inject `LUX_PROXY_URL` and removes the proxy variables the child would otherwise inherit.
+///
+/// Some upstream APIs reject a proxy exit address while accepting the host's own address, and a
+/// proxy rule cannot fix that from inside Lux. One plugin id per line (a comma-separated single
+/// line also works).
+pub const PLUGIN_PROXY_BYPASS_FILE: &str = "plugin_proxy_bypass";
+/// Environment fallback for [`PLUGIN_PROXY_BYPASS_FILE`], used by container deployments that do not
+/// want to mount another file.
+pub const PLUGIN_PROXY_BYPASS_ENV: &str = "LUX_PLUGIN_PROXY_BYPASS";
 const MAX_TRUSTED_PROXY_CIDRS: usize = 100;
 pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";
 pub const RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE: &str = "RECENTLY_ADDED";
@@ -1015,6 +1025,42 @@ pub fn read_network_proxy_url(config_dir: &Path) -> Option<String> {
     read_secret(config_dir.join(NETWORK_PROXY_URL_FILE))
 }
 
+/// Plugin ids that must reach their upstream without the configured outbound proxy.
+///
+/// The file wins over the environment fallback so an operator can keep the list next to the proxy
+/// configuration; both accept one id per line or a comma-separated list.
+pub fn read_plugin_proxy_bypass(config_dir: &Path) -> Vec<String> {
+    let configured = std::fs::read_to_string(config_dir.join(PLUGIN_PROXY_BYPASS_FILE))
+        .ok()
+        .map(|value| parse_plugin_proxy_bypass(&value))
+        .filter(|ids| !ids.is_empty());
+    configured.unwrap_or_else(|| {
+        std::env::var(PLUGIN_PROXY_BYPASS_ENV)
+            .ok()
+            .map(|value| parse_plugin_proxy_bypass(&value))
+            .unwrap_or_default()
+    })
+}
+
+pub fn parse_plugin_proxy_bypass(value: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in value.lines() {
+        // `#` starts a comment that runs to the end of the line.
+        let line = line.split('#').next().unwrap_or_default();
+        for candidate in line.split([',', ' ', '\t']) {
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                continue;
+            }
+            let candidate = candidate.to_owned();
+            if !ids.contains(&candidate) {
+                ids.push(candidate);
+            }
+        }
+    }
+    ids
+}
+
 fn read_secret(path: impl AsRef<Path>) -> Option<String> {
     std::fs::read_to_string(path)
         .ok()
@@ -1071,6 +1117,22 @@ async fn write_secret_file(
 #[cfg(test)]
 mod variant_cache_tests {
     use super::*;
+
+    #[test]
+    fn parses_a_proxy_bypass_list_from_lines_commas_and_comments() {
+        let parsed = parse_plugin_proxy_bypass(
+            "org.lux.theintrodb-chapter-source\n  org.lux.douban , # comment\r\norg.lux.tmdb\norg.lux.tmdb\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "org.lux.theintrodb-chapter-source".to_owned(),
+                "org.lux.douban".to_owned(),
+                "org.lux.tmdb".to_owned(),
+            ]
+        );
+        assert!(parse_plugin_proxy_bypass("   \n ").is_empty());
+    }
 
     #[test]
     fn legacy_media_strategy_json_defaults_the_variant_cache_to_off() {
