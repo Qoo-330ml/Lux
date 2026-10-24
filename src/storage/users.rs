@@ -4842,6 +4842,35 @@ impl Database {
         })
     }
 
+    pub(crate) async fn transcoding_settings(&self) -> Result<Option<String>, StorageError> {
+        self.query_scalar(
+            "SELECT value FROM server_settings
+             WHERE key = 'transcoding'",
+        )
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn set_transcoding_settings(&self, value: &str) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO server_settings (key, value)
+             VALUES ('transcoding', ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = unixepoch()",
+        )
+        .bind(value)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     pub(crate) async fn login_background_source(&self) -> Result<Option<String>, StorageError> {
         self.query_scalar(
             "SELECT value FROM server_settings

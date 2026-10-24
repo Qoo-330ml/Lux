@@ -1511,6 +1511,26 @@ export type AdminImage = {
   source?: string | null;
 };
 
+export type AdminTranscodingSettings = {
+  enabled: boolean;
+  hardwareEncoder: string;
+  remuxSessions: number;
+  hardwareSessions: number;
+  softwareSessions: number;
+  sessionQuotaMb: number;
+  globalBudgetMb: number;
+  minFreeSpaceMb: number;
+  maxVideoBitrateKbps: number;
+  softwarePreset: string;
+  maxOutputHeight: number;
+  audioBitrateKbps: number;
+};
+
+export type AdminTranscodingOptions = {
+  hardwareEncoders: string[];
+  softwarePresets: string[];
+};
+
 export type AdminSettings = {
   serverName?: string;
   resumePlayedPercent: number;
@@ -1523,6 +1543,8 @@ export type AdminSettings = {
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;
+  transcoding?: AdminTranscodingSettings;
+  transcodingOptions?: AdminTranscodingOptions;
   networkProxy?: AdminNetworkProxySettings;
 };
 

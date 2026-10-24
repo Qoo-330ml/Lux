@@ -235,3 +235,136 @@ async fn registration_settings_require_admin_csrf_and_version_without_changing_m
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn transcoding_settings_are_admin_only_validated_and_persisted()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let users = UserStore::new(database.clone())?;
+    users
+        .create_initial_admin("admin", "Admin", "settings-test-password")
+        .await?;
+    users
+        .create_user("viewer", "Viewer", "settings-test-password", false)
+        .await?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        SetupService::new(database.clone())?,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database)?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let base = format!("http://{}", listener.local_addr()?);
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(12))
+        .build()?;
+    let endpoint = format!("{base}/api/v1/admin/settings");
+    let (admin_cookies, admin_csrf) = login(&client, &base, "admin").await?;
+    let (viewer_cookies, viewer_csrf) = login(&client, &base, "viewer").await?;
+
+    let initial = client
+        .get(&endpoint)
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(initial.status(), StatusCode::OK);
+    let initial = initial.json::<Value>().await?;
+    let transcoding = initial["transcoding"].clone();
+    assert_eq!(transcoding["enabled"], json!(true));
+    assert_eq!(transcoding["hardwareEncoder"], json!("NONE"));
+    assert_eq!(transcoding["remuxSessions"], json!(4));
+    assert_eq!(transcoding["hardwareSessions"], json!(2));
+    assert_eq!(transcoding["softwareSessions"], json!(1));
+    assert_eq!(transcoding["softwarePreset"], json!("veryfast"));
+    assert_eq!(transcoding["audioBitrateKbps"], json!(192));
+    assert_eq!(
+        initial["transcodingOptions"]["hardwareEncoders"],
+        json!(["h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"])
+    );
+    assert!(
+        initial["transcodingOptions"]["softwarePresets"]
+            .as_array()
+            .is_some_and(|presets| presets.iter().any(|preset| preset == "veryfast"))
+    );
+
+    let forbidden = client
+        .patch(&endpoint)
+        .header(COOKIE, &viewer_cookies)
+        .header("X-CSRF-Token", &viewer_csrf)
+        .json(&json!({ "transcoding": { "enabled": false } }))
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), StatusCode::FORBIDDEN);
+
+    let invalid = client
+        .patch(&endpoint)
+        .header(COOKIE, &admin_cookies)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({ "transcoding": { "softwarePreset": "placebo" } }))
+        .send()
+        .await?;
+    assert_eq!(invalid.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(
+        invalid.json::<Value>().await?["error"]["message"],
+        json!("服务端转码设置无效")
+    );
+
+    let saved = client
+        .patch(&endpoint)
+        .header(COOKIE, &admin_cookies)
+        .header("X-CSRF-Token", &admin_csrf)
+        .json(&json!({
+            "transcoding": {
+                "enabled": false,
+                "hardwareEncoder": "h264_videotoolbox",
+                "remuxSessions": 0,
+                "hardwareSessions": 3,
+                "softwareSessions": 2,
+                "sessionQuotaMb": 1024,
+                "globalBudgetMb": 4096,
+                "minFreeSpaceMb": 256,
+                "maxVideoBitrateKbps": 8000,
+                "softwarePreset": "fast",
+                "maxOutputHeight": 1080,
+                "audioBitrateKbps": 256
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(saved.status(), StatusCode::OK);
+    let saved = saved.json::<Value>().await?;
+    assert_eq!(saved["transcoding"]["enabled"], json!(false));
+    assert_eq!(
+        saved["transcoding"]["hardwareEncoder"],
+        json!("h264_videotoolbox")
+    );
+    assert_eq!(saved["transcoding"]["remuxSessions"], json!(0));
+    assert_eq!(saved["transcoding"]["softwarePreset"], json!("fast"));
+    assert_eq!(saved["transcoding"]["maxOutputHeight"], json!(1080));
+    assert_eq!(saved["transcoding"]["audioBitrateKbps"], json!(256));
+
+    // The stored row survives a fresh read, so a restart keeps the policy.
+    let reloaded = client
+        .get(&endpoint)
+        .header(COOKIE, &admin_cookies)
+        .send()
+        .await?;
+    assert_eq!(reloaded.status(), StatusCode::OK);
+    let reloaded = reloaded.json::<Value>().await?;
+    assert_eq!(reloaded["transcoding"], saved["transcoding"]);
+
+    // Unrelated settings stay untouched by a transcoding-only patch.
+    assert_eq!(reloaded["resumeMinTicks"], initial["resumeMinTicks"]);
+    assert_eq!(reloaded["mediaStrategy"], initial["mediaStrategy"]);
+
+    server.abort();
+    Ok(())
+}

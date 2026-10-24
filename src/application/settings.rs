@@ -7,6 +7,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    application::transcoding::{
+        TranscodingSettings, read_transcoding_settings, write_transcoding_settings,
+    },
     application::{
         admin_dashboard::DEFAULT_SERVER_NAME,
         home::HomeService,
@@ -352,6 +355,7 @@ pub(crate) struct AdminSettingsSnapshot {
     pub(crate) login_background_source: String,
     pub(crate) login_background_source_status: String,
     pub(crate) media_strategy: MediaStrategySettings,
+    pub(crate) transcoding: TranscodingSettings,
     pub(crate) network_proxy: NetworkProxySettings,
 }
 
@@ -372,6 +376,7 @@ pub(crate) struct AdminSettingsUpdate {
     pub(crate) new_user_permissions: Option<NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
+    pub(crate) transcoding: Option<TranscodingSettings>,
     pub(crate) network_proxy: NetworkProxyChange,
 }
 
@@ -386,6 +391,7 @@ pub(crate) enum AdminSettingsError {
     InvalidUserActivityRetentionDays,
     InvalidTrustedProxyCidrs,
     InvalidNewUserPermissions,
+    InvalidTranscodingSettings,
     InvalidNetworkProxy,
     PluginServiceUnavailable,
     Plugin(PluginServiceError),
@@ -402,6 +408,7 @@ struct StoredAdminSettings {
     new_user_permissions: NewUserPermissions,
     login_background_source: String,
     media_strategy: MediaStrategySettings,
+    transcoding: TranscodingSettings,
 }
 
 pub(crate) async fn read_admin_settings(
@@ -431,6 +438,7 @@ pub(crate) async fn read_admin_settings(
         _ => DEFAULT_SERVER_NAME.to_owned(),
     };
     let network_proxy = network_proxy_settings(config_dir).await;
+    let transcoding = read_transcoding_settings(database).await;
     Ok(AdminSettingsSnapshot {
         server_name,
         resume_played_percent,
@@ -443,6 +451,7 @@ pub(crate) async fn read_admin_settings(
         login_background_source,
         login_background_source_status,
         media_strategy,
+        transcoding,
         network_proxy,
     })
 }
@@ -482,6 +491,12 @@ pub(crate) async fn update_admin_settings(
         }
     }
     let media_strategy = update.media_strategy.unwrap_or(current.media_strategy);
+    let transcoding = match update.transcoding {
+        Some(settings) => settings
+            .normalized()
+            .map_err(|_| AdminSettingsError::InvalidTranscodingSettings)?,
+        None => current.transcoding,
+    };
     let server_name = match update.server_name {
         Some(name) => normalize_server_name(&name).ok_or(AdminSettingsError::InvalidServerName)?,
         None => current.server_name,
@@ -596,6 +611,9 @@ pub(crate) async fn update_admin_settings(
     )
     .await
     .map_err(|_| AdminSettingsError::Unavailable)?;
+    write_transcoding_settings(database, &transcoding)
+        .await
+        .map_err(|_| AdminSettingsError::InvalidTranscodingSettings)?;
     let login_background_source_status =
         login_background_source_status(plugins, &login_background_source).await;
     let network_proxy = network_proxy_settings(config_dir).await;
@@ -611,6 +629,7 @@ pub(crate) async fn update_admin_settings(
         login_background_source,
         login_background_source_status,
         media_strategy,
+        transcoding,
         network_proxy,
     })
 }
@@ -635,6 +654,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         Some(name) if !name.trim().is_empty() => name,
         _ => DEFAULT_SERVER_NAME.to_owned(),
     };
+    let transcoding = read_transcoding_settings(database).await;
     Ok(StoredAdminSettings {
         server_name,
         resume_played_percent,
@@ -646,6 +666,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         new_user_permissions,
         login_background_source,
         media_strategy,
+        transcoding,
     })
 }
 

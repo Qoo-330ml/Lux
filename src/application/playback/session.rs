@@ -365,6 +365,18 @@ impl WebPlaybackSessionService {
             },
             policy,
         )?);
+        // An administrator can turn server-side processing off entirely. The plan then degrades to
+        // direct play (or an explicit unsupported reason) instead of starting FFmpeg.
+        let plan = if !self.transcoding_settings().await.enabled {
+            match plan {
+                WebPlaybackPlan::ServerHls { .. } => WebPlaybackPlan::Unsupported {
+                    reason: UnsupportedReason::ServerTranscodingDisabled,
+                },
+                plan => plan,
+            }
+        } else {
+            plan
+        };
         let WebPlaybackPlan::Unsupported { .. } = plan else {
             let id = Uuid::now_v7().to_string();
             let play_session_id = format!("{}:{id}", input.play_session_prefix);
@@ -1024,6 +1036,21 @@ impl WebPlaybackSessionService {
         .await
     }
 
+    /// Current administrator transcoding policy; unreadable rows fall back to defaults.
+    pub(crate) async fn transcoding_settings(
+        &self,
+    ) -> crate::application::transcoding::TranscodingSettings {
+        crate::application::transcoding::read_transcoding_settings(&self.database).await
+    }
+
+    /// Applies a policy change immediately so capability reporting and the next session agree.
+    pub(crate) fn apply_transcoding_settings(
+        &self,
+        settings: &crate::application::transcoding::TranscodingSettings,
+    ) {
+        self.hls.apply_settings(settings);
+    }
+
     async fn start_hls_with_runtime(
         &self,
         session_id: &str,
@@ -1031,6 +1058,9 @@ impl WebPlaybackSessionService {
         input: &std::path::Path,
         options: HlsWebStartOptions,
     ) -> Result<(), WebPlaybackSessionError> {
+        // Every HLS start re-reads the policy so a saved setting applies to the next session
+        // without a restart, while running sessions keep their captured parameters.
+        self.hls.apply_settings(&self.transcoding_settings().await);
         self.hls
             .start_with_audio(session_id, tier, input, options)
             .await?;
@@ -1055,6 +1085,7 @@ impl WebPlaybackSessionService {
         video_bitrate: Option<i64>,
         options: HlsStartOptions,
     ) -> Result<(), WebPlaybackSessionError> {
+        self.hls.apply_settings(&self.transcoding_settings().await);
         self.hls
             .start_emby_vod(session_id, tier, input, video_bitrate, options)
             .await?;
@@ -2118,6 +2149,99 @@ mod tests {
                 .expect_err("only the owner's live session exposes statistics");
             assert!(matches!(error, super::WebPlaybackSessionError::NotFound));
         }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn disabling_server_transcoding_degrades_plans_to_unsupported()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let source_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind, container, is_default)
+             VALUES (?, ?, 'LOCAL_FILE', 'mkv', 1)",
+        )
+        .bind(&source_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        let service = WebPlaybackSessionService::new(database.clone(), config.config_dir.clone());
+        crate::application::transcoding::write_transcoding_settings(
+            &database,
+            &crate::application::transcoding::TranscodingSettings {
+                enabled: false,
+                ..crate::application::transcoding::TranscodingSettings::default()
+            },
+        )
+        .await?;
+        let user_id = user.id.to_string();
+        let transcode_capabilities = PlaybackCapabilities {
+            direct_play: false,
+            hls: true,
+            video_copy_to_fmp4: true,
+            audio_copy_to_fmp4: true,
+            hardware_transcode: false,
+            software_transcode: true,
+        };
+        let created = service
+            .create(CreateWebPlaybackSession {
+                user_id: &user_id,
+                is_admin: true,
+                item_id: &item_id,
+                media_source_id: &source_id,
+                play_session_prefix: "lux-web",
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: transcode_capabilities,
+            })
+            .await?;
+        assert_eq!(
+            created.plan,
+            WebPlaybackPlan::Unsupported {
+                reason: UnsupportedReason::ServerTranscodingDisabled
+            }
+        );
+        assert!(created.id.is_empty(), "no session row is created");
+        let stored: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM web_playback_sessions")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(stored, 0);
+
+        let direct = service
+            .create(CreateWebPlaybackSession {
+                user_id: &user_id,
+                is_admin: true,
+                item_id: &item_id,
+                media_source_id: &source_id,
+                play_session_prefix: "lux-web",
+                source_kind: PlaybackSourceKind::LocalFile,
+                capabilities: PlaybackCapabilities {
+                    direct_play: true,
+                    ..transcode_capabilities
+                },
+            })
+            .await?;
+        assert_eq!(direct.plan, WebPlaybackPlan::Direct);
         Ok(())
     }
 

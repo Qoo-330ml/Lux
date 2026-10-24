@@ -311,7 +311,13 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Ok(settings) => settings,
         Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    Json(json!({
+    Json(admin_settings_json(&settings)).into_response()
+}
+
+pub(crate) fn admin_settings_json(
+    settings: &crate::application::settings::AdminSettingsSnapshot,
+) -> Value {
+    json!({
         "serverName": settings.server_name,
         "resumePlayedPercent": settings.resume_played_percent,
         "resumeMinTicks": settings.resume_min_ticks,
@@ -323,9 +329,14 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,
+        "transcoding": settings.transcoding,
+        // Advertised so the admin UI never hard-codes a list the server would reject.
+        "transcodingOptions": {
+            "hardwareEncoders": crate::application::transcoding::HARDWARE_ENCODERS,
+            "softwarePresets": crate::application::transcoding::SOFTWARE_PRESETS,
+        },
         "networkProxy": settings.network_proxy,
-    }))
-    .into_response()
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -428,6 +439,7 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
     pub(crate) new_user_permissions: Option<crate::application::settings::NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
+    pub(crate) transcoding: Option<crate::application::transcoding::TranscodingSettings>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
 }
@@ -545,6 +557,7 @@ pub(crate) async fn admin_update_settings(
             new_user_permissions: request.new_user_permissions,
             login_background_source: request.login_background_source,
             media_strategy: request.media_strategy,
+            transcoding: request.transcoding,
             network_proxy,
         },
     )
@@ -620,6 +633,15 @@ pub(crate) async fn admin_update_settings(
             )
             .into_response();
         }
+        Err(crate::application::settings::AdminSettingsError::InvalidTranscodingSettings) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "服务端转码设置无效",
+            )
+            .into_response();
+        }
         Err(crate::application::settings::AdminSettingsError::InvalidNetworkProxy) => {
             return api_error(
                 &headers,
@@ -645,28 +667,17 @@ pub(crate) async fn admin_update_settings(
     if let Some(variants) = state.image_variants.as_ref() {
         variants.apply_settings(settings.media_strategy.images.variant_cache.clone());
     }
+    if let Some(web_playback) = state.web_playback.as_ref() {
+        web_playback.apply_transcoding_settings(&settings.transcoding);
+    }
     record_audit_event(
         &state,
         &headers,
         "SETTINGS_UPDATED",
         Some("settings"),
         None,
-        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"userActivityRetentionDays":{},"loginBackgroundSource":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.user_activity_retention_days, settings.login_background_source),
+        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"userActivityRetentionDays":{},"loginBackgroundSource":"{}","transcodingEnabled":{},"transcodingPreset":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.user_activity_retention_days, settings.login_background_source, settings.transcoding.enabled, settings.transcoding.software_preset),
     )
     .await;
-    Json(json!({
-        "serverName": settings.server_name,
-        "resumePlayedPercent": settings.resume_played_percent,
-        "resumeMinTicks": settings.resume_min_ticks,
-        "forceAdminLibraryOrder": settings.force_admin_library_order,
-        "userDeletionGraceDays": settings.user_deletion_grace_days,
-        "userActivityRetentionDays": settings.user_activity_retention_days,
-        "trustedProxyCidrs": settings.trusted_proxy_cidrs,
-        "newUserPermissions": settings.new_user_permissions,
-        "loginBackgroundSource": settings.login_background_source,
-        "loginBackgroundSourceStatus": settings.login_background_source_status,
-        "mediaStrategy": settings.media_strategy,
-        "networkProxy": settings.network_proxy,
-    }))
-    .into_response()
+    Json(admin_settings_json(&settings)).into_response()
 }

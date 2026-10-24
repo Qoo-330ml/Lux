@@ -282,6 +282,12 @@ pub(super) async fn emby_playback_info(
         .unwrap_or_else(|| Uuid::now_v7().to_string());
     let direct_ticket_expires_at =
         current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
+    // When an administrator disables server transcoding, Emby clients are told direct play is the
+    // only option instead of receiving a transcoding capability the server would refuse.
+    let transcoding_enabled = match state.web_playback.as_ref() {
+        Some(service) => service.transcoding_settings().await.enabled,
+        None => false,
+    };
     let mut direct_ticket_issued = false;
     let media_sources = sources
         .into_iter()
@@ -295,7 +301,8 @@ pub(super) async fn emby_playback_info(
             let source_transcode_session = transcode_session
                 .as_ref()
                 .filter(|session| session.media_source_id == source.id);
-            let source_can_transcode = source.source_kind == "LOCAL_FILE"
+            let source_can_transcode = transcoding_enabled
+                && source.source_kind == "LOCAL_FILE"
                 && (source_transcode_session.is_some()
                     || request.enable_transcoding != Some(false)
                         && (request.enable_transcoding == Some(true)
@@ -303,9 +310,9 @@ pub(super) async fn emby_playback_info(
                                 .device_profile
                                 .as_ref()
                                 .is_some_and(EmbyDeviceProfile::supports_lux_hls)));
-            let direct_play_disabled = request.enable_direct_play == Some(false)
-                || force_transcode
-                || source_transcode_session.is_some();
+            let direct_play_disabled = source_transcode_session.is_some()
+                || (transcoding_enabled
+                    && (request.enable_direct_play == Some(false) || force_transcode));
             if let Value::Object(object) = &mut value {
                 object.insert(
                     "RunTimeTicks".to_owned(),
@@ -1063,6 +1070,9 @@ async fn create_emby_transcoding_session(
     let Some(service) = state.web_playback.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
+    if !service.transcoding_settings().await.enabled {
+        return Ok(None);
+    }
     let Some(access) = state.access.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };

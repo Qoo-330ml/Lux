@@ -355,6 +355,17 @@ impl AppState {
             database.clone(),
             config_dir.clone(),
         ));
+        // Load the administrator transcoding policy before the first playback session so hardware
+        // capability reporting matches what FFmpeg will actually be asked to use.
+        if let Some(service) = web_playback.as_ref()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            let service = service.clone();
+            handle.spawn(async move {
+                let settings = service.transcoding_settings().await;
+                service.apply_transcoding_settings(&settings);
+            });
+        }
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
         let catalog = CatalogService::new(database.clone(), access.clone());
