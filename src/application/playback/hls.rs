@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -13,7 +13,7 @@ use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
 
 use tokio::{
     fs,
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::{Child, Command},
     sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
     time::sleep,
@@ -43,6 +43,100 @@ const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
 const ORPHAN_PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Session identifiers become directory names, so they stay within one predictable segment.
 const MAX_SESSION_ID_BYTES: usize = 128;
+/// `ffmpeg -progress` writes one `key=value` pair per line; anything larger is not a progress
+/// report and must not grow the reader's buffer.
+const MAX_PROGRESS_LINE_BYTES: usize = 4_096;
+
+/// The newest complete-enough `ffmpeg -progress` values for one HLS process generation.
+///
+/// FFmpeg emits a block of `key=value` lines roughly twice a second and closes each block with
+/// `progress=continue` or `progress=end`. The reader applies lines as they arrive, so a caller can
+/// observe a half-updated block; every field is independently optional and display-only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct HlsProgressSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) frame: Option<u64>,
+    pub(crate) fps: Option<f64>,
+    /// Encoded output bitrate in kbit/s, as reported by FFmpeg.
+    pub(crate) bitrate_kbps: Option<f64>,
+    pub(crate) total_size: Option<u64>,
+    pub(crate) out_time_us: Option<u64>,
+    pub(crate) speed: Option<f64>,
+    pub(crate) duplicated_frames: Option<u64>,
+    pub(crate) dropped_frames: Option<u64>,
+    pub(crate) finished: bool,
+    /// Milliseconds since the Unix epoch of the last accepted line; zero means "no report yet".
+    pub(crate) updated_at_ms: i64,
+}
+
+impl HlsProgressSnapshot {
+    /// Applies one `key=value` progress line. Returns whether the line carried a known value.
+    fn apply_line(&mut self, line: &str, now_ms: i64) -> bool {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            return false;
+        };
+        let value = value.trim();
+        let changed = match key {
+            "frame" => assign_parsed(&mut self.frame, parse_u64(value)),
+            "fps" => assign_parsed(&mut self.fps, parse_f64(value)),
+            "bitrate" => assign_parsed(&mut self.bitrate_kbps, parse_bitrate_kbps(value)),
+            "total_size" => assign_parsed(&mut self.total_size, parse_u64(value)),
+            "out_time_us" => assign_parsed(&mut self.out_time_us, parse_u64(value)),
+            "speed" => assign_parsed(&mut self.speed, parse_speed(value)),
+            "dup_frames" => assign_parsed(&mut self.duplicated_frames, parse_u64(value)),
+            "drop_frames" => assign_parsed(&mut self.dropped_frames, parse_u64(value)),
+            "progress" => {
+                self.finished = value == "end";
+                true
+            }
+            // `out_time_ms` is documented as microseconds in practice, so it is ignored in
+            // favour of `out_time_us`; every other key (stream_*_q, out_time, ...) is unused.
+            _ => false,
+        };
+        if changed {
+            self.updated_at_ms = now_ms;
+        }
+        changed
+    }
+}
+
+fn assign_parsed<T>(slot: &mut Option<T>, value: Option<T>) -> bool {
+    match value {
+        Some(value) => {
+            *slot = Some(value);
+            true
+        }
+        None => false,
+    }
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
+}
+
+fn parse_f64(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn parse_bitrate_kbps(value: &str) -> Option<f64> {
+    let value = value.strip_suffix("kbits/s")?.trim();
+    parse_f64(value)
+}
+
+fn parse_speed(value: &str) -> Option<f64> {
+    let value = value.strip_suffix('x')?.trim();
+    parse_f64(value)
+}
+
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsSegmentContainer {
@@ -150,6 +244,7 @@ struct HlsProcess {
     state: Mutex<HlsProcessState>,
     restart: Mutex<()>,
     quota: Mutex<SessionQuotaCache>,
+    progress: Arc<Mutex<HlsProgressSnapshot>>,
 }
 
 struct HlsProcessSpecification {
@@ -382,6 +477,10 @@ impl HlsManager {
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
         let segment_start_number = hls_start_number(start_time_ticks);
         let generation = 0;
+        let progress = Arc::new(Mutex::new(HlsProgressSnapshot {
+            generation,
+            ..HlsProgressSnapshot::default()
+        }));
         let init = hls_init_path(
             &directory,
             specification.emby_vod,
@@ -397,6 +496,7 @@ impl HlsManager {
                 &manifest,
                 generation,
                 start_time_ticks,
+                Arc::clone(&progress),
             ) {
                 Ok(child) => Some(child),
                 Err(error) => {
@@ -423,6 +523,7 @@ impl HlsManager {
             }),
             restart: Mutex::new(()),
             quota: Mutex::new(SessionQuotaCache::default()),
+            progress,
         });
         let previous = self
             .processes
@@ -443,6 +544,7 @@ impl HlsManager {
         manifest: &Path,
         generation: u64,
         start_time_ticks: Option<i64>,
+        progress: Arc<Mutex<HlsProgressSnapshot>>,
     ) -> Result<Child, HlsError> {
         let init_file_name = init.file_name().and_then(|name| name.to_str());
         let args = if specification.emby_vod {
@@ -486,7 +588,7 @@ impl HlsManager {
         command
             .args(args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
@@ -507,7 +609,48 @@ impl HlsManager {
                 }
             });
         }
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    // Bound each read so a malformed producer cannot grow this buffer without
+                    // limit; `read_until` stops at the newline or at `MAX_PROGRESS_LINE_BYTES`.
+                    let read = match (&mut reader)
+                        .take(MAX_PROGRESS_LINE_BYTES as u64)
+                        .read_until(b'\n', &mut line)
+                        .await
+                    {
+                        Ok(read) => read,
+                        Err(_) => break,
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    let Ok(text) = std::str::from_utf8(&line) else {
+                        continue;
+                    };
+                    let now_ms = unix_millis();
+                    let mut snapshot = progress.lock().await;
+                    if snapshot.generation != generation {
+                        *snapshot = HlsProgressSnapshot {
+                            generation,
+                            ..HlsProgressSnapshot::default()
+                        };
+                    }
+                    snapshot.apply_line(text, now_ms);
+                }
+            });
+        }
         Ok(child)
+    }
+
+    /// Latest FFmpeg progress for one HLS session, or `None` before FFmpeg reported anything.
+    pub(crate) async fn progress(&self, session_id: &str) -> Option<HlsProgressSnapshot> {
+        let process = self.processes.read().await.get(session_id).cloned()?;
+        let snapshot = process.progress.lock().await.clone();
+        (snapshot.updated_at_ms > 0).then_some(snapshot)
     }
 
     pub(crate) async fn start_for_initial_asset(
@@ -877,6 +1020,7 @@ impl HlsManager {
             &manifest,
             generation,
             Some(start_time_ticks),
+            Arc::clone(&process.progress),
         )?;
         tracing::info!(
             event = "emby_hls_segment_restart",
@@ -1536,6 +1680,10 @@ fn ffmpeg_args_for_output_with_audio(
         "-loglevel".to_owned(),
         "warning".to_owned(),
         "-nostdin".to_owned(),
+        // Progress reports are the only stdout consumer: the media goes to segment files, and
+        // the reader task turns these lines into the session's live statistics.
+        "-progress".to_owned(),
+        "pipe:1".to_owned(),
     ];
     let start_time = ffmpeg_start_time(timing.start_time_ticks);
     if let Some(start_time) = start_time.as_ref() {
@@ -1911,6 +2059,7 @@ mod tests {
                 checked_at: total_bytes.map(|_| Instant::now()),
                 total_bytes: total_bytes.unwrap_or_default(),
             }),
+            progress: Arc::new(Mutex::new(super::HlsProgressSnapshot::default())),
         }
     }
 
@@ -2221,6 +2370,7 @@ mod tests {
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-progress", "pipe:1"]));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-hls_segment_type", "fmp4"])
@@ -3037,5 +3187,117 @@ while :; do sleep 1; done
                 .join("config/web-playback/low-space")
                 .exists()
         );
+    }
+
+    #[test]
+    fn ffmpeg_progress_lines_populate_the_snapshot() {
+        let mut snapshot = super::HlsProgressSnapshot {
+            generation: 3,
+            ..super::HlsProgressSnapshot::default()
+        };
+        for line in [
+            "frame=120",
+            "fps=24.00",
+            "bitrate=1234.5kbits/s",
+            "total_size=987654",
+            "out_time_us=5000000",
+            "speed=1.53x",
+            "dup_frames=1",
+            "drop_frames=2",
+            "progress=continue",
+        ] {
+            assert!(snapshot.apply_line(line, 42), "line must be recognized");
+        }
+        assert_eq!(snapshot.generation, 3);
+        assert_eq!(snapshot.frame, Some(120));
+        assert_eq!(snapshot.fps, Some(24.0));
+        assert_eq!(snapshot.bitrate_kbps, Some(1234.5));
+        assert_eq!(snapshot.total_size, Some(987_654));
+        assert_eq!(snapshot.out_time_us, Some(5_000_000));
+        assert_eq!(snapshot.speed, Some(1.53));
+        assert_eq!(snapshot.duplicated_frames, Some(1));
+        assert_eq!(snapshot.dropped_frames, Some(2));
+        assert!(!snapshot.finished);
+        assert_eq!(snapshot.updated_at_ms, 42);
+
+        assert!(snapshot.apply_line("progress=end", 43));
+        assert!(snapshot.finished);
+        assert_eq!(snapshot.updated_at_ms, 43);
+    }
+
+    #[test]
+    fn ffmpeg_progress_ignores_unusable_values() {
+        let mut snapshot = super::HlsProgressSnapshot::default();
+        for line in [
+            "bitrate=N/A",
+            "speed=N/A",
+            "fps=   ",
+            "drop_frames=-1",
+            "out_time_ms=5000000000",
+            "stream_0_0_q=-1.0",
+            "no-equals-sign",
+            "",
+        ] {
+            assert!(!snapshot.apply_line(line, 7), "line must be ignored");
+        }
+        assert_eq!(snapshot, super::HlsProgressSnapshot::default());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffmpeg_progress_reaches_the_session_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script = temp_dir.path().join("fake-ffmpeg");
+        let source = [
+            "#!/bin/sh",
+            "printf 'frame=240\\nfps=24.00\\nbitrate=2048.5kbits/s\\ntotal_size=1048576\\n'",
+            "printf 'out_time_us=10000000\\nspeed=2.00x\\ndup_frames=0\\ndrop_frames=3\\n'",
+            "printf 'progress=end\\n'",
+            "sleep 0.3",
+        ]
+        .join("\n");
+        std::fs::write(&script, source).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let manager = super::HlsManager::new_with_limits(
+            temp_dir.path().join("config"),
+            script.to_string_lossy().into_owned(),
+            0,
+        );
+
+        manager
+            .start(
+                "progress",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut snapshot = None;
+        for _ in 0..200 {
+            snapshot = manager.progress("progress").await;
+            if snapshot.as_ref().is_some_and(|value| value.finished) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snapshot = snapshot.expect("progress must be captured");
+        assert_eq!(snapshot.fps, Some(24.0));
+        assert_eq!(snapshot.bitrate_kbps, Some(2048.5));
+        assert_eq!(snapshot.total_size, Some(1_048_576));
+        assert_eq!(snapshot.out_time_us, Some(10_000_000));
+        assert_eq!(snapshot.speed, Some(2.0));
+        assert_eq!(snapshot.dropped_frames, Some(3));
+        assert!(snapshot.finished);
+        assert_eq!(snapshot.generation, 0);
+        assert!(manager.progress("missing-session").await.is_none());
+        let _ = manager.stop("progress").await;
     }
 }

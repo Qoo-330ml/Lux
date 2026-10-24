@@ -17672,6 +17672,69 @@ PlaybackInfo、HEAD、浏览详情、PAUSED/STOPPED 回调不触发。重复播�
 
 结果（2026-10-21；本机 macOS `arm64`，Toshiba 已挂载，Cargo 使用 `/Volumes/Toshiba/mywork/Lux/target`）：六个定向集成目标共 14/14 通过；新增扫描范围失败任务重试串行回归 1/1 通过（实现前按 RED 复现，补锁后 GREEN），`cargo fmt --all -- --check` 通过。全量 Rust 测试为 1,157 passed、31 ignored、4 failed；四项失败在干净 `test` 基线上复现，分别为 `scan_local_nfo_page_flushes_actor_credits_and_isolates_invalid_nfo`、`automatic_and_explicit_fill_missing_jobs_keep_dispatch_sources_separate`、`automatic_fill_missing_retry_backoff_excludes_manual_modes_and_cancelled_failures`、`changed_local_fill_request_during_running_item_is_not_lost`，全量命令因此未继续执行 integration targets。完整 Clippy 仍有 10 项既有诊断（5 项 `too_many_arguments`、2 项 `useless_conversion`、1 项 `cloned_ref_to_slice_refs`、2 项 `type_complexity`）；本任务早期提交引入的测试模块顺序诊断已通过移动模块修正。全量门禁不记为通过。
 
+#### LUX-847：Web 播放信息面板与服务端转码实时统计
+
+范围：为 Lux Web 播放页提供 Emby / Jellyfin / YouTube 风格的信息面板：右键、`i` 键或控制栏按钮打开，
+`Esc` 关闭，按「播放 / 来源 / 输出 / 实时」分组展示会话计划与档位、源容器与音视频 codec、码率、
+分辨率、帧率、服务端输出参数，以及服务端 FFmpeg 的实时 fps、speed、输出码率、已输出字节和丢帧；
+直放或客户端 fallback 时改为展示直放方式与推流状态，面板内容可选中复制。服务端新增会话级
+`GET /api/v1/playback/sessions/{sessionId}/stats`（仅会话所属用户，GET 无 CSRF、无副作用），
+数据来自解析后的 FFmpeg `-progress` stdout，不读取媒体文件、不新增 ffprobe 调用。Web 播放 HLS
+会话在创建时持久化输出容器、codec 与码率，使管理看板与播放面板看到同一组事实。
+
+按四个增量实施（每个增量单独可回滚）：
+
+1. `src/application/playback/hls.rs`：FFmpeg 增加 `-progress pipe:1`，解析并保存有界进度快照。
+2. `src/application/playback/session.rs`、`src/api/playback.rs`、`src/api/lux_api.rs`、
+   `tests/web_playback.rs`：会话统计端点、会话归属校验与 Web 会话输出详情。
+3. `web/src/lib/api/types.ts`、`web/src/lib/api/client.ts`、
+   `web/src/features/player/components/player-info-panel.tsx`、`web/src/features/player/player-stats.ts`、
+   `web/src/features/player/PlayerPage.tsx`、`web/src/features/player/player.css`、
+   `web/tests/player-info-panel.test.tsx`：信息面板、客户端指标采集与触发方式。
+4. `docs/API.md`、`docs/CHANGELOG.md`、`docs/LUX-DEVELOPMENT.md`：协议边界与验证记录。
+
+验收：
+
+- [ ] 右键、`i` 键与控制栏按钮可打开和关闭面板，`Esc` 关闭；打开时才轮询，关闭后不再请求。
+- [ ] 直放会话显示直放方式、源容器/codec/码率与客户端解码指标，并明确“未转码”；`.strm` 保持直放语义。
+- [ ] `SERVER_HLS` 会话显示档位（封装转换 / 音频转码 / 硬件转码 / 软件转码）、输出容器与 codec、
+  服务端实时 fps、speed、输出码率、已输出字节、丢帧和最后一次进度时间。
+- [ ] FFmpeg `-progress` 解析只保留最新快照、按行有界处理，不阻塞事件循环，不影响 HLS 起播与 seek 重启。
+- [ ] 统计端点只允许会话所属用户访问；他人会话、不存在、已过期会话返回 404；GET 不写库、不续租。
+- [ ] Web 播放 HLS 会话写入转码详情后，管理看板 `output` 显示实际输出而非回退猜测。
+- [ ] `hls` 单测、`web_playback` 与 `playback` 定向集成测试、Web vitest 与构建通过。
+
+依赖：LUX-254（Emby 服务端转码）、LUX-827（播放会话策略）。
+
+#### LUX-848：后台服务端转码设置
+
+范围：把转码资源与画质参数从编译期常量/环境变量改为管理员可配置，并接入「服务器设置 → 服务端转码」：
+全局开关（关闭后本地媒体只做直放与客户端 fallback）、硬件编码器、每档并发上限、单会话磁盘配额、
+全局磁盘预算、最低剩余空间、输出码率上限、软件编码 preset、最大输出分辨率与音频码率。
+配置保存在既有 `server_settings` 表（新增键，不新增迁移）；保存后对新建会话生效，运行中会话保持
+原参数直到结束。现有 `LUX_HLS_HW_ENCODER` 与 `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES` 继续作为运维覆盖，
+优先级为环境变量 > 管理员设置 > 内置默认值，并在部署文档写明。
+
+按三个增量实施：
+
+1. `src/application/settings.rs`、`src/storage/repository.rs`、`src/application/playback/hls.rs`：
+   设置模型、归一化与校验、持久化读写、HlsManager 运行时参数与新增 FFmpeg 参数（preset、缩放、音频码率）。
+2. `src/api/admin/admin_settings.rs`、`src/api/legacy.rs`、`tests/playback.rs` 或新增定向目标：
+   管理员读写接口、启动时装载、保存后应用到新会话、越界与非法值拒绝。
+3. `web/src/features/admin/AdminSettingsPage.tsx`、`web/src/lib/api/types.ts`、
+   `web/tests/admin-settings*.test.tsx`：设置面板与回归测试。
+
+验收：
+
+- [ ] 并发上限、磁盘配额、码率与分辨率越界值被拒绝且不落库；0 值语义明确（0 = 不限制或关闭）。
+- [ ] 全局关闭转码后，本地媒体不再创建 HLS 会话，直放与既有客户端 fallback 不受影响；`.strm` 行为不变。
+- [ ] 硬件编码器仅接受允许列表；未配置时硬件档位降级到软件档位，且看板/日志不出现伪造的硬件转码。
+- [ ] 保存设置后新会话使用新参数，已启动会话不被中断；重启后设置保持。
+- [ ] 管理界面可读取、修改并保存全部设置项，非法输入显示固定文案且保留草稿。
+- [ ] `settings` 单测、`playback`/`web_playback` 定向测试、Web vitest 与构建通过。
+
+依赖：LUX-254、LUX-847（统计端点用于确认输出参数）。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
