@@ -1951,6 +1951,23 @@ fn insert_provider_id_if_missing(
     provider_ids.insert(provider.to_ascii_lowercase(), provider_id.to_owned());
 }
 
+/// Candidate payloads carry the identity Lux resolved itself, so they win over any provider id
+/// read from a sidecar NFO. Removing the old key before inserting also covers case variants such
+/// as `Imdb` versus `imdb`.
+fn replace_provider_id_with_candidate(
+    provider_ids: &mut BTreeMap<String, String>,
+    provider: &str,
+    provider_id: &str,
+) {
+    let provider = provider.trim();
+    let provider_id = provider_id.trim();
+    if provider.is_empty() || provider_id.is_empty() {
+        return;
+    }
+    provider_ids.retain(|key, _| !key.eq_ignore_ascii_case(provider));
+    provider_ids.insert(provider.to_owned(), provider_id.to_owned());
+}
+
 fn image_attempt_identities(
     capability_identity: Option<&(String, String)>,
 ) -> Vec<(String, String)> {
@@ -3135,10 +3152,17 @@ impl MetadataSelectionService {
                 &candidate.provider_id,
             );
         } else {
-            provider_ids.extend(movie_nfo.provider_ids.clone());
-            provider_ids.insert(
-                candidate.provider.to_ascii_lowercase(),
-                candidate.provider_id.clone(),
+            // The candidate payload carries the identity Lux resolved itself. Replace stale
+            // provider ids that came from a sidecar NFO with the same provider namespace instead
+            // of keeping both: a leftover IMDb/TVDB id from another film would otherwise feed the
+            // automatic merge with a false identity key.
+            for (provider, provider_id) in &movie_nfo.provider_ids {
+                replace_provider_id_with_candidate(&mut provider_ids, provider, provider_id);
+            }
+            replace_provider_id_with_candidate(
+                &mut provider_ids,
+                &candidate.provider,
+                &candidate.provider_id,
             );
         }
         let provider_ids_json = serde_json::to_string(&provider_ids)
@@ -5165,7 +5189,8 @@ mod tests {
         image_attempt_identities, local_metadata_completeness_plan, merge_actor_values,
         merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
         metadata_request_plan, metadata_request_plan_has_work, parse_image_selection_policy,
-        run_bounded_completeness_plan_tasks, selected_scraper_provider_id,
+        replace_provider_id_with_candidate, run_bounded_completeness_plan_tasks,
+        selected_scraper_provider_id,
     };
     use crate::application::images::ImageWriteService;
     use crate::application::scraper::{
@@ -5184,6 +5209,41 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
     };
     use tokio::time::{Duration, sleep};
+
+    #[test]
+    fn candidate_provider_ids_replace_stale_case_variants() {
+        let mut provider_ids = BTreeMap::from([
+            ("imdb".to_owned(), "tt0093773".to_owned()),
+            ("tmdb".to_owned(), "48193".to_owned()),
+            ("douban".to_owned(), "1291543".to_owned()),
+        ]);
+
+        replace_provider_id_with_candidate(&mut provider_ids, "Imdb", "tt3829266");
+        replace_provider_id_with_candidate(&mut provider_ids, "Tmdb", "346910");
+
+        assert_eq!(
+            provider_ids.get("Imdb").map(String::as_str),
+            Some("tt3829266")
+        );
+        assert_eq!(provider_ids.get("Tmdb").map(String::as_str), Some("346910"));
+        assert!(!provider_ids.contains_key("imdb"));
+        assert!(!provider_ids.contains_key("tmdb"));
+        assert_eq!(
+            provider_ids.get("douban").map(String::as_str),
+            Some("1291543")
+        );
+    }
+
+    #[test]
+    fn candidate_provider_id_ignores_empty_values() {
+        let mut provider_ids = BTreeMap::from([("imdb".to_owned(), "tt0093773".to_owned())]);
+        replace_provider_id_with_candidate(&mut provider_ids, "imdb", " ");
+        replace_provider_id_with_candidate(&mut provider_ids, "", "tt3829266");
+        assert_eq!(
+            provider_ids.get("imdb").map(String::as_str),
+            Some("tt0093773")
+        );
+    }
 
     #[test]
     fn confirmed_scraper_candidate_keeps_collection_provider_namespace() {

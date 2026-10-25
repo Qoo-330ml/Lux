@@ -6222,13 +6222,15 @@ mod tests {
 
 pub(crate) async fn find_nfo_path(media_path: &Path) -> Option<PathBuf> {
     let directory = media_path.parent()?;
-    let movie_nfo = directory.join("movie.nfo");
-    if fs::try_exists(&movie_nfo).await.ok()? {
-        return Some(movie_nfo);
-    }
+    // A per-file `<video>.nfo` describes exactly this source. Prefer it over a folder-level
+    // `movie.nfo`, which is often written by another tool and may describe a different film.
     let same_name = media_path.with_extension("nfo");
     if fs::try_exists(&same_name).await.ok()? {
         return Some(same_name);
+    }
+    let movie_nfo = directory.join("movie.nfo");
+    if fs::try_exists(&movie_nfo).await.ok()? {
+        return Some(movie_nfo);
     }
     find_directory_nfo(directory).await
 }
@@ -6765,5 +6767,60 @@ impl std::error::Error for MetadataError {
 impl From<StorageError> for MetadataError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+#[cfg(test)]
+mod nfo_path_selection_tests {
+    use super::find_nfo_path;
+
+    #[tokio::test]
+    async fn same_name_nfo_wins_over_folder_movie_nfo() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let media = directory.path().join("银翼杀手2049 (2017).strm");
+        tokio::fs::write(&media, b"https://example.invalid/video").await?;
+        tokio::fs::write(
+            directory.path().join("movie.nfo"),
+            b"<movie><title>Wrong film</title></movie>",
+        )
+        .await?;
+        let same_name = directory.path().join("银翼杀手2049 (2017).nfo");
+        tokio::fs::write(&same_name, b"<movie><title>Right film</title></movie>").await?;
+
+        assert_eq!(
+            find_nfo_path(&media).await.as_deref(),
+            Some(same_name.as_path())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn folder_movie_nfo_remains_the_fallback() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let media = directory.path().join("Movie (2017).strm");
+        tokio::fs::write(&media, b"https://example.invalid/video").await?;
+        let movie_nfo = directory.path().join("movie.nfo");
+        tokio::fs::write(&movie_nfo, b"<movie><title>Film</title></movie>").await?;
+
+        assert_eq!(
+            find_nfo_path(&media).await.as_deref(),
+            Some(movie_nfo.as_path())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn single_directory_nfo_is_the_last_fallback() -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let media = directory.path().join("Movie (2017).strm");
+        tokio::fs::write(&media, b"https://example.invalid/video").await?;
+        let directory_nfo = directory.path().join("Movie (2017) - 2160p.nfo");
+        tokio::fs::write(&directory_nfo, b"<movie><title>Film</title></movie>").await?;
+
+        assert_eq!(
+            find_nfo_path(&media).await.as_deref(),
+            Some(directory_nfo.as_path())
+        );
+        Ok(())
     }
 }

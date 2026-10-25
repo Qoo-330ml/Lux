@@ -176,6 +176,11 @@ Lux 的核心价值不是功能数量，而是：
 - 图片优先本地；在线图片按首选语言组、无语言、英文的顺序选择。
 - 电影、剧集、季度和单集 NFO 均应兼容常见 Emby/Kodi 旁挂形式。
 - 至少识别 movie.nfo、tvshow.nfo、与视频同名的 .nfo、poster、fanart/backdrop、seasonXX-poster 等常见命名。
+- 同一目录同时存在与视频同名的 `.nfo` 和 `movie.nfo` 时，优先使用更具体的同名 NFO；只有它
+  不存在时才回退 `movie.nfo`，再回退目录内唯一 NFO。目录级 `movie.nfo` 常由其他工具写入，
+  可能描述另一部影片。
+- 识别确认写回时，provider ID 以实际选中的刮削器结果为准；本地 NFO 中同一 provider 命名空间
+  的旧 ID 被新值替换而不是并存，避免脏 ID 继续参与自动合并。
 - 写回时使用稳定、公开记录的 Lux NFO 子集，同时尽量保留未知 XML 字段，避免破坏其他软件写入的信息。
 
 ### 3.6 元数据匹配和重新匹配
@@ -3037,6 +3042,12 @@ fnos 实际库中出现三条电影和一条剧集被错误合并：旁车 NFO �
 SQLite 0225 / PostgreSQL 0227 增加 `merge_suppressions`：手动拆分时把命中的 TMDb（或标题+年份）
 键写入，自动合并候选查询用 `NOT EXISTS` 排除；`--lib application::item_merge` 的两项抑制回归和
 `--test item_unmerge` 通过。
+
+同一批修复还调整了识别侧的输入：`find_nfo_path` 在有同名 `<视频>.nfo` 时不再让目录级
+`movie.nfo` 抢先，识别写回时同一 provider 命名空间的旧 ID 被刮削器结果替换而不是并存。
+`--lib application::candidates`（2 项 provider ID 替换）、`--lib metadata::nfo_path_selection_tests`
+（3 项）、`--test metadata`（21 项）、`--test metadata_selection`（38 项）、`--test metadata_api`
+（9 项）通过。
 
 全量 `cargo test --locked --all-targets` 后仍有 11 个目标失败：`admin_api_key`、`admin_health`、
 `image_api`、`people_api`、`scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、
