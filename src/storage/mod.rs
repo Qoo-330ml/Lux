@@ -842,7 +842,7 @@ pub(crate) use repository::GLOBAL_COLLECTION_LIBRARY_ID;
 pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 pub use repository::{
     Database, DatabaseDiagnosticsSnapshot, DatabaseLifecycleCleanupReport, PersonListOptions,
-    PersonSort, StorageError,
+    PersonSort, SqliteStatisticsRefresh, StorageError,
 };
 
 #[allow(unused_imports)]

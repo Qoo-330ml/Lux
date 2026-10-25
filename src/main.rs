@@ -134,6 +134,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     database.spawn_task_history_retention();
     database.spawn_database_maintenance();
     database.spawn_watch_state_reconcile();
+    database.spawn_query_statistics_refresh();
     let cancelled_jobs = database.cancel_incomplete_jobs_for_shutdown().await?;
     if cancelled_jobs > 0 {
         info!(

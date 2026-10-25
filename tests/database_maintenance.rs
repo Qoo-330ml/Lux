@@ -1,4 +1,7 @@
-use luxd::{config::Config, storage::Database};
+use luxd::{
+    config::Config,
+    storage::{Database, SqliteStatisticsRefresh},
+};
 
 static MAINTENANCE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -193,5 +196,95 @@ async fn maintenance_skips_round_while_a_scan_is_running() -> Result<(), Box<dyn
         "maintenance must stand down while a scan runs, got {:?}",
         guarded_round.vacuumed
     );
+    Ok(())
+}
+
+async fn statistics_table_exists(database: &Database) -> Result<bool, Box<dyn std::error::Error>> {
+    let exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    Ok(exists != 0)
+}
+
+async fn seed_catalog_row(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('stats-lib', 'Stats', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('stats-movie', 'stats-lib', 'MOVIE', 'Stats', 'stats', 'LOCAL_CONFIRMED')",
+    )
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn statistics_refresh_does_not_describe_an_empty_catalog()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+
+    let refreshed = database.refresh_query_statistics().await?;
+
+    assert_eq!(refreshed, SqliteStatisticsRefresh::SkippedEmpty);
+    assert!(
+        !statistics_table_exists(&database).await?,
+        "statistics of an empty library would tell the planner every table has one row"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn statistics_refresh_analyzes_once_then_hands_over_to_optimize()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+    seed_catalog_row(&database).await?;
+
+    let first = database.refresh_query_statistics().await?;
+    assert_eq!(first, SqliteStatisticsRefresh::Analyzed);
+    assert!(statistics_table_exists(&database).await?);
+    let described: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'media_items'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(
+        described > 0,
+        "the catalog table the planner has to estimate is still undescribed"
+    );
+
+    let second = database.refresh_query_statistics().await?;
+    assert_eq!(
+        second,
+        SqliteStatisticsRefresh::Optimized,
+        "a second pass must not rescan every index"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn statistics_refresh_stands_down_while_a_scan_runs() -> Result<(), Box<dyn std::error::Error>>
+{
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+    seed_catalog_row(&database).await?;
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('stats-job', 'stats-lib', 'RECONCILE_LIBRARY', 'RUNNING', 'generation')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let refreshed = database.refresh_query_statistics().await?;
+
+    assert_eq!(refreshed, SqliteStatisticsRefresh::SkippedBusy);
+    assert!(!statistics_table_exists(&database).await?);
     Ok(())
 }

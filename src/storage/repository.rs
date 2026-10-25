@@ -37,7 +37,7 @@ pub use database_diagnostics::DatabaseDiagnosticsSnapshot;
 mod database_maintenance;
 pub use database_maintenance::{
     DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
-    MaintenanceCandidate, MaintenanceReport,
+    MaintenanceCandidate, MaintenanceReport, SqliteStatisticsRefresh,
 };
 #[path = "device_pairings.rs"]
 mod device_pairings;

@@ -420,6 +420,159 @@ impl Database {
     }
 }
 
+/// Statistics refresh outcomes. Every skip is a deliberate decision, not a failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqliteStatisticsRefresh {
+    /// Statistics existed already; the planner was told to check whether they still fit.
+    Optimized,
+    /// The database had never been analyzed, so a full `ANALYZE` ran.
+    Analyzed,
+    /// No catalog rows yet. Statistics taken on an empty database teach the planner that every
+    /// table has a single row, which it then plans full scans for long after the library filled up.
+    SkippedEmpty,
+    /// A scan or metadata job owns the database; describing it mid-flight would sample a shape
+    /// that is about to change.
+    SkippedBusy,
+    /// PostgreSQL maintains its own statistics through autovacuum and the per-table
+    /// `VACUUM (ANALYZE)` this module already issues.
+    SkippedBackend,
+}
+
+/// `ANALYZE` reads every indexed row. A library that needs much longer than this is better served
+/// by a partial sample than by holding the write lock for minutes.
+const SQLITE_ANALYZE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Statistics refresh cadence. `PRAGMA optimize` is usually a no-op, so this stays cheap enough
+/// to run far more often than the daily maintenance round that reclaims space.
+const STATISTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
+const STATISTICS_REFRESH_INITIAL_DELAY: Duration = Duration::from_secs(120);
+
+impl Database {
+    /// Keeps `sqlite_stat1` describing the catalog the planner actually sees.
+    ///
+    /// Without statistics SQLite falls back to fixed selectivity guesses, which is exactly the
+    /// wrong input for the composite indexes the catalog relies on (`library_id` + `removed_at` +
+    /// `has_available_source` and friends are anything but uniform).
+    ///
+    /// The first pass after a library appears runs a full `ANALYZE`; later passes only run
+    /// `PRAGMA optimize`, which decides for itself whether any table grew enough to be worth
+    /// re-sampling. The `analysis_limit` a pooled connection may have inherited from a previous
+    /// `PRAGMA optimize` is restored after the full pass, so this never turns into sampled
+    /// statistics by accident.
+    pub async fn refresh_query_statistics(&self) -> Result<SqliteStatisticsRefresh, StorageError> {
+        if self.backend != DatabaseBackend::Sqlite {
+            return Ok(SqliteStatisticsRefresh::SkippedBackend);
+        }
+        if self.maintenance_scan_in_progress().await? {
+            return Ok(SqliteStatisticsRefresh::SkippedBusy);
+        }
+        let has_items: i64 = self
+            .query_scalar("SELECT EXISTS(SELECT 1 FROM media_items)")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if has_items == 0 {
+            return Ok(SqliteStatisticsRefresh::SkippedEmpty);
+        }
+        let analyzed: i64 = self
+            .query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1')",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if analyzed == 0 {
+            self.analyze_catalog().await?;
+            return Ok(SqliteStatisticsRefresh::Analyzed);
+        }
+        self.query("PRAGMA optimize")
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(SqliteStatisticsRefresh::Optimized)
+    }
+
+    async fn analyze_catalog(&self) -> Result<(), StorageError> {
+        let previous: Option<i64> = self
+            .query_scalar("PRAGMA analysis_limit")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query("PRAGMA analysis_limit = 0")
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let analyzed = tokio::time::timeout(
+            SQLITE_ANALYZE_TIMEOUT,
+            self.query("ANALYZE").execute(&self.pool),
+        )
+        .await;
+        if let Some(limit) = previous {
+            // The connection goes back to the pool, so hand it over the way it was handed to us.
+            let restore = format!("PRAGMA analysis_limit = {limit}");
+            let _ = self
+                .query(sqlx::AssertSqlSafe(restore))
+                .execute(&self.pool)
+                .await;
+        }
+        match analyzed {
+            Ok(Ok(_)) => {
+                tracing::info!("analyzed sqlite catalog statistics for the first time");
+                Ok(())
+            }
+            Ok(Err(source)) => Err(StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            }),
+            Err(_) => {
+                tracing::warn!(
+                    timeout_seconds = SQLITE_ANALYZE_TIMEOUT.as_secs(),
+                    "sqlite ANALYZE did not finish in time; keeping the statistics it wrote"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Keeps query statistics fresh between maintenance rounds.
+    ///
+    /// Separate from the space-reclaiming round on purpose: that one runs daily and skips whole
+    /// scans, while a fresh library needs statistics within minutes of its first scan.
+    pub fn spawn_query_statistics_refresh(&self) {
+        if !maintenance_enabled() {
+            tracing::info!("query statistics refresh disabled with database maintenance");
+            return;
+        }
+        let database = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STATISTICS_REFRESH_INITIAL_DELAY).await;
+            let mut ticker = tokio::time::interval(STATISTICS_REFRESH_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = database.refresh_query_statistics().await {
+                    tracing::warn!(%error, "refreshing query statistics failed");
+                }
+            }
+        });
+    }
+}
+
 /// Quotes a table name for interpolation into DDL that cannot take bind
 /// parameters. Names come from system catalogs, never user input.
 fn quote_identifier(name: &str) -> String {
