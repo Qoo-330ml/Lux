@@ -17866,6 +17866,12 @@ LUX-849 的降级路径兜底；部署文档写明各平台前置条件、设备
 `AdminTranscodingPage` 与 `admin-transcoding-page` 2 项测试（进度渲染与空状态），`vitest` 890/890、`node --test`
 150/150、`tsc --noEmit` 与构建通过。未新增导航级权限：页面沿用 `user.canManageServer` 与管理员路由保护。
 
+浏览器验证（2026-10-25）：真实软件转码进行中打开 `/admin/transcoding`，导航高亮“转码”，摘要显示活动 1 /
+软件编码 1 / 硬件编码 0，会话行显示 `Live Transcode Demo | Admin · 档位 4 · 软件转码 · MP4 | 编码中` 与
+`178.6 fps / 7.42× / 输出码率 21 Mbps / 平均码率 5.7 Mbps / 已输出 20 MB / 编码位置 00:30`，截图见
+`output/playwright/lux-852/admin-transcoding-page.png`。验证中发现并修复摘要把档位 4 误计为硬件编码的问题，
+已在 `--test web_playback` 中加断言（`softwareCount=1`、`hardwareCount=0`）。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

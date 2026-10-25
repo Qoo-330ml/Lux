@@ -57,7 +57,7 @@ impl TranscodingSummary {
         stats: Option<&crate::application::playback::session::WebPlaybackStats>,
     ) {
         match tier {
-            tier if tier >= i64::from(ServerTier::HardwareTranscode.number()) => self.hardware += 1,
+            tier if tier == i64::from(ServerTier::HardwareTranscode.number()) => self.hardware += 1,
             tier if tier == i64::from(ServerTier::SoftwareTranscode.number()) => self.software += 1,
             _ => self.stream_copy += 1,
         }

@@ -1841,6 +1841,9 @@ async fn web_playback_stats_report_the_plan_and_live_transcode_progress()
     assert_eq!(listed["title"], json!("Stats Playback Movie"));
     assert_eq!(listed["progress"]["fps"], json!(24.0));
     assert_eq!(listed["progress"]["latestSegmentBitrateKbps"], json!(0.014));
+    assert_eq!(listing["summary"]["softwareCount"], json!(1));
+    assert_eq!(listing["summary"]["hardwareCount"], json!(0));
+    assert_eq!(listing["summary"]["streamCopyCount"], json!(0));
 
     let unknown = client
         .get(format!(
