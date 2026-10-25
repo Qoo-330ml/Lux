@@ -1,8 +1,12 @@
-import { useQuery } from "@tanstack/react-query";
-import { Cpu, Gauge } from "lucide-react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { Cpu, Gauge, History, Square } from "lucide-react";
+import { useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type { AdminTranscodingSession } from "../../lib/api/types";
+import type {
+  AdminTranscodingHistoryItem,
+  AdminTranscodingSession,
+} from "../../lib/api/types";
 import {
   formatBytes,
   formatFrameRate,
@@ -18,7 +22,11 @@ import { AdminTranscodingPanel } from "./AdminTranscodingPanel";
  * The settings panel is reused from the server-settings page, but everything transcoding-related
  * now lives here so the general settings page stays about access, playback defaults and network.
  */
+const HISTORY_PAGE_SIZE = 10;
+
 export function AdminTranscodingPage() {
+  const queryClient = useQueryClient();
+  const [historyPage, setHistoryPage] = useState(1);
   const settings = useQuery({
     queryKey: queryKeys.adminSettings,
     queryFn: () => api.adminSettings(),
@@ -29,6 +37,22 @@ export function AdminTranscodingPage() {
     refetchInterval: 2_000,
     staleTime: 1_000,
     retry: false,
+  });
+
+  const history = useQuery({
+    queryKey: queryKeys.adminTranscodingHistory(historyPage, HISTORY_PAGE_SIZE),
+    queryFn: ({ signal }) => api.adminTranscodingHistory(historyPage, HISTORY_PAGE_SIZE, signal),
+    staleTime: 5_000,
+    retry: false,
+  });
+  const stopSession = useMutation({
+    mutationFn: (sessionId: string) => api.stopAdminTranscodingSession(sessionId),
+    onSuccess: () => {
+      void queryClient.invalidateQueries({ queryKey: queryKeys.adminTranscodingSessions });
+      void queryClient.invalidateQueries({
+        queryKey: queryKeys.adminTranscodingHistory(historyPage, HISTORY_PAGE_SIZE),
+      });
+    },
   });
 
   if (settings.isPending) {
@@ -80,15 +104,112 @@ export function AdminTranscodingPage() {
           </div>
         ) : (
           <div className="lux-transcoding-sessions" aria-label="转码会话">
-            {list.map((session) => <TranscodingSessionRow key={session.sessionId} session={session} />)}
+            {list.map((session) => (
+              <TranscodingSessionRow
+                key={session.sessionId}
+                session={session}
+                stopping={stopSession.isPending && stopSession.variables === session.sessionId}
+                onStop={() => {
+                  const title = session.title ?? "该条目";
+                  if (!window.confirm(`停止「${title}」的转码会话？播放会立即中断。`)) return;
+                  stopSession.mutate(session.sessionId);
+                }}
+              />
+            ))}
           </div>
+        )}
+        {stopSession.error ? <p className="lux-error-copy">{stopSession.error.message}</p> : null}
+      </section>
+
+      <section className="lux-admin-panel" aria-labelledby="transcoding-history-heading">
+        <div className="lux-admin-panel-heading">
+          <div>
+            <h2 id="transcoding-history-heading">转码历史</h2>
+            <p>最近完成、失败或过期的服务端转码；平均速度按编码时长与墙钟时长计算。</p>
+          </div>
+          <History size={20} className="lux-admin-panel-icon" />
+        </div>
+        {history.isPending ? (
+          <p className="lux-admin-field-hint">正在读取转码历史…</p>
+        ) : history.error ? (
+          <p className="lux-error-copy">{history.error.message}</p>
+        ) : (history.data?.items.length ?? 0) === 0 ? (
+          <p className="lux-admin-field-hint">还没有转码历史。</p>
+        ) : (
+          <>
+            <div className="lux-transcoding-history" aria-label="转码历史记录">
+              {(history.data?.items ?? []).map((item) => (
+                <TranscodingHistoryRow key={item.id} item={item} />
+              ))}
+            </div>
+            <div className="lux-transcoding-history-pager">
+              <span>
+                共 {history.data?.total ?? 0} 条 · 第 {history.data?.page ?? historyPage} 页
+              </span>
+              <div>
+                <button
+                  type="button"
+                  className="lux-button lux-button-secondary"
+                  disabled={historyPage <= 1}
+                  onClick={() => setHistoryPage((page) => Math.max(1, page - 1))}
+                >
+                  上一页
+                </button>
+                <button
+                  type="button"
+                  className="lux-button lux-button-secondary"
+                  disabled={(history.data?.total ?? 0) <= historyPage * HISTORY_PAGE_SIZE}
+                  onClick={() => setHistoryPage((page) => page + 1)}
+                >
+                  下一页
+                </button>
+              </div>
+            </div>
+          </>
         )}
       </section>
     </div>
   );
 }
 
-function TranscodingSessionRow({ session }: { session: AdminTranscodingSession }) {
+function TranscodingHistoryRow({ item }: { item: AdminTranscodingHistoryItem }) {
+  return (
+    <article className="lux-transcoding-history-row">
+      <div className="lux-transcoding-history-main">
+        <strong>{item.title ?? "未知条目"}</strong>
+        <small>
+          {[item.userName ?? "未知用户", tierLabel(item.tier), formatClock(item.wallSeconds), formatDateTime(item.finishedAt)]
+            .filter(Boolean)
+            .join(" · ")}
+        </small>
+        {item.failureReason ? (
+          <small className="lux-transcoding-history-reason">失败原因：{item.failureReason}</small>
+        ) : null}
+      </div>
+      <div className="lux-transcoding-history-metrics">
+        <OutcomeBadge outcome={item.outcome} />
+        <span>平均速度 {formatSpeed(item.averageSpeed) ?? "—"}</span>
+        <span>输出 {formatBytes(item.outputBytes) ?? "—"}</span>
+      </div>
+    </article>
+  );
+}
+
+function OutcomeBadge({ outcome }: { outcome: string }) {
+  const label = outcome === "COMPLETED" ? "完成" : outcome === "FAILED" ? "失败" : outcome === "EXPIRED" ? "过期" : outcome;
+  const className = outcome === "COMPLETED" ? "is-ok" : outcome === "FAILED" ? "is-error" : "is-muted";
+  return <span className={`lux-transcoding-outcome ${className}`}>{label}</span>;
+}
+
+function TranscodingSessionRow({
+  session,
+  stopping,
+  onStop,
+}: {
+  session: AdminTranscodingSession;
+  stopping: boolean;
+  onStop: () => void;
+}) {
   const progress = session.progress;
   const bitrate = progress?.latestSegmentBitrateKbps ?? progress?.bitrateKbps;
   return (
@@ -102,9 +223,20 @@ function TranscodingSessionRow({ session }: { session: AdminTranscodingSession }
               .join(" · ")}
           </small>
         </div>
-        <span className={`lux-transcoding-session-state${progress?.finished ? " is-finished" : ""}`}>
-          {progress ? (progress.finished ? "编码结束" : "编码中") : "等待 FFmpeg 进度"}
-        </span>
+        <div className="lux-transcoding-session-actions">
+          <span className={`lux-transcoding-session-state${progress?.finished ? " is-finished" : ""}`}>
+            {progress ? (progress.finished ? "编码结束" : "编码中") : "等待 FFmpeg 进度"}
+          </span>
+          <button
+            type="button"
+            className="lux-button lux-button-secondary lux-transcoding-stop"
+            aria-label={`停止 ${session.title ?? "转码会话"}`}
+            disabled={stopping}
+            onClick={onStop}
+          >
+            <Square size={13} /> {stopping ? "停止中…" : "停止会话"}
+          </button>
+        </div>
       </header>
       <dl className="lux-transcoding-session-metrics">
         <Metric label="编码帧率" value={formatFrameRate(progress?.fps)} />
@@ -136,6 +268,15 @@ function SummaryChip({ label, value }: { label: string; value: string }) {
       <strong>{value}</strong>
     </div>
   );
+}
+
+function formatClock(seconds: number | null | undefined) {
+  return formatOutTime(seconds) ?? "—";
+}
+
+function formatDateTime(timestamp: number | null | undefined) {
+  if (typeof timestamp !== "number" || !Number.isFinite(timestamp) || timestamp <= 0) return null;
+  return new Date(timestamp * 1000).toLocaleString();
 }
 
 function formatOutTime(seconds: number | null | undefined) {

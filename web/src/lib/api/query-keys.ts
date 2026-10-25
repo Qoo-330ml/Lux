@@ -66,6 +66,8 @@ export const queryKeys = {
   adminLogs: ["admin", "logs"] as const,
   adminSettings: ["admin", "settings"] as const,
   adminTranscodingSessions: ["admin", "transcoding", "sessions"] as const,
+  adminTranscodingHistory: (page: number, pageSize: number) =>
+    ["admin", "transcoding", "history", page, pageSize] as const,
   adminApiKey: ["admin", "api-key"] as const,
   adminEmbyMigrations: (page = 1) => ["admin", "emby-migrations", page] as const,
   adminEmbyMigrationSourceUsers: (page = 1, search = "") => ["admin", "emby-migration", "source-users", page, search] as const,

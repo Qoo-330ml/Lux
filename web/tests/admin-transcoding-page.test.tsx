@@ -59,6 +59,54 @@ const SETTINGS = {
   },
 } as unknown as AdminSettings;
 
+const HISTORY = {
+  page: 1,
+  pageSize: 10,
+  total: 2,
+  items: [
+    {
+      id: "history-1",
+      sessionId: "session-old",
+      userId: "user-1",
+      userName: "Admin",
+      itemId: "item-1",
+      title: "Transcode Demo",
+      itemType: "MOVIE",
+      mediaSourceId: "source-1",
+      tier: 3,
+      outcome: "COMPLETED",
+      startedAt: 1_000,
+      finishedAt: 1_060,
+      wallSeconds: 60,
+      encodedSeconds: 20,
+      averageSpeed: 0.33,
+      lastFps: 425.7,
+      outputBytes: 1_048_576,
+      failureReason: null,
+    },
+    {
+      id: "history-2",
+      sessionId: "session-failed",
+      userId: "user-1",
+      userName: "Admin",
+      itemId: "item-2",
+      title: "Broken GPU Test",
+      itemType: "MOVIE",
+      mediaSourceId: "source-2",
+      tier: 3,
+      outcome: "FAILED",
+      startedAt: 2_000,
+      finishedAt: 2_001,
+      wallSeconds: 1,
+      encodedSeconds: null,
+      averageSpeed: null,
+      lastFps: null,
+      outputBytes: null,
+      failureReason: "HLS_START_FAILED",
+    },
+  ],
+};
+
 const SESSIONS: AdminTranscodingSessions = {
   summary: {
     activeCount: 1,
@@ -113,6 +161,7 @@ describe("AdminTranscodingPage", () => {
     queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     vi.spyOn(api, "adminSettings").mockResolvedValue(SETTINGS);
     vi.spyOn(api, "adminTranscodingSessions").mockResolvedValue(SESSIONS);
+    vi.spyOn(api, "adminTranscodingHistory").mockResolvedValue(HISTORY);
   });
 
   afterEach(() => {
@@ -157,6 +206,44 @@ describe("AdminTranscodingPage", () => {
     expect(row?.textContent).toContain("1.0 MB");
     expect(row?.textContent).toContain("00:20");
     expect(row?.textContent).toContain("编码中");
+  });
+
+  it("stops a live session and shows the history with outcomes", async () => {
+    const stop = vi.spyOn(api, "stopAdminTranscodingSession").mockResolvedValue(undefined);
+    const confirm = vi.fn().mockReturnValue(true);
+    vi.stubGlobal("confirm", confirm);
+    await render();
+
+    const stopButton = container.querySelector<HTMLButtonElement>("button[aria-label='停止 Transcode Demo']");
+    expect(stopButton).not.toBeNull();
+    await act(async () => {
+      stopButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(confirm).toHaveBeenCalledTimes(1);
+    expect(stop).toHaveBeenCalledWith("session-1");
+
+    const history = container.querySelector("[aria-label='转码历史记录']");
+    expect(history).not.toBeNull();
+    expect(history?.textContent).toContain("完成");
+    expect(history?.textContent).toContain("失败");
+    expect(history?.textContent).toContain("失败原因：HLS_START_FAILED");
+    expect(history?.textContent).toContain("平均速度 0.33×");
+    expect(container.textContent).toContain("共 2 条");
+    vi.unstubAllGlobals();
+  });
+
+  it("does not stop when the confirmation is dismissed", async () => {
+    const stop = vi.spyOn(api, "stopAdminTranscodingSession").mockResolvedValue(undefined);
+    vi.stubGlobal("confirm", vi.fn().mockReturnValue(false));
+    await render();
+    const stopButton = container.querySelector<HTMLButtonElement>("button[aria-label='停止 Transcode Demo']");
+    await act(async () => {
+      stopButton?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(stop).not.toHaveBeenCalled();
+    vi.unstubAllGlobals();
   });
 
   it("shows an empty state when nothing is transcoding", async () => {

@@ -134,6 +134,7 @@ import type {
   WebPlaybackBootstrap,
   AdminTranscodingStatus,
   AdminTranscodingSessions,
+  AdminTranscodingHistoryPage,
   WebPlaybackTrackSelection,
   WebDanmakuInfo,
   SetupStatus,
@@ -952,6 +953,20 @@ export class LuxApiClient {
     return this.request<AdminTranscodingSessions>(
       "/api/v1/admin/transcoding/sessions",
       { signal },
+    );
+  }
+
+  adminTranscodingHistory(page = 1, pageSize = 10, signal?: AbortSignal) {
+    return this.request<AdminTranscodingHistoryPage>(
+      `/api/v1/admin/transcoding/history?page=${page}&pageSize=${pageSize}`,
+      { signal },
+    );
+  }
+
+  stopAdminTranscodingSession(sessionId: string) {
+    return this.request<void>(
+      `/api/v1/admin/transcoding/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
     );
   }
 

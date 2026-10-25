@@ -1585,6 +1585,36 @@ export type AdminTranscodingSessions = {
   };
 };
 
+export type AdminTranscodingOutcome = "COMPLETED" | "FAILED" | "EXPIRED" | string;
+
+export type AdminTranscodingHistoryItem = {
+  id: string;
+  sessionId: string;
+  userId: string;
+  userName: string | null;
+  itemId: string;
+  title: string | null;
+  itemType: string | null;
+  mediaSourceId: string | null;
+  tier: number;
+  outcome: AdminTranscodingOutcome;
+  startedAt: number;
+  finishedAt: number;
+  wallSeconds: number;
+  encodedSeconds: number | null;
+  averageSpeed: number | null;
+  lastFps: number | null;
+  outputBytes: number | null;
+  failureReason: string | null;
+};
+
+export type AdminTranscodingHistoryPage = {
+  page: number;
+  pageSize: number;
+  total: number;
+  items: AdminTranscodingHistoryItem[];
+};
+
 export type AdminTranscodingOptions = {
   hardwareEncoders: string[];
   softwarePresets: string[];

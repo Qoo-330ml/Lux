@@ -2429,3 +2429,34 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
 .lux-transcoding-metric dt { color: var(--lux-muted); font-size: .68rem; }
 
 .lux-transcoding-metric dd { margin: 0; font-size: .8rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+
+/* Live transcode actions and history. */
+.lux-transcoding-session-actions { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+
+.lux-transcoding-stop { min-height: 30px; padding: 0 10px; font-size: .72rem; }
+
+.lux-transcoding-history { display: grid; gap: 6px; }
+
+.lux-transcoding-history-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 9px 12px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(255,255,255,.02); }
+
+.lux-transcoding-history-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+.lux-transcoding-history-main strong { font-size: .84rem; overflow-wrap: anywhere; }
+
+.lux-transcoding-history-main small { color: var(--lux-muted); font-size: .72rem; }
+
+.lux-transcoding-history-reason { color: #f87171 !important; overflow-wrap: anywhere; }
+
+.lux-transcoding-history-metrics { display: flex; align-items: center; gap: 12px; flex: 0 0 auto; color: var(--lux-muted); font-size: .72rem; font-variant-numeric: tabular-nums; }
+
+.lux-transcoding-outcome { padding: 2px 8px; border-radius: 999px; border: 1px solid var(--lux-line-soft); font-size: .7rem; }
+
+.lux-transcoding-outcome.is-ok { color: #34d399; border-color: rgba(52,211,153,.35); }
+
+.lux-transcoding-outcome.is-error { color: #f87171; border-color: rgba(248,113,113,.35); }
+
+.lux-transcoding-outcome.is-muted { color: var(--lux-muted); }
+
+.lux-transcoding-history-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; color: var(--lux-muted); font-size: .74rem; flex-wrap: wrap; }
+
+.lux-transcoding-history-pager > div { display: flex; gap: 8px; }
