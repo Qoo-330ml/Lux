@@ -130,7 +130,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
           />
           <span>启用服务端转码</span>
         </label>
-        <small>关闭后本地媒体只做直连播放或浏览器端解码，不再启动 FFmpeg；正在播放的会话不受影响。</small>
+        <small>只影响实时播放：关闭后本地媒体只做直连播放或浏览器端解码，不再启动播放转码进程。缩略图、媒体信息探测、章节检测等后台任务仍照常使用 FFmpeg/FFprobe；正在播放的会话不受影响。</small>
 
         <label>
           <span>硬件编码器</span>

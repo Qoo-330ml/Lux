@@ -1156,3 +1156,49 @@ done
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn disabling_playback_transcoding_does_not_block_thumbnail_ffmpeg()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&config(temp_dir.path())).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Scoped Thumbnail (2024)");
+    fs::create_dir_all(&movie_dir)?;
+    fs::write(movie_dir.join("Scoped.Thumbnail.2024.mkv"), b"video")?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 test path")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let scan = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&scan.id, 100, None).await?;
+
+    // The playback transcoding switch must only gate the HLS pipeline; thumbnails keep using ffmpeg.
+    sqlx::query(
+        "INSERT INTO server_settings (key, value) VALUES ('transcoding', '{\"enabled\":false}')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let fake = temp_dir.path().join("ffmpeg");
+    let log = temp_dir.path().join("ffmpeg.log");
+    fake_ffmpeg(&fake, &log, 0)?;
+    let thumbnails = ThumbnailService::with_runner(database.clone(), fake, Duration::from_secs(5));
+    let report = thumbnails.generate_library(library.id).await?;
+
+    assert_eq!(report.generated, 1);
+    assert!(movie_dir.join("Scoped.Thumbnail.2024-poster.jpg").is_file());
+    assert!(
+        movie_dir
+            .join("Scoped.Thumbnail.2024-thumbnail.jpg")
+            .is_file()
+    );
+    let log = fs::read_to_string(log)?;
+    assert_eq!(ffmpeg_invocation_count(&log), 1, "ffmpeg log:\n{log}");
+    Ok(())
+}

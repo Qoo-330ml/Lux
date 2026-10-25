@@ -123,7 +123,7 @@ docker buildx bake --load --set app.tags=pdzhou/lux:latest app
 docker compose up -d --force-recreate lux
 ```
 
-服务端转码的并发上限、磁盘配额、码率与画质参数默认由管理员在“服务器设置 → 服务端转码”配置，保存在数据库 `server_settings.transcoding`，保存后对新建播放会话生效，正在播放的会话保持启动时的参数。两个部署级环境变量仍然优先于后台设置，用于设备/驱动相关的紧急覆盖：
+“服务端转码”设置只作用于实时播放的 HLS 转码（是否启用、编码器、并发、磁盘与画质）。缩略图与截图、媒体信息探测、章节检测等后台任务使用独立的 FFmpeg/FFprobe 预算（`LUX_FFMPEG_CONCURRENCY` 等），不受该开关影响。播放转码的并发上限、磁盘配额、码率与画质参数默认由管理员在“服务器设置 → 服务端转码”配置，保存在数据库 `server_settings.transcoding`，保存后对新建播放会话生效，正在播放的会话保持启动时的参数。两个部署级环境变量仍然优先于后台设置，用于设备/驱动相关的紧急覆盖：
 
 - `LUX_HLS_HW_ENCODER`：显式指定硬件编码器（`h264_nvenc`、`h264_qsv`、`h264_vaapi`、`h264_videotoolbox`）。设置后忽略后台选择的编码器；未设置时使用后台设置，后台为 `NONE` 时硬件档位不可用并降级为软件转码。
 - `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES`：覆盖全局 HLS 磁盘预算；未设置时使用后台的“全局磁盘预算”（0 表示不限制）。

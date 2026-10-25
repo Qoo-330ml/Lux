@@ -17743,7 +17743,8 @@ MPEG-2/AC-3 的 MKV 样例进入档位 4 软件转码，面板显示 `H.264`/`AA
 验收：
 
 - [x] 并发上限、磁盘配额、码率与分辨率越界值被拒绝且不落库；0 值语义明确（0 = 不限制或关闭）。
-- [x] 全局关闭转码后，本地媒体不再创建 HLS 会话，直放与既有客户端 fallback 不受影响；`.strm` 行为不变。
+- [x] 全局关闭转码后，本地媒体不再创建 HLS 会话，直放与既有客户端 fallback 不受影响；`.strm` 行为不变；
+  该开关只作用于播放 HLS，缩略图/截图、媒体信息探测与章节检测等后台 FFmpeg/FFprobe 任务不受影响。
 - [x] 硬件编码器仅接受允许列表；未配置时硬件档位降级到软件档位，且看板/日志不出现伪造的硬件转码。
 - [x] 保存设置后新会话使用新参数，已启动会话不被中断；重启后设置保持。
 - [x] 管理界面可读取、修改并保存全部设置项，非法输入显示固定文案且保留草稿。
@@ -17766,7 +17767,9 @@ FNOS/NAS 上验证硬件编码器路径；`h264_vaapi` 等需要设备映射，�
 `shared_admin_key_authenticates_lux_and_emby_requests_without_csrf` 与
 `shared_admin_key_can_follow_emby_library_discovery_flow` 在本机稳定返回 401，已用干净基线提交
 `5fca6b52` 的 worktree 复现，属既有失败；`tests/web_playback.rs` 的长场景用例另有既有间歇失败（见 LUX-847）。
-本任务改动范围内的定向目标全部通过。
+本任务改动范围内的定向目标全部通过。新增 `--test thumbnails
+disabling_playback_transcoding_does_not_block_thumbnail_ffmpeg` 确认关闭播放转码后缩略图仍会调用 FFmpeg 并写入
+POSTER/THUMB，锁定“开关只作用于实时播放 HLS”的边界。
 
 依赖：LUX-254、LUX-847（统计端点用于确认输出参数）。
 
