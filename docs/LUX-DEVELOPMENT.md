@@ -17844,6 +17844,28 @@ LUX-849 的降级路径兜底；部署文档写明各平台前置条件、设备
 结果（2026-10-25）：Compose 与部署文档更新；参数注入由 `--lib hls hardware_decode_adds_acceleration_before_the_input`
 覆盖；Web 后台新增“启用硬件解码”开关与说明，`admin-transcoding` 6/6、`tsc --noEmit` 与构建通过。
 
+#### LUX-852：独立转码设置组与实时转码进度
+
+范围：把转码从“服务器设置”中拆出为独立后台页面 `/admin/transcoding` 与导航入口，集中放置启用开关、硬件编码器、
+设备路径、硬件解码、三档并发、磁盘配额与水位、码率、preset、分辨率、音频码率，以及硬件自检状态和“重新检测”。
+新增管理员只读接口 `GET /api/v1/admin/transcoding/sessions`：列出活动的服务端 HLS 会话（用户、条目、档位、
+容器、codec、`progress` 中的 fps/speed/输出码率/已输出字节/丢帧/状态）与汇总；页面每 2 秒刷新。服务器设置页
+移除转码面板，其余设置保持不变。列表有界（最多 24 条），不新增数据库迁移，不读取媒体文件。
+
+验收：
+
+- [x] 后台导航新增“转码”，页面可读取/保存全部转码设置并显示自检状态与重测结果。
+- [x] 服务器设置页不再包含转码面板，其余设置行为不变。
+- [x] 实时列表只返回活动 `SERVER_HLS` 会话，最多 24 条，含摘要与逐会话进度；无会话时显示空状态。
+- [x] 接口需要管理员会话，非管理员被拒绝；只读、不写库、不启动或停止转码。
+- [x] 定向 Rust 测试、Web 组件测试、`tsc` 与构建通过。
+
+结果（2026-10-25）：新增 `GET /api/v1/admin/transcoding/sessions`（`src/api/admin/admin_transcoding.rs`）与
+`active_server_transcoding_sessions` 存储查询（join 用户与条目，LIMIT 24）。`--test web_playback` 的统计用例
+新增断言：列表包含该会话、`tier=4`、用户/标题正确、`progress.fps=24`、分片码率可读。Web 新增
+`AdminTranscodingPage` 与 `admin-transcoding-page` 2 项测试（进度渲染与空状态），`vitest` 890/890、`node --test`
+150/150、`tsc --noEmit` 与构建通过。未新增导航级权限：页面沿用 `user.canManageServer` 与管理员路由保护。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
