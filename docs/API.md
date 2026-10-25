@@ -46,9 +46,9 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/auth/logout`：需要有效 `lux_session` 和 `X-CSRF-Token`，成功返回 204 并撤销 session。
 - `PATCH /api/v1/auth/password`：需要当前 Web session 和 `X-CSRF-Token`，不接受用户级客户端令牌。请求体为 `{ "currentPassword": "旧密码", "newPassword": "新密码" }`；当前密码验证成功后写入新的 Argon2id 哈希，成功返回 204，当前密码错误返回 `401 INVALID_CREDENTIALS`。
 
-`lux_session` 为 `HttpOnly; Secure; SameSite=Lax; Path=/`，数据库只保存其 SHA-256 哈希。`lux_csrf` 不设置 HttpOnly，供同源 Web 客户端读取并通过 `X-CSRF-Token` header 发送；数据库保存 CSRF 哈希。session 有效期为 30 天，注销后立即失效。
+`lux_session` 为 `HttpOnly; SameSite=Lax; Path=/`，数据库只保存其 SHA-256 哈希；`Secure` 按请求的实际传输方案附加：请求声明 HTTPS（`X-Forwarded-Proto: https`，通常由反向代理注入）时带 `Secure`，明文 HTTP 时**不带**，因此局域网明文地址也能完成登录。`lux_csrf` 不设置 HttpOnly，供同源 Web 客户端读取并通过 `X-CSRF-Token` header 发送；数据库保存 CSRF 哈希。session 有效期为 30 天，注销后立即失效。
 
-当前阶段的 cookie 始终标记 `Secure`，部署时应使用 HTTPS；本机 HTTP 集成测试只验证协议和服务端行为，不代表浏览器会在不安全来源发送 Secure cookie。
+cookie 的 `Secure` 属性跟随传输方案，而不是恒为 `Secure`（实现见 `src/network.rs` 的 `is_secure_request` 与 `src/api/admin/admin_common.rs` 的 `secure_cookie_for_request`，明文 HTTP 登录断言见 `tests/web_auth.rs`）。明文 HTTP 部署可用，但凭据与会话在链路上都是明文；面向公网仍应使用 HTTPS，此时会话 cookie 与 Web 端 CSRF cookie 都会带 `Secure`（`web/src/lib/api/client.ts` 只在 `https:` 源写入带 `Secure` 的 CSRF cookie）。`X-Forwarded-Proto` 只用于该传输属性判断和展示信息，不参与认证、授权或 ACL。
 
 ## Lux 客户端令牌
 
