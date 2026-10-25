@@ -17798,6 +17798,15 @@ FNOS/NAS 上验证硬件编码器路径；`h264_vaapi` 等需要设备映射，�
 失败时，响应 `plan.tier=4`、会话行 `tier=4`、清单可读、统计接口显示 4。Web `admin-transcoding` 6/6。
 既有 `tests/web_playback.rs` 长场景用例仍在本机间歇失败（webhook 顺序/可信代理断言），与本次改动无关。
 
+真机验证（2026-10-25，macOS VideoToolbox）：保存 `h264_videotoolbox` 后 PATCH 响应与重启后的 GET 均返回
+`transcodingStatus.available=true`；“重新检测”可用；MPEG-2/AC-3 的 MKV 计划选择 `tier=3`（硬件档），
+清单与分片正常生成，统计接口返回 `tier=3`、`fps=425.7`、`speed=17.7`、分片实测约 `8.2 Mbps`；后台面板显示
+“自检通过（08:53:34）”，截图见 `output/playwright/lux-849/admin-hardware-selftest.png`。
+
+实现过程中发现并修复一个共享状态缺陷：`HlsManager` 的 `Clone` 曾把并发槽位、运行时策略和自检状态复制成
+新的锁，而 `AppState` 会按请求克隆，导致每个请求各持一份状态——硬件档永远看到“未自检”、LUX-848 的并发上限
+也会被绕过。现在三者都通过 `Arc` 共享，并新增 `cloned_managers_share_slots_runtime_and_probe_state` 回归。
+
 #### LUX-850：VAAPI / QSV / NVENC 编码参数与设备路径
 
 范围：按编码器补齐真实可用参数：VAAPI 增加 `-vaapi_device <device>` 与 `format=nv12,hwupload`；QSV 增加

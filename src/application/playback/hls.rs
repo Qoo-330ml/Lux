@@ -508,31 +508,16 @@ fn hardware_encoder_from_env() -> Option<String> {
         .filter(|value| is_allowed_hardware_encoder(value))
 }
 
+/// Every mutable field is shared through an `Arc`: `AppState` is cloned for each request, so a
+/// per-clone semaphore or self-test status would silently bypass limits and hide the probe result.
+#[derive(Clone)]
 pub(crate) struct HlsManager {
     base_directory: PathBuf,
     processes: Arc<RwLock<HashMap<String, Arc<HlsProcess>>>>,
-    slots: std::sync::RwLock<TierSlots>,
-    runtime: std::sync::RwLock<RuntimeTranscodeConfig>,
-    hardware_status: std::sync::RwLock<HardwareEncoderStatus>,
+    slots: Arc<std::sync::RwLock<TierSlots>>,
+    runtime: Arc<std::sync::RwLock<RuntimeTranscodeConfig>>,
+    hardware_status: Arc<std::sync::RwLock<HardwareEncoderStatus>>,
     ffmpeg_executable: String,
-}
-
-impl Clone for HlsManager {
-    fn clone(&self) -> Self {
-        Self {
-            base_directory: self.base_directory.clone(),
-            processes: Arc::clone(&self.processes),
-            slots: std::sync::RwLock::new(
-                self.slots
-                    .read()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .clone(),
-            ),
-            runtime: std::sync::RwLock::new(self.runtime_snapshot()),
-            hardware_status: std::sync::RwLock::new(self.hardware_status()),
-            ffmpeg_executable: self.ffmpeg_executable.clone(),
-        }
-    }
 }
 
 impl HlsManager {
@@ -573,13 +558,13 @@ impl HlsManager {
         Self {
             base_directory: config_dir.join("web-playback"),
             processes: Arc::new(RwLock::new(HashMap::new())),
-            slots: std::sync::RwLock::new(TierSlots::new((
+            slots: Arc::new(std::sync::RwLock::new(TierSlots::new((
                 MAX_REMUX_SESSIONS,
                 MAX_HARDWARE_SESSIONS,
                 MAX_SOFTWARE_SESSIONS,
-            ))),
-            runtime: std::sync::RwLock::new(runtime),
-            hardware_status: std::sync::RwLock::new(HardwareEncoderStatus::default()),
+            )))),
+            runtime: Arc::new(std::sync::RwLock::new(runtime)),
+            hardware_status: Arc::new(std::sync::RwLock::new(HardwareEncoderStatus::default())),
             ffmpeg_executable,
         }
     }
@@ -4121,6 +4106,30 @@ while :; do sleep 1; done
         permissions.set_mode(0o700);
         std::fs::set_permissions(&script, permissions).unwrap();
         script
+    }
+
+    #[tokio::test]
+    async fn cloned_managers_share_slots_runtime_and_probe_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            "/usr/bin/true".to_owned(),
+        );
+        let clone = manager.clone();
+        clone.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_videotoolbox".to_owned(),
+            remux_sessions: 0,
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(
+            manager.acquire_permit(ServerTier::Remux).is_err(),
+            "a cloned manager must share the concurrency slots"
+        );
+        assert_eq!(
+            manager.hardware_status().encoder.as_deref(),
+            Some("h264_videotoolbox"),
+            "a cloned manager must share the self-test state"
+        );
     }
 
     #[cfg(unix)]
