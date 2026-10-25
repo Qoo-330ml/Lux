@@ -353,6 +353,79 @@ impl Database {
             return Err(StorageError::Conflict("条目已不处于合并状态".to_owned()));
         }
 
+        // Remember the identity that caused this merge so the background worker cannot merge the
+        // same items right back. Provider keys cover TMDb groups; the title+year key covers the
+        // fallback for items without provider IDs.
+        let shared_provider_keys = self
+            .query(
+                "SELECT provider, provider_id
+                 FROM media_item_provider_ids
+                 WHERE media_item_id IN (?, ?)
+                 GROUP BY provider, provider_id
+                 HAVING COUNT(*) > 1",
+            )
+            .bind(primary_item_id)
+            .bind(merged_item_id)
+            .fetch_all(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if shared_provider_keys.is_empty() {
+            let title_key = self
+                .query(
+                    "SELECT sort_title, production_year FROM media_items
+                     WHERE id = ? AND production_year IS NOT NULL",
+                )
+                .bind(primary_item_id)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if let Some(title_key) = title_key {
+                let sort_title: String = title_key.get("sort_title");
+                let production_year: i64 = title_key.get("production_year");
+                self.query(
+                    "INSERT INTO merge_suppressions
+                         (library_id, item_type, sort_title, production_year)
+                     VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                )
+                .bind(&library_id)
+                .bind(&item_type)
+                .bind(sort_title)
+                .bind(production_year)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        } else {
+            for row in shared_provider_keys {
+                let provider: String = row.get("provider");
+                let provider_id: String = row.get("provider_id");
+                self.query(
+                    "INSERT INTO merge_suppressions
+                         (library_id, item_type, provider, provider_id)
+                     VALUES (?, ?, ?, ?) ON CONFLICT DO NOTHING",
+                )
+                .bind(&library_id)
+                .bind(&item_type)
+                .bind(provider)
+                .bind(provider_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            }
+        }
+
         let item_rows = self
             .query(
                 "SELECT item_id, parent_id, series_id, merged_into_item_id
@@ -515,6 +588,13 @@ impl Database {
                -- Local sidecar NFOs frequently carry stale IMDb/TVDB IDs from another film.
                -- Only TMDb, which Lux resolves itself, may prove two items are the same title.
                AND provider.provider = 'tmdb'
+               AND NOT EXISTS (
+                   SELECT 1 FROM merge_suppressions suppression
+                   WHERE suppression.library_id = mi.library_id
+                     AND suppression.item_type = mi.item_type
+                     AND suppression.provider = provider.provider
+                     AND suppression.provider_id = provider.provider_id
+               )
                {condition}
              GROUP BY mi.library_id, mi.item_type, provider.provider, provider.provider_id
              HAVING COUNT(*) > 1
@@ -574,6 +654,13 @@ impl Database {
                AND NOT EXISTS (
                    SELECT 1 FROM media_item_provider_ids provider
                    WHERE provider.media_item_id = mi.id
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM merge_suppressions suppression
+                   WHERE suppression.library_id = mi.library_id
+                     AND suppression.item_type = mi.item_type
+                     AND suppression.sort_title = mi.sort_title
+                     AND suppression.production_year = mi.production_year
                )
              GROUP BY mi.library_id, mi.item_type, mi.sort_title, mi.production_year
              HAVING COUNT(*) > 1

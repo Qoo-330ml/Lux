@@ -3004,6 +3004,8 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 - 自动合并只用 TMDb provider ID 分组；IMDb、TVDB、Wikidata 等旁车 NFO ID 不参与合并判定。
 - 候选条目首个媒体源路径目录段标注的年份不一致时否决合并，即使 provider ID 相同。
 - 任一条目存在非空 `edition_name` 媒体源时跳过自动合并，导演剪辑版等仍可作为独立条目。
+- 管理员手动拆分后，本次合并命中的身份键写入 `merge_suppressions`；后台自动合并跳过该键，
+  不会在两分钟内把同一条目并回去。身份键改变（重新识别）后旧抑制项自然失效。
 - 后台 worker 按游标分页有界执行，不在请求路径扫描全库；回填以 `lux_meta` 标记只跑一次，重复执行幂等。
 - 合并写入 `media_merge_records`、条目状态和媒体源状态；撤销恢复条目层级、媒体源归属和默认源，不恢复被合并条目的用户状态原值。
 - `GET /api/v1/admin/items/{itemId}/merges` 与 `POST /api/v1/admin/items/unmerge` 需要管理员会话和 CSRF，成功使目录/首页缓存失效并写不含路径和 URL 的审计事件。
@@ -3027,11 +3029,14 @@ NAS/x86 性能或第三方客户端表现。撤销不恢复被合并条目的用
 无法拆分。
 
 结果（2026-10-25，错误合并修复）：自动合并键收窄为 TMDb 单一 provider，并新增源路径年份否决，
-`--lib application::item_merge` 7 项、`--lib media_merge` 9 项、`--test item_merge` 通过。背景是
+`--lib application::item_merge` 9 项、`--lib media_merge` 9 项、`--test item_merge` 通过。背景是
 fnos 实际库中出现三条电影和一条剧集被错误合并：旁车 NFO 把 IMDb/TVDB ID 写成了另一部影片的 ID，
 自动合并按“任意共享 provider ID”把不同影片并成多版本；`银翼杀手 (1982)` 甚至因为目录级
 `movie.nfo` 写错 TMDb 78，把 `银翼杀手2049 (2017)` 并了进来。年份否决从路径目录段读取
-`(YYYY)`，与 provider ID 无关，专门拦截这类被 NFO 带偏的身份。手动拆分后的自动再合并抑制仍待实现。
+`(YYYY)`，与 provider ID 无关，专门拦截这类被 NFO 带偏的身份。
+SQLite 0225 / PostgreSQL 0227 增加 `merge_suppressions`：手动拆分时把命中的 TMDb（或标题+年份）
+键写入，自动合并候选查询用 `NOT EXISTS` 排除；`--lib application::item_merge` 的两项抑制回归和
+`--test item_unmerge` 通过。
 
 全量 `cargo test --locked --all-targets` 后仍有 11 个目标失败：`admin_api_key`、`admin_health`、
 `image_api`、`people_api`、`scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、

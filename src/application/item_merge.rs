@@ -785,4 +785,85 @@ mod tests {
         assert_eq!(source_year("Movie (1800)/file.strm"), None);
         assert_eq!(source_year("Movie (2100)/file.strm"), None);
     }
+
+    #[tokio::test]
+    async fn manual_unmerge_suppresses_provider_group_from_auto_merge()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        let provider = Some(r#"{"tmdb":"77"}"#);
+        for (id, title) in [("movie-a", "Same Movie"), ("movie-b", "Same Movie")] {
+            insert_item(
+                &database,
+                &library_id,
+                id,
+                "MOVIE",
+                None,
+                None,
+                None,
+                None,
+                title,
+                Some(2001),
+                provider,
+            )
+            .await?;
+            insert_source(&database, &format!("source-{id}"), id, None).await?;
+        }
+
+        let service = ItemMergeService::new(database.clone());
+        let report = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(report.groups_merged, 1);
+        assert_eq!(
+            merged_into(&database, "movie-b").await?.as_deref(),
+            Some("movie-a")
+        );
+
+        service.unmerge("movie-a", "movie-b").await?;
+        assert_eq!(merged_into(&database, "movie-b").await?, None);
+
+        let second = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(second.groups_merged, 0);
+        assert_eq!(merged_into(&database, "movie-b").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_unmerge_suppresses_title_fallback_group()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        for (id, title) in [("movie-a", "Same Movie"), ("movie-b", "Same Movie")] {
+            insert_item(
+                &database,
+                &library_id,
+                id,
+                "MOVIE",
+                None,
+                None,
+                None,
+                None,
+                title,
+                Some(2001),
+                None,
+            )
+            .await?;
+            insert_source(&database, &format!("source-{id}"), id, None).await?;
+        }
+
+        let service = ItemMergeService::new(database.clone());
+        let report = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(report.groups_merged, 1);
+
+        service.unmerge("movie-a", "movie-b").await?;
+        let second = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(second.groups_merged, 0);
+        assert_eq!(merged_into(&database, "movie-b").await?, None);
+        Ok(())
+    }
 }
