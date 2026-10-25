@@ -2537,3 +2537,19 @@ PostgreSQL 16.15 运行在同机 Docker；**没有在 x86_64 或 NAS 上验证�
 指针映射维护把提速全部抵消。因此该模式改为 opt-in（`LUX_SQLITE_AUTO_VACUUM=incremental`），
 默认保持关闭；默认路径下空闲页仍只能由整库 `VACUUM` 回收，其超时由
 `LUX_SQLITE_VACUUM_TIMEOUT_SECONDS` 控制（默认 120 秒）。
+
+### 按表集合删除子行（借鉴 Jellyfin）
+
+同一 502 行/剧夹具、同一批大小（500）：
+
+| 后端 | 逐行级联 | 每表一条集合删除 | 结论 |
+|---|---:|---:|---|
+| SQLite（4,016,000 行） | 37.96 s | **25.15 s** | 快 1.5×，整体从 65.74 s 降到 25.15 s（2.6×） |
+| PostgreSQL（1,004,000 行） | **5.69 s** | 8.29 s | 慢 1.46×，不采用 |
+
+SQLite 在删除前按「media_sources 的子表 → media_sources → media_items 的其余子表」顺序执行 37 条
+`DELETE … WHERE col IN (SELECT … LIMIT ?)`，把每行一次的级联查找换成每批固定条数的语句。
+PostgreSQL 的级联触发器本来就是每行一次索引探查，额外 37 条语句反而要重复扫描批次选择集，因此
+PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表时仍由级联兜底。
+`media_item_child_delete_list_covers_every_cascade_edge` 从 live schema 枚举所有 CASCADE 边做覆盖断言，
+本实现落地时它立刻发现了此前遗漏的 `media_merge_records` 两条边。

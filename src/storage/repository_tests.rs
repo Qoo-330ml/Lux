@@ -31764,3 +31764,164 @@ async fn batched_accessible_library_ids_match_single_user_queries() {
     );
     database.close().await;
 }
+
+#[tokio::test]
+async fn media_item_child_delete_list_covers_every_cascade_edge()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::library_deletion::MEDIA_ITEM_CHILD_DELETES;
+    use crate::config::Config;
+    use sqlx::Row;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_new'",
+    )
+    .fetch_all(database.pool())
+    .await?;
+
+    let mut missing = Vec::new();
+    for table in tables {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA foreign_key_list('{table}')"
+        )))
+        .fetch_all(database.pool())
+        .await?;
+        for row in rows {
+            let parent: String = row.get("table");
+            let column: String = row.get("from");
+            let action: String = row.get("on_delete");
+            // SET NULL edges keep their row on purpose; only cascades must be listed.
+            if action != "CASCADE" || (parent != "media_items" && parent != "media_sources") {
+                continue;
+            }
+            if !MEDIA_ITEM_CHILD_DELETES
+                .iter()
+                .any(|(list_table, list_column, _)| *list_table == table && *list_column == column)
+            {
+                missing.push(format!("{table}.{column} -> {parent}"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "set-based child deletes miss these cascade edges: {missing:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_item_batch_removes_every_child_table_row() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    for statement in [
+        "INSERT INTO libraries (id, name, kind) VALUES ('lib-batch', 'Batch', 'SERIES')",
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('root-batch', 'lib-batch', '/media/series', '/media/series', 1, 1)",
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             last_seen_generation
+         ) VALUES ('entry-batch', 'root-batch', 'Show/S01E01.mkv', 'FILE', 1, 1, '1')",
+        "INSERT INTO library_deletion_jobs (
+             id, library_id, library_name, status, stage
+         ) VALUES ('job-batch', 'lib-batch', 'Batch', 'RUNNING', 'MEDIA_ITEMS')",
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             provider_ids_json
+         ) VALUES ('series-batch', 'lib-batch', 'SERIES', 'Show', 'show',
+                   'LOCAL_CONFIRMED', '{\"tmdb\":\"1\"}')",
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number,
+             episode_number, title, sort_title, identification_status
+         ) VALUES ('episode-batch', 'lib-batch', 'EPISODE', 'series-batch',
+                   'series-batch', 1, 1, 'Show S01E01', 'show s01e01', 'LOCAL_CONFIRMED')",
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, container
+         ) VALUES ('source-batch', 'episode-batch', 'LOCAL_FILE', 'entry-batch', 'mkv')",
+        "INSERT INTO media_streams (
+             id, media_source_id, stream_index, stream_type
+         ) VALUES ('stream-batch', 'source-batch', 0, 'VIDEO')",
+        "INSERT INTO media_chapters (
+             id, media_source_id, start_position_ticks, marker_type, chapter_index,
+             provider_id, confidence
+         ) VALUES ('chapter-batch', 'source-batch', 0, 'INTRO_START', 0, 'test', 0.9)",
+        "INSERT INTO person_credits (item_id, person_id, person_type, person_name, role)
+         VALUES ('episode-batch', 'person-1', 'CAST', 'Actor', 'Role')",
+        "INSERT INTO item_images (id, item_id, image_type, local_path)
+         VALUES ('image-batch', 'series-batch', 'POSTER', '/config/metadata/library/x.jpg')",
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('alias-batch', 'series-batch', 'Alias', 'alias')",
+        "INSERT INTO item_metadata_completeness (item_id, capability, local_state, is_missing)
+         VALUES ('series-batch', 'NFO', 'READY', 0)",
+    ] {
+        sqlx::query(statement).execute(database.pool()).await?;
+    }
+
+    let mut batches = 0;
+    loop {
+        let deleted = database
+            .delete_library_deletion_batch(
+                "job-batch",
+                "lib-batch",
+                crate::storage::LibraryDeletionBatch::MediaItems,
+                500,
+            )
+            .await?
+            .ok_or("deletion batch stopped unexpectedly")?;
+        batches += 1;
+        if deleted == 0 {
+            break;
+        }
+        assert!(batches < 10, "batch loop did not converge");
+    }
+
+    for (table, column) in [
+        ("media_items", "library_id"),
+        ("media_sources", "item_id"),
+        ("media_streams", "media_source_id"),
+        ("media_chapters", "media_source_id"),
+        ("person_credits", "item_id"),
+        ("item_images", "item_id"),
+        ("item_aliases", "item_id"),
+        ("item_metadata_completeness", "item_id"),
+        ("media_item_provider_ids", "media_item_id"),
+        ("media_content_restriction_index_queue", "item_id"),
+    ] {
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} IN \
+             (SELECT id FROM media_items WHERE library_id = 'lib-batch')"
+        )))
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            remaining, 0,
+            "{table} still holds rows for the deleted library"
+        );
+    }
+
+    let stray_streams: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_streams WHERE id = 'stream-batch'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        stray_streams, 0,
+        "set-based delete must remove media streams"
+    );
+    Ok(())
+}

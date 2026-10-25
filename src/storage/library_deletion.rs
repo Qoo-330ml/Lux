@@ -21,6 +21,205 @@ pub(crate) enum LibraryDeletionBatch {
     ScanJobs,
 }
 
+/// Which parent table a set-based child delete is scoped through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeletionParent {
+    MediaItems,
+    MediaSources,
+}
+
+/// Deepest-first child deletes for one media-item batch.
+///
+/// Deleting a library item by item makes the foreign keys run one cascade lookup per
+/// parent row. Walking the same tables set-based keeps the work identical but turns it
+/// into a fixed number of statements per batch.
+///
+/// SQLite only. Measured on the 502-rows-per-series fixture: 4.02M rows went from
+/// 38.0 s to 25.2 s. PostgreSQL moves the other way (5.69 s to 8.29 s) because its
+/// cascade triggers are already a single index probe per row and the extra statements
+/// re-scan the batch selection 37 times, so PostgreSQL keeps the cascade path.
+///
+/// Foreign keys stay enabled either way: a table missing from this list is still
+/// cleaned up by the cascade, only more slowly, so the list is an optimization rather
+/// than a correctness requirement.
+pub(crate) const MEDIA_ITEM_CHILD_DELETES: &[(&str, &str, DeletionParent)] = &[
+    // Children of media_sources first: they hold the bulk of the rows (streams and
+    // chapter markers per episode) and must go before their parent.
+    (
+        "chapter_detection_job_items",
+        "source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "chapter_detection_source_states",
+        "source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "danmaku_match_job_items",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "danmaku_tracks",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "media_chapters",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "media_info_chapters",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "media_streams",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    // Then media_sources and the remaining children of media_items.
+    ("media_sources", "item_id", DeletionParent::MediaItems),
+    (
+        "chapter_detection_job_items",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "chapter_detection_job_items",
+        "season_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "collection_item_references",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("collection_items", "item_id", DeletionParent::MediaItems),
+    (
+        "collection_work_items",
+        "work_item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "collection_work_sources",
+        "source_item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("collections", "item_id", DeletionParent::MediaItems),
+    (
+        "emby_migration_import_records",
+        "lux_item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("item_aliases", "item_id", DeletionParent::MediaItems),
+    ("item_images", "item_id", DeletionParent::MediaItems),
+    (
+        "item_metadata_completeness",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_content_restriction_index",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_content_restriction_index_queue",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_item_provider_ids",
+        "media_item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_merge_records",
+        "merged_item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_merge_records",
+        "primary_item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("metadata_candidates", "item_id", DeletionParent::MediaItems),
+    (
+        "metadata_capability_attempts",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "metadata_image_attempts",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "metadata_reidentify_job_items",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("person_credits", "item_id", DeletionParent::MediaItems),
+    (
+        "person_index_item_state",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "person_match_candidates",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "playback_history_events",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("playback_sessions", "item_id", DeletionParent::MediaItems),
+    (
+        "recommendation_item_stats",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "thumbnail_scraper_retries",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("user_item_state", "item_id", DeletionParent::MediaItems),
+    (
+        "web_playback_sessions",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+];
+
+fn media_item_child_delete_sql(table: &str, column: &str, parent: DeletionParent) -> String {
+    match parent {
+        DeletionParent::MediaItems => format!(
+            "DELETE FROM {table} WHERE {column} IN \
+             (SELECT id FROM media_items WHERE library_id = ? LIMIT ?)"
+        ),
+        DeletionParent::MediaSources => format!(
+            "DELETE FROM {table} WHERE {column} IN (SELECT id FROM media_sources \
+             WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ? LIMIT ?))"
+        ),
+    }
+}
+
+fn media_item_child_deletes() -> &'static [String] {
+    static STATEMENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    STATEMENTS.get_or_init(|| {
+        MEDIA_ITEM_CHILD_DELETES
+            .iter()
+            .map(|(table, column, parent)| media_item_child_delete_sql(table, column, *parent))
+            .collect()
+    })
+}
+
 const LIBRARY_DELETION_JOB_COLUMNS: &str =
     "id, library_id, library_name, status, stage, processed_count, error_code,
      created_at, updated_at, started_at, finished_at";
@@ -508,6 +707,21 @@ impl Database {
                     source,
                 })?;
             return Ok(None);
+        }
+        if batch == LibraryDeletionBatch::MediaItems && self.backend() == DatabaseBackend::Sqlite {
+            // Set-based child deletes: same rows, a fixed number of statements instead
+            // of one foreign-key cascade lookup per parent row.
+            for statement in media_item_child_deletes() {
+                self.query(sqlx::AssertSqlSafe(statement.clone()))
+                    .bind(library_id)
+                    .bind(limit)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            }
         }
         let result = match batch {
             LibraryDeletionBatch::MediaItems => {
