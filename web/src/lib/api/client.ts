@@ -133,6 +133,7 @@ import type {
   WebPlaybackSessionStats,
   WebPlaybackBootstrap,
   AdminTranscodingStatus,
+  AdminTranscodingSessions,
   WebPlaybackTrackSelection,
   WebDanmakuInfo,
   SetupStatus,
@@ -943,6 +944,13 @@ export class LuxApiClient {
   webPlaybackStats(sessionId: string, signal?: AbortSignal) {
     return this.request<WebPlaybackSessionStats>(
       `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}/stats`,
+      { signal },
+    );
+  }
+
+  adminTranscodingSessions(signal?: AbortSignal) {
+    return this.request<AdminTranscodingSessions>(
+      "/api/v1/admin/transcoding/sessions",
       { signal },
     );
   }

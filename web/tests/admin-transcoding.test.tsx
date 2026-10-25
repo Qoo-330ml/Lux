@@ -122,7 +122,7 @@ describe("AdminTranscodingPanel", () => {
 
   it("shows the stored policy and the encoder allowlist", async () => {
     await render(SETTINGS);
-    expect(container.textContent).toContain("服务端转码");
+    expect(container.textContent).toContain("转码设置");
     expect(container.textContent).toContain("部署层 LUX_HLS_HW_ENCODER 优先于此处选择");
     expect(input("启用服务端转码")?.checked).toBe(true);
     expect(select("硬件编码器")?.value).toBe("NONE");

@@ -1541,6 +1541,50 @@ export type AdminTranscodingStatus = {
   error: string | null;
 };
 
+export type AdminTranscodingSessionProgress = {
+  fps: number | null;
+  speed: number | null;
+  bitrateKbps: number | null;
+  latestSegmentBitrateKbps: number | null;
+  averageBitrateKbps: number | null;
+  directoryBytes: number | null;
+  outTimeSeconds: number | null;
+  droppedFrames: number | null;
+  finished: boolean;
+  updatedAt: number;
+};
+
+export type AdminTranscodingSession = {
+  sessionId: string;
+  playSessionId: string | null;
+  userId: string;
+  userName: string | null;
+  itemId: string;
+  title: string | null;
+  itemType: string | null;
+  tier: number;
+  state: string;
+  container: string | null;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  audioBitrate: number | null;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+  progress: AdminTranscodingSessionProgress | null;
+};
+
+export type AdminTranscodingSessions = {
+  sessions: AdminTranscodingSession[];
+  summary: {
+    activeCount: number;
+    hardwareCount: number;
+    softwareCount: number;
+    streamCopyCount: number;
+    outputBytes: number;
+  };
+};
+
 export type AdminTranscodingOptions = {
   hardwareEncoders: string[];
   softwarePresets: string[];

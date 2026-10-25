@@ -99,7 +99,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
     return (
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="transcoding-settings-heading">
         <div className="lux-admin-panel-heading">
-          <div><h2 id="transcoding-settings-heading">服务端转码</h2></div>
+          <div><h2 id="transcoding-settings-heading">转码设置</h2></div>
           <ServerCog size={20} className="lux-admin-panel-icon" />
         </div>
         <p className="lux-admin-field-hint">当前服务器版本未返回转码设置。</p>
@@ -117,7 +117,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
   return (
     <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="transcoding-settings-heading">
       <div className="lux-admin-panel-heading">
-        <div><h2 id="transcoding-settings-heading">服务端转码</h2></div>
+        <div><h2 id="transcoding-settings-heading">转码设置</h2></div>
         <ServerCog size={20} className="lux-admin-panel-icon" />
       </div>
       <div className="lux-admin-settings-form">

@@ -4,7 +4,6 @@ import { useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { AdminApiKeyPanel } from "../account/AdminApiKeyPanel";
-import { AdminTranscodingPanel } from "./AdminTranscodingPanel";
 import type {
   AdminNetworkProxySettings,
   LoginBackgroundSource,
@@ -167,8 +166,6 @@ export function AdminSettingsPage() {
         {saved ? <p className="lux-settings-saved"><Check size={15} /> 设置已保存</p> : null}
         {save.error ? <p className="lux-error-copy">{save.error.message}</p> : null}
       </section>
-
-      <AdminTranscodingPanel settings={settings.data} />
 
       <section className="lux-admin-panel lux-admin-settings-panel" aria-labelledby="login-background-heading">
         <div className="lux-admin-panel-heading">

@@ -21,6 +21,7 @@ import {
   loadAdminOperationsPage,
   loadAdminPluginsPage,
   loadAdminSettingsPage,
+  loadAdminTranscodingPage,
   loadAdminUsersPage,
 } from "../features/admin/admin-navigation";
 
@@ -41,6 +42,7 @@ const AdminNotificationsPage = lazy(loadAdminNotificationsPage);
 const AdminUsersPage = lazy(loadAdminUsersPage);
 const AdminOperationsPage = lazy(loadAdminOperationsPage);
 const AdminSettingsPage = lazy(loadAdminSettingsPage);
+const AdminTranscodingPage = lazy(loadAdminTranscodingPage);
 const AdminChangelogPage = lazy(loadAdminChangelogPage);
 const AdminUserDetailPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserDetailPage }) => ({ default: AdminUserDetailPage })));
 const AdminUserSettingsPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserSettingsPage }) => ({ default: AdminUserSettingsPage })));
@@ -146,6 +148,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
               <Route path="users/:userId" element={<AdminUserDetailPage />} />
               <Route path="jobs" element={<AdminOperationsPage />} />
               <Route path="settings" element={<AdminSettingsPage />} />
+              <Route path="transcoding" element={<AdminTranscodingPage />} />
               <Route path="changelog" element={<AdminChangelogPage />} />
             </Route>
           </Route>

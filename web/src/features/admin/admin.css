@@ -2396,3 +2396,36 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
 .lux-admin-transcoding-status .is-spinning { animation: lux-admin-spin .9s linear infinite; }
 
 @keyframes lux-admin-spin { to { transform: rotate(360deg); } }
+
+/* Dedicated transcoding page: live session summary and per-session progress. */
+.lux-admin-transcoding-summary { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; margin: 14px 0 16px; }
+
+.lux-transcoding-summary-chip { display: flex; flex-direction: column; gap: 3px; padding: 10px 12px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(255,255,255,.03); }
+
+.lux-transcoding-summary-chip small { color: var(--lux-muted); font-size: .7rem; }
+
+.lux-transcoding-summary-chip strong { font-size: .95rem; font-variant-numeric: tabular-nums; }
+
+.lux-transcoding-sessions { display: grid; gap: 10px; }
+
+.lux-transcoding-session { padding: 12px 14px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: rgba(255,255,255,.02); }
+
+.lux-transcoding-session-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; }
+
+.lux-transcoding-session-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+
+.lux-transcoding-session-title strong { font-size: .88rem; overflow-wrap: anywhere; }
+
+.lux-transcoding-session-title small { color: var(--lux-muted); font-size: .72rem; }
+
+.lux-transcoding-session-state { flex: 0 0 auto; padding: 3px 8px; border: 1px solid var(--lux-line-soft); border-radius: 999px; color: var(--lux-muted); font-size: .7rem; }
+
+.lux-transcoding-session-state.is-finished { color: #fbbf24; border-color: rgba(251,191,36,.35); }
+
+.lux-transcoding-session-metrics { display: grid; grid-template-columns: repeat(auto-fit, minmax(104px, 1fr)); gap: 8px 14px; margin: 10px 0 0; }
+
+.lux-transcoding-metric { display: flex; flex-direction: column; gap: 1px; }
+
+.lux-transcoding-metric dt { color: var(--lux-muted); font-size: .68rem; }
+
+.lux-transcoding-metric dd { margin: 0; font-size: .8rem; font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
