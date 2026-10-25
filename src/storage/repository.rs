@@ -92,6 +92,7 @@ mod notifications;
 mod people;
 #[path = "sessions.rs"]
 mod sessions;
+pub(crate) use sessions::StoredTranscodingSessionRow;
 #[path = "users.rs"]
 mod users;
 

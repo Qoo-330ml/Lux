@@ -1815,6 +1815,33 @@ async fn web_playback_stats_report_the_plan_and_live_transcode_progress()
             .is_some_and(|kbps| kbps > 0.0)
     );
 
+    let listing = client
+        .get(format!("{base_url}/api/v1/admin/transcoding/sessions"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listing.status(), reqwest::StatusCode::OK);
+    let listing = listing.json::<Value>().await?;
+    assert!(
+        listing["summary"]["activeCount"]
+            .as_i64()
+            .is_some_and(|count| count >= 1),
+        "{listing}"
+    );
+    let listed = listing["sessions"]
+        .as_array()
+        .and_then(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session["sessionId"] == json!(transcode_id))
+        })
+        .ok_or("active transcoding session missing from the admin listing")?;
+    assert_eq!(listed["tier"], json!(4));
+    assert_eq!(listed["userName"], json!("Admin"));
+    assert_eq!(listed["title"], json!("Stats Playback Movie"));
+    assert_eq!(listed["progress"]["fps"], json!(24.0));
+    assert_eq!(listed["progress"]["latestSegmentBitrateKbps"], json!(0.014));
+
     let unknown = client
         .get(format!(
             "{base_url}/api/v1/playback/sessions/unknown-session/stats"

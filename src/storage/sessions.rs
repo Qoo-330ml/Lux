@@ -1128,6 +1128,53 @@ impl Database {
         })
     }
 
+    /// Active server-side transcoding sessions for the admin progress list, newest first.
+    pub(crate) async fn active_server_transcoding_sessions(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<StoredTranscodingSessionRow>, StorageError> {
+        self.query(
+            "SELECT w.id AS session_id, w.user_id, u.display_name AS user_name,
+                    w.item_id, mi.title AS item_title, mi.item_type, w.tier, w.state,
+                    w.expires_at, w.created_at, w.updated_at, w.video_codec, w.audio_codec,
+                    w.audio_bitrate, w.transcoding_container
+             FROM web_playback_sessions w
+             LEFT JOIN users u ON u.id = w.user_id
+             LEFT JOIN media_items mi ON mi.id = w.item_id
+             WHERE w.state = 'ACTIVE' AND w.plan = 'SERVER_HLS'
+             ORDER BY w.updated_at DESC, w.id DESC
+             LIMIT ?",
+        )
+        .bind(limit.clamp(1, 100))
+        .fetch_all(&self.pool)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .map(|row| StoredTranscodingSessionRow {
+                    session_id: row.get("session_id"),
+                    user_id: row.get("user_id"),
+                    user_name: row.get("user_name"),
+                    item_id: row.get("item_id"),
+                    item_title: row.get("item_title"),
+                    item_type: row.get("item_type"),
+                    tier: row.get("tier"),
+                    state: row.get("state"),
+                    expires_at: row.get("expires_at"),
+                    created_at: row.get("created_at"),
+                    updated_at: row.get("updated_at"),
+                    video_codec: row.get("video_codec"),
+                    audio_codec: row.get("audio_codec"),
+                    audio_bitrate: row.get("audio_bitrate"),
+                    transcoding_container: row.get("transcoding_container"),
+                })
+                .collect()
+        })
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     /// Records the tier actually running, after a hardware start fell back to software.
     pub(crate) async fn update_web_playback_session_tier(
         &self,
@@ -1542,4 +1589,22 @@ mod session_bound_tests {
     fn session_listing_bound_is_small_enough_to_stay_cheap() {
         assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
     }
+}
+
+pub(crate) struct StoredTranscodingSessionRow {
+    pub(crate) session_id: String,
+    pub(crate) user_id: String,
+    pub(crate) user_name: Option<String>,
+    pub(crate) item_id: String,
+    pub(crate) item_title: Option<String>,
+    pub(crate) item_type: Option<String>,
+    pub(crate) tier: i64,
+    pub(crate) state: String,
+    pub(crate) expires_at: i64,
+    pub(crate) created_at: i64,
+    pub(crate) updated_at: i64,
+    pub(crate) video_codec: Option<String>,
+    pub(crate) audio_codec: Option<String>,
+    pub(crate) audio_bitrate: Option<i64>,
+    pub(crate) transcoding_container: Option<String>,
 }

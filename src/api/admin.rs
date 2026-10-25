@@ -12,6 +12,8 @@ mod admin_users;
 pub(super) use admin_users::user_json;
 #[path = "admin/admin_settings.rs"]
 mod admin_settings;
+#[path = "admin/admin_transcoding.rs"]
+mod admin_transcoding;
 #[path = "admin/admin_user_invitations.rs"]
 mod admin_user_invitations;
 #[path = "admin/admin_user_registrations.rs"]
@@ -75,6 +77,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(admin_user_invitations::api_routes())
         .merge(admin_user_registrations::api_routes())
         .merge(settings_routes())
+        .merge(transcoding_routes())
         .merge(libraries_routes())
         .merge(items_routes())
         .merge(people_routes())
@@ -96,6 +99,10 @@ pub(super) fn users_routes() -> Router<AppState> {
 
 pub(super) fn settings_routes() -> Router<AppState> {
     admin_settings::api_routes()
+}
+
+pub(super) fn transcoding_routes() -> Router<AppState> {
+    admin_transcoding::api_routes()
 }
 
 pub(super) fn libraries_routes() -> Router<AppState> {
