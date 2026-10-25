@@ -817,7 +817,7 @@ function LibraryDeletionJobRow({ job, retrying, onRetry }: { job: AdminLibraryDe
     <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
     <div className="lux-admin-job-main">
       <div className="lux-admin-job-heading"><strong>{job.libraryName}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{libraryDeletionStatusLabel(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{job.status === "PENDING" ? "等待后台处理" : libraryDeletionStageLabel(job.stage)}</span></div>
+      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{job.status === "PENDING" ? "等待后台清理" : libraryDeletionStageLabel(job.stage)}</span></div>
       {message ? <div className="lux-admin-job-error" role="alert"><strong>{message}</strong><code>{job.errorCode}</code></div> : null}
       <time className="lux-admin-job-finished-at">{active ? `最近更新：${formatAdminDate(job.updatedAt)}` : `完成时间：${job.finishedAt == null ? "—" : formatAdminDate(job.finishedAt)}`}</time>
     </div>

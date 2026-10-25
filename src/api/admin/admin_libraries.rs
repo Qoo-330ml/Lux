@@ -915,7 +915,6 @@ pub(crate) async fn admin_delete_library(
     if let Some(home) = state.home.as_ref() {
         home.invalidate();
     }
-    service.spawn_worker(&job.id);
     record_audit_event(
         &state,
         &headers,
@@ -1068,7 +1067,6 @@ pub(crate) async fn admin_retry_library_deletion(
             .into_response();
         }
     };
-    service.spawn_worker(&job.id);
     record_audit_event(
         &state,
         &headers,

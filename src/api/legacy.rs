@@ -496,7 +496,15 @@ impl AppState {
             thumbnails.clone(),
         )
         .with_library_covers(library_covers.clone())
-        .with_danmaku(danmaku.clone());
+        .with_danmaku(danmaku.clone())
+        .with_library_deletion(
+            crate::application::library_deletion::LibraryDeletionService::new(
+                database.clone(),
+                Some(scan_jobs.clone()),
+                Some(plugins.clone()),
+                Some(home.clone()),
+            ),
+        );
         let global_collection_sync_worker =
             Some(GlobalCollectionSyncWorker::start(database.clone()));
         let identity_merge_worker = Some(IdentityMergeWorker::start(

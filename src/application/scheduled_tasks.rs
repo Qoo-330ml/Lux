@@ -1,3 +1,4 @@
+use crate::application::library_deletion::LibraryDeletionService;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -67,6 +68,7 @@ pub struct ScheduledTaskService {
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
     thumbnail_retry_semaphore: Arc<Semaphore>,
     worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
+    library_deletion: Option<LibraryDeletionService>,
 }
 
 struct TaskCursor {
@@ -200,6 +202,7 @@ impl ScheduledTaskService {
             thumbnail_retry_semaphore: Arc::new(Semaphore::new(
                 THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE as usize,
             )),
+            library_deletion: None,
             worker: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -220,6 +223,14 @@ impl ScheduledTaskService {
 
     pub fn with_library_covers(mut self, library_covers: Option<LibraryCoverService>) -> Self {
         self.library_covers = library_covers;
+        self
+    }
+
+    pub(crate) fn with_library_deletion(
+        mut self,
+        library_deletion: LibraryDeletionService,
+    ) -> Self {
+        self.library_deletion = Some(library_deletion);
         self
     }
 
@@ -359,6 +370,11 @@ impl ScheduledTaskService {
             tracing::warn!(%error, "due automatic metadata retries could not be scheduled");
         }
         self.run_due_thumbnail_scraper_retries().await;
+        // Library deletions are queued by the admin API and drained by this pass, so the
+        // request returns without touching the library's rows.
+        if let Some(deletion) = &self.library_deletion {
+            deletion.drain_pending().await;
+        }
         self.cursors
             .lock()
             .await
