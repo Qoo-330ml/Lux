@@ -250,13 +250,6 @@ struct RestoreCandidate {
 }
 
 impl Database {
-    fn storage_error(&self, source: sqlx::Error) -> StorageError {
-        StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        }
-    }
-
     /// Copies the watch state of exactly these items into the archive.
     ///
     /// Every identified item contributes one row per provider identity, so one archive row can be
@@ -494,11 +487,11 @@ impl Database {
         .map_err(|source| self.storage_error(source))
     }
 
-    /// Reattaches detached watch state on a schedule.
+    /// Reattaches detached watch state and playback history on a schedule.
     ///
     /// Runs after the database is ready rather than inside a request, and tolerates a failed pass:
     /// the next one sees the same rows, because a row is only consumed once it was applied.
-    pub fn spawn_watch_state_reconcile(&self) {
+    pub fn spawn_detached_state_reconcile(&self) {
         let database = self.clone();
         tokio::spawn(async move {
             tokio::time::sleep(WATCH_STATE_RECONCILE_INITIAL_DELAY).await;
@@ -516,6 +509,20 @@ impl Database {
                     }
                     Err(error) => {
                         tracing::warn!(%error, "reattaching detached watch state failed");
+                    }
+                }
+                match database
+                    .restore_detached_playback_history(
+                        super::playback_history_archive::PLAYBACK_HISTORY_RESTORE_BATCH,
+                    )
+                    .await
+                {
+                    Ok(0) => {}
+                    Ok(restored) => {
+                        tracing::info!(restored, "reattached detached playback history");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "reattaching detached playback history failed");
                     }
                 }
             }

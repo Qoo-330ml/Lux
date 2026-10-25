@@ -15,21 +15,22 @@ const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGME
 
 /// Expired tombstones that can be dropped without losing anything the user earned.
 ///
-/// Playback history and merge targets still block the delete. User state no longer does when the
-/// item carries a provider identity: that identity is what lets the archived state find the item
-/// again, so the state is copied into the archive instead of pinning the row forever. An
-/// unidentified item keeps its row, because there is nothing left to match its state by later.
+/// Merge targets still block the delete. User state and playback history no longer do when the item
+/// carries a provider identity: that identity is what lets the archived copies find the item again,
+/// so both are archived instead of pinning the row forever. An unidentified item keeps its row,
+/// because there would be nothing left to match its history by later.
 const PURGEABLE_REMOVED_ITEM_SELECT: &str = "
 SELECT mi.id FROM media_items mi
 WHERE mi.removed_at IS NOT NULL
   AND mi.removed_at < unixepoch() - ?
   AND mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO', 'UNRESOLVED')
   AND NOT EXISTS (
-      SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
-  AND NOT EXISTS (
       SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
   AND (
-      NOT EXISTS (SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
+      (
+          NOT EXISTS (SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
+          AND NOT EXISTS (SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
+      )
       OR EXISTS (SELECT 1 FROM media_item_provider_ids p WHERE p.media_item_id = mi.id)
   )
 ORDER BY mi.removed_at
@@ -1113,12 +1114,12 @@ impl Database {
 
     /// Hard-deletes soft-deleted media items older than `retention_seconds` in small
     /// batches, letting `ON DELETE CASCADE` remove images, credits and search rows.
-    /// Items that still carry playback history or are a merge target are kept.
+    /// Items that are a merge target are kept.
     ///
-    /// User state no longer blocks the delete: an identified item has its state copied into
-    /// `user_item_state_archive` first, so the history survives and is reattached to whichever
+    /// User state and playback history no longer block the delete: an identified item has both
+    /// copied into their archives first, so the history survives and is reattached to whichever
     /// item carries the same provider identity later. Only items without a provider identity keep
-    /// their state by keeping the row, because there would be nothing to match them by afterwards.
+    /// their rows, because there would be nothing to match their history by afterwards.
     pub async fn purge_expired_removed_media_items(
         &self,
         retention_seconds: i64,
@@ -1148,6 +1149,8 @@ impl Database {
             // item whose state was already consumed or a state row whose item is already gone.
             let mut transaction = self.begin_metadata_write_transaction().await?;
             self.archive_watch_state_for_items(&mut transaction, &candidates)
+                .await?;
+            self.archive_playback_history_for_items(&mut transaction, &candidates)
                 .await?;
             let placeholders = std::iter::repeat_n("?", candidates.len())
                 .collect::<Vec<_>>()

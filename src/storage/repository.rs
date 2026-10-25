@@ -95,6 +95,8 @@ mod sessions;
 pub(crate) use sessions::{
     NewTranscodingHistory, StoredTranscodingHistory, StoredTranscodingSessionRow,
 };
+#[path = "playback_history_archive.rs"]
+mod playback_history_archive;
 #[path = "users.rs"]
 mod users;
 #[path = "watch_state_archive.rs"]
@@ -1648,6 +1650,17 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
         self.query_count.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Maps an sqlx failure onto a storage error that names the database it came from.
+    ///
+    /// Shared by the modules that archive and reattach detached user state, so every one of those
+    /// paths reports failures the same way.
+    pub(super) fn storage_error(&self, source: sqlx::Error) -> StorageError {
+        StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        }
     }
 
     fn query(

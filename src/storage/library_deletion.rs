@@ -709,11 +709,13 @@ impl Database {
             return Ok(None);
         }
         if batch == LibraryDeletionBatch::MediaItems {
-            // Watch state has to be copied out before anything below removes it: the set-based child
-            // deletes on SQLite and the foreign-key cascade on PostgreSQL both take
-            // `user_item_state` with the item, and the user expects the history back when the same
-            // title is added to another library.
+            // Watch state and playback history have to be copied out before anything below removes
+            // them: the set-based child deletes on SQLite and the foreign-key cascade on PostgreSQL
+            // both take both tables with the item, and the user expects the history back when the
+            // same title is added to another library.
             self.archive_watch_state_for_library(&mut transaction, library_id)
+                .await?;
+            self.archive_playback_history_for_library(&mut transaction, library_id)
                 .await?;
         }
         if batch == LibraryDeletionBatch::MediaItems && self.backend() == DatabaseBackend::Sqlite {

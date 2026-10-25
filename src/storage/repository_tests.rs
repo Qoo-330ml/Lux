@@ -31875,6 +31875,11 @@ async fn media_item_batch_removes_every_child_table_row() -> Result<(), Box<dyn 
              user_id, item_id, position_ticks, is_played, is_favorite, play_count,
              last_played_at
          ) VALUES ('user-batch', 'series-batch', 0, 1, 1, 4, 1700000000)",
+        "INSERT INTO playback_history_events (
+             id, user_id, item_id, event_type, position_ticks, occurred_at, source,
+             source_event_key
+         ) VALUES ('event-batch', 'user-batch', 'series-batch', 'PLAY_STARTED', 0, 1700000000,
+                   'emby-import', 'emby-event-batch')",
     ] {
         sqlx::query(statement).execute(database.pool()).await?;
     }
@@ -31955,6 +31960,16 @@ async fn media_item_batch_removes_every_child_table_row() -> Result<(), Box<dyn 
             4
         )],
         "deleting a library has to keep the watch state the user earned, exactly once"
+    );
+    let archived_events: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, provider, provider_id FROM playback_history_event_archive ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        archived_events,
+        vec![("event-batch".to_owned(), "tmdb".to_owned(), "1".to_owned())],
+        "deleting a library has to keep the playback history too"
     );
     Ok(())
 }
