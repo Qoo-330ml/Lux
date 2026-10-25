@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -402,8 +402,49 @@ const DATABASE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::
 /// Shutdown cannot hang on a checkpoint: a log that is not truncated only costs a replay on the
 /// next start, so the budget stays short and the failure is logged, never fatal.
 const WAL_TRUNCATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a database write lock may be held before the wait becomes worth a log line. These
+/// locks are only taken by writers, so an occasional wait is normal; a wait past this threshold
+/// means two subsystems are queuing on the same rows and the log should name both.
+const WRITE_LOCK_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const DATABASE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Acquires one of the process-wide write locks, reporting a wait that stops being negligible.
+///
+/// The lock is deliberately not a fair queue: the point is to serialise a handful of writers, not to
+/// schedule requests. What the log line adds is the answer to "why did this write take two seconds"
+/// without instrumenting every caller.
+async fn acquire_write_lock_after(
+    lock: &Arc<AsyncMutex<()>>,
+    operation: &'static str,
+    threshold: Duration,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    match tokio::time::timeout(threshold, lock.clone().lock_owned()).await {
+        Ok(guard) => guard,
+        Err(_) => {
+            let started = Instant::now();
+            tracing::info!(
+                operation,
+                threshold_ms = threshold.as_millis() as u64,
+                "database write lock is held by another writer; waiting"
+            );
+            let guard = lock.clone().lock_owned().await;
+            tracing::info!(
+                operation,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "database write lock acquired after waiting"
+            );
+            guard
+        }
+    }
+}
+
+async fn acquire_write_lock(
+    lock: &Arc<AsyncMutex<()>>,
+    operation: &'static str,
+) -> tokio::sync::OwnedMutexGuard<()> {
+    acquire_write_lock_after(lock, operation, WRITE_LOCK_WAIT_LOG_THRESHOLD).await
+}
 
 fn database_pool_options(max_connections: u32) -> AnyPoolOptions {
     AnyPoolOptions::new()
@@ -1127,7 +1168,7 @@ impl Database {
         &self,
     ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         if self.backend == DatabaseBackend::Sqlite {
-            Some(self.metadata_write_lock.clone().lock_owned().await)
+            Some(acquire_write_lock(&self.metadata_write_lock, "metadata_write").await)
         } else {
             None
         }

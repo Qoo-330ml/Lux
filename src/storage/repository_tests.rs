@@ -31958,3 +31958,26 @@ async fn media_item_batch_removes_every_child_table_row() -> Result<(), Box<dyn 
     );
     Ok(())
 }
+
+#[tokio::test]
+async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
+    let lock = Arc::new(AsyncMutex::new(()));
+    let holder_lock = lock.clone();
+    let holder = tokio::spawn(async move {
+        let _guard = holder_lock.lock().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+    // Let the holder take the lock before the acquisition under test starts waiting.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let started = Instant::now();
+    let guard = acquire_write_lock_after(&lock, "test", Duration::from_millis(1)).await;
+    let waited = started.elapsed();
+    drop(guard);
+    holder.await.expect("holder task");
+
+    assert!(
+        waited >= Duration::from_millis(40),
+        "the acquisition returned while another writer still held the lock, after {waited:?}"
+    );
+}

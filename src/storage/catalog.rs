@@ -538,7 +538,11 @@ impl Database {
     pub(crate) async fn refresh_recommendation_stats_if_needed(
         &self,
     ) -> Result<bool, StorageError> {
-        let _refresh_guard = self.recommendation_stats_refresh_lock.lock().await;
+        let _refresh_guard = acquire_write_lock(
+            &self.recommendation_stats_refresh_lock,
+            "recommendation_stats",
+        )
+        .await;
         let now = current_unix_timestamp();
         let batch_key = recommendation_batch_key_at(now);
         let state = self
