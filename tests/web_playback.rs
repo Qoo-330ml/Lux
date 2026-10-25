@@ -1845,6 +1845,78 @@ async fn web_playback_stats_report_the_plan_and_live_transcode_progress()
     assert_eq!(listing["summary"]["hardwareCount"], json!(0));
     assert_eq!(listing["summary"]["streamCopyCount"], json!(0));
 
+    let stop_without_csrf = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/transcoding/sessions/{transcode_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(stop_without_csrf.status(), reqwest::StatusCode::FORBIDDEN);
+    let stopped = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/transcoding/sessions/{transcode_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .send()
+        .await?;
+    assert_eq!(stopped.status(), reqwest::StatusCode::NO_CONTENT);
+    let second_stop = client
+        .delete(format!(
+            "{base_url}/api/v1/admin/transcoding/sessions/{transcode_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .send()
+        .await?;
+    assert_eq!(second_stop.status(), reqwest::StatusCode::NOT_FOUND);
+    let after_stop = client
+        .get(format!("{base_url}/api/v1/admin/transcoding/sessions"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(after_stop.status(), reqwest::StatusCode::OK);
+    let after_stop = after_stop.json::<Value>().await?;
+    assert!(
+        !after_stop["sessions"]
+            .as_array()
+            .is_some_and(|sessions| sessions
+                .iter()
+                .any(|session| session["sessionId"] == json!(transcode_id))),
+        "a stopped session must leave the live list: {after_stop}"
+    );
+
+    let history = client
+        .get(format!(
+            "{base_url}/api/v1/admin/transcoding/history?page=1&pageSize=10"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(history.status(), reqwest::StatusCode::OK);
+    let history = history.json::<Value>().await?;
+    assert!(history["total"].as_i64().is_some_and(|total| total >= 1));
+    let entry = history["items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["sessionId"] == json!(transcode_id))
+        })
+        .ok_or("stopped session missing from the transcoding history")?;
+    assert_eq!(entry["outcome"], json!("COMPLETED"));
+    assert_eq!(entry["tier"], json!(4));
+    assert_eq!(entry["title"], json!("Stats Playback Movie"));
+    assert_eq!(entry["userName"], json!("Admin"));
+    assert!(
+        entry["averageSpeed"]
+            .as_f64()
+            .is_some_and(|speed| speed > 0.0)
+    );
+    assert!(entry["outputBytes"].as_i64().is_some_and(|bytes| bytes > 0));
+    assert_eq!(entry["lastFps"], json!(24.0));
+
     let unknown = client
         .get(format!(
             "{base_url}/api/v1/playback/sessions/unknown-session/stats"

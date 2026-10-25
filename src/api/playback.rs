@@ -1126,7 +1126,9 @@ async fn create_emby_transcoding_session(
         )
         .await
     {
-        let _ = service.stop(&created.id, &user_id).await;
+        let _ = service
+            .fail(&created.id, &user_id, "AUTHORIZATION_FAILED")
+            .await;
         return Err(emby_playback_session_error_status(error));
     }
     if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
@@ -1141,7 +1143,9 @@ async fn create_emby_transcoding_session(
             .await
             .is_err()
         {
-            let _ = service.stop(&created.id, &user_id).await;
+            let _ = service
+                .fail(&created.id, &user_id, "SESSION_UPDATE_FAILED")
+                .await;
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         }
     }
@@ -3700,7 +3704,9 @@ async fn create_web_playback_session_json(
             match web_playback_authorization_context(headers, state, &user_id).await {
                 Ok(context) => context,
                 Err(error) => {
-                    let _ = service.stop(&created.id, &user_id).await;
+                    let _ = service
+                        .fail(&created.id, &user_id, "AUTHORIZATION_FAILED")
+                        .await;
                     return Err(web_playback_error(headers, error));
                 }
             };
@@ -3713,24 +3719,30 @@ async fn create_web_playback_session_json(
             )
             .await
         {
-            let _ = service.stop(&created.id, &user_id).await;
+            let _ = service
+                .fail(&created.id, &user_id, "AUTHORIZATION_FAILED")
+                .await;
             return Err(web_playback_error(headers, error));
         }
     }
     if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
         if source.source_kind != "LOCAL_FILE" {
-            let _ = service.stop(&created.id, &user_id).await;
+            let _ = service
+                .fail(&created.id, &user_id, "SOURCE_NOT_LOCAL")
+                .await;
             return Err(StatusCode::NOT_IMPLEMENTED.into_response());
         }
         let input = match canonical_local_media_path(&source.root_path, &source.relative_path).await
         {
             Ok(path) => path,
             Err(LocalPathError::Missing) => {
-                let _ = service.stop(&created.id, &user_id).await;
+                let _ = service.fail(&created.id, &user_id, "SOURCE_MISSING").await;
                 return Err(StatusCode::NOT_FOUND.into_response());
             }
             Err(LocalPathError::Forbidden) => {
-                let _ = service.stop(&created.id, &user_id).await;
+                let _ = service
+                    .fail(&created.id, &user_id, "SOURCE_FORBIDDEN")
+                    .await;
                 return Err(StatusCode::FORBIDDEN.into_response());
             }
         };
@@ -3761,7 +3773,9 @@ async fn create_web_playback_session_json(
         };
         if let Some(error) = start_failure {
             if effective_tier != ServerTier::HardwareTranscode {
-                let _ = service.stop(&created.id, &user_id).await;
+                let _ = service
+                    .fail(&created.id, &user_id, "HLS_START_FAILED")
+                    .await;
                 return Err(web_playback_error(headers, error));
             }
             match service
@@ -3770,7 +3784,9 @@ async fn create_web_playback_session_json(
             {
                 Ok(tier) => effective_tier = tier,
                 Err(fallback_error) => {
-                    let _ = service.stop(&created.id, &user_id).await;
+                    let _ = service
+                        .fail(&created.id, &user_id, "SOFTWARE_FALLBACK_FAILED")
+                        .await;
                     return Err(web_playback_error(headers, fallback_error));
                 }
             }
@@ -3785,7 +3801,9 @@ async fn create_web_playback_session_json(
             .set_transcoding_details(&created.id, &user_id, &output)
             .await
         {
-            let _ = service.stop(&created.id, &user_id).await;
+            let _ = service
+                .fail(&created.id, &user_id, "SESSION_UPDATE_FAILED")
+                .await;
             return Err(web_playback_error(headers, error));
         }
     }

@@ -14,11 +14,11 @@ use subtle::ConstantTimeEq;
 use uuid::Uuid;
 
 use crate::storage::{
-    Database, NewAuditEvent, NewEmbyDirectPlaybackTicket, NewUserActivityEvent,
-    NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult, StorageError,
-    StoredEmbyDirectPlaybackTicket, StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery,
-    UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy, WebPlaybackEventClaim,
-    WebPlaybackTranscodingDetails,
+    Database, NewAuditEvent, NewEmbyDirectPlaybackTicket, NewTranscodingHistory,
+    NewUserActivityEvent, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult,
+    StorageError, StoredEmbyDirectPlaybackTicket, StoredWebPlaybackSession,
+    UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy,
+    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
 };
 
 use crate::application::user_access_rules::{
@@ -246,7 +246,15 @@ impl WebPlaybackSessionService {
                     .take_inactive_web_playback_sessions(now, WEB_PLAYBACK_STALE_AFTER_SECONDS)
                     .await
                 {
-                    Ok(sessions) => stop_hls_sessions(&cleanup, sessions).await,
+                    Ok(sessions) => {
+                        record_and_stop_hls_sessions(
+                            &database_cleanup,
+                            &cleanup,
+                            sessions,
+                            TranscodingOutcome::Expired,
+                        )
+                        .await
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "failed to reap inactive Web HLS sessions")
                     }
@@ -261,7 +269,13 @@ impl WebPlaybackSessionService {
                         continue;
                     }
                 };
-                stop_hls_sessions(&cleanup, sessions).await;
+                record_and_stop_hls_sessions(
+                    &database_cleanup,
+                    &cleanup,
+                    sessions,
+                    TranscodingOutcome::Expired,
+                )
+                .await;
             }
         });
         Self {
@@ -446,7 +460,7 @@ impl WebPlaybackSessionService {
             .start_emby_hls_with_runtime(&created.id, tier, media_path, video_bitrate, options)
             .await
         {
-            let _ = self.stop(&created.id, &user_id).await;
+            let _ = self.fail(&created.id, &user_id, "HLS_START_FAILED").await;
             return Err(error);
         }
         Ok(created)
@@ -1404,6 +1418,33 @@ impl WebPlaybackSessionService {
         session_id: &str,
         user_id: &str,
     ) -> Result<(), WebPlaybackSessionError> {
+        self.stop_with_outcome(session_id, user_id, TranscodingOutcome::Completed, None)
+            .await
+    }
+
+    /// Stops a session that failed to play, recording the reason for the admin history.
+    pub(crate) async fn fail(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        reason: &str,
+    ) -> Result<(), WebPlaybackSessionError> {
+        self.stop_with_outcome(
+            session_id,
+            user_id,
+            TranscodingOutcome::Failed,
+            Some(reason),
+        )
+        .await
+    }
+
+    async fn stop_with_outcome(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        outcome: TranscodingOutcome,
+        failure_reason: Option<&str>,
+    ) -> Result<(), WebPlaybackSessionError> {
         let session = self.database.find_web_playback_session(session_id).await?;
         // Stopping also removes the HLS working directory, so the session identifier must be
         // resolved to a stored session owned by the caller before it is used.
@@ -1413,6 +1454,9 @@ impl WebPlaybackSessionService {
         if session.user_id != user_id {
             return Err(WebPlaybackSessionError::NotFound);
         }
+        // Capture the live snapshot before the process (and its progress) disappears.
+        record_transcoding_snapshot(&self.database, &self.hls, &session, outcome, failure_reason)
+            .await;
         let _ = self.hls.stop(session_id).await;
         let now = unix_timestamp();
         self.database
@@ -1485,6 +1529,16 @@ impl WebPlaybackSessionService {
     }
 
     async fn stop_failed_hls_session(&self, session_id: &str) {
+        if let Ok(Some(session)) = self.database.find_web_playback_session(session_id).await {
+            record_transcoding_snapshot(
+                &self.database,
+                &self.hls,
+                &session,
+                TranscodingOutcome::Failed,
+                Some("HLS_PROCESS_FAILED"),
+            )
+            .await;
+        }
         if let Err(error) = self.hls.stop(session_id).await {
             tracing::warn!(
                 event = "web_hls_failed_session_cleanup",
@@ -1561,6 +1615,87 @@ impl WebPlaybackSessionService {
             );
         }
     }
+}
+
+/// Why a server-side transcode ended, for the admin history.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TranscodingOutcome {
+    Completed,
+    Failed,
+    Expired,
+}
+
+impl TranscodingOutcome {
+    pub(crate) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "COMPLETED",
+            Self::Failed => "FAILED",
+            Self::Expired => "EXPIRED",
+        }
+    }
+}
+
+/// Writes one history row from the live FFmpeg snapshot before the process is stopped.
+async fn record_transcoding_snapshot(
+    database: &Database,
+    hls: &HlsManager,
+    session: &StoredWebPlaybackSession,
+    outcome: TranscodingOutcome,
+    failure_reason: Option<&str>,
+) {
+    if session.plan != "SERVER_HLS" {
+        return;
+    }
+    let now = unix_timestamp();
+    let progress = hls.progress(&session.id).await;
+    let output_bytes = hls
+        .session_bytes(&session.id)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|bytes| i64::try_from(bytes).ok());
+    let encoded_seconds = progress
+        .as_ref()
+        .and_then(|progress| progress.out_time_us)
+        .map(|micros| i64::try_from(micros / 1_000_000).unwrap_or(i64::MAX));
+    let wall_seconds = (now - session.created_at).max(0);
+    let average_speed = encoded_seconds
+        .filter(|seconds| *seconds > 0)
+        .map(|seconds| seconds as f64 / wall_seconds.max(1) as f64);
+    let last_fps = progress.as_ref().and_then(|progress| progress.fps);
+    let id = Uuid::now_v7().to_string();
+    let _ = database
+        .insert_transcoding_history(NewTranscodingHistory {
+            id: &id,
+            session_id: &session.id,
+            user_id: &session.user_id,
+            item_id: &session.item_id,
+            media_source_id: session.media_source_id.as_deref(),
+            tier: session.tier,
+            outcome: outcome.as_str(),
+            started_at: session.created_at,
+            finished_at: now,
+            wall_seconds,
+            encoded_seconds,
+            average_speed,
+            last_fps,
+            output_bytes,
+            failure_reason,
+            now,
+        })
+        .await;
+}
+
+async fn record_and_stop_hls_sessions(
+    database: &Database,
+    hls: &HlsManager,
+    sessions: Vec<StoredWebPlaybackSession>,
+    outcome: TranscodingOutcome,
+) {
+    for session in &sessions {
+        record_transcoding_snapshot(database, hls, session, outcome, None).await;
+    }
+    stop_hls_sessions(hls, sessions).await;
 }
 
 async fn stop_hls_sessions(hls: &HlsManager, sessions: Vec<StoredWebPlaybackSession>) {

@@ -1128,6 +1128,118 @@ impl Database {
         })
     }
 
+    /// Inserts one finished-transcode row; a session id is recorded at most once.
+    ///
+    /// Rows older than [`TRANSCODING_HISTORY_RETENTION_SECONDS`] are dropped on the same call so
+    /// the table stays bounded without a background worker.
+    pub(crate) async fn insert_transcoding_history(
+        &self,
+        entry: NewTranscodingHistory<'_>,
+    ) -> Result<(), StorageError> {
+        let now = entry.now;
+        self.query(
+            "INSERT INTO transcoding_history (
+                 id, session_id, user_id, item_id, media_source_id, tier, outcome,
+                 started_at, finished_at, wall_seconds, encoded_seconds, average_speed,
+                 last_fps, output_bytes, failure_reason, created_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(session_id) DO NOTHING",
+        )
+        .bind(entry.id)
+        .bind(entry.session_id)
+        .bind(entry.user_id)
+        .bind(entry.item_id)
+        .bind(entry.media_source_id)
+        .bind(entry.tier)
+        .bind(entry.outcome)
+        .bind(entry.started_at)
+        .bind(entry.finished_at)
+        .bind(entry.wall_seconds)
+        .bind(entry.encoded_seconds)
+        .bind(entry.average_speed)
+        .bind(entry.last_fps)
+        .bind(entry.output_bytes)
+        .bind(entry.failure_reason)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        let _ = self
+            .query(
+                "DELETE FROM transcoding_history
+                 WHERE finished_at < ?",
+            )
+            .bind(now.saturating_sub(TRANSCODING_HISTORY_RETENTION_SECONDS))
+            .execute(&self.pool)
+            .await;
+        Ok(())
+    }
+
+    /// One page of finished transcodes, newest first, with item title and user name.
+    pub(crate) async fn transcoding_history_page(
+        &self,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<StoredTranscodingHistory>, i64), StorageError> {
+        let total: i64 = self
+            .query_scalar("SELECT COUNT(*) FROM transcoding_history")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let rows = self
+            .query(
+                "SELECT h.id, h.session_id, h.user_id, u.display_name AS user_name,
+                        h.item_id, mi.title AS item_title, mi.item_type, h.media_source_id,
+                        h.tier, h.outcome, h.started_at, h.finished_at, h.wall_seconds,
+                        h.encoded_seconds, h.average_speed, h.last_fps, h.output_bytes,
+                        h.failure_reason
+                 FROM transcoding_history h
+                 LEFT JOIN users u ON u.id = h.user_id
+                 LEFT JOIN media_items mi ON mi.id = h.item_id
+                 ORDER BY h.finished_at DESC, h.id DESC
+                 LIMIT ? OFFSET ?",
+            )
+            .bind(limit.clamp(1, 50))
+            .bind(offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok((
+            rows.into_iter()
+                .map(|row| StoredTranscodingHistory {
+                    id: row.get("id"),
+                    session_id: row.get("session_id"),
+                    user_id: row.get("user_id"),
+                    user_name: row.get("user_name"),
+                    item_id: row.get("item_id"),
+                    item_title: row.get("item_title"),
+                    item_type: row.get("item_type"),
+                    media_source_id: row.get("media_source_id"),
+                    tier: row.get("tier"),
+                    outcome: row.get("outcome"),
+                    started_at: row.get("started_at"),
+                    finished_at: row.get("finished_at"),
+                    wall_seconds: row.get("wall_seconds"),
+                    encoded_seconds: row.get("encoded_seconds"),
+                    average_speed: row.get("average_speed"),
+                    last_fps: row.get("last_fps"),
+                    output_bytes: row.get("output_bytes"),
+                    failure_reason: row.get("failure_reason"),
+                })
+                .collect(),
+            total,
+        ))
+    }
+
     /// Active server-side transcoding sessions for the admin progress list, newest first.
     pub(crate) async fn active_server_transcoding_sessions(
         &self,
@@ -1607,4 +1719,47 @@ pub(crate) struct StoredTranscodingSessionRow {
     pub(crate) audio_codec: Option<String>,
     pub(crate) audio_bitrate: Option<i64>,
     pub(crate) transcoding_container: Option<String>,
+}
+
+/// Transcode history is diagnostic data, not business data: keep a month.
+const TRANSCODING_HISTORY_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+pub(crate) struct NewTranscodingHistory<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) session_id: &'a str,
+    pub(crate) user_id: &'a str,
+    pub(crate) item_id: &'a str,
+    pub(crate) media_source_id: Option<&'a str>,
+    pub(crate) tier: i64,
+    pub(crate) outcome: &'a str,
+    pub(crate) started_at: i64,
+    pub(crate) finished_at: i64,
+    pub(crate) wall_seconds: i64,
+    pub(crate) encoded_seconds: Option<i64>,
+    pub(crate) average_speed: Option<f64>,
+    pub(crate) last_fps: Option<f64>,
+    pub(crate) output_bytes: Option<i64>,
+    pub(crate) failure_reason: Option<&'a str>,
+    pub(crate) now: i64,
+}
+
+pub(crate) struct StoredTranscodingHistory {
+    pub(crate) id: String,
+    pub(crate) session_id: String,
+    pub(crate) user_id: String,
+    pub(crate) user_name: Option<String>,
+    pub(crate) item_id: String,
+    pub(crate) item_title: Option<String>,
+    pub(crate) item_type: Option<String>,
+    pub(crate) media_source_id: Option<String>,
+    pub(crate) tier: i64,
+    pub(crate) outcome: String,
+    pub(crate) started_at: i64,
+    pub(crate) finished_at: i64,
+    pub(crate) wall_seconds: i64,
+    pub(crate) encoded_seconds: Option<i64>,
+    pub(crate) average_speed: Option<f64>,
+    pub(crate) last_fps: Option<f64>,
+    pub(crate) output_bytes: Option<i64>,
+    pub(crate) failure_reason: Option<String>,
 }
