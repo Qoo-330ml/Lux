@@ -399,6 +399,9 @@ async fn reserve_sqlite_incremental_vacuum(pool: &AnyPool) -> Result<(), sqlx::E
 
 /// Timeouts applied to every pool so a saturated or half-dead database cannot hang requests.
 const DATABASE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shutdown cannot hang on a checkpoint: a log that is not truncated only costs a replay on the
+/// next start, so the budget stays short and the failure is logged, never fatal.
+const WAL_TRUNCATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 const DATABASE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(1800);
 
@@ -995,6 +998,13 @@ impl Database {
                     ))
                 })?,
         };
+        migration::refuse_empty_database_when_initialized(
+            &config.config_dir,
+            &path,
+            backend,
+            &database_url,
+        )
+        .await?;
         let options =
             AnyConnectOptions::from_str(&database_url).map_err(|source| StorageError::Sqlx {
                 path: path.clone(),
@@ -1002,7 +1012,9 @@ impl Database {
             })?;
         let after_connect_sql = match backend {
             DatabaseBackend::Sqlite => {
-                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"
+                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;
+                 PRAGMA busy_timeout = 5000;
+                 PRAGMA journal_size_limit = 67108864;"
             }
             DatabaseBackend::Postgres => {
                 "SET TIME ZONE 'UTC';
@@ -1076,6 +1088,7 @@ impl Database {
                 path: path.clone(),
                 source,
             })?;
+        migration::record_server_state(&config.config_dir, &server_id).await?;
 
         Ok(Self {
             pool,
@@ -1559,7 +1572,30 @@ impl Database {
             })
     }
 
+    /// Truncates the write-ahead log, then retires the pool.
+    ///
+    /// After this returns, `lux.db` alone is the whole database, which is what an operator
+    /// copying the file expects and what keeps the next start from replaying a log left behind by
+    /// an ungraceful stop. Nothing may be reading while the truncation runs -- a reader pins the
+    /// log open and makes it fail -- so this belongs at shutdown, after the workers stopped.
     pub async fn close(self) {
+        if self.backend == DatabaseBackend::Sqlite {
+            match tokio::time::timeout(
+                WAL_TRUNCATE_TIMEOUT,
+                self.query("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_optional(&self.pool),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "could not truncate the write-ahead log before closing");
+                }
+                Err(_) => {
+                    tracing::warn!("truncating the write-ahead log timed out before closing");
+                }
+            }
+        }
         self.pool.close().await;
     }
 
@@ -8412,6 +8448,15 @@ pub enum StorageError {
     Conflict(String),
     Serialization(String),
     LastManager,
+    /// The configuration directory belongs to a server that has been set up before, but the
+    /// database it points at is missing or empty.
+    ///
+    /// Refusing here is the difference between a loud failure and a silent one: opening a missing
+    /// SQLite file creates it, migrations then build an empty schema, and the next request shows a
+    /// setup wizard over data the operator believes still exists.
+    EmptyDatabase {
+        path: PathBuf,
+    },
 }
 
 impl StorageError {
@@ -8450,6 +8495,11 @@ impl std::fmt::Display for StorageError {
             Self::LastManager => {
                 formatter.write_str("at least one active server manager is required")
             }
+            Self::EmptyDatabase { path } => write!(
+                formatter,
+                "配置目录已初始化但数据库为空: '{}'。请确认数据卷已正确挂载并恢复该数据库；如果确实要从空库重新开始，删除配置目录中的 server-state.json 后再启动",
+                path.display()
+            ),
         }
     }
 }
@@ -8535,7 +8585,10 @@ impl std::error::Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlx { source, .. } => Some(source),
             Self::Migration { source, .. } => Some(source),
-            Self::Conflict(_) | Self::LastManager | Self::Serialization(_) => None,
+            Self::Conflict(_)
+            | Self::LastManager
+            | Self::Serialization(_)
+            | Self::EmptyDatabase { .. } => None,
         }
     }
 }

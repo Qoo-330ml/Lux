@@ -616,3 +616,205 @@ pub(super) async fn ensure_server_id(
         .fetch_one(pool)
         .await
 }
+
+/// Marker written next to the configuration once a server identity exists.
+///
+/// The database cannot answer "was this server set up before?" on its own: a missing file and a
+/// first install look identical to SQLite, which creates the file on connect. The marker lives
+/// beside the database precisely so the two can be compared.
+const SERVER_STATE_FILE: &str = "server-state.json";
+
+/// Refuses to start a previously initialized server against an empty database.
+///
+/// Restoring only the configuration directory, or mounting the wrong volume, used to look like a
+/// brand-new install: an empty `lux.db` was created, migrations built a fresh schema, and the setup
+/// wizard appeared over libraries the operator believed were still there. The check runs before the
+/// connection is opened, so the failed attempt does not even create the file.
+pub(super) async fn refuse_empty_database_when_initialized(
+    config_dir: &Path,
+    path: &Path,
+    backend: DatabaseBackend,
+    database_url: &str,
+) -> Result<(), StorageError> {
+    if !server_state_marker_present(config_dir).await? {
+        return Ok(());
+    }
+    let has_identity = match backend {
+        DatabaseBackend::Sqlite => sqlite_database_has_identity(path).await?,
+        DatabaseBackend::Postgres => postgres_database_has_identity(database_url).await?,
+    };
+    if has_identity {
+        return Ok(());
+    }
+    Err(StorageError::EmptyDatabase {
+        path: path.to_path_buf(),
+    })
+}
+
+async fn server_state_marker_present(config_dir: &Path) -> Result<bool, StorageError> {
+    let marker = config_dir.join(SERVER_STATE_FILE);
+    match fs::read(&marker).await {
+        Ok(bytes) => {
+            if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+                // A corrupt marker is not evidence that the server is new, and guessing "new"
+                // here is the one guess that can overwrite real data with a fresh schema.
+                tracing::warn!(
+                    path = %marker.display(),
+                    "server state marker is unreadable; treating this directory as initialized"
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(StorageError::Io {
+            path: marker,
+            source,
+        }),
+    }
+}
+
+async fn sqlite_database_has_identity(path: &Path) -> Result<bool, StorageError> {
+    if fs::metadata(path).await.is_err() {
+        return Ok(false);
+    }
+    // Read-only, and before the read-write pool exists: opening read-write would create the very
+    // empty database this check is looking for.
+    let url = format!("sqlite://{}?mode=ro", path.display());
+    let options = AnyConnectOptions::from_str(&url).map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let pool = match AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            // Being unable to read the file is not proof that it is empty; refusing would turn a
+            // permissions problem into an outage the operator cannot diagnose.
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not verify the existing database; continuing"
+            );
+            return Ok(true);
+        }
+    };
+    let has_meta_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'lux_meta'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let has_identity = if has_meta_table == 0 {
+        false
+    } else {
+        let identities: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = 'server_id'")
+                .fetch_one(&pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        identities > 0
+    };
+    pool.close().await;
+    Ok(has_identity)
+}
+
+async fn postgres_database_has_identity(database_url: &str) -> Result<bool, StorageError> {
+    let path = PathBuf::from("external PostgreSQL");
+    let options =
+        AnyConnectOptions::from_str(database_url).map_err(|source| StorageError::Sqlx {
+            path: path.clone(),
+            source,
+        })?;
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.clone(),
+            source,
+        })?;
+    let has_meta_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'lux_meta'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.clone(),
+        source,
+    })?;
+    let has_identity = if has_meta_table == 0 {
+        false
+    } else {
+        let identities: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = 'server_id'")
+                .fetch_one(&pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.clone(),
+                    source,
+                })?;
+        identities > 0
+    };
+    pool.close().await;
+    Ok(has_identity)
+}
+
+/// Records that this configuration directory now belongs to an initialized server.
+///
+/// Written once, after the server identity exists, and never rewritten: it is the evidence the
+/// startup guard reads on the next boot.
+pub(super) async fn record_server_state(
+    config_dir: &Path,
+    server_id: &str,
+) -> Result<(), StorageError> {
+    let marker = config_dir.join(SERVER_STATE_FILE);
+    match fs::metadata(&marker).await {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(StorageError::Io {
+                path: marker,
+                source,
+            });
+        }
+    }
+    let state = serde_json::json!({
+        "serverId": server_id,
+        "initializedAt": crate::clock::unix_timestamp(),
+    });
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|source| StorageError::Serialization(source.to_string()))?;
+    let temporary = config_dir.join(format!(".{SERVER_STATE_FILE}.{}.tmp", Uuid::now_v7()));
+    fs::write(&temporary, bytes)
+        .await
+        .map_err(|source| StorageError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|source| StorageError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+    }
+    fs::rename(&temporary, &marker)
+        .await
+        .map_err(|source| StorageError::Io {
+            path: marker,
+            source,
+        })
+}
