@@ -130,6 +130,19 @@ docker compose up -d --force-recreate lux
 
 转码临时目录位于配置目录下的 `web-playback/`，只保存当前会话的分片，会话停止、过期或服务重启后会回收。
 
+### 服务端 GPU 转码
+
+硬件编码默认关闭。选择编码器后，Lux 会在启动、保存设置和手动“重新检测”时用与真实转码相同的参数跑一次单帧自检：自检不通过时不会使用该编码器，播放自动走软件转码；硬件档启动失败或并发名额不足时，同一会话会自动降级为软件转码并更新会话档位，不再直接返回 502。自检只验证编码，不验证解码或 4K 实时能力。
+
+各家 GPU 的前置条件不同：
+
+- **Apple VideoToolbox**：仅 macOS 原生部署可用（Docker 运行在 Linux，无法使用 VideoToolbox）。
+- **NVIDIA NVENC**：宿主机需安装驱动与 `nvidia-container-toolkit`，并给容器启用 GPU（`gpus: all` 或 `runtime: nvidia`）；`compose.yaml` 已提供注释示例。驱动对并发 NVENC 会话有上限，建议把“硬件转码并发上限”保持在 2–4。
+- **Intel QSV / Intel/AMD VAAPI**：需要把 `/dev/dri` 映射进容器（`devices: - /dev/dri:/dev/dri`），且镜像内的 Jellyfin FFmpeg 能找到对应驱动。设备路径默认 `/dev/dri/renderD128`，多 GPU 或多渲染节点时可在后台改成实际节点。
+- 硬件解码默认关闭。开启后会在输入前加入厂商 `-hwaccel`；源编码不被 GPU 解码器支持时会失败并回退到软件档，生产环境建议先在后台用“重新检测”和一次实际播放确认。
+
+GPU 转码会占用宿主机 CPU 做解封装/音频编码；只开启 GPU 编码时，解码和缩放仍在 CPU。弱 NAS 上 4K HEVC 建议同时开启硬件解码并先用实际片源验证。
+
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
 反向代理应向 Lux 传递 `X-Forwarded-For` 和 `X-Forwarded-Proto`；Lux 会优先使用这些头部中的客户端 IP 和协议。

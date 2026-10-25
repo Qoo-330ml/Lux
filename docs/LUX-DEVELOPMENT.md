@@ -17770,6 +17770,68 @@ FNOS/NAS 上验证硬件编码器路径；`h264_vaapi` 等需要设备映射，�
 
 依赖：LUX-254、LUX-847（统计端点用于确认输出参数）。
 
+#### LUX-849：硬件编码器自检与失败回退
+
+范围：在启动、保存设置和管理员手动触发时，用与真实转码完全相同的厂商参数跑一次单帧编码自检；自检未通过时
+`hardware_transcode_available()` 为 false，Web 与 Emby 计划不再选择档位 3，改走软件转码。硬件档启动后进程
+立即退出、没有清单或并发许可不足时，自动用软件档重启同一会话，并把 `web_playback_sessions.tier` 更新为实际
+档位；Emby 首次分片启动失败同样降级。管理设置响应与后台面板回显编码器、检测时间、失败原因，并提供
+`POST /api/v1/admin/settings/transcoding/probe` 手动重测。
+
+预计文件：`src/application/playback/hls.rs`、`src/application/playback/session.rs`、
+`src/storage/sessions.rs`、`src/api/playback.rs`、`src/api/admin/admin_settings.rs`、`src/api/legacy.rs`、
+`web/src/features/admin/AdminTranscodingPanel.tsx`、`web/src/lib/api/{types,client}.ts`、
+`tests/{web_playback,admin_settings}.rs`、`web/tests/admin-transcoding.test.tsx`。
+
+验收：
+
+- [x] 配置编码器但尚未自检或自检失败时不宣称档位 3。
+- [x] 自检使用与真实转码相同的设备初始化、上传与编码参数；探测源为 lavfi，不读取用户媒体。
+- [x] 编码器变更后旧自检结果立即失效，需重新检测。
+- [x] 硬件档启动失败时自动降级为软件档，响应与数据库档位一致，播放成功。
+- [x] 管理员可手动重测，非管理员被拒绝；GET/PATCH 均回显 `transcodingStatus`。
+- [x] 定向测试与 Web 构建通过。
+
+结果（2026-10-25；本机 macOS `arm64`）：`--lib hls` 63/63（含厂商参数、自检通过/失败、编码器变更失效）、
+`--lib playback` 143/143、`--test playback` 6/6、`--test admin_settings` 2/2（含探测端点权限与状态回显）。
+新增 `--test web_playback broken_hardware_encoder_falls_back_to_software_transcoding`：自检通过但真实编码
+失败时，响应 `plan.tier=4`、会话行 `tier=4`、清单可读、统计接口显示 4。Web `admin-transcoding` 6/6。
+既有 `tests/web_playback.rs` 长场景用例仍在本机间歇失败（webhook 顺序/可信代理断言），与本次改动无关。
+
+#### LUX-850：VAAPI / QSV / NVENC 编码参数与设备路径
+
+范围：按编码器补齐真实可用参数：VAAPI 增加 `-vaapi_device <device>` 与 `format=nv12,hwupload`；QSV 增加
+`-init_hw_device qsv=hw:<device>`、`-filter_hw_device hw` 与 `hwupload=extra_hw_frames=64,format=qsv`；
+NVENC 增加 `-preset p4 -tune hq -rc vbr`；NVENC 与 VideoToolbox 强制 `-pix_fmt yuv420p` 以避免 10-bit 源
+不兼容；缩放与上传合并为同一个 `-vf`。设备路径可由管理员配置（默认 `/dev/dri/renderD128`，空值回落默认）。
+
+验收：
+
+- [x] 各厂商的设备初始化/上传参数出现在 `-i` 之前或 `-vf` 中，NVENC 不再缺少 preset。
+- [x] 缩放与硬件上传合并为一个滤镜链，`max_output_height=0` 时不产生 `-vf`。
+- [x] 设备路径去空格、限制 128 字符、拒绝控制字符；非法值返回 400 且不落库。
+- [x] 参数单测覆盖四个编码器与硬件解码开关。
+
+结果（2026-10-25）：`--lib hls` 中 VAAPI/QSV/NVENC/VideoToolbox/缩放合并/硬件解码 6 项参数测试通过；
+`--lib transcoding` 14/14 覆盖设备路径校验与默认值。未在真实 Intel/AMD/NVIDIA 设备上跑通完整播放，
+QSV/VAAPI 参数按 FFmpeg 官方文档构造，需真机复核。
+
+#### LUX-851：GPU 部署示例与可选硬件解码
+
+范围：`compose.yaml` 增加注释化的 `/dev/dri` 与 `gpus: all`/`runtime: nvidia` 示例；新增
+`hardwareDecode` 设置，开启后在输入前注入厂商 `-hwaccel`（VAAPI 同时注入 `-hwaccel_device`），失败由
+LUX-849 的降级路径兜底；部署文档写明各平台前置条件、设备路径、失败行为与“自检不验证解码/4K”的限制。
+
+验收：
+
+- [x] Compose 示例覆盖 Intel/AMD 与 NVIDIA，默认保持不映射设备。
+- [x] `hardwareDecode` 默认关闭，开启后 `-hwaccel` 出现在 `-i` 之前；关闭时不产生该参数。
+- [x] 部署文档说明容器/驱动前置条件与自检、降级的边界。
+- [ ] 真实 GPU 上的 4K/HEVC 与硬件解码验证（缺设备，未执行）。
+
+结果（2026-10-25）：Compose 与部署文档更新；参数注入由 `--lib hls hardware_decode_adds_acceleration_before_the_input`
+覆盖；Web 后台新增“启用硬件解码”开关与说明，`admin-transcoding` 6/6、`tsc --noEmit` 与构建通过。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
