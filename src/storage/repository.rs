@@ -97,6 +97,8 @@ pub(crate) use sessions::{
 };
 #[path = "users.rs"]
 mod users;
+#[path = "watch_state_archive.rs"]
+mod watch_state_archive;
 
 // A media_sources row uses 11 bind values. Keep each backend's positive-index batches
 // below its parameter limit while allowing PostgreSQL fewer round trips per transaction.

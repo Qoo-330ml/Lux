@@ -31869,6 +31869,12 @@ async fn media_item_batch_removes_every_child_table_row() -> Result<(), Box<dyn 
          VALUES ('alias-batch', 'series-batch', 'Alias', 'alias')",
         "INSERT INTO item_metadata_completeness (item_id, capability, local_state, is_missing)
          VALUES ('series-batch', 'NFO', 'READY', 0)",
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('user-batch', 'user-batch', 'Batch User', 'not-a-real-hash')",
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, is_favorite, play_count,
+             last_played_at
+         ) VALUES ('user-batch', 'series-batch', 0, 1, 1, 4, 1700000000)",
     ] {
         sqlx::query(statement).execute(database.pool()).await?;
     }
@@ -31922,6 +31928,33 @@ async fn media_item_batch_removes_every_child_table_row() -> Result<(), Box<dyn 
     assert_eq!(
         stray_streams, 0,
         "set-based delete must remove media streams"
+    );
+
+    let remaining_state: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state WHERE item_id = 'series-batch'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        remaining_state, 0,
+        "the batch still removes the state row it copied out"
+    );
+    let archived: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT provider, provider_id, item_type, is_played, is_favorite, play_count
+         FROM user_item_state_archive",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        archived,
+        vec![(
+            "tmdb".to_owned(),
+            "1".to_owned(),
+            "SERIES".to_owned(),
+            1,
+            1,
+            4
+        )],
+        "deleting a library has to keep the watch state the user earned, exactly once"
     );
     Ok(())
 }

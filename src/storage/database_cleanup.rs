@@ -13,6 +13,28 @@ const CLEANUP_BATCH_SIZE: i64 = 1_000;
 const LOCAL_METADATA_BATCH_RETENTION_SECONDS: i64 = 3_600;
 const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGMENT_BYTES / 2;
 
+/// Expired tombstones that can be dropped without losing anything the user earned.
+///
+/// Playback history and merge targets still block the delete. User state no longer does when the
+/// item carries a provider identity: that identity is what lets the archived state find the item
+/// again, so the state is copied into the archive instead of pinning the row forever. An
+/// unidentified item keeps its row, because there is nothing left to match its state by later.
+const PURGEABLE_REMOVED_ITEM_SELECT: &str = "
+SELECT mi.id FROM media_items mi
+WHERE mi.removed_at IS NOT NULL
+  AND mi.removed_at < unixepoch() - ?
+  AND mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO', 'UNRESOLVED')
+  AND NOT EXISTS (
+      SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
+  AND NOT EXISTS (
+      SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
+  AND (
+      NOT EXISTS (SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
+      OR EXISTS (SELECT 1 FROM media_item_provider_ids p WHERE p.media_item_id = mi.id)
+  )
+ORDER BY mi.removed_at
+LIMIT ?";
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DatabaseLifecycleCleanupReport {
     pub scan_job_paths_deleted: u64,
@@ -1091,7 +1113,12 @@ impl Database {
 
     /// Hard-deletes soft-deleted media items older than `retention_seconds` in small
     /// batches, letting `ON DELETE CASCADE` remove images, credits and search rows.
-    /// Items that still carry user state, playback history or are a merge target are kept.
+    /// Items that still carry playback history or are a merge target are kept.
+    ///
+    /// User state no longer blocks the delete: an identified item has its state copied into
+    /// `user_item_state_archive` first, so the history survives and is reattached to whichever
+    /// item carries the same provider identity later. Only items without a provider identity keep
+    /// their state by keeping the row, because there would be nothing to match them by afterwards.
     pub async fn purge_expired_removed_media_items(
         &self,
         retention_seconds: i64,
@@ -1099,35 +1126,52 @@ impl Database {
         max_batches: u32,
         pause: std::time::Duration,
     ) -> Result<u64, StorageError> {
+        if batch_size <= 0 {
+            return Ok(0);
+        }
         let mut purged = 0_u64;
         for _ in 0..max_batches {
-            let count = self
-                .query(
-                    "DELETE FROM media_items
-                     WHERE id IN (
-                         SELECT mi.id FROM media_items mi
-                         WHERE mi.removed_at IS NOT NULL
-                           AND mi.removed_at < unixepoch() - ?
-                           AND mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO', 'UNRESOLVED')
-                           AND NOT EXISTS (
-                               SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
-                           AND NOT EXISTS (
-                               SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
-                           AND NOT EXISTS (
-                               SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
-                         ORDER BY mi.removed_at
-                         LIMIT ?
-                     )",
-                )
+            let candidates = self
+                .query_scalar::<String>(PURGEABLE_REMOVED_ITEM_SELECT)
                 .bind(retention_seconds)
                 .bind(batch_size)
-                .execute(&self.pool)
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            if candidates.is_empty() {
+                break;
+            }
+            // Archive and delete in one transaction: a crash in between must not leave either an
+            // item whose state was already consumed or a state row whose item is already gone.
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            self.archive_watch_state_for_items(&mut transaction, &candidates)
+                .await?;
+            let placeholders = std::iter::repeat_n("?", candidates.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete = format!("DELETE FROM media_items WHERE id IN ({placeholders})");
+            let mut statement = self.query(sqlx::AssertSqlSafe(delete));
+            for id in &candidates {
+                statement = statement.bind(id.as_str());
+            }
+            let count = statement
+                .execute(&mut *transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
                     source,
                 })?
                 .rows_affected();
+            transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
             if count == 0 {
                 break;
             }
