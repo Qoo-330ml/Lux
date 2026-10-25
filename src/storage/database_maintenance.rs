@@ -178,6 +178,35 @@ impl Database {
         Ok(active != 0)
     }
 
+    /// Whether a client is watching right now.
+    ///
+    /// A full `VACUUM` rewrites the file while holding the write lock, and playback progress is
+    /// persisted every few seconds, so a round that starts during playback competes with the one
+    /// write a user notices immediately -- the resume position of the film they are watching.
+    async fn active_playback_in_progress(&self) -> Result<bool, StorageError> {
+        let query = format!(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM playback_sessions
+                 WHERE state IN ('PLAYING', 'PAUSED')
+                   AND last_event_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+             ) OR EXISTS(
+                 SELECT 1 FROM web_playback_sessions
+                 WHERE state = 'ACTIVE'
+                   AND last_heartbeat_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+                   AND expires_at >= unixepoch()
+             ) THEN 1 ELSE 0 END"
+        );
+        let active: i64 = self
+            .query_scalar(sqlx::AssertSqlSafe(query))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(active != 0)
+    }
+
     async fn maintenance_candidates(&self) -> Result<Vec<MaintenanceCandidate>, StorageError> {
         match self.backend {
             DatabaseBackend::Sqlite => self.sqlite_maintenance_candidates().await,
@@ -645,6 +674,19 @@ impl Database {
             Ok(false) => {}
             Err(error) => {
                 tracing::warn!(%error, "database maintenance scan check failed");
+                return report;
+            }
+        }
+        match self.active_playback_in_progress().await {
+            Ok(true) => {
+                // Deferring costs nothing: the next round reclaims the same pages, and the client
+                // never sees its progress write fail against a VACUUM holding the write lock.
+                tracing::debug!("database maintenance deferred while a client is streaming");
+                return report;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "database maintenance playback check failed");
                 return report;
             }
         }

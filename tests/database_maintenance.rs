@@ -288,3 +288,96 @@ async fn statistics_refresh_stands_down_while_a_scan_runs() -> Result<(), Box<dy
     assert!(!statistics_table_exists(&database).await?);
     Ok(())
 }
+
+/// Seeds reclaimable pages so a round genuinely has something to do.
+async fn seed_reclaimable_pages(
+    database: &Database,
+    table: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE TABLE {table} (id INTEGER PRIMARY KEY, payload TEXT NOT NULL)"
+    )))
+    .execute(database.pool())
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO {table} (payload)
+         WITH RECURSIVE n(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM n WHERE x < 2000)
+         SELECT hex(randomblob(2048)) FROM n"
+    )))
+    .execute(database.pool())
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!("DELETE FROM {table}")))
+        .execute(database.pool())
+        .await?;
+    Ok(())
+}
+
+async fn seed_playback_session(
+    database: &Database,
+    last_event_at_sql: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('stream-lib', 'Stream', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('stream-movie', 'stream-lib', 'MOVIE', 'Stream', 'stream', 'LOCAL_CONFIRMED')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('stream-user', 'stream-user', 'Stream', 'not-a-real-hash')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO playback_sessions (
+             id, user_id, item_id, play_session_id, device_id, state, position_ticks,
+             last_event_at
+         ) VALUES ('stream-session', 'stream-user', 'stream-movie', 'play-1', 'device-1',
+                   'PLAYING', 100, {last_event_at_sql})"
+    )))
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn maintenance_defers_while_a_client_is_streaming()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+    seed_reclaimable_pages(&database, "stream_probe").await?;
+    seed_playback_session(&database, "unixepoch()").await?;
+
+    let deferred = database.run_database_maintenance_round().await;
+
+    assert!(
+        deferred.vacuumed.is_empty(),
+        "a VACUUM holding the write lock competes with progress writes, got {:?}",
+        deferred.vacuumed
+    );
+    assert_freelist_is_nonzero(&database).await?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn maintenance_resumes_once_the_stream_is_stale()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+    seed_reclaimable_pages(&database, "stale_probe").await?;
+    seed_playback_session(&database, "unixepoch() - 86400").await?;
+
+    let completed = database.run_database_maintenance_round().await;
+
+    assert!(
+        !completed.vacuumed.is_empty(),
+        "a session that stopped reporting an hour ago must not block maintenance"
+    );
+    Ok(())
+}
