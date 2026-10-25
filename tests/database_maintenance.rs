@@ -345,8 +345,8 @@ async fn seed_playback_session(
 }
 
 #[tokio::test]
-async fn maintenance_defers_while_a_client_is_streaming()
--> Result<(), Box<dyn std::error::Error>> {
+async fn maintenance_defers_while_a_client_is_streaming() -> Result<(), Box<dyn std::error::Error>>
+{
     let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
     let temp_dir = tempfile::tempdir()?;
     let database = test_database(&temp_dir).await?;
@@ -365,8 +365,7 @@ async fn maintenance_defers_while_a_client_is_streaming()
 }
 
 #[tokio::test]
-async fn maintenance_resumes_once_the_stream_is_stale()
--> Result<(), Box<dyn std::error::Error>> {
+async fn maintenance_resumes_once_the_stream_is_stale() -> Result<(), Box<dyn std::error::Error>> {
     let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
     let temp_dir = tempfile::tempdir()?;
     let database = test_database(&temp_dir).await?;
