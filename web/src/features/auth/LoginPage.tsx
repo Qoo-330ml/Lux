@@ -99,16 +99,27 @@ export function LoginPage() {
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-label="登录页背景">
         {singlePosterItem ? (
-          <img
-            className="lux-auth-single-poster"
-            src={singlePosterItem.imageUrl}
-            alt=""
-            aria-hidden="true"
-            loading="eager"
-            onError={markBackgroundFailed}
-          />
+          <>
+            {/* 同图模糊铺满视觉区，完整原比例海报居中叠在其上，避免上下露黑边又把海报裁掉 */}
+            <img
+              className="lux-auth-single-poster-backdrop"
+              src={singlePosterItem.imageUrl}
+              alt=""
+              aria-hidden="true"
+              loading="eager"
+              onError={markBackgroundFailed}
+            />
+            <img
+              className="lux-auth-single-poster"
+              src={singlePosterItem.imageUrl}
+              alt=""
+              aria-hidden="true"
+              loading="eager"
+              onError={markBackgroundFailed}
+            />
+          </>
         ) : singleImageItem ? (
-          <div className="lux-auth-single-image-content">
+          <>
             <img
               className="lux-auth-single-image"
               src={singleImageItem.imageUrl}
@@ -121,7 +132,7 @@ export function LoginPage() {
               item={singleImageItem}
               sourceName={pluginBackground?.sourceName}
             />
-          </div>
+          </>
         ) : heroItem ? (
           <>
             <img

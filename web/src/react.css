@@ -896,7 +896,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-auth-screen { position: relative; display: grid; place-items: center; min-height: 100vh; min-height: 100dvh; overflow: hidden; padding: 24px; background: #050506; }
 
-.lux-auth-screen.lux-auth-split-layout { display: flex; flex-direction: row; min-height: 100vh; min-height: 100dvh; width: 100vw; overflow: hidden; padding: 0; background: #090a0f; position: relative; }
+/* 登录页左右分割：左侧视觉区与右侧登录面板始终按同一比例分配宽度，
+   任何桌面分辨率下比例都不变（旧的固定 500px 面板会让左侧占比随屏幕变宽而增大）。 */
+.lux-auth-screen.lux-auth-split-layout { --lux-auth-split-visual: 62%; --lux-auth-split-panel: 38%; display: flex; flex-direction: row; min-height: 100vh; min-height: 100dvh; width: 100vw; overflow: hidden; padding: 0; background: #090a0f; position: relative; }
 
 .lux-auth-brand-badge { position: absolute; top: 36px; left: 42px; z-index: 25; display: flex; align-items: center; gap: 12px; user-select: none; pointer-events: auto; }
 
@@ -904,9 +906,11 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-auth-brand-text { font-size: 26px; font-weight: 800; letter-spacing: -.03em; color: #fff; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif; text-shadow: 0 2px 12px rgba(0,0,0,.6); }
 
-.lux-auth-visual { flex: 1; position: relative; overflow: hidden; min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #090a0f; }
+.lux-auth-visual { flex: 0 0 var(--lux-auth-split-visual, 62%); width: var(--lux-auth-split-visual, 62%); min-width: 0; position: relative; overflow: hidden; min-height: 100vh; min-height: 100dvh; display: flex; align-items: center; justify-content: center; background: #090a0f; }
 
-.lux-auth-poster-wall { width: 100%; height: 100%; object-fit: cover; object-position: left center; pointer-events: none; user-select: none; }
+/* 背景图必须绝对定位铺满视觉区：留在文档流里时 height:100% 相对不确定高度会退化成 auto，
+   图片按原始比例渲染，视口变高或左栏变窄时上下会露出黑边。 */
+.lux-auth-poster-wall { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: left center; pointer-events: none; user-select: none; }
 
 .lux-auth-poster-waterfall { position: absolute; top: -14%; right: -4%; bottom: -14%; left: 20%; display: grid; grid-template-columns: repeat(5, minmax(0, var(--lux-auth-poster-column-width, 26%))); column-gap: 12px; row-gap: 12px; justify-content: start; overflow: hidden; padding: 0 20px; box-sizing: border-box; transform: rotate(9deg); transform-origin: left center; background: #11102b; }
 
@@ -928,17 +932,16 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-auth-hero-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; }
 
-.lux-auth-single-poster { display: block; max-width: min(76%, 560px); max-height: 82vh; width: auto; height: auto; object-fit: contain; object-position: center; pointer-events: none; user-select: none; }
+/* 单幅海报：同一张图模糊铺满视觉区（不留黑边），原始比例海报居中叠在上面（不裁切）。 */
+.lux-auth-single-poster-backdrop { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; filter: blur(28px) brightness(.55) saturate(1.05); transform: scale(1.08); pointer-events: none; user-select: none; }
 
-.lux-auth-single-image-content { display: flex; max-width: 82%; max-height: 90vh; align-items: center; flex-direction: column; gap: 10px; }
+.lux-auth-single-poster { position: absolute; top: 50%; left: 50%; width: auto; height: auto; max-width: min(76%, 560px); max-height: 82vh; transform: translate(-50%, -50%); border-radius: 8px; object-position: center; box-shadow: 0 30px 80px rgba(0,0,0,.55); pointer-events: none; user-select: none; }
 
-.lux-auth-single-image { display: block; max-width: min(100%, 760px); max-height: 74vh; width: auto; height: auto; object-fit: contain; object-position: center; pointer-events: none; user-select: none; }
+.lux-auth-single-image { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; object-position: center; pointer-events: none; user-select: none; }
 
 .lux-auth-hero-shade { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(8,9,15,.42), transparent 62%), linear-gradient(0deg, rgba(8,9,15,.48), transparent 34%); pointer-events: none; }
 
 .lux-auth-background-credit { position: absolute; z-index: 15; left: 24px; bottom: 58px; display: grid; gap: 3px; max-width: min(54%, 480px); color: rgba(255,255,255,.82); font-size: .72rem; line-height: 1.45; text-shadow: 0 1px 8px rgba(0,0,0,.9); }
-
-.lux-auth-single-image-content .lux-auth-background-credit { position: static; z-index: auto; align-self: flex-start; max-width: 100%; text-shadow: none; }
 
 .lux-auth-background-credit span + span { color: rgba(255,255,255,.68); }
 
@@ -964,7 +967,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-auth-credits-panel p { margin: 8px 0 0; font-size: .68rem; }
 
-.lux-auth-panel { flex: 0 0 500px; width: 500px; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 40px 48px; background: #090a0f; z-index: 10; position: relative; }
+.lux-auth-panel { flex: 0 0 var(--lux-auth-split-panel, 38%); width: var(--lux-auth-split-panel, 38%); min-width: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 40px clamp(24px, 3vw, 48px); background: #090a0f; z-index: 10; position: relative; }
 
 .lux-auth-split-layout .lux-auth-card { position: relative; width: min(100%, 390px); padding: 36px 32px; border: 1px solid rgba(255,255,255,.08); border-radius: 24px; background: rgba(21, 21, 27, .95); box-shadow: 0 24px 60px rgba(0,0,0,.7); backdrop-filter: blur(24px); }
 
@@ -1004,7 +1007,7 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 @media (max-width: 1024px) {
   .lux-auth-screen { min-height: 100dvh; align-items: start; overflow-y: auto; padding-top: max(24px, env(safe-area-inset-top)); padding-right: max(24px, env(safe-area-inset-right)); padding-bottom: max(24px, env(safe-area-inset-bottom)); padding-left: max(24px, env(safe-area-inset-left)); }
-  .lux-auth-screen.lux-auth-split-layout { min-height: 100dvh; overflow-x: hidden; overflow-y: auto; padding: 0; }
+  .lux-auth-screen.lux-auth-split-layout { --lux-auth-split-visual: 100%; --lux-auth-split-panel: 100%; min-height: 100dvh; overflow-x: hidden; overflow-y: auto; padding: 0; }
   .lux-auth-brand-badge { top: max(24px, env(safe-area-inset-top)); left: max(24px, env(safe-area-inset-left)); }
   .lux-auth-credits { top: max(24px, env(safe-area-inset-top)); right: max(24px, env(safe-area-inset-right)); bottom: auto; left: auto; }
   .lux-auth-credits-panel { top: calc(100% + 10px); right: 0; bottom: auto; left: auto; }

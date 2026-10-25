@@ -176,7 +176,7 @@ describe("LoginPage session state", () => {
     expect(container.textContent).not.toContain("TMDb 图片来源");
   });
 
-  it("renders a single plugin poster intact without using the feed or hero layout", async () => {
+  it("renders a single plugin poster over a blurred backdrop without using the feed or hero layout", async () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.tmdb-trending-background",
       contentKind: "SINGLE_POSTER",
@@ -202,6 +202,8 @@ describe("LoginPage session state", () => {
           .toContain("https://image.tmdb.org/t/p/w500/trending.jpg");
       });
     });
+    expect(container.querySelector<HTMLImageElement>(".lux-auth-single-poster-backdrop")?.src)
+      .toContain("https://image.tmdb.org/t/p/w500/trending.jpg");
     expect(container.querySelector(".lux-auth-poster-waterfall")).toBeNull();
     expect(container.querySelector(".lux-auth-hero-image")).toBeNull();
     expect(container.querySelector(".lux-auth-visual-fade")).toBeNull();
@@ -215,9 +217,10 @@ describe("LoginPage session state", () => {
     expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.src)
       .toContain("/lux-poster-wall.jpg");
     expect(container.querySelector(".lux-auth-single-poster")).toBeNull();
+    expect(container.querySelector(".lux-auth-single-poster-backdrop")).toBeNull();
   });
 
-  it("renders an original single image with clickable work and license attribution", async () => {
+  it("renders a single image filling the visual column with clickable work and license attribution", async () => {
     vi.mocked(api.loginBackground).mockResolvedValue({
       source: "PLUGIN:org.lux.wikimedia-potd-background",
       contentKind: "SINGLE_IMAGE",
@@ -249,10 +252,9 @@ describe("LoginPage session state", () => {
           .toContain("https://thumb.wikimedia.org/potd.jpg");
       });
     });
-    expect(container.querySelector(".lux-auth-single-image-content")
-      ?.contains(container.querySelector(".lux-auth-single-image"))).toBe(true);
-    expect(container.querySelector(".lux-auth-single-image-content")
-      ?.contains(container.querySelector(".lux-auth-background-credit"))).toBe(true);
+    const visual = container.querySelector(".lux-auth-visual");
+    expect(visual?.contains(container.querySelector(".lux-auth-single-image"))).toBe(true);
+    expect(visual?.contains(container.querySelector(".lux-auth-background-credit"))).toBe(true);
     const links = container.querySelectorAll<HTMLAnchorElement>(".lux-auth-background-credit a");
     expect([...links].map((link) => link.href)).toEqual([
       "https://commons.wikimedia.org/wiki/File:Potd.jpg",
@@ -270,7 +272,7 @@ describe("LoginPage session state", () => {
     });
     expect(container.querySelector<HTMLImageElement>(".lux-auth-poster-wall")?.src)
       .toContain("/lux-poster-wall.jpg");
-    expect(container.querySelector(".lux-auth-single-image-content")).toBeNull();
+    expect(container.querySelector(".lux-auth-single-image")).toBeNull();
   });
 
   it("renders plugin hero images with source attribution and falls back after an image error", async () => {
