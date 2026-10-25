@@ -1529,6 +1529,16 @@ export type AdminTranscodingSettings = {
   softwarePreset: string;
   maxOutputHeight: number;
   audioBitrateKbps: number;
+  hardwareDevice: string;
+  hardwareDecode: boolean;
+};
+
+export type AdminTranscodingStatus = {
+  encoder: string | null;
+  available: boolean;
+  /** Milliseconds since the epoch; 0 means "not checked yet". */
+  checkedAt: number;
+  error: string | null;
 };
 
 export type AdminTranscodingOptions = {
@@ -1549,6 +1559,7 @@ export type AdminSettings = {
   loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;
   transcoding?: AdminTranscodingSettings;
+  transcodingStatus?: AdminTranscodingStatus | null;
   transcodingOptions?: AdminTranscodingOptions;
   networkProxy?: AdminNetworkProxySettings;
 };

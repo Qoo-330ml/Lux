@@ -2381,3 +2381,18 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
   .lux-library-strategy-footer-actions .lux-library-toolbar-button { flex: 1; }
   .lux-library-override-modes, .lux-library-override-toggles, .lux-library-override-fields { grid-template-columns: 1fr; }
 }
+
+/* Hardware encoder self-test row (server transcoding settings). */
+.lux-admin-transcoding-status { display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap; padding: 10px 12px; border: 1px solid var(--lux-line-soft); border-radius: 10px; background: rgba(255,255,255,.03); }
+
+.lux-admin-transcoding-state { display: inline-flex; align-items: center; gap: 7px; color: var(--lux-muted); font-size: .78rem; line-height: 1.45; }
+
+.lux-admin-transcoding-state.is-ok { color: #34d399; }
+
+.lux-admin-transcoding-state.is-error { color: #f87171; }
+
+.lux-admin-transcoding-status .lux-button { flex: 0 0 auto; }
+
+.lux-admin-transcoding-status .is-spinning { animation: lux-admin-spin .9s linear infinite; }
+
+@keyframes lux-admin-spin { to { transform: rotate(360deg); } }

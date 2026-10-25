@@ -23,6 +23,8 @@ const TRANSCODING: AdminTranscodingSettings = {
   softwarePreset: "veryfast",
   maxOutputHeight: 0,
   audioBitrateKbps: 192,
+  hardwareDevice: "/dev/dri/renderD128",
+  hardwareDecode: false,
 };
 
 const SETTINGS: AdminSettings = {
@@ -57,6 +59,12 @@ const SETTINGS: AdminSettings = {
     showMetadataPending: true,
   },
   transcoding: TRANSCODING,
+  transcodingStatus: {
+    encoder: "NONE",
+    available: false,
+    checkedAt: 0,
+    error: null,
+  },
   transcodingOptions: {
     hardwareEncoders: ["h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"],
     softwarePresets: ["ultrafast", "superfast", "veryfast", "faster", "fast", "medium"],
@@ -124,6 +132,9 @@ describe("AdminTranscodingPanel", () => {
     expect(select("最大输出分辨率")?.value).toBe("0");
     expect(input("封装转换并发上限")?.value).toBe("4");
     expect(input("音频码率")?.value).toBe("192");
+    expect(input("硬件设备路径")?.value).toBe("/dev/dri/renderD128");
+    expect(input("启用硬件解码")?.checked).toBe(false);
+    expect(container.textContent).toContain("未启用硬件编码");
   });
 
   it("saves the edited policy as one payload", async () => {
@@ -165,6 +176,10 @@ describe("AdminTranscodingPanel", () => {
     await type("软件转码并发上限", "0");
     await type("视频码率上限", "8000");
     await type("音频码率", "256");
+    await type("硬件设备路径", "/dev/dri/renderD129");
+    await act(async () => {
+      input("启用硬件解码")?.click();
+    });
 
     await act(async () => {
       [...container.querySelectorAll<HTMLButtonElement>("button")]
@@ -188,6 +203,8 @@ describe("AdminTranscodingPanel", () => {
         softwarePreset: "fast",
         maxOutputHeight: 1_080,
         audioBitrateKbps: 256,
+        hardwareDevice: "/dev/dri/renderD129",
+        hardwareDecode: true,
       },
     });
     expect(container.textContent).toContain("设置已保存，将在新的播放会话生效");
@@ -211,6 +228,45 @@ describe("AdminTranscodingPanel", () => {
     });
     expect(container.textContent).toContain("服务端转码设置无效");
     expect(select("软件编码 preset")?.value).toBe("medium");
+  });
+
+  it("shows the self-test result and can re-run it", async () => {
+    const probe = vi.spyOn(api, "probeAdminTranscoding").mockResolvedValue({
+      transcodingStatus: {
+        encoder: "h264_vaapi",
+        available: true,
+        checkedAt: Date.UTC(2026, 9, 25, 1, 0, 0),
+        error: null,
+      },
+    });
+    await render({
+      ...SETTINGS,
+      transcoding: { ...TRANSCODING, hardwareEncoder: "h264_vaapi" },
+      transcodingStatus: {
+        encoder: "h264_vaapi",
+        available: false,
+        checkedAt: Date.UTC(2026, 9, 25, 0, 0, 0),
+        error: "Failed to initialise VAAPI connection: -1 (unknown libva error).",
+      },
+    });
+    expect(container.textContent).toContain("自检失败");
+    expect(container.textContent).toContain("Failed to initialise VAAPI");
+
+    await act(async () => {
+      [...container.querySelectorAll<HTMLButtonElement>("button")]
+        .find((button) => button.textContent?.includes("重新检测"))
+        ?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(probe).toHaveBeenCalledTimes(1);
+    expect(container.textContent).toContain("自检通过");
+  });
+
+  it("disables the probe button when no hardware encoder is selected", async () => {
+    await render(SETTINGS);
+    const button = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((entry) => entry.textContent?.includes("重新检测"));
+    expect(button?.disabled).toBe(true);
   });
 
   it("explains an older server that returns no transcoding block", async () => {
