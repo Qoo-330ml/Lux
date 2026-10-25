@@ -256,4 +256,24 @@ describe("light theme contrast", () => {
 
     expect(colors.size, "each badge variant should use a distinct hue").toBe(variants.length);
   });
+
+  it("scopes light-theme badge pill surfaces to their usage families", () => {
+    // A bare `html[data-lux-theme="light"] .lux-badge-pill` rule (0,2,1) outranks
+    // every `.lux-badge-pill` modifier and the `:hover` state, so it silently
+    // swallows variant colors and kills hover feedback. Each family keeps its own
+    // light surface instead.
+    expect(stylesheet).not.toMatch(/html\[data-lux-theme="light"\] \.lux-badge-pill\s*(?:,|\{)/);
+
+    const families = [
+      ".lux-detail-badge",
+      ".lux-media-nfo-studios .lux-badge-pill",
+      ".lux-media-nfo-links-list .lux-badge-pill",
+      ".lux-media-nfo-provider-badge",
+    ];
+    for (const family of families) {
+      expect(lightThemeRule(family), `${family} needs its own light pill surface`).toContain(
+        "background: rgba(28,28,34",
+      );
+    }
+  });
 });

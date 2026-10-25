@@ -441,13 +441,21 @@ html[data-lux-theme="light"] .lux-collection-sub { color: rgba(24,24,28,.8); fon
 
 html[data-lux-theme="light"] .lux-collection-icon-badge { border-color: rgba(217,119,6,.35); background: linear-gradient(135deg, rgba(245,158,11,.15), rgba(245,158,11,.05)); color: #b45309; box-shadow: 0 2px 8px rgba(217,119,6,.1); }
 
-html[data-lux-theme="light"] .lux-badge-pill { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
-
+/* Light pill surfaces are declared per usage family. A bare
+   `html[data-lux-theme="light"] .lux-badge-pill` (0,2,1) would outrank every
+   `.lux-badge-pill` modifier and the shared `:hover` state, silently dropping
+   variant colors and hover feedback. */
 html[data-lux-theme="light"] .lux-badge-accent { border-color: var(--lux-line-soft) !important; color: var(--lux-muted) !important; background: rgba(28,28,34,.05) !important; }
 
 html[data-lux-theme="light"] .lux-media-nfo-tagline { color: var(--lux-muted); }
 
 html[data-lux-theme="light"] .lux-media-nfo-genre-tags span { border-color: rgba(28,28,34,.16); color: var(--lux-text); background: rgba(28,28,34,.05); font-weight: 500; }
+
+html[data-lux-theme="light"] .lux-media-nfo-studios .lux-badge-pill { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
+
+html[data-lux-theme="light"] .lux-media-nfo-links-list .lux-badge-pill { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
+
+html[data-lux-theme="light"] .lux-media-nfo-provider-badge { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
 
 html[data-lux-theme="light"] .lux-media-nfo-rating-val strong small { color: var(--lux-muted); }
 
@@ -565,8 +573,10 @@ html[data-lux-theme="light"] .lux-season-episode-copy p { color: var(--lux-text)
 
 .lux-detail-badge.is-audio { border-color: rgba(16,185,129,.35); background: rgba(16,185,129,.1); color: #a7f3d0; }
 
-/* The generic light pill uses a muted text color with higher specificity than the
-   plain .lux-detail-badge.is-* rules above, so re-declare each variant hue here. */
+/* The neutral (codec, bit depth) badges keep the muted pill surface in light mode,
+   while the variant rules below restore each semantic hue. */
+html[data-lux-theme="light"] .lux-detail-badge { border-color: rgba(28,28,34,.16); background: rgba(28,28,34,.05); color: var(--lux-text); font-weight: 500; }
+
 html[data-lux-theme="light"] .lux-detail-badge.is-4k { border-color: rgba(180,83,9,.35); background: rgba(245,158,11,.16); color: #92400e; font-weight: 700; box-shadow: 0 0 10px rgba(245,158,11,.12); }
 
 html[data-lux-theme="light"] .lux-detail-badge.is-1080p { border-color: rgba(29,78,216,.32); background: rgba(59,130,246,.14); color: #1d4ed8; font-weight: 600; }
