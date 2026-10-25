@@ -38,6 +38,18 @@ function lightStatusColor(name: string) {
   return lightThemeRootRule().match(new RegExp(`${name}:\\s*(#[\\da-f]{6})`, "i"))?.[1] ?? "";
 }
 
+// Composite the rule's translucent badge background over the light detail
+// surface so contrast is measured on the color the user actually sees.
+function composedBadgeBackground(rule: string) {
+  const surface = [0xf4, 0xf3, 0xf1];
+  const match = rule.match(/background:\s*rgba\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*([\d.]+)\s*\)/);
+  if (!match) return "#f4f3f1";
+  const alpha = Number(match[4]);
+  const tint = [match[1], match[2], match[3]].map(Number);
+  const composed = tint.map((channel, index) => Math.round(channel * alpha + surface[index] * (1 - alpha)));
+  return `#${composed.map((channel) => channel.toString(16).padStart(2, "0")).join("")}`;
+}
+
 describe("light theme contrast", () => {
   it("keeps home content text readable on the light background", () => {
     expect(lightThemeRule(".lux-home-content")).toContain("background: var(--lux-bg)");
@@ -215,5 +227,33 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-media-address-value")).toContain("color: var(--lux-text)");
     expect(lightThemeRule(".lux-media-file-facts #fact-container")).toContain("color: var(--lux-muted)");
     expect(lightThemeRule(".lux-media-stream-badges span.is-default")).toContain("color: var(--lux-muted)");
+  });
+
+  it("keeps the detail source badges colored in light mode", () => {
+    const variants = [
+      ".lux-detail-badge.is-4k",
+      ".lux-detail-badge.is-1080p",
+      ".lux-detail-badge.is-hdr",
+      ".lux-detail-badge.is-audio",
+    ];
+    const colors = new Set<string>();
+
+    for (const variant of variants) {
+      const rule = lightThemeRule(variant);
+      expect(rule, `${variant} needs a light-theme color rule`).toContain("color:");
+      const color = rule.match(/(?:^|;)\s*color:\s*(#[\da-f]{6})/i)?.[1] ?? "";
+      expect(color, `${variant} should keep its own hue in light mode`).toMatch(/^#[\da-f]{6}$/i);
+      expect(
+        color.toLowerCase(),
+        `${variant} must not fall back to the neutral light pill color`,
+      ).not.toBe("#18181b");
+      expect(
+        contrastRatio(color, composedBadgeBackground(rule)),
+        `${variant} should meet 4.5:1 on its tinted light badge background`,
+      ).toBeGreaterThanOrEqual(4.5);
+      colors.add(color.toLowerCase());
+    }
+
+    expect(colors.size, "each badge variant should use a distinct hue").toBe(variants.length);
   });
 });

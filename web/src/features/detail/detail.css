@@ -565,6 +565,16 @@ html[data-lux-theme="light"] .lux-season-episode-copy p { color: var(--lux-text)
 
 .lux-detail-badge.is-audio { border-color: rgba(16,185,129,.35); background: rgba(16,185,129,.1); color: #a7f3d0; }
 
+/* The generic light pill uses a muted text color with higher specificity than the
+   plain .lux-detail-badge.is-* rules above, so re-declare each variant hue here. */
+html[data-lux-theme="light"] .lux-detail-badge.is-4k { border-color: rgba(180,83,9,.35); background: rgba(245,158,11,.16); color: #92400e; font-weight: 700; box-shadow: 0 0 10px rgba(245,158,11,.12); }
+
+html[data-lux-theme="light"] .lux-detail-badge.is-1080p { border-color: rgba(29,78,216,.32); background: rgba(59,130,246,.14); color: #1d4ed8; font-weight: 600; }
+
+html[data-lux-theme="light"] .lux-detail-badge.is-hdr { border-color: rgba(109,40,217,.32); background: rgba(168,85,247,.14); color: #6d28d9; font-weight: 600; }
+
+html[data-lux-theme="light"] .lux-detail-badge.is-audio { border-color: rgba(4,120,87,.38); background: rgba(16,185,129,.14); color: #065f46; }
+
 .lux-detail-overview { position: relative; max-width: none; margin: 28px 0 0; color: rgba(255,255,255,.7); font-size: 1rem; line-height: 1.7; }
 
 .lux-detail-overview-text { max-height: calc(1.7em * 3); margin: 0; overflow: hidden; color: inherit; line-height: inherit; }
