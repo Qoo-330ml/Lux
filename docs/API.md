@@ -124,6 +124,13 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
   用户、条目标题、档位、容器、音视频 codec、编码时间与 `progress`（`fps`、`speed`、`latestSegmentBitrateKbps`、
   `averageBitrateKbps`、`directoryBytes`、`outTimeSeconds`、`droppedFrames`、`finished`、`updatedAt`）；
   尚未启动 FFmpeg 的会话 `progress` 为 `null`。该接口只读取数据库与内存进度，会按会话目录统计输出字节。
+- `DELETE /api/v1/admin/transcoding/sessions/{sessionId}`：管理员停止一个活动的服务端 HLS 会话，等同该会话本人发送
+  `STOPPED`；成功 204，会话不是 `SERVER_HLS` 或已经结束返回 404。要求管理员 Web session 与 CSRF，并记录
+  `TRANSCODING_SESSION_STOPPED` 审计事件。停止前会采集 FFmpeg 快照写入历史。
+- `GET /api/v1/admin/transcoding/history?page=1&pageSize=10`：分页返回完成、失败与过期的服务端转码历史，
+  `pageSize` 上限 50。每条包含条目/用户、档位、`outcome`（`COMPLETED`、`FAILED`、`EXPIRED`）、`startedAt`、
+  `finishedAt`、`wallSeconds`、`encodedSeconds`、`averageSpeed`（编码时长 ÷ 墙钟时长）、`lastFps`、
+  `outputBytes` 与 `failureReason`。记录在会话结束/失败/过期时写入，每个会话最多一条，保留 30 天。
 - `POST /api/v1/admin/settings/transcoding/probe`：立即重新执行硬件编码器自检，需要管理员 Web session 与 CSRF；返回 `{ "transcodingStatus": { "encoder": "...", "available": true, "checkedAt": 1792888660271, "error": null } }`。检测超时上限 15 秒，失败原因只保留最后一行 FFmpeg 错误（最多 240 字符）。
 - `POST /api/v1/admin/settings/network-proxy/test`：管理员检测当前输入或已生效的网络代理；服务端只请求百度、Google 和 Cloudflare 三个固定目标，返回逐站延迟/HTTP 状态、网络出口 IP 和 Cloudflare 返回的两位国家/地区代码。具体 provider 的连通性由其插件自身的健康状态负责。需要管理员 Web session 和 CSRF；认证信息不会出现在响应或日志中。
 - `GET/PATCH /api/v1/admin/settings/registration`：管理员读取或更新注册模式，GET 返回 `{ "registrationMode": "INVITATION_ONLY", "version": 0 }`。默认邀请制；可选值仅 `INVITATION_ONLY`、`PUBLIC_EMAIL`。PATCH 使用 `{ "registrationMode": "PUBLIC_EMAIL", "version": 0 }`，必须带当前版本，成功返回新模式及递增版本；空对象不修改配置，字段显式为 null、未知字段、无效模式/版本返回 400，版本冲突返回 409 `VERSION_CONFLICT`，请求体上限 4 KiB。Web 写请求需管理员会话和 CSRF，沿用管理员 API Key 的既有授权语义。响应不包含 SMTP 配置或凭据，切换模式不改已发邀请。此设置本身不开放注册端点。

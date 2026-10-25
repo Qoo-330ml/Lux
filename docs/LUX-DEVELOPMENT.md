@@ -17872,6 +17872,27 @@ LUX-849 的降级路径兜底；部署文档写明各平台前置条件、设备
 `output/playwright/lux-852/admin-transcoding-page.png`。验证中发现并修复摘要把档位 4 误计为硬件编码的问题，
 已在 `--test web_playback` 中加断言（`softwareCount=1`、`hardwareCount=0`）。
 
+#### LUX-853：停止转码会话与转码历史
+
+范围：在“转码”页的实时进度行增加“停止会话”，经确认后由管理员结束该会话（复用会话本人的 STOPPED 语义并记录
+`TRANSCODING_SESSION_STOPPED` 审计事件）。新增 `transcoding_history` 表（SQLite/PostgreSQL 迁移 0224/0226），
+在会话正常停止、启动失败、HLS 进程失败与过期回收时，于停止进程前采集 FFmpeg 快照并记录：条目/用户、档位、
+outcome（COMPLETED/FAILED/EXPIRED）、起止时间、墙钟时长、编码时长、平均速度、最后帧率、输出字节与失败原因。
+每个会话最多一条（`session_id` 唯一），保留 30 天并在写入时顺带清理旧行。提供分页查询接口并在转码页展示。
+
+验收：
+
+- [x] 管理员可停止活动会话；非管理员/缺 CSRF 被拒绝；已结束或非 HLS 会话返回 404；停止后从实时列表消失。
+- [x] 正常停止、失败与过期都会写入历史，平均速度按编码时长 ÷ 墙钟时长计算，失败原因可见。
+- [x] 历史按 `finished_at` 倒序分页，`pageSize` 服务端上限 50；每个会话至多一条；超过 30 天自动清理。
+- [x] 页面提供停止确认、历史列表、outcome 标签、平均速度/输出字节/失败原因与翻页。
+- [x] 定向 Rust 测试、Web 组件测试、构建与迁移（空库）通过。
+
+结果（2026-10-25）：`--test web_playback web_playback_stats_report_the_plan_and_live_transcode_progress` 覆盖
+缺 CSRF 403、停止 204、重复停止 404、实时列表移除、历史 `outcome=COMPLETED`/`tier=4`/标题/用户/平均速度>0/
+输出字节>0/`lastFps=24`。Web `admin-transcoding-page` 4/4（停止确认与取消、历史 outcome/失败原因/平均速度），
+`vitest` 892/892、`tsc --noEmit` 与构建通过。迁移在空库测试中自动执行。
+
 ## 29. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
