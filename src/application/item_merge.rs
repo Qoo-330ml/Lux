@@ -179,6 +179,18 @@ impl ItemMergeService {
             report.groups_skipped += 1;
             return Ok(());
         }
+        // Provider IDs come from sidecar NFOs that may point at another film. The folder year is
+        // an independent veto: 银翼杀手 (1982) and 银翼杀手2049 (2017) can share a polluted TMDb
+        // id but never the same release year.
+        let candidate_item_ids = items.iter().map(|item| item.id.clone()).collect::<Vec<_>>();
+        let source_paths = self
+            .database
+            .list_identity_group_source_paths(&candidate_item_ids)
+            .await?;
+        if source_years_conflict(&source_paths) {
+            report.groups_skipped += 1;
+            return Ok(());
+        }
         let ordered = order_identity_merge_items(items);
         let primary_item_id = ordered
             .first()
@@ -220,6 +232,54 @@ fn order_identity_merge_items(
             .then_with(|| left.id.cmp(&right.id))
     });
     items
+}
+
+/// True when candidate items live in source folders that name different release years.
+fn source_years_conflict(paths: &[(String, String)]) -> bool {
+    let mut year: Option<u32> = None;
+    for (_, path) in paths {
+        let Some(found) = source_year(path) else {
+            continue;
+        };
+        match year {
+            None => year = Some(found),
+            Some(existing) if existing != found => return true,
+            Some(_) => {}
+        }
+    }
+    false
+}
+
+/// Release year from the first path segment, e.g. `Movie (2017)/file.strm`.
+///
+/// Only parenthesized 4-digit years count so titles such as `银翼杀手2049` and quality labels
+/// such as `2160p` never look like years.
+fn source_year(path: &str) -> Option<u32> {
+    let segment = path.split(['/', '\\']).next().unwrap_or(path);
+    let characters = segment.chars().collect::<Vec<_>>();
+    for (index, character) in characters.iter().enumerate() {
+        if *character != '(' && *character != '（' {
+            continue;
+        }
+        let mut cursor = index + 1;
+        let mut digits = String::new();
+        while cursor < characters.len() && characters[cursor].is_ascii_digit() && digits.len() < 4 {
+            digits.push(characters[cursor]);
+            cursor += 1;
+        }
+        if digits.len() != 4 || cursor >= characters.len() {
+            continue;
+        }
+        if characters[cursor] != ')' && characters[cursor] != '）' {
+            continue;
+        }
+        if let Ok(year) = digits.parse::<u32>()
+            && (1900..=2099).contains(&year)
+        {
+            return Some(year);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -290,6 +350,51 @@ mod tests {
         .execute(database.pool())
         .await
         .map(|_| ())
+    }
+
+    async fn insert_library_root(
+        database: &Database,
+        id: &str,
+        library_id: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES (?, ?, ?, ?, 1, 0)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(format!("/media/{library_id}"))
+        .bind(format!("/media/{library_id}"))
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn attach_source_path(
+        database: &Database,
+        source_id: &str,
+        root_id: &str,
+        relative_path: &str,
+    ) -> Result<(), sqlx::Error> {
+        let entry_id = format!("{source_id}-entry");
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation
+             ) VALUES (?, ?, ?, 'FILE', 1, 0, 'test')",
+        )
+        .bind(&entry_id)
+        .bind(root_id)
+        .bind(relative_path)
+        .execute(database.pool())
+        .await?;
+        sqlx::query("UPDATE media_sources SET filesystem_entry_id = ? WHERE id = ?")
+            .bind(entry_id)
+            .bind(source_id)
+            .execute(database.pool())
+            .await
+            .map(|_| ())
     }
 
     async fn merged_into(database: &Database, id: &str) -> Result<Option<String>, sqlx::Error> {
@@ -546,5 +651,138 @@ mod tests {
         assert!(report.groups_skipped >= 1);
         assert_eq!(merged_into(&database, "extended").await?, None);
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn provider_identity_requires_a_shared_tmdb_key() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        // The 2018 film carries a stale 1987 IMDb id in its sidecar NFO. A shared IMDb id must
+        // not merge items whose TMDb identities differ.
+        insert_item(
+            &database,
+            &library_id,
+            "predator-1987",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Predator",
+            Some(1987),
+            Some(r#"{"imdb":"tt0093773","tmdb":"48193"}"#),
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "predator-2018",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Predator",
+            Some(2018),
+            Some(r#"{"imdb":"tt0093773","tmdb":"346910"}"#),
+        )
+        .await?;
+        insert_source(&database, "source-1987", "predator-1987", None).await?;
+        insert_source(&database, "source-2018", "predator-2018", None).await?;
+
+        let service = ItemMergeService::new(database.clone());
+        let report = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(report.groups_merged, 0);
+        assert_eq!(merged_into(&database, "predator-2018").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn source_path_year_conflict_vetoes_merge() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        insert_library_root(&database, "root-movies", &library_id).await?;
+        // Both items were identified as TMDb 78 by a polluted movie.nfo, but their folders
+        // belong to different films.
+        let provider = Some(r#"{"tmdb":"78"}"#);
+        insert_item(
+            &database,
+            &library_id,
+            "blade-runner",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Blade Runner",
+            Some(1982),
+            provider,
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "blade-runner-2049",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            "Blade Runner",
+            Some(1982),
+            provider,
+        )
+        .await?;
+        insert_source(&database, "source-1982", "blade-runner", None).await?;
+        insert_source(&database, "source-2049", "blade-runner-2049", None).await?;
+        attach_source_path(
+            &database,
+            "source-1982",
+            "root-movies",
+            "银翼杀手 (1982)/银翼杀手 (1982) - 2160p.strm",
+        )
+        .await?;
+        attach_source_path(
+            &database,
+            "source-2049",
+            "root-movies",
+            "银翼杀手2049 (2017)/银翼杀手2049 (2017) - 2160p.strm",
+        )
+        .await?;
+
+        let service = ItemMergeService::new(database.clone());
+        let report = service.merge_identity_duplicates(None, 10).await?;
+        assert_eq!(report.groups_merged, 0);
+        assert_eq!(merged_into(&database, "blade-runner-2049").await?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn parenthesized_year_ignores_unparenthesized_numbers() {
+        assert_eq!(
+            source_year("银翼杀手2049 (2017)/银翼杀手2049 (2017) - 2160p.strm"),
+            Some(2017)
+        );
+        assert_eq!(
+            source_year("铁血战士（1987）/铁血战士 (1987) - 2160p.strm"),
+            Some(1987)
+        );
+        assert_eq!(source_year("Movie 2160p (2010)/file.strm"), Some(2010));
+        assert_eq!(
+            source_year("Show (2017)/Season 1/S01E01 (2019).mkv"),
+            Some(2017)
+        );
+        assert_eq!(source_year("Movie (1888)/file.strm"), None);
+        assert_eq!(source_year("Movie (2099)/file.strm"), Some(2099));
+        assert_eq!(source_year("Movie/file.strm"), None);
+        assert_eq!(source_year("Movie (1800)/file.strm"), None);
+        assert_eq!(source_year("Movie (2100)/file.strm"), None);
     }
 }

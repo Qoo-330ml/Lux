@@ -512,6 +512,9 @@ impl Database {
                AND mi.item_type IN ('MOVIE', 'SERIES')
                AND mi.merged_into_item_id IS NULL
                AND mi.removed_at IS NULL
+               -- Local sidecar NFOs frequently carry stale IMDb/TVDB IDs from another film.
+               -- Only TMDb, which Lux resolves itself, may prove two items are the same title.
+               AND provider.provider = 'tmdb'
                {condition}
              GROUP BY mi.library_id, mi.item_type, provider.provider, provider.provider_id
              HAVING COUNT(*) > 1
@@ -645,6 +648,51 @@ impl Database {
             path: self.path.clone(),
             source,
         })
+    }
+
+    /// Media-source paths for the given candidate items, keyed by item ID.
+    ///
+    /// Automatic merging uses these first path segments as an identity veto: two items whose
+    /// folders name different release years are different titles even when their provider IDs
+    /// (usually polluted by a sidecar NFO) agree. Only direct sources are read; series episodes
+    /// are intentionally excluded so a multi-season show cannot look like a year conflict.
+    pub(crate) async fn list_identity_group_source_paths(
+        &self,
+        item_ids: &[String],
+    ) -> Result<Vec<(String, String)>, StorageError> {
+        if item_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let item_ids = item_ids
+            .iter()
+            .take(MAX_IDENTITY_MERGE_GROUP_ITEMS as usize)
+            .collect::<Vec<_>>();
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT source.item_id AS item_id, entry.relative_path AS relative_path
+             FROM media_sources source
+             JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
+             WHERE source.item_id IN ({placeholders})
+               AND entry.relative_path <> ''
+             LIMIT 500"
+        )));
+        for item_id in item_ids {
+            query = query.bind(item_id);
+        }
+        query
+            .fetch_all(&self.pool)
+            .await
+            .map(|rows| {
+                rows.into_iter()
+                    .map(|row| (row.get("item_id"), row.get("relative_path")))
+                    .collect()
+            })
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 
     pub(crate) async fn list_title_identity_group_items(

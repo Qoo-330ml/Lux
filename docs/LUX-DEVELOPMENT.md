@@ -150,6 +150,10 @@ Lux 的核心价值不是功能数量，而是：
 - 已看、进度和收藏绑定逻辑标题，在普通清晰度版本之间共享。
 - 导演剪辑版、加长版等内容不同的版本可作为独立逻辑条目。
 - 自动聚合必须依赖可靠的 provider ID、显式版本标记或管理员操作，不得仅凭相似标题粗暴合并。
+- 自动合并只认同 Lux 自己解析出的 TMDb 身份；旁车 NFO 携带的 IMDb、TVDB、Wikidata 等 ID
+  可能来自另一部影片，只用于展示和外部链接，不得作为自动合并键。
+- 自动合并还要用媒体源路径做否决：候选条目所在首个目录段标注的上映年份不一致时，即使
+  provider ID 相同也保持独立条目，避免被错误 NFO 带偏身份。
 - 电影文件名末尾的连字符后缀只有在同目录存在唯一、完全匹配的基础视频文件时，才作为版本标签并归入基础标题；无基础文件或存在多个可能基础名时不自动归并，后缀值不使用固定白名单。
 
 ### 3.5 元数据优先级
@@ -2997,7 +3001,9 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 验收：
 
 - 自动合并只处理同一启用媒体库、同一 `MOVIE`/`SERIES` 根类型、未移除且未合并的条目，沿用既有合并约束。
-- provider ID 完全一致优先；任一条目存在非空 `edition_name` 媒体源时跳过自动合并，导演剪辑版等仍可作为独立条目。
+- 自动合并只用 TMDb provider ID 分组；IMDb、TVDB、Wikidata 等旁车 NFO ID 不参与合并判定。
+- 候选条目首个媒体源路径目录段标注的年份不一致时否决合并，即使 provider ID 相同。
+- 任一条目存在非空 `edition_name` 媒体源时跳过自动合并，导演剪辑版等仍可作为独立条目。
 - 后台 worker 按游标分页有界执行，不在请求路径扫描全库；回填以 `lux_meta` 标记只跑一次，重复执行幂等。
 - 合并写入 `media_merge_records`、条目状态和媒体源状态；撤销恢复条目层级、媒体源归属和默认源，不恢复被合并条目的用户状态原值。
 - `GET /api/v1/admin/items/{itemId}/merges` 与 `POST /api/v1/admin/items/unmerge` 需要管理员会话和 CSRF，成功使目录/首页缓存失效并写不含路径和 URL 的审计事件。
@@ -3019,6 +3025,13 @@ PostgreSQL 路径改为一条 `LATERAL` 查询，每个媒体库先通过现有 
 `web/tests/media-merge-sources.test.tsx`（3 项）通过；本机 `uname -m=arm64`，未验证 PostgreSQL 运行时、
 NAS/x86 性能或第三方客户端表现。撤销不恢复被合并条目的用户状态原值，升级前没有溯源记录的历史合并
 无法拆分。
+
+结果（2026-10-25，错误合并修复）：自动合并键收窄为 TMDb 单一 provider，并新增源路径年份否决，
+`--lib application::item_merge` 7 项、`--lib media_merge` 9 项、`--test item_merge` 通过。背景是
+fnos 实际库中出现三条电影和一条剧集被错误合并：旁车 NFO 把 IMDb/TVDB ID 写成了另一部影片的 ID，
+自动合并按“任意共享 provider ID”把不同影片并成多版本；`银翼杀手 (1982)` 甚至因为目录级
+`movie.nfo` 写错 TMDb 78，把 `银翼杀手2049 (2017)` 并了进来。年份否决从路径目录段读取
+`(YYYY)`，与 provider ID 无关，专门拦截这类被 NFO 带偏的身份。手动拆分后的自动再合并抑制仍待实现。
 
 全量 `cargo test --locked --all-targets` 后仍有 11 个目标失败：`admin_api_key`、`admin_health`、
 `image_api`、`people_api`、`scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、
