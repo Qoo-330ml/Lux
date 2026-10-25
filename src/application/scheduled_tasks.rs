@@ -255,6 +255,18 @@ impl ScheduledTaskService {
         ));
     }
 
+    /// Starts queued library deletions once at startup instead of waiting for the
+    /// first scheduler tick. The loop's first tick is immediate today, but it is an
+    /// implicit dependency of `tokio::time::interval`, and `run_once` returns early on
+    /// a plan read failure, so a queued deletion could otherwise sit until the next
+    /// pass. Best effort: a storage error only logs.
+    pub(crate) async fn drain_queued_library_deletions(&self) {
+        let Some(deletion) = &self.library_deletion else {
+            return;
+        };
+        deletion.drain_pending().await;
+    }
+
     /// Stops the scheduler loop and waits for the current pass.
     pub async fn shutdown(&self) {
         let worker = self.worker.lock().await.take();

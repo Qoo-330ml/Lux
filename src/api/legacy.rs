@@ -725,6 +725,9 @@ impl AppState {
             tracing::error!(%error, "failed to synchronize manifest scheduled tasks");
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
+            // Resume deletions that were queued before a restart before the loop starts,
+            // so they do not depend on the first tick or on a scheduled plan running.
+            scheduled_tasks.drain_queued_library_deletions().await;
             scheduled_tasks.spawn().await;
         }
     }
