@@ -3683,7 +3683,7 @@ async fn create_web_playback_session_json(
         capabilities.direct_play = false;
     }
     let user_id = user.id.to_string();
-    let created = service
+    let mut created = service
         .create(CreateWebPlaybackSession {
             user_id: &user_id,
             is_admin: user.is_admin,
@@ -3734,16 +3734,53 @@ async fn create_web_playback_session_json(
                 return Err(StatusCode::FORBIDDEN.into_response());
             }
         };
-        if let Err(error) = service
-            .start_hls_with_audio(&created.id, *tier, &input, None, None, audio_stream_index)
+        let mut effective_tier = *tier;
+        let start_failure = match service
+            .start_hls_with_audio(
+                &created.id,
+                effective_tier,
+                &input,
+                None,
+                None,
+                audio_stream_index,
+            )
             .await
         {
-            let _ = service.stop(&created.id, &user_id).await;
-            return Err(web_playback_error(headers, error));
+            Ok(()) if effective_tier == ServerTier::HardwareTranscode => {
+                // Give a broken hardware encoder a moment to fail, then verify the process is
+                // alive. Playback must degrade to software transcoding instead of erroring out.
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                (!service.hls_start_healthy(&created.id).await).then_some(
+                    crate::application::playback::session::WebPlaybackSessionError::Hls(
+                        crate::application::playback::hls::HlsError::Failed,
+                    ),
+                )
+            }
+            Ok(()) => None,
+            Err(error) => Some(error),
+        };
+        if let Some(error) = start_failure {
+            if effective_tier != ServerTier::HardwareTranscode {
+                let _ = service.stop(&created.id, &user_id).await;
+                return Err(web_playback_error(headers, error));
+            }
+            match service
+                .restart_with_software(&created.id, &input, None, None, audio_stream_index)
+                .await
+            {
+                Ok(tier) => effective_tier = tier,
+                Err(fallback_error) => {
+                    let _ = service.stop(&created.id, &user_id).await;
+                    return Err(web_playback_error(headers, fallback_error));
+                }
+            }
         }
+        created.plan = WebPlaybackPlan::ServerHls {
+            tier: effective_tier,
+        };
         // Persist what the server actually produces so the admin dashboard and the player's
         // information panel describe the same session instead of guessing.
-        let output = web_transcoding_output(*tier, HlsSegmentContainer::FragmentedMp4);
+        let output = web_transcoding_output(effective_tier, HlsSegmentContainer::FragmentedMp4);
         if let Err(error) = service
             .set_transcoding_details(&created.id, &user_id, &output)
             .await

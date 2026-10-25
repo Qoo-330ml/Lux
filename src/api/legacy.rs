@@ -362,8 +362,8 @@ impl AppState {
         {
             let service = service.clone();
             handle.spawn(async move {
-                let settings = service.transcoding_settings().await;
-                service.apply_transcoding_settings(&settings);
+                // Load the policy and validate the hardware encoder before the first playback.
+                service.refresh_hardware_status().await;
             });
         }
         let access = MediaAccessService::new(database.clone());

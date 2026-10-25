@@ -24,6 +24,8 @@ pub(crate) const SOFTWARE_PRESETS: [&str; 6] = [
     "fast",
     "medium",
 ];
+/// Default DRM render node used for VAAPI and QSV when no device is configured.
+pub(crate) const DEFAULT_HARDWARE_DEVICE: &str = "/dev/dri/renderD128";
 
 const MAX_SESSIONS_PER_TIER: i64 = 16;
 const MAX_SESSION_QUOTA_MB: i64 = 65_536;
@@ -72,6 +74,12 @@ pub(crate) struct TranscodingSettings {
     /// AAC bitrate for audio transcoding.
     #[serde(default = "default_audio_bitrate_kbps")]
     pub(crate) audio_bitrate_kbps: i64,
+    /// DRM render node for VAAPI/QSV; empty keeps the FFmpeg default.
+    #[serde(default = "default_hardware_device")]
+    pub(crate) hardware_device: String,
+    /// Let FFmpeg decode on the GPU before encoding; failures fall back to the software tier.
+    #[serde(default)]
+    pub(crate) hardware_decode: bool,
 }
 
 fn default_enabled() -> bool {
@@ -114,6 +122,10 @@ fn default_audio_bitrate_kbps() -> i64 {
     192
 }
 
+fn default_hardware_device() -> String {
+    DEFAULT_HARDWARE_DEVICE.to_owned()
+}
+
 impl Default for TranscodingSettings {
     fn default() -> Self {
         Self {
@@ -129,6 +141,8 @@ impl Default for TranscodingSettings {
             software_preset: default_software_preset(),
             max_output_height: 0,
             audio_bitrate_kbps: default_audio_bitrate_kbps(),
+            hardware_device: default_hardware_device(),
+            hardware_decode: false,
         }
     }
 }
@@ -141,6 +155,7 @@ pub(crate) enum TranscodingSettingsError {
     UnknownPreset,
     UnknownEncoder,
     OutputHeightOutOfRange,
+    DeviceUnusable,
 }
 
 impl std::fmt::Display for TranscodingSettingsError {
@@ -152,6 +167,7 @@ impl std::fmt::Display for TranscodingSettingsError {
             Self::UnknownPreset => "invalid software encoding preset",
             Self::UnknownEncoder => "invalid hardware encoder",
             Self::OutputHeightOutOfRange => "invalid maximum output height",
+            Self::DeviceUnusable => "invalid hardware device path",
         })
     }
 }
@@ -175,6 +191,16 @@ impl TranscodingSettings {
             lower
         };
         self.hardware_encoder = encoder;
+
+        let device = self.hardware_device.trim().to_owned();
+        if device.chars().count() > 128 || device.chars().any(char::is_control) {
+            return Err(TranscodingSettingsError::DeviceUnusable);
+        }
+        self.hardware_device = if device.is_empty() {
+            DEFAULT_HARDWARE_DEVICE.to_owned()
+        } else {
+            device
+        };
 
         let preset = self.software_preset.trim().to_ascii_lowercase();
         if !SOFTWARE_PRESETS.contains(&preset.as_str()) {
@@ -249,8 +275,8 @@ pub(crate) async fn write_transcoding_settings(
 #[cfg(test)]
 mod tests {
     use super::{
-        HARDWARE_ENCODER_NONE, TranscodingSettings, TranscodingSettingsError,
-        read_transcoding_settings, write_transcoding_settings,
+        DEFAULT_HARDWARE_DEVICE, HARDWARE_ENCODER_NONE, TranscodingSettings,
+        TranscodingSettingsError, read_transcoding_settings, write_transcoding_settings,
     };
     use crate::{config::Config, storage::Database};
 
@@ -269,6 +295,36 @@ mod tests {
         assert_eq!(settings.audio_bitrate_kbps, 192);
         assert_eq!(settings.max_video_bitrate_kbps, 0);
         assert_eq!(settings.max_output_height, 0);
+        assert_eq!(settings.hardware_device, DEFAULT_HARDWARE_DEVICE);
+        assert!(!settings.hardware_decode);
+    }
+
+    #[test]
+    fn hardware_device_is_trimmed_and_validated() {
+        let normalized = TranscodingSettings {
+            hardware_device: "  /dev/dri/renderD129 ".to_owned(),
+            ..TranscodingSettings::default()
+        }
+        .normalized()
+        .expect("a device path is accepted");
+        assert_eq!(normalized.hardware_device, "/dev/dri/renderD129");
+
+        let empty = TranscodingSettings {
+            hardware_device: "   ".to_owned(),
+            ..TranscodingSettings::default()
+        }
+        .normalized()
+        .expect("empty falls back to the default device");
+        assert_eq!(empty.hardware_device, DEFAULT_HARDWARE_DEVICE);
+
+        let invalid = TranscodingSettings {
+            hardware_device: "/dev/dri/renderD\u{7}128".to_owned(),
+            ..TranscodingSettings::default()
+        };
+        assert_eq!(
+            invalid.normalized().unwrap_err(),
+            TranscodingSettingsError::DeviceUnusable
+        );
     }
 
     #[test]

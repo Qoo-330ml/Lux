@@ -1055,6 +1055,82 @@ impl WebPlaybackSessionService {
         self.hls.apply_settings(settings);
     }
 
+    /// Re-applies the stored policy and runs the hardware encoder self-test.
+    pub(crate) async fn refresh_hardware_status(
+        &self,
+    ) -> crate::application::playback::hls::HardwareEncoderStatus {
+        let settings = self.transcoding_settings().await;
+        self.hls.apply_settings(&settings);
+        self.hls.probe_hardware_encoder().await
+    }
+
+    pub(crate) fn hardware_status(
+        &self,
+    ) -> crate::application::playback::hls::HardwareEncoderStatus {
+        self.hls.hardware_status()
+    }
+
+    async fn mark_session_tier(
+        &self,
+        session_id: &str,
+        tier: ServerTier,
+    ) -> Result<(), WebPlaybackSessionError> {
+        let Some(session) = self.database.find_web_playback_session(session_id).await? else {
+            return Err(WebPlaybackSessionError::NotFound);
+        };
+        if self
+            .database
+            .update_web_playback_session_tier(
+                session_id,
+                &session.user_id,
+                i64::from(tier.number()),
+                &session.plan,
+                unix_timestamp(),
+            )
+            .await?
+        {
+            Ok(())
+        } else {
+            Err(WebPlaybackSessionError::NotFound)
+        }
+    }
+
+    /// Cheap liveness check right after a hardware start: a dead child means the GPU path failed.
+    pub(crate) async fn hls_start_healthy(&self, session_id: &str) -> bool {
+        if self.hls.process_alive(session_id).await.unwrap_or(false) {
+            return true;
+        }
+        self.hls.manifest_ready(session_id).await
+    }
+
+    /// Restarts a failed Web HLS start as software transcoding, when the policy allows it.
+    pub(crate) async fn restart_with_software(
+        &self,
+        session_id: &str,
+        input: &std::path::Path,
+        video_bitrate: Option<i64>,
+        start_time_ticks: Option<i64>,
+        audio_stream_index: Option<i64>,
+    ) -> Result<ServerTier, WebPlaybackSessionError> {
+        let settings = self.transcoding_settings().await;
+        if settings.software_sessions <= 0 {
+            return Err(WebPlaybackSessionError::Hls(HlsError::Limit));
+        }
+        let _ = self.hls.stop(session_id).await;
+        self.start_hls_with_audio(
+            session_id,
+            ServerTier::SoftwareTranscode,
+            input,
+            video_bitrate,
+            start_time_ticks,
+            audio_stream_index,
+        )
+        .await?;
+        self.mark_session_tier(session_id, ServerTier::SoftwareTranscode)
+            .await?;
+        Ok(ServerTier::SoftwareTranscode)
+    }
+
     async fn start_hls_with_runtime(
         &self,
         session_id: &str,
@@ -1120,6 +1196,22 @@ impl WebPlaybackSessionService {
         match self.hls.wait_for_manifest(session_id).await {
             Ok(path) => Ok(path),
             Err(error) => {
+                // A broken hardware encoder must not take playback down: restart the same
+                // session on the software tier and only then report the failure.
+                if error.is_terminal_process_failure()
+                    && let Ok(Some(tier)) = self.hls.downgrade_to_software(session_id).await
+                {
+                    let _ = self.mark_session_tier(session_id, tier).await;
+                    match self.hls.wait_for_manifest(session_id).await {
+                        Ok(path) => return Ok(path),
+                        Err(retry) => {
+                            if retry.is_terminal_process_failure() {
+                                self.stop_failed_hls_session(session_id).await;
+                            }
+                            return Err(retry.into());
+                        }
+                    }
+                }
                 self.stop_failed_hls_session(session_id).await;
                 Err(error.into())
             }
@@ -1201,7 +1293,16 @@ impl WebPlaybackSessionService {
                 self.stop(&active_session.id, &session.user_id).await?;
             }
         }
-        self.hls.start_for_initial_asset(session_id, asset).await?;
+        if let Err(error) = self.hls.start_for_initial_asset(session_id, asset).await {
+            if error.is_terminal_process_failure()
+                && let Ok(Some(tier)) = self.hls.downgrade_to_software(session_id).await
+            {
+                self.mark_session_tier(&session.id, tier).await?;
+                self.hls.start_for_initial_asset(session_id, asset).await?;
+                return Ok(());
+            }
+            return Err(error.into());
+        }
         Ok(())
     }
 

@@ -46,6 +46,18 @@ const MAX_SESSION_ID_BYTES: usize = 128;
 /// `ffmpeg -progress` writes one `key=value` pair per line; anything larger is not a progress
 /// report and must not grow the reader's buffer.
 const MAX_PROGRESS_LINE_BYTES: usize = 4_096;
+/// Encoder self-test budget; a working GPU initialises in well under a second.
+const HARDWARE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Result of the last hardware encoder self-test.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct HardwareEncoderStatus {
+    pub(crate) encoder: Option<String>,
+    pub(crate) available: bool,
+    /// Milliseconds since the Unix epoch; zero means "not checked yet".
+    pub(crate) checked_at_ms: i64,
+    pub(crate) error: Option<String>,
+}
 
 /// The newest complete-enough `ffmpeg -progress` values for one HLS process generation.
 ///
@@ -255,6 +267,7 @@ struct HlsChildRequest<'a> {
     start_time_ticks: Option<i64>,
 }
 
+#[derive(Clone)]
 struct HlsProcessSpecification {
     input: PathBuf,
     tier: ServerTier,
@@ -274,6 +287,8 @@ struct FfmpegEncodingOptions {
     max_output_height: u32,
     audio_bitrate: i64,
     max_video_bitrate: i64,
+    hardware_device: String,
+    hardware_decode: bool,
 }
 
 impl Default for FfmpegEncodingOptions {
@@ -284,6 +299,8 @@ impl Default for FfmpegEncodingOptions {
             max_output_height: 0,
             audio_bitrate: 192_000,
             max_video_bitrate: 0,
+            hardware_device: default_hardware_device(),
+            hardware_decode: false,
         }
     }
 }
@@ -296,6 +313,8 @@ impl FfmpegEncodingOptions {
             max_output_height: config.max_output_height,
             audio_bitrate: config.audio_bitrate,
             max_video_bitrate: config.max_video_bitrate,
+            hardware_device: config.hardware_device.clone(),
+            hardware_decode: config.hardware_decode,
         }
     }
 
@@ -398,6 +417,8 @@ struct RuntimeTranscodeConfig {
     software_preset: String,
     max_output_height: u32,
     audio_bitrate: i64,
+    hardware_device: String,
+    hardware_decode: bool,
 }
 
 impl Default for RuntimeTranscodeConfig {
@@ -413,6 +434,8 @@ impl Default for RuntimeTranscodeConfig {
             software_preset: "veryfast".to_owned(),
             max_output_height: 0,
             audio_bitrate: 192_000,
+            hardware_device: default_hardware_device(),
+            hardware_decode: false,
         }
     }
 }
@@ -453,6 +476,8 @@ impl RuntimeTranscodeConfig {
             software_preset: settings.software_preset.clone(),
             max_output_height: u32::try_from(settings.max_output_height).unwrap_or(0),
             audio_bitrate: settings.audio_bitrate_kbps.saturating_mul(1_000),
+            hardware_device: settings.hardware_device.clone(),
+            hardware_decode: settings.hardware_decode,
         }
     }
 }
@@ -461,6 +486,20 @@ fn megabytes(value: i64) -> u64 {
     u64::try_from(value)
         .unwrap_or(0)
         .saturating_mul(1024 * 1024)
+}
+
+fn default_hardware_device() -> String {
+    crate::application::transcoding::DEFAULT_HARDWARE_DEVICE.to_owned()
+}
+
+/// Device node passed to VAAPI/QSV; empty values mean the documented default.
+fn hardware_device(encoding: &FfmpegEncodingOptions) -> String {
+    let device = encoding.hardware_device.trim();
+    if device.is_empty() {
+        default_hardware_device()
+    } else {
+        device.to_owned()
+    }
 }
 
 fn hardware_encoder_from_env() -> Option<String> {
@@ -474,6 +513,7 @@ pub(crate) struct HlsManager {
     processes: Arc<RwLock<HashMap<String, Arc<HlsProcess>>>>,
     slots: std::sync::RwLock<TierSlots>,
     runtime: std::sync::RwLock<RuntimeTranscodeConfig>,
+    hardware_status: std::sync::RwLock<HardwareEncoderStatus>,
     ffmpeg_executable: String,
 }
 
@@ -489,6 +529,7 @@ impl Clone for HlsManager {
                     .clone(),
             ),
             runtime: std::sync::RwLock::new(self.runtime_snapshot()),
+            hardware_status: std::sync::RwLock::new(self.hardware_status()),
             ffmpeg_executable: self.ffmpeg_executable.clone(),
         }
     }
@@ -538,6 +579,7 @@ impl HlsManager {
                 MAX_SOFTWARE_SESSIONS,
             ))),
             runtime: std::sync::RwLock::new(runtime),
+            hardware_status: std::sync::RwLock::new(HardwareEncoderStatus::default()),
             ffmpeg_executable,
         }
     }
@@ -566,6 +608,7 @@ impl HlsManager {
         &self,
         settings: &crate::application::transcoding::TranscodingSettings,
     ) {
+        let previous_encoder = self.runtime_read().hardware_encoder.clone();
         let limits = (
             usize::try_from(settings.remux_sessions).unwrap_or(0),
             usize::try_from(settings.hardware_sessions).unwrap_or(0),
@@ -580,11 +623,119 @@ impl HlsManager {
                 *slots = TierSlots::new(limits);
             }
         }
-        *self.runtime_write() = RuntimeTranscodeConfig::from_settings(settings);
+        let runtime = RuntimeTranscodeConfig::from_settings(settings);
+        let encoder_changed = previous_encoder != runtime.hardware_encoder;
+        *self.runtime_write() = runtime;
+        if encoder_changed {
+            let mut status = self
+                .hardware_status
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *status = HardwareEncoderStatus {
+                encoder: self.runtime_read().hardware_encoder.clone(),
+                available: false,
+                checked_at_ms: 0,
+                error: None,
+            };
+        }
     }
 
+    pub(crate) fn hardware_status(&self) -> HardwareEncoderStatus {
+        self.hardware_status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_hardware_status(&self, status: HardwareEncoderStatus) {
+        *self
+            .hardware_status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+    }
+
+    /// A configured encoder only counts as available once the self-test has passed.
     pub(crate) fn hardware_transcode_available(&self) -> bool {
-        self.runtime_read().hardware_encoder.is_some()
+        self.runtime_read().hardware_encoder.is_some() && self.hardware_status().available
+    }
+
+    /// Runs a one-frame encode with the configured hardware encoder and records the result.
+    pub(crate) async fn probe_hardware_encoder(&self) -> HardwareEncoderStatus {
+        let runtime = self.runtime_snapshot();
+        let Some(encoder) = runtime.hardware_encoder.clone() else {
+            let status = HardwareEncoderStatus {
+                encoder: None,
+                available: false,
+                checked_at_ms: unix_millis(),
+                error: None,
+            };
+            self.record_hardware_status(status.clone());
+            return status;
+        };
+        let encoding = FfmpegEncodingOptions {
+            // The probe source is generated by lavfi, so decode acceleration must stay off.
+            hardware_decode: false,
+            ..FfmpegEncodingOptions::from_runtime(&runtime)
+        };
+        let args = hardware_probe_args(&encoding);
+        let result = tokio::time::timeout(
+            HARDWARE_PROBE_TIMEOUT,
+            Command::new(&self.ffmpeg_executable)
+                .args(&args)
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let (available, error) = match result {
+            Ok(Ok(output)) if output.status.success() => (true, None),
+            Ok(Ok(output)) => (
+                false,
+                Some(sanitize_probe_error(&String::from_utf8_lossy(
+                    &output.stderr,
+                ))),
+            ),
+            Ok(Err(error)) => (false, Some(format!("无法启动 FFmpeg：{error}"))),
+            Err(_) => (false, Some("编码器自检超时".to_owned())),
+        };
+        let status = HardwareEncoderStatus {
+            encoder: Some(encoder),
+            available,
+            checked_at_ms: unix_millis(),
+            error,
+        };
+        self.record_hardware_status(status.clone());
+        status
+    }
+
+    /// Restarts a hardware session as software transcoding after a failed start.
+    /// Returns the new tier when a hardware session was actually restarted as software.
+    pub(crate) async fn downgrade_to_software(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ServerTier>, HlsError> {
+        let (specification, runtime_ticks) = {
+            let processes = self.processes.read().await;
+            let process = processes.get(session_id).ok_or(HlsError::NotFound)?;
+            (process.specification.clone(), process.runtime_ticks)
+        };
+        if specification.tier != ServerTier::HardwareTranscode {
+            return Ok(None);
+        }
+        self.stop(session_id).await?;
+        let mut specification = specification;
+        specification.tier = ServerTier::SoftwareTranscode;
+        specification.encoding.hardware_encoder = None;
+        let spawn_immediately = !specification.emby_vod;
+        self.start_process(
+            session_id,
+            specification,
+            None,
+            runtime_ticks,
+            spawn_immediately,
+        )
+        .await?;
+        Ok(Some(ServerTier::SoftwareTranscode))
     }
 
     pub(crate) fn with_executable(mut self, executable: String) -> Self {
@@ -888,6 +1039,33 @@ impl HlsManager {
             });
         }
         Ok(child)
+    }
+
+    /// Whether the session's FFmpeg child is still running.
+    pub(crate) async fn process_alive(&self, session_id: &str) -> Result<bool, HlsError> {
+        let process = self
+            .processes
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or(HlsError::NotFound)?;
+        let mut state = process.state.lock().await;
+        match state.child.as_mut() {
+            Some(child) => Ok(child.try_wait().map_err(HlsError::Io)?.is_none()),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether the initial manifest already exists (a tiny input can finish encoding instantly).
+    pub(crate) async fn manifest_ready(&self, session_id: &str) -> bool {
+        let process = self.processes.read().await.get(session_id).cloned();
+        match process {
+            Some(process) => fs::metadata(&process.initial_manifest)
+                .await
+                .is_ok_and(|metadata| metadata.is_file()),
+            None => false,
+        }
     }
 
     /// Latest FFmpeg progress for one HLS session, or `None` before FFmpeg reported anything.
@@ -1992,6 +2170,124 @@ fn ffmpeg_args_for_output(
     )
 }
 
+/// Hardware-specific options that must precede `-i` (device creation, optional hw decode).
+fn hardware_input_options(encoding: &FfmpegEncodingOptions, tier: ServerTier) -> Vec<String> {
+    if tier != ServerTier::HardwareTranscode {
+        return Vec::new();
+    }
+    let Some(encoder) = encoding.hardware_encoder.as_deref() else {
+        return Vec::new();
+    };
+    let device = hardware_device(encoding);
+    let mut args = Vec::new();
+    match encoder {
+        // VAAPI needs an explicit DRM render node before the encoder can see frames.
+        "h264_vaapi" => args.extend(["-vaapi_device".to_owned(), device.clone()]),
+        // QSV initialises a named device that the filter graph uploads into.
+        "h264_qsv" => args.extend([
+            "-init_hw_device".to_owned(),
+            format!("qsv=hw:{device}"),
+            "-filter_hw_device".to_owned(),
+            "hw".to_owned(),
+        ]),
+        _ => {}
+    }
+    if encoding.hardware_decode {
+        match encoder {
+            "h264_vaapi" => args.extend([
+                "-hwaccel".to_owned(),
+                "vaapi".to_owned(),
+                "-hwaccel_device".to_owned(),
+                device,
+            ]),
+            "h264_qsv" => args.extend([
+                "-hwaccel".to_owned(),
+                "qsv".to_owned(),
+                "-hwaccel_device".to_owned(),
+                "hw".to_owned(),
+            ]),
+            "h264_nvenc" => args.extend(["-hwaccel".to_owned(), "cuda".to_owned()]),
+            "h264_videotoolbox" => {
+                args.extend(["-hwaccel".to_owned(), "videotoolbox".to_owned()]);
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+/// Filter chain for the encoder: scaling for every tier, plus the hardware upload VAAPI/QSV need.
+fn video_filter_chain(encoding: &FfmpegEncodingOptions, tier: ServerTier) -> Option<String> {
+    let scale = (encoding.max_output_height > 0)
+        .then(|| format!("scale=-2:min(ih\\,{})", encoding.max_output_height));
+    if tier != ServerTier::HardwareTranscode {
+        return scale;
+    }
+    let upload = match encoding.hardware_encoder.as_deref() {
+        Some("h264_vaapi") => Some("format=nv12,hwupload".to_owned()),
+        Some("h264_qsv") => Some("hwupload=extra_hw_frames=64,format=qsv".to_owned()),
+        _ => None,
+    };
+    match (scale, upload) {
+        (Some(scale), Some(upload)) => Some(format!("{scale},{upload}")),
+        (Some(scale), None) => Some(scale),
+        (None, Some(upload)) => Some(upload),
+        (None, None) => None,
+    }
+}
+
+/// FFmpeg arguments for the hardware encoder self-test.
+fn hardware_probe_args(encoding: &FfmpegEncodingOptions) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-nostdin".to_owned(),
+    ];
+    args.extend(hardware_input_options(
+        encoding,
+        ServerTier::HardwareTranscode,
+    ));
+    args.extend([
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        "testsrc=size=320x240:rate=30:duration=0.3".to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+    ]);
+    if let Some(filter) = video_filter_chain(encoding, ServerTier::HardwareTranscode) {
+        args.extend(["-vf".to_owned(), filter]);
+    }
+    if let Some(encoder) = encoding.hardware_encoder.as_deref() {
+        args.extend(["-c:v".to_owned(), encoder.to_owned()]);
+    }
+    args.extend(["-f".to_owned(), "null".to_owned(), "-".to_owned()]);
+    args
+}
+
+/// Keeps the last FFmpeg error line for the admin UI without dumping the whole log.
+fn sanitize_probe_error(stderr: &str) -> String {
+    let line = stderr
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("FFmpeg 未给出错误信息");
+    let cleaned: String = line
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(240)
+        .collect();
+    cleaned.trim().to_owned()
+}
+
 fn ffmpeg_args_for_output_with_audio(
     input: &Path,
     tier: ServerTier,
@@ -2020,6 +2316,7 @@ fn ffmpeg_args_for_output_with_audio(
     if let Some(start_time) = start_time.as_ref() {
         args.extend(["-ss".to_owned(), start_time.clone()]);
     }
+    args.extend(hardware_input_options(encoding, tier));
     args.extend([
         "-i".to_owned(),
         input.to_string_lossy().into_owned(),
@@ -2052,9 +2349,23 @@ fn ffmpeg_args_for_output_with_audio(
             ]);
         }
         ServerTier::HardwareTranscode => {
+            let encoder = encoding.hardware_encoder.clone().unwrap_or_default();
+            args.extend(["-c:v".to_owned(), encoder.clone()]);
+            if matches!(encoder.as_str(), "h264_nvenc" | "h264_videotoolbox") {
+                // Normalise 10-bit sources so a hardware H.264 encoder never refuses the input.
+                args.extend(["-pix_fmt".to_owned(), "yuv420p".to_owned()]);
+            }
+            if encoder == "h264_nvenc" {
+                args.extend([
+                    "-preset".to_owned(),
+                    "p4".to_owned(),
+                    "-tune".to_owned(),
+                    "hq".to_owned(),
+                    "-rc".to_owned(),
+                    "vbr".to_owned(),
+                ]);
+            }
             args.extend([
-                "-c:v".to_owned(),
-                encoding.hardware_encoder.clone().unwrap_or_default(),
                 "-c:a".to_owned(),
                 "aac".to_owned(),
                 "-b:a".to_owned(),
@@ -2083,12 +2394,8 @@ fn ffmpeg_args_for_output_with_audio(
         tier,
         ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
     ) {
-        // Keep the aspect ratio and never upscale: `min(ih,H)` leaves smaller sources untouched.
-        if encoding.max_output_height > 0 {
-            args.extend([
-                "-vf".to_owned(),
-                format!("scale=-2:min(ih\\,{})", encoding.max_output_height),
-            ]);
+        if let Some(filter) = video_filter_chain(encoding, tier) {
+            args.extend(["-vf".to_owned(), filter]);
         }
         if let Some(video_bitrate) = encoding.effective_video_bitrate(video_bitrate) {
             args.extend(["-b:v".to_owned(), video_bitrate.to_string()]);
@@ -3592,6 +3899,7 @@ while :; do sleep 1; done
             max_output_height: 1_080,
             audio_bitrate: 256_000,
             max_video_bitrate: 4_000_000,
+            ..super::FfmpegEncodingOptions::default()
         };
         let args = super::ffmpeg_args_for_output_with_audio(
             Path::new("movie.mkv"),
@@ -3677,6 +3985,207 @@ while :; do sleep 1; done
             runtime.hardware_encoder,
             super::hardware_encoder_from_env(),
             "NONE in the stored policy must not invent a hardware encoder"
+        );
+    }
+
+    fn hardware_output<'a>(manifest: &'a Path) -> super::HlsOutput<'a> {
+        super::HlsOutput {
+            init_file_name: "init.mp4",
+            manifest,
+            segment_file_name: "session/segment_%06d.m4s".to_owned(),
+            segment_container: HlsSegmentContainer::FragmentedMp4,
+            preserve_input_timestamps: false,
+        }
+    }
+
+    fn hardware_args(encoding: &super::FfmpegEncodingOptions) -> Vec<String> {
+        super::ffmpeg_args_for_output_with_audio(
+            Path::new("movie.mkv"),
+            ServerTier::HardwareTranscode,
+            encoding,
+            None,
+            super::FfmpegTimelineOptions {
+                start_time_ticks: None,
+                audio_stream_index: None,
+            },
+            hardware_output(Path::new("session/index.m3u8")),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn vaapi_arguments_initialise_the_device_and_upload_frames() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_vaapi".to_owned()),
+            hardware_device: "/dev/dri/renderD129".to_owned(),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vaapi_device", "/dev/dri/renderD129"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vf", "format=nv12,hwupload"]),
+            "VAAPI encodes hardware surfaces only: {args:?}"
+        );
+        let device_position = args.iter().position(|arg| arg == "-vaapi_device").unwrap();
+        let input_position = args.iter().position(|arg| arg == "-i").unwrap();
+        assert!(device_position < input_position);
+    }
+
+    #[test]
+    fn qsv_arguments_initialise_a_named_device_and_upload_into_it() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_qsv".to_owned()),
+            hardware_device: "/dev/dri/renderD128".to_owned(),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-init_hw_device", "qsv=hw:/dev/dri/renderD128"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-filter_hw_device", "hw"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vf", "hwupload=extra_hw_frames=64,format=qsv"]),
+            "QSV encodes qsv surfaces only: {args:?}"
+        );
+    }
+
+    #[test]
+    fn nvenc_arguments_use_a_preset_and_normalise_pixel_format() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_nvenc".to_owned()),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(args.windows(2).any(|pair| pair == ["-preset", "p4"]));
+        assert!(args.windows(2).any(|pair| pair == ["-tune", "hq"]));
+        assert!(args.windows(2).any(|pair| pair == ["-rc", "vbr"]));
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+        assert!(!args.iter().any(|arg| arg == "-vaapi_device"));
+    }
+
+    #[test]
+    fn videotoolbox_arguments_normalise_pixel_format() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_videotoolbox".to_owned()),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+        assert!(!args.iter().any(|arg| arg == "-vf"));
+    }
+
+    #[test]
+    fn hardware_decode_adds_acceleration_before_the_input() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_nvenc".to_owned()),
+            hardware_decode: true,
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(args.windows(2).any(|pair| pair == ["-hwaccel", "cuda"]));
+        let hwaccel_position = args.iter().position(|arg| arg == "-hwaccel").unwrap();
+        let input_position = args.iter().position(|arg| arg == "-i").unwrap();
+        assert!(hwaccel_position < input_position);
+    }
+
+    #[test]
+    fn scale_combines_with_the_hardware_upload_filter() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_vaapi".to_owned()),
+            max_output_height: 1080,
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vf", "scale=-2:min(ih\\,1080),format=nv12,hwupload"]),
+            "{args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn probe_script(directory: &Path, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = directory.join(format!("probe-{exit_code}.sh"));
+        std::fs::write(&script, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardware_probe_gates_tier_three_availability() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            probe_script(temp_dir.path(), 0)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_videotoolbox".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(
+            !manager.hardware_transcode_available(),
+            "an unchecked encoder must not advertise tier 3"
+        );
+        let status = manager.probe_hardware_encoder().await;
+        assert!(status.available);
+        assert_eq!(status.encoder.as_deref(), Some("h264_videotoolbox"));
+        assert!(status.checked_at_ms > 0);
+        assert!(manager.hardware_transcode_available());
+
+        let failing = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config-failing"),
+            probe_script(temp_dir.path(), 1)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        failing.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_vaapi".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        let status = failing.probe_hardware_encoder().await;
+        assert!(!status.available);
+        assert!(status.error.is_some());
+        assert!(!failing.hardware_transcode_available());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changing_the_encoder_invalidates_the_previous_probe() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            probe_script(temp_dir.path(), 0)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_videotoolbox".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(manager.probe_hardware_encoder().await.available);
+        assert!(manager.hardware_transcode_available());
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_vaapi".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(
+            !manager.hardware_transcode_available(),
+            "a new encoder needs its own self-test"
         );
     }
 

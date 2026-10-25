@@ -13,6 +13,10 @@ pub(super) fn api_routes() -> Router<AppState> {
             get(admin_settings).patch(admin_update_settings),
         )
         .route(
+            "/api/v1/admin/settings/transcoding/probe",
+            post(admin_probe_transcoding),
+        )
+        .route(
             "/api/v1/admin/settings/mail",
             get(admin_get_mail_settings).put(admin_update_mail_settings),
         )
@@ -294,6 +298,29 @@ pub(crate) async fn admin_test_mail_connection(
     }
 }
 
+/// Re-runs the hardware encoder self-test on demand.
+pub(crate) async fn admin_probe_transcoding(
+    headers: HeaderMap,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let Some(service) = state.web_playback.as_ref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
+    let status = service.refresh_hardware_status().await;
+    Json(json!({
+        "transcodingStatus": {
+            "encoder": status.encoder,
+            "available": status.available,
+            "checkedAt": status.checked_at_ms,
+            "error": status.error,
+        }
+    }))
+    .into_response()
+}
+
 pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -311,11 +338,16 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Ok(settings) => settings,
         Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    Json(admin_settings_json(&settings)).into_response()
+    let status = state
+        .web_playback
+        .as_ref()
+        .map(|service| service.hardware_status());
+    Json(admin_settings_json(&settings, status.as_ref())).into_response()
 }
 
 pub(crate) fn admin_settings_json(
     settings: &crate::application::settings::AdminSettingsSnapshot,
+    hardware_status: Option<&crate::application::playback::hls::HardwareEncoderStatus>,
 ) -> Value {
     json!({
         "serverName": settings.server_name,
@@ -330,6 +362,12 @@ pub(crate) fn admin_settings_json(
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,
         "transcoding": settings.transcoding,
+        "transcodingStatus": hardware_status.map(|status| json!({
+            "encoder": status.encoder,
+            "available": status.available,
+            "checkedAt": status.checked_at_ms,
+            "error": status.error,
+        })),
         // Advertised so the admin UI never hard-codes a list the server would reject.
         "transcodingOptions": {
             "hardwareEncoders": crate::application::transcoding::HARDWARE_ENCODERS,
@@ -667,9 +705,14 @@ pub(crate) async fn admin_update_settings(
     if let Some(variants) = state.image_variants.as_ref() {
         variants.apply_settings(settings.media_strategy.images.variant_cache.clone());
     }
-    if let Some(web_playback) = state.web_playback.as_ref() {
-        web_playback.apply_transcoding_settings(&settings.transcoding);
-    }
+    let hardware_status = match state.web_playback.as_ref() {
+        Some(web_playback) => {
+            web_playback.apply_transcoding_settings(&settings.transcoding);
+            // Re-run the self-test so the response and the capability flags agree immediately.
+            Some(web_playback.refresh_hardware_status().await)
+        }
+        None => None,
+    };
     record_audit_event(
         &state,
         &headers,
@@ -679,5 +722,5 @@ pub(crate) async fn admin_update_settings(
         &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"userActivityRetentionDays":{},"loginBackgroundSource":"{}","transcodingEnabled":{},"transcodingPreset":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.user_activity_retention_days, settings.login_background_source, settings.transcoding.enabled, settings.transcoding.software_preset),
     )
     .await;
-    Json(admin_settings_json(&settings)).into_response()
+    Json(admin_settings_json(&settings, hardware_status.as_ref())).into_response()
 }

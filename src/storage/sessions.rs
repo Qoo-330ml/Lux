@@ -1128,6 +1128,36 @@ impl Database {
         })
     }
 
+    /// Records the tier actually running, after a hardware start fell back to software.
+    pub(crate) async fn update_web_playback_session_tier(
+        &self,
+        session_id: &str,
+        user_id: &str,
+        tier: i64,
+        plan: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        Ok(self
+            .query(
+                "UPDATE web_playback_sessions
+                 SET tier = ?, plan = ?, updated_at = ?
+                 WHERE id = ? AND user_id = ? AND state = 'ACTIVE'",
+            )
+            .bind(tier)
+            .bind(plan)
+            .bind(now)
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected()
+            == 1)
+    }
+
     pub(crate) async fn set_web_playback_transcoding_details(
         &self,
         session_id: &str,

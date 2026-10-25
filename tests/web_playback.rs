@@ -1834,3 +1834,184 @@ async fn web_playback_stats_report_the_plan_and_live_transcode_progress()
     server.abort();
     Ok(())
 }
+
+#[tokio::test]
+async fn broken_hardware_encoder_falls_back_to_software_transcoding()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config_dir = temp_dir.path().join("config");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: config_dir.clone(),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Fallback Movie 2026.mkv"), b"fallback-bytes").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE'")
+            .fetch_one(database.pool())
+            .await?;
+    let source_id: String = sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO server_settings (key, value)
+         VALUES ('transcoding', '{\"hardwareEncoder\":\"h264_videotoolbox\"}')
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    )
+    .execute(database.pool())
+    .await?;
+
+    // The self-test succeeds (probe args contain the lavfi source) but the real encode with the
+    // hardware encoder fails, which is exactly the "configured but unusable GPU" case.
+    let fake_ffmpeg = temp_dir.path().join("fake-ffmpeg");
+    let fake_ffmpeg_source = [
+        "#!/bin/sh",
+        "set -eu",
+        "is_probe=0",
+        "is_hardware=0",
+        "manifest=\"\"",
+        "segment=\"\"",
+        "init=\"init.mp4\"",
+        "for arg in \"$@\"; do",
+        "  [ \"$arg\" = \"testsrc=size=320x240:rate=30:duration=0.3\" ] && is_probe=1",
+        "  [ \"$arg\" = \"h264_videotoolbox\" ] && is_hardware=1",
+        "done",
+        "if [ \"$is_hardware\" = \"1\" ] && [ \"$is_probe\" = \"0\" ]; then exit 1; fi",
+        "while [ \"$#\" -gt 0 ]; do",
+        "  case \"$1\" in",
+        "    -hls_segment_filename) segment=\"$2\"; shift 2 ;;",
+        "    -hls_fmp4_init_filename) init=\"$2\"; shift 2 ;;",
+        "    *.m3u8) manifest=\"$1\"; shift ;;",
+        "    *) shift ;;",
+        "  esac",
+        "done",
+        "[ -n \"$manifest\" ] || exit 0",
+        "directory=$(dirname \"$manifest\")",
+        "mkdir -p \"$directory\"",
+        "printf '#EXTM3U\\n#EXT-X-MAP:URI=\"%s\"\\n#EXTINF:1,\\nsegment_000000.m4s\\n' \"$init\" > \"$manifest\"",
+        "printf init > \"$directory/$init\"",
+        "printf segment > \"$(printf '%s' \"$segment\" | sed 's/%06d/000000/')\"",
+        "printf 'frame=24\\nfps=24.00\\nspeed=1.00x\\nprogress=continue\\n'",
+        "sleep 2",
+    ]
+    .join("\n");
+    tokio::fs::write(&fake_ffmpeg, fake_ffmpeg_source).await?;
+    let mut permissions = tokio::fs::metadata(&fake_ffmpeg).await?.permissions();
+    permissions.set_mode(0o700);
+    tokio::fs::set_permissions(&fake_ffmpeg, permissions).await?;
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let state = AppState::ready(config, database.clone(), setup, auth, emby_auth)
+        .with_hls_executable(fake_ffmpeg);
+    let app = app_with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session_cookie = cookie_value(login.headers(), "lux_session").ok_or("missing session")?;
+    let csrf_cookie = cookie_value(login.headers(), "lux_csrf").ok_or("missing csrf")?;
+    let cookies = format!("lux_session={session_cookie}; lux_csrf={csrf_cookie}");
+
+    let probe = client
+        .post(format!(
+            "{base_url}/api/v1/admin/settings/transcoding/probe"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .send()
+        .await?;
+    assert_eq!(probe.status(), reqwest::StatusCode::OK);
+    let probe = probe.json::<Value>().await?;
+    assert_eq!(probe["transcodingStatus"]["available"], json!(true));
+    assert_eq!(
+        probe["transcodingStatus"]["encoder"],
+        json!("h264_videotoolbox")
+    );
+
+    let created = client
+        .post(format!("{base_url}/api/v1/playback/sessions"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .json(&json!({
+            "itemId": item_id,
+            "sourceId": source_id,
+            "capabilities": {
+                "directPlay": false,
+                "hls": true,
+                "videoCopyToFmp4": false,
+                "audioCopyToFmp4": false,
+                "softwareTranscode": true
+            }
+        }))
+        .send()
+        .await?;
+    assert_eq!(created.status(), reqwest::StatusCode::OK);
+    let created_body = created.json::<Value>().await?;
+    assert_eq!(created_body["plan"]["type"], json!("SERVER_HLS"));
+    assert_eq!(
+        created_body["plan"]["tier"],
+        json!(4),
+        "the failed hardware start must fall back to software: {created_body}"
+    );
+    assert_eq!(created_body["tier"], json!(4));
+    let session_id = created_body["sessionId"]
+        .as_str()
+        .ok_or("missing playback session id")?;
+    let manifest_url = created_body["plan"]["manifestUrl"]
+        .as_str()
+        .ok_or("missing manifest url")?;
+    let manifest = client
+        .get(format!("{base_url}{manifest_url}"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(manifest.status(), reqwest::StatusCode::OK);
+    let manifest_body = manifest.text().await?;
+    assert!(manifest_body.contains("#EXTINF"), "{manifest_body}");
+    let stored_tier: i64 =
+        sqlx::query_scalar("SELECT tier FROM web_playback_sessions WHERE id = ?")
+            .bind(session_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(stored_tier, 4, "the session row must record the real tier");
+
+    let stats = client
+        .get(format!(
+            "{base_url}/api/v1/playback/sessions/{session_id}/stats"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(stats.status(), reqwest::StatusCode::OK);
+    let stats = stats.json::<Value>().await?;
+    assert_eq!(stats["tier"], json!(4));
+
+    server.abort();
+    Ok(())
+}

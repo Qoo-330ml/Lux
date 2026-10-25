@@ -295,6 +295,16 @@ async fn transcoding_settings_are_admin_only_validated_and_persisted()
             .is_some_and(|presets| presets.iter().any(|preset| preset == "veryfast"))
     );
 
+    assert_eq!(initial["transcodingStatus"]["available"], json!(false));
+    assert_eq!(initial["transcodingStatus"]["encoder"], Value::Null);
+    let forbidden_probe = client
+        .post(format!("{endpoint}/transcoding/probe"))
+        .header(COOKIE, &viewer_cookies)
+        .header("X-CSRF-Token", &viewer_csrf)
+        .send()
+        .await?;
+    assert_eq!(forbidden_probe.status(), StatusCode::FORBIDDEN);
+
     let forbidden = client
         .patch(&endpoint)
         .header(COOKIE, &viewer_cookies)
@@ -350,6 +360,31 @@ async fn transcoding_settings_are_admin_only_validated_and_persisted()
     assert_eq!(saved["transcoding"]["softwarePreset"], json!("fast"));
     assert_eq!(saved["transcoding"]["maxOutputHeight"], json!(1080));
     assert_eq!(saved["transcoding"]["audioBitrateKbps"], json!(256));
+    assert_eq!(
+        saved["transcoding"]["hardwareDevice"],
+        json!("/dev/dri/renderD128")
+    );
+    assert_eq!(saved["transcoding"]["hardwareDecode"], json!(false));
+    // Saving re-runs the self-test: this test host has no usable VideoToolbox/libva encoder.
+    assert_eq!(
+        saved["transcodingStatus"]["encoder"],
+        json!("h264_videotoolbox")
+    );
+    assert_eq!(saved["transcodingStatus"]["available"], json!(false));
+
+    let admin_probe = client
+        .post(format!("{endpoint}/transcoding/probe"))
+        .header(COOKIE, &admin_cookies)
+        .header("X-CSRF-Token", &admin_csrf)
+        .send()
+        .await?;
+    assert_eq!(admin_probe.status(), StatusCode::OK);
+    let admin_probe = admin_probe.json::<Value>().await?;
+    assert_eq!(
+        admin_probe["transcodingStatus"]["encoder"],
+        json!("h264_videotoolbox")
+    );
+    assert_eq!(admin_probe["transcodingStatus"]["available"], json!(false));
 
     // The stored row survives a fresh read, so a restart keeps the policy.
     let reloaded = client
