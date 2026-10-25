@@ -327,21 +327,23 @@ impl Database {
         for chunk in candidates.chunks(WATCH_STATE_RESTORE_CHUNK) {
             let mut transaction = self.begin_metadata_write_transaction().await?;
             for candidate in chunk {
-                if candidate.state.is_empty() {
-                    continue;
-                }
-                let merged = self
-                    .merge_watch_state(
+                let merged = if candidate.state.is_empty() {
+                    false
+                } else {
+                    self.merge_watch_state(
                         &mut transaction,
                         &candidate.user_id,
                         &candidate.target_item_id,
                         candidate.state,
                     )
-                    .await?;
+                    .await?
+                };
                 if merged {
                     restored = restored.saturating_add(1);
                 }
                 if let Some(archive) = candidate.archive.as_ref() {
+                    // Consumed even when there was nothing to apply: an all-default row would
+                    // otherwise come back as a candidate on every pass and crowd out real work.
                     self.delete_archived_watch_state(&mut transaction, archive)
                         .await?;
                 }
