@@ -15,6 +15,23 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.6.20",
+    date: "2026-10-25",
+    sections: [
+      { kind: "added", items: [
+        "后台“服务端转码”页面展示硬件编码器自检状态和失败原因，并提供重新检测；可配置 VAAPI/QSV 设备路径与硬件解码开关，部署文档和 Compose 示例补充 Intel、AMD、NVIDIA 设备映射方式。",
+      ] },
+      { kind: "changed", items: [
+        "硬件编码器会在启动、保存设置和手动重测时自检；自检失败时自动使用软件转码。硬件档启动失败或无法取得并发许可时，同一会话也会降级到软件转码，避免直接返回 502。",
+        "补齐 VAAPI/QSV 设备初始化与 hwupload，完善 NVENC 参数设置，并统一 NVENC 与 VideoToolbox 输出为 yuv420p。",
+        "关闭服务端转码只影响实时播放 HLS；缩略图、截图、媒体信息探测和章节检测等后台 FFmpeg/FFprobe 任务仍可运行。",
+      ] },
+      { kind: "fixed", items: [
+        "修复播放请求各自克隆转码管理器导致并发槽位、运行时策略和硬件自检状态无法共享的问题，使并发上限与硬件档选择对所有请求一致生效。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.19",
     date: "2026-10-25",
     sections: [
