@@ -1038,6 +1038,122 @@ mod prune_sql {
          )";
 }
 
+/// Terminal account records (invitations, mail, merge history) are kept this long for audits.
+const ACCOUNT_RECORD_RETENTION_SECONDS: i64 = 90 * 24 * 60 * 60;
+/// Devices that have not been seen for this long are dropped so the list stays bounded.
+const USER_DEVICE_RETENTION_SECONDS: i64 = 180 * 24 * 60 * 60;
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct AccountRecordPurge {
+    pub user_invitations: u64,
+    pub mail_outbox: u64,
+    pub mail_challenges: u64,
+    pub user_devices: u64,
+    pub media_merge_records: u64,
+}
+
+impl Database {
+    /// Drops terminal invitation/mail/merge rows and stale devices in bounded batches.
+    #[allow(clippy::field_reassign_with_default)]
+    pub(crate) async fn purge_expired_account_records(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<AccountRecordPurge, StorageError> {
+        let cutoff = now.saturating_sub(ACCOUNT_RECORD_RETENTION_SECONDS);
+        let device_cutoff = now.saturating_sub(USER_DEVICE_RETENTION_SECONDS);
+        let batch = limit.clamp(1, 5_000);
+        let mut purge = AccountRecordPurge::default();
+        purge.user_invitations = self
+            .query(
+                "DELETE FROM user_invitations WHERE id IN (
+                     SELECT id FROM user_invitations
+                     WHERE status <> 'PENDING' AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.mail_outbox = self
+            .query(
+                "DELETE FROM mail_outbox WHERE id IN (
+                     SELECT id FROM mail_outbox
+                     WHERE status IN ('SENT', 'FAILED') AND updated_at < ?
+                     ORDER BY updated_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.mail_challenges = self
+            .query(
+                "DELETE FROM mail_challenges WHERE id IN (
+                     SELECT id FROM mail_challenges
+                     WHERE expires_at < ?
+                       AND (consumed_at IS NOT NULL OR revoked_at IS NOT NULL)
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.user_devices = self
+            .query(
+                "DELETE FROM user_devices WHERE (user_id, device_id) IN (
+                     SELECT user_id, device_id FROM user_devices
+                     WHERE last_seen_at < ?
+                     ORDER BY last_seen_at, user_id, device_id LIMIT ?
+                 )",
+            )
+            .bind(device_cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.media_merge_records = self
+            .query(
+                "DELETE FROM media_merge_records WHERE id IN (
+                     SELECT id FROM media_merge_records
+                     WHERE undone_at IS NOT NULL AND undone_at < ?
+                     ORDER BY undone_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        Ok(purge)
+    }
+}
+
 /// Session and playback rows older than this are not needed for any active client.
 const SESSION_HISTORY_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
 
@@ -1056,6 +1172,7 @@ impl Database {
     /// These tables are append-only today: nothing removed them, so a NAS that has been running
     /// for a year keeps every login and playback row. Only terminal rows older than the retention
     /// window are touched; active sessions and running playbacks are never deleted.
+    #[allow(clippy::field_reassign_with_default)]
     pub(crate) async fn purge_expired_session_history(
         &self,
         now: i64,

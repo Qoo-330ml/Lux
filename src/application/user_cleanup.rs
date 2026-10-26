@@ -72,6 +72,12 @@ pub(crate) fn spawn_user_cleanup_worker(database: Database, avatars: UserAvatarS
             {
                 tracing::warn!(%error, "failed to purge expired Emby direct-play tickets");
             }
+            if let Err(error) = database
+                .purge_expired_account_records(now, USER_CLEANUP_BATCH_SIZE)
+                .await
+            {
+                tracing::warn!(%error, "failed to purge expired account records");
+            }
         }
     });
 }

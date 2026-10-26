@@ -18177,8 +18177,12 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
   `session_history_purge_removes_only_terminal_old_rows`（每表旧行删除、新/活动行保留）。
 - 用户清理 worker 每分钟调用该函数，并接上已有的
   `delete_expired_emby_direct_playback_tickets`（此前无调用方）。
-剩余：`emby_migration_jobs`、`media_merge_records`、`user_invitations`、`mail_outbox/challenges`、
-`user_devices` 的期限清理；`metadata_reidentify_jobs`/`scan_jobs` 已在任务历史保留期覆盖；
+第二批：`purge_expired_account_records`（90 天保留期，设备 180 天）有界删除终态
+`user_invitations`、已发送/失败的 `mail_outbox`、已消费/撤销且过期的 `mail_challenges`、超过 180 天
+未见的 `user_devices`、已撤销超过 90 天的 `media_merge_records`；回归
+`account_record_purge_drops_only_terminal_rows_past_retention` 覆盖每表旧行删除与新行保留。worker
+每分钟调用。
+剩余：`emby_migration_jobs`、`user_registration_requests` 的期限清理；`metadata_reidentify_jobs`/`scan_jobs` 已在任务历史保留期覆盖；
 `playback_events` 原始行转 JSONL 归档未做。
 
 #### LUX-860：元数据批量写入

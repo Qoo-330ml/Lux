@@ -21548,9 +21548,7 @@ async fn session_history_purge_removes_only_terminal_old_rows()
         .await?;
     }
 
-    let purge = database
-        .purge_expired_session_history(now, 100)
-        .await?;
+    let purge = database.purge_expired_session_history(now, 100).await?;
     assert_eq!(purge.web_sessions, 2);
     assert_eq!(purge.access_tokens, 1);
     assert_eq!(purge.web_playback_sessions, 1);
@@ -21584,6 +21582,165 @@ async fn session_history_purge_removes_only_terminal_old_rows()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(remaining_admission, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_record_purge_drops_only_terminal_rows_past_retention()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::auth::users::UserStore;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Records", "Records", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    let library = LibraryService::new(database.clone())
+        .create_library("Records", LibraryKind::Movie, false)
+        .await?;
+    let mut movie_ids = Vec::new();
+    for suffix in ["a", "b"] {
+        let movie_id = format!("record-movie-{suffix}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&movie_id)
+        .bind(library.id.to_string())
+        .bind(&movie_id)
+        .bind(&movie_id)
+        .execute(database.pool())
+        .await?;
+        movie_ids.push(movie_id);
+    }
+
+    let now = 400 * 24 * 60 * 60;
+    let old = now - 91 * 24 * 60 * 60;
+    let device_old = now - 181 * 24 * 60 * 60;
+    let future = now + 24 * 60 * 60;
+    for (id, status, expires_at, created_at) in [
+        ("inv-old", "EXPIRED", old + 10, old),
+        ("inv-fresh", "EXPIRED", future, now),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_invitations (
+                 id, recipient_email, status, preset_id, preset_name, preset_version,
+                 permission_snapshot_json, expires_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'viewer', 'Viewer', 1, '{}', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("{id}@example.invalid"))
+        .bind(status)
+        .bind(expires_at)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, status, updated_at) in [("mail-old", "SENT", old), ("mail-fresh", "SENT", now)] {
+        sqlx::query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, sent_at, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'INVITATION', 'ref', ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(format!("{id}@example.invalid"))
+        .bind(status)
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, expires_at, consumed_at) in [
+        ("challenge-old", old + 10, Some(old + 5)),
+        ("challenge-fresh", future, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, consumed_at, created_at
+             ) VALUES (?, 'INVITATION', 'x@example.invalid', 'ref', randomblob(32), ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(expires_at)
+        .bind(consumed_at)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+    for (device_id, last_seen_at) in [("device-old", device_old), ("device-fresh", now)] {
+        sqlx::query(
+            "INSERT INTO user_devices (
+                 user_id, device_id, client_name, first_seen_at, last_seen_at
+             ) VALUES (?, ?, 'client', ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(device_id)
+        .bind(last_seen_at)
+        .bind(last_seen_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, undone_at) in [("merge-old", Some(old)), ("merge-live", None)] {
+        sqlx::query(
+            "INSERT INTO media_merge_records (
+                 id, library_id, item_type, primary_item_id, merged_item_id, source,
+                 merged_at, undone_at
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'scan', ?, ?)",
+        )
+        .bind(id)
+        .bind(library.id.to_string())
+        .bind(&movie_ids[0])
+        .bind(&movie_ids[1])
+        .bind(old)
+        .bind(undone_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let purge = database.purge_expired_account_records(now, 100).await?;
+    assert_eq!(purge.user_invitations, 1);
+    assert_eq!(purge.mail_outbox, 1);
+    assert_eq!(purge.mail_challenges, 1);
+    assert_eq!(purge.user_devices, 1);
+    assert_eq!(purge.media_merge_records, 1);
+
+    for (table, kept, gone) in [
+        ("user_invitations", "inv-fresh", "inv-old"),
+        ("mail_outbox", "mail-fresh", "mail-old"),
+        ("mail_challenges", "challenge-fresh", "challenge-old"),
+        ("media_merge_records", "merge-live", "merge-old"),
+    ] {
+        let kept_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(kept)
+        .fetch_one(database.pool())
+        .await?;
+        let gone_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(gone)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(kept_count, 1, "{table} must keep {kept}");
+        assert_eq!(gone_count, 0, "{table} must drop {gone}");
+    }
+    let device_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_devices WHERE device_id IN ('device-fresh', 'device-old')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(device_count, 1);
     Ok(())
 }
 
