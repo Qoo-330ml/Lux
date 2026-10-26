@@ -241,6 +241,13 @@ def main() -> int:
     parser.add_argument("--episodes-per-series", type=int, default=50)
     parser.add_argument("--seasons-per-series", type=int, default=5)
     parser.add_argument("--detail-items", type=int, default=2_000)
+    parser.add_argument(
+        "--nfo-items",
+        type=int,
+        default=0,
+        help="seed this many movies with inline NFO snapshots (for the LUX-857 A/B)",
+    )
+    parser.add_argument("--nfo-bytes", type=int, default=128 * 1024)
     parser.add_argument("--user-states", type=int, default=2_000)
     parser.add_argument("--posters", type=int, default=20)
     parser.add_argument("--json-out", type=pathlib.Path)
@@ -279,6 +286,8 @@ def main() -> int:
         episodes_per_series=args.episodes_per_series,
         seasons_per_series=args.seasons_per_series,
         detail_items=args.detail_items,
+        nfo_items=args.nfo_items,
+        nfo_bytes=args.nfo_bytes,
         user_states=args.user_states,
         poster_limit=args.posters,
         session_token=token,
