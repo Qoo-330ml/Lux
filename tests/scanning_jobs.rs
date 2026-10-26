@@ -2264,6 +2264,66 @@ async fn persisted_workflow_two_manifest_keeps_its_scan_semantics()
 }
 
 #[tokio::test]
+async fn full_scan_completion_refreshes_sqlite_query_statistics()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Stats.Refresh.Movie.2024.mkv"), b"fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    sqlx::query("UPDATE scan_manifests SET workflow_version = 2 WHERE job_id = ?")
+        .bind(&job.id)
+        .execute(database.pool())
+        .await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let status: String = sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(&job.id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(status, "COMPLETED");
+
+    // The refresh runs in a background task so it never delays the scan response.
+    let mut described = false;
+    for _ in 0..100 {
+        let tables: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        if tables == 1 {
+            described = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        described,
+        "a completed full scan must refresh optimizer statistics"
+    );
+    let described_catalog: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'media_items'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(described_catalog > 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn lite_scan_uses_the_manifest_root_snapshot() -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {

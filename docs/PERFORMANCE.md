@@ -27,8 +27,8 @@ python3 scripts/run-api-performance.py --binary target/release/luxd \
 | `GET /api/v1/items/{id}` | 1.6 | 2.0 | 2.0 | 2,034 |
 | `GET /api/v1/continue-watching?pageSize=24` | 11.9 | 12.1 | 12.1 | 40,324 |
 
-冷启动首个 `/api/v1/home`：200，186.2 ms，93,491 B。进程 CPU 增量 75.3 ms/请求（仍含后台 worker，
-只作量级参考）。
+冷启动首个 `/api/v1/home`（3 次独立进程重启）：181.3 / 140.5 / 147.3 ms，**p95 = 181.3 ms**，
+均 200、93,491 B。进程 CPU 增量 75.8 ms/请求（仍含后台 worker，只作量级参考）。
 
 ### 为什么先前的数字不可用
 
@@ -45,12 +45,14 @@ python3 scripts/run-api-performance.py --binary target/release/luxd \
 - 周期统计刷新的首次延迟从 120 s 降到 10 s；周期刷新与批量刷新共用 `sqlite_statistics` 写锁，
   扫描仍占用数据库时返回 `SkippedBusy`。
 - 写锁守卫现在会记录超过 1 s 的持有事件（`operation`、调用点、`held_ms`），不记录 SQL、路径或参数。
+  本轮 5 次启动的日志中超过 1 s 的持有事件为 0，维护任务未被阻塞。
+- 增量扫描只在新增条目 ≥500 时触发统计刷新，避免实时监听的小批量扫描反复全量 `ANALYZE`。
 
 ### 限制
 
 - 数字只代表本机 arm64 / 单进程 / 临时目录，不代表 NAS/x86_64 或真实弱网。
 - 未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池，媒体文件不存在。
-- 冷启动只测到单次 186 ms；`p95` 需要多次冷启动才能给出。
+- 冷启动 p95 来自同机连续 3 次进程重启；不含 OS 页缓存清空，也不代表断电恢复后的首次读取。
 - 搜索 67.7 ms、首页 117.6 ms 均低于规格 500 / 400 ms，但这是 66k 夹具，不是生产媒体库。
 
 ## LUX-829–839 总览（2026-10-21）

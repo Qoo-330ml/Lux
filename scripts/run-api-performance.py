@@ -114,6 +114,17 @@ def percentile(values: list[float], fraction: float) -> float:
     return ordered[rank - 1]
 
 
+def p95_of(runs: list[dict[str, object]]) -> float | None:
+    values = [
+        float(run["elapsedMs"])
+        for run in runs
+        if isinstance(run.get("elapsedMs"), (int, float))
+    ]
+    if not values:
+        return None
+    return round(percentile(values, 0.95), 1)
+
+
 def fetch(base_url: str, path: str, cookie: str, timeout: float) -> tuple[int, int, float]:
     request = urllib.request.Request(
         f"{base_url}{path}",
@@ -217,7 +228,13 @@ def main() -> int:
         "--cold-timeout",
         type=float,
         default=180.0,
-        help="timeout for the first home request after startup (cold cache); 0 skips it",
+        help="timeout for each first home request after a server restart; 0 skips cold runs",
+    )
+    parser.add_argument(
+        "--cold-runs",
+        type=int,
+        default=3,
+        help="number of server restarts used to measure cold home latency",
     )
     parser.add_argument("--movies", type=int, default=10_000)
     parser.add_argument("--series", dest="series_count", type=int, default=1_000)
@@ -293,23 +310,51 @@ def main() -> int:
     server, server_log = start_server(args.binary, config_dir, port, work_dir / "server.log")
     try:
         wait_ready(base_url, args.startup_timeout)
-        cold_home: dict[str, object] | None = None
-        if args.cold_timeout > 0:
-            started = time.perf_counter()
-            try:
-                status, size, _ = fetch(base_url, "/api/v1/home", token, args.cold_timeout)
-                cold_home = {
-                    "status": status,
-                    "bytes": size,
-                    "elapsedMs": round((time.perf_counter() - started) * 1000.0, 1),
-                }
-            except Exception as error:
-                cold_home = {
-                    "status": None,
-                    "timeout": True,
-                    "elapsedMs": round((time.perf_counter() - started) * 1000.0, 1),
-                    "error": repr(error),
-                }
+        cold_home_runs: list[dict[str, object]] = []
+        if args.cold_timeout > 0 and args.cold_runs > 0:
+            for _ in range(args.cold_runs):
+                # The final measurement server has not started yet, so reuse its port sequence by
+                # restarting on a fresh loopback port for each cold sample.
+                stop_server(server, server_log)
+                cold_port = free_port()
+                cold_base = f"http://127.0.0.1:{cold_port}"
+                server, server_log = start_server(
+                    args.binary, config_dir, cold_port, work_dir / "server.log"
+                )
+                wait_ready(cold_base, args.startup_timeout)
+                started = time.perf_counter()
+                try:
+                    status, size, _ = fetch(
+                        cold_base, "/api/v1/home", token, args.cold_timeout
+                    )
+                    cold_home_runs.append(
+                        {
+                            "status": status,
+                            "bytes": size,
+                            "elapsedMs": round(
+                                (time.perf_counter() - started) * 1000.0, 1
+                            ),
+                        }
+                    )
+                except Exception as error:
+                    cold_home_runs.append(
+                        {
+                            "status": None,
+                            "timeout": True,
+                            "elapsedMs": round(
+                                (time.perf_counter() - started) * 1000.0, 1
+                            ),
+                            "error": repr(error),
+                        }
+                    )
+            # The warm measurements below run on yet another clean process.
+            stop_server(server, server_log)
+            port = free_port()
+            base_url = f"http://127.0.0.1:{port}"
+            server, server_log = start_server(
+                args.binary, config_dir, port, work_dir / "server.log"
+            )
+            wait_ready(base_url, args.startup_timeout)
         movie_library = next(
             library["id"] for library in manifest["libraries"] if library["kind"] == "MOVIE"
         )
@@ -365,7 +410,8 @@ def main() -> int:
         "databaseBytes": database_bytes,
         "walBytes": wal_bytes,
         "cpuMsPerRequest": cpu_ms,
-        "coldHome": cold_home,
+        "coldHomeRuns": cold_home_runs,
+        "coldHomeP95Ms": p95_of(cold_home_runs),
         "endpoints": results,
     }
 
@@ -380,8 +426,15 @@ def main() -> int:
         f"Database {database_bytes} B, WAL {wal_bytes} B, seed {seed_seconds:.2f}s, "
         f"CPU {cpu_ms} ms/request, arch {summary['architecture']}"
     )
-    if cold_home is not None:
-        print(f"Cold home: {cold_home}")
+    if cold_home_runs:
+        print(
+            "Cold home runs: "
+            + ", ".join(
+                f"{run.get('elapsedMs')} ms (status={run.get('status')})"
+                for run in cold_home_runs
+            )
+        )
+        print(f"Cold home p95: {summary['coldHomeP95Ms']} ms")
     print()
     print("| endpoint | p50 ms | p95 ms | p99 ms | mean bytes | requests | status |")
     print("|---|---:|---:|---:|---:|---:|---|")

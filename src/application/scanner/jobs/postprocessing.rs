@@ -12,6 +12,9 @@ struct ScanPostprocessingOptions {
 
 const SCAN_IDLE_BATCH_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Incremental scans run on watcher events, so only a large batch is worth a full statistics pass.
+const INCREMENTAL_STATISTICS_REFRESH_MIN_CREATED_ITEMS: usize = 500;
+
 const MAX_CHANGED_LOCAL_IMAGE_BYTES: u64 = 128 * 1024 * 1024;
 
 fn media_info_sidecar_source_stem(path: &Path) -> Option<&str> {
@@ -472,6 +475,9 @@ impl ScanJobService {
             .await;
         if !strm_probe_scheduled {
             self.database.clear_scan_job_paths(job_id).await?;
+        }
+        if created_items >= INCREMENTAL_STATISTICS_REFRESH_MIN_CREATED_ITEMS {
+            self.database.spawn_bulk_change_statistics_refresh();
         }
         Ok(())
     }
