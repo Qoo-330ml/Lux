@@ -82,6 +82,8 @@ pub(crate) use media_merge_records::{
 #[path = "scan_fingerprint_migration.rs"]
 mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;
+#[path = "catalog_read_model.rs"]
+mod catalog_read_model;
 #[path = "metadata.rs"]
 mod metadata;
 #[path = "migration.rs"]

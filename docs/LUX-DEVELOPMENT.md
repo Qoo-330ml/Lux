@@ -18304,6 +18304,12 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 验收：空库迁移成功；入队/读取顺序与分页正确；重复推进幂等；`applied_seq + 1 < 最小 outbox id`
 可检测为缺口；两后端迁移与单测通过。
 
+进度（2026-10-27）：迁移 `0229_catalog_outbox.sql` / PostgreSQL `0231_catalog_outbox.sql` 建
+`catalog_outbox`（追加型）与 `catalog_consumers`；存储层新增入队、按 seq 读取、单调推进水位、
+记录错误、缺口检测（`src/storage/catalog_read_model.rs`）。尚未接入任何触发器或请求路径。
+验证：`catalog_outbox_appends_reads_and_advances_idempotently`（顺序/分页/水位不回退/错误清除/缺口）、
+PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。
+
 #### LUX-864：catalog_items 读模型与重建
 
 范围：`catalog_items`、`catalog_item_stats` 表与索引；从权威表全量重建（分批、可取消、可恢复）、

@@ -21903,6 +21903,106 @@ async fn account_record_purge_surfaces_a_failure_and_keeps_the_affected_rows()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_outbox_appends_reads_and_advances_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    assert_eq!(database.catalog_outbox_gap("catalog_items").await?, None);
+
+    let first = database
+        .append_catalog_outbox("item_upsert", "item-a", Some("lib"))
+        .await?;
+    let second = database
+        .append_catalog_outbox("item_upsert", "item-b", Some("lib"))
+        .await?;
+    let third = database
+        .append_catalog_outbox("item_delete", "item-c", None)
+        .await?;
+    assert_eq!((first, second, third), (1, 2, 3));
+
+    let page = database.read_catalog_outbox_after(0, 2).await?;
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].id, 1);
+    assert_eq!(page[0].kind, "item_upsert");
+    assert_eq!(page[0].item_id, "item-a");
+    assert_eq!(page[0].library_id.as_deref(), Some("lib"));
+    assert_eq!(page[1].id, 2);
+    assert_eq!(page[1].item_id, "item-b");
+    let rest = database.read_catalog_outbox_after(2, 10).await?;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].id, 3);
+    assert_eq!(rest[0].library_id, None);
+
+    database
+        .advance_catalog_consumer("catalog_items", 2)
+        .await?;
+    assert_eq!(
+        database
+            .catalog_consumer("catalog_items")
+            .await?
+            .map(|state| state.applied_seq),
+        Some(2)
+    );
+    // Watermarks never move backwards.
+    database
+        .advance_catalog_consumer("catalog_items", 1)
+        .await?;
+    assert_eq!(
+        database
+            .catalog_consumer("catalog_items")
+            .await?
+            .map(|state| state.applied_seq),
+        Some(2)
+    );
+    database
+        .record_catalog_consumer_error("catalog_items", "boom")
+        .await?;
+    assert_eq!(
+        database
+            .catalog_consumer("catalog_items")
+            .await?
+            .and_then(|state| state.last_error),
+        Some("boom".to_owned())
+    );
+    database
+        .advance_catalog_consumer("catalog_items", 3)
+        .await?;
+    let advanced = database
+        .catalog_consumer("catalog_items")
+        .await?
+        .ok_or("consumer")?;
+    assert_eq!(advanced.applied_seq, 3);
+    assert_eq!(advanced.last_error, None);
+
+    // A trimmed queue must surface as a gap instead of silently skipping derived rows.
+    database
+        .query("DELETE FROM catalog_outbox WHERE id IN (2, 3)")
+        .execute(database.pool())
+        .await?;
+    database
+        .advance_catalog_consumer("stale_consumer", 1)
+        .await?;
+    assert_eq!(
+        database.catalog_outbox_gap("stale_consumer").await?,
+        None,
+        "the remaining sequence follows the watermark"
+    );
+    database
+        .query("DELETE FROM catalog_outbox WHERE id = 1")
+        .execute(database.pool())
+        .await?;
+    database
+        .append_catalog_outbox("item_upsert", "item-d", None)
+        .await?;
+    assert_eq!(
+        database.catalog_outbox_gap("stale_consumer").await?,
+        Some((1, 4))
+    );
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
