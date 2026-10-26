@@ -137,6 +137,22 @@ def fetch(base_url: str, path: str, cookie: str, timeout: float) -> tuple[int, i
         return response.status, len(body) if body else 0, elapsed * 1000.0
 
 
+def process_rss_kb(pid: int) -> int | None:
+    try:
+        output = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "rss="],
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    try:
+        return int(output)
+    except ValueError:
+        return None
+
+
 def process_cpu_seconds(pid: int) -> float | None:
     try:
         output = subprocess.run(
@@ -400,6 +416,7 @@ def main() -> int:
                 raise SystemExit(f"{label} ({path}) failed: {error!r}") from error
             results.append({"label": label} | result)
         cpu_after = process_cpu_seconds(server.pid)
+        rss_kb = process_rss_kb(server.pid)
     finally:
         stop_server(server, server_log)
         if not args.keep_work_dir and args.work_dir is None:
@@ -418,6 +435,7 @@ def main() -> int:
         "seedSeconds": round(seed_seconds, 2),
         "databaseBytes": database_bytes,
         "walBytes": wal_bytes,
+        "rssKb": rss_kb,
         "cpuMsPerRequest": cpu_ms,
         "coldHomeRuns": cold_home_runs,
         "coldHomeP95Ms": p95_of(cold_home_runs),
@@ -432,8 +450,8 @@ def main() -> int:
         + ", ".join(f"{key}={value}" for key, value in summary["fixture"].items())
     )
     print(
-        f"Database {database_bytes} B, WAL {wal_bytes} B, seed {seed_seconds:.2f}s, "
-        f"CPU {cpu_ms} ms/request, arch {summary['architecture']}"
+        f"Database {database_bytes} B, WAL {wal_bytes} B, RSS {rss_kb} KiB, "
+        f"seed {seed_seconds:.2f}s, CPU {cpu_ms} ms/request, arch {summary['architecture']}"
     )
     if cold_home_runs:
         print(
