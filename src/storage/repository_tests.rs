@@ -22003,6 +22003,125 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_read_model_rebuild_copies_authoritative_fields_and_validates()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Read Model", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at
+         ) VALUES ('rm-movie', ?, 'MOVIE', 'Read Model Movie', 'read model movie',
+                   'LOCAL_CONFIRMED', 1, 100),
+                  ('rm-series', ?, 'SERIES', 'Read Model Series', 'read model series',
+                   'LOCAL_CONFIRMED', 1, 90),
+                  ('rm-season', ?, 'SEASON', 'Read Model Season', 'read model season',
+                   'LOCAL_CONFIRMED', 0, 95),
+                  ('rm-episode', ?, 'EPISODE', 'Read Model Episode', 'read model episode',
+                   'LOCAL_CONFIRMED', 1, 110)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET series_id = 'rm-series', parent_id = 'rm-season',
+                season_number = 1, episode_number = 1 WHERE id = 'rm-episode'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET series_id = 'rm-series' WHERE id = 'rm-season'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, is_default)
+         VALUES ('rm-source', 'rm-movie', 'LOCAL_FILE', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path, content_tag)
+         VALUES ('rm-poster', 'rm-movie', 'POSTER', 0, '/tmp/poster.png', 'poster-tag')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('rm-movie', 'PG-13')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    // Resume through one-row batches to exercise the keyset loop.
+    let mut after: Option<String> = None;
+    let mut processed = 0_u64;
+    loop {
+        let (rows, last) = database
+            .rebuild_catalog_items_batch(after.as_deref(), 1)
+            .await?;
+        if rows == 0 {
+            break;
+        }
+        processed += rows;
+        after = last;
+    }
+    assert_eq!(processed, 4);
+    assert_eq!(database.catalog_items_count().await?, 4);
+
+    let movie: (Option<String>, Option<String>, Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT poster_tag, default_source_id, restriction_code, season_count, episode_count
+         FROM catalog_items WHERE item_id = 'rm-movie'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(movie.0.as_deref(), Some("poster-tag"));
+    assert_eq!(movie.1.as_deref(), Some("rm-source"));
+    assert_eq!(movie.2.as_deref(), Some("PG-13"));
+
+    let series: (i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT season_count, episode_count, latest_child_added_at
+         FROM catalog_items WHERE item_id = 'rm-series'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(series, (1, 1, Some(110)));
+
+    database.rebuild_catalog_item_stats().await?;
+    let totals: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT scope, scope_id, item_type, total FROM catalog_item_stats
+         WHERE scope = 'library' ORDER BY item_type",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(totals.len(), 4);
+    assert!(
+        totals
+            .iter()
+            .all(|(_, scope_id, _, total)| scope_id == &library_id && *total == 1)
+    );
+
+    let first = database.catalog_items_checksum().await?;
+    assert_eq!(first.item_count, 4);
+    let (_, last) = database.rebuild_catalog_items_batch(None, 100).await?;
+    assert_eq!(last.as_deref(), Some("rm-series"));
+    let second = database.catalog_items_checksum().await?;
+    assert_eq!(second, first, "a repeated rebuild must be idempotent");
+
+    database.truncate_catalog_read_model().await?;
+    assert_eq!(database.catalog_items_count().await?, 0);
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,

@@ -18317,6 +18317,14 @@ PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。
 
 验收：66k 夹具重建行数与权威一致；校验哈希稳定；中断后从游标恢复；重建不持写锁长时间。
 
+进度（2026-10-27）：迁移 `0230_catalog_items.sql` / PostgreSQL `0232_catalog_items.sql` 建
+`catalog_items` 与 `catalog_item_stats`（未切换任何请求路径）。存储层新增 keyset 重建批次
+（含海报/背景/缩略图/logo 标签、默认源、分级码、季/集计数与最近子项时间）、统计重建、截断与
+`contentSha256` 校验；应用层 `rebuild_catalog_read_model` 循环重建并在启动时为空则后台补建。
+验证：`catalog_read_model_rebuild_copies_authoritative_fields_and_validates`（4 行、图片/源/分级
+字段、季集计数、统计 4 行、重复重建校验和一致、截断）、`rebuild_reports_row_count_and_stable_checksum`、
+PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。尚未在 66k 夹具上跑全量重建与中断恢复计时。
+
 #### LUX-865：库列表读模型切换（off/shadow/on）
 
 范围：`readModel.mode` 开关；列表分页查询切到 `catalog_items`（含 keyset/既有排序语义）；shadow 模式

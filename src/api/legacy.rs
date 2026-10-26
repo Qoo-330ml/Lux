@@ -707,6 +707,9 @@ impl AppState {
 
     pub async fn start_scheduled_tasks(&self) {
         if let (Some(database), Some(avatars)) = (&self.database, &self.user_avatars) {
+            crate::application::catalog_read_model::spawn_startup_catalog_read_model(
+                database.clone(),
+            );
             crate::application::user_cleanup::spawn_user_cleanup_worker(
                 database.clone(),
                 avatars.clone(),

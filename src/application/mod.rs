@@ -18,6 +18,7 @@ pub(crate) mod background_loop;
 pub(crate) mod background_work;
 pub mod candidates;
 pub mod catalog;
+pub(crate) mod catalog_read_model;
 pub mod chapter_detector;
 pub mod collections;
 pub(crate) mod content_restriction_index;
