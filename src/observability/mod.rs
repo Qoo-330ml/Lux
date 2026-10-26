@@ -1,4 +1,5 @@
 pub mod logs;
+pub mod request_metrics;
 pub mod resources;
 
 use std::{

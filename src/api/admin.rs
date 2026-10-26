@@ -51,6 +51,8 @@ mod admin_dashboard;
 mod admin_emby_migration;
 #[path = "admin/admin_health.rs"]
 mod admin_health;
+#[path = "admin/admin_performance.rs"]
+mod admin_performance;
 pub(super) use crate::application::admin_dashboard::DEFAULT_SERVER_NAME;
 #[path = "admin/admin_database_diagnostics.rs"]
 mod admin_database_diagnostics;
@@ -90,6 +92,7 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(logs_events_routes())
         .merge(health_routes())
         .merge(database_diagnostics_routes())
+        .merge(performance_metrics_routes())
         .merge(dashboard_routes())
 }
 
@@ -155,4 +158,8 @@ pub(super) fn database_diagnostics_routes() -> Router<AppState> {
 
 pub(super) fn dashboard_routes() -> Router<AppState> {
     admin_dashboard::api_routes()
+}
+
+pub(super) fn performance_metrics_routes() -> Router<AppState> {
+    admin_performance::api_routes()
 }

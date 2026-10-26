@@ -17924,7 +17924,142 @@ outcome（COMPLETED/FAILED/EXPIRED）、起止时间、墙钟时长、编码时�
 输出字节>0/`lastFps=24`。Web `admin-transcoding-page` 4/4（停止确认与取消、历史 outcome/失败原因/平均速度），
 `vitest` 892/892、`tsc --noEmit` 与构建通过。迁移在空库测试中自动执行。
 
-## 29. 参考资料
+## 29. 数据路径与性能重构阶段
+
+依据：`docs/LUX-DATA-PATH-PLAN.md`（本地设计稿，不入库）。本阶段按“先测量、再改读路径、再改写路径”的顺序执行；一次只做一个任务。
+
+### 阶段门
+
+- 每个任务开始前记录同一夹具的基线；完成后记录同一夹具的结果，不得用不同数据集比较。
+- 数据库关系变更（新表、列、索引、触发器）必须先在本规格登记，并按任务给出回滚方法。
+- 未达到任务验收前不进入下一个任务；不得顺手实现后续任务。
+- 性能数字必须注明硬件（`uname -m`）、夹具、命令与限制；本机 ARM 结果不得外推 NAS/x86_64。
+
+#### LUX-854：请求级性能指标采集与管理员查询端点
+
+范围：在现有请求中间件旁增加按路由模板聚合的请求指标（请求数、5xx 数、p50/p90/p95/p99、最大/平均耗时、最后出现时间），上限 256 条路由，超出归入 `other`；新增管理员只读端点 `GET /api/v1/admin/performance-metrics`，返回 `Cache-Control: no-store`，不含路径参数、查询串、用户或媒体信息。只在进程内保存最近 512 个样本/路由，不上报、不落库。
+
+预计修改文件（8 个）：`src/observability/request_metrics.rs`（新增）、`src/observability/mod.rs`、`src/api/legacy.rs`、`src/api/routes.rs`、`src/api/admin/admin_performance.rs`（新增）、`src/api/admin.rs`、`tests/admin_performance_metrics.rs`（新增）、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [x] 路由模板聚合，动态段归一；未匹配路由归入 `unmatched`。
+- [x] 非管理员 401；管理员 200 且 `Cache-Control: no-store`；响应不含 API key、请求 ID、完整路径或查询串。
+- [x] 指标覆盖 home/列表/搜索等已注册路由；样本上限与路由上限有单元测试。
+- [x] 定向测试、`cargo build --locked`、fmt 通过；clippy 无新增诊断（既有 19 项待 LUX-856）。
+
+依赖：无。
+
+结果（2026-10-26）：新增 `src/observability/request_metrics.rs`：每路由模板保留最近 512 个耗时样本，
+最多 256 条路由，超出与超长模板归入 `OTHER/other`；记录请求数、5xx 数、p50/p90/p95/p99、平均/最大耗时与
+最后出现时间。`AppState` 新增 `request_metrics`，`app_with_state` 最外层中间件用 `MatchedPath` 取模板并写入；
+未匹配路由记为 `unmatched`，动态段不写入指标。新增管理员只读 `GET /api/v1/admin/performance-metrics`，
+返回 `Cache-Control: no-store, max-age=0`，不包含凭据、请求 ID、实际路径或查询串。
+
+验证：`cargo test --locked --lib observability::request_metrics` 6/6（最近秩分位、512 样本窗口、256 路由上限、
+仅 5xx 计错、超长模板折叠、camelCase 序列化）；`cargo test --locked --test admin_performance_metrics` 1/1
+（未认证 401、管理员 200 + no-store、`/api/v1/home` 按模板出现且 4xx 不记为 error、响应不回显 API key 与 `?`）；
+`cargo build --locked`、`cargo fmt --all -- --check` 通过；全目标 clippy 仍因既有 19 项诊断失败，逐项过滤后无 `request_metrics`/`admin_performance` 命中，新增诊断 0。
+
+限制：p95/p99 是进程内最近 512 个样本的近似值，重启清零，不跨实例聚合；计时覆盖到响应头返回，不含响应体传输；
+SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点基线与后续中间件扩展）。
+
+#### LUX-855：固定性能夹具与端点基线
+
+范围：在 `tools/` 增加数据库行级夹具（10,000 电影 / 1,000 剧集 / 50,000 集，含 overview、图片标签、演员、用户状态），可直接写入已迁移 SQLite；PostgreSQL 用同一脚本导入。统一记录 home、库列表、搜索、详情、继续观看的 p95、SQL 数、响应字节、CPU/请求、RSS、DB/WAL 体积，以及扫描并发场景；结果写入 `docs/PERFORMANCE.md`。不修改产品行为。
+
+预计修改文件（5 个）：`tools/catalog-fixture/generate.py`、`tools/catalog-fixture/test_generator.py`、`scripts/run-performance.sh`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [ ] 固定种子、可重复生成，记录 checksum 与生成耗时。
+- [ ] 基线表覆盖五个端点与扫描并发，注明硬件/夹具/命令。
+- [ ] 至少一次完整 PostgreSQL 基线；SQLite 与 PostgreSQL 分列。
+- [ ] `python3 -m unittest tools/catalog-fixture/test_generator.py` 通过。
+
+依赖：无。
+
+#### LUX-856：门禁基线处置
+
+范围：处置当前 4 个既有失败用例与既有 Clippy 诊断：逐项确认根因，能修则修；不能修的登记豁免（负责人、原因、到期条件），并把“新增失败为 0”写入阶段完成标准。不得借机重构无关模块。
+
+预计修改文件（2–4 个）：`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`，以及实际修复涉及的源文件/测试。
+
+验收：
+
+- [ ] 每项列出处置结论与证据（提交、命令、输出）。
+- [ ] `cargo test --locked --all-targets` 与 clippy 结果记录在案；豁免项经项目所有者确认。
+- [ ] 修复项有对应回归断言，未放宽既有断言。
+
+依赖：无。
+
+#### LUX-857：NFO 快照外置与条件写
+
+范围：新增 `media_item_nfo_cache(item_id PK, fingerprint, json, bytes, updated_at)`（SQLite/PostgreSQL 同语义迁移），把 `media_items.nfo_metadata_json` 按批迁入；`media_items` 保留 `nfo_metadata_fingerprint` 供条件写。详情读取改为批量接口；`update_media_item_nfo_metadata` 在指纹未变时不写大字段，也不触发内容限制失效。提供回填游标、重试与回滚说明。
+
+预计修改文件（8–12 个）：`migrations/02xx_media_item_nfo_cache.sql`、`migrations-postgres/02xx_media_item_nfo_cache.sql`、`src/storage/metadata.rs`、`src/storage/catalog.rs`、`src/application/nfo.rs`、`src/storage/repository_tests.rs`、`tests/*`、`docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [ ] 空库迁移与既有库升级均通过；回填可中断续跑；失败不丢 NFO。
+- [ ] 详情响应与 NFO 字段行为不变；未变化指纹不写大字段。
+- [ ] 记录 DB 体积、WAL、详情 p95 的前后对比。
+- [ ] 双后端定向测试、断电/写故障脚本通过。
+
+依赖：LUX-855、LUX-856。
+
+#### LUX-858：元数据候选减重
+
+范围：`metadata_candidates` 每个 item 只保留最新候选与选中项，拒绝/过期短窗口；`candidate_json` 只存应用所需字段，完整 TMDb 载荷不落库；清理按 `expires_at`，批次语句必须能走索引范围（参考 `database_cleanup.rs:932-938` 的既有结论）。
+
+预计修改文件（6 个）：`src/application/candidates.rs`、`src/storage/database_cleanup.rs`、`src/storage/metadata.rs`、`migrations/02xx_metadata_candidate_slimming.sql`（如需要）、`src/storage/repository_tests.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [ ] 候选表行数 ≤100,000（目标数据集），清理批次无全表排序。
+- [ ] 选择/拒绝/过期行为不变；失败可重试且不重复应用。
+- [ ] 记录清理耗时与表体积变化。
+
+依赖：LUX-855。
+
+#### LUX-859：历史与会话保留期补齐
+
+范围：接线 `emby_direct_playback_tickets` 清理；为 `web_sessions`、`access_tokens`、`playback_sessions`、`web_playback_sessions`、`playback_admissions`、`emby_migration_*`、`media_merge_records`、`merge_suppressions`、`user_invitations`、`user_registration_requests`、`mail_outbox`、`mail_challenges`、`user_devices` 增加有界时间清理；`scan_manifest_*`、`scan_job_paths`、`reconciliation_scan_entries` 从启动时一次性改为任务完成后周期清理；播放原始事件明细复用 `observability/logs` 的分段 JSONL，数据库保留聚合与短窗口。
+
+预计修改文件（10–14 个）：`src/storage/database_cleanup.rs`、`src/storage/sessions.rs`、`src/storage/users.rs`、`src/storage/notifications.rs`、`src/application/user_cleanup.rs`、`src/observability/logs.rs`、迁移文件（如需索引）、`tests/*`、`docs/DEPLOYMENT.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [ ] 每张表有保留期设置、默认值与有界批次；`0` 表示关闭并记录。
+- [ ] 删除不影响 Emby 导入历史、继续观看、推荐与播放进度。
+- [ ] 维护轮 p95 在既有预算内；清理语句有 EXPLAIN 证据。
+- [ ] 归档文件上限明确（现有 `MAX_LOG_ARCHIVES=20` × 50 MiB）。
+
+依赖：LUX-855。
+
+#### LUX-860：元数据批量写入
+
+范围：`select_metadata_candidate*` 增加批量入口（100 条/事务，逐条 fingerprint CAS，冲突项回退单条），同一事务内完成 NFO 缓存与 collection 引用；保持现有写锁与 SQLite `BEGIN IMMEDIATE` 语义；记录事务数、输入项数、失败回退数。
+
+预计修改文件（6 个）：`src/storage/metadata.rs`、`src/application/candidates.rs`、`src/application/metadata.rs`、`src/storage/repository_tests.rs`、`tests/metadata_api.rs`、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [ ] 50,000 条补全的事务数 ≤1,000（目标数据集）。
+- [ ] 失败/取消/并发修改时逐条回退，最终状态与原逐条路径一致。
+- [ ] 补全吞吐不低于基线；记录 WAL 与锁等待。
+
+依赖：LUX-857、LUX-858。
+
+### 阶段 29 门（P0/P1）
+
+- [ ] LUX-854–856 完成：端点 p95/SQL 数/字节/CPU 基线可查询，夹具可重复，门禁状态明确。
+- [ ] LUX-857–860 完成：NFO 外置、候选减重、保留期补齐、元数据批写均有前后数据。
+- [ ] 相对基线：DB 体积净下降或持平，扫描墙钟 +≤5%，WAL +≤10%，补全吞吐 −≤5%。
+- [ ] 回滚演练：NFO 缓存回填中断、候选清理失败、批写部分失败均可恢复。
+- [ ] 经项目所有者确认后，才登记并进入 P2（读模型）任务。
+
+## 30. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
 

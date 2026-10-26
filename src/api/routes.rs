@@ -1,4 +1,5 @@
 use super::*;
+use axum::extract::MatchedPath;
 use tower::{ServiceExt, service_fn};
 
 const CATALOG_WORKER_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
@@ -11,6 +12,7 @@ const MAX_CONCURRENT_HOME_REQUESTS: usize = MAX_CONCURRENT_CATALOG_REQUESTS;
 pub(super) fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
     let resources = state.resources.clone();
+    let request_metrics = state.request_metrics.clone();
     let (emby_routes, emby_path_templates) = emby::api_routes();
     let request_rate_limiter = state.request_rate_limiter.clone();
     let catalog_request_slots =
@@ -164,7 +166,28 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 .propagate_x_request_id(),
         )
         .layer(middleware::from_fn(security_response_headers))
-        .layer(middleware::from_fn(web_asset_cache_policy));
+        .layer(middleware::from_fn(web_asset_cache_policy))
+        .layer(middleware::from_fn(
+            move |request: Request<Body>, next: Next| {
+                let request_metrics = request_metrics.clone();
+                async move {
+                    let method = request.method().as_str().to_owned();
+                    let route = request.extensions().get::<MatchedPath>().map_or_else(
+                        || "unmatched".to_owned(),
+                        |matched| matched.as_str().to_owned(),
+                    );
+                    let started = Instant::now();
+                    let response = next.run(request).await;
+                    request_metrics.record(
+                        &method,
+                        &route,
+                        response.status().as_u16(),
+                        started.elapsed(),
+                    );
+                    response
+                }
+            },
+        ));
     case_insensitive_emby_router(app, emby_path_templates)
 }
 

@@ -112,6 +112,7 @@ use crate::{
     network::RemoteAccessPolicy,
     observability::{
         logs::{LogDateRange, LogExport, LogExportError, LogStore, export_logs},
+        request_metrics::RequestMetrics,
         resources::ResourceMetrics,
     },
     security::{DevicePairingRateLimiter, LoginRateLimiter},
@@ -222,6 +223,7 @@ pub struct AppState {
     user_events: UserEventHub,
     web_playback: Option<WebPlaybackSessionService>,
     resources: ResourceMetrics,
+    request_metrics: RequestMetrics,
     remote_access: RemoteAccessPolicy,
     login_rate_limiter: LoginRateLimiter,
     device_pairing_rate_limiter: DevicePairingRateLimiter,
@@ -588,6 +590,7 @@ impl AppState {
             user_events,
             web_playback,
             resources,
+            request_metrics: RequestMetrics::new(),
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
