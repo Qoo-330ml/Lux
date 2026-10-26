@@ -798,6 +798,7 @@ impl WebPlaybackSessionService {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_emby_direct_stream(
         &self,
         user_id: &str,
@@ -845,6 +846,7 @@ impl WebPlaybackSessionService {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn verify_emby_direct_stream_v2(
         &self,
         user_id: &str,

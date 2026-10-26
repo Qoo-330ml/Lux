@@ -4666,6 +4666,7 @@ pub(super) fn emby_media_source_stream_url_parts(
     format!("/Videos/{item_id}/stream{stream_suffix}?MediaSourceId={source_id}")
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn emby_signed_direct_stream_url(
     service: &WebPlaybackSessionService,
     item_id: &str,

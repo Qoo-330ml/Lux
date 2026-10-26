@@ -1815,6 +1815,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+#[allow(clippy::type_complexity)]
 async fn postgres_legacy_user_and_library_access_upgrade_from_v183_to_current_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

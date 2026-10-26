@@ -166,7 +166,7 @@ async fn run_webhook_delivery_worker(
             last_retention_sweep = Some(Instant::now());
         }
         match service.process_ready_deliveries().await {
-            Ok(count) if count == 0 => {
+            Ok(0) => {
                 if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
                     .await
                 {

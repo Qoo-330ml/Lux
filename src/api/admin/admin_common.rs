@@ -187,9 +187,16 @@ fn query_api_key_is_allowed(method: &Method, path: &str) -> bool {
     if !matches!(*method, Method::GET | Method::HEAD) {
         return false;
     }
-    if !path.starts_with("/api/v1") || path.starts_with("/api/v1/admin") {
+    if path.starts_with("/api/v1/admin") {
         return false;
     }
+    // The Lux API and the Emby surface share one rule: a token may travel in the URL only for
+    // read-only media requests. Emby clients address streams, images and downloads on both
+    // `/Videos/...` and `/emby/Videos/...`, so the path-prefix check must not be Lux-only.
+    if path.starts_with("/api/") && !path.starts_with("/api/v1") {
+        return false;
+    }
+    let path = path.to_ascii_lowercase();
     QUERY_API_KEY_PATH_SUFFIXES
         .iter()
         .any(|suffix| path.ends_with(suffix) || path.contains(suffix))
@@ -319,6 +326,11 @@ mod query_api_key_tests {
             (Method::GET, "/api/v1/items/abc/download"),
             (Method::GET, "/api/v1/items/abc/image"),
             (Method::GET, "/api/v1/items/abc/subtitle/1"),
+            (Method::GET, "/Videos/abc/stream"),
+            (Method::GET, "/Videos/abc/stream.mkv"),
+            (Method::GET, "/emby/Videos/abc/stream"),
+            (Method::GET, "/Audio/abc/stream"),
+            (Method::GET, "/Items/abc/Images/Primary"),
         ] {
             assert!(query_api_key_is_allowed(&method, path), "{method} {path}");
         }
@@ -328,6 +340,9 @@ mod query_api_key_tests {
             (Method::GET, "/api/v1/admin/users"),
             (Method::GET, "/api/v1/items"),
             (Method::GET, "/api/v1/auth/me"),
+            (Method::GET, "/Search/Hints"),
+            (Method::GET, "/Items/abc"),
+            (Method::POST, "/Videos/abc/stream"),
         ] {
             assert!(!query_api_key_is_allowed(&method, path), "{method} {path}");
         }

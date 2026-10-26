@@ -18022,11 +18022,29 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 
 验收：
 
-- [ ] 每项列出处置结论与证据（提交、命令、输出）。
+- [x] 每项列出处置结论与证据（提交、命令、输出）。
 - [ ] `cargo test --locked --all-targets` 与 clippy 结果记录在案；豁免项经项目所有者确认。
-- [ ] 修复项有对应回归断言，未放宽既有断言。
+- [x] 修复项有对应回归断言，未放宽既有断言。
 
 依赖：无。
+
+进度（2026-10-26）：
+- **Clippy 19 项 → 0**：`too_many_arguments`、`type_complexity`、`cloned_ref_to_slice_refs`、
+  `unnecessary_get_then_check`、`redundant_guard`、手动 `for` 循环、测试模块之后的条目均已处理。
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过（exit 0）。
+- **共享管理员 key 回归**（源自 `e06ecf4c` 把 query key 限到 `/api/v1` 媒体路径）：
+  `/api/v1/auth/me?api_key=` 现应 401（测试改为断言拒绝）；Emby 媒体路径
+  （`/Videos/...`、`/emby/Videos/...`、`/Audio/...`、`/Items/.../Images/...`）恢复 query key；
+  非媒体 Emby 路径仍拒绝。共享 key 无用户身份时不再因按用户播放准入返回 401。
+  `--test admin_api_key` 4/4。
+- **admin_health**：`schemaVersion` 固定 187 改为读取 `migrations/` 最新版本；`--test admin_health` 1/1。
+- **全清单基线**：`--all-targets --no-fail-fast` 在 128 个目标中 118 通过、10 失败；在基线提交
+  `f00150f3` 的独立 worktree 上逐项复跑同样 10 个目标，结果同样失败（`image_api`、`libraries_api`、
+  `people_api`、`scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、`scheduled_tasks`、
+  `watch`、`web_playback`、`web_static`），说明不是本次改动引入。lib 测试 1339/0（32 ignored）。
+- 剩余：上述 10 个既有失败需逐项决定修复或豁免（需项目所有者确认）。初步迹象：
+  `people_api` 的 `/emby/Persons?...&&` 返回 400、`web_static` 的 `/emby/not-implemented` 缺少
+  `application/json`、`image_api` 的图片搜索返回 403，均与当前 query/CSRF 策略不一致，需单独任务处理。
 
 #### LUX-857：NFO 快照外置与条件写
 

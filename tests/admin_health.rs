@@ -1,4 +1,4 @@
-use std::time::Duration;
+use std::{ffi::OsStr, fs, path::Path, time::Duration};
 
 use luxd::{
     api::{AppState, app_with_state},
@@ -11,6 +11,27 @@ use luxd::{
 use reqwest::header::{COOKIE, SET_COOKIE};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
+
+fn latest_migration_version() -> Result<i64, Box<dyn std::error::Error>> {
+    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut latest_version = None;
+    for entry in fs::read_dir(migration_dir)? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|stem| stem.split('_').next())
+            .and_then(|version| version.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        latest_version = Some(latest_version.map_or(version, |current: i64| current.max(version)));
+    }
+    latest_version.ok_or_else(|| "no migrations found".into())
+}
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
@@ -112,7 +133,7 @@ async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
             "degraded"
         }
     );
-    assert_eq!(body["schemaVersion"], 187);
+    assert_eq!(body["schemaVersion"], latest_migration_version()?);
     assert_eq!(body["jobs"]["scanRunning"], 2);
     assert_eq!(body["jobs"]["scanFailed"], 1);
     assert_eq!(body["database"]["status"], "ok");

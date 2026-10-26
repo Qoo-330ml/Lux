@@ -1147,6 +1147,11 @@ U 表示有效用户 token，K 表示有效静态 key。query 名称大小写不
 
 实测 Emby 不把 query `apiKey` 或 query `X-MediaBrowser-Token` 当作标准来源。为保留现有 Lux 客户端合同，Lux 将它们作为所有标准来源为空时的扩展回退；历史 `X-Lux-Api-Key`、`X-Emby-Authentication` 和 Authorization 的 Bearer/原始 token 也仅作扩展回退。选中的 query token 按原始凭据处理，不把其中的 `Bearer ` 或 `Token=` 当作 header 语法。
 
+共享管理员静态 key 的 query 回退只允许只读媒体请求：`/api/v1` 下的 stream/download/image/subtitle/hls 路径，
+以及 Emby 媒体路径（`/Videos/...`、`/emby/Videos/...`、`/Audio/...`、`/Items/.../Images/...`）。`/api/v1/auth/me`、
+`/api/v1/items`、`/Search/Hints` 等非媒体路径必须改用 header 或 Bearer，query 中的 key 不再被接受。共享 key 没有用户身份，
+因此媒体流请求不参与按用户的并发播放准入；它仍不能写入播放 URL 或读取管理员端点。
+
 请求内选中的凭据只在 Emby 路由内部传递，外部同名内部 header 会被清除；该内部 header 不会转发给插件，也不会作为 header 输出到响应或日志。既有用户、媒体库 ACL 与 HMAC 播放票据验证保持不变；签名播放票据继续使用原有独立授权路径。PlaybackInfo 使用实际选中的用户 token 生成 `.strm` 签名播放 URL，低优先级 Lux key header 不再抑制它；管理员共享 key 仍禁止写入播放 URL。
 
 本机验证（Toshiba 已挂载，macOS `arm64`，所有 Cargo 命令使用 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`）：

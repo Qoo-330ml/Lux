@@ -1693,16 +1693,6 @@ impl Database {
     }
 }
 
-#[cfg(test)]
-mod session_bound_tests {
-    use super::MAX_LISTED_PLAYBACK_SESSIONS;
-
-    #[test]
-    fn session_listing_bound_is_small_enough_to_stay_cheap() {
-        assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
-    }
-}
-
 pub(crate) struct StoredTranscodingSessionRow {
     pub(crate) session_id: String,
     pub(crate) user_id: String,
@@ -1762,4 +1752,14 @@ pub(crate) struct StoredTranscodingHistory {
     pub(crate) last_fps: Option<f64>,
     pub(crate) output_bytes: Option<i64>,
     pub(crate) failure_reason: Option<String>,
+}
+
+#[cfg(test)]
+mod session_bound_tests {
+    use super::MAX_LISTED_PLAYBACK_SESSIONS;
+
+    #[test]
+    fn session_listing_bound_is_small_enough_to_stay_cheap() {
+        assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
+    }
 }

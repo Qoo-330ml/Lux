@@ -8675,7 +8675,7 @@ fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -
                     adapted.push(next);
                 }
                 let mut previous = '\0';
-                while let Some(next) = characters.next() {
+                for next in characters.by_ref() {
                     adapted.push(next);
                     if previous == '*' && next == '/' {
                         break;

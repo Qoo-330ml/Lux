@@ -114,10 +114,15 @@ async fn shared_admin_key_authenticates_lux_and_emby_requests_without_csrf()
     assert_eq!(me_body["principal"]["permissions"]["canRemoteAccess"], true);
     assert!(me_body.get("user").is_none());
 
+    // URL tokens are limited to read-only media requests, so the query fallback must not
+    // authenticate a normal API route.
+    let query_key = client
+        .get(format!("http://{address}/api/v1/auth/me?api_key={key}"))
+        .send()
+        .await?;
+    assert_eq!(query_key.status(), reqwest::StatusCode::UNAUTHORIZED);
+
     for request in [
-        client
-            .get(format!("http://{address}/api/v1/auth/me?api_key={key}"))
-            .build()?,
         client
             .get(format!("http://{address}/api/v1/auth/me"))
             .header("Authorization", format!("Bearer {key}"))

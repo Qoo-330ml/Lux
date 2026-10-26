@@ -3005,6 +3005,7 @@ pub(super) async fn serve_media_file(
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn serve_emby_media_file(
     state: &AppState,
     principal: AccessPrincipal,
@@ -3200,12 +3201,17 @@ async fn admit_emby_media_response(
     }
     if let Some(play_session_id) = play_session_id {
         let user_id = principal.user_id_string();
-        if user_id.is_empty() {
-            return StatusCode::UNAUTHORIZED.into_response();
-        }
-        if let Err(response) =
-            super::playback::admit_emby_direct_playback(headers, state, &user_id, play_session_id)
-                .await
+        // The shared server-admin key has no user identity, and playback admission is per-user
+        // (concurrent stream limits and progress). It must not turn a trusted admin credential
+        // into a 401 for read-only media requests.
+        if !user_id.is_empty()
+            && let Err(response) = super::playback::admit_emby_direct_playback(
+                headers,
+                state,
+                &user_id,
+                play_session_id,
+            )
+            .await
         {
             return response;
         }

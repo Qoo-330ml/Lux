@@ -1477,6 +1477,7 @@ async fn emby_login_and_existing_tokens_enforce_device_client_blacklists()
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn emby_password_logins_update_device_inventory_without_blocking_auth()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

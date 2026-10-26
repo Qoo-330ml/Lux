@@ -334,6 +334,7 @@ async fn successful_login_is_written_to_the_user_activity_index()
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn failed_web_logins_are_indexed_only_for_known_users_and_not_rate_limited_attempts()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

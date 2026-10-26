@@ -869,6 +869,7 @@ mod tests {
         Ok((temp_dir, database))
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn insert_item(
         database: &Database,
         library_id: &str,

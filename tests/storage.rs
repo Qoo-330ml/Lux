@@ -570,6 +570,7 @@ async fn web_session_device_id_migration_preserves_existing_sessions()
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn user_device_inventory_migration_backfills_legacy_emby_device_evidence()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -1256,6 +1257,7 @@ async fn media_content_restriction_index_migration_runs_from_an_empty_database()
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn legacy_user_and_library_access_upgrade_from_v183_to_current_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;

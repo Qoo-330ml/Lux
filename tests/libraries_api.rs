@@ -345,7 +345,7 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .send()
         .await?;
     assert_eq!(deleted_library.status(), reqwest::StatusCode::ACCEPTED);
-    wait_for_library_deletion(&database, &library_id).await?;
+    wait_for_library_deletion(&database, library_id).await?;
     let after_delete = client
         .get(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookies)

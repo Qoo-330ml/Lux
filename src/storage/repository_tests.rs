@@ -16467,7 +16467,7 @@ async fn user_permission_copy_applies_selected_groups_with_snapshot_checks()
     let source = &copied["permission-write-source"];
     let target = &copied["permission-write-target"];
     assert_eq!(target.library_access_mode, "SELECTED");
-    assert_eq!(target.library_ids, [library_id.clone()]);
+    assert_eq!(target.library_ids, vec![library_id.clone()]);
     assert!(target.can_download);
     let copied_content = target
         .content_restrictions
@@ -26769,6 +26769,7 @@ async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_fin
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subjects()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -26845,6 +26846,7 @@ async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subje
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn user_device_observations_merge_monotonically_and_are_user_scoped()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
@@ -29108,6 +29110,7 @@ async fn postgres_registration_mode_contract() -> Result<(), Box<dyn std::error:
 
 const REGISTRATION_TEST_PERMISSION_SNAPSHOT: &str = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"NONE","libraryIds":[],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#;
 
+#[allow(clippy::too_many_arguments)]
 fn registration_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
@@ -30852,7 +30855,7 @@ async fn library_strm_source_counts_ignore_removed_items() -> Result<(), Box<dyn
     }
 
     let counts = database
-        .list_strm_media_source_counts_for_libraries(&[library_id.clone()])
+        .list_strm_media_source_counts_for_libraries(std::slice::from_ref(&library_id))
         .await?;
     assert_eq!(
         counts.get(&library_id).copied(),
@@ -30912,7 +30915,13 @@ async fn person_credit_item_ids_are_paged_by_keyset() -> Result<(), Box<dyn std:
     }
 
     let first = database
-        .list_person_credit_item_ids(&[library_id.clone()], "Actor", "person-1", None, 2)
+        .list_person_credit_item_ids(
+            std::slice::from_ref(&library_id),
+            "Actor",
+            "person-1",
+            None,
+            2,
+        )
         .await?;
     assert_eq!(first, vec!["item-a".to_owned(), "item-b".to_owned()]);
     let second = database
@@ -30993,7 +31002,7 @@ async fn search_pages_past_the_end_still_report_the_real_total()
             query: "Zebra",
             like_query: "%Zebra%",
             item_types: &["MOVIE".to_owned()],
-            library_ids: Some(&[library_id.clone()]),
+            library_ids: Some(std::slice::from_ref(&library_id)),
             offset: 10,
             limit: 5,
             content_restrictions: None,
@@ -31658,9 +31667,9 @@ async fn user_batch_reads_match_single_user_reads() {
                 .expect("single configuration")
         );
     }
-    assert!(orders.get("batch-unknown-user").is_none());
-    assert!(flags.get("batch-unknown-user").is_none());
-    assert!(configurations.get("batch-unknown-user").is_none());
+    assert!(!orders.contains_key("batch-unknown-user"));
+    assert!(!flags.contains_key("batch-unknown-user"));
+    assert!(!configurations.contains_key("batch-unknown-user"));
     database.close().await;
 }
 
