@@ -31287,6 +31287,104 @@ async fn unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference(
 }
 
 #[tokio::test]
+async fn batch_nfo_updates_share_one_transaction_and_skip_unchanged_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('nfo-batch-lib', 'NFO', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for id in ["nfo-batch-a", "nfo-batch-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'nfo-batch-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .update_media_item_nfo_metadata_batch(&[
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-a",
+                json: Some(r#"{"title":"A"}"#),
+                source_fingerprint: Some(&[1]),
+            },
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-b",
+                json: Some(r#"{"title":"B"}"#),
+                source_fingerprint: Some(&[2]),
+            },
+        ])
+        .await?;
+    let rows: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT cache.item_id, cache.json, item.nfo_metadata_fingerprint
+         FROM media_item_nfo_cache cache
+         JOIN media_items item ON item.id = cache.item_id
+         WHERE cache.item_id LIKE 'nfo-batch-%' ORDER BY cache.item_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "nfo-batch-a");
+    assert_eq!(rows[0].1, r#"{"title":"A"}"#);
+    assert_eq!(rows[0].2.as_deref(), Some([1].as_slice()));
+    assert_eq!(rows[1].2.as_deref(), Some([2].as_slice()));
+
+    let before: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, updated_at FROM media_items WHERE id LIKE 'nfo-batch-%' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    database
+        .update_media_item_nfo_metadata_batch(&[
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-a",
+                json: Some(r#"{"title":"A"}"#),
+                source_fingerprint: Some(&[1]),
+            },
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-b",
+                json: Some(r#"{"title":"B"}"#),
+                source_fingerprint: Some(&[2]),
+            },
+        ])
+        .await?;
+    let after: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, updated_at FROM media_items WHERE id LIKE 'nfo-batch-%' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(after, before, "unchanged batch items must not be rewritten");
+
+    database
+        .update_media_item_nfo_metadata_batch(&[MediaItemNfoMetadataUpdate {
+            item_id: "nfo-batch-a",
+            json: None,
+            source_fingerprint: None,
+        }])
+        .await?;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_item_nfo_cache WHERE item_id = 'nfo-batch-a'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining, 0);
+    Ok(())
+}
+
+#[tokio::test]
 async fn successful_write_probes_are_cached_so_health_checks_do_not_write()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::config::Config;

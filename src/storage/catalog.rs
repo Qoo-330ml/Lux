@@ -9115,18 +9115,17 @@ impl Database {
         Ok(true)
     }
 
-    pub(crate) async fn update_media_item_nfo_metadata(
+    async fn update_media_item_nfo_metadata_in_transaction(
         &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
         item_id: &str,
         nfo_metadata_json: Option<&str>,
         source_fingerprint: Option<&[u8]>,
     ) -> Result<(), StorageError> {
-        let _write_guard = self.acquire_metadata_write_lock().await;
-        let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(json) = nfo_metadata_json else {
             self.query("DELETE FROM media_item_nfo_cache WHERE item_id = ?")
                 .bind(item_id)
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(|source| StorageError::Sqlx {
                     path: self.path.clone(),
@@ -9140,24 +9139,18 @@ impl Database {
                    AND (nfo_metadata_json IS NOT NULL OR nfo_metadata_fingerprint IS NOT NULL)",
             )
             .bind(item_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
-            return transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                });
+            return Ok(());
         };
 
         let changed = self
             .upsert_media_item_nfo_cache_in_transaction(
-                &mut transaction,
+                &mut *transaction,
                 item_id,
                 json,
                 source_fingerprint,
@@ -9168,7 +9161,7 @@ impl Database {
                 "SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?",
             )
             .bind(item_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -9179,7 +9172,7 @@ impl Database {
         if changed {
             // A new snapshot invalidates the derived collection reference and content-rating
             // index; also clear the legacy inline column so upgraded databases shrink over time.
-            self.invalidate_content_restriction_index_in_transaction(&mut transaction, item_id)
+            self.invalidate_content_restriction_index_in_transaction(&mut *transaction, item_id)
                 .await?;
             self.query(
                 "UPDATE media_items
@@ -9189,7 +9182,7 @@ impl Database {
             )
             .bind(source_fingerprint)
             .bind(item_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
@@ -9203,13 +9196,61 @@ impl Database {
             )
             .bind(source_fingerprint)
             .bind(item_id)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
             })?;
         }
+        Ok(())
+    }
+
+    /// Applies several local-NFO snapshots in one write transaction, so a scan page pays one
+    /// commit instead of one per item.
+    #[allow(dead_code)] // LUX-860 wires the scan-page flush in the next increment.
+    pub(crate) async fn update_media_item_nfo_metadata_batch(
+        &self,
+        updates: &[crate::storage::MediaItemNfoMetadataUpdate<'_>],
+    ) -> Result<(), StorageError> {
+        if updates.is_empty() {
+            return Ok(());
+        }
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        for update in updates {
+            self.update_media_item_nfo_metadata_in_transaction(
+                &mut transaction,
+                update.item_id,
+                update.json,
+                update.source_fingerprint,
+            )
+            .await?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    pub(crate) async fn update_media_item_nfo_metadata(
+        &self,
+        item_id: &str,
+        nfo_metadata_json: Option<&str>,
+        source_fingerprint: Option<&[u8]>,
+    ) -> Result<(), StorageError> {
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.update_media_item_nfo_metadata_in_transaction(
+            &mut transaction,
+            item_id,
+            nfo_metadata_json,
+            source_fingerprint,
+        )
+        .await?;
         transaction
             .commit()
             .await

@@ -18205,6 +18205,12 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
 
 依赖：LUX-857、LUX-858。
 
+进度（2026-10-26）：新增存储批写入原语 `update_media_item_nfo_metadata_batch`，一次写锁/一次事务内
+应用多个 NFO 快照；每个条目仍按“未变化不重写”判断。回归
+`batch_nfo_updates_share_one_transaction_and_skip_unchanged_items`（两条目一次调用、重复调用不 bump
+`updated_at`、置空删除缓存）。下一步把扫描页的逐条 `write_item_with_semantic_fingerprint` 收集为页级
+flush 调用该批量接口，再补“批量失败整体回滚”用例。
+
 #### LUX-861：冷启动首页与元数据写锁持有时长
 
 范围：定位并修复“新库首次 `/api/v1/home` 可超过 90 s”的冷启动问题。日志显示首次启动时

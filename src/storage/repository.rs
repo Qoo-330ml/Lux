@@ -6790,6 +6790,14 @@ pub(crate) struct NewMetadataCandidate<'a> {
     pub(crate) expires_at: Option<i64>,
 }
 
+/// One local-NFO snapshot in a batched metadata write.
+#[allow(dead_code)] // LUX-860 wires the scan-page flush in the next increment.
+pub(crate) struct MediaItemNfoMetadataUpdate<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) json: Option<&'a str>,
+    pub(crate) source_fingerprint: Option<&'a [u8]>,
+}
+
 pub(crate) struct MetadataImageUnavailable<'a> {
     pub(crate) image_type: &'a str,
     pub(crate) candidate_key: &'a str,
