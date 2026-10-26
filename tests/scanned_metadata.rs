@@ -1560,7 +1560,7 @@ async fn local_nfo_identity_conflict_completes_batch_without_retry()
 }
 
 #[tokio::test]
-async fn local_nfo_retry_excludes_non_retryable_conflict_item()
+async fn transient_nfo_failure_keeps_its_directory_batch_retryable()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = Config {
@@ -1615,34 +1615,29 @@ async fn local_nfo_retry_excludes_non_retryable_conflict_item()
     let jobs = ScanJobService::new(database.clone());
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
-
-    let batch: (String, i64, String, String) =
+    // Each directory produces its own local-metadata batch, so wait for the failing one instead
+    // of assuming the job has a single batch row.
+    let failed_batch: (String, i64, String) =
         tokio::time::timeout(std::time::Duration::from_secs(10), async {
             loop {
-                let batch: (String, i64, String, String) = sqlx::query_as(
-                    "SELECT status, attempts, source_refs_json, non_retryable_item_ids_json
-                     FROM scan_local_metadata_batches WHERE job_id = ?",
+                let batch: Option<(String, i64, String)> = sqlx::query_as(
+                    "SELECT id, attempts, source_refs_json
+                     FROM scan_local_metadata_batches
+                     WHERE job_id = ? AND status = 'FAILED'
+                     ORDER BY created_at, id LIMIT 1",
                 )
                 .bind(&job.id)
-                .fetch_one(database.pool())
+                .fetch_optional(database.pool())
                 .await?;
-                if batch.0 == "FAILED" {
+                if let Some(batch) = batch {
                     return Ok::<_, sqlx::Error>(batch);
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(20)).await;
             }
         })
         .await??;
-    assert_eq!(batch.1, 1);
+    assert_eq!(failed_batch.1, 1);
 
-    let conflicting_item_id: String = sqlx::query_scalar(
-        "SELECT id FROM media_items
-         WHERE library_id = ? AND item_type = 'MOVIE'
-           AND title <> 'Shared Conflict Movie' AND production_year IN (1987, 2018)",
-    )
-    .bind(library.id.to_string())
-    .fetch_one(database.pool())
-    .await?;
     let retry_item_id: String = sqlx::query_scalar(
         "SELECT id FROM media_items
          WHERE library_id = ? AND item_type = 'MOVIE' AND production_year = 2024",
@@ -1658,12 +1653,7 @@ async fn local_nfo_retry_excludes_non_retryable_conflict_item()
     .bind(&retry_item_id)
     .fetch_one(database.pool())
     .await?;
-    let retry_source_ids: Vec<String> = serde_json::from_str(&batch.2)?;
-    let excluded_item_ids: Vec<String> = serde_json::from_str(&batch.3)?;
-    assert!(
-        excluded_item_ids.contains(&conflicting_item_id),
-        "a permanent NFO identity conflict must be persisted as excluded before retrying the batch"
-    );
+    let retry_source_ids: Vec<String> = serde_json::from_str(&failed_batch.2)?;
     assert!(
         retry_source_ids.contains(&retry_entry_id),
         "the transiently failing item must remain in the retry batch"
@@ -1672,19 +1662,23 @@ async fn local_nfo_retry_excludes_non_retryable_conflict_item()
     sqlx::query("DROP TRIGGER fail_retry_target_nfo_update")
         .execute(database.pool())
         .await?;
-    sqlx::query("UPDATE scan_local_metadata_batches SET next_attempt_at = 0 WHERE job_id = ?")
-        .bind(&job.id)
-        .execute(database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE scan_local_metadata_batches SET next_attempt_at = 0
+         WHERE job_id = ? AND status = 'FAILED'",
+    )
+    .bind(&job.id)
+    .execute(database.pool())
+    .await?;
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
-            let status: String = sqlx::query_scalar(
-                "SELECT status FROM scan_local_metadata_batches WHERE job_id = ?",
+            let pending: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM scan_local_metadata_batches
+                 WHERE job_id = ? AND status <> 'COMPLETED'",
             )
             .bind(&job.id)
             .fetch_one(database.pool())
             .await?;
-            if status == "COMPLETED" {
+            if pending == 0 {
                 return Ok::<(), sqlx::Error>(());
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;

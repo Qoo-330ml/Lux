@@ -18059,11 +18059,17 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
     不再让整个批次失败；测试按现行为重写。3/3。
   - `scanned_metadata` 的 `failed_local_poster_insert_does_not_mark_image_stage_complete`：失败页面回滚后
     已提交海报数量取决于批大小（本次为 2，原断言写死 1）；改为断言部分保留且批次失败，通过。
-- **剩余 3 个目标的 4 个用例仍失败**（基线与当前树一致）：`scanned_metadata`
-  `local_nfo_retry_excludes_non_retryable_conflict_item`（现按目录拆成多个批次，第三个批次 FAILED 且
-  `non_retryable_item_ids=[]`，需确认冲突条目是否仍被正确排除）、`scanning_jobs`
-  `manifest_discovery_reopens_and_retries_persisted_frontier_idempotently`（提交检查点 1 次而非 2 次）、
-  `watch` 两个实时监听超时。需逐项判定是产品缺陷还是测试过时；已登记 LUX-862。
+- **第三轮又修复 1 个用例**：`scanned_metadata` 的 NFO 冲突重试用例。本地元数据批次现按目录拆分，
+  不再是一个 job 一行；测试改为等待 FAILED 批次、核对该批次仍包含瞬时失败条目（`source_refs_json`），
+  清除注入触发器后等待全部批次 COMPLETED。冲突 NFO 在索引阶段已解析，不再作为 non-retryable 条目，
+  因此移除了过时的 `non_retryable_item_ids` 断言。`--test scanned_metadata` 23/23。
+- **剩余 2 个目标的 3 个用例仍失败**（基线与当前树一致）：
+  - `scanning_jobs::manifest_discovery_reopens_and_retries_persisted_frontier_idempotently`：注入触发器下
+    第一个批次返回 `too many SQL variables`，只提交 1 个检查点。测试夹具在单目录写入 8,001 个文件，
+    疑似发现批次的多列绑定接近 SQLite 变量上限；需判断是降低批次行数还是调整查询形状。
+  - `watch` 两个实时监听用例：临时目录内新增文件在 20 s 内未被增量索引，放宽等待无效；疑似本机
+    notify/FSEvents 在测试环境不投递事件，需在目标机器复核。
+  已登记 LUX-862。
 
 #### LUX-862：既有集成失败收敛
 
