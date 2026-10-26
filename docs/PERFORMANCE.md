@@ -2,6 +2,19 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-857 NFO 外置前后对比方法（待执行）
+
+A/B 方式：在 `ad8bed43^`（内联列）与 `ad8bed43`（缓存表）两个提交上分别
+
+```bash
+CARGO_TARGET_DIR=target-nfo-ab cargo build --release --locked
+python3 scripts/run-api-performance.py --cold-runs 3 --json-out /tmp/nfo-ab-<rev>.json
+```
+
+比较 `databaseBytes`、`walBytes`、`endpoints.detail.p95Ms`。注意夹具本身不含 NFO 载荷，需在夹具里
+补 200 条各 128 KiB 的 NFO 快照（`media_item_nfo_cache` 或旧列）后再跑，否则只能验证“无回归”，不能
+证明体积收益；这一点在 LUX-857 验收记录中必须注明。
+
 ## LUX-855 / LUX-861 规格夹具端点基线（2026-10-26，已修正）
 
 本机 `arm64`（macOS），release `luxd`，固定夹具由 `tools/catalog-fixture/generate.py --spec-target`
