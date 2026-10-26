@@ -21835,6 +21835,49 @@ async fn session_history_purge_respects_the_batch_limit()
     Ok(())
 }
 
+#[tokio::test]
+async fn account_record_purge_surfaces_a_failure_and_keeps_the_affected_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let _admin = UserStore::new(database.clone())?
+        .create_initial_admin("Failure", "Failure", "correct horse battery staple")
+        .await?;
+    let now = 400 * 24 * 60 * 60;
+    let old = now - 91 * 24 * 60 * 60;
+    sqlx::query(
+        "INSERT INTO mail_outbox (
+             id, idempotency_key, recipient_email, template_kind, reference_id,
+             status, sent_at, available_at, created_at, updated_at
+         ) VALUES ('mail-failing', 'mail-failing', 'x@example.invalid', 'INVITATION', 'ref',
+                   'SENT', ?, ?, ?, ?)",
+    )
+    .bind(old)
+    .bind(old)
+    .bind(old)
+    .bind(old)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_mail_purge BEFORE DELETE ON mail_outbox
+         BEGIN
+             SELECT RAISE(ABORT, 'injected mail purge failure');
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let result = database.purge_expired_account_records(now, 100).await;
+    assert!(result.is_err(), "a cleanup failure must surface to the worker");
+    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox WHERE id = 'mail-failing'")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(kept, 1, "rows whose delete failed stay for the next attempt");
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
