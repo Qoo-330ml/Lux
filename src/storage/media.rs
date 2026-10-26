@@ -2394,7 +2394,8 @@ impl Database {
         );
 
         let movie_source_insert_started = Instant::now();
-        for chunk in source_rows.chunks(batch_size) {
+        let source_batch_size = super::media_source_insert_chunk_size(self.backend(), batch_size);
+        for chunk in source_rows.chunks(source_batch_size) {
             let values =
                 std::iter::repeat_n(
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",
@@ -2822,7 +2823,8 @@ impl Database {
             .0;
 
         let mut defaulted_episode_identities = HashSet::new();
-        for chunk in files.chunks(batch_size) {
+        let source_batch_size = super::media_source_insert_chunk_size(self.backend(), batch_size);
+        for chunk in files.chunks(source_batch_size) {
             let values =
                 std::iter::repeat_n(
                     "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CASE WHEN ? = 'STRM_URL' THEN 'NOT_CONFIGURED' ELSE 'PENDING' END)",

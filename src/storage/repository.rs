@@ -184,6 +184,14 @@ pub(crate) fn max_sql_bind_parameters(backend: DatabaseBackend) -> usize {
     }
 }
 
+/// Rows per media-source insert, capped by the backend's bind budget (13 binds per row).
+pub(crate) fn media_source_insert_chunk_size(backend: DatabaseBackend, requested: usize) -> usize {
+    const BIND_VALUES_PER_ROW: usize = 13;
+    (max_sql_bind_parameters(backend) / BIND_VALUES_PER_ROW)
+        .min(requested)
+        .max(1)
+}
+
 pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize {
     match backend {
         DatabaseBackend::Sqlite => MANIFEST_PATH_QUERY_SQLITE_CHUNK_SIZE,
@@ -225,6 +233,7 @@ mod manifest_positive_index_batch_tests {
         SQLITE_MAX_BIND_PARAMETERS, manifest_existing_file_update_chunk_size,
         manifest_path_query_chunk_size, manifest_positive_index_insert_chunk_size,
         manifest_seen_filesystem_update_chunk_size, media_item_hierarchy_insert_chunk_size,
+        media_source_insert_chunk_size,
     };
 
     #[test]
@@ -256,6 +265,16 @@ mod manifest_positive_index_batch_tests {
         assert!(
             postgres_update_size * MANIFEST_EXISTING_FILE_UPDATE_MAX_BIND_VALUES_PER_ROW
                 <= POSTGRES_MAX_BIND_PARAMETERS
+        );
+
+        // The media-source insert binds 13 values per row, so the 2,900-row path batch would
+        // overflow SQLite's 32,766-variable limit on database scans.
+        let sqlite_source_size = media_source_insert_chunk_size(DatabaseBackend::Sqlite, 2_900);
+        assert_eq!(sqlite_source_size, 2_520);
+        assert!(sqlite_source_size * 13 <= SQLITE_MAX_BIND_PARAMETERS);
+        assert_eq!(
+            media_source_insert_chunk_size(DatabaseBackend::Postgres, 2_900),
+            2_900
         );
     }
 
