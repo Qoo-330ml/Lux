@@ -1052,6 +1052,7 @@ pub(crate) struct AccountRecordPurge {
     pub media_merge_records: u64,
     pub user_registration_requests: u64,
     pub emby_migration_jobs: u64,
+    pub metadata_candidates: u64,
 }
 
 impl Database {
@@ -1180,6 +1181,27 @@ impl Database {
                  )",
             )
             .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        // Pending candidates past their expiry can never be selected. The retention worker also
+        // removes them, but it only runs daily; the minute-level cleanup keeps the table small.
+        purge.metadata_candidates = self
+            .query(
+                "DELETE FROM metadata_candidates WHERE id IN (
+                     SELECT id FROM metadata_candidates
+                     WHERE status = 'PENDING'
+                       AND expires_at IS NOT NULL
+                       AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(now.saturating_sub(60 * 60))
             .bind(batch)
             .execute(&self.pool)
             .await

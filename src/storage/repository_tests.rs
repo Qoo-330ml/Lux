@@ -21707,6 +21707,19 @@ async fn account_record_purge_drops_only_terminal_rows_past_retention()
         .await?;
     }
 
+    for (id, expires_at) in [("candidate-old", old), ("candidate-fresh", future)] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
+             ) VALUES (?, ?, 'TMDB', ?, '{}', 10, 'PENDING', ?)",
+        )
+        .bind(id)
+        .bind(&movie_ids[0])
+        .bind(id)
+        .bind(expires_at)
+        .execute(database.pool())
+        .await?;
+    }
     for (id, expires_at, created_at) in [
         ("registration-old", old + 10, old),
         ("registration-fresh", future, now),
@@ -21757,6 +21770,7 @@ async fn account_record_purge_drops_only_terminal_rows_past_retention()
     assert_eq!(purge.media_merge_records, 1);
     assert_eq!(purge.user_registration_requests, 1);
     assert_eq!(purge.emby_migration_jobs, 1);
+    assert_eq!(purge.metadata_candidates, 1);
 
     for (table, kept, gone) in [
         ("user_invitations", "inv-fresh", "inv-old"),
@@ -21769,6 +21783,7 @@ async fn account_record_purge_drops_only_terminal_rows_past_retention()
             "registration-old",
         ),
         ("emby_migration_jobs", "migration-fresh", "migration-old"),
+        ("metadata_candidates", "candidate-fresh", "candidate-old"),
     ] {
         let kept_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE id = ?"
@@ -21795,8 +21810,8 @@ async fn account_record_purge_drops_only_terminal_rows_past_retention()
 }
 
 #[tokio::test]
-async fn session_history_purge_respects_the_batch_limit()
--> Result<(), Box<dyn std::error::Error>> {
+async fn session_history_purge_respects_the_batch_limit() -> Result<(), Box<dyn std::error::Error>>
+{
     use crate::auth::users::UserStore;
     use crate::storage::test_database;
 
@@ -21823,7 +21838,10 @@ async fn session_history_purge_respects_the_batch_limit()
     }
 
     let first = database.purge_expired_session_history(now, 2).await?;
-    assert_eq!(first.web_sessions, 2, "one call deletes at most the batch limit");
+    assert_eq!(
+        first.web_sessions, 2,
+        "one call deletes at most the batch limit"
+    );
     let remaining: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions WHERE id LIKE 'bounded-session-%'")
             .fetch_one(database.pool())
@@ -21870,11 +21888,18 @@ async fn account_record_purge_surfaces_a_failure_and_keeps_the_affected_rows()
     .await?;
 
     let result = database.purge_expired_account_records(now, 100).await;
-    assert!(result.is_err(), "a cleanup failure must surface to the worker");
-    let kept: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox WHERE id = 'mail-failing'")
-        .fetch_one(database.pool())
-        .await?;
-    assert_eq!(kept, 1, "rows whose delete failed stay for the next attempt");
+    assert!(
+        result.is_err(),
+        "a cleanup failure must surface to the worker"
+    );
+    let kept: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox WHERE id = 'mail-failing'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        kept, 1,
+        "rows whose delete failed stay for the next attempt"
+    );
     Ok(())
 }
 

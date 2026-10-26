@@ -29,8 +29,8 @@ LUX-854–862 已实现并合并。剩余门禁项与需要项目所有者决定
 
 - 30 条过期 `web_sessions`、30 条超过 90 天的 `playback_history_events`，启动服务 75 秒后：
   `web_sessions=0`、`playback_history_events=0`，`archive/playback-history/*.jsonl` 共 30 行。
-- 30 条过期 PENDING `metadata_candidates` 在 75 秒内未删除：候选清理挂在任务历史保留任务上
-  （首次延迟 15 分钟、周期 24 小时），不是用户清理 worker；行为由单元测试覆盖，但本轮未等到周期。
+- 30 条过期 PENDING `metadata_candidates` 起初在 75 秒内未删除（清理挂在任务历史保留任务上，首次
+  延迟 15 分钟）；随后把该清理并入分钟级账户清理 worker，复测 35 → 5（30 条过期删除、5 条未到期保留）。
 
 ## 回滚覆盖
 
