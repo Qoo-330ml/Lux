@@ -3455,7 +3455,7 @@ impl Database {
                         mi.original_language, mi.rating, mi.provider_ids_json,
                         mi.metadata_scraper_id, mi.identification_status,
                         mi.metadata_provenance_json, mi.locked_fields_json,
-                        mi.nfo_metadata_json, mi.metadata_fingerprint,
+                        cache.json AS nfo_metadata_json, mi.metadata_fingerprint,
                         mi.nfo_collection_reference_key, mi.series_id,
                         collection_reference.movie_provider AS collection_movie_provider,
                         collection_reference.movie_provider_id AS collection_movie_provider_id,
@@ -3468,6 +3468,7 @@ impl Database {
                         series.metadata_scraper_id AS series_metadata_scraper_id,
                         libraries.scraper_id AS scraper_id
                  FROM media_items mi
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = mi.id
                  LEFT JOIN collection_item_references collection_reference
                    ON collection_reference.item_id = mi.id
                  LEFT JOIN media_items series ON series.id = mi.series_id
@@ -3513,7 +3514,7 @@ impl Database {
                         mi.original_language, mi.rating, mi.provider_ids_json,
                         mi.metadata_scraper_id, mi.identification_status,
                         mi.metadata_provenance_json, mi.locked_fields_json,
-                        mi.nfo_metadata_json, mi.metadata_fingerprint,
+                        cache.json AS nfo_metadata_json, mi.metadata_fingerprint,
                         mi.nfo_collection_reference_key, mi.series_id,
                         collection_reference.movie_provider AS collection_movie_provider,
                         collection_reference.movie_provider_id AS collection_movie_provider_id,
@@ -3526,6 +3527,7 @@ impl Database {
                         series.metadata_scraper_id AS series_metadata_scraper_id,
                         libraries.scraper_id AS scraper_id
                  FROM media_items mi
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = mi.id
                  JOIN libraries
                    ON libraries.id = mi.library_id AND libraries.is_enabled = 1
                  LEFT JOIN collection_item_references collection_reference

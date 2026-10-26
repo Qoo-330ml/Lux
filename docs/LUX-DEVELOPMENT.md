@@ -18129,6 +18129,18 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
 `unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference` 覆盖“同快照不重写”和
 “快照变化则失效引用键”两条路径。`media_item_nfo_cache` 迁移与读写切换（外置）仍在进行，尚未提交。
 
+进度（2026-10-26）：候选减重先做两项确定收益：
+- 选择候选时把同条目的其它 PENDING 行标为 `REJECTED` 并立即把 `candidate_json` 收缩为 `{}`；管理端列表
+  与搜索只读 PENDING，被拒候选不再占用 TMDb 载荷体积。回归
+  `rejecting_alternative_candidates_drops_their_payload`。
+- 任务历史清理新增 `metadata_candidate_expired_pending`：状态仍为 PENDING 但 `expires_at` 超过 1 小时
+  宽限期的候选按 `expires_at` 顺序有界删除；回归
+  `cleanup_removes_expired_pending_candidates_after_grace`（宽限期内、未到期、无过期时间三类保留）。
+- 同时修复 LUX-857 的遗漏：`find_media_item_metadata` / `list_media_item_metadata_by_ids` 的写回投影
+  仍读内联列，导致填充缺失把已有 NFO 详情当成缺失并额外请求 videos/credits；已改读缓存表。
+剩余：完整 `candidate_json` 字段裁剪未做（需要核对管理端预览与演员应用字段）；目标数据集上的候选行数/体积
+前后对比待测。
+
 #### LUX-858：元数据候选减重
 
 范围：`metadata_candidates` 每个 item 只保留最新候选与选中项，拒绝/过期短窗口；`candidate_json` 只存应用所需字段，完整 TMDb 载荷不落库；清理按 `expires_at`，批次语句必须能走索引范围（参考 `database_cleanup.rs:932-938` 的既有结论）。

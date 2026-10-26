@@ -1992,8 +1992,11 @@ impl Database {
         )
         .await?;
         self.query(
+            // Rejected alternatives are never listed again (the admin list and search only read
+            // PENDING), so drop their payload immediately instead of keeping full TMDb JSON until
+            // the retention worker removes the row.
             "UPDATE metadata_candidates
-             SET status = 'REJECTED', updated_at = unixepoch()
+             SET status = 'REJECTED', candidate_json = '{}', updated_at = unixepoch()
              WHERE item_id = ? AND status = 'PENDING' AND id <> ?",
         )
         .bind(update.item_id)

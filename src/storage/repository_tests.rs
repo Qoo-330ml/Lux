@@ -21286,6 +21286,159 @@ async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
     assert_eq!(candidate_status, "SELECTED");
 }
 
+#[tokio::test]
+async fn rejecting_alternative_candidates_drops_their_payload()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Candidate payload", LibraryKind::Movie, false)
+        .await?;
+    let item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Payload', 'payload', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    for (candidate_id, provider_id, json) in [
+        (
+            "payload-selected",
+            "100",
+            r#"{"title":"Selected","overview":"keep me"}"#,
+        ),
+        (
+            "payload-rejected",
+            "200",
+            r#"{"title":"Rejected","overview":"drop me"}"#,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status
+             ) VALUES (?, ?, 'TMDB', ?, ?, 50, 'PENDING')",
+        )
+        .bind(candidate_id)
+        .bind(&item_id)
+        .bind(provider_id)
+        .bind(json)
+        .execute(database.pool())
+        .await?;
+    }
+
+    assert!(
+        database
+            .select_metadata_candidate(SelectedMetadataUpdate {
+                item_id: &item_id,
+                candidate_id: "payload-selected",
+                title: "Selected",
+                original_title: None,
+                overview: None,
+                production_year: None,
+                premiere_date: None,
+                last_air_date: None,
+                status: None,
+                original_language: None,
+                rating: None,
+                rating_source: None,
+                provider_ids_json: "{}",
+                metadata_scraper_id: None,
+                metadata_fingerprint: &[],
+                provenance_json: "{}",
+                locked_fields_json: "[]",
+                poster_fallback_required: false,
+                keep_pending: false,
+            })
+            .await?
+    );
+
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, status, candidate_json FROM metadata_candidates
+         WHERE item_id = ? ORDER BY id",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(rows[0].0, "payload-rejected");
+    assert_eq!(rows[0].1, "REJECTED");
+    assert_eq!(
+        rows[0].2, "{}",
+        "rejected candidates must not keep TMDb JSON"
+    );
+    assert_eq!(rows[1].0, "payload-selected");
+    assert_eq!(rows[1].1, "SELECTED");
+    assert!(rows[1].2.contains("keep me"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_removes_expired_pending_candidates_after_grace()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Expired candidates", LibraryKind::Movie, false)
+        .await?;
+    let item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Expired', 'expired', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let now = crate::clock::unix_timestamp();
+    for (candidate_id, expires_at) in [
+        ("expired-long-ago", Some(now - 7_200)),
+        ("expired-within-grace", Some(now - 60)),
+        ("fresh", Some(now + 3_600)),
+        ("no-expiry", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
+             ) VALUES (?, ?, 'TMDB', ?, '{}', 10, 'PENDING', ?)",
+        )
+        .bind(candidate_id)
+        .bind(&item_id)
+        .bind(candidate_id)
+        .bind(expires_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.prune_task_history(100, 10).await?;
+
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM metadata_candidates WHERE item_id = ? ORDER BY id")
+            .bind(&item_id)
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        remaining,
+        vec![
+            "expired-within-grace".to_owned(),
+            "fresh".to_owned(),
+            "no-expiry".to_owned()
+        ],
+        "only candidates past the one-hour grace are removed"
+    );
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,

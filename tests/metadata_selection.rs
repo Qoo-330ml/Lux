@@ -436,7 +436,7 @@ async fn full_refresh_preserves_locked_nfo_fields_and_replaces_existing_images()
     assert!(nfo.contains("<title>本地标题</title>"));
     assert!(nfo.contains("<plot>Online Overview</plot>"));
     let nfo_details_json: String =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(&fixture.item_id)
             .fetch_one(fixture.database.pool())
             .await?;
@@ -2679,7 +2679,7 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
             original_title = 'Example Movie', overview = 'Overview', production_year = 2020,
             premiere_date = '2020-01-01', original_language = 'en', rating = 8.0,
             provider_ids_json = ?, metadata_scraper_id = 'tmdb',
-            metadata_provenance_json = ?, nfo_metadata_json = ?
+            metadata_provenance_json = ?
          WHERE id = ?",
     )
     .bind(json!({"Tmdb": "1", "Imdb": "tt1"}).to_string())
@@ -2692,18 +2692,25 @@ async fn fill_missing_requests_the_missing_credits_capability_without_images()
         })
         .to_string(),
     )
-    .bind(
-        json!({
-            "rating": 8.0,
-            "releaseDate": "2020-01-01",
-            "originalLanguage": "en",
-            "directors": [{"provider_id": "director-1", "name": "Director"}],
-            "writers": [{"provider_id": "writer-1", "name": "Writer"}],
-            "trailers": ["https://example.invalid/trailer"]
-        })
-        .to_string(),
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+    let local_nfo_json = json!({
+        "rating": 8.0,
+        "releaseDate": "2020-01-01",
+        "originalLanguage": "en",
+        "directors": [{"provider_id": "director-1", "name": "Director"}],
+        "writers": [{"provider_id": "writer-1", "name": "Writer"}],
+        "trailers": ["https://example.invalid/trailer"]
+    })
+    .to_string();
+    sqlx::query(
+        "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+         VALUES (?, ?, length(CAST(? AS BLOB)))",
     )
     .bind(&fixture.item_id)
+    .bind(&local_nfo_json)
+    .bind(&local_nfo_json)
     .execute(fixture.database.pool())
     .await?;
 
@@ -2947,7 +2954,7 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
             original_title = 'Example Movie', overview = 'Overview', production_year = 2020,
             premiere_date = '2020-01-01', original_language = 'en', rating = 8.0,
             provider_ids_json = ?, metadata_scraper_id = 'tmdb',
-            metadata_provenance_json = ?, nfo_metadata_json = ?
+            metadata_provenance_json = ?
          WHERE id = ?",
     )
     .bind(json!({"Tmdb": "1", "Imdb": "tt1"}).to_string())
@@ -2960,8 +2967,16 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
         })
         .to_string(),
     )
-    .bind(nfo_details.to_string())
     .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+         VALUES (?, ?, length(CAST(? AS BLOB)))",
+    )
+    .bind(&fixture.item_id)
+    .bind(nfo_details.to_string())
+    .bind(nfo_details.to_string())
     .execute(fixture.database.pool())
     .await?;
 
@@ -3027,11 +3042,16 @@ async fn fill_missing_does_not_repeat_an_explicitly_empty_image_result()
         .with_database(fixture.database.clone())
         .persist_item_actors(&fixture.item_id, "tmdb", &[])
         .await?;
-    sqlx::query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
-        .bind(nfo_details.to_string())
-        .bind(&fixture.item_id)
-        .execute(fixture.database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE media_item_nfo_cache
+         SET json = ?, bytes = length(CAST(? AS BLOB)), updated_at = unixepoch()
+         WHERE item_id = ?",
+    )
+    .bind(nfo_details.to_string())
+    .bind(nfo_details.to_string())
+    .bind(&fixture.item_id)
+    .execute(fixture.database.pool())
+    .await?;
 
     let second_service = MetadataReidentifyService::with_selection(
         fixture.database.clone(),

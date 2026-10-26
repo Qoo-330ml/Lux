@@ -992,6 +992,18 @@ mod prune_sql {
              ORDER BY created_at, id
              LIMIT ?
          )";
+    /// Pending candidates past their expiry can never be selected, but they keep their payload
+    /// until the rejection retention window. Delete them after a one-hour grace so a slow worker
+    /// can still finish a just-expired page.
+    pub(super) const METADATA_CANDIDATE_EXPIRED_PENDING: &str = "DELETE FROM metadata_candidates
+         WHERE id IN (
+             SELECT id FROM metadata_candidates
+             WHERE status = 'PENDING'
+               AND expires_at IS NOT NULL
+               AND expires_at < ?
+             ORDER BY expires_at, id
+             LIMIT ?
+         )";
     /// Orphaned targets belong to a job that no longer exists. The anti-join is bounded by the
     /// batch size, so the sweep finishes its first batches on the pages that still hold orphans.
     pub(super) const ORPHAN_SCAN_JOB_TARGETS: &str = "DELETE FROM scan_job_targets
@@ -1601,6 +1613,16 @@ impl Database {
                 deadline,
             )
             .await;
+        let expired_pending = self
+            .prune_table(
+                &mut failed,
+                "metadata_candidate_expired_pending",
+                prune_sql::METADATA_CANDIDATE_EXPIRED_PENDING,
+                current_unix_timestamp().saturating_sub(60 * 60),
+                METADATA_CANDIDATE_PRUNE_BATCH.max(batch),
+                deadline,
+            )
+            .await;
         Ok(TaskHistoryRetentionReport {
             strm_probe_jobs,
             chapter_detection_jobs,
@@ -1608,7 +1630,9 @@ impl Database {
             metadata_reidentify_jobs,
             scan_jobs,
             scan_job_targets,
-            metadata_candidates: rejected.saturating_add(superseded),
+            metadata_candidates: rejected
+                .saturating_add(superseded)
+                .saturating_add(expired_pending),
             failed,
         })
     }
