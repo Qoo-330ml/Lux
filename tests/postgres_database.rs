@@ -4256,7 +4256,7 @@ async fn postgres_resume_visibility_upgrade_preserves_existing_playback_state()
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 187);
+    assert_eq!(version, latest_migration_version("migrations-postgres")?);
     pool.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())

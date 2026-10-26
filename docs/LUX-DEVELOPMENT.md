@@ -18014,6 +18014,13 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 继续观看 300 ms）。未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池且媒体文件不存在；
 本机 arm64 结果不代表 NAS/x86_64。测试：`python3 -m unittest tools/catalog-fixture/test_generator.py` 10/10。
 
+PostgreSQL（同日）：本机容器 `postgres:16-alpine`（`127.0.0.1:55432`）跑
+`POSTGRES_TEST_* cargo test --locked --test postgres_database -- --ignored`，修正一处硬编码迁移版本
+（187 → 从 `migrations-postgres` 读取最新版本）后 **33/33** 通过，覆盖 bootstrap/升级、触发器、
+扫描目标与后处理、合集引用、用户状态等；端点级 PostgreSQL 延迟基线（同一 `run-api-performance.py`
+夹具导入 PG）与扫描并发压测仍未做。
+
+
 #### LUX-856：门禁基线处置
 
 范围：处置当前 4 个既有失败用例与既有 Clippy 诊断：逐项确认根因，能修则修；不能修的登记豁免（负责人、原因、到期条件），并把“新增失败为 0”写入阶段完成标准。不得借机重构无关模块。
@@ -18140,6 +18147,11 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
   仍读内联列，导致填充缺失把已有 NFO 详情当成缺失并额外请求 videos/credits；已改读缓存表。
 剩余：完整 `candidate_json` 字段裁剪未做（需要核对管理端预览与演员应用字段）；目标数据集上的候选行数/体积
 前后对比待测。
+
+A/B 结果（2026-10-26，arm64，release，见 `docs/PERFORMANCE.md`）：详情 p95 2.90→2.30 ms（−21%）、
+更新 200 行 WAL 4.57→3.80 MB（−17%）；DB 体积持平（载荷搬家，删旧列并 VACUUM 后才释放）。PostgreSQL
+迁移 `0230` 已通过 `postgres_database --ignored` 全套 33/33（含 bootstrap 与升级路径）验证。
+
 
 #### LUX-858：元数据候选减重
 
