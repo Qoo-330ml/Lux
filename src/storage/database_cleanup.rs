@@ -1050,6 +1050,8 @@ pub(crate) struct AccountRecordPurge {
     pub mail_challenges: u64,
     pub user_devices: u64,
     pub media_merge_records: u64,
+    pub user_registration_requests: u64,
+    pub emby_migration_jobs: u64,
 }
 
 impl Database {
@@ -1139,6 +1141,42 @@ impl Database {
                      SELECT id FROM media_merge_records
                      WHERE undone_at IS NOT NULL AND undone_at < ?
                      ORDER BY undone_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.user_registration_requests = self
+            .query(
+                "DELETE FROM user_registration_requests WHERE id IN (
+                     SELECT id FROM user_registration_requests
+                     WHERE status IN ('APPROVED', 'REJECTED', 'EXPIRED')
+                       AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.emby_migration_jobs = self
+            .query(
+                "DELETE FROM emby_migration_jobs WHERE id IN (
+                     SELECT id FROM emby_migration_jobs
+                     WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+                       AND COALESCE(finished_at, updated_at) < ?
+                     ORDER BY COALESCE(finished_at, updated_at), id LIMIT ?
                  )",
             )
             .bind(cutoff)

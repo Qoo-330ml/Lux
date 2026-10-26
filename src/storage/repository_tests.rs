@@ -21707,18 +21707,68 @@ async fn account_record_purge_drops_only_terminal_rows_past_retention()
         .await?;
     }
 
+    for (id, expires_at, created_at) in [
+        ("registration-old", old + 10, old),
+        ("registration-fresh", future, now),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_registration_requests (
+                 id, recipient_email, username_normalized, display_name,
+                 permission_snapshot_json, status, expires_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, '{}', 'EXPIRED', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("{id}@example.invalid"))
+        .bind(id)
+        .bind(id)
+        .bind(expires_at)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, status, finished_at) in [
+        ("migration-old", "COMPLETED", Some(old)),
+        ("migration-fresh", "RUNNING", Some(old)),
+    ] {
+        sqlx::query(
+            "INSERT INTO emby_migration_jobs (
+                 id, plugin_id, created_by_user_id, source_label, source_base_url,
+                 secret_ref, status, phase, dry_run, merge_policy, created_at, updated_at,
+                 finished_at
+             ) VALUES (?, 'plugin', ?, 'source', 'https://example.invalid', 'secret',
+                       ?, 'TESTING', 1, 'MERGE', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(status)
+        .bind(old)
+        .bind(old)
+        .bind(finished_at)
+        .execute(database.pool())
+        .await?;
+    }
+
     let purge = database.purge_expired_account_records(now, 100).await?;
     assert_eq!(purge.user_invitations, 1);
     assert_eq!(purge.mail_outbox, 1);
     assert_eq!(purge.mail_challenges, 1);
     assert_eq!(purge.user_devices, 1);
     assert_eq!(purge.media_merge_records, 1);
+    assert_eq!(purge.user_registration_requests, 1);
+    assert_eq!(purge.emby_migration_jobs, 1);
 
     for (table, kept, gone) in [
         ("user_invitations", "inv-fresh", "inv-old"),
         ("mail_outbox", "mail-fresh", "mail-old"),
         ("mail_challenges", "challenge-fresh", "challenge-old"),
         ("media_merge_records", "merge-live", "merge-old"),
+        (
+            "user_registration_requests",
+            "registration-fresh",
+            "registration-old",
+        ),
+        ("emby_migration_jobs", "migration-fresh", "migration-old"),
     ] {
         let kept_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
             "SELECT COUNT(*) FROM {table} WHERE id = ?"

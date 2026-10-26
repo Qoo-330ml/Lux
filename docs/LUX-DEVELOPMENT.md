@@ -18182,7 +18182,9 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
 未见的 `user_devices`、已撤销超过 90 天的 `media_merge_records`；回归
 `account_record_purge_drops_only_terminal_rows_past_retention` 覆盖每表旧行删除与新行保留。worker
 每分钟调用。
-剩余：`emby_migration_jobs`、`user_registration_requests` 的期限清理；`metadata_reidentify_jobs`/`scan_jobs` 已在任务历史保留期覆盖；
+第三批：同一清理函数覆盖终态 `user_registration_requests`（EXPIRED/APPROVED/REJECTED）与
+终态 `emby_migration_jobs`（COMPLETED/CANCELLED/FAILED，按 `finished_at`），回归同步扩展。
+剩余：`metadata_reidentify_jobs`/`scan_jobs` 已在任务历史保留期覆盖；
 `playback_events` 原始行转 JSONL 归档未做。
 
 #### LUX-860：元数据批量写入
