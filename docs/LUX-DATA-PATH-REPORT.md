@@ -25,6 +25,13 @@ LUX-854–862 已实现并合并。剩余门禁项与需要项目所有者决定
 - NFO A/B：详情 p95 2.90 → 2.30 ms；更新 200 行 WAL 4.57 → 3.80 MB；DB 体积持平（待删旧列）。
 - 诊断：无 `sqlite_stat1` 时冷启动 home 可达 90–240 s；`latest_by_library` 14 s → 2 ms（ANALYZE 后）。
 
+## 清理实测（release，空库 + 手工旧行）
+
+- 30 条过期 `web_sessions`、30 条超过 90 天的 `playback_history_events`，启动服务 75 秒后：
+  `web_sessions=0`、`playback_history_events=0`，`archive/playback-history/*.jsonl` 共 30 行。
+- 30 条过期 PENDING `metadata_candidates` 在 75 秒内未删除：候选清理挂在任务历史保留任务上
+  （首次延迟 15 分钟、周期 24 小时），不是用户清理 worker；行为由单元测试覆盖，但本轮未等到周期。
+
 ## 回滚覆盖
 
 - 元数据批写中途失败：已测整体回滚。
