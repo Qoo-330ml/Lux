@@ -1038,6 +1038,123 @@ mod prune_sql {
          )";
 }
 
+/// Session and playback rows older than this are not needed for any active client.
+const SESSION_HISTORY_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct SessionHistoryPurge {
+    pub web_sessions: u64,
+    pub access_tokens: u64,
+    pub web_playback_sessions: u64,
+    pub playback_sessions: u64,
+    pub playback_admissions: u64,
+}
+
+impl Database {
+    /// Drops expired/revoked session rows and finished playback history in bounded batches.
+    ///
+    /// These tables are append-only today: nothing removed them, so a NAS that has been running
+    /// for a year keeps every login and playback row. Only terminal rows older than the retention
+    /// window are touched; active sessions and running playbacks are never deleted.
+    pub(crate) async fn purge_expired_session_history(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<SessionHistoryPurge, StorageError> {
+        let cutoff = now.saturating_sub(SESSION_HISTORY_RETENTION_SECONDS);
+        let batch = limit.clamp(1, 5_000);
+        let mut purge = SessionHistoryPurge::default();
+        purge.web_sessions = self
+            .query(
+                "DELETE FROM web_sessions WHERE id IN (
+                     SELECT id FROM web_sessions
+                     WHERE expires_at < ?
+                        OR (revoked_at IS NOT NULL AND revoked_at < ?)
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.access_tokens = self
+            .query(
+                "DELETE FROM access_tokens WHERE id IN (
+                     SELECT id FROM access_tokens
+                     WHERE revoked_at IS NOT NULL AND revoked_at < ?
+                     ORDER BY revoked_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.web_playback_sessions = self
+            .query(
+                "DELETE FROM web_playback_sessions WHERE id IN (
+                     SELECT id FROM web_playback_sessions
+                     WHERE state <> 'ACTIVE' AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.playback_sessions = self
+            .query(
+                "DELETE FROM playback_sessions WHERE id IN (
+                     SELECT id FROM playback_sessions
+                     WHERE state = 'STOPPED' AND last_event_at < ?
+                     ORDER BY last_event_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        purge.playback_admissions = self
+            .query(
+                "DELETE FROM playback_admissions WHERE (user_id, play_session_id) IN (
+                     SELECT user_id, play_session_id FROM playback_admissions
+                     WHERE state = 'RELEASED' AND last_seen_at < ?
+                     ORDER BY last_seen_at, user_id, play_session_id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .rows_affected();
+        Ok(purge)
+    }
+}
+
 static REMOVED_ITEM_PURGE_RUNNING: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

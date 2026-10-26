@@ -60,6 +60,18 @@ pub(crate) fn spawn_user_cleanup_worker(database: Database, avatars: UserAvatarS
             if let Err(error) = purge_expired_user_activity_batch(&database, now).await {
                 tracing::warn!(%error, "failed to purge expired user activity events");
             }
+            if let Err(error) = database
+                .purge_expired_session_history(now, USER_CLEANUP_BATCH_SIZE)
+                .await
+            {
+                tracing::warn!(%error, "failed to purge expired session and playback history");
+            }
+            if let Err(error) = database
+                .delete_expired_emby_direct_playback_tickets(now, USER_CLEANUP_BATCH_SIZE)
+                .await
+            {
+                tracing::warn!(%error, "failed to purge expired Emby direct-play tickets");
+            }
         }
     });
 }

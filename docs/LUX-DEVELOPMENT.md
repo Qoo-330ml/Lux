@@ -18170,6 +18170,17 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
 
 依赖：LUX-855。
 
+进度（2026-10-26）：先补最确定的两类保留期：
+- `purge_expired_session_history`：按 30 天保留期有界删除过期的 `web_sessions`、已撤销的
+  `access_tokens`、终态的 `web_playback_sessions`、`STOPPED` 的 `playback_sessions`、`RELEASED` 的
+  `playback_admissions`；活动会话/播放永不删除。回归
+  `session_history_purge_removes_only_terminal_old_rows`（每表旧行删除、新/活动行保留）。
+- 用户清理 worker 每分钟调用该函数，并接上已有的
+  `delete_expired_emby_direct_playback_tickets`（此前无调用方）。
+剩余：`emby_migration_jobs`、`media_merge_records`、`user_invitations`、`mail_outbox/challenges`、
+`user_devices` 的期限清理；`metadata_reidentify_jobs`/`scan_jobs` 已在任务历史保留期覆盖；
+`playback_events` 原始行转 JSONL 归档未做。
+
 #### LUX-860：元数据批量写入
 
 范围：`select_metadata_candidate*` 增加批量入口（100 条/事务，逐条 fingerprint CAS，冲突项回退单条），同一事务内完成 NFO 缓存与 collection 引用；保持现有写锁与 SQLite `BEGIN IMMEDIATE` 语义；记录事务数、输入项数、失败回退数。

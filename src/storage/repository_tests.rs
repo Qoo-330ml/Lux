@@ -21439,6 +21439,154 @@ async fn cleanup_removes_expired_pending_candidates_after_grace()
     Ok(())
 }
 
+#[tokio::test]
+async fn session_history_purge_removes_only_terminal_old_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::auth::users::UserStore;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Purge", "Purge", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    let movie_id = uuid::Uuid::now_v7().to_string();
+    let library = LibraryService::new(database.clone())
+        .create_library("Purge", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Purge', 'purge', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&movie_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let now = 90 * 24 * 60 * 60;
+    let old = now - 31 * 24 * 60 * 60;
+    let future = now + 24 * 60 * 60;
+    for (id, expires_at, revoked_at) in [
+        ("ws-old", old, None),
+        ("ws-revoked", future, Some(old)),
+        ("ws-active", future, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_sessions (id, user_id, session_token_hash, csrf_token_hash,
+                                       expires_at, revoked_at)
+             VALUES (?, ?, randomblob(16), randomblob(16), ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(expires_at)
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, revoked_at) in [("at-old", Some(old)), ("at-fresh", None)] {
+        sqlx::query(
+            "INSERT INTO access_tokens (id, token_hash, user_id, device_id, client_name,
+                                        device_name, client_version, revoked_at)
+             VALUES (?, randomblob(16), ?, 'device', 'client', 'device', '1', ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, state, expires_at) in [
+        ("wps-stopped", "STOPPED", old),
+        ("wps-active", "ACTIVE", old),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_playback_sessions (id, user_id, item_id, play_session_id, tier,
+                                                plan, state, expires_at, last_heartbeat_at)
+             VALUES (?, ?, ?, ?, 0, 'DIRECT', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(&movie_id)
+        .bind(id)
+        .bind(state)
+        .bind(expires_at)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, state) in [("ps-stopped", "STOPPED"), ("ps-playing", "PLAYING")] {
+        sqlx::query(
+            "INSERT INTO playback_sessions (id, user_id, item_id, play_session_id, device_id,
+                                            state, last_event_at)
+             VALUES (?, ?, ?, ?, 'device', ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(&movie_id)
+        .bind(id)
+        .bind(state)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+    for (session_id, state) in [("adm-released", "RELEASED"), ("adm-active", "ACTIVE")] {
+        sqlx::query(
+            "INSERT INTO playback_admissions (user_id, play_session_id, state, admitted_at,
+                                              last_seen_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(session_id)
+        .bind(state)
+        .bind(old)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let purge = database
+        .purge_expired_session_history(now, 100)
+        .await?;
+    assert_eq!(purge.web_sessions, 2);
+    assert_eq!(purge.access_tokens, 1);
+    assert_eq!(purge.web_playback_sessions, 1);
+    assert_eq!(purge.playback_sessions, 1);
+    assert_eq!(purge.playback_admissions, 1);
+
+    for (table, kept, gone) in [
+        ("web_sessions", "ws-active", "ws-old"),
+        ("access_tokens", "at-fresh", "at-old"),
+        ("web_playback_sessions", "wps-active", "wps-stopped"),
+        ("playback_sessions", "ps-playing", "ps-stopped"),
+    ] {
+        let kept_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(kept)
+        .fetch_one(database.pool())
+        .await?;
+        let gone_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(gone)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(kept_count, 1, "{table} must keep {kept}");
+        assert_eq!(gone_count, 0, "{table} must drop {gone}");
+    }
+    let remaining_admission: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playback_admissions WHERE play_session_id = 'adm-active'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_admission, 1);
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
