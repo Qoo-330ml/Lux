@@ -18184,7 +18184,11 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
 每分钟调用。
 第三批：同一清理函数覆盖终态 `user_registration_requests`（EXPIRED/APPROVED/REJECTED）与
 终态 `emby_migration_jobs`（COMPLETED/CANCELLED/FAILED，按 `finished_at`），回归同步扩展。
-剩余：`metadata_reidentify_jobs`/`scan_jobs` 已在任务历史保留期覆盖；
+第四批：`playback_history_events` 超过 90 天的行按月写入
+`<config>/archive/playback-history/<YYYY-MM>.jsonl`（flush + sync 成功后才删除对应行），失败时保留行等待
+下一次重试；回归 `archives_expired_events_to_monthly_jsonl_and_deletes_them` 与
+`archive_failure_keeps_the_rows_for_the_next_attempt`。worker 每分钟执行一批。
+`metadata_reidentify_jobs`/`scan_jobs` 已在任务历史保留期覆盖；
 `playback_events` 原始行转 JSONL 归档未做。
 
 #### LUX-860：元数据批量写入

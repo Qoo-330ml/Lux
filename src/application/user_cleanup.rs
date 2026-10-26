@@ -23,7 +23,11 @@ async fn purge_expired_user_activity_batch(
         .await
 }
 
-pub(crate) fn spawn_user_cleanup_worker(database: Database, avatars: UserAvatarService) {
+pub(crate) fn spawn_user_cleanup_worker(
+    database: Database,
+    avatars: UserAvatarService,
+    config_dir: Option<std::path::PathBuf>,
+) {
     tokio::spawn(async move {
         let first_tick = tokio::time::Instant::now() + USER_CLEANUP_INTERVAL;
         let mut interval = tokio::time::interval_at(first_tick, USER_CLEANUP_INTERVAL);
@@ -77,6 +81,18 @@ pub(crate) fn spawn_user_cleanup_worker(database: Database, avatars: UserAvatarS
                 .await
             {
                 tracing::warn!(%error, "failed to purge expired account records");
+            }
+            if let Some(config_dir) = &config_dir
+                && let Err(error) =
+                    crate::application::playback_history_retention::archive_playback_history(
+                        config_dir,
+                        &database,
+                        now,
+                        USER_CLEANUP_BATCH_SIZE,
+                    )
+                    .await
+            {
+                tracing::warn!(%error, "failed to archive expired playback history");
             }
         }
     });

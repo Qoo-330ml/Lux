@@ -710,6 +710,7 @@ impl AppState {
             crate::application::user_cleanup::spawn_user_cleanup_worker(
                 database.clone(),
                 avatars.clone(),
+                self.config_dir.clone(),
             );
         }
         if let Some(plugins) = self.plugins.as_ref()

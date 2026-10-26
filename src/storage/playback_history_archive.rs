@@ -201,3 +201,71 @@ impl Database {
         Ok(restored)
     }
 }
+
+#[derive(Debug, sqlx::FromRow)]
+pub(crate) struct StoredPlaybackHistoryEvent {
+    pub(crate) id: String,
+    pub(crate) user_id: String,
+    pub(crate) item_id: String,
+    pub(crate) event_type: String,
+    pub(crate) position_ticks: i64,
+    pub(crate) duration_ticks: Option<i64>,
+    pub(crate) occurred_at: i64,
+    pub(crate) source: String,
+}
+
+impl Database {
+    /// Old history events that the JSONL archive is about to move out of the database.
+    pub(crate) async fn list_playback_history_events_for_archive(
+        &self,
+        before: i64,
+        limit: i64,
+    ) -> Result<Vec<StoredPlaybackHistoryEvent>, StorageError> {
+        self.query_as(
+            "SELECT id, user_id, item_id, event_type, position_ticks, duration_ticks,
+                    occurred_at, source
+             FROM playback_history_events
+             WHERE occurred_at < ?
+             ORDER BY occurred_at, id
+             LIMIT ?",
+        )
+        .bind(before)
+        .bind(limit.clamp(1, 5_000))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    /// Deletes exactly the archived event ids. Callers must only pass ids whose lines reached disk.
+    pub(crate) async fn delete_playback_history_events(
+        &self,
+        ids: &[String],
+    ) -> Result<u64, StorageError> {
+        let mut deleted = 0_u64;
+        for chunk in ids.chunks(500) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!("DELETE FROM playback_history_events WHERE id IN ({placeholders})");
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for id in chunk {
+                statement = statement.bind(id);
+            }
+            deleted += statement
+                .execute(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected();
+        }
+        Ok(deleted)
+    }
+}
