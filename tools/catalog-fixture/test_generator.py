@@ -199,6 +199,142 @@ class CatalogSeedTests(unittest.TestCase):
             self.assertEqual((posters[0]["width"], posters[0]["height"]), (12, 18))
             self.assertEqual(posters[0]["content_tag"], fixture._sha256(sources / "source-0.png"))
 
+class SpecTargetSeedTests(unittest.TestCase):
+    DEFAULTS = {
+        "movies": 8,
+        "series_count": 2,
+        "episodes_per_series": 6,
+        "seasons_per_series": 2,
+        "detail_items": 3,
+        "user_states": 5,
+        "actor_items": 2,
+        "actors_per_item": 3,
+        "people_count": 5,
+        "poster_limit": 2,
+        "session_token": "fixed-token",
+        "now": 1_700_000_000,
+    }
+
+    def seed(self, directory: pathlib.Path, name: str = "lux.db", **overrides):
+        root = directory / name
+        root.mkdir()
+        database = root / "catalog.db"
+        migrated_database(database)
+        kwargs = dict(self.DEFAULTS)
+        kwargs.update(overrides)
+        manifest = fixture.seed_spec_target(database, root / "media", **kwargs)
+        return manifest, database
+
+    def test_spec_target_seed_builds_hierarchy_states_and_credits(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, database = self.seed(pathlib.Path(directory))
+            self.assertEqual(manifest["movieCount"], 8)
+            self.assertEqual(manifest["seriesCount"], 2)
+            self.assertEqual(manifest["seasonCount"], 4)
+            self.assertEqual(manifest["episodeCount"], 12)
+            self.assertEqual(manifest["itemCount"], 26)
+            self.assertEqual(manifest["imageCount"], 52)
+            self.assertEqual(manifest["sourceCount"], 3)
+            self.assertEqual(manifest["streamCount"], 9)
+            self.assertEqual(manifest["userStateCount"], 5)
+            self.assertEqual(manifest["creditCount"], 6)
+            self.assertEqual(len(manifest["contentSha256"]), 64)
+
+            connection = sqlite3.connect(database)
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM media_items WHERE item_type = 'EPISODE'"
+                        " AND series_id IS NOT NULL AND parent_id IS NOT NULL"
+                    ).fetchone()[0],
+                    12,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM media_items WHERE item_type IN ('MOVIE', 'SERIES')"
+                        " AND parent_id IS NOT NULL"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM media_items s JOIN media_items e"
+                        " ON e.parent_id = s.id"
+                        " WHERE s.item_type = 'SEASON' AND e.series_id = s.series_id"
+                    ).fetchone()[0],
+                    12,
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM user_item_state").fetchone()[0],
+                    5,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM user_item_state WHERE position_ticks > 0"
+                    ).fetchone()[0],
+                    5,
+                )
+                self.assertEqual(
+                    connection.execute("SELECT COUNT(*) FROM person_credits").fetchone()[0], 6
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM person_credits WHERE lux_person_id IS NOT NULL"
+                    ).fetchone()[0],
+                    6,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM item_images i"
+                        " LEFT JOIN media_items m ON m.id = i.item_id WHERE m.id IS NULL"
+                    ).fetchone()[0],
+                    0,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT COUNT(*) FROM media_sources s"
+                        " LEFT JOIN filesystem_entries f ON f.id = s.filesystem_entry_id"
+                        " WHERE f.id IS NULL"
+                    ).fetchone()[0],
+                    0,
+                )
+            finally:
+                connection.close()
+
+    def test_spec_target_seed_is_deterministic(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            first, first_db = self.seed(root, "first")
+            second, second_db = self.seed(root, "second")
+            self.assertEqual(first["contentSha256"], second["contentSha256"])
+            self.assertEqual(
+                {key: first[key] for key in first if key.endswith("Count")},
+                {key: second[key] for key in second if key.endswith("Count")},
+            )
+
+            def item_ids(database):
+                connection = sqlite3.connect(database)
+                try:
+                    return connection.execute(
+                        "SELECT item_type, id FROM media_items ORDER BY item_type, id"
+                    ).fetchall()
+                finally:
+                    connection.close()
+
+            self.assertEqual(item_ids(first_db), item_ids(second_db))
+
+    def test_spec_target_validates_counts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            database = root / "catalog.db"
+            migrated_database(database)
+            with self.assertRaises(ValueError):
+                fixture.seed_spec_target(database, root / "media", movies=0, series_count=0)
+            with self.assertRaises(ValueError):
+                fixture.seed_spec_target(
+                    database, root / "media", series_count=1, episodes_per_series=2, seasons_per_series=3
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

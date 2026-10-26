@@ -17972,12 +17972,28 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 
 验收：
 
-- [ ] 固定种子、可重复生成，记录 checksum 与生成耗时。
+- [x] 固定种子、可重复生成，记录 checksum 与生成耗时。
 - [ ] 基线表覆盖五个端点与扫描并发，注明硬件/夹具/命令。
 - [ ] 至少一次完整 PostgreSQL 基线；SQLite 与 PostgreSQL 分列。
-- [ ] `python3 -m unittest tools/catalog-fixture/test_generator.py` 通过。
+- [x] `python3 -m unittest tools/catalog-fixture/test_generator.py` 通过。
 
 依赖：无。
+
+进度（2026-10-26）：`tools/catalog-fixture/generate.py` 新增 `--spec-target` 配置（`--movies`、
+`--series`、`--episodes-per-series`、`--seasons-per-series`、`--user-states`、`--actor-items`、
+`--actors-per-item`、`--people`、`--detail-items`）；新增 `seed_spec_target()` 生成电影/剧集/季/集层级、
+每项海报与背景图、样本源与轨道、用户继续观看状态、人物与演职员，并输出 `contentSha256`（对排序后的
+`item_type:id` 求哈希）。修复 `_BatchWriter.TABLE_ORDER`：此前不在该顺序列表中的表会在 `flush()` 时
+被静默丢弃；本次加入 `people`、`person_credits`、`user_item_state` 后两类行才真正落库。
+
+本机 arm64 实测（`now=1_700_000_000`、固定 token、20 张海报）：迁移 210 个 SQLite migration 0.26 s，
+种子 5.68 s；生成 66,000 条目（10,000 电影 / 1,000 剧集 / 5,000 季 / 50,000 集）、132,000 图片行、
+2,000 源、6,000 轨道、2,000 用户状态、5,000 演职员；数据库 242,806,784 B，`PRAGMA integrity_check=ok`、
+`foreign_key_check` 为空；两次同参数生成 `contentSha256` 与条目 ID 集合一致。测试
+`python3 -m unittest tools/catalog-fixture/test_generator.py` 10/10。
+
+限制：图片复用同一海报池且不写媒体文件；只有前 2,000 条有源/轨道；本次未跑端点 p95 基线、
+未导入 PostgreSQL、未做扫描并发场景（下一步）。
 
 #### LUX-856：门禁基线处置
 
