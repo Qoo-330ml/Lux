@@ -18271,6 +18271,8 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 
 状态（2026-10-26，待项目所有者确认）：
 
+- 最终全量门禁（2026-10-27，提交 `d5fdd2e3` 之上的工作树）：`cargo test --locked --all-targets
+  --no-fail-fast` exit 0，128 个目标全部通过（lib 1349/0/32 ignored）。
 - LUX-854–856：已完成；端点基线由 `scripts/run-api-performance.py` 输出 p95/字节/CPU/RSS/DB/WAL，
   夹具可重复（11/11 生成器测试），门禁处置见 LUX-856 段。SQL 条数尚未接入中间件。
 - LUX-857–860：已完成。857 有 A/B（详情 p95 −21%、200 行更新 WAL −17%）；858 有拒绝载荷收缩与
