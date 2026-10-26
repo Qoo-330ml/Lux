@@ -225,7 +225,7 @@ class SpecTargetSeedTests(unittest.TestCase):
         manifest = fixture.seed_spec_target(database, root / "media", **kwargs)
         return manifest, database
 
-    def test_spec_target_can_seed_inline_nfo_payloads(self):
+    def test_spec_target_can_seed_nfo_payloads_for_the_current_schema(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest, database = self.seed(
                 pathlib.Path(directory), nfo_items=3, nfo_bytes=512
@@ -233,20 +233,42 @@ class SpecTargetSeedTests(unittest.TestCase):
             self.assertEqual(manifest["nfoItemCount"], 3)
             connection = sqlite3.connect(database)
             try:
-                rows = connection.execute(
-                    "SELECT length(nfo_metadata_json), length(nfo_metadata_fingerprint) "
-                    "FROM media_items WHERE item_type = 'MOVIE' ORDER BY title"
+                has_cache = (
+                    connection.execute(
+                        "SELECT 1 FROM sqlite_master WHERE type='table' "
+                        "AND name='media_item_nfo_cache'"
+                    ).fetchone()
+                    is not None
+                )
+                inline = connection.execute(
+                    "SELECT length(nfo_metadata_json) FROM media_items "
+                    "WHERE item_type = 'MOVIE' ORDER BY title"
                 ).fetchall()
+                if has_cache:
+                    cached = connection.execute(
+                        "SELECT length(cache.json), length(cache.fingerprint) "
+                        "FROM media_item_nfo_cache cache "
+                        "JOIN media_items item ON item.id = cache.item_id "
+                        "WHERE item.item_type = 'MOVIE' ORDER BY item.title"
+                    ).fetchall()
+                else:
+                    cached = connection.execute(
+                        "SELECT length(nfo_metadata_json), "
+                        "length(nfo_metadata_fingerprint) FROM media_items "
+                        "WHERE item_type = 'MOVIE' ORDER BY title"
+                    ).fetchall()
             finally:
                 connection.close()
-            self.assertEqual(len(rows), 8)
-            for json_bytes, fingerprint_bytes in rows[:3]:
+            self.assertEqual(len(inline), 8)
+            self.assertEqual(len(cached), 3)
+            for json_bytes, fingerprint_bytes in cached:
                 self.assertGreaterEqual(json_bytes, 400)
                 self.assertLessEqual(json_bytes, 512 + 128)
                 self.assertEqual(fingerprint_bytes, 32)
-            for json_bytes, fingerprint_bytes in rows[3:]:
-                self.assertIsNone(json_bytes)
-                self.assertIsNone(fingerprint_bytes)
+            if has_cache:
+                self.assertTrue(all(row[0] is None for row in inline))
+            else:
+                self.assertTrue(all(row[0] is None for row in inline[3:]))
 
     def test_spec_target_seed_builds_hierarchy_states_and_credits(self):
         with tempfile.TemporaryDirectory() as directory:

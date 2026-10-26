@@ -262,6 +262,7 @@ class _BatchWriter:
         "users",
         "web_sessions",
         "media_items",
+        "media_item_nfo_cache",
         "filesystem_entries",
         "media_sources",
         "media_streams",
@@ -784,6 +785,8 @@ def seed_spec_target(
                 ),
             )
 
+            has_nfo_cache = _table_exists(connection, "media_item_nfo_cache")
+
             def add_item(
                 *,
                 item_id: str,
@@ -837,10 +840,26 @@ def seed_spec_target(
                     added_at,
                     1,
                 ]
-                if nfo_json is not None:
+                fingerprint = (
+                    hashlib.sha256(nfo_json.encode("utf-8")).digest()
+                    if nfo_json is not None
+                    else None
+                )
+                if nfo_json is not None and not has_nfo_cache:
                     columns.extend(("nfo_metadata_json", "nfo_metadata_fingerprint"))
-                    row.extend((nfo_json, hashlib.sha256(nfo_json.encode("utf-8")).digest()))
+                    row.extend((nfo_json, fingerprint))
                 writer.add("media_items", tuple(columns), tuple(row))
+                if nfo_json is not None and has_nfo_cache:
+                    writer.add(
+                        "media_item_nfo_cache",
+                        ("item_id", "fingerprint", "json", "bytes"),
+                        (
+                            item_id,
+                            fingerprint,
+                            nfo_json,
+                            len(nfo_json.encode("utf-8")),
+                        ),
+                    )
 
                 for image_offset, image_type in enumerate(("POSTER", "FANART")):
                     poster = posters[(added_at + image_offset) % len(posters)]
