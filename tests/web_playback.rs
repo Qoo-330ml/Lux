@@ -1602,8 +1602,11 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     )
     .execute(database.pool())
     .await?;
+    // Without a forwarded chain the peer is the client and the trusted-proxy settings are never
+    // read. Send a chain so the resolver must consult the (now invalid) configuration.
     let proxy_settings_error = peer_client
         .get(format!("{peer_base_url}{}", proxy_context_ticket.1))
+        .header("x-forwarded-for", "198.51.100.7")
         .send()
         .await?;
     assert_eq!(

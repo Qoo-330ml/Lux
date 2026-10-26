@@ -18050,10 +18050,20 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
     改为启动 `start_scheduled_tasks()` 并把等待放宽到 30 s（含插件配置重写），14/14。
   - `web_static`：Vite 资产名是内容哈希（`index-*.js`/`*.css`），测试硬编码旧名；Emby 命名空间按设计返回
     裸 404 而不是 JSON 信封。测试改为从 index 解析入口并用裸 404 断言，2/2。
-- **剩余 6 个目标仍失败**（基线与当前树一致）：`scanned_metadata`（海报回滚计数、NFO 重试超时）、
-  `scanned_series_metadata`（不可读海报重试）、`scanning_jobs`（frontier 幂等计数）、
-  `scheduled_tasks`（cron 任务 0 次）、`watch`（2 个超时）、`web_playback`（期望 503 实际 200）。
-  需逐项判定是产品缺陷还是测试过时；已登记 LUX-862。
+- **第二轮又修复 3 个目标**：
+  - `scheduled_tasks`：STRM 计划只为真正含 STRM 源的库建任务；测试库没有任何 STRM 源所以 0 个任务是正确行为。
+    测试补一条 STRM 源后 9/9。
+  - `web_playback`：无转发链时访问 IP 直接取连接对端、不读可信代理设置；测试改为带 `X-Forwarded-For`
+    验证无效配置 fail-closed 503，测试通过。
+  - `scanned_series_metadata`：不可读本地海报现在的语义是“跳过并完成批次”（`1 local image item(s) skipped`），
+    不再让整个批次失败；测试按现行为重写。3/3。
+  - `scanned_metadata` 的 `failed_local_poster_insert_does_not_mark_image_stage_complete`：失败页面回滚后
+    已提交海报数量取决于批大小（本次为 2，原断言写死 1）；改为断言部分保留且批次失败，通过。
+- **剩余 3 个目标的 4 个用例仍失败**（基线与当前树一致）：`scanned_metadata`
+  `local_nfo_retry_excludes_non_retryable_conflict_item`（现按目录拆成多个批次，第三个批次 FAILED 且
+  `non_retryable_item_ids=[]`，需确认冲突条目是否仍被正确排除）、`scanning_jobs`
+  `manifest_discovery_reopens_and_retries_persisted_frontier_idempotently`（提交检查点 1 次而非 2 次）、
+  `watch` 两个实时监听超时。需逐项判定是产品缺陷还是测试过时；已登记 LUX-862。
 
 #### LUX-862：既有集成失败收敛
 

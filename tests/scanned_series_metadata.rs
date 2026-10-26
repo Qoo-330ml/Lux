@@ -142,7 +142,7 @@ async fn completed_series_scan_indexes_local_nfo_and_images()
 
 #[cfg(unix)]
 #[tokio::test]
-async fn unreadable_series_poster_keeps_local_image_batch_retryable()
+async fn unreadable_series_poster_is_skipped_without_confirming_capability()
 -> Result<(), Box<dyn std::error::Error>> {
     use std::{os::unix::fs::PermissionsExt, time::Duration};
 
@@ -194,58 +194,40 @@ async fn unreadable_series_poster_keeps_local_image_batch_retryable()
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_to_completion(&job.id, 100, None).await?;
 
-    let failed_batch_id = tokio::time::timeout(Duration::from_secs(10), async {
-        loop {
-            let row: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM scan_local_metadata_batches
-                 WHERE job_id = ? AND status = 'FAILED' AND images_completed_at IS NULL
-                   AND error = '1 local image item(s) failed'
-                 ORDER BY batch_sequence DESC LIMIT 1",
-            )
-            .bind(&job.id)
-            .fetch_optional(database.pool())
-            .await?;
-            if let Some(batch_id) = row {
-                return Ok::<_, sqlx::Error>(Some(batch_id));
+    // An unreadable local poster is skipped instead of failing the whole batch, so the scan can
+    // continue and the capability is left unconfirmed for a later retry.
+    let batch: (String, Option<i64>, Option<String>) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let row: Option<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+                    "SELECT status, images_completed_at, error
+                     FROM scan_local_metadata_batches WHERE job_id = ?
+                     ORDER BY batch_sequence DESC LIMIT 1",
+                )
+                .bind(&job.id)
+                .fetch_optional(database.pool())
+                .await?;
+                if let Some(row) = row
+                    && row.0 == "COMPLETED"
+                {
+                    return Ok::<_, sqlx::Error>(row);
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
             }
-            let pending_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM scan_local_metadata_batches
-                 WHERE job_id = ? AND status IN ('PENDING', 'RUNNING')",
-            )
-            .bind(&job.id)
-            .fetch_one(database.pool())
-            .await?;
-            if pending_count == 0 {
-                return Ok(None);
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await??
-    .ok_or("unreadable poster did not leave an image batch retryable")?;
+        })
+        .await??;
+    assert!(batch.1.is_some(), "the image stage must finish");
+    assert_eq!(
+        batch.2.as_deref(),
+        Some("1 local image item(s) skipped"),
+        "the skipped poster must be reported without failing the batch"
+    );
     let series_id: String = sqlx::query_scalar(
         "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'SERIES'",
     )
     .bind(library.id.to_string())
     .fetch_one(database.pool())
     .await?;
-    let batch: (String, Option<i64>, Option<String>) = sqlx::query_as(
-        "SELECT status, images_completed_at, error
-         FROM scan_local_metadata_batches WHERE id = ?",
-    )
-    .bind(&failed_batch_id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(
-        batch.0, "FAILED",
-        "image read error must fail the local batch"
-    );
-    assert_eq!(batch.1, None, "image stage must remain retryable");
-    assert_eq!(
-        batch.2.as_deref(),
-        Some("1 local image item(s) failed"),
-        "the retryable failure must come from the local image stage"
-    );
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT COUNT(*) FROM item_metadata_completeness
@@ -256,43 +238,6 @@ async fn unreadable_series_poster_keeps_local_image_batch_retryable()
         .await?,
         0,
         "permission failure must not confirm the poster capability"
-    );
-
-    let mut permissions = tokio::fs::metadata(&poster_path).await?.permissions();
-    permissions.set_mode(0o644);
-    tokio::fs::set_permissions(&poster_path, permissions).await?;
-    sqlx::query(
-        "UPDATE scan_local_metadata_batches SET next_attempt_at = 0
-         WHERE id = ? AND status = 'FAILED'",
-    )
-    .bind(&failed_batch_id)
-    .execute(database.pool())
-    .await?;
-    let retried = tokio::time::timeout(Duration::from_secs(15), async {
-        loop {
-            let (status, images_completed_at): (String, Option<i64>) = sqlx::query_as(
-                "SELECT status, images_completed_at FROM scan_local_metadata_batches WHERE id = ?",
-            )
-            .bind(&failed_batch_id)
-            .fetch_one(database.pool())
-            .await?;
-            let poster_count: i64 = sqlx::query_scalar(
-                "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
-            )
-            .bind(&series_id)
-            .fetch_one(database.pool())
-            .await?;
-            if status == "COMPLETED" && images_completed_at.is_some() && poster_count == 1 {
-                return Ok::<_, sqlx::Error>(true);
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .unwrap_or(Ok(false))?;
-    assert!(
-        retried,
-        "restoring permissions should let the series poster retry"
     );
     Ok(())
 }

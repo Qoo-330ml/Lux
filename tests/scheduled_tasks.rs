@@ -810,6 +810,40 @@ async fn enabled_strm_task_runs_once_per_matching_cron_minute()
     let library = luxd::application::libraries::LibraryService::new(database.clone())
         .create_library("Movies", LibraryKind::Movie, false)
         .await?;
+    // The STRM plan only creates jobs for libraries that actually contain STRM sources.
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('strm-task-root', ?, '/media', '/media', 1, 0)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at, last_seen_generation
+         ) VALUES ('strm-task-file', 'strm-task-root', 'movie.strm', 'FILE', 10, 0, 'gen')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status
+         ) VALUES ('strm-task-item', ?, 'MOVIE', 'Strm task', 'strm task', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, container, external_url,
+             is_default, probe_status
+         ) VALUES ('strm-task-source', 'strm-task-item', 'STRM_URL', 'strm-task-file', 'strm',
+                   'https://example.test/movie.mkv', 1, 'PENDING')",
+    )
+    .execute(database.pool())
+    .await?;
+
     let plugins = PluginService::new(database.clone(), config_dir);
     plugins.install(MEDIA_INFO_PLUGIN_ID).await?;
     plugins
