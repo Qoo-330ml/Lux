@@ -18113,6 +18113,12 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 
 依赖：LUX-855、LUX-856。
 
+进度（2026-10-26）：先完成**条件写**部分。`update_media_item_nfo_metadata` 只有在解析快照或
+fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 bump `updated_at`，也不清除
+`nfo_collection_reference_key`。回归
+`unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference` 覆盖“同快照不重写”和
+“快照变化则失效引用键”两条路径。`media_item_nfo_cache` 迁移与读写切换（外置）仍在进行，尚未提交。
+
 #### LUX-858：元数据候选减重
 
 范围：`metadata_candidates` 每个 item 只保留最新候选与选中项，拒绝/过期短窗口；`candidate_json` 只存应用所需字段，完整 TMDb 载荷不落库；清理按 `expires_at`，批次语句必须能走索引范围（参考 `database_cleanup.rs:932-938` 的既有结论）。

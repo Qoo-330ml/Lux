@@ -30690,6 +30690,64 @@ async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn 
 }
 
 #[tokio::test]
+async fn unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('nfo-write-lib', 'NFO', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, nfo_metadata_json, nfo_metadata_fingerprint,
+             nfo_collection_reference_key, updated_at
+         ) VALUES ('nfo-write', 'nfo-write-lib', 'MOVIE', 'Write', 'write', 'LOCAL_CONFIRMED',
+                   1, '{\"title\":\"Write\"}', X'01', 'collection-key', 100)",
+    )
+    .execute(database.pool())
+    .await?;
+
+    // Same snapshot and fingerprint: no row rewrite, no reference invalidation.
+    database
+        .update_media_item_nfo_metadata("nfo-write", Some("{\"title\":\"Write\"}"), Some(&[1]))
+        .await?;
+    let unchanged: (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT updated_at, nfo_collection_reference_key, nfo_metadata_json
+         FROM media_items WHERE id = 'nfo-write'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        unchanged.0, 100,
+        "unchanged snapshots must not bump updated_at"
+    );
+    assert_eq!(unchanged.1.as_deref(), Some("collection-key"));
+    assert_eq!(unchanged.2.as_deref(), Some("{\"title\":\"Write\"}"));
+
+    // A changed snapshot rewrites once and invalidates the derived reference.
+    database
+        .update_media_item_nfo_metadata("nfo-write", Some("{\"title\":\"Changed\"}"), Some(&[2]))
+        .await?;
+    let changed: (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT updated_at, nfo_collection_reference_key, nfo_metadata_json
+         FROM media_items WHERE id = 'nfo-write'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(changed.0 > 100);
+    assert_eq!(changed.1, None);
+    assert_eq!(changed.2.as_deref(), Some("{\"title\":\"Changed\"}"));
+    Ok(())
+}
+
+#[tokio::test]
 async fn successful_write_probes_are_cached_so_health_checks_do_not_write()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::config::Config;

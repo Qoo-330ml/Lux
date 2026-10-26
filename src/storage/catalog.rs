@@ -9032,6 +9032,10 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        // NFO files are re-read on every scan; only rewrite the row (and invalidate the derived
+        // collection reference) when the parsed snapshot or its fingerprint actually changed.
+        // The WHERE clause also keeps unchanged calls from bumping updated_at, which would
+        // otherwise make every scan look like a metadata change.
         self.query(
             "UPDATE media_items
              SET nfo_collection_reference_key = CASE
@@ -9040,12 +9044,16 @@ impl Database {
                  END,
                  nfo_metadata_json = ?, nfo_metadata_fingerprint = ?,
                  updated_at = unixepoch()
-             WHERE id = ?",
+             WHERE id = ?
+               AND (nfo_metadata_json IS DISTINCT FROM ?
+                    OR nfo_metadata_fingerprint IS DISTINCT FROM ?)",
         )
         .bind(nfo_metadata_json)
         .bind(nfo_metadata_json)
         .bind(source_fingerprint)
         .bind(item_id)
+        .bind(nfo_metadata_json)
+        .bind(source_fingerprint)
         .execute(&mut *transaction)
         .await
         .map(|_| ())
