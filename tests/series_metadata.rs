@@ -156,10 +156,11 @@ async fn series_metadata_reads_tvshow_season_episode_nfo_and_images()
         Some(&"tt1234567".to_owned())
     );
     let rich_nfo: Vec<(String, Option<String>)> = sqlx::query_as(
-        "SELECT item_type, nfo_metadata_json
-         FROM media_items
-         WHERE item_type IN ('SERIES', 'SEASON', 'EPISODE')
-         ORDER BY item_type",
+        "SELECT item.item_type, cache.json
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.item_type IN ('SERIES', 'SEASON', 'EPISODE')
+         ORDER BY item.item_type",
     )
     .fetch_all(database.pool())
     .await?;

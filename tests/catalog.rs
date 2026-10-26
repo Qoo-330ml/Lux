@@ -1905,9 +1905,9 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
         Some(1)
     );
     let cleared_nfo_json: Option<String> =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(&item_id)
-            .fetch_one(database.pool())
+            .fetch_optional(database.pool())
             .await?;
     assert!(
         cleared_nfo_json.is_none(),

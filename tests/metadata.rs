@@ -699,7 +699,9 @@ async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
     assert!(preserved_provider_ids.contains("1462229"));
 
     let stored_json: Option<String> = sqlx::query_scalar(
-        "SELECT nfo_metadata_json FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
+        "SELECT cache.json FROM media_item_nfo_cache cache
+         JOIN media_items item ON item.id = cache.item_id
+         WHERE item.item_type = 'MOVIE' LIMIT 1",
     )
     .fetch_one(database.pool())
     .await?;
@@ -749,8 +751,10 @@ async fn unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_chang
             .fetch_one(database.pool())
             .await?;
     let before: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
-         FROM media_items WHERE id = ?",
+        "SELECT cache.json, item.nfo_metadata_fingerprint
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = ?",
     )
     .bind(&item_id)
     .fetch_one(database.pool())
@@ -763,8 +767,10 @@ async fn unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_chang
     assert_eq!(second.nfo_skipped, 1);
 
     let after: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
-         FROM media_items WHERE id = ?",
+        "SELECT cache.json, item.nfo_metadata_fingerprint
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = ?",
     )
     .bind(&item_id)
     .fetch_one(database.pool())
@@ -817,7 +823,7 @@ async fn semantically_unchanged_nfo_revision_skips_metadata_and_relation_rewrite
     // source revision, but no semantic fingerprint, so it must be parsed and
     // upgraded once before the exact-revision fast path can resume.
     let versioned_cache: String =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
@@ -825,16 +831,21 @@ async fn semantically_unchanged_nfo_revision_skips_metadata_and_relation_rewrite
         .get("details")
         .cloned()
         .ok_or("versioned NFO cache has no details")?;
-    sqlx::query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
-        .bind(legacy_details.to_string())
-        .bind(&item_id)
-        .execute(database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE media_item_nfo_cache
+         SET json = ?, bytes = length(CAST(? AS BLOB)), updated_at = unixepoch()
+         WHERE item_id = ?",
+    )
+    .bind(legacy_details.to_string())
+    .bind(legacy_details.to_string())
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
     let legacy_upgrade = enricher.enrich_movie_library(library.id).await?;
     assert_eq!(legacy_upgrade.nfo_loaded, 1);
     assert_eq!(legacy_upgrade.nfo_skipped, 0);
     let upgraded_cache: String =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
@@ -848,7 +859,7 @@ async fn semantically_unchanged_nfo_revision_skips_metadata_and_relation_rewrite
 
     let relation_before = tokio::fs::read(&relation_path).await?;
     let cache_before: Option<String> =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
@@ -873,7 +884,7 @@ async fn semantically_unchanged_nfo_revision_skips_metadata_and_relation_rewrite
     assert_eq!(tokio::fs::read(&nfo_path).await?, equivalent.as_bytes());
     assert_eq!(tokio::fs::read(&relation_path).await?, relation_before);
     let cache_after: Option<String> =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
@@ -981,7 +992,7 @@ async fn actor_relation_failure_does_not_discard_nfo_and_is_retried_separately()
             .fetch_one(database.pool())
             .await?;
     let rich_json: Option<String> =
-        sqlx::query_scalar("SELECT nfo_metadata_json FROM media_items WHERE id = ?")
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
             .bind(&item_id)
             .fetch_one(database.pool())
             .await?;
@@ -1129,8 +1140,10 @@ async fn metadata_enrichment_ignores_conflicts_without_available_sources()
     assert_eq!(report.nfo_loaded, 1);
     assert_eq!(report.nfo_failed, 0);
     let current: (String, i64, Option<String>) = sqlx::query_as(
-        "SELECT title, production_year, nfo_metadata_json
-         FROM media_items WHERE has_available_source = 1",
+        "SELECT item.title, item.production_year, cache.json
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.has_available_source = 1",
     )
     .fetch_one(database.pool())
     .await?;
