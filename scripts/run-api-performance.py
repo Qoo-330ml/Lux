@@ -280,6 +280,11 @@ def main() -> int:
             " ON CONFLICT(library_root_id) DO UPDATE SET status = 'COMPLETED'"
         )
         connection.commit()
+        # A bulk seed leaves SQLite without optimizer statistics; without this the planner scans
+        # every episode per parent and the first catalog query can take tens of seconds.
+        connection.execute("ANALYZE")
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     finally:
         connection.close()
 

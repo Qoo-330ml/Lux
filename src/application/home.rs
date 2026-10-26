@@ -156,20 +156,35 @@ impl HomeService {
     ) -> Result<Arc<HomeSnapshot>, HomeError> {
         library_ids.sort_unstable();
         library_ids.dedup();
+        let stage_started = std::time::Instant::now();
         let content_restrictions = self
             .inner
             .catalog
             .content_restrictions_for_principal(principal)
             .await?;
+        tracing::debug!(
+            stage = "restrictions",
+            elapsed_ms = stage_started.elapsed().as_millis(),
+            "home snapshot stage"
+        );
+        let stage_started = std::time::Instant::now();
         let recommended = self
             .cached_snapshot_with_policy(principal, &library_ids, content_restrictions.clone())
             .await?
             .recommended
             .clone();
+        tracing::debug!(
+            stage = "recommended",
+            elapsed_ms = stage_started.elapsed().as_millis(),
+            "home snapshot stage"
+        );
         let user_id = principal.user_id_string();
+        let stage_started = std::time::Instant::now();
         let (continue_watching, recently_added, latest_groups, views) = tokio::try_join!(
             async {
-                self.inner
+                let started = std::time::Instant::now();
+                let result = self
+                    .inner
                     .catalog
                     .list_home_continue_watching_for_library_ids(
                         &library_ids,
@@ -178,11 +193,18 @@ impl HomeService {
                         0,
                         10,
                     )
-                    .await
-                    .map_err(HomeError::Catalog)
+                    .await;
+                tracing::debug!(
+                    stage = "continue_watching",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Catalog)
             },
             async {
-                self.inner
+                let started = std::time::Instant::now();
+                let result = self
+                    .inner
                     .catalog
                     .list_recently_added_for_library_ids(
                         &library_ids,
@@ -190,28 +212,48 @@ impl HomeService {
                         0,
                         12,
                     )
-                    .await
-                    .map_err(HomeError::Catalog)
+                    .await;
+                tracing::debug!(
+                    stage = "recently_added",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Catalog)
             },
             async {
-                self.inner
+                let started = std::time::Instant::now();
+                let result = self
+                    .inner
                     .catalog
                     .list_recently_added_by_library_ids(
                         &library_ids,
                         content_restrictions.as_ref(),
                         12,
                     )
-                    .await
-                    .map_err(HomeError::Catalog)
+                    .await;
+                tracing::debug!(
+                    stage = "latest_by_library",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Catalog)
             },
             async {
-                self.inner
-                    .libraries
-                    .list_libraries()
-                    .await
-                    .map_err(HomeError::Libraries)
+                let started = std::time::Instant::now();
+                let result = self.inner.libraries.list_libraries().await;
+                tracing::debug!(
+                    stage = "libraries",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Libraries)
             },
         )?;
+        tracing::debug!(
+            stage = "sections",
+            elapsed_ms = stage_started.elapsed().as_millis(),
+            "home snapshot stage"
+        );
         let views = self
             .inner
             .libraries

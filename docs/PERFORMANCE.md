@@ -2,12 +2,12 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
-## LUX-855 规格夹具端点基线（2026-10-26）
+## LUX-855 / LUX-861 规格夹具端点基线（2026-10-26，已修正）
 
-本机 `arm64`（macOS），release `luxd`（`LUX-855` 工作树），固定夹具由 `tools/catalog-fixture/generate.py
---spec-target` 生成：10,000 电影 / 1,000 剧集 / 5,000 季 / 50,000 集 = 66,000 条目，132,000 图片行、
-66,000 源、6,000 轨道、2,000 用户状态、5,000 演职员；`contentSha256=21c1f40b…3186`；数据库
-297,537,536 B，种子 11.9 s。命令：
+本机 `arm64`（macOS），release `luxd`，固定夹具由 `tools/catalog-fixture/generate.py --spec-target`
+生成：10,000 电影 / 1,000 剧集 / 5,000 季 / 50,000 集 = 66,000 条目，132,000 图片行、66,000 源、
+6,000 轨道、2,000 用户状态、5,000 演职员；`contentSha256=21c1f40b…3186`；数据库 297,619,456 B，
+种子 7.35 s。命令：
 
 ```bash
 python3 scripts/run-api-performance.py --binary target/release/luxd \
@@ -16,27 +16,42 @@ python3 scripts/run-api-performance.py --binary target/release/luxd \
 ```
 
 脚本先启动一次 `luxd` 让 sqlx 建库，再写夹具、把本地元数据回填标记为 `COMPLETED`、执行 `ANALYZE`
-并 checkpoint WAL，最后启动服务测量。会话使用夹具固定 token 的 `lux_session` cookie。
+并 checkpoint WAL，最后启动服务测量。
 
 | 端点 | p50 ms | p95 ms | p99 ms | 平均字节 |
 |---|---:|---:|---:|---:|
-| `GET /api/v1/home` | 681.7 | 704.7 | 704.7 | 93,491 |
-| `GET /api/v1/libraries/{id}/items?pageSize=24&count=false` | 6.2 | 9.0 | 9.0 | 47,761 |
-| `GET /api/v1/libraries/{id}/items?pageSize=24&count=true` | 5.8 | 6.8 | 6.8 | 47,775 |
-| `GET /api/v1/search?q=Spec&pageSize=24` | 874.5 | 905.1 | 905.1 | 47,847 |
-| `GET /api/v1/items/{id}` | 6.5 | 8.8 | 8.8 | 2,034 |
-| `GET /api/v1/continue-watching?pageSize=24` | 102.8 | 112.1 | 112.1 | 40,324 |
+| `GET /api/v1/home` | 111.7 | 117.6 | 117.6 | 93,491 |
+| `GET /api/v1/libraries/{id}/items?pageSize=24&count=false` | 2.2 | 2.4 | 2.4 | 47,761 |
+| `GET /api/v1/libraries/{id}/items?pageSize=24&count=true` | 2.0 | 2.3 | 2.3 | 47,775 |
+| `GET /api/v1/search?q=Spec&pageSize=24` | 66.2 | 67.7 | 67.7 | 47,847 |
+| `GET /api/v1/items/{id}` | 1.6 | 2.0 | 2.0 | 2,034 |
+| `GET /api/v1/continue-watching?pageSize=24` | 11.9 | 12.1 | 12.1 | 40,324 |
 
-### 冷启动与异常
+冷启动首个 `/api/v1/home`：200，186.2 ms，93,491 B。进程 CPU 增量 75.3 ms/请求（仍含后台 worker，
+只作量级参考）。
 
-- **新库首次 `/api/v1/home` 超过 90 s 超时**。服务日志显示首次启动时 `metadata_write` 写锁被持有约
-  2 分钟（`database write lock is held by another writer; waiting`），维护任务在锁释放后才完成
-  `ANALYZE`。早前一轮未加 `ANALYZE` 的夹具在调试构建下记录到 `latest_by_library` 用时 92.5 s。
-  根因未定位，已登记 LUX-861；本表数字是冷启动之后的稳态值。
-- 进程 CPU/请求为 1,631 ms，受后台 worker 与冷启动窗口污染，不能解释为单请求成本。
-- 搜索 905 ms、首页 705 ms 仍高于规格目标 500 / 400 ms；列表、详情、继续观看已达标。
-- 未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池，媒体文件不存在；结果不代表
-  NAS/x86_64 或真实弱网。
+### 为什么先前的数字不可用
+
+第一次运行没有执行 `ANALYZE`：SQLite 没有 `sqlite_stat1` 时按固定选择率估算，`latest_by_library`
+与 `continue_watching` 退化为逐父项扫描全部分集。当时记录到冷启动首个 home 超过 90 s（更早一轮
+240 s）、`latest_by_library` 92.5 s，后端日志显示首次启动时维护任务要等 `metadata_write` 写锁约
+2 分钟才完成 `ANALYZE`。同一数据库补跑 `ANALYZE`（66k 条目耗时 1.2 s）后，冷启动 home 变为
+185 ms，热路径也同步恢复到毫秒级。**上表是统计信息存在后的正确基线；旧数字只说明缺统计信息的后果。**
+
+### 产品修复（LUX-861）
+
+- 扫描后处理成功完成后，后台触发一次全量统计刷新（`refresh_query_statistics_after_bulk_change`），
+  不再等 15 分钟周期或首次启动的 120 s 延迟。
+- 周期统计刷新的首次延迟从 120 s 降到 10 s；周期刷新与批量刷新共用 `sqlite_statistics` 写锁，
+  扫描仍占用数据库时返回 `SkippedBusy`。
+- 写锁守卫现在会记录超过 1 s 的持有事件（`operation`、调用点、`held_ms`），不记录 SQL、路径或参数。
+
+### 限制
+
+- 数字只代表本机 arm64 / 单进程 / 临时目录，不代表 NAS/x86_64 或真实弱网。
+- 未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池，媒体文件不存在。
+- 冷启动只测到单次 186 ms；`p95` 需要多次冷启动才能给出。
+- 搜索 67.7 ms、首页 117.6 ms 均低于规格 500 / 400 ms，但这是 66k 夹具，不是生产媒体库。
 
 ## LUX-829–839 总览（2026-10-21）
 

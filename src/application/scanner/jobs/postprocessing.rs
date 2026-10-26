@@ -1510,6 +1510,7 @@ impl ScanJobService {
         {
             tracing::warn!(job_id, %error, "completed scan manifest payload cleanup failed");
         }
+        self.database.spawn_bulk_change_statistics_refresh();
         self.database.spawn_removed_media_item_purge();
         if completed_job.auto_metadata_match
             && !uses_local_metadata_outbox

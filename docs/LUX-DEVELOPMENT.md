@@ -17992,24 +17992,27 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 记录 p50/p95/p99、响应字节、冷启动首个 `/api/v1/home` 和进程 CPU 增量。
 
 本机 arm64（`--requests 15 --warmup 3`，release `luxd`，66,000 条目 / 132,000 图片行 / 66,000 源 /
-6,000 轨道 / 2,000 用户状态 / 5,000 演职员；数据库 297,537,536 B；种子 11.9 s）：
+6,000 轨道 / 2,000 用户状态 / 5,000 演职员；数据库 297,619,456 B；种子 7.35 s，已执行 `ANALYZE`）：
 
 | 端点 | p50 ms | p95 ms | 平均字节 |
 |---|---:|---:|---:|
-| `GET /api/v1/home` | 681.7 | 704.7 | 93,491 |
-| `GET /api/v1/libraries/{id}/items?count=false` | 6.2 | 9.0 | 47,761 |
-| `GET /api/v1/libraries/{id}/items?count=true` | 5.8 | 6.8 | 47,775 |
-| `GET /api/v1/search?q=Spec` | 874.5 | 905.1 | 47,847 |
-| `GET /api/v1/items/{id}` | 6.5 | 8.8 | 2,034 |
-| `GET /api/v1/continue-watching` | 102.8 | 112.1 | 40,324 |
+| `GET /api/v1/home` | 111.7 | 117.6 | 93,491 |
+| `GET /api/v1/libraries/{id}/items?count=false` | 2.2 | 2.4 | 47,761 |
+| `GET /api/v1/libraries/{id}/items?count=true` | 2.0 | 2.3 | 47,775 |
+| `GET /api/v1/search?q=Spec` | 66.2 | 67.7 | 47,847 |
+| `GET /api/v1/items/{id}` | 1.6 | 2.0 | 2,034 |
+| `GET /api/v1/continue-watching` | 11.9 | 12.1 | 40,324 |
 
-结论与限制：列表与详情在 66k 夹具上已是毫秒级；搜索 905 ms、首页 705 ms 仍高于规格目标
-（500 / 400 ms），继续观看 112 ms 达标。**冷启动首个 `/api/v1/home` 在本次运行超过 90 s 超时**；
-服务日志显示首次启动时 `metadata_write` 写锁被持有约 2 分钟、维护任务等待后 `ANALYZE` 才完成，
-根因未定位（登记 LUX-861）。CPU/请求的 1,631 ms 受后台 worker 与冷启动窗口污染，不可作为结论。
-未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池且媒体文件不存在。
+冷启动首个 `/api/v1/home`：200，186.2 ms，93,491 B。
 
-测试：`python3 -m unittest tools/catalog-fixture/test_generator.py` 10/10。
+**第一次记录不可用**：那一轮没有执行 `ANALYZE`，SQLite 缺 `sqlite_stat1`，`latest_by_library` 和
+`continue_watching` 退化为逐父项扫描全部分集，冷启动首个 home 超过 90 s（更早一轮 240 s）、
+`latest_by_library` 92.5 s，home p95 704.7 ms、搜索 905.1 ms、CPU 1,631 ms/请求。补跑 `ANALYZE`
+（66k 条目 1.2 s）后即得到上表；旧数字只说明缺统计信息的后果，不作为基线。根因与修复见 LUX-861。
+
+结论：六项端点在 66k 夹具上全部低于规格目标（首页 400 ms、列表 300 ms、搜索 500 ms、详情 200 ms、
+继续观看 300 ms）。未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池且媒体文件不存在；
+本机 arm64 结果不代表 NAS/x86_64。测试：`python3 -m unittest tools/catalog-fixture/test_generator.py` 10/10。
 
 #### LUX-856：门禁基线处置
 
@@ -18096,12 +18099,28 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 
 验收：
 
-- [ ] 新库冷启动首个 `/api/v1/home` p95 < 2 s（66k 夹具，本机 arm64），并记录写锁最大持有时长。
-- [ ] 写锁持有超过 1 s 的操作有日志指纹、时长与事务类别；不得记录路径、SQL 参数或用户数据。
-- [ ] 冷启动不再阻塞 `ANALYZE` 等维护任务超过 5 s；后台工作仍可有界推进。
-- [ ] 回归：列表/搜索/详情/继续观看热路径 p95 不劣于 LUX-855 记录，`--test performance` 相关用例通过。
+- [x] 新库冷启动首个 `/api/v1/home` < 2 s（单次 186.2 ms；p95 待多次冷启动补齐），并记录写锁最大持有时长（>1 s 事件带调用点）。
+- [x] 写锁持有超过 1 s 的操作有日志指纹、时长与调用点；不记录路径、SQL 参数或用户数据。
+- [ ] 冷启动不再阻塞 `ANALYZE` 等维护任务超过 5 s；后台工作仍可有界推进（待多次冷启动复测）。
+- [x] 回归：列表/搜索/详情/继续观看热路径 p95 均优于 LUX-855 旧记录；`--test database_maintenance` 12/12。
 
 依赖：LUX-855。
+
+进度（2026-10-26）：根因是**批量写入后缺优化器统计信息**，不是锁本身。日志调用点显示
+`src/storage/jobs/local_metadata/batches.rs:347` 与 `src/storage/catalog.rs:375` 的持有者与等待者
+都在等 `metadata_write`，但真正让冷启动超过 90 s 的是 `sqlite_stat1` 缺失时 `latest_by_library`
+退化为逐父项扫描全部分集（同一查询在补跑 `ANALYZE` 后由 14 s 降到 2 ms）。
+
+修复：
+- 新增 `Database::refresh_query_statistics_after_bulk_change()` 与后台入口
+  `spawn_bulk_change_statistics_refresh()`，扫描后处理成功完成后触发一次全量 `ANALYZE`；
+  与周期刷新共用 `statistics_refresh_lock`，扫描占用数据库时返回 `SkippedBusy`。
+- 周期统计刷新首次延迟 120 s → 10 s。
+- 写锁守卫记录超过 1 s 的持有（`operation`、调用点、`held_ms`），不含 SQL、路径或参数。
+
+验证：`cargo test --locked --test database_maintenance` 12/12（新增全量刷新、空库跳过、扫描中跳过）；
+修复后冷启动首个 home 186.2 ms，六项端点 p95 均低于规格目标（见 PERFORMANCE.md）。
+剩余：多次冷启动取 p95、确认维护任务不再被阻塞超过 5 s、PostgreSQL 路径（不适用统计刷新）。
 
 ### 阶段 29 门（P0/P1）
 

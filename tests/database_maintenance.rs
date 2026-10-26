@@ -289,6 +289,73 @@ async fn statistics_refresh_stands_down_while_a_scan_runs() -> Result<(), Box<dy
     Ok(())
 }
 
+#[tokio::test]
+async fn bulk_change_statistics_refresh_runs_a_full_analyze_each_time()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+    seed_catalog_row(&database).await?;
+
+    let first = database
+        .refresh_query_statistics_after_bulk_change()
+        .await?;
+    assert_eq!(first, SqliteStatisticsRefresh::Analyzed);
+    assert!(statistics_table_exists(&database).await?);
+    let described: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'media_items'")
+            .fetch_one(database.pool())
+            .await?;
+    assert!(described > 0, "the scanned catalog must be described");
+
+    // A completed scan can change thousands of rows, so the next bulk pass re-samples instead of
+    // trusting `PRAGMA optimize` to notice the growth.
+    let second = database
+        .refresh_query_statistics_after_bulk_change()
+        .await?;
+    assert_eq!(second, SqliteStatisticsRefresh::Analyzed);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_change_statistics_refresh_skips_an_empty_catalog()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+
+    let refreshed = database
+        .refresh_query_statistics_after_bulk_change()
+        .await?;
+
+    assert_eq!(refreshed, SqliteStatisticsRefresh::SkippedEmpty);
+    assert!(!statistics_table_exists(&database).await?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn bulk_change_statistics_refresh_stands_down_while_a_scan_runs()
+-> Result<(), Box<dyn std::error::Error>> {
+    let _serial_guard = MAINTENANCE_TEST_LOCK.lock().await;
+    let temp_dir = tempfile::tempdir()?;
+    let database = test_database(&temp_dir).await?;
+    seed_catalog_row(&database).await?;
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('bulk-stats-job', 'stats-lib', 'RECONCILE_LIBRARY', 'RUNNING', 'generation')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let refreshed = database
+        .refresh_query_statistics_after_bulk_change()
+        .await?;
+
+    assert_eq!(refreshed, SqliteStatisticsRefresh::SkippedBusy);
+    assert!(!statistics_table_exists(&database).await?);
+    Ok(())
+}
+
 /// Seeds reclaimable pages so a round genuinely has something to do.
 async fn seed_reclaimable_pages(
     database: &Database,

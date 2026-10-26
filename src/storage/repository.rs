@@ -416,36 +416,83 @@ const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::fro
 /// The lock is deliberately not a fair queue: the point is to serialise a handful of writers, not to
 /// schedule requests. What the log line adds is the answer to "why did this write take two seconds"
 /// without instrumenting every caller.
+/// Guard that reports write-lock holds long enough to delay maintenance and reader waits.
+///
+/// The caller location is captured at acquisition so a long hold names the code path without
+/// logging SQL text, identifiers, or user data.
+pub(crate) struct WriteLockGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    operation: &'static str,
+    caller: &'static std::panic::Location<'static>,
+    acquired_at: Instant,
+}
+
+/// How long one writer may hold a process-wide write lock before the hold is reported.
+const WRITE_LOCK_HOLD_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+
+impl Drop for WriteLockGuard {
+    fn drop(&mut self) {
+        let held = self.acquired_at.elapsed();
+        if held >= WRITE_LOCK_HOLD_LOG_THRESHOLD {
+            tracing::warn!(
+                operation = self.operation,
+                caller = %self.caller,
+                held_ms = u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+                "database write lock held for a long time"
+            );
+        }
+    }
+}
+
 async fn acquire_write_lock_after(
     lock: &Arc<AsyncMutex<()>>,
     operation: &'static str,
     threshold: Duration,
-) -> tokio::sync::OwnedMutexGuard<()> {
+    caller: &'static std::panic::Location<'static>,
+) -> WriteLockGuard {
     match tokio::time::timeout(threshold, lock.clone().lock_owned()).await {
-        Ok(guard) => guard,
+        Ok(guard) => WriteLockGuard {
+            _guard: guard,
+            operation,
+            caller,
+            acquired_at: Instant::now(),
+        },
         Err(_) => {
             let started = Instant::now();
             tracing::info!(
                 operation,
+                caller = %caller,
                 threshold_ms = threshold.as_millis() as u64,
                 "database write lock is held by another writer; waiting"
             );
             let guard = lock.clone().lock_owned().await;
             tracing::info!(
                 operation,
+                caller = %caller,
                 waited_ms = started.elapsed().as_millis() as u64,
                 "database write lock acquired after waiting"
             );
-            guard
+            WriteLockGuard {
+                _guard: guard,
+                operation,
+                caller,
+                acquired_at: started,
+            }
         }
     }
 }
 
-async fn acquire_write_lock(
+/// Returns a future so `#[track_caller]` can capture the real call site (async fns ignore it).
+#[track_caller]
+fn acquire_write_lock(
     lock: &Arc<AsyncMutex<()>>,
     operation: &'static str,
-) -> tokio::sync::OwnedMutexGuard<()> {
-    acquire_write_lock_after(lock, operation, WRITE_LOCK_WAIT_LOG_THRESHOLD).await
+) -> impl std::future::Future<Output = WriteLockGuard> {
+    let caller = std::panic::Location::caller();
+    let lock = lock.clone();
+    async move {
+        acquire_write_lock_after(&lock, operation, WRITE_LOCK_WAIT_LOG_THRESHOLD, caller).await
+    }
 }
 
 fn database_pool_options(max_connections: u32) -> AnyPoolOptions {
@@ -531,6 +578,7 @@ pub struct Database {
     person_credits_write_lock: Arc<AsyncMutex<()>>,
     metadata_write_lock: Arc<AsyncMutex<()>>,
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
+    statistics_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
     dashboard_stats_cache: Arc<AsyncMutex<Option<CachedDashboardStats>>>,
     write_probe: Arc<AsyncMutex<Option<std::time::Instant>>>,
@@ -1143,6 +1191,7 @@ impl Database {
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
             recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+            statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
@@ -1166,13 +1215,27 @@ impl Database {
         }
     }
 
-    pub(crate) async fn acquire_metadata_write_lock(
+    #[track_caller]
+    pub(crate) fn acquire_metadata_write_lock(
         &self,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if self.backend == DatabaseBackend::Sqlite {
-            Some(acquire_write_lock(&self.metadata_write_lock, "metadata_write").await)
-        } else {
-            None
+    ) -> impl std::future::Future<Output = Option<WriteLockGuard>> {
+        let caller = std::panic::Location::caller();
+        let backend = self.backend;
+        let lock = self.metadata_write_lock.clone();
+        async move {
+            if backend == DatabaseBackend::Sqlite {
+                Some(
+                    acquire_write_lock_after(
+                        &lock,
+                        "metadata_write",
+                        WRITE_LOCK_WAIT_LOG_THRESHOLD,
+                        caller,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
         }
     }
 

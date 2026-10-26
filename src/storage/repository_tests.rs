@@ -11908,6 +11908,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
@@ -14507,6 +14508,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
@@ -14576,6 +14578,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
@@ -14707,6 +14710,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
@@ -18567,6 +18571,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
@@ -18658,6 +18663,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
@@ -19161,6 +19167,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
@@ -31986,7 +31993,13 @@ async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
     tokio::time::sleep(Duration::from_millis(10)).await;
 
     let started = Instant::now();
-    let guard = acquire_write_lock_after(&lock, "test", Duration::from_millis(1)).await;
+    let guard = acquire_write_lock_after(
+        &lock,
+        "test",
+        Duration::from_millis(1),
+        std::panic::Location::caller(),
+    )
+    .await;
     let waited = started.elapsed();
     drop(guard);
     holder.await.expect("holder task");
