@@ -225,6 +225,29 @@ class SpecTargetSeedTests(unittest.TestCase):
         manifest = fixture.seed_spec_target(database, root / "media", **kwargs)
         return manifest, database
 
+    def test_spec_target_can_seed_inline_nfo_payloads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            manifest, database = self.seed(
+                pathlib.Path(directory), nfo_items=3, nfo_bytes=512
+            )
+            self.assertEqual(manifest["nfoItemCount"], 3)
+            connection = sqlite3.connect(database)
+            try:
+                rows = connection.execute(
+                    "SELECT length(nfo_metadata_json), length(nfo_metadata_fingerprint) "
+                    "FROM media_items WHERE item_type = 'MOVIE' ORDER BY title"
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(len(rows), 8)
+            for json_bytes, fingerprint_bytes in rows[:3]:
+                self.assertGreaterEqual(json_bytes, 400)
+                self.assertLessEqual(json_bytes, 512 + 128)
+                self.assertEqual(fingerprint_bytes, 32)
+            for json_bytes, fingerprint_bytes in rows[3:]:
+                self.assertIsNone(json_bytes)
+                self.assertIsNone(fingerprint_bytes)
+
     def test_spec_target_seed_builds_hierarchy_states_and_credits(self):
         with tempfile.TemporaryDirectory() as directory:
             manifest, database = self.seed(pathlib.Path(directory))

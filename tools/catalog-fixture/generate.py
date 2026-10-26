@@ -680,6 +680,8 @@ def seed_spec_target(
     actor_items: int = 1_000,
     actors_per_item: int = 5,
     people_count: int = 200,
+    nfo_items: int = 0,
+    nfo_bytes: int = 128 * 1024,
     poster_limit: int = DEFAULT_POSTER_COUNT,
     posters_dir: Path | None = None,
     session_token: str | None = None,
@@ -698,6 +700,10 @@ def seed_spec_target(
         raise ValueError("movies and series_count must be non-negative with at least one item")
     if episodes_per_series < 1 or seasons_per_series < 1:
         raise ValueError("episodes_per_series and seasons_per_series must be positive")
+    if nfo_items < 0 or nfo_items > movies:
+        raise ValueError("nfo_items must be between 0 and movies")
+    if nfo_bytes < 0:
+        raise ValueError("nfo_bytes must be non-negative")
     if episodes_per_series < seasons_per_series:
         raise ValueError("episodes_per_series must be at least seasons_per_series")
     if people_count < 1 or actors_per_item < 1:
@@ -791,48 +797,50 @@ def seed_spec_target(
                 episode_number: int | None = None,
                 sort_title: str | None = None,
                 runtime_ticks: int = 54_000_000_000,
+                nfo_json: str | None = None,
             ) -> None:
-                writer.add(
-                    "media_items",
-                    (
-                        "id",
-                        "library_id",
-                        "item_type",
-                        "parent_id",
-                        "series_id",
-                        "season_number",
-                        "episode_number",
-                        "title",
-                        "sort_title",
-                        "overview",
-                        "production_year",
-                        "premiere_date",
-                        "runtime_ticks",
-                        "rating",
-                        "identification_status",
-                        "added_at",
-                        "has_available_source",
-                    ),
-                    (
-                        item_id,
-                        library_id,
-                        item_type,
-                        parent_id,
-                        series_id,
-                        season_number,
-                        episode_number,
-                        title,
-                        sort_title or title,
-                        SPEC_TARGET_OVERVIEW * 3,
-                        1990 + added_at % 35,
-                        f"{1990 + added_at % 35:04d}-01-01",
-                        runtime_ticks,
-                        round((added_at % 97) / 10.0, 1),
-                        "LOCAL_CONFIRMED",
-                        added_at,
-                        1,
-                    ),
-                )
+                columns = [
+                    "id",
+                    "library_id",
+                    "item_type",
+                    "parent_id",
+                    "series_id",
+                    "season_number",
+                    "episode_number",
+                    "title",
+                    "sort_title",
+                    "overview",
+                    "production_year",
+                    "premiere_date",
+                    "runtime_ticks",
+                    "rating",
+                    "identification_status",
+                    "added_at",
+                    "has_available_source",
+                ]
+                row: list[object] = [
+                    item_id,
+                    library_id,
+                    item_type,
+                    parent_id,
+                    series_id,
+                    season_number,
+                    episode_number,
+                    title,
+                    sort_title or title,
+                    SPEC_TARGET_OVERVIEW * 3,
+                    1990 + added_at % 35,
+                    f"{1990 + added_at % 35:04d}-01-01",
+                    runtime_ticks,
+                    round((added_at % 97) / 10.0, 1),
+                    "LOCAL_CONFIRMED",
+                    added_at,
+                    1,
+                ]
+                if nfo_json is not None:
+                    columns.extend(("nfo_metadata_json", "nfo_metadata_fingerprint"))
+                    row.extend((nfo_json, hashlib.sha256(nfo_json.encode("utf-8")).digest()))
+                writer.add("media_items", tuple(columns), tuple(row))
 
                 for image_offset, image_type in enumerate(("POSTER", "FANART")):
                     poster = posters[(added_at + image_offset) % len(posters)]
@@ -866,6 +874,16 @@ def seed_spec_target(
 
             sources = 0
             streams = 0
+            nfo_padding = "x" * max(0, nfo_bytes - 128)
+            nfo_json = json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "semanticFingerprint": None,
+                    "relationFingerprint": None,
+                    "details": {"tagline": nfo_padding},
+                },
+                separators=(",", ":"),
+            )
             for index in range(movies):
                 item_id = _stable_uuid(f"spec:movie:{index:06d}")
                 add_item(
@@ -875,6 +893,7 @@ def seed_spec_target(
                     title=f"Spec Movie {index:06d}",
                     added_at=timestamp - index * 60,
                     runtime_ticks=54_000_000_000,
+                    nfo_json=nfo_json if index < nfo_items else None,
                 )
                 detail_order.append((item_id, movie_library))
 
@@ -1188,6 +1207,8 @@ def seed_spec_target(
                 ).fetchone()[0],
                 "userStateCount": state_count,
                 "creditCount": credits,
+                "nfoItemCount": nfo_items,
+                "nfoBytes": nfo_bytes,
                 "detailItemCount": min(detail_budget, len(detail_order)),
                 "contentSha256": digest.hexdigest(),
                 "libraries": [
@@ -1243,6 +1264,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--actor-items", type=int, default=1_000)
     parser.add_argument("--actors-per-item", type=int, default=5)
     parser.add_argument("--people", type=int, default=200)
+    parser.add_argument("--nfo-items", type=int, default=0)
+    parser.add_argument("--nfo-bytes", type=int, default=128 * 1024)
     return parser
 
 
@@ -1264,6 +1287,8 @@ def main() -> int:
             actor_items=args.actor_items,
             actors_per_item=args.actors_per_item,
             people_count=args.people,
+            nfo_items=args.nfo_items,
+            nfo_bytes=args.nfo_bytes,
             poster_limit=args.posters,
             posters_dir=args.posters_dir,
             session_token=args.session_token,
