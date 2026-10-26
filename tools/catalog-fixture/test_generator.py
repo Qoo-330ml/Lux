@@ -234,7 +234,7 @@ class SpecTargetSeedTests(unittest.TestCase):
             self.assertEqual(manifest["episodeCount"], 12)
             self.assertEqual(manifest["itemCount"], 26)
             self.assertEqual(manifest["imageCount"], 52)
-            self.assertEqual(manifest["sourceCount"], 3)
+            self.assertEqual(manifest["sourceCount"], manifest["itemCount"])
             self.assertEqual(manifest["streamCount"], 9)
             self.assertEqual(manifest["userStateCount"], 5)
             self.assertEqual(manifest["creditCount"], 6)

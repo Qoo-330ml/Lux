@@ -17986,14 +17986,30 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 `item_type:id` 求哈希）。修复 `_BatchWriter.TABLE_ORDER`：此前不在该顺序列表中的表会在 `flush()` 时
 被静默丢弃；本次加入 `people`、`person_credits`、`user_item_state` 后两类行才真正落库。
 
-本机 arm64 实测（`now=1_700_000_000`、固定 token、20 张海报）：迁移 210 个 SQLite migration 0.26 s，
-种子 5.68 s；生成 66,000 条目（10,000 电影 / 1,000 剧集 / 5,000 季 / 50,000 集）、132,000 图片行、
-2,000 源、6,000 轨道、2,000 用户状态、5,000 演职员；数据库 242,806,784 B，`PRAGMA integrity_check=ok`、
-`foreign_key_check` 为空；两次同参数生成 `contentSha256` 与条目 ID 集合一致。测试
-`python3 -m unittest tools/catalog-fixture/test_generator.py` 10/10。
+后续补充（同日）：为全部 66,000 条目生成源（此前只有前 2,000 条有源，导致 `has_available_source=1`
+与 `media_sources` 不一致）；新增 `scripts/run-api-performance.py`：先启动一次 `luxd` 让 sqlx 建库，
+再写入夹具、标记本地元数据回填为 `COMPLETED`、执行 `ANALYZE` 并 checkpoint WAL，最后启动服务按路由模板
+记录 p50/p95/p99、响应字节、冷启动首个 `/api/v1/home` 和进程 CPU 增量。
 
-限制：图片复用同一海报池且不写媒体文件；只有前 2,000 条有源/轨道；本次未跑端点 p95 基线、
-未导入 PostgreSQL、未做扫描并发场景（下一步）。
+本机 arm64（`--requests 15 --warmup 3`，release `luxd`，66,000 条目 / 132,000 图片行 / 66,000 源 /
+6,000 轨道 / 2,000 用户状态 / 5,000 演职员；数据库 297,537,536 B；种子 11.9 s）：
+
+| 端点 | p50 ms | p95 ms | 平均字节 |
+|---|---:|---:|---:|
+| `GET /api/v1/home` | 681.7 | 704.7 | 93,491 |
+| `GET /api/v1/libraries/{id}/items?count=false` | 6.2 | 9.0 | 47,761 |
+| `GET /api/v1/libraries/{id}/items?count=true` | 5.8 | 6.8 | 47,775 |
+| `GET /api/v1/search?q=Spec` | 874.5 | 905.1 | 47,847 |
+| `GET /api/v1/items/{id}` | 6.5 | 8.8 | 2,034 |
+| `GET /api/v1/continue-watching` | 102.8 | 112.1 | 40,324 |
+
+结论与限制：列表与详情在 66k 夹具上已是毫秒级；搜索 905 ms、首页 705 ms 仍高于规格目标
+（500 / 400 ms），继续观看 112 ms 达标。**冷启动首个 `/api/v1/home` 在本次运行超过 90 s 超时**；
+服务日志显示首次启动时 `metadata_write` 写锁被持有约 2 分钟、维护任务等待后 `ANALYZE` 才完成，
+根因未定位（登记 LUX-861）。CPU/请求的 1,631 ms 受后台 worker 与冷启动窗口污染，不可作为结论。
+未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池且媒体文件不存在。
+
+测试：`python3 -m unittest tools/catalog-fixture/test_generator.py` 10/10。
 
 #### LUX-856：门禁基线处置
 
@@ -18066,6 +18082,26 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 - [ ] 补全吞吐不低于基线；记录 WAL 与锁等待。
 
 依赖：LUX-857、LUX-858。
+
+#### LUX-861：冷启动首页与元数据写锁持有时长
+
+范围：定位并修复“新库首次 `/api/v1/home` 可超过 90 s”的冷启动问题。日志显示首次启动时
+`metadata_write` 写锁被持有约 2 分钟（`database write lock is held by another writer; waiting`），
+维护任务在锁释放后才完成 `ANALYZE`。需确认持锁者（推荐统计刷新、本地元数据 outbox 或内容限制索引），
+给出可复现的锁等待/持有时长，并把持锁工作拆成有界批次或移出请求路径。不得改变 API 语义。
+
+预计修改文件（4–8 个）：`src/storage/repository.rs`、`src/application/home.rs`、
+`src/application/scanner/jobs/local_metadata.rs`、`src/storage/catalog.rs`、`src/observability/*`、
+`tests/performance.rs`、`docs/PERFORMANCE.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [ ] 新库冷启动首个 `/api/v1/home` p95 < 2 s（66k 夹具，本机 arm64），并记录写锁最大持有时长。
+- [ ] 写锁持有超过 1 s 的操作有日志指纹、时长与事务类别；不得记录路径、SQL 参数或用户数据。
+- [ ] 冷启动不再阻塞 `ANALYZE` 等维护任务超过 5 s；后台工作仍可有界推进。
+- [ ] 回归：列表/搜索/详情/继续观看热路径 p95 不劣于 LUX-855 记录，`--test performance` 相关用例通过。
+
+依赖：LUX-855。
 
 ### 阶段 29 门（P0/P1）
 

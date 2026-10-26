@@ -790,7 +790,7 @@ def seed_spec_target(
                 season_number: int | None = None,
                 episode_number: int | None = None,
                 sort_title: str | None = None,
-                runtime_ticks: int = 5_400_000_000,
+                runtime_ticks: int = 54_000_000_000,
             ) -> None:
                 writer.add(
                     "media_items",
@@ -874,6 +874,7 @@ def seed_spec_target(
                     item_type="MOVIE",
                     title=f"Spec Movie {index:06d}",
                     added_at=timestamp - index * 60,
+                    runtime_ticks=54_000_000_000,
                 )
                 detail_order.append((item_id, movie_library))
 
@@ -920,7 +921,7 @@ def seed_spec_target(
                         series_id=series_id,
                         season_number=season_number,
                         episode_number=episode_number,
-                        runtime_ticks=2_700_000_000,
+                        runtime_ticks=27_000_000_000,
                     )
                     detail_order.append((episode_id, series_library))
 
@@ -1004,6 +1005,69 @@ def seed_spec_target(
                     )
                     streams += 1
 
+            # Every item needs a real source row: items without sources make list joins and
+            # metadata completeness checks inconsistent with `has_available_source = 1`.
+            writer.flush()
+            remaining = connection.execute(
+                "SELECT mi.id, mi.library_id FROM media_items mi"
+                " WHERE NOT EXISTS (SELECT 1 FROM media_sources s WHERE s.item_id = mi.id)"
+            ).fetchall()
+            for item_id, library_id in remaining:
+                file_entry_id = _stable_uuid(f"spec:file:{item_id}")
+                writer.add(
+                    "filesystem_entries",
+                    (
+                        "id",
+                        "library_root_id",
+                        "relative_path",
+                        "entry_kind",
+                        "size",
+                        "modified_at",
+                        "last_seen_generation",
+                    ),
+                    (
+                        file_entry_id,
+                        _stable_uuid(
+                            "spec:root:movies"
+                            if library_id == movie_library
+                            else "spec:root:series"
+                        ),
+                        f"media/{item_id}/source.mkv",
+                        "FILE",
+                        1_000_000,
+                        timestamp,
+                        "spec",
+                    ),
+                )
+                writer.add(
+                    "media_sources",
+                    (
+                        "id",
+                        "item_id",
+                        "source_kind",
+                        "filesystem_entry_id",
+                        "container",
+                        "size",
+                        "duration_ticks",
+                        "bitrate",
+                        "is_default",
+                        "probe_status",
+                    ),
+                    (
+                        _stable_uuid(f"spec:source:{item_id}"),
+                        item_id,
+                        "LOCAL_FILE",
+                        file_entry_id,
+                        "mkv",
+                        1_000_000,
+                        54_000_000_000,
+                        8_000_000,
+                        1,
+                        "PROBED",
+                    ),
+                )
+                sources += 1
+
             episode_ids = [
                 _stable_uuid(f"spec:episode:{series_index:04d}:{episode_number}")
                 for series_index in range(series_count)
@@ -1026,7 +1090,7 @@ def seed_spec_target(
                     (
                         user_id,
                         item_id,
-                        1_000_000 + state_index * 1_000,
+                        6_000_000_000 + state_index * 10_000_000,
                         0,
                         1 if state_index % 5 == 0 else 0,
                         1,
@@ -1126,6 +1190,12 @@ def seed_spec_target(
                 "creditCount": credits,
                 "detailItemCount": min(detail_budget, len(detail_order)),
                 "contentSha256": digest.hexdigest(),
+                "libraries": [
+                    {"id": movie_library, "name": "Spec Movies", "kind": "MOVIE"},
+                    {"id": series_library, "name": "Spec Series", "kind": "SERIES"},
+                ],
+                "sampleMovieId": _stable_uuid("spec:movie:000000"),
+                "sampleSeriesId": _stable_uuid("spec:series:0000"),
                 "database": str(database),
                 "mediaRoot": str(media_root),
                 "postersDirectory": str(media_root / "posters"),

@@ -2,6 +2,42 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-855 规格夹具端点基线（2026-10-26）
+
+本机 `arm64`（macOS），release `luxd`（`LUX-855` 工作树），固定夹具由 `tools/catalog-fixture/generate.py
+--spec-target` 生成：10,000 电影 / 1,000 剧集 / 5,000 季 / 50,000 集 = 66,000 条目，132,000 图片行、
+66,000 源、6,000 轨道、2,000 用户状态、5,000 演职员；`contentSha256=21c1f40b…3186`；数据库
+297,537,536 B，种子 11.9 s。命令：
+
+```bash
+python3 scripts/run-api-performance.py --binary target/release/luxd \
+  --work-dir /tmp/lux-api-perf-full --requests 15 --warmup 3 \
+  --json-out /tmp/lux-api-baseline.json
+```
+
+脚本先启动一次 `luxd` 让 sqlx 建库，再写夹具、把本地元数据回填标记为 `COMPLETED`、执行 `ANALYZE`
+并 checkpoint WAL，最后启动服务测量。会话使用夹具固定 token 的 `lux_session` cookie。
+
+| 端点 | p50 ms | p95 ms | p99 ms | 平均字节 |
+|---|---:|---:|---:|---:|
+| `GET /api/v1/home` | 681.7 | 704.7 | 704.7 | 93,491 |
+| `GET /api/v1/libraries/{id}/items?pageSize=24&count=false` | 6.2 | 9.0 | 9.0 | 47,761 |
+| `GET /api/v1/libraries/{id}/items?pageSize=24&count=true` | 5.8 | 6.8 | 6.8 | 47,775 |
+| `GET /api/v1/search?q=Spec&pageSize=24` | 874.5 | 905.1 | 905.1 | 47,847 |
+| `GET /api/v1/items/{id}` | 6.5 | 8.8 | 8.8 | 2,034 |
+| `GET /api/v1/continue-watching?pageSize=24` | 102.8 | 112.1 | 112.1 | 40,324 |
+
+### 冷启动与异常
+
+- **新库首次 `/api/v1/home` 超过 90 s 超时**。服务日志显示首次启动时 `metadata_write` 写锁被持有约
+  2 分钟（`database write lock is held by another writer; waiting`），维护任务在锁释放后才完成
+  `ANALYZE`。早前一轮未加 `ANALYZE` 的夹具在调试构建下记录到 `latest_by_library` 用时 92.5 s。
+  根因未定位，已登记 LUX-861；本表数字是冷启动之后的稳态值。
+- 进程 CPU/请求为 1,631 ms，受后台 worker 与冷启动窗口污染，不能解释为单请求成本。
+- 搜索 905 ms、首页 705 ms 仍高于规格目标 500 / 400 ms；列表、详情、继续观看已达标。
+- 未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池，媒体文件不存在；结果不代表
+  NAS/x86_64 或真实弱网。
+
 ## LUX-829–839 总览（2026-10-21）
 
 同一 1,000,000 条夹具、release `luxd`、20 Mbps / 40 ms、每轮重启服务的冷启动序列：
