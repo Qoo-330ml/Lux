@@ -4346,8 +4346,8 @@ mod tests {
         );
         assert_eq!(
             database.query_count(),
-            3,
-            "item context, mirror policy, and combined state sync"
+            4,
+            "item context, mirror policy, cache freshness and combined state sync"
         );
         let content = fs::read_to_string(&target).await?;
         assert!(content.contains("<custom>keep</custom>"));
@@ -4386,8 +4386,8 @@ mod tests {
             .await?;
         assert_eq!(
             database.query_count(),
-            3,
-            "movie item context, mirror policy, and combined state sync"
+            4,
+            "movie item context, mirror policy, cache freshness and combined state sync"
         );
         let movie_content = fs::read_to_string(&target).await?;
         assert!(

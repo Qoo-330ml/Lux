@@ -1897,7 +1897,7 @@ impl Database {
                  metadata_scraper_id = CASE WHEN ? IS NULL THEN metadata_scraper_id ELSE ? END,
                  identification_status = CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END,
                  metadata_fingerprint = ?, metadata_provenance_json = ?, locked_fields_json = ?,
-                 nfo_metadata_json = COALESCE(?, nfo_metadata_json),
+                 nfo_metadata_json = NULL,
                  nfo_metadata_fingerprint = COALESCE(?, nfo_metadata_fingerprint),
                  poster_fallback_required = ?, updated_at = unixepoch()
              WHERE id = ? AND removed_at IS NULL",
@@ -1922,7 +1922,6 @@ impl Database {
         .bind(update.metadata_fingerprint)
         .bind(update.provenance_json)
         .bind(update.locked_fields_json)
-        .bind(nfo_metadata_json)
         .bind(nfo_metadata_fingerprint)
         .bind(database_flag(update.poster_fallback_required))
         .bind(update.item_id)
@@ -1932,6 +1931,33 @@ impl Database {
             path: self.path.clone(),
             source,
         })?;
+        if let Some(json) = nfo_metadata_json {
+            let changed = self
+                .upsert_media_item_nfo_cache_in_transaction(
+                    &mut transaction,
+                    update.item_id,
+                    json,
+                    nfo_metadata_fingerprint,
+                )
+                .await?;
+            if changed {
+                self.query(
+                    "UPDATE media_items SET nfo_collection_reference_key = NULL WHERE id = ?",
+                )
+                .bind(update.item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+                self.invalidate_content_restriction_index_in_transaction(
+                    &mut transaction,
+                    update.item_id,
+                )
+                .await?;
+            }
+        }
         let selected = self
             .query(
                 "UPDATE metadata_candidates

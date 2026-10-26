@@ -8005,12 +8005,12 @@ impl Database {
             .query_as(
                 "SELECT item.id AS item_id, item.provider_ids_json, item.metadata_scraper_id,
                         library.scraper_id AS library_scraper_id,
-                        item.production_year, item.nfo_metadata_json
+                        item.production_year, cache.json AS nfo_metadata_json
                  FROM media_items item
                  JOIN libraries library ON library.id = item.library_id
+                 JOIN media_item_nfo_cache cache ON cache.item_id = item.id
                  WHERE item.item_type = 'MOVIE'
                    AND item.removed_at IS NULL
-                   AND item.nfo_metadata_json IS NOT NULL
                    AND item.nfo_collection_reference_key IS NULL
                  ORDER BY item.id
                  LIMIT ?",
@@ -8044,10 +8044,11 @@ impl Database {
         };
         let current_query = format!(
             "SELECT item.provider_ids_json, item.metadata_scraper_id,
-                    library.scraper_id, item.production_year, item.nfo_metadata_json,
+                    library.scraper_id, item.production_year, cache.json,
                     item.nfo_collection_reference_key
              FROM media_items item
              JOIN libraries library ON library.id = item.library_id
+             LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
              WHERE item.id = ? AND item.item_type = 'MOVIE'
                AND item.removed_at IS NULL{lock_clause}"
         );
@@ -8528,9 +8529,9 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<String>, StorageError> {
         self.query_scalar(
-            "SELECT nfo_metadata_json
-             FROM media_items
-             WHERE id = ? AND nfo_metadata_json IS NOT NULL",
+            "SELECT json
+             FROM media_item_nfo_cache
+             WHERE item_id = ?",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
@@ -8555,9 +8556,9 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT id, nfo_metadata_json
-                 FROM media_items
-                 WHERE id IN ({placeholders}) AND nfo_metadata_json IS NOT NULL"
+                "SELECT item_id, json
+                 FROM media_item_nfo_cache
+                 WHERE item_id IN ({placeholders})"
             );
             let mut statement = self.query(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
@@ -8572,7 +8573,7 @@ impl Database {
                         source,
                     })?;
             for row in rows {
-                cached.insert(row.get("id"), row.get("nfo_metadata_json"));
+                cached.insert(row.get("item_id"), row.get("json"));
             }
         }
         Ok(cached)
@@ -8591,8 +8592,9 @@ impl Database {
         let bounded_limit = limit.min(CONTENT_RESTRICTION_INDEX_BATCH_LIMIT) as i64;
         let query = if after_item_id.is_some() {
             self.query_as(
-                "SELECT item.id, item.nfo_metadata_json
+                "SELECT item.id, cache.json
                  FROM media_items item
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
                  LEFT JOIN media_content_restriction_index restriction_index
                    ON restriction_index.item_id = item.id
                  WHERE item.removed_at IS NULL
@@ -8604,8 +8606,9 @@ impl Database {
             .bind(after_item_id)
         } else {
             self.query_as(
-                "SELECT item.id, item.nfo_metadata_json
+                "SELECT item.id, cache.json
                  FROM media_items item
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
                  LEFT JOIN media_content_restriction_index restriction_index
                    ON restriction_index.item_id = item.id
                  WHERE item.removed_at IS NULL
@@ -8645,9 +8648,10 @@ impl Database {
         let bounded_limit = limit.min(CONTENT_RESTRICTION_INDEX_BATCH_LIMIT) as i64;
         let rows: Vec<(String, Option<String>)> = self
             .query_as(
-                "SELECT item.id, item.nfo_metadata_json
+                "SELECT item.id, cache.json
                  FROM media_content_restriction_index_queue queue
                  JOIN media_items item ON item.id = queue.item_id
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
                  WHERE item.removed_at IS NULL
                  ORDER BY queue.queued_at, queue.item_id
                  LIMIT ?",
@@ -8750,12 +8754,14 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let snapshot_query = match self.backend() {
             DatabaseBackend::Sqlite => {
-                "SELECT nfo_metadata_json FROM media_items
-                 WHERE id = ? AND removed_at IS NULL"
+                "SELECT cache.json FROM media_items item
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+                 WHERE item.id = ? AND item.removed_at IS NULL"
             }
             DatabaseBackend::Postgres => {
-                "SELECT nfo_metadata_json FROM media_items
-                 WHERE id = ? AND removed_at IS NULL FOR UPDATE"
+                "SELECT cache.json FROM media_items item
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+                 WHERE item.id = ? AND item.removed_at IS NULL FOR UPDATE OF item"
             }
         };
         let current: Option<(Option<String>,)> = self
@@ -8863,10 +8869,14 @@ impl Database {
         }
         let snapshot_query = match self.backend() {
             DatabaseBackend::Sqlite => {
-                "SELECT nfo_metadata_json, removed_at FROM media_items WHERE id = ?"
+                "SELECT cache.json, item.removed_at FROM media_items item
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+                 WHERE item.id = ?"
             }
             DatabaseBackend::Postgres => {
-                "SELECT nfo_metadata_json, removed_at FROM media_items WHERE id = ? FOR UPDATE"
+                "SELECT cache.json, item.removed_at FROM media_items item
+                 LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+                 WHERE item.id = ? FOR UPDATE OF item"
             }
         };
         for write in writes {
@@ -8987,9 +8997,10 @@ impl Database {
         item_id: &str,
     ) -> Result<Option<(String, Option<Vec<u8>>)>, StorageError> {
         self.query_as(
-            "SELECT nfo_metadata_json, nfo_metadata_fingerprint
-             FROM media_items
-             WHERE id = ? AND nfo_metadata_json IS NOT NULL",
+            "SELECT cache.json, item.nfo_metadata_fingerprint
+             FROM media_items item
+             JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+             WHERE item.id = ?",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
@@ -9005,10 +9016,11 @@ impl Database {
         item_id: &str,
     ) -> Result<(bool, Option<Vec<u8>>), StorageError> {
         self.query_as(
-            "SELECT CASE WHEN nfo_metadata_json IS NULL THEN 0 ELSE 1 END,
-                    nfo_metadata_fingerprint
-             FROM media_items
-             WHERE id = ?",
+            "SELECT CASE WHEN cache.item_id IS NULL THEN 0 ELSE 1 END,
+                    item.nfo_metadata_fingerprint
+             FROM media_items item
+             LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+             WHERE item.id = ?",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
@@ -9024,6 +9036,85 @@ impl Database {
         })
     }
 
+    /// Drops the derived content-rating index and queues it for rebuild after the NFO snapshot
+    /// changes. The database trigger that used to do this only watched the inline column, which
+    /// this refactor stops writing.
+    pub(crate) async fn invalidate_content_restriction_index_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        item_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query("DELETE FROM media_content_restriction_index WHERE item_id = ?")
+            .bind(item_id)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "INSERT INTO media_content_restriction_index_queue (item_id)
+             VALUES (?)
+             ON CONFLICT(item_id) DO UPDATE SET queued_at = unixepoch()",
+        )
+        .bind(item_id)
+        .execute(&mut **transaction)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    /// Writes the parsed NFO projection into the side cache, leaving the legacy inline column
+    /// empty. Returns whether the snapshot content changed.
+    pub(crate) async fn upsert_media_item_nfo_cache_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, sqlx::Any>,
+        item_id: &str,
+        json: &str,
+        fingerprint: Option<&[u8]>,
+    ) -> Result<bool, StorageError> {
+        let previous: Option<String> = self
+            .query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+            .bind(item_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if previous.as_deref() == Some(json) {
+            return Ok(false);
+        }
+        let (byte_length, now) = match self.backend() {
+            DatabaseBackend::Sqlite => ("length(CAST(? AS BLOB))", "unixepoch()"),
+            DatabaseBackend::Postgres => ("octet_length(?)", "EXTRACT(EPOCH FROM now())::BIGINT"),
+        };
+        let query = format!(
+            "INSERT INTO media_item_nfo_cache (item_id, fingerprint, json, bytes, updated_at)
+             VALUES (?, ?, ?, {byte_length}, {now})
+             ON CONFLICT(item_id) DO UPDATE SET
+                 fingerprint = excluded.fingerprint,
+                 json = excluded.json,
+                 bytes = excluded.bytes,
+                 updated_at = {now}"
+        );
+        self.query(sqlx::AssertSqlSafe(query))
+            .bind(item_id)
+            .bind(fingerprint)
+            .bind(json)
+            .bind(json)
+            .execute(&mut **transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(true)
+    }
+
     pub(crate) async fn update_media_item_nfo_metadata(
         &self,
         item_id: &str,
@@ -9032,35 +9123,93 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        // NFO files are re-read on every scan; only rewrite the row (and invalidate the derived
-        // collection reference) when the parsed snapshot or its fingerprint actually changed.
-        // The WHERE clause also keeps unchanged calls from bumping updated_at, which would
-        // otherwise make every scan look like a metadata change.
-        self.query(
-            "UPDATE media_items
-             SET nfo_collection_reference_key = CASE
-                     WHEN nfo_metadata_json IS DISTINCT FROM ? THEN NULL
-                     ELSE nfo_collection_reference_key
-                 END,
-                 nfo_metadata_json = ?, nfo_metadata_fingerprint = ?,
-                 updated_at = unixepoch()
-             WHERE id = ?
-               AND (nfo_metadata_json IS DISTINCT FROM ?
-                    OR nfo_metadata_fingerprint IS DISTINCT FROM ?)",
-        )
-        .bind(nfo_metadata_json)
-        .bind(nfo_metadata_json)
-        .bind(source_fingerprint)
-        .bind(item_id)
-        .bind(nfo_metadata_json)
-        .bind(source_fingerprint)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let Some(json) = nfo_metadata_json else {
+            self.query("DELETE FROM media_item_nfo_cache WHERE item_id = ?")
+                .bind(item_id)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+            self.query(
+                "UPDATE media_items
+                 SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL,
+                     updated_at = unixepoch()
+                 WHERE id = ?
+                   AND (nfo_metadata_json IS NOT NULL OR nfo_metadata_fingerprint IS NOT NULL)",
+            )
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+            return transaction
+                .commit()
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                });
+        };
+
+        let changed = self
+            .upsert_media_item_nfo_cache_in_transaction(
+                &mut transaction,
+                item_id,
+                json,
+                source_fingerprint,
+            )
+            .await?;
+        let current_fingerprint: Option<Vec<u8>> = self
+            .query_as::<(Option<Vec<u8>>,)>(
+                "SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?",
+            )
+            .bind(item_id)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .and_then(|(fingerprint,)| fingerprint);
+        let fingerprint_changed = current_fingerprint.as_deref() != source_fingerprint;
+        if changed {
+            // A new snapshot invalidates the derived collection reference and content-rating
+            // index; also clear the legacy inline column so upgraded databases shrink over time.
+            self.invalidate_content_restriction_index_in_transaction(&mut transaction, item_id)
+                .await?;
+            self.query(
+                "UPDATE media_items
+                 SET nfo_metadata_json = NULL, nfo_collection_reference_key = NULL,
+                     nfo_metadata_fingerprint = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(source_fingerprint)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        } else if fingerprint_changed {
+            self.query(
+                "UPDATE media_items
+                 SET nfo_metadata_fingerprint = ?, updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(source_fingerprint)
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -9077,21 +9226,33 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE media_items
-             SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL,
-                 updated_at = unixepoch()
-             WHERE id = ? AND nfo_metadata_json = ?",
-        )
-        .bind(item_id)
-        .bind(expected_json)
-        .execute(&mut *transaction)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let removed = self
+            .query("DELETE FROM media_item_nfo_cache WHERE item_id = ? AND json = ?")
+            .bind(item_id)
+            .bind(expected_json)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if removed.rows_affected() == 1 {
+            self.invalidate_content_restriction_index_in_transaction(&mut transaction, item_id)
+                .await?;
+            self.query(
+                "UPDATE media_items
+                 SET nfo_metadata_json = NULL, nfo_metadata_fingerprint = NULL,
+                     updated_at = unixepoch()
+                 WHERE id = ?",
+            )
+            .bind(item_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        }
         transaction
             .commit()
             .await
@@ -9143,13 +9304,26 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let dropped = self
+            .query(
+                "DELETE FROM media_item_nfo_cache
+                 WHERE item_id = ? AND (fingerprint IS NULL OR fingerprint <> ?)",
+            )
+            .bind(item_id)
+            .bind(source_fingerprint)
+            .execute(&mut *transaction)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if dropped.rows_affected() > 0 {
+            self.invalidate_content_restriction_index_in_transaction(&mut transaction, item_id)
+                .await?;
+        }
         self.query(
             "UPDATE media_items
-             SET nfo_metadata_json = CASE
-                     WHEN nfo_metadata_fingerprint IS NULL
-                       OR nfo_metadata_fingerprint <> ? THEN NULL
-                     ELSE nfo_metadata_json
-                 END,
+             SET nfo_metadata_json = NULL,
                  nfo_metadata_fingerprint = CASE
                      WHEN nfo_metadata_fingerprint IS NULL
                        OR nfo_metadata_fingerprint <> ? THEN NULL
@@ -9165,7 +9339,6 @@ impl Database {
                  END
              WHERE id = ?",
         )
-        .bind(source_fingerprint)
         .bind(source_fingerprint)
         .bind(metadata_fingerprint)
         .bind(source_fingerprint)

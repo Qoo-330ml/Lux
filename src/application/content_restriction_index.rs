@@ -239,17 +239,26 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO media_items (
-                     id, library_id, item_type, title, sort_title, identification_status,
-                     nfo_metadata_json
-                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?)",
+                     id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
             )
             .bind(item_id)
             .bind(&library_id)
             .bind(item_id)
             .bind(item_id)
-            .bind(nfo_json)
             .execute(database.pool())
             .await?;
+            if let Some(json) = nfo_json {
+                sqlx::query(
+                    "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                     VALUES (?, ?, length(CAST(? AS BLOB)))",
+                )
+                .bind(item_id)
+                .bind(json)
+                .bind(json)
+                .execute(database.pool())
+                .await?;
+            }
         }
         let excessive_genres = (0..=100)
             .map(|index| format!("genre-{index}"))
@@ -259,15 +268,21 @@ mod tests {
         }))?;
         sqlx::query(
             "INSERT INTO media_items (
-                 id, library_id, item_type, title, sort_title, identification_status,
-                 nfo_metadata_json
-             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?)",
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
         )
         .bind("indexer-d-invalid-tags")
         .bind(&library_id)
         .bind("indexer-d-invalid-tags")
         .bind("indexer-d-invalid-tags")
-        .bind(excessive_genres_json)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+             VALUES ('indexer-d-invalid-tags', ?, length(CAST(? AS BLOB)))",
+        )
+        .bind(&excessive_genres_json)
+        .bind(&excessive_genres_json)
         .execute(database.pool())
         .await?;
 
@@ -350,12 +365,18 @@ mod tests {
             .await?;
         sqlx::query(
             "INSERT INTO media_items (
-                 id, library_id, item_type, title, sort_title, identification_status,
-                 nfo_metadata_json
-             ) VALUES (?, ?, 'MOVIE', 'Worker Item', 'worker item', 'LOCAL_CONFIRMED', ?)",
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Worker Item', 'worker item', 'LOCAL_CONFIRMED')",
         )
         .bind("index-worker-item")
         .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+             VALUES ('index-worker-item', ?, length(CAST(? AS BLOB)))",
+        )
+        .bind(r#"{"certification":"PG","genres":["Family"]}"#)
         .bind(r#"{"certification":"PG","genres":["Family"]}"#)
         .execute(database.pool())
         .await?;

@@ -16773,17 +16773,28 @@ async fn assert_media_content_restriction_index_storage(
             .query(
                 "INSERT INTO media_items (
                      id, library_id, item_type, title, sort_title, identification_status,
-                     nfo_metadata_json, removed_at
-                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+                     removed_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?)",
             )
             .bind(item_id)
             .bind(&library_id)
             .bind(item_id)
             .bind(item_id)
-            .bind(nfo_json)
             .bind(removed_at)
             .execute(database.pool())
             .await?;
+        if let Some(json) = nfo_json {
+            database
+                .query(
+                    "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                     VALUES (?, ?, length(CAST(? AS BLOB)))",
+                )
+                .bind(item_id)
+                .bind(json)
+                .bind(json)
+                .execute(database.pool())
+                .await?;
+        }
     }
     database
         .query(
@@ -16872,10 +16883,7 @@ async fn assert_media_content_restriction_index_storage(
     assert_eq!(indexed_tags, ["family"]);
 
     database
-        .query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
-        .bind(changed_nfo)
-        .bind("restriction-index-a")
-        .execute(database.pool())
+        .update_media_item_nfo_metadata("restriction-index-a", Some(changed_nfo), None)
         .await?;
     assert!(
         !database
@@ -30657,15 +30665,25 @@ async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn 
         sqlx::query(
             "INSERT INTO media_items (
                  id, library_id, item_type, title, sort_title,
-                 identification_status, has_available_source, nfo_metadata_json
-             ) VALUES (?, 'nfo-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1, ?)",
+                 identification_status, has_available_source
+             ) VALUES (?, 'nfo-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
         )
         .bind(id)
         .bind(id)
         .bind(id)
-        .bind(nfo)
         .execute(database.pool())
         .await?;
+        if let Some(json) = nfo {
+            sqlx::query(
+                "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                 VALUES (?, ?, length(CAST(? AS BLOB)))",
+            )
+            .bind(id)
+            .bind(json)
+            .bind(json)
+            .execute(database.pool())
+            .await?;
+        }
     }
 
     let item_ids = vec!["nfo-a".to_owned(), "nfo-b".to_owned(), "nfo-c".to_owned()];
@@ -30706,10 +30724,17 @@ async fn unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference(
     sqlx::query(
         "INSERT INTO media_items (
              id, library_id, item_type, title, sort_title, identification_status,
-             has_available_source, nfo_metadata_json, nfo_metadata_fingerprint,
+             has_available_source, nfo_metadata_fingerprint,
              nfo_collection_reference_key, updated_at
          ) VALUES ('nfo-write', 'nfo-write-lib', 'MOVIE', 'Write', 'write', 'LOCAL_CONFIRMED',
-                   1, '{\"title\":\"Write\"}', X'01', 'collection-key', 100)",
+                   1, X'01', 'collection-key', 100)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_item_nfo_cache (item_id, fingerprint, json, bytes)
+         VALUES ('nfo-write', X'01', '{\"title\":\"Write\"}',
+                 length(CAST('{\"title\":\"Write\"}' AS BLOB)))",
     )
     .execute(database.pool())
     .await?;
@@ -30718,9 +30743,12 @@ async fn unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference(
     database
         .update_media_item_nfo_metadata("nfo-write", Some("{\"title\":\"Write\"}"), Some(&[1]))
         .await?;
-    let unchanged: (i64, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT updated_at, nfo_collection_reference_key, nfo_metadata_json
-         FROM media_items WHERE id = 'nfo-write'",
+    let unchanged: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT item.updated_at, item.nfo_collection_reference_key, item.nfo_metadata_json,
+                cache.json
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = 'nfo-write'",
     )
     .fetch_one(database.pool())
     .await?;
@@ -30729,15 +30757,18 @@ async fn unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference(
         "unchanged snapshots must not bump updated_at"
     );
     assert_eq!(unchanged.1.as_deref(), Some("collection-key"));
-    assert_eq!(unchanged.2.as_deref(), Some("{\"title\":\"Write\"}"));
+    assert_eq!(unchanged.2, None, "legacy inline snapshots stay empty");
+    assert_eq!(unchanged.3.as_deref(), Some("{\"title\":\"Write\"}"));
 
     // A changed snapshot rewrites once and invalidates the derived reference.
     database
         .update_media_item_nfo_metadata("nfo-write", Some("{\"title\":\"Changed\"}"), Some(&[2]))
         .await?;
     let changed: (i64, Option<String>, Option<String>) = sqlx::query_as(
-        "SELECT updated_at, nfo_collection_reference_key, nfo_metadata_json
-         FROM media_items WHERE id = 'nfo-write'",
+        "SELECT item.updated_at, item.nfo_collection_reference_key, cache.json
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = 'nfo-write'",
     )
     .fetch_one(database.pool())
     .await?;

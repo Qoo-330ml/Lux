@@ -1005,8 +1005,10 @@ async fn nfo_writeback_only_invalidates_rich_snapshot_when_content_changes()
             .fetch_one(database.pool())
             .await?;
     let initial: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
-         FROM media_items WHERE id = ?",
+        "SELECT cache.json, item.nfo_metadata_fingerprint
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = ?",
     )
     .bind(&item_id)
     .fetch_one(database.pool())
@@ -1029,8 +1031,10 @@ async fn nfo_writeback_only_invalidates_rich_snapshot_when_content_changes()
         )
         .await?;
     let unchanged: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
-         FROM media_items WHERE id = ?",
+        "SELECT cache.json, item.nfo_metadata_fingerprint
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = ?",
     )
     .bind(&item_id)
     .fetch_one(database.pool())
@@ -1047,8 +1051,10 @@ async fn nfo_writeback_only_invalidates_rich_snapshot_when_content_changes()
         )
         .await?;
     let changed: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
-        "SELECT nfo_metadata_json, nfo_metadata_fingerprint
-         FROM media_items WHERE id = ?",
+        "SELECT cache.json, item.nfo_metadata_fingerprint
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = ?",
     )
     .bind(&item_id)
     .fetch_one(database.pool())

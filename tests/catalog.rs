@@ -1870,11 +1870,16 @@ async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
     // Malformed database-derived NFO JSON must not take down item detail: degrade
     // gracefully (nfo null) and clear the cache row for background rebuilding.
     // The detail request must not parse the source NFO file.
-    sqlx::query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
-        .bind("{not-valid-json")
-        .bind(&item_id)
-        .execute(database.pool())
-        .await?;
+    sqlx::query(
+        "UPDATE media_item_nfo_cache
+         SET json = ?, bytes = length(CAST(? AS BLOB)), updated_at = unixepoch()
+         WHERE item_id = ?",
+    )
+    .bind("{not-valid-json")
+    .bind("{not-valid-json")
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
     let lux_detail_malformed = client
         .get(format!("{base_url}/api/v1/items/{item_id}"))
         .header(COOKIE, &cookies)

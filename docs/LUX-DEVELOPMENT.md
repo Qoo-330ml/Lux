@@ -18113,6 +18113,16 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
 
 依赖：LUX-855、LUX-856。
 
+进度（2026-10-26，续）：**外置已完成**。新增迁移 `migrations/0228_media_item_nfo_cache.sql` 与
+`migrations-postgres/0230_media_item_nfo_cache.sql`：建 `media_item_nfo_cache(item_id PK, fingerprint,
+json, bytes, updated_at)` 并从 `media_items.nfo_metadata_json` 回填。读取路径全部改查缓存表（详情单条/批量、
+内容限制候选与队列、合集引用对账、CAS 校验、快照与状态查询）；写入路径 upsert 缓存并按 fingerprint 条件写，
+`media_items.nfo_metadata_json` 在写入时置 NULL 逐步收缩；内容限制索引改由 Rust 在快照变化时显式失效并入队；
+`MEDIA_ITEM_CHILD_DELETES` 加入缓存表。回归：lib 1341/0（32 ignored），`nfo_writer` 27/27，
+`scanned_metadata` 23/23、`scanned_series_metadata` 3/3、`scanning_jobs` 92/92、`catalog` 3/3、
+`collections` 4/4、`emby_incremental_refresh` 8/8、`users` 39/39、`storage` 76/76，clippy 0。
+剩余：DB 体积/WAL/详情 p95 前后对比未测；PostgreSQL 迁移未在本机运行时验证；旧内联列计划在下一发布周期删除。
+
 进度（2026-10-26）：先完成**条件写**部分。`update_media_item_nfo_metadata` 只有在解析快照或
 fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 bump `updated_at`，也不清除
 `nfo_collection_reference_key`。回归
