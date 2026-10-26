@@ -1287,7 +1287,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
     assert_eq!(avdb_persons_body["Items"].as_array().map(Vec::len), Some(4));
 
     let full_query = format!(
-        "ParentId={}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=999999&Fields=DateCreated,Overview&SortBy=DateCreated&SortOrder=Descending&userid={}&api_key={key}",
+        "ParentId={}&Recursive=true&PersonTypes=Actor&StartIndex=0&Limit=1000&Fields=DateCreated,Overview&SortBy=DateCreated&SortOrder=Descending&userid={}&api_key={key}",
         library.id, admin.id
     );
     let full_response = client
@@ -1306,7 +1306,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
 
     let ascending = client
         .get(format!(
-            "http://{address}/Persons?ParentId={}&Recursive=true&PersonTypes=Actor&Limit=999999&SortBy=DateCreated&SortOrder=Ascending&api_key={key}",
+            "http://{address}/Persons?ParentId={}&Recursive=true&PersonTypes=Actor&Limit=1000&SortBy=DateCreated&SortOrder=Ascending&api_key={key}",
             library.id
         ))
         .send()
@@ -1333,7 +1333,7 @@ async fn emby_persons_lists_library_actors_with_shared_admin_key()
 
     let non_recursive = client
         .get(format!(
-            "http://{address}/Persons?ParentId={}&Recursive=false&PersonTypes=Actor&Limit=999999&api_key={key}",
+            "http://{address}/Persons?ParentId={}&Recursive=false&PersonTypes=Actor&Limit=1000&api_key={key}",
             library.id
         ))
         .send()

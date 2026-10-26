@@ -27,7 +27,8 @@ async fn wait_for_library_deletion(
     database: &Database,
     library_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    for _ in 0..200 {
+    // The scheduler polls queued deletions every 15 s, so the wait must exceed one poll.
+    for _ in 0..300 {
         let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM libraries WHERE id = ?")
             .bind(library_id)
             .fetch_one(database.pool())
@@ -35,9 +36,9 @@ async fn wait_for_library_deletion(
         if remaining == 0 {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    Err(format!("library {library_id} was not deleted within 10 seconds").into())
+    Err(format!("library {library_id} was not deleted within 30 seconds").into())
 }
 
 async fn start_server(
@@ -54,13 +55,10 @@ async fn start_server(
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let app = app_with_state(AppState::ready(
-        config,
-        database.clone(),
-        setup,
-        auth,
-        emby_auth,
-    ));
+    let state = AppState::ready(config, database.clone(), setup, auth, emby_auth);
+    // Library deletion is queued and drained by the scheduler's first pass.
+    state.start_scheduled_tasks().await;
+    let app = app_with_state(state);
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
@@ -786,7 +784,8 @@ async fn deleting_library_removes_it_from_strm_media_info_plugin_config()
 
     // The deletion worker rewrites the plugin configuration once the library is gone.
     let mut configured_library_ids = Value::Null;
-    for _ in 0..200 {
+    // Deletion itself waits for the scheduler pass, so the rewrite can land after 10 s.
+    for _ in 0..300 {
         if let Ok(bytes) =
             tokio::fs::read(plugin_config_dir.join("org.lux.strm-media-info.json")).await
             && let Ok(config_values) = serde_json::from_slice::<Value>(&bytes)
@@ -795,7 +794,7 @@ async fn deleting_library_removes_it_from_strm_media_info_plugin_config()
             configured_library_ids = config_values["libraryIds"].clone();
             break;
         }
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
     assert_eq!(configured_library_ids, json!([remaining_library_id]));
 

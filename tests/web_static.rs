@@ -28,23 +28,32 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     } else {
         "id=\"app\""
     }));
-    for path in [
-        "/api/v1/not-implemented",
-        "/emby/not-implemented",
-        "/Sessions/not-implemented",
-    ] {
+    let lux_missing = client
+        .get(format!("{base_url}/api/v1/not-implemented"))
+        .send()
+        .await?;
+    assert_eq!(lux_missing.status(), StatusCode::NOT_FOUND);
+    assert_eq!(
+        lux_missing
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.split(';').next()),
+        Some("application/json")
+    );
+    assert!(lux_missing.json::<serde_json::Value>().await?.is_object());
+    // Emby clients expect a bare status; only the Lux API uses the JSON error envelope.
+    for path in ["/emby/not-implemented", "/Sessions/not-implemented"] {
         let response = client.get(format!("{base_url}{path}")).send().await?;
         assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
-        assert_eq!(
+        assert!(
             response
                 .headers()
                 .get(reqwest::header::CONTENT_TYPE)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.split(';').next()),
-            Some("application/json"),
-            "{path}"
+                .is_none(),
+            "{path} must not advertise JSON"
         );
-        assert!(response.json::<serde_json::Value>().await?.is_object());
+        assert!(response.bytes().await?.is_empty(), "{path} has a body");
     }
     let logo = client.get(format!("{base_url}/logo.svg")).send().await?;
     assert_eq!(logo.status(), StatusCode::OK);
@@ -56,17 +65,27 @@ async fn same_origin_web_assets_are_served_by_rust() -> Result<(), Box<dyn std::
     );
     assert!(logo.text().await?.contains("<svg"));
     if vite_assets {
+        // Vite emits content-hashed entry names, so read them from the served index instead of
+        // assuming a fixed filename.
+        let script_path = index_body
+            .split("src=\"")
+            .nth(1)
+            .and_then(|rest| rest.split('"').next())
+            .filter(|path| path.ends_with(".js"))
+            .ok_or("entry script missing from index.html")?;
         let script = client
-            .get(format!("{base_url}/assets/lux.js"))
+            .get(format!("{base_url}{script_path}"))
             .send()
             .await?;
-        assert_eq!(script.status(), StatusCode::OK);
+        assert_eq!(script.status(), StatusCode::OK, "{script_path}");
         assert!(script.text().await?.contains("/api/v1/auth/login"));
-        let styles = client
-            .get(format!("{base_url}/assets/index.css"))
-            .send()
-            .await?;
-        assert_eq!(styles.status(), StatusCode::OK);
+        let style_path = index_body
+            .split("href=\"")
+            .filter_map(|rest| rest.split('"').next())
+            .find(|path| path.ends_with(".css"))
+            .ok_or("entry stylesheet missing from index.html")?;
+        let styles = client.get(format!("{base_url}{style_path}")).send().await?;
+        assert_eq!(styles.status(), StatusCode::OK, "{style_path}");
         assert!(styles.text().await?.contains("--lux-bg"));
     } else {
         let script = client.get(format!("{base_url}/app.mjs")).send().await?;

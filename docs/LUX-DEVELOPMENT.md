@@ -18042,9 +18042,33 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
   `f00150f3` 的独立 worktree 上逐项复跑同样 10 个目标，结果同样失败（`image_api`、`libraries_api`、
   `people_api`、`scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、`scheduled_tasks`、
   `watch`、`web_playback`、`web_static`），说明不是本次改动引入。lib 测试 1339/0（32 ignored）。
-- 剩余：上述 10 个既有失败需逐项决定修复或豁免（需项目所有者确认）。初步迹象：
-  `people_api` 的 `/emby/Persons?...&&` 返回 400、`web_static` 的 `/emby/not-implemented` 缺少
-  `application/json`、`image_api` 的图片搜索返回 403，均与当前 query/CSRF 策略不一致，需单独任务处理。
+- **已修复 4 个目标**：
+  - `image_api`：图片搜索返回 403 是测试缺少 `x-csrf-token`；补上后 1/1。
+  - `people_api`：`/Persons` 使用 `Limit=999999` 超过 `EMBY_MAX_PAGE_LIMIT=1000`，服务端按约定返回 400；
+    测试改用 1000 后 10/10。
+  - `libraries_api`：辅助函数从未启动调度器（删除任务只在调度轮询中执行），且等待 10 s 短于 15 s 轮询；
+    改为启动 `start_scheduled_tasks()` 并把等待放宽到 30 s（含插件配置重写），14/14。
+  - `web_static`：Vite 资产名是内容哈希（`index-*.js`/`*.css`），测试硬编码旧名；Emby 命名空间按设计返回
+    裸 404 而不是 JSON 信封。测试改为从 index 解析入口并用裸 404 断言，2/2。
+- **剩余 6 个目标仍失败**（基线与当前树一致）：`scanned_metadata`（海报回滚计数、NFO 重试超时）、
+  `scanned_series_metadata`（不可读海报重试）、`scanning_jobs`（frontier 幂等计数）、
+  `scheduled_tasks`（cron 任务 0 次）、`watch`（2 个超时）、`web_playback`（期望 503 实际 200）。
+  需逐项判定是产品缺陷还是测试过时；已登记 LUX-862。
+
+#### LUX-862：既有集成失败收敛
+
+范围：处理 `scanned_metadata`、`scanned_series_metadata`、`scanning_jobs`、`scheduled_tasks`、`watch`、
+`web_playback` 六个目标中的 8 个失败用例。逐项复现并判定：产品缺陷则修复并加回归断言；测试过时则更新断言并
+记录行为依据；两者都不是则登记豁免。不得降低安全或分页上限来迁就测试。
+
+预计修改文件：按根因落在 `src/application/scanner/`、`src/application/watch.rs`、`src/application/playback/`、
+`src/application/scheduled_tasks.rs` 或对应测试，另加 `docs/COMPATIBILITY.md`、`docs/LUX-DEVELOPMENT.md`。
+
+验收：
+
+- [ ] 每个用例有复现命令、基线结果与结论（产品缺陷/测试过时/豁免）。
+- [ ] 修复项有回归断言；测试更新引用当前行为依据。
+- [ ] `cargo test --locked --all-targets` 不再出现这 8 个失败（豁免项经所有者确认）。
 
 #### LUX-857：NFO 快照外置与条件写
 

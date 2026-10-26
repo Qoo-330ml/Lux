@@ -147,14 +147,15 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
         .json(&json!({ "username": "admin", "password": "correct password" }))
         .send()
         .await?;
+    let csrf = cookie_value(login.headers(), "lux_csrf");
     let cookie = format!(
-        "lux_session={}; lux_csrf={}",
+        "lux_session={}; lux_csrf={csrf}",
         cookie_value(login.headers(), "lux_session"),
-        cookie_value(login.headers(), "lux_csrf")
     );
     let response = client
         .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
         .header(COOKIE, cookie.clone())
+        .header("x-csrf-token", &csrf)
         .json(&json!({ "imageType": "POSTER", "language": "zh-CN", "source": "TMDB" }))
         .send()
         .await?;
@@ -169,6 +170,7 @@ async fn image_search_returns_filtered_scraper_candidates() -> Result<(), Box<dy
     let response = client
         .post(format!("{base_url}/api/v1/items/{item_id}/images/search"))
         .header(COOKIE, cookie)
+        .header("x-csrf-token", &csrf)
         .json(&json!({ "imageType": "POSTER", "language": "", "source": "TMDB" }))
         .send()
         .await?;
