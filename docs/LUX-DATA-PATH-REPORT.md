@@ -38,6 +38,13 @@ LUX-854–862 已实现并合并。剩余门禁项与需要项目所有者决定
 - 清理删除失败：已测行保留并返回错误。
 - NFO 缓存回填中断、候选清理中断：**未演练**。
 
+## 已知测试抖动
+
+`tests/shutdown.rs::unix::probe_runtime_shutdown_reaps_active_ffprobe_before_return` 在本机间歇性
+报“fake ffprobe did not start within twenty seconds”（单独连续 3 次通过；混合/高并发运行时偶发）。
+探针最终都停在 `acquire_process_background_work(Probe)` 后的等待，未发现与 LUX-857–860 的直接关联；
+登记为环境/时序抖动，最终门禁若命中需单独复跑确认。
+
 ## 未完成 / 待决定
 
 1. 858/859 在 66k 夹具上的清理前后行数/体积未取数。
