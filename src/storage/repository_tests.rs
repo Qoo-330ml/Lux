@@ -21794,6 +21794,47 @@ async fn account_record_purge_drops_only_terminal_rows_past_retention()
     Ok(())
 }
 
+#[tokio::test]
+async fn session_history_purge_respects_the_batch_limit()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Bounded", "Bounded", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    let now = 90 * 24 * 60 * 60;
+    let old = now - 31 * 24 * 60 * 60;
+    for index in 0..5 {
+        sqlx::query(
+            "INSERT INTO web_sessions (id, user_id, session_token_hash, csrf_token_hash,
+                                       expires_at, created_at, updated_at)
+             VALUES (?, ?, randomblob(16), randomblob(16), ?, ?, ?)",
+        )
+        .bind(format!("bounded-session-{index}"))
+        .bind(&user_id)
+        .bind(old)
+        .bind(old)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let first = database.purge_expired_session_history(now, 2).await?;
+    assert_eq!(first.web_sessions, 2, "one call deletes at most the batch limit");
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions WHERE id LIKE 'bounded-session-%'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining, 3);
+
+    let second = database.purge_expired_session_history(now, 10).await?;
+    assert_eq!(second.web_sessions, 3);
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
