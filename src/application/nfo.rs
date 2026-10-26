@@ -193,7 +193,7 @@ pub struct MovieNfoMetadata {
     pub trailers: Vec<String>,
 }
 
-const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_LOCAL_NFO_BYTES: usize = 1024 * 1024;
 const MAX_LOCAL_NFO_EVENTS: usize = 20_000;
 const LOCAL_NFO_CACHE_SCHEMA_VERSION: u8 = 1;
 const MAX_MOVIE_NFO_ACTORS: usize = 100;
@@ -1126,7 +1126,7 @@ pub(crate) fn local_nfo_details_from_cache_json(json: &str) -> Option<LocalNfoDe
         .map(|decoded| decoded.details)
 }
 
-fn encode_local_nfo_cache(
+pub(crate) fn encode_local_nfo_cache(
     details: &LocalNfoDetails,
     semantic_fingerprint: Option<&[u8]>,
     relation_fingerprint: Option<&[u8]>,
@@ -1168,6 +1168,7 @@ impl LocalNfoMetadataStore {
             .map_err(LocalNfoMetadataStoreError::Storage)
     }
 
+    #[allow(dead_code)] // exercised by unit tests; scan pages use the deferred batch path
     pub(crate) async fn write_item_with_semantic_fingerprint(
         &self,
         item_id: &str,

@@ -9208,7 +9208,6 @@ impl Database {
 
     /// Applies several local-NFO snapshots in one write transaction, so a scan page pays one
     /// commit instead of one per item.
-    #[allow(dead_code)] // LUX-860 wires the scan-page flush in the next increment.
     pub(crate) async fn update_media_item_nfo_metadata_batch(
         &self,
         updates: &[crate::storage::MediaItemNfoMetadataUpdate<'_>],

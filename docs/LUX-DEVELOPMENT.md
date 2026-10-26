@@ -18211,6 +18211,14 @@ fingerprint 实际变化时才更新行；未变化时 `rows_affected=0`，不 b
 `updated_at`、置空删除缓存）。下一步把扫描页的逐条 `write_item_with_semantic_fingerprint` 收集为页级
 flush 调用该批量接口，再补“批量失败整体回滚”用例。
 
+接线（2026-10-26）：扫描页的 `write_item_with_semantic_fingerprint` 改为经
+`store_local_nfo_snapshot`：有页级延迟上下文时收集到 `pending_nfo_writes`，在
+`flush_deferred_local_nfo_metadata_updates` 末尾按 `LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE` 调用
+`update_media_item_nfo_metadata_batch`；批量失败逐个重试并记 warn。无页上下文（单条刷新）仍立即走批量
+接口的单条形式。回归新增 `batch_nfo_updates_roll_back_together_on_a_mid_batch_failure`（注入第二条
+写入失败，第一条不落库）。`scanned_metadata` 23/23、`metadata_selection` 38/38、`scanning_jobs` 92/92。
+
+
 #### LUX-861：冷启动首页与元数据写锁持有时长
 
 范围：定位并修复“新库首次 `/api/v1/home` 可超过 90 s”的冷启动问题。日志显示首次启动时

@@ -31385,6 +31385,68 @@ async fn batch_nfo_updates_share_one_transaction_and_skip_unchanged_items()
 }
 
 #[tokio::test]
+async fn batch_nfo_updates_roll_back_together_on_a_mid_batch_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('nfo-batch-lib', 'NFO', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for id in ["nfo-rollback-a", "nfo-rollback-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'nfo-batch-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "CREATE TRIGGER fail_second_nfo_cache_write
+         BEFORE INSERT ON media_item_nfo_cache
+         WHEN NEW.item_id = 'nfo-rollback-b'
+         BEGIN
+             SELECT RAISE(ABORT, 'injected cache failure');
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let result = database
+        .update_media_item_nfo_metadata_batch(&[
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-rollback-a",
+                json: Some(r#"{"title":"A"}"#),
+                source_fingerprint: Some(&[1]),
+            },
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-rollback-b",
+                json: Some(r#"{"title":"B"}"#),
+                source_fingerprint: Some(&[2]),
+            },
+        ])
+        .await;
+    assert!(result.is_err(), "the injected failure must surface");
+    let cached: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_item_nfo_cache WHERE item_id LIKE 'nfo-rollback-%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cached, 0, "the first item must not be committed alone");
+    Ok(())
+}
+
+#[tokio::test]
 async fn successful_write_probes_are_cached_so_health_checks_do_not_write()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::config::Config;

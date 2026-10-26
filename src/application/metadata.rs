@@ -1093,8 +1093,16 @@ struct DeferredLocalNfoMetadataUpdates {
 #[derive(Default)]
 struct DeferredLocalNfoMetadataState {
     pending: Vec<DeferredLocalNfoMetadataUpdate>,
+    pending_nfo_writes: Vec<DeferredLocalNfoWrite>,
     pending_default_repairs: Vec<DeferredLocalNfoDefaultsRepair>,
     failed_updates: Vec<DeferredLocalNfoMetadataFailure>,
+}
+
+#[derive(Clone)]
+struct DeferredLocalNfoWrite {
+    item_id: String,
+    json: String,
+    source_fingerprint: Vec<u8>,
 }
 
 #[derive(Clone)]
@@ -1202,6 +1210,22 @@ impl DeferredLocalNfoMetadataUpdate {
 }
 
 impl DeferredLocalNfoMetadataUpdates {
+    async fn defer_nfo_write(&self, item_id: &str, json: String, source_fingerprint: &[u8]) {
+        self.state
+            .lock()
+            .await
+            .pending_nfo_writes
+            .push(DeferredLocalNfoWrite {
+                item_id: item_id.to_owned(),
+                json,
+                source_fingerprint: source_fingerprint.to_vec(),
+            });
+    }
+
+    async fn take_nfo_writes(&self) -> Vec<DeferredLocalNfoWrite> {
+        std::mem::take(&mut self.state.lock().await.pending_nfo_writes)
+    }
+
     async fn push(
         &self,
         update: MediaMetadataUpdate<'_>,
@@ -2409,6 +2433,47 @@ impl MetadataEnricher {
             update_offset = update_end;
             repair_offset = repair_end;
         }
+
+        // Parsed NFO snapshots deferred by the page are written in one transaction per chunk,
+        // instead of one commit per item.
+        let nfo_writes = deferred_updates.take_nfo_writes().await;
+        for chunk in nfo_writes.chunks(LOCAL_NFO_METADATA_UPDATE_BATCH_SIZE) {
+            let updates = chunk
+                .iter()
+                .map(|write| crate::storage::MediaItemNfoMetadataUpdate {
+                    item_id: &write.item_id,
+                    json: Some(&write.json),
+                    source_fingerprint: Some(&write.source_fingerprint),
+                })
+                .collect::<Vec<_>>();
+            if let Err(error) = self
+                .database
+                .update_media_item_nfo_metadata_batch(&updates)
+                .await
+            {
+                tracing::warn!(
+                    %error,
+                    "local NFO cache page transaction failed; retrying items individually"
+                );
+                for write in chunk {
+                    if let Err(error) = self
+                        .database
+                        .update_media_item_nfo_metadata(
+                            &write.item_id,
+                            Some(&write.json),
+                            Some(&write.source_fingerprint),
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            item_id = %write.item_id,
+                            %error,
+                            "local NFO cache write failed"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     async fn enrich_scan_job_batch(
@@ -3293,6 +3358,43 @@ impl MetadataEnricher {
         Ok(())
     }
 
+    /// Stores the parsed NFO snapshot immediately, or defers it to the page-level batch flush.
+    async fn store_local_nfo_snapshot(
+        &self,
+        item_id: &str,
+        source_fingerprint: &[u8],
+        semantic_fingerprint: Option<&[u8]>,
+        relation_fingerprint: Option<&[u8]>,
+        details: &crate::application::nfo::LocalNfoDetails,
+        deferred: Option<&DeferredLocalNfoMetadataUpdates>,
+    ) -> Result<(), MetadataError> {
+        let json = crate::application::nfo::encode_local_nfo_cache(
+            details,
+            semantic_fingerprint,
+            relation_fingerprint,
+        )
+        .map_err(MetadataError::NfoCache)?;
+        if json.len() > crate::application::nfo::MAX_LOCAL_NFO_BYTES {
+            return Err(MetadataError::NfoCache(
+                crate::application::nfo::LocalNfoMetadataStoreError::TooLarge,
+            ));
+        }
+        if let Some(deferred) = deferred {
+            deferred
+                .defer_nfo_write(item_id, json, source_fingerprint)
+                .await;
+            return Ok(());
+        }
+        self.database
+            .update_media_item_nfo_metadata_batch(&[crate::storage::MediaItemNfoMetadataUpdate {
+                item_id,
+                json: Some(&json),
+                source_fingerprint: Some(source_fingerprint),
+            }])
+            .await?;
+        Ok(())
+    }
+
     async fn enrich_nfo_item_with_metadata(
         &self,
         item_id: &str,
@@ -3536,22 +3638,21 @@ impl MetadataEnricher {
                     unqualified_nfo_set_id_from_details(&projection.details).as_deref(),
                 )
                 .await?;
-            if let (Some(local_nfo), Some((details, _, Some(_), relation_fingerprint))) =
+            if let (Some(_), Some((details, _, Some(_), relation_fingerprint))) =
                 (self.local_nfo.as_ref(), cached_nfo.as_ref())
             {
                 let relation_fingerprint = relation_fingerprint
                     .as_deref()
                     .or_else(|| cached_nfo.as_ref().map(|(_, raw, _, _)| raw.as_slice()));
-                local_nfo
-                    .write_item_with_semantic_fingerprint(
-                        item_id,
-                        &source_fingerprint,
-                        Some(&semantic_fingerprint),
-                        relation_fingerprint,
-                        details,
-                    )
-                    .await
-                    .map_err(MetadataError::NfoCache)?;
+                self.store_local_nfo_snapshot(
+                    item_id,
+                    &source_fingerprint,
+                    Some(&semantic_fingerprint),
+                    relation_fingerprint,
+                    details,
+                    deferred_metadata_updates.as_ref(),
+                )
+                .await?;
             }
             if let Some(fingerprint) = fingerprint.as_deref() {
                 self.database
@@ -3666,16 +3767,15 @@ impl MetadataEnricher {
                 .as_ref()
                 .is_some_and(|(_, _, semantic_fingerprint, _)| semantic_fingerprint.is_some());
             if !current || !cache_has_semantic_fingerprint {
-                local_nfo
-                    .write_item_with_semantic_fingerprint(
-                        item_id,
-                        &source_fingerprint,
-                        Some(&semantic_fingerprint),
-                        Some(&source_fingerprint),
-                        &projection.details,
-                    )
-                    .await
-                    .map_err(MetadataError::NfoCache)?;
+                self.store_local_nfo_snapshot(
+                    item_id,
+                    &source_fingerprint,
+                    Some(&semantic_fingerprint),
+                    Some(&source_fingerprint),
+                    &projection.details,
+                    deferred_metadata_updates.as_ref(),
+                )
+                .await?;
             }
         }
         let provider_ids_json = merged_provider_ids_json(
