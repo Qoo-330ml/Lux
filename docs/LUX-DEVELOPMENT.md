@@ -18065,8 +18065,11 @@ SQL 条数、响应字节与 CPU/请求尚未接入（留给 LUX-855 的端点�
   因此移除了过时的 `non_retryable_item_ids` 断言。`--test scanned_metadata` 23/23。
 - **剩余 2 个目标的 3 个用例仍失败**（基线与当前树一致）：
   - `scanning_jobs::manifest_discovery_reopens_and_retries_persisted_frontier_idempotently`：注入触发器下
-    第一个批次返回 `too many SQL variables`，只提交 1 个检查点。测试夹具在单目录写入 8,001 个文件，
-    疑似发现批次的多列绑定接近 SQLite 变量上限；需判断是降低批次行数还是调整查询形状。
+    第一个批次返回 `too many SQL variables`，只提交 1 个检查点。测试夹具在单目录写入 8,001 个文件。
+    已修复其中一处确定问题：无序号观察批次每行绑定 12 个值，而批次沿用路径查询的 2,900 行上限
+    （34,800 > 32,766）；现按后端绑定预算计算行上限（SQLite 12 绑定 → 2,730 行，8 绑定 → 4,095 行），
+    并加单元回归 `observation_rows_are_capped_by_the_statement_bind_budget`。该用例仍失败，说明还有
+    另一条语句超限，需要按 SQL 文本定位（当前 storage 错误未携带 SQL）。
   - `watch` 两个实时监听用例：临时目录内新增文件在 20 s 内未被增量索引，放宽等待无效；疑似本机
     notify/FSEvents 在测试环境不投递事件，需在目标机器复核。
   已登记 LUX-862。

@@ -176,6 +176,14 @@ pub(crate) fn manifest_existing_file_update_chunk_size(backend: DatabaseBackend)
     chunk_size
 }
 
+/// Maximum bind parameters SQLite/PostgreSQL accept for one prepared statement.
+pub(crate) fn max_sql_bind_parameters(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS,
+        DatabaseBackend::Postgres => POSTGRES_MAX_BIND_PARAMETERS,
+    }
+}
+
 pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize {
     match backend {
         DatabaseBackend::Sqlite => MANIFEST_PATH_QUERY_SQLITE_CHUNK_SIZE,

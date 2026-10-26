@@ -149,6 +149,13 @@ impl Database {
         observation_batch_size: usize,
         observation_sequence_start: Option<i64>,
     ) -> Result<(), StorageError> {
+        // The sequence-less shape binds 12 values per row (the sequence shape binds 8 plus two
+        // statement-level values), so a chunk sized for path lookups can exceed SQLite's variable
+        // limit on large directories. Cap the row count by the backend's bind budget.
+        let observation_batch_size = observation_batch_size.min(observation_batch_row_cap(
+            self.backend(),
+            observation_sequence_start.is_some(),
+        ));
         let mut observation_offset = 0_i64;
         for entry_chunk in observation_entries.chunks(observation_batch_size) {
             if entry_chunk.is_empty() {
@@ -246,5 +253,47 @@ impl Database {
         }
 
         Ok(())
+    }
+}
+
+/// Rows one observation insert may bind without exceeding the backend's variable limit.
+pub(super) fn observation_batch_row_cap(
+    backend: crate::config::DatabaseBackend,
+    has_sequence: bool,
+) -> usize {
+    let binds_per_row = if has_sequence { 8 } else { 12 };
+    super::super::max_sql_bind_parameters(backend)
+        .saturating_sub(2)
+        .checked_div(binds_per_row)
+        .unwrap_or(1)
+        .max(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::DatabaseBackend;
+
+    #[test]
+    fn observation_rows_are_capped_by_the_statement_bind_budget() {
+        // SQLite accepts 32,766 variables: 12 binds per row leaves room for 2,730 rows; the
+        // sequence shape uses 8 binds per row.
+        assert_eq!(
+            observation_batch_row_cap(DatabaseBackend::Sqlite, false),
+            2_730
+        );
+        assert_eq!(
+            observation_batch_row_cap(DatabaseBackend::Sqlite, true),
+            4_095
+        );
+        // PostgreSQL's 65,535 budget stays above the discovery page for both shapes.
+        assert_eq!(
+            observation_batch_row_cap(DatabaseBackend::Postgres, false),
+            5_461
+        );
+        assert_eq!(
+            observation_batch_row_cap(DatabaseBackend::Postgres, true),
+            8_191
+        );
     }
 }
