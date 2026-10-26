@@ -15,6 +15,26 @@ python3 scripts/run-api-performance.py --cold-runs 3 --json-out /tmp/nfo-ab-<rev
 补 200 条各 128 KiB 的 NFO 快照（`media_item_nfo_cache` 或旧列）后再跑，否则只能验证“无回归”，不能
 证明体积收益；这一点在 LUX-857 验收记录中必须注明。
 
+## LUX-857 NFO 外置 A/B 实测（2026-10-26，arm64，release）
+
+同一夹具（10k 电影 / 1k 剧集 / 50k 分集，其中 200 条各 128 KiB NFO 快照），分别在
+`46ba0128`（内联列）与 `ad8bed43`（缓存表）上构建 release 并运行
+`scripts/run-api-performance.py --nfo-items 200 --nfo-bytes 131072`：
+
+| 指标 | before（内联列） | after（缓存表） | 变化 |
+|---|---:|---:|---:|
+| detail p50 | 1.82 ms | 1.80 ms | ≈0 |
+| detail p95 | 2.90 ms | 2.30 ms | **−21%** |
+| home p95 | 113.4 ms | 121.6 ms | 噪声范围内 |
+| search p95 | 67.3 ms | 67.1 ms | ≈0 |
+| 数据库文件 | 331.3 MB | 331.4 MB | 持平（载荷搬家，未删除） |
+| 空闲 WAL | 4,152 B | 4,152 B | 持平 |
+| 更新 200 行的 WAL 增量 | 4,569,112 B | 3,798,672 B | **−17%** |
+
+结论：详情读取的 p95 明显下降；WAL 写放大在“只改小字段”的更新上下降 17%。数据库文件持平是预期
+的——载荷从 `media_items` 搬到 `media_item_nfo_cache`，只有删除旧列并 VACUUM 后才会释放空间；
+升级库在写入时把旧列置 NULL，后续版本可安全删列。以上为单次 ARM64 本地测量，不外推到 NAS/x86。
+
 ## LUX-855 / LUX-861 规格夹具端点基线（2026-10-26，已修正）
 
 本机 `arm64`（macOS），release `luxd`，固定夹具由 `tools/catalog-fixture/generate.py --spec-target`
