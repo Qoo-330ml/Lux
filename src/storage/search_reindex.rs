@@ -21,6 +21,18 @@ impl Database {
             // PostgreSQL still maintains `media_search` inline; nothing is queued there yet.
             return Ok(0);
         }
+        // A trimmed or lost queue means events were skipped; re-enqueue everything rather than
+        // leaving the index permanently missing rows.
+        if let Some((applied_seq, oldest_remaining)) =
+            self.catalog_outbox_gap(SEARCH_REINDEX_CONSUMER).await?
+        {
+            tracing::warn!(
+                applied_seq,
+                oldest_remaining,
+                "search reindex queue gap; scheduling a full reindex"
+            );
+            self.enqueue_full_search_reindex().await?;
+        }
         let applied_seq = self
             .catalog_consumer(SEARCH_REINDEX_CONSUMER)
             .await?
@@ -43,6 +55,21 @@ impl Database {
         self.advance_catalog_consumer(SEARCH_REINDEX_CONSUMER, last_seq)
             .await?;
         Ok(item_ids.len())
+    }
+
+    /// Queues every item once; used after a detected queue gap so the index cannot stay incomplete.
+    pub(crate) async fn enqueue_full_search_reindex(&self) -> Result<i64, StorageError> {
+        self.query(
+            "INSERT INTO catalog_outbox (kind, item_id)
+             SELECT 'search', id FROM media_items",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() as i64)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
     }
 
     /// Rewrites the FTS rows for `item_ids` from the authoritative tables in one transaction.

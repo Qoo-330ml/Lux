@@ -1062,6 +1062,74 @@ async fn search_reindex_queue_defers_fts_writes_until_drained() {
 }
 
 #[tokio::test]
+async fn search_reindex_detects_a_queue_gap_and_reindexes_everything() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    for item_id in ["gap-a", "gap-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    assert_eq!(database.drain_search_reindex(100).await.expect("drain"), 2);
+
+    // Simulate a queue trimmed past the watermark without the consumer applying it: the oldest
+    // remaining event is no longer the one the consumer expects, so everything must be re-queued.
+    sqlx::query("DELETE FROM catalog_outbox WHERE id = 1")
+        .execute(database.pool())
+        .await
+        .expect("lose the first event");
+    sqlx::query(
+        "INSERT INTO catalog_consumers (name, applied_seq) VALUES (?, 0)
+         ON CONFLICT(name) DO UPDATE SET applied_seq = 0",
+    )
+    .bind(SEARCH_REINDEX_CONSUMER)
+    .execute(database.pool())
+    .await
+    .expect("rewind the watermark");
+    sqlx::query("UPDATE media_items SET title = 'gap changed' WHERE id = 'gap-a'")
+        .execute(database.pool())
+        .await
+        .expect("queue a fresh event for gap-a");
+    let applied = database.drain_search_reindex(100).await.expect("gap drain");
+    assert!(
+        applied >= 2,
+        "gap must trigger a full reindex, applied {applied}"
+    );
+    for item_id in ["gap-a", "gap-b"] {
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_search WHERE item_id = ? AND title MATCH 'gap'",
+        )
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("reindexed row");
+        assert_eq!(
+            indexed, 1,
+            "{item_id} must be searchable after the gap repair"
+        );
+    }
+    database.close().await;
+}
+
+#[tokio::test]
 async fn incremental_strm_count_uses_exact_file_paths_and_preserves_directory_scopes() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {
