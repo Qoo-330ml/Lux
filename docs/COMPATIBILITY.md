@@ -1299,3 +1299,17 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 - `pg_trgm` 对 CJK 三元组有效，但查询短于 3 字符时 PostgreSQL 也退化为顺序扫描。
 - 本轮未在真实的 PostgreSQL 实例上跑用例矩阵，PostgreSQL 侧只核对了 SQL 形状与绑定数；需要在有
   PG 的环境执行 `cargo test --locked --test search` 补齐证据。
+
+## W4：搜索索引维护方式的差异（2026-10-28）
+
+| 维度 | SQLite | PostgreSQL |
+| --- | --- | --- |
+| 写入路径 | 触发器只向 `catalog_outbox(kind='search')` 追加；消费者 `search_reindex@1` 批量重建 `media_search`（FTS5） | 行级触发器（`0219` 已按列过滤）在写事务内维护 `media_search` 表 |
+| 一致性 | 搜索请求前有界排空（200 条/请求）+ 后台 worker（1 s、500 条/批）；队列缺口时全量重建 | 同步写入，无滞后 |
+| 滞后 | 最坏约 1 秒；`FTS 空页 → LIKE 回退` 保证不会返回空结果 | 无 |
+| 行号映射 | `media_search_map` 由消费者按批取号，条目删除后清理映射 | 无（`item_id` 直接是主键） |
+| 不一致时的兜底 | 水位缺口检测 → 为所有条目重新入队；drain 幂等 | 不适用 |
+
+因此两后端的**查询语义一致**（同样的 FTS/LIKE 组合在 `LUX-869` 已对齐），差异只在维护机制：
+SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在扫描路径上。PostgreSQL 的等价入队
+改造待有 PG 实例时再做（见 `LUX-DEVELOPMENT.md` W4「剩余」）。

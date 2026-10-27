@@ -133,6 +133,53 @@ pub(crate) fn spawn_startup_user_series_next(database: Database) {
     });
 }
 
+/// How many queued events one consumer pass applies, and how often it runs.
+const SEARCH_REINDEX_BATCH: i64 = 500;
+const SEARCH_REINDEX_INTERVAL: Duration = Duration::from_secs(1);
+/// Applied queue rows are reclaimed in bounded batches on the same tick.
+const SEARCH_REINDEX_TRIM_BATCH: i64 = 2_000;
+
+/// Drains queued search-reindex events in the background so a scan leaves a short queue instead of
+/// writing the FTS index inside every item transaction.
+pub(crate) fn spawn_search_reindex_worker(database: Database) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SEARCH_REINDEX_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            loop {
+                match database.drain_search_reindex(SEARCH_REINDEX_BATCH).await {
+                    Ok(0) => {
+                        // Everything queued has been applied; reclaim the rows we no longer need.
+                        match database
+                            .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_TRIM_BATCH)
+                            .await
+                        {
+                            Ok(0) => break,
+                            Ok(trimmed) => tracing::debug!(trimmed, "catalog outbox trimmed"),
+                            Err(error) => {
+                                tracing::warn!(%error, "catalog outbox trim failed");
+                                break;
+                            }
+                        }
+                    }
+                    Ok(items) => tracing::debug!(items, "search reindex applied"),
+                    Err(error) => {
+                        tracing::warn!(%error, "search reindex failed");
+                        let _ = database
+                            .record_catalog_consumer_error(
+                                SEARCH_REINDEX_CONSUMER,
+                                &error.to_string(),
+                            )
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,51 +260,4 @@ mod tests {
         assert_eq!(second, first);
         Ok(())
     }
-}
-
-/// How many queued events one consumer pass applies, and how often it runs.
-const SEARCH_REINDEX_BATCH: i64 = 500;
-const SEARCH_REINDEX_INTERVAL: Duration = Duration::from_secs(1);
-/// Applied queue rows are reclaimed in bounded batches on the same tick.
-const SEARCH_REINDEX_TRIM_BATCH: i64 = 2_000;
-
-/// Drains queued search-reindex events in the background so a scan leaves a short queue instead of
-/// writing the FTS index inside every item transaction.
-pub(crate) fn spawn_search_reindex_worker(database: Database) {
-    tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(SEARCH_REINDEX_INTERVAL);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            ticker.tick().await;
-            loop {
-                match database.drain_search_reindex(SEARCH_REINDEX_BATCH).await {
-                    Ok(0) => {
-                        // Everything queued has been applied; reclaim the rows we no longer need.
-                        match database
-                            .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_TRIM_BATCH)
-                            .await
-                        {
-                            Ok(0) => break,
-                            Ok(trimmed) => tracing::debug!(trimmed, "catalog outbox trimmed"),
-                            Err(error) => {
-                                tracing::warn!(%error, "catalog outbox trim failed");
-                                break;
-                            }
-                        }
-                    }
-                    Ok(items) => tracing::debug!(items, "search reindex applied"),
-                    Err(error) => {
-                        tracing::warn!(%error, "search reindex failed");
-                        let _ = database
-                            .record_catalog_consumer_error(
-                                SEARCH_REINDEX_CONSUMER,
-                                &error.to_string(),
-                            )
-                            .await;
-                        break;
-                    }
-                }
-            }
-        }
-    });
 }
