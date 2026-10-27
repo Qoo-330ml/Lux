@@ -18525,6 +18525,11 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   排序索引 `idx_catalog_items_recent_sort`。派生行形状未变，`READ_MODEL_SCHEMA_VERSION` 保持 2。
 - 未完成/风险：PostgreSQL 侧只在 SQL 层核对了搜索分支（无本机 PG 实例）；1M 规模与深页收益待复测；
   LUX-869 的三处规格偏差（外部内容表、trigram/tsvector、搜索开关）需项目所有者确认。
+- 门禁（2026-10-28，`9d172ca4`）：`cargo test --locked --all-targets --no-fail-fast` **EXIT=0，
+  128 个目标全部通过（2,242 项通过、0 失败）**；`cargo fmt --all -- --check` 与
+  `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。首轮门禁暴露两个问题并已修：
+  `sync_played_container_states` 的整表指针重建（`288f9f51`，改为只刷新受影响剧集）与
+  `web_playback` 里对 webhook 投递顺序的断言（`072a29af`，投递由 4 并发 worker 处理，改为断言集合）。
 - W4（触发器入队与写预算）、W5（CPU/协议层）待登记。
 
 ### P2（读模型）阶段门状态（2026-10-27）
