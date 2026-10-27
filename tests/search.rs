@@ -562,7 +562,7 @@ async fn search_matrix_matches_chinese_prefix_alias_and_punctuation()
             _ => &spider_id,
         };
         assert_eq!(body["total"], 1, "query {label}");
-        assert_eq!(&ids, &[expected.clone()], "query {label}");
+        assert_eq!(&ids, std::slice::from_ref(expected), "query {label}");
     }
 
     let empty = client
