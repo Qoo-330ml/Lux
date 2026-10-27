@@ -87,6 +87,28 @@ pub struct CatalogService {
     library_page_cache: Arc<LibraryPageCache>,
     search_flights: Arc<SearchFlightRegistry>,
     recommendation_compute_lock: Arc<Mutex<()>>,
+    read_model_mode: ReadModelMode,
+}
+
+/// Read-model rollout switch. `on` stays unavailable until shadow parity is proven.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ReadModelMode {
+    Off,
+    Shadow,
+}
+
+impl ReadModelMode {
+    pub fn from_env() -> Self {
+        match std::env::var("LUX_READ_MODEL_MODE")
+            .unwrap_or_default()
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "shadow" => Self::Shadow,
+            _ => Self::Off,
+        }
+    }
 }
 
 const LIBRARY_PAGE_CACHE_TTL: Duration = Duration::from_secs(15);
@@ -265,6 +287,7 @@ impl LibraryPageCache {
                     library_page_cache: cache.clone(),
                     search_flights: search_flights.clone(),
                     recommendation_compute_lock: Arc::new(Mutex::new(())),
+                    read_model_mode: ReadModelMode::Off,
                 };
                 cache.refresh_entries(&service).await;
             }
@@ -425,6 +448,11 @@ pub struct CatalogItemCounts {
 }
 
 impl CatalogService {
+    pub fn with_read_model_mode(mut self, mode: ReadModelMode) -> Self {
+        self.read_model_mode = mode;
+        self
+    }
+
     pub fn new(database: Database, access: MediaAccessService) -> Self {
         let search_flights = SearchFlightRegistry::new();
         let library_page_cache =
@@ -435,6 +463,7 @@ impl CatalogService {
             library_page_cache,
             search_flights,
             recommendation_compute_lock: Arc::new(Mutex::new(())),
+            read_model_mode: ReadModelMode::Off,
         }
     }
 
@@ -975,6 +1004,84 @@ impl CatalogService {
         return self.library_page_cache.get_or_load(self, request).await;
     }
 
+    async fn compare_read_model_page(
+        &self,
+        query: &CatalogFilterQuery<'_>,
+        rows: &[StoredCatalogRow],
+        total: i64,
+    ) {
+        let sort = match query.sort_by {
+            StorageCatalogSort::Name | StorageCatalogSort::SortName => {
+                crate::storage::ReadModelSort::SortTitle
+            }
+            StorageCatalogSort::DateCreated => crate::storage::ReadModelSort::EffectiveAddedAt,
+            StorageCatalogSort::Rating => crate::storage::ReadModelSort::Rating,
+            StorageCatalogSort::ProductionYear => crate::storage::ReadModelSort::ProductionYear,
+            StorageCatalogSort::PremiereDate => return,
+        };
+        // The read model has no per-user/person/provider joins yet; only compare the default page.
+        if query.library_ids.len() != 1
+            || query.person_id.is_some()
+            || query.media_source_ids.is_some()
+            || query.provider_id_equals.is_some()
+            || !query.years.is_empty()
+            || query.is_played.is_some()
+            || query.is_favorite.is_some()
+            || query.min_date_last_saved.is_some()
+            || query.metadata_pending
+            || query.parent_id_scope.is_some()
+            || query.content_restrictions.is_some()
+        {
+            return;
+        }
+        let limit = if query.include_total {
+            query.limit
+        } else {
+            query.limit.saturating_add(1)
+        };
+        let legacy = rows
+            .iter()
+            .map(|row| row.item_id.as_str())
+            .collect::<Vec<_>>();
+        match self
+            .database
+            .shadow_catalog_library_page(&crate::storage::ReadModelPageQuery {
+                library_id: &query.library_ids[0],
+                item_types: query.item_types,
+                excluded_item_types: query.excluded_item_types,
+                sort,
+                descending: query.descending,
+                offset: query.offset,
+                limit,
+                include_total: query.include_total,
+            })
+            .await
+        {
+            Ok((ids, shadow_total)) => {
+                let shadow = ids.iter().map(String::as_str).collect::<Vec<_>>();
+                if legacy != shadow {
+                    tracing::warn!(
+                        library_id = %query.library_ids[0],
+                        legacy_count = legacy.len(),
+                        shadow_count = shadow.len(),
+                        "catalog read-model shadow page differs"
+                    );
+                }
+                if query.include_total && total != shadow_total {
+                    tracing::warn!(
+                        library_id = %query.library_ids[0],
+                        legacy_total = total,
+                        shadow_total,
+                        "catalog read-model shadow total differs"
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "catalog read-model shadow query failed");
+            }
+        }
+    }
+
     async fn load_library_page(
         &self,
         request: &LibraryPageRequest,
@@ -1015,6 +1122,9 @@ impl CatalogService {
             limit: request.limit,
         };
         let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
+        if self.read_model_mode == ReadModelMode::Shadow {
+            self.compare_read_model_page(&query, &rows, total).await;
+        }
         let mut items = assemble_items(rows);
         self.populate_item_details_and_episode_counts(
             &mut items,

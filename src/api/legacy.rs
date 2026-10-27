@@ -370,7 +370,8 @@ impl AppState {
         }
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
-        let catalog = CatalogService::new(database.clone(), access.clone());
+        let catalog = CatalogService::new(database.clone(), access.clone())
+            .with_read_model_mode(crate::application::catalog::ReadModelMode::from_env());
         let home = HomeService::new(catalog.clone(), libraries.clone());
         let image_writes = ImageWriteService::with_config_proxy_and_config_dir(
             database.clone(),

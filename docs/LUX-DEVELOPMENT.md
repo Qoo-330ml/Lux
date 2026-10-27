@@ -18335,6 +18335,12 @@ PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。66k 夹具实测（r
 
 验收：10k/50k 夹具 count=false p95 ≤300 ms、count=true ≤350 ms；SQL/请求 ≤4；shadow 差异可解释。
 
+进度（2026-10-27）：先落 `off | shadow` 开关（`LUX_READ_MODEL_MODE`，`on` 在对齐后开放）。默认库列表
+（无 person/source/provider/年份/播放/收藏/父级/内容限制过滤）在 shadow 下额外执行
+`catalog_items` 查询，按 item 顺序与总数与旧路径比较，差异记 warn；响应仍走旧路径。
+回归 `catalog_read_model_shadow_matches_the_legacy_default_list`（名称升序与创建时间降序的 id 序列、
+总数均一致）。尚未做 10k/50k 夹具 p95 与 SQL 数，也未开放 `on`。
+
 #### LUX-866：详情读模型切换
 
 范围：详情路由切到读模型 + 现有 DTO 组装；`Fields` 与媒体源仍走权威表；off/shadow/on 同 LUX-865。

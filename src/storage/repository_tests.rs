@@ -22169,6 +22169,116 @@ async fn catalog_items_rebuild_can_resume_from_the_materialized_prefix()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_read_model_shadow_matches_the_legacy_default_list()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('shadow-lib', 'Shadow', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for (id, sort_title, added_at, available) in [
+        ("shadow-a", "alpha", 1, 1),
+        ("shadow-b", "beta", 2, 0),
+        ("shadow-c", "gamma", 3, 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES (?, 'shadow-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+        )
+        .bind(id)
+        .bind(sort_title)
+        .bind(sort_title)
+        .bind(available)
+        .bind(added_at)
+        .execute(database.pool())
+        .await?;
+    }
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let library_ids = ["shadow-lib".to_owned()];
+    let empty_types: Vec<String> = Vec::new();
+    let empty_years: Vec<i64> = Vec::new();
+    let query = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "shadow-user",
+        item_types: &empty_types,
+        excluded_item_types: &empty_types,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &empty_years,
+        is_played: None,
+        is_favorite: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: None,
+        sort_by: CatalogSort::Name,
+        descending: false,
+        offset: 0,
+        limit: 10,
+        include_total: true,
+    };
+    let (legacy, legacy_total) = database.list_filtered_catalog_rows(&query).await?;
+    let legacy_ids = legacy
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<Vec<_>>();
+    let (shadow_ids, shadow_total) = database
+        .shadow_catalog_library_page(&ReadModelPageQuery {
+            library_id: "shadow-lib",
+            item_types: &empty_types,
+            excluded_item_types: &empty_types,
+            sort: ReadModelSort::SortTitle,
+            descending: false,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        })
+        .await?;
+    assert_eq!(legacy_ids, shadow_ids);
+    assert_eq!(legacy_total, shadow_total);
+    assert_eq!(
+        legacy_ids,
+        vec!["shadow-a".to_owned(), "shadow-c".to_owned()]
+    );
+
+    let recent = CatalogFilterQuery {
+        descending: true,
+        sort_by: CatalogSort::DateCreated,
+        ..query
+    };
+    let (recent_rows, recent_total) = database.list_filtered_catalog_rows(&recent).await?;
+    let recent_ids = recent_rows
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<Vec<_>>();
+    let (shadow_recent, shadow_recent_total) = database
+        .shadow_catalog_library_page(&ReadModelPageQuery {
+            library_id: "shadow-lib",
+            item_types: &empty_types,
+            excluded_item_types: &empty_types,
+            sort: ReadModelSort::EffectiveAddedAt,
+            descending: true,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        })
+        .await?;
+    assert_eq!(recent_ids, shadow_recent);
+    assert_eq!(recent_total, shadow_recent_total);
+    assert_eq!(
+        recent_ids,
+        vec!["shadow-c".to_owned(), "shadow-a".to_owned()]
+    );
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,

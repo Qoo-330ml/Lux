@@ -396,3 +396,118 @@ impl Database {
         })
     }
 }
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum ReadModelSort {
+    SortTitle,
+    EffectiveAddedAt,
+    Rating,
+    ProductionYear,
+}
+
+pub(crate) struct ReadModelPageQuery<'a> {
+    pub(crate) library_id: &'a str,
+    pub(crate) item_types: &'a [String],
+    pub(crate) excluded_item_types: &'a [String],
+    pub(crate) sort: ReadModelSort,
+    pub(crate) descending: bool,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+    pub(crate) include_total: bool,
+}
+
+impl Database {
+    /// Shadow query for the default library list: ids and total only, so it can be compared with
+    /// the authoritative path without changing the response.
+    #[allow(dead_code)] // wired by the shadow comparison in the catalog service
+    pub(crate) async fn shadow_catalog_library_page(
+        &self,
+        page: &ReadModelPageQuery<'_>,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        let ReadModelPageQuery {
+            library_id,
+            item_types,
+            excluded_item_types,
+            sort,
+            descending,
+            offset,
+            limit,
+            include_total,
+        } = *page;
+        let order = match sort {
+            ReadModelSort::SortTitle => "sort_title",
+            ReadModelSort::EffectiveAddedAt => "effective_added_at",
+            ReadModelSort::Rating => "rating",
+            ReadModelSort::ProductionYear => "production_year",
+        };
+        let direction = if descending { "DESC" } else { "ASC" };
+        let mut conditions = vec![
+            "library_id = ?".to_owned(),
+            "removed_at IS NULL".to_owned(),
+            "merged_into IS NULL".to_owned(),
+            "has_available_source = 1".to_owned(),
+        ];
+        if !item_types.is_empty() {
+            let placeholders = std::iter::repeat_n("?", item_types.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("item_type IN ({placeholders})"));
+        }
+        if !excluded_item_types.is_empty() {
+            let placeholders = std::iter::repeat_n("?", excluded_item_types.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            conditions.push(format!("item_type NOT IN ({placeholders})"));
+        }
+        let where_clause = conditions.join(" AND ");
+        let list_query = format!(
+            "SELECT item_id FROM catalog_items
+             WHERE {where_clause}
+             ORDER BY {order} {direction}, item_id
+             LIMIT ? OFFSET ?"
+        );
+        let mut statement = self
+            .query_as::<(String,)>(sqlx::AssertSqlSafe(list_query))
+            .bind(library_id);
+        for item_type in item_types {
+            statement = statement.bind(item_type);
+        }
+        for item_type in excluded_item_types {
+            statement = statement.bind(item_type);
+        }
+        let ids = statement
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(|(id,)| id)
+            .collect::<Vec<_>>();
+        let total = if include_total {
+            let count_query = format!("SELECT COUNT(*) FROM catalog_items WHERE {where_clause}");
+            let mut count_statement = self
+                .query_scalar::<i64>(sqlx::AssertSqlSafe(count_query))
+                .bind(library_id);
+            for item_type in item_types {
+                count_statement = count_statement.bind(item_type);
+            }
+            for item_type in excluded_item_types {
+                count_statement = count_statement.bind(item_type);
+            }
+            count_statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+        } else {
+            0
+        };
+        Ok((ids, total))
+    }
+}
