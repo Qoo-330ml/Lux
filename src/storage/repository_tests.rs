@@ -22084,7 +22084,7 @@ async fn catalog_read_model_rebuild_copies_authoritative_fields_and_validates()
     )
     .fetch_one(database.pool())
     .await?;
-    assert_eq!(movie.0.as_deref(), Some("poster-tag"));
+    assert_eq!(movie.0.as_deref(), Some("rm-poster"));
     assert_eq!(movie.1.as_deref(), Some("rm-source"));
     assert_eq!(movie.2.as_deref(), Some("PG-13"));
 
