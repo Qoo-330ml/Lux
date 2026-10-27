@@ -18449,8 +18449,9 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
   会先重建；回归 `read_model_watermarks_are_version_scoped`。改动派生行形状或其输入时必须递增该版本。
 - 两轮交错复测（`--rounds 2`，区间不重叠）：首页 `off` p95 126.7 ms / `on` 155.8 ms —— 首页 `on`
   净亏约 38 ms 且可复现，继续观看 `on` 更快（11.7 → 9.1 ms），库列表基本持平；三者均逐字节一致。
-  因此 `on` 必须保持默认关闭，下一步用 `RUST_LOG=debug` 抓 `stage` 耗时定位这 38 ms（判断是
-  `recently_added` 还是 `latest_by_library`），再决定修查询或回退该 rail 的切换。
+  因此 `on` 必须保持默认关闭。分段日志已定位：`recently_added` 104 → 150 ms（读模型的计数查询退化成
+  整表扫描），而 `latest_by_library` 81 → 12 ms、`continue_watching` 42 → 20 ms 都是收益。下一步把该
+  rail 的计数拆成两条可走索引的查询，再复测；不要回退按库最新 rail 的切换（它是最大收益项）。
 - 延迟测量注意（历史）：同一份构建在本机会话后段明显变慢（同一配置首页 p95 依次出现 86.7 / 113.3 / 146.7 ms，
   release 构建耗时也逐次上升），判断为机器负载/散热噪声。66k 上读模型的延迟结论需要交错多轮复测，
   本轮只确认**响应逐字节一致 + shadow 零差异 + 索引命中**。

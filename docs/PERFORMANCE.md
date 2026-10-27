@@ -2725,3 +2725,24 @@ PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表
 结论：**`on` 在首页仍净亏，必须保持默认关闭**；下一步要用 `RUST_LOG=debug` 抓
 `stage = "recently_added"` / `"latest_by_library"` 的耗时，定位这 38 ms 落在哪个 rail，再决定修查询
 还是回退该 rail 的切换。
+
+### 首页分段耗时（`RUST_LOG=debug`，单轮 9 个请求的中位数）
+
+| rail | `off` | `on` |
+|---|---:|---:|
+| `recently_added` | 104 ms | **150 ms** |
+| `latest_by_library` | 81 ms | **12 ms** |
+| `continue_watching` | 42 ms | **20 ms** |
+| `libraries` | 0 ms | 0 ms |
+
+定位结论：首页 `on` 的净亏来自 **`recently_added` rail 的读模型查询（+46 ms）**，它抵消了
+`latest_by_library`（−69 ms）和 `continue_watching`（−22 ms）的收益。该 rail 的读模型实现每次都要
+`COUNT(*)` 配合“可用条目 ∪ 无源容器”的大 OR 谓词，`catalog_items` 上这份计数没有可用索引，退化成
+整表扫描；权威查询的计数走的是 `media_items` 上的分区索引。
+
+下一步（按收益排序）：
+
+1. 把该 rail 的计数拆成两条可走索引的计数（可用条目一条、无源容器一条），或改为从
+   `catalog_item_stats` 取近似值之前先验证一致性；
+2. 修好后重跑 `--rounds 2`，预期首页 `on` 由 155.8 ms 降到 110 ms 左右；
+3. 保留 `latest_by_library` 的读模型切换——它是当前收益最大的一项（81 → 12 ms）。
