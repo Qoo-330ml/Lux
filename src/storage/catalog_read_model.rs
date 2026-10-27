@@ -614,44 +614,97 @@ impl Database {
              ORDER BY effective_added_at DESC, sort_title, item_id
              LIMIT ? OFFSET ?"
         );
-        let mut statement = self.query_as::<(String,)>(sqlx::AssertSqlSafe(list_sql));
-        for library_id in query.library_ids {
-            statement = statement.bind(library_id).bind(per_library_limit);
+        let list_future = async {
+            let mut statement = self.query_as::<(String,)>(sqlx::AssertSqlSafe(list_sql));
+            for library_id in query.library_ids {
+                statement = statement.bind(library_id).bind(per_library_limit);
+            }
+            statement
+                .bind(query.limit)
+                .bind(query.offset.max(0))
+                .fetch_all(&self.pool)
+                .await
+                .map(|rows| {
+                    rows.into_iter()
+                        .map(|(item_id,)| item_id)
+                        .collect::<Vec<_>>()
+                })
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })
+        };
+        if !query.include_total {
+            return Ok((list_future.await?, 0));
         }
-        let ids = statement
-            .bind(query.limit)
-            .bind(query.offset.max(0))
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .into_iter()
-            .map(|(item_id,)| item_id)
-            .collect::<Vec<_>>();
-        let total = if query.include_total {
-            let count_sql = format!(
-                "SELECT COUNT(*)
-                 FROM catalog_items ci
-                 JOIN libraries l ON l.id = ci.library_id AND l.is_enabled = 1
-                 WHERE ci.library_id IN ({placeholders}) AND {visible}"
-            );
-            let mut statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql));
+        // Two disjoint, index-backed counts instead of one `OR` predicate: the available branch is
+        // covered by `idx_catalog_items_visibility`, while the container branch only visits
+        // containers without a source. The single-predicate form made SQLite walk (and fetch) every
+        // row of the library just to evaluate the `OR`.
+        let available_count_sql = format!(
+            "SELECT COUNT(*)
+             FROM catalog_items ci
+             JOIN libraries l ON l.id = ci.library_id AND l.is_enabled = 1
+             WHERE ci.library_id IN ({placeholders})
+               AND ci.removed_at IS NULL AND ci.merged_into IS NULL
+               AND {available_types} AND ci.has_available_source = 1"
+        );
+        let container_count_sql = format!(
+            "SELECT COUNT(*)
+             FROM catalog_items ci
+             JOIN libraries l ON l.id = ci.library_id AND l.is_enabled = 1
+             WHERE ci.library_id IN ({placeholders})
+               AND ci.removed_at IS NULL AND ci.merged_into IS NULL
+               AND {container_types} AND ci.has_available_source = 0
+               AND (EXISTS (
+                        SELECT 1 FROM catalog_items visible_child
+                        WHERE visible_child.removed_at IS NULL
+                          AND visible_child.merged_into IS NULL
+                          AND visible_child.has_available_source = 1
+                          AND (visible_child.parent_id = ci.item_id
+                               OR visible_child.series_id = ci.item_id)
+                    )
+                    OR EXISTS (
+                        SELECT 1 FROM collection_items visible_collection_item
+                        JOIN collections visible_collection
+                          ON visible_collection.id = visible_collection_item.collection_id
+                        JOIN catalog_items visible_child
+                          ON visible_child.item_id = visible_collection_item.item_id
+                        WHERE visible_collection.item_id = ci.item_id
+                          AND visible_child.removed_at IS NULL
+                          AND visible_child.merged_into IS NULL
+                          AND visible_child.has_available_source = 1
+                    ))"
+        );
+        let count_scope = |sql: &str| {
+            let mut statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(sql.to_owned()));
             for library_id in query.library_ids {
                 statement = statement.bind(library_id);
             }
             statement
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-        } else {
-            0
         };
-        Ok((ids, total))
+        let (ids, available_total, container_total) = tokio::try_join!(
+            list_future,
+            async {
+                count_scope(&available_count_sql)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })
+            },
+            async {
+                count_scope(&container_count_sql)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })
+            },
+        )?;
+        Ok((ids, available_total.saturating_add(container_total)))
     }
 }
 
