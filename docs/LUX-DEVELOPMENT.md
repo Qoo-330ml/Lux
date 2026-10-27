@@ -18418,7 +18418,7 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 
 验收：首页 p95 ≤400 ms；扫描并发下 p95 比值下降；`off` 逐字节一致。
 
-进度（2026-10-27，部分完成）：
+进度（2026-10-27，完成；仅“扫描并发下 p95 比值”待补）：
 
 - 继续观看 rail 已由 LUX-867 覆盖（`user_series_next` + 进行中电影/视频）。
 - 最近添加 rail 接 `catalog_items`：`list_recent_read_model_ids` 复刻权威查询的可见集合（可用条目 +
@@ -18447,16 +18447,27 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 - 水位带版本：`catalog_items_rebuild@<READ_MODEL_SCHEMA_VERSION>`、
   `user_series_next_rebuild@<同版本>`（当前 2）。旧构建写下的派生行不会被 `on` 路径直接信任，升级后
   会先重建；回归 `read_model_watermarks_are_version_scoped`。改动派生行形状或其输入时必须递增该版本。
-- 两轮交错复测（`--rounds 2`，区间不重叠）：首页 `off` p95 126.7 ms / `on` 155.8 ms —— 首页 `on`
-  净亏约 38 ms 且可复现，继续观看 `on` 更快（11.7 → 9.1 ms），库列表基本持平；三者均逐字节一致。
-  因此 `on` 必须保持默认关闭。分段日志已定位：`recently_added` 104 → 150 ms（读模型的计数查询退化成
-  整表扫描），而 `latest_by_library` 81 → 12 ms、`continue_watching` 42 → 20 ms 都是收益。下一步把该
-  rail 的计数拆成两条可走索引的查询，再复测；不要回退按库最新 rail 的切换（它是最大收益项）。
-- 延迟测量注意（历史）：同一份构建在本机会话后段明显变慢（同一配置首页 p95 依次出现 86.7 / 113.3 / 146.7 ms，
-  release 构建耗时也逐次上升），判断为机器负载/散热噪声。66k 上读模型的延迟结论需要交错多轮复测，
-  本轮只确认**响应逐字节一致 + shadow 零差异 + 索引命中**。
-- 未完成：扫描并发下首页 p95 比值（第 29 节验收）本轮未复测；首页 `on` 的净收益取决于上一条的
-  排序键物化。
+- 两轮交错复测（`--rounds 2`，区间不重叠）曾显示首页 `off` p95 126.7 ms / `on` 155.8 ms —— 首页
+  `on` 净亏约 38 ms，分段日志定位到 `recently_added` 的读模型计数退化为整表扫描。修复（见下）
+  后同一脚本复测：首页 `off` 118.05 ms / `on` **16.58 ms**（−86%，区间 110.8–125.3 vs
+  16.2–16.9 不重叠），继续观看 9.97 / 9.83 ms，库列表 2.47 / 4.18 ms，三者逐字节一致。
+- 修复分两处（都是查询形状问题，不是数据形状问题，因此没有递增 `READ_MODEL_SCHEMA_VERSION`）：
+  迁移 `0235_catalog_items_visibility_index.sql` / PostgreSQL `0237_...` 加覆盖索引
+  `(library_id, has_available_source, removed_at, merged_into, item_type)`，把该 rail 的总数拆成
+  权威查询同构的两段（可用条目 56 → 2.3 ms，无源容器 → 0.02 ms）并与页查询并发；迁移
+  `0236_catalog_items_recent_sort_index.sql` / PostgreSQL `0238_...` 加
+  `(library_id, effective_added_at DESC, sort_title, item_id)`，让每库有界子查询真正走索引序
+  （67 → 0.12 ms）。页查询这一项其实是 `latest_added_at` 物化索引上线后规划器改用整库扫描 +
+  临时排序带来的回归，先前“0.1 ms”的读数只是因为当时没有竞争索引。
+- 分段耗时（同口径 10 请求中位数）：`recently_added` 104.5 → 5.0 ms、`latest_by_library`
+  81 → 7.0 ms、`continue_watching` 44 → 11.0 ms。首页 `on` 的三条 rail 全部变快。
+- 残留差异（非等价场景）：读模型把“已合并条目”（`merged_into` 非空但 `removed_at` 为空）排除，
+  而 `list_recent_catalog_item_ids` 这条权威查询没有 `merged_into_item_id IS NULL` 过滤（其它
+  目录查询走 `CATALOG_VISIBLE_PREDICATE` 是有的）。两侧只在存在已合并条目时才可能不同；统一这条
+  权威 SQL 会改变既有 `off` 行为，留待项目所有者确认后再改。
+- 未完成：扫描并发下首页 p95 比值（第 29 节验收）。当前 66k 夹具只种数据库行、`library_roots`
+  指向不存在的路径，真实扫描会把全部条目判为缺失并改写夹具，因此这项需要一个“有真实文件”的
+  小夹具，留待扫描并发实验单独立项。
 
 #### LUX-869：搜索统一
 

@@ -2746,3 +2746,51 @@ PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表
    `catalog_item_stats` 取近似值之前先验证一致性；
 2. 修好后重跑 `--rounds 2`，预期首页 `on` 由 155.8 ms 降到 110 ms 左右；
 3. 保留 `latest_by_library` 的读模型切换——它是当前收益最大的一项（81 → 12 ms）。
+
+### 修复：两段索引计数 + 排序索引（2026-10-27）
+
+分段日志只指出“哪一段慢”，没有指出“哪条 SQL 慢”。直接在夹具上逐条计时（`sqlite3`，66k
+`catalog_items`、3 个库）后，`recently_added` rail 上有两个独立问题：
+
+| 语句 | 修复前 | 根因 | 修复后 |
+|---|---:|---|---:|
+| 总数（单条大 OR） | 56 ms | `OR` 谓词让 SQLite 用 `idx_catalog_items_recent` 逐行回表 | — |
+| 总数：可用条目分支 | — | — | **2.3 ms**（`idx_catalog_items_visibility` 覆盖索引） |
+| 总数：无源容器分支 | — | — | **0.02 ms**（只碰无源容器） |
+| 页查询（每库有界子查询） | 67 ms | 排序键缺 `sort_title`，每库先全量排序再 `LIMIT` | **0.12 ms**（`idx_catalog_items_recent_sort` 走索引序） |
+
+改动：
+
+1. `0235_catalog_items_visibility_index.sql` / PostgreSQL `0237_…`：`(library_id,
+   has_available_source, removed_at, merged_into, item_type)` 覆盖索引；
+2. `0236_catalog_items_recent_sort_index.sql` / PostgreSQL `0238_…`：`(library_id,
+   effective_added_at DESC, sort_title, item_id)`，与页查询的 `ORDER BY` 逐列同向；
+3. `list_recent_read_model_ids` 的计数拆成权威查询同构的两段（可并有界），并与页查询并发执行。
+
+页查询的 67 ms 有一个反直觉点：**首版在 66k 上测到 0.1 ms 只是因为当时没有竞争索引**。
+`latest_added_at` 物化索引上线后，规划器改用它扫整库再临时排序；也就是说这项其实是 LUX-868
+自己引入的回归，靠加排序索引修掉，而不是靠“当时测过”。
+
+### 修复后复测（2026-10-27，`--rounds 2 --requests 10`，读数可信）
+
+| 端点 | `off` p50/p95 | `on` p50/p95 | 逐字节一致 |
+|---|---:|---:|---|
+| `/api/v1/home` | 105.49 / **118.05** ms（p95 110.8–125.3） | 14.08 / **16.58** ms（p95 16.2–16.9） | ✅ 93,909 B |
+| `/api/v1/continue-watching` | 9.56 / 9.97 ms | 8.10 / 9.83 ms | ✅ 40,324 B |
+| `/api/v1/libraries` | 2.05 / 2.47 ms | 1.96 / 4.18 ms | ✅ 249 B |
+
+两模式 p95 区间不重叠（`off` 110.8–125.3 vs `on` 16.2–16.9），首页 `on` 从“净亏 38 ms”变为
+**净赚约 101 ms**（−86%）。库列表 p95 在 `on` 侧反而高 1.7 ms，属于 249 B 小响应上的调度噪声
+（p50 两侧相同 1.96/2.05 ms），不作为回归。
+
+分段耗时同口径（`RUST_LOG=debug`，每模式 10 个请求中位数）：
+
+| rail | `off` | `on` |
+|---|---:|---:|
+| `recently_added` | 104.5 ms | **5.0 ms** |
+| `latest_by_library` | 79.5 ms | **7.0 ms** |
+| `continue_watching` | 44.0 ms | **11.0 ms** |
+| `libraries` | 0 ms | 0 ms |
+
+结论：首页 `on` 的三条 rail 全部变快，`on` 不再是净亏；默认仍保持 `off`，由项目所有者决定
+何时开启。本机为 macOS arm64，不能据此外推到 NAS/x86_64。
