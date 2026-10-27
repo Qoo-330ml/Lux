@@ -25,7 +25,9 @@ mod unix {
             .no_proxy()
             .build()
             .expect("test client");
-        tokio::time::timeout(Duration::from_secs(30), async {
+        // Debug builds with full request logging can approach 30 s on a loaded machine; a timeout
+        // here only delays the failure, so give startup twice the old budget.
+        tokio::time::timeout(Duration::from_secs(60), async {
             loop {
                 match client.get(health_url).send().await {
                     Ok(response) if response.status().is_success() => {
