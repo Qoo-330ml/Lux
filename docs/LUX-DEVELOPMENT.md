@@ -18344,8 +18344,10 @@ PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。66k 夹具实测（r
 去重后与读模型一致）。`on` 模式已接入：用 `catalog_items` 选页 + 一次批量源/流查询组装旧行结构（图片标签改存
 `item_images.id` 以与旧路径一致），不支持的过滤组合自动回退旧路径。66k 夹具实测：同一页
 `pageSize=50&includeTotal=false` 的 off/on 响应字节完全一致（99,464 B），on 日志无告警；30 次请求
-p50/p95 为 off 4.09/4.93 ms、on 4.57/5.26 ms（小规模下读模型略慢，收益在 1M 行与深页，尚未在该规模
-验证）。
+p50/p95 为 off 4.09/4.93 ms、on 4.57/5.26 ms；`pageSize=100&includeTotal=true` 响应也逐字节一致
+（198,866 B，off 3.41/4.02 ms、on 5.26/7.37 ms），深页（page=40）同样一致（157,665 B，
+off 3.27/3.67 ms、on 4.65/5.64 ms）。on 每请求 3 条 SQL（id 页 + 核心行 + 批量源/流）≤4，p95 远低于
+300/350 ms 目标；但在 66k 规模上比旧路径慢 1.5–3 ms，默认仍保持 `off`，读模型收益需在 1M/深页复测。
 
 #### LUX-866：详情读模型切换
 
