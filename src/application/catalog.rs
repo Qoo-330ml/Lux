@@ -1039,9 +1039,12 @@ impl CatalogService {
         } else {
             query.limit.saturating_add(1)
         };
+        // The legacy query joins sources/streams, so one item can appear on several rows.
+        let mut seen = std::collections::HashSet::new();
         let legacy = rows
             .iter()
             .map(|row| row.item_id.as_str())
+            .filter(|item_id| seen.insert(*item_id))
             .collect::<Vec<_>>();
         match self
             .database

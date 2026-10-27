@@ -18339,7 +18339,9 @@ PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。66k 夹具实测（r
 （无 person/source/provider/年份/播放/收藏/父级/内容限制过滤）在 shadow 下额外执行
 `catalog_items` 查询，按 item 顺序与总数与旧路径比较，差异记 warn；响应仍走旧路径。
 回归 `catalog_read_model_shadow_matches_the_legacy_default_list`（名称升序与创建时间降序的 id 序列、
-总数均一致）。尚未做 10k/50k 夹具 p95 与 SQL 数，也未开放 `on`。
+总数均一致）。66k 夹具实测：`LUX_READ_MODEL_MODE=shadow` 下请求库列表 pageSize 50 与 100，
+日志中 `shadow page differs` / `shadow total differs` / `shadow query failed` 均为 0（旧路径按 item
+去重后与读模型一致）。尚未做 10k/50k 夹具 p95 与 SQL 数，也未开放 `on`。
 
 #### LUX-866：详情读模型切换
 
