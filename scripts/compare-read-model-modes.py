@@ -98,8 +98,10 @@ def wait_for_backfill(database: pathlib.Path, name: str, timeout: float) -> None
         try:
             connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
             try:
+                # Watermarks are version scoped (`name@<schema version>`), so match the prefix.
                 done = connection.execute(
-                    "SELECT COUNT(*) FROM catalog_consumers WHERE name = ?", (name,)
+                    "SELECT COUNT(*) FROM catalog_consumers WHERE name = ? OR name LIKE ?",
+                    (name, f"{name}@%"),
                 ).fetchone()[0]
             finally:
                 connection.close()
