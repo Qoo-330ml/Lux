@@ -18476,6 +18476,35 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 
 验收：搜索 p95 ≤500 ms；中英文/别名/前缀用例全绿；`off` 回退旧 LIKE 路径。
 
+进度（2026-10-27，完成）：
+
+- 现状核对：SQLite 已有触发器维护的 FTS5 `media_search`（title/sort_title/original_title/aliases
+  与行号映射 `media_search_map`，迁移 0167），查询先取 FTS 命中页、空页回退 LIKE；PostgreSQL 侧是
+  `media_search` 表上的 ILIKE + `pg_trgm` GIN（迁移 0214）。因此本任务不需要新建索引主体，需要的是
+  补齐两后端语义差、把用例矩阵落成回归，并对 trigram/tsvector 两条备选给出取舍依据。
+- 语义统一（`104c8c19`）：LIKE 回退分支与 PostgreSQL 分支都补上 `sort_title`。此前只有 FTS 行索引了
+  排序标题，于是“只出现在排序标题里的文本”在子串查询里查不到（在 PostgreSQL 上是所有查询都查不到）。
+  回归 `search_matrix_matches_chinese_prefix_alias_and_punctuation` 增加 sort_title 用例，先红后绿。
+- 用例矩阵（`30e53e1c`）：`tests/search.rs` 新增矩阵用例，覆盖中文 2/3/4 字、词内后缀、中文别名、
+  拉丁别名、拉丁前缀、拉丁子串、连字符标题、双词查询与空结果，断言总数与条目 id。
+- trigram 评估（66k 夹具，其中 10k 电影标题改为中文）：FTS5 `tokenize='trigram'` 建表 862 ms、
+  数据库 398.5 → 407.8 MB（+9.4 MB），3–6 字中文 `MATCH` 1.6–1.8 ms，对比 LIKE 全表 6.5–7.8 ms；
+  但 **1–2 字查询（如“银河”）trigram 无法回答**（要求 ≥3 字符），而这正是中文查询最常见的长度，
+  仍要回退 LIKE。收益约 5 ms/次，代价是每次媒体写入多维护一份 FTS 索引（与 W4 写预算方向相反），
+  本轮不采用，留待 1M 规模复评。
+- tsvector 评估：PostgreSQL 现状的 `pg_trgm` GIN 已让 ILIKE 走索引，且 ILIKE 的“包含”语义与 SQLite
+  的 LIKE 回退一致；改用 `tsvector` 会引入词元化差异（中文会被切成一整段），与“不得改变 Lux API
+  语义”冲突，本轮保留 `pg_trgm`，差异写入兼容性矩阵。
+- 与规格的差异（需项目所有者确认）：(1) 未把 `media_search` 改成外部内容表——FTS5 external content
+  要求单一内容表，而搜索列来自 `media_items` + `item_aliases`，现有“触发器 + 行号映射”已避免长期
+  漂移；(2) 未采用 trigram/tsvector，理由如上；(3) 未新增搜索开关——本轮改动只是补齐两后端同一
+  路径的语义，`off` 语义即现有 FTS+LIKE 路径，没有需要灰度回滚的新实现。
+- 验收数据（66k 夹具，arm64 release，`/api/v1/search`，每例 12 次取 p95）：中文 2 字 15.9 ms、
+  中文 4 字 23.7 ms、中文整词 11.7 ms、拉丁词元 106.6 ms、拉丁双词 19.1 ms、拉丁子串 17.5 ms、
+  无结果 18.3 ms，全部 ≤500 ms；用例矩阵 3/3 通过，库内搜索相关单测 11/11 通过。
+- 风险：PostgreSQL 分支无本机实例可跑，本轮只做了 SQL 形状与绑定数的静态核对；需要 PG 环境复测
+  `search_matrix` 用例集。
+
 W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成并复测后再登记。
 
 ### P2（读模型）阶段门状态（2026-10-27）

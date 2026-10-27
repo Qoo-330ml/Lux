@@ -1274,3 +1274,28 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 可触发入口为已授权的 Web/Emby 实际播放 GET，以及已授权的 Emby `PLAYING` 回调；PlaybackInfo、HEAD、浏览详情、暂停和停止回调不触发。播放只排队当前来源，不扩展为全库扫描。单来源范围由 SQLite/PostgreSQL 迁移持久化，普通全库与扫描增量任务范围保持不变。
 
 本机 macOS `arm64` 服务端验证：`playback` 5/5、`playback_strm_probe` 1/1、`strm` 1/1、`strm_probe` 4/4、`strm_probe_api` 2/2、`web_playback` 1/1；另有扫描范围重试锁回归 1/1。完整 Rust 门禁的 4 个失败已在干净 `test` 基线上复现，完整 Clippy 尚有既有诊断；未验证 FNOS/NAS、真实远程媒体服务器或第三方播放器，因此不代表部署环境链路已验证。
+
+## LUX-869：搜索语义矩阵（2026-10-27）
+
+搜索在两个后端走不同索引，但必须给出同一结果集。本轮把差异逐项核对并补齐：
+
+| 维度 | SQLite | PostgreSQL | 处理 |
+| --- | --- | --- | --- |
+| 索引 | FTS5 `media_search`（触发器 + `media_search_map` 行号映射） | `media_search` 表 + `pg_trgm` GIN（`title`/`original_title`/`aliases`） | 各自使用，不共享 DDL |
+| 词元命中 | 先 `MATCH`（整词/短语，`AND` 连接多词，可跨列） | 无词元层，只有 `ILIKE '%…%'` 包含匹配 | 结果集取并集语义：FTS 命中优先，空页回退 LIKE |
+| 包含匹配 | `LIKE … ESCAPE '!'`，ASCII 大小写不敏感 | `ILIKE`，按库 locale 折叠 | 对 ASCII 与 CJK 用例等价 |
+| 可搜索列 | `title`/`original_title`/`aliases`（LIKE）+ `title`/`sort_title`/`original_title`/`aliases`（FTS） | `title`/`original_title`/`sort_title`/`aliases` | 本轮给两后端的 LIKE 分支补上 `sort_title`，列集一致 |
+| 中文 1–2 字 | FTS 单词元不含子串，回退 LIKE 全表（66k 约 16 ms p95） | `ILIKE` + trigram GIN | 都不使用 trigram FTS：FTS5 trigram 要求 ≥3 字符 |
+| 前缀（拉丁） | `"token"` 短语不匹配前缀，回退 LIKE | `ILIKE '%pre%'` | 语义一致（都是包含） |
+| 大小写/重音 | FTS `unicode61` 折叠大小写并去重音；LIKE 只折叠 ASCII | `ILIKE` 折叠大小写 | FTS 命中集合可能更大，回退分支保持一致 |
+| 排序 | `sort_title, id` | `sort_title, id` | 一致；不使用 FTS rank |
+| 权限与内容限制 | 先 ACL/内容限制再分页 | 同 | 一致 |
+
+已知差异与限制：
+
+- 词元语义只在 SQLite 侧存在（例如查询命中 `sort_title` 的某个整词）。因为结果集是“FTS 并集 LIKE”，
+  SQLite 的命中集合是 PostgreSQL 的超集；PostgreSQL 侧通过补齐 `sort_title` 缩小差距，但没有引入
+  `tsvector`，因为 `tsvector` 的中文词元化会把整段中文切成一个 token，反而改变 API 语义。
+- `pg_trgm` 对 CJK 三元组有效，但查询短于 3 字符时 PostgreSQL 也退化为顺序扫描。
+- 本轮未在真实的 PostgreSQL 实例上跑用例矩阵，PostgreSQL 侧只核对了 SQL 形状与绑定数；需要在有
+  PG 的环境执行 `cargo test --locked --test search` 补齐证据。
