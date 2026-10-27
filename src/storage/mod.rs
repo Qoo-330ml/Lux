@@ -880,7 +880,7 @@ pub(crate) use repository::{
     NewUserDeviceObservation, NewUserInvitation, NewWebPlaybackEvent, NewWebPlaybackSession,
     PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, ReadModelPageQuery,
     ReadModelSort, RecentByLibraryReadModelQuery, RecentReadModelQuery, ReconciliationBatchCommit,
-    ReconciliationBatchCommitResult, ResumeItemsQuery, ResumePointerQuery,
+    ReconciliationBatchCommitResult, ResumeItemsQuery, ResumePointerQuery, SEARCH_REINDEX_CONSUMER,
     ScanFingerprintMigrationCommit, ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate,
     StoredAccessTokenDevice, StoredActivityEvent, StoredAdminUserListItem, StoredCanonicalPerson,
     StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,

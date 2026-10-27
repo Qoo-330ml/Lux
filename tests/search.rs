@@ -122,25 +122,12 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     .bind(&hidden_movie_id)
     .execute(database.pool())
     .await?;
-    let initial_fts_sort_title: String =
-        sqlx::query_scalar("SELECT sort_title FROM media_search WHERE item_id = ?")
-            .bind(&hidden_movie_id)
-            .fetch_one(database.pool())
-            .await?;
-    assert_eq!(initial_fts_sort_title, "");
-
+    // The search index is maintained by the `search_reindex` consumer (W4): the write only
+    // enqueues, and the search request drains the queue before querying.
     sqlx::query("UPDATE media_items SET sort_title = 'Canonical Hidden' WHERE id = ?")
         .bind(&hidden_movie_id)
         .execute(database.pool())
         .await?;
-    let canonical_sort_title_matches: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM media_search
-         WHERE media_search MATCH 'Canonical' AND item_id = ?",
-    )
-    .bind(&hidden_movie_id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(canonical_sort_title_matches, 1);
     let emby_chinese_id = emby_public_id(&chinese_id);
     sqlx::query(
         "INSERT INTO item_aliases (id, item_id, alias, language, alias_normalized)
@@ -249,6 +236,16 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     let punctuation_body = punctuation.json::<Value>().await?;
     assert_eq!(punctuation_body["total"], 1);
     assert_eq!(punctuation_body["items"][0]["id"], hidden_movie_id);
+
+    let canonical = client
+        .get(format!("{base_url}/api/v1/search?q=Canonical"))
+        .header("Cookie", format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(canonical.status(), reqwest::StatusCode::OK);
+    let canonical_body = canonical.json::<Value>().await?;
+    assert_eq!(canonical_body["total"], 1);
+    assert_eq!(canonical_body["items"][0]["id"], hidden_movie_id);
 
     let substring = client
         .get(format!("{base_url}/api/v1/search?q=idden"))
@@ -485,14 +482,6 @@ async fn search_matrix_matches_chinese_prefix_alias_and_punctuation()
         .execute(database.pool())
         .await?;
     }
-    let alias_fts_row: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM media_search WHERE media_search MATCH 'Guardians' AND item_id = ?",
-    )
-    .bind(&chinese_id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(alias_fts_row, 1);
-
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let app = app_with_state(AppState::ready(

@@ -4,7 +4,9 @@
 //! item id, and never blocks a request path. Consumers for incremental changes are wired in
 //! LUX-865; until then this module only provides the full rebuild and its validation summary.
 
-use crate::storage::{Database, StorageError};
+use std::time::Duration;
+
+use crate::storage::{Database, SEARCH_REINDEX_CONSUMER, StorageError};
 
 /// Bumped whenever the derived row shape or its inputs change, so a read model written by an older
 /// build is rebuilt instead of trusted.
@@ -211,4 +213,51 @@ mod tests {
         assert_eq!(second, first);
         Ok(())
     }
+}
+
+/// How many queued events one consumer pass applies, and how often it runs.
+const SEARCH_REINDEX_BATCH: i64 = 500;
+const SEARCH_REINDEX_INTERVAL: Duration = Duration::from_secs(1);
+/// Applied queue rows are reclaimed in bounded batches on the same tick.
+const SEARCH_REINDEX_TRIM_BATCH: i64 = 2_000;
+
+/// Drains queued search-reindex events in the background so a scan leaves a short queue instead of
+/// writing the FTS index inside every item transaction.
+pub(crate) fn spawn_search_reindex_worker(database: Database) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(SEARCH_REINDEX_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            loop {
+                match database.drain_search_reindex(SEARCH_REINDEX_BATCH).await {
+                    Ok(0) => {
+                        // Everything queued has been applied; reclaim the rows we no longer need.
+                        match database
+                            .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_TRIM_BATCH)
+                            .await
+                        {
+                            Ok(0) => break,
+                            Ok(trimmed) => tracing::debug!(trimmed, "catalog outbox trimmed"),
+                            Err(error) => {
+                                tracing::warn!(%error, "catalog outbox trim failed");
+                                break;
+                            }
+                        }
+                    }
+                    Ok(items) => tracing::debug!(items, "search reindex applied"),
+                    Err(error) => {
+                        tracing::warn!(%error, "search reindex failed");
+                        let _ = database
+                            .record_catalog_consumer_error(
+                                SEARCH_REINDEX_CONSUMER,
+                                &error.to_string(),
+                            )
+                            .await;
+                        break;
+                    }
+                }
+            }
+        }
+    });
 }

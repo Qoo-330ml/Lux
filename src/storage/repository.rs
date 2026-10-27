@@ -87,6 +87,9 @@ mod catalog_read_model;
 pub(crate) use catalog_read_model::{
     ReadModelPageQuery, ReadModelSort, RecentByLibraryReadModelQuery, RecentReadModelQuery,
 };
+#[path = "search_reindex.rs"]
+mod search_reindex;
+pub(crate) use search_reindex::SEARCH_REINDEX_CONSUMER;
 #[path = "metadata.rs"]
 mod metadata;
 #[path = "migration.rs"]

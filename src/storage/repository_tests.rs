@@ -792,6 +792,19 @@ use crate::{
     },
 };
 
+/// Applies every queued search event; write paths only append to the outbox (W4).
+async fn drain_search_index(database: &Database) {
+    loop {
+        let applied = database
+            .drain_search_reindex(100)
+            .await
+            .expect("search reindex drain");
+        if applied == 0 {
+            return;
+        }
+    }
+}
+
 #[tokio::test]
 async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -819,6 +832,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .await
         .expect("media item");
     }
+    drain_search_index(&database).await;
     let original_rowid: i64 =
         sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
             .fetch_one(database.pool())
@@ -846,6 +860,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("search metadata update");
+    drain_search_index(&database).await;
     let renamed_rowid: i64 =
         sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
             .fetch_one(database.pool())
@@ -869,6 +884,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
     .execute(database.pool())
     .await
     .expect("insert alias");
+    drain_search_index(&database).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
@@ -889,6 +905,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("move alias to another item");
+    drain_search_index(&database).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
@@ -911,6 +928,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("delete alias");
+    drain_search_index(&database).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM media_search WHERE item_id = 'fts-second' AND aliases MATCH 'alias'",
@@ -925,6 +943,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("delete media item");
+    drain_search_index(&database).await;
     let remaining_mappings: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_search_map WHERE item_id = 'fts-first'")
             .fetch_one(database.pool())
@@ -937,6 +956,108 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
             .expect("deleted FTS row");
     assert_eq!(remaining_mappings, 0);
     assert_eq!(remaining_search_rows, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn search_reindex_queue_defers_fts_writes_until_drained() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title,
+             identification_status, has_available_source
+         ) VALUES ('queued-item', ?, 'MOVIE', 'Queued Title', 'queued title',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    // The write path only appends; the FTS row appears after the consumer runs.
+    let queued: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search' AND item_id = 'queued-item'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("queued event");
+    assert_eq!(queued, 1);
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("FTS rows before drain");
+    assert_eq!(before, 0);
+
+    assert_eq!(database.drain_search_reindex(100).await.expect("drain"), 1);
+    let matches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_search WHERE item_id = 'queued-item' AND title MATCH 'Queued'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("drained FTS row");
+    assert_eq!(matches, 1);
+    // A second pass is a no-op and leaves a watermark behind.
+    assert_eq!(
+        database
+            .drain_search_reindex(100)
+            .await
+            .expect("second drain"),
+        0
+    );
+    let watermark = database
+        .catalog_consumer(SEARCH_REINDEX_CONSUMER)
+        .await
+        .expect("watermark read")
+        .expect("watermark row");
+    assert!(watermark.applied_seq > 0);
+    assert!(watermark.last_error.is_none());
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'queued-item'")
+        .execute(database.pool())
+        .await
+        .expect("delete media item");
+    assert_eq!(
+        database
+            .drain_search_reindex(100)
+            .await
+            .expect("delete drain"),
+        1
+    );
+    // Applied events are reclaimed; a fresh event survives until it is applied too.
+    let trimmed = database
+        .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, 100)
+        .await
+        .expect("trim outbox");
+    assert!(trimmed >= 2);
+    let queued_after_trim: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("outbox after trim");
+    assert_eq!(queued_after_trim, 0);
+
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted FTS row");
+    let mapping: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search_map WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted row mapping");
+    assert_eq!(remaining, 0);
+    assert_eq!(mapping, 0);
     database.close().await;
 }
 

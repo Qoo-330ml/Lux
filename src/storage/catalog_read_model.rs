@@ -135,6 +135,39 @@ impl Database {
         })
     }
 
+    /// Drops events the named consumer has already applied, oldest first and bounded so a long
+    /// backlog never turns into one huge delete. Every other consumer of the queue must be added to
+    /// the floor before this can be widened beyond a single consumer.
+    pub(crate) async fn trim_catalog_outbox(
+        &self,
+        consumer: &str,
+        limit: i64,
+    ) -> Result<i64, StorageError> {
+        let applied_seq = self
+            .catalog_consumer(consumer)
+            .await?
+            .map(|state| state.applied_seq)
+            .unwrap_or(0);
+        if applied_seq <= 0 {
+            return Ok(0);
+        }
+        self.query(
+            "DELETE FROM catalog_outbox
+             WHERE id IN (
+                 SELECT id FROM catalog_outbox WHERE id <= ? ORDER BY id LIMIT ?
+             )",
+        )
+        .bind(applied_seq)
+        .bind(limit.clamp(1, 10_000))
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() as i64)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
     /// Detects that the queue was trimmed past a consumer's watermark.
     ///
     /// Returns `(applied_seq, oldest_remaining_seq)` when the next expected sequence is gone, so the

@@ -2611,6 +2611,7 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        self.apply_pending_search_reindex().await;
         let library_ids = if principal.is_admin {
             None
         } else {
@@ -2701,6 +2702,22 @@ impl CatalogService {
                 })
                 .await
             }
+        }
+    }
+
+    /// Applies queued search-reindex events before the query so a write made just before the
+    /// request is already searchable. One bounded batch per request: a backlog is drained by the
+    /// background worker instead of making one request pay for it.
+    async fn apply_pending_search_reindex(&self) {
+        const SEARCH_ON_READ_BATCH: i64 = 200;
+        match self
+            .database
+            .drain_search_reindex(SEARCH_ON_READ_BATCH)
+            .await
+        {
+            Ok(0) => {}
+            Ok(items) => tracing::debug!(items, "search reindex applied on read"),
+            Err(error) => tracing::warn!(%error, "search reindex on read failed"),
         }
     }
 
