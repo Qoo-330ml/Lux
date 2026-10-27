@@ -18374,7 +18374,10 @@ p50/p95 为 off 1.72/2.59 ms、on 2.78/4.29 ms，均远低于 200 ms；on 每请
 `user_series_next_round_trips_and_orders_by_recent_update`（增改查删、排序、用户删除级联清空）。
 重建已实现（`rebuild_user_series_next`：清空后按“最近已看完集之后的第一个未看集”重算，66k 级用户状态可一批完成），回归
 `user_series_next_rebuild_picks_the_next_unplayed_episode`（ep1/ep2 已看 → ep3；ep3 看完后无下一集）。
-尚未接入写入事务与继续观看切换。
+写入接线：`set_user_item_played` 与 `record_playback_event` 提交后按条目刷新（仅剧集，查 series_id 后
+重算该用户/剧集）；`sync_played_container_states` 这类批量操作提交后整表重建。回归
+`marking_episodes_played_refreshes_the_next_pointer`（ep1→ep2、ep2→ep3、ep3 后清空）。
+尚未做继续观看 `off/shadow/on` 切换。
 
 #### LUX-868：首页读模型
 

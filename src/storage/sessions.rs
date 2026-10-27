@@ -358,11 +358,12 @@ impl Database {
         .bind(database_flag(played))
         .execute(&self.pool)
         .await
-        .map(|_| ())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
-        })
+        })?;
+        self.refresh_user_series_next_for_item(user_id, item_id)
+            .await
     }
 
     pub(crate) async fn set_user_item_resume_hidden(
@@ -558,7 +559,9 @@ impl Database {
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        self.refresh_user_series_next_for_item(event.user_id, event.item_id)
+            .await
     }
 
     pub(crate) async fn sync_played_container_states(
@@ -685,7 +688,10 @@ impl Database {
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            })?;
+        // Bulk container updates can touch many series; a full rebuild is cheaper and safer
+        // than tracking each affected series here.
+        self.rebuild_user_series_next().await.map(|_| ())
     }
 
     pub(crate) async fn list_playback_sessions(

@@ -22514,6 +22514,70 @@ async fn user_series_next_rebuild_picks_the_next_unplayed_episode()
     Ok(())
 }
 
+#[tokio::test]
+async fn marking_episodes_played_refreshes_the_next_pointer()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Pointer", "Pointer", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('pointer-lib', 'P', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('pointer-series', 'pointer-lib', 'SERIES', 'Series', 'series',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    for episode in 1..=3 {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number
+             ) VALUES (?, 'pointer-lib', 'EPISODE', ?, ?, 'LOCAL_CONFIRMED', 1,
+                       'pointer-series', 1, ?)",
+        )
+        .bind(format!("pointer-episode-{episode}"))
+        .bind(format!("Episode {episode}"))
+        .bind(format!("episode {episode}"))
+        .bind(episode)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .set_user_item_played(&user_id, "pointer-episode-1", true)
+        .await?;
+    let pointer = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(pointer.len(), 1);
+    assert_eq!(pointer[0].next_item_id, "pointer-episode-2");
+
+    database
+        .set_user_item_played(&user_id, "pointer-episode-2", true)
+        .await?;
+    let pointer = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(pointer[0].next_item_id, "pointer-episode-3");
+
+    database
+        .set_user_item_played(&user_id, "pointer-episode-3", true)
+        .await?;
+    assert!(
+        database
+            .list_user_series_next(&user_id, 0, 10)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,

@@ -168,3 +168,101 @@ impl Database {
         Ok(result.rows_affected())
     }
 }
+
+impl Database {
+    /// Refreshes one user/series pointer after a playback state change.
+    pub(crate) async fn refresh_user_series_next_for_item(
+        &self,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<(), StorageError> {
+        let series_id: Option<Option<String>> = self
+            .query_scalar(
+                "SELECT series_id FROM media_items WHERE id = ? AND item_type = 'EPISODE'",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let Some(Some(series_id)) = series_id else {
+            return Ok(());
+        };
+        self.refresh_user_series_next_for_series(user_id, &series_id)
+            .await
+    }
+
+    pub(crate) async fn refresh_user_series_next_for_series(
+        &self,
+        user_id: &str,
+        series_id: &str,
+    ) -> Result<(), StorageError> {
+        self.query("DELETE FROM user_series_next WHERE user_id = ? AND series_id = ?")
+            .bind(user_id)
+            .bind(series_id)
+            .execute(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        self.query(
+            "WITH completed AS (
+                 SELECT mi.season_number, mi.episode_number,
+                        ROW_NUMBER() OVER (
+                            ORDER BY us.last_played_at DESC NULLS LAST,
+                                     mi.season_number DESC, mi.episode_number DESC, mi.id DESC
+                        ) AS played_rank
+                 FROM media_items mi
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type = 'EPISODE'
+                   AND mi.series_id = ?
+                   AND mi.season_number IS NOT NULL
+                   AND mi.episode_number IS NOT NULL
+                   AND mi.removed_at IS NULL
+                   AND us.is_played = 1
+             ),
+             latest AS (
+                 SELECT season_number, episode_number FROM completed WHERE played_rank = 1
+             ),
+             next_episode AS (
+                 SELECT mi.id,
+                        ROW_NUMBER() OVER (
+                            ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id
+                        ) AS next_rank
+                 FROM latest
+                 JOIN media_items mi
+                   ON mi.series_id = ?
+                  AND mi.item_type = 'EPISODE'
+                  AND (mi.season_number > latest.season_number
+                    OR (mi.season_number = latest.season_number
+                        AND mi.episode_number > latest.episode_number))
+                 LEFT JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.has_available_source = 1
+                   AND mi.removed_at IS NULL
+                   AND COALESCE(us.is_played, 0) = 0
+                   AND COALESCE(us.hide_from_resume, 0) = 0
+             )
+             INSERT INTO user_series_next (
+                 user_id, series_id, next_item_id, position_ticks, played, updated_at
+             )
+             SELECT ?, ?, id, 0, 0, unixepoch()
+             FROM next_episode WHERE next_rank = 1",
+        )
+        .bind(user_id)
+        .bind(series_id)
+        .bind(series_id)
+        .bind(user_id)
+        .bind(user_id)
+        .bind(series_id)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+}
