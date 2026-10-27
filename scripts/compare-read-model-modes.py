@@ -29,10 +29,13 @@ import sys
 import time
 import urllib.error
 import urllib.request
+import uuid
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 COOKIE = "lux_session"
 TOKEN = "lux-api-performance-token"
+# The fixture generator seeds the admin session with this CSRF token (sha256 of it is stored).
+CSRF_TOKEN = "spec-csrf-token"
 ENDPOINTS = (
     ("home", "/api/v1/home"),
     ("continue-watching", "/api/v1/continue-watching?pageSize=24"),
@@ -134,6 +137,94 @@ def reset_derived(database: pathlib.Path) -> None:
         connection.close()
 
 
+def seed_scan_libraries(
+    database: pathlib.Path, media_root: pathlib.Path, libraries: int, files: int
+) -> list[str]:
+    """Create movie libraries with real files so a scan can run during the measurement.
+
+    The 66k fixture only carries database rows; scanning those roots would mark every item as
+    missing. These libraries are added after the prepare start so the read model covers them too.
+    """
+    library_ids = []
+    connection = sqlite3.connect(database)
+    try:
+        for index in range(libraries):
+            root = media_root / f"library-{index}"
+            root.mkdir(parents=True, exist_ok=True)
+            # Store the resolved path: on macOS /tmp is a symlink and the scanner compares the
+            # walked path against the canonical root.
+            root = root.resolve()
+            for file_index in range(files):
+                path = root / f"Scan.Movie.{index:02d}.{file_index:06d}.2024.mkv"
+                if not path.exists():
+                    path.write_bytes(b"scan")
+            library_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"lux-scan-library:{root}"))
+            root_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"lux-scan-root:{root}"))
+            connection.execute(
+                "INSERT OR IGNORE INTO libraries"
+                " (id, name, kind, is_enabled, scan_concurrency, probe_concurrency)"
+                " VALUES (?, ?, 'MOVIE', 1, 2, 1)",
+                (library_id, f"Scan Target {index}"),
+            )
+            connection.execute(
+                "INSERT OR IGNORE INTO library_roots"
+                " (id, library_id, canonical_path, display_path, is_available, is_writable)"
+                " VALUES (?, ?, ?, ?, 1, 0)",
+                (root_id, library_id, str(root), str(root)),
+            )
+            library_ids.append(library_id)
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+    return library_ids
+
+
+def post_scan(base: str, library_id: str, timeout: float) -> None:
+    request = urllib.request.Request(
+        f"{base}/api/v1/admin/libraries/{library_id}/scan",
+        method="POST",
+        headers={
+            "Cookie": f"{COOKIE}={TOKEN}",
+            "X-CSRF-Token": CSRF_TOKEN,
+            "Content-Length": "0",
+        },
+        data=b"",
+    )
+    with urllib.request.urlopen(request, timeout=timeout) as response:
+        response.read()
+
+
+def wait_for_scan_items(
+    database: pathlib.Path, library_id: str, expected: int, timeout: float
+) -> None:
+    deadline = time.monotonic() + timeout
+    previous = -1
+    stable = 0
+    while time.monotonic() < deadline:
+        try:
+            connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
+            try:
+                count = connection.execute(
+                    "SELECT COUNT(*) FROM media_items WHERE library_id = ?", (library_id,)
+                ).fetchone()[0]
+            finally:
+                connection.close()
+        except sqlite3.Error:
+            time.sleep(0.5)
+            continue
+        if count >= expected:
+            return
+        stable = stable + 1 if count == previous else 0
+        if stable >= 20 and previous > 0:
+            raise SystemExit(
+                f"scan of {library_id} stopped at {count}/{expected} items; rerun with fewer files"
+            )
+        previous = count
+        time.sleep(0.5)
+    raise SystemExit(f"scan of {library_id} did not finish in {timeout:.0f}s")
+
+
 def measure_round(base: str, path: str, warmup: int, requests: int, timeout: float):
     for _ in range(warmup):
         fetch(base, path, timeout)
@@ -170,6 +261,18 @@ def main() -> int:
     parser.add_argument("--startup-timeout", type=float, default=240.0)
     parser.add_argument("--json-out", type=pathlib.Path)
     parser.add_argument("--keep-work-dir", action="store_true")
+    parser.add_argument(
+        "--scan-libraries",
+        type=int,
+        default=0,
+        help="seed this many real-file movie libraries and re-scan them during each round",
+    )
+    parser.add_argument(
+        "--scan-files",
+        type=int,
+        default=2000,
+        help="tiny media files per scan library",
+    )
     args = parser.parse_args()
 
     source = args.work_dir.resolve() / "config"
@@ -197,8 +300,36 @@ def main() -> int:
         prepare.wait_ready(args.startup_timeout)
         wait_for_backfill(database, "catalog_items_rebuild", args.startup_timeout)
         wait_for_backfill(database, "user_series_next_rebuild", args.startup_timeout)
+        scan_libraries = []
+        if args.scan_libraries > 0:
+            # The 66k fixture only carries database rows, so a scan of it would mark everything as
+            # missing. Seed separate libraries with real files instead: the first scan fills them,
+            # later scans only re-walk, which gives write/CPU pressure without changing content.
+            scan_libraries = seed_scan_libraries(
+                database, work / "scan-media", args.scan_libraries, args.scan_files
+            )
+            for library_id in scan_libraries:
+                post_scan(prepare.base, library_id, args.timeout)
+            for library_id in scan_libraries:
+                wait_for_scan_items(database, library_id, args.scan_files, args.startup_timeout)
     finally:
         prepare.close()
+
+    if scan_libraries:
+        # The seed scan added items after the read model had been rebuilt, so rebuild once more:
+        # otherwise the `on` page would miss the new rows and fall back on every request.
+        reset_derived(database)
+        rebuild = Server(args.binary, config, "off", work / "rebuild.log")
+        try:
+            rebuild.wait_ready(args.startup_timeout)
+            wait_for_backfill(database, "catalog_items_rebuild", args.startup_timeout)
+            wait_for_backfill(database, "user_series_next_rebuild", args.startup_timeout)
+        finally:
+            rebuild.close()
+
+    labels = list(ENDPOINTS)
+    if scan_libraries:
+        labels.append(("home-during-scan", "/api/v1/home"))
 
     rounds = []
     for round_index in range(args.rounds):
@@ -212,12 +343,18 @@ def main() -> int:
                     results[label] = measure_round(
                         server.base, path, args.warmup, args.requests, args.timeout
                     )
+                if scan_libraries:
+                    for library_id in scan_libraries:
+                        post_scan(server.base, library_id, args.timeout)
+                    results["home-during-scan"] = measure_round(
+                        server.base, "/api/v1/home", args.warmup, args.requests, args.timeout
+                    )
             finally:
                 server.close()
             rounds.append({"round": round_index + 1, "mode": mode, "results": results})
 
     summary = {}
-    for label, _ in ENDPOINTS:
+    for label, _ in labels:
         per_mode = {}
         for mode in ("off", "on"):
             samples = [entry["results"][label] for entry in rounds if entry["mode"] == mode]
@@ -232,10 +369,8 @@ def main() -> int:
             }
         summary[label] = per_mode
 
-    for label, _ in ENDPOINTS:
-        digests = {
-            entry["results"][label]["sha256"] for entry in rounds
-        }
+    for label, _ in labels:
+        digests = {entry["results"][label]["sha256"] for entry in rounds}
         summary[label]["identical_across_modes"] = len(digests) == 1
     report = {"endpoints": summary, "rounds": rounds}
     if args.json_out:
