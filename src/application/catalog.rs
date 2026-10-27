@@ -95,6 +95,7 @@ pub struct CatalogService {
 pub enum ReadModelMode {
     Off,
     Shadow,
+    On,
 }
 
 impl ReadModelMode {
@@ -106,6 +107,7 @@ impl ReadModelMode {
             .as_str()
         {
             "shadow" => Self::Shadow,
+            "on" => Self::On,
             _ => Self::Off,
         }
     }
@@ -1004,22 +1006,12 @@ impl CatalogService {
         return self.library_page_cache.get_or_load(self, request).await;
     }
 
-    async fn compare_read_model_page(
+    /// Sort key supported by the read-model slice. `None` means the filter set is not covered yet
+    /// and both `shadow` and `on` fall back to the authoritative query.
+    fn read_model_sort(
         &self,
         query: &CatalogFilterQuery<'_>,
-        rows: &[StoredCatalogRow],
-        total: i64,
-    ) {
-        let sort = match query.sort_by {
-            StorageCatalogSort::Name | StorageCatalogSort::SortName => {
-                crate::storage::ReadModelSort::SortTitle
-            }
-            StorageCatalogSort::DateCreated => crate::storage::ReadModelSort::EffectiveAddedAt,
-            StorageCatalogSort::Rating => crate::storage::ReadModelSort::Rating,
-            StorageCatalogSort::ProductionYear => crate::storage::ReadModelSort::ProductionYear,
-            StorageCatalogSort::PremiereDate => return,
-        };
-        // The read model has no per-user/person/provider joins yet; only compare the default page.
+    ) -> Option<crate::storage::ReadModelSort> {
         if query.library_ids.len() != 1
             || query.person_id.is_some()
             || query.media_source_ids.is_some()
@@ -1032,8 +1024,32 @@ impl CatalogService {
             || query.parent_id_scope.is_some()
             || query.content_restrictions.is_some()
         {
-            return;
+            return None;
         }
+        match query.sort_by {
+            StorageCatalogSort::Name | StorageCatalogSort::SortName => {
+                Some(crate::storage::ReadModelSort::SortTitle)
+            }
+            StorageCatalogSort::DateCreated => {
+                Some(crate::storage::ReadModelSort::EffectiveAddedAt)
+            }
+            StorageCatalogSort::Rating => Some(crate::storage::ReadModelSort::Rating),
+            StorageCatalogSort::ProductionYear => {
+                Some(crate::storage::ReadModelSort::ProductionYear)
+            }
+            StorageCatalogSort::PremiereDate => None,
+        }
+    }
+
+    async fn compare_read_model_page(
+        &self,
+        query: &CatalogFilterQuery<'_>,
+        rows: &[StoredCatalogRow],
+        total: i64,
+    ) {
+        let Some(sort) = self.read_model_sort(query) else {
+            return;
+        };
         let limit = if query.include_total {
             query.limit
         } else {
@@ -1124,10 +1140,35 @@ impl CatalogService {
             offset: request.offset,
             limit: request.limit,
         };
-        let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
-        if self.read_model_mode == ReadModelMode::Shadow {
-            self.compare_read_model_page(&query, &rows, total).await;
-        }
+        let read_model_sort = self.read_model_sort(&query);
+        let (rows, total) = match (self.read_model_mode, read_model_sort) {
+            (ReadModelMode::On, Some(sort)) => {
+                let fetch_limit = if query.include_total {
+                    query.limit
+                } else {
+                    query.limit.saturating_add(1)
+                };
+                self.database
+                    .list_catalog_rows_from_read_model(&crate::storage::ReadModelPageQuery {
+                        library_id: &query.library_ids[0],
+                        item_types: query.item_types,
+                        excluded_item_types: query.excluded_item_types,
+                        sort,
+                        descending: query.descending,
+                        offset: query.offset,
+                        limit: fetch_limit,
+                        include_total: query.include_total,
+                    })
+                    .await?
+            }
+            _ => {
+                let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
+                if self.read_model_mode == ReadModelMode::Shadow && read_model_sort.is_some() {
+                    self.compare_read_model_page(&query, &rows, total).await;
+                }
+                (rows, total)
+            }
+        };
         let mut items = assemble_items(rows);
         self.populate_item_details_and_episode_counts(
             &mut items,

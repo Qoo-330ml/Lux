@@ -241,16 +241,16 @@ impl Database {
                      mi.merged_into_item_id, mi.has_available_source,
                      (SELECT ms.id FROM media_sources ms WHERE ms.item_id = mi.id
                        ORDER BY ms.is_default DESC, ms.id LIMIT 1),
-                     (SELECT ii.content_tag FROM item_images ii
+                     (SELECT ii.id FROM item_images ii
                        WHERE ii.item_id = mi.id AND ii.image_type = 'POSTER'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT ii.content_tag FROM item_images ii
+                     (SELECT ii.id FROM item_images ii
                        WHERE ii.item_id = mi.id AND ii.image_type = 'BACKDROP'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT ii.content_tag FROM item_images ii
+                     (SELECT ii.id FROM item_images ii
                        WHERE ii.item_id = mi.id AND ii.image_type = 'THUMB'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT ii.content_tag FROM item_images ii
+                     (SELECT ii.id FROM item_images ii
                        WHERE ii.item_id = mi.id AND ii.image_type = 'LOGO'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
                      (SELECT COUNT(*) FROM media_items child
@@ -510,4 +510,221 @@ impl Database {
         };
         Ok((ids, total))
     }
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReadModelCoreRow {
+    item_id: String,
+    library_id: String,
+    item_type: String,
+    parent_id: Option<String>,
+    series_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    title: String,
+    sort_title: String,
+    original_title: Option<String>,
+    production_year: Option<i64>,
+    rating: Option<f64>,
+    runtime_ticks: Option<i64>,
+    added_at: i64,
+    updated_at: i64,
+    poster_tag: Option<String>,
+    backdrop_tag: Option<String>,
+    thumb_tag: Option<String>,
+    logo_tag: Option<String>,
+    series_name: Option<String>,
+}
+
+#[derive(Debug, sqlx::FromRow)]
+struct ReadModelSourceRow {
+    item_id: String,
+    source_relative_path: Option<String>,
+    source_id: Option<String>,
+    source_kind: Option<String>,
+    container: Option<String>,
+    size: Option<i64>,
+    external_url: Option<String>,
+    edition_name: Option<String>,
+    quality_label: Option<String>,
+    bitrate: Option<i64>,
+    duration_ticks: Option<i64>,
+    is_default: Option<i64>,
+    probe_status: Option<String>,
+    stream_id: Option<String>,
+    stream_index: Option<i64>,
+    stream_type: Option<String>,
+    codec: Option<String>,
+    language: Option<String>,
+    stream_title: Option<String>,
+    stream_details_json: Option<String>,
+    stream_is_external: Option<i64>,
+    stream_is_default: Option<i64>,
+    stream_is_forced: Option<i64>,
+}
+
+impl Database {
+    /// Builds the legacy row shape from `catalog_items` plus one batched source/stream query.
+    #[allow(dead_code)] // wired by the `on` mode switch
+    pub(crate) async fn list_catalog_rows_from_read_model(
+        &self,
+        page: &ReadModelPageQuery<'_>,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        let (ids, total) = self.shadow_catalog_library_page(page).await?;
+        if ids.is_empty() {
+            return Ok((Vec::new(), total));
+        }
+        let placeholders = std::iter::repeat_n("?", ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let core_query = format!(
+            "SELECT ci.item_id, ci.library_id, ci.item_type, ci.parent_id, ci.series_id,
+                    ci.season_number, ci.episode_number, ci.title, ci.sort_title,
+                    ci.original_title, ci.production_year, ci.rating, ci.runtime_ticks,
+                    ci.added_at, ci.updated_at, ci.poster_tag, ci.backdrop_tag,
+                    ci.thumb_tag, ci.logo_tag,
+                    (SELECT s.title FROM media_items s WHERE s.id = ci.series_id) AS series_name
+             FROM catalog_items ci
+             WHERE ci.item_id IN ({placeholders})"
+        );
+        let mut statement = self.query_as::<ReadModelCoreRow>(sqlx::AssertSqlSafe(core_query));
+        for id in &ids {
+            statement = statement.bind(id);
+        }
+        let cores = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let source_query = format!(
+            "SELECT ms.item_id,
+                    (SELECT fe.relative_path FROM filesystem_entries fe
+                     WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
+                    ms.id AS source_id, ms.source_kind, ms.container, ms.size,
+                    ms.external_url, ms.edition_name, ms.quality_label, ms.bitrate,
+                    ms.duration_ticks, ms.is_default, ms.probe_status,
+                    mt.id AS stream_id, mt.stream_index, mt.stream_type, mt.codec,
+                    mt.language, mt.title AS stream_title, mt.details_json AS stream_details_json,
+                    mt.is_external AS stream_is_external, mt.is_default AS stream_is_default,
+                    mt.is_forced AS stream_is_forced
+             FROM media_sources ms
+             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             WHERE ms.item_id IN ({placeholders})
+               AND EXISTS (
+                   SELECT 1 FROM filesystem_entries fe
+                   WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+               )
+             ORDER BY ms.item_id, ms.id, mt.stream_index"
+        );
+        let mut statement = self.query_as::<ReadModelSourceRow>(sqlx::AssertSqlSafe(source_query));
+        for id in &ids {
+            statement = statement.bind(id);
+        }
+        let sources =
+            statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        let mut by_item: std::collections::HashMap<String, Vec<ReadModelSourceRow>> =
+            std::collections::HashMap::new();
+        for source in sources {
+            by_item
+                .entry(source.item_id.clone())
+                .or_default()
+                .push(source);
+        }
+        let mut rows = Vec::new();
+        for core in cores {
+            let item_sources = by_item.remove(&core.item_id).unwrap_or_default();
+            if item_sources.is_empty() {
+                rows.push(core_row_without_source(&core));
+                continue;
+            }
+            for source in item_sources {
+                rows.push(core_row_with_source(&core, &source));
+            }
+        }
+        Ok((rows, total))
+    }
+}
+
+fn core_row_without_source(core: &ReadModelCoreRow) -> StoredCatalogRow {
+    StoredCatalogRow {
+        item_id: core.item_id.clone(),
+        library_id: core.library_id.clone(),
+        item_type: core.item_type.clone(),
+        parent_id: core.parent_id.clone(),
+        series_id: core.series_id.clone(),
+        series_name: core.series_name.clone(),
+        season_number: core.season_number,
+        episode_number: core.episode_number,
+        title: core.title.clone(),
+        sort_title: core.sort_title.clone(),
+        original_title: core.original_title.clone(),
+        overview: None,
+        production_year: core.production_year,
+        rating: core.rating,
+        rating_source: None,
+        runtime_ticks: core.runtime_ticks,
+        added_at: core.added_at,
+        updated_at: core.updated_at,
+        poster_image_tag: core.poster_tag.clone(),
+        fanart_image_tag: core.backdrop_tag.clone(),
+        thumb_image_tag: core.thumb_tag.clone(),
+        logo_image_tag: core.logo_tag.clone(),
+        source_id: None,
+        source_relative_path: None,
+        source_kind: None,
+        container: None,
+        size: None,
+        external_url: None,
+        edition_name: None,
+        quality_label: None,
+        bitrate: None,
+        duration_ticks: None,
+        is_default: None,
+        probe_status: None,
+        stream_id: None,
+        stream_index: None,
+        stream_type: None,
+        codec: None,
+        language: None,
+        stream_title: None,
+        stream_details_json: None,
+        stream_is_external: None,
+        stream_is_default: None,
+        stream_is_forced: None,
+    }
+}
+
+fn core_row_with_source(core: &ReadModelCoreRow, source: &ReadModelSourceRow) -> StoredCatalogRow {
+    let mut row = core_row_without_source(core);
+    row.source_id = source.source_id.clone();
+    row.source_relative_path = source.source_relative_path.clone();
+    row.source_kind = source.source_kind.clone();
+    row.container = source.container.clone();
+    row.size = source.size;
+    row.external_url = source.external_url.clone();
+    row.edition_name = source.edition_name.clone();
+    row.quality_label = source.quality_label.clone();
+    row.bitrate = source.bitrate;
+    row.duration_ticks = source.duration_ticks;
+    row.is_default = source.is_default.map(|value| value != 0);
+    row.probe_status = source.probe_status.clone();
+    row.stream_id = source.stream_id.clone();
+    row.stream_index = source.stream_index;
+    row.stream_type = source.stream_type.clone();
+    row.codec = source.codec.clone();
+    row.language = source.language.clone();
+    row.stream_title = source.stream_title.clone();
+    row.stream_details_json = source.stream_details_json.clone();
+    row.stream_is_external = source.stream_is_external.map(|value| value != 0);
+    row.stream_is_default = source.stream_is_default.map(|value| value != 0);
+    row.stream_is_forced = source.stream_is_forced.map(|value| value != 0);
+    row
 }

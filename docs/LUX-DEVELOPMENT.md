@@ -18341,7 +18341,11 @@ PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。66k 夹具实测（r
 回归 `catalog_read_model_shadow_matches_the_legacy_default_list`（名称升序与创建时间降序的 id 序列、
 总数均一致）。66k 夹具实测：`LUX_READ_MODEL_MODE=shadow` 下请求库列表 pageSize 50 与 100，
 日志中 `shadow page differs` / `shadow total differs` / `shadow query failed` 均为 0（旧路径按 item
-去重后与读模型一致）。尚未做 10k/50k 夹具 p95 与 SQL 数，也未开放 `on`。
+去重后与读模型一致）。`on` 模式已接入：用 `catalog_items` 选页 + 一次批量源/流查询组装旧行结构（图片标签改存
+`item_images.id` 以与旧路径一致），不支持的过滤组合自动回退旧路径。66k 夹具实测：同一页
+`pageSize=50&includeTotal=false` 的 off/on 响应字节完全一致（99,464 B），on 日志无告警；30 次请求
+p50/p95 为 off 4.09/4.93 ms、on 4.57/5.26 ms（小规模下读模型略慢，收益在 1M 行与深页，尚未在该规模
+验证）。
 
 #### LUX-866：详情读模型切换
 
