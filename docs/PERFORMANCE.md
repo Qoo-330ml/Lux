@@ -2639,3 +2639,19 @@ PostgreSQL 的级联触发器本来就是每行一次索引探查，额外 37 �
 PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表时仍由级联兜底。
 `media_item_child_delete_list_covers_every_cascade_edge` 从 live schema 枚举所有 CASCADE 边做覆盖断言，
 本实现落地时它立刻发现了此前遗漏的 `media_merge_records` 两条边。
+
+## 继续观看读模型 A/B（LUX-867，2026-10-27）
+
+同一 66k 夹具（10k 电影 / 1k 剧集 / 50k 集、2,000 条用户进度）、arm64 release、`pageSize=24`，
+`off` 与 `on` 两个进程各取 40 次请求（前 5 次预热）：
+
+| 端点 | 模式 | p50 | p95 | 响应字节 |
+|---|---|---:|---:|---:|
+| `/api/v1/continue-watching` | `off` | 13.14 ms | 18.91 ms | 40,324 |
+| `/api/v1/continue-watching` | `on` | 8.44 ms | 10.21 ms | 40,324 |
+| `/api/v1/home` | `off` | 111.04 ms | 114.96 ms | 93,909 |
+| `/api/v1/home` | `on` | 117.48 ms | 164.12 ms | 93,909 |
+
+两侧继续观看响应 sha256 相同（逐字节一致），首页响应也一致。`LUX_READ_MODEL_MODE=shadow` 下请求
+首页、继续观看第 1/2 页与 `pageSize=100`，`continue watching shadow * differs` 计数为 0。
+本机为 macOS arm64，不能据此外推 NAS/x86_64；首页 p95 的单次波动不代表回归。
