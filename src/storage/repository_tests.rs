@@ -2519,13 +2519,13 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
     let user_id = admin.id.to_string();
     sqlx::query(
         "INSERT INTO media_items (
-             id, library_id, item_type, parent_id, series_id, title, sort_title,
-             identification_status, has_available_source
+             id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+             title, sort_title, identification_status, has_available_source
          ) VALUES
-            ('played-parent-series', ?, 'SERIES', NULL, NULL, 'Series', 'series', 'LOCAL_CONFIRMED', 1),
-            ('played-parent-season', ?, 'SEASON', 'played-parent-series', 'played-parent-series', 'Season', 'season', 'LOCAL_CONFIRMED', 1),
-            ('played-episode-1', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1),
-            ('played-episode-2', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1)",
+            ('played-parent-series', ?, 'SERIES', NULL, NULL, NULL, NULL, 'Series', 'series', 'LOCAL_CONFIRMED', 1),
+            ('played-parent-season', ?, 'SEASON', 'played-parent-series', 'played-parent-series', 1, NULL, 'Season', 'season', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-1', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 1, 1, 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-2', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 1, 2, 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1)",
     )
     .bind(&library_id)
     .bind(&library_id)
@@ -2549,7 +2549,9 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
         .sync_played_container_states(&user_id, "played-episode-1")
         .await
         .expect("played parent states");
-    assert_eq!(database.query_count(), 3);
+    // One episode-scope read, one parent-state read, one batched state write, plus the two
+    // statements that refresh this series' resume pointer after the commit.
+    assert_eq!(database.query_count(), 5);
 
     let played_states: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT item_id, is_played, play_count FROM user_item_state
@@ -2580,7 +2582,7 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
         .sync_played_container_states(&user_id, "played-episode-2")
         .await
         .expect("unplayed parent states");
-    assert_eq!(database.query_count(), 3);
+    assert_eq!(database.query_count(), 5);
 
     let unplayed_states: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT item_id, is_played, version FROM user_item_state
@@ -2598,6 +2600,18 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
             ("played-parent-series".to_owned(), 0, 1),
         ]
     );
+
+    // The container sync also keeps the resume pointer in step: with episode 1 played and episode 2
+    // unplayed again, the next-up pointer is episode 2.
+    let pointer: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT next_item_id, position_ticks FROM user_series_next
+         WHERE user_id = ? AND series_id = 'played-parent-series'",
+    )
+    .bind(&user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("resume pointer rows");
+    assert_eq!(pointer, vec![("played-episode-2".to_owned(), 0)]);
 }
 
 #[tokio::test]

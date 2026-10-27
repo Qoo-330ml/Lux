@@ -569,25 +569,27 @@ impl Database {
         user_id: &str,
         item_id: &str,
     ) -> Result<(), StorageError> {
-        let parent_ids: Vec<String> = self
-            .query(
-                "SELECT parent_id FROM media_items
-                 WHERE id = ? AND item_type = 'EPISODE' AND parent_id IS NOT NULL
-                 UNION
-                 SELECT series_id FROM media_items
-                 WHERE id = ? AND item_type = 'EPISODE' AND series_id IS NOT NULL",
+        let episode_scope = self
+            .query_as::<(Option<String>, Option<String>)>(
+                "SELECT parent_id, series_id FROM media_items
+                 WHERE id = ? AND item_type = 'EPISODE'",
             )
             .bind(item_id)
-            .bind(item_id)
-            .fetch_all(&self.pool)
+            .fetch_optional(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })?
-            .into_iter()
-            .map(|row| row.get::<String, _>(0))
-            .collect();
+            })?;
+        let Some((parent_id, series_id)) = episode_scope else {
+            return Ok(());
+        };
+        let mut parent_ids = Vec::new();
+        for candidate in [parent_id, series_id.clone()].into_iter().flatten() {
+            if !parent_ids.contains(&candidate) {
+                parent_ids.push(candidate);
+            }
+        }
         if parent_ids.is_empty() {
             return Ok(());
         }
@@ -689,9 +691,16 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        // Bulk container updates can touch many series; a full rebuild is cheaper and safer
-        // than tracking each affected series here.
-        self.rebuild_user_series_next().await.map(|_| ())
+        // The pointer only reads episode-level progress, so refreshing the played item's series is
+        // enough and stays bounded; a table-wide rebuild here would rewrite every series of every
+        // user on each play event.
+        match series_id.as_deref() {
+            Some(series_id) => {
+                self.refresh_user_series_next_for_series(user_id, series_id)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 
     pub(crate) async fn list_playback_sessions(
