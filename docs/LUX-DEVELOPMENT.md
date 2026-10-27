@@ -18439,9 +18439,14 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
   `recent_by_library_read_model_matches_the_legacy_query`（跨库、空壳剧集、靠分集变新的剧集、
   无源但有可见子项的剧集）。
 - 66k 复核：接入按库最新 rail 后首页两模式仍逐字节一致（93,909 B），`shadow` 差异告警 0，但
-  p95 `off` 115.0 ms / `on` 113.3 ms（p50 111.6 / 105.0 ms） —— 该 rail 的排序键 `latest_added_at` 没法走索引，读模型没有带来
-  收益（只接最近添加 rail 时 `on` 为 86.7 ms）。下一步需要把该排序键物化成列并建
-  `(library_id, latest_added_at DESC, item_id)` 索引，或维持该 rail 走权威查询。
+  该 rail 的排序键 `latest_added_at` 起初是表达式、走不了索引，读模型没有收益，因此已把它物化：
+  迁移 `0234_catalog_items_latest_added_at.sql` / PostgreSQL `0236_...` 增加列与
+  `(library_id, latest_added_at DESC, item_id)` 索引，重建时按“剧集取可用分集最新入库时间，其余取
+  `added_at`”写入。`EXPLAIN QUERY PLAN` 显示该 rail 现在走 `idx_catalog_items_latest_added`，只剩
+  同值组的 `sort_title/id` 需要在临时 B 树里排。
+- 延迟测量注意：同一份构建在本机会话后段明显变慢（同一配置首页 p95 依次出现 86.7 / 113.3 / 146.7 ms，
+  release 构建耗时也逐次上升），判断为机器负载/散热噪声。66k 上读模型的延迟结论需要交错多轮复测，
+  本轮只确认**响应逐字节一致 + shadow 零差异 + 索引命中**。
 - 未完成：扫描并发下首页 p95 比值（第 29 节验收）本轮未复测；首页 `on` 的净收益取决于上一条的
   排序键物化。
 

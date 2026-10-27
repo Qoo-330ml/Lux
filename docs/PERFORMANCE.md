@@ -2682,3 +2682,18 @@ PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表
 （剧集取可用分集的最新入库时间）无法命中索引，读模型在这一规模没有收益：只切最近添加 rail 时
 `on` 的首页 p95 是 86.7 ms。要拿到收益，需把该排序键物化为列并建
 `(library_id, latest_added_at DESC, item_id)` 索引后再复测。
+
+## 首页按库最新 rail 排序键物化（LUX-868，2026-10-27）
+
+`latest_added_at` 物化成 `catalog_items` 的列并建 `(library_id, latest_added_at DESC, item_id)` 索引后：
+
+```text
+|--SEARCH ci USING INDEX idx_catalog_items_latest_added (library_id=?)
+`--USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+```
+
+即排序前缀走索引，只有 `latest_added_at` 相同的行需要临时排序。
+
+延迟数字本轮不作为结论：同一份构建在会话后段连续复测时，首页 p95 从 86.7 ms 漂到 113.3 ms 再到
+146.7 ms（`off` 也在 115 ms 上下波动），release 构建耗时同样逐次上升，判断为本机负载/散热噪声。
+要给出可信的 `off` vs `on` 收益，需要交错、多轮、同一状态下的复测（例如 off/on 各 3 轮交替取中位数）。

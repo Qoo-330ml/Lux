@@ -231,7 +231,8 @@ impl Database {
                      removed_at, merged_into, has_available_source, default_source_id,
                      poster_tag, backdrop_tag, thumb_tag, logo_tag, season_count,
                      episode_count, latest_child_added_at, latest_episode_added_at,
-                     restriction_code, metadata_state, nfo_fingerprint, applied_seq
+                     latest_added_at, restriction_code, metadata_state, nfo_fingerprint,
+                     applied_seq
                  )
                  SELECT
                      mi.id, mi.library_id, mi.item_type, mi.parent_id, mi.series_id,
@@ -265,6 +266,14 @@ impl Database {
                          AND child.removed_at IS NULL
                          AND child.has_available_source = 1
                          AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                     CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
+                         (SELECT MAX(child.added_at) FROM media_items child
+                          WHERE child.item_type = 'EPISODE'
+                            AND child.removed_at IS NULL
+                            AND child.has_available_source = 1
+                            AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                         mi.added_at)
+                     ELSE mi.added_at END,
                      (SELECT cri.certification_code FROM media_content_restriction_index cri
                        WHERE cri.item_id = mi.id LIMIT 1),
                      mi.identification_status, mi.nfo_metadata_fingerprint, 0
@@ -298,6 +307,7 @@ impl Database {
                      episode_count = excluded.episode_count,
                      latest_child_added_at = excluded.latest_child_added_at,
                      latest_episode_added_at = excluded.latest_episode_added_at,
+                     latest_added_at = excluded.latest_added_at,
                      restriction_code = excluded.restriction_code,
                      metadata_state = excluded.metadata_state,
                      nfo_fingerprint = excluded.nfo_fingerprint,
@@ -663,9 +673,7 @@ impl Database {
         }
         let branch = "SELECT id, library_id FROM (
                 SELECT ci.item_id AS id, ci.library_id,
-                       CASE WHEN ci.item_type = 'SERIES'
-                            THEN COALESCE(ci.latest_episode_added_at, ci.effective_added_at)
-                            ELSE ci.effective_added_at END AS latest_added_at,
+                       ci.latest_added_at,
                        ci.sort_title
                 FROM catalog_items ci
                 WHERE ci.library_id = ?
