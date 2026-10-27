@@ -65,10 +65,7 @@ pub(crate) fn spawn_startup_catalog_read_model(database: Database) {
         }
         {
             let started = std::time::Instant::now();
-            let resume_after = database
-                .catalog_items_max_item_id()
-                .await
-                .unwrap_or(None);
+            let resume_after = database.catalog_items_max_item_id().await.unwrap_or(None);
             match rebuild_catalog_read_model_from(&database, 1_000, resume_after).await {
                 Ok(report) => tracing::info!(
                     items = report.items,
