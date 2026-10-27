@@ -96,6 +96,10 @@ struct CatalogSearchPageBindings<'a> {
     limit: i64,
 }
 
+/// Number of `like_query` bindings in the fallback search branch: display title, original title,
+/// canonical sort title and the alias subquery share the same pattern.
+const SEARCH_LIKE_BINDS: usize = 4;
+
 fn postgres_recent_catalog_rows_by_library_query(
     library_count: usize,
     content_restriction_predicate: &str,
@@ -1190,6 +1194,7 @@ impl Database {
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE (mi.title LIKE ? ESCAPE '!' OR COALESCE(mi.original_title, '') LIKE ? ESCAPE '!'
+                    OR mi.sort_title LIKE ? ESCAPE '!'
                     OR EXISTS (SELECT 1 FROM item_aliases ia
                                WHERE ia.item_id = mi.id AND ia.alias LIKE ? ESCAPE '!'))
              AND mi.removed_at IS NULL
@@ -1279,7 +1284,7 @@ impl Database {
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
-             WHERE (ms.title ILIKE ? OR ms.original_title ILIKE ?
+             WHERE (ms.title ILIKE ? OR ms.original_title ILIKE ? OR ms.sort_title ILIKE ?
                     OR ms.aliases ILIKE ?)
                AND mi.removed_at IS NULL
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
@@ -1330,7 +1335,11 @@ impl Database {
             }
         }
         if let Some(like_query) = bindings.like_query {
-            statement = statement.bind(like_query).bind(like_query).bind(like_query);
+            // One binding for each LIKE branch in the query: title, original title, canonical sort
+            // title and the alias subquery.
+            for _ in 0..SEARCH_LIKE_BINDS {
+                statement = statement.bind(like_query);
+            }
             for item_type in bindings.item_types {
                 statement = statement.bind(item_type);
             }

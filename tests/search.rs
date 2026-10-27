@@ -573,6 +573,22 @@ async fn search_matrix_matches_chinese_prefix_alias_and_punctuation()
     assert_eq!(empty.status(), reqwest::StatusCode::OK);
     assert_eq!(empty.json::<Value>().await?["total"], 0);
 
+    // Canonical sort title: the ordering form can carry text the display title does not, and a
+    // substring query must find the item through the LIKE fallback as well as through FTS.
+    sqlx::query("UPDATE media_items SET sort_title = 'guardians of the galaxy' WHERE id = ?")
+        .bind(&chinese_id)
+        .execute(database.pool())
+        .await?;
+    let canonical = client
+        .get(format!("{base_url}/api/v1/search?q=galax"))
+        .header("Cookie", format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(canonical.status(), reqwest::StatusCode::OK);
+    let canonical_body = canonical.json::<Value>().await?;
+    assert_eq!(canonical_body["total"], 1);
+    assert_eq!(canonical_body["items"][0]["id"], chinese_id);
+
     server.abort();
     Ok(())
 }
