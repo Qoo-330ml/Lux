@@ -18418,6 +18418,23 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 
 验收：首页 p95 ≤400 ms；扫描并发下 p95 比值下降；`off` 逐字节一致。
 
+进度（2026-10-27，部分完成）：
+
+- 继续观看 rail 已由 LUX-867 覆盖（`user_series_next` + 进行中电影/视频）。
+- 最近添加 rail 接 `catalog_items`：`list_recent_read_model_ids` 复刻权威查询的可见集合（可用条目 +
+  无源但仍有可见子项的 SERIES/SEASON/BOX_SET），按 `effective_added_at DESC, sort_title, id` 排序。
+  每个库一条有界子查询再归并，避免 `library_id IN (...)` 让 SQLite 对全量候选做临时排序
+  （首版写法在 66k 上慢约 50 ms，已改）。
+- `on` 仅在无内容限制时启用（读模型不含内容限制索引），受限用户、未回填或行缺失时整页回退旧查询；
+  `shadow` 比对 id 序列与总数，差异记 `recently added shadow page/total differs`。
+- 回归：`recently_added_read_model_matches_the_legacy_query`（两库、无源电影、空壳剧集、文件夹、
+  `media_only` 两种取值）、`recently_added_switch_matches_the_legacy_page`（`off`/`on` 同页、
+  未回填回退）。
+- 66k 夹具实测（arm64 release）：首页 `off` p50/p95 109.1/122.2 ms，`on` 82.5/86.7 ms，响应逐字节
+  一致（93,909 B）；`shadow` 下首页与库列表请求的差异告警为 0。
+- 未完成：按库最新 rail（`list_recent_catalog_rows_by_library_with_restrictions`，SQLite/PostgreSQL
+  两套选区查询）仍走权威路径；扫描并发下首页 p95 比值（第 29 节验收）本轮未复测。
+
 #### LUX-869：搜索统一
 
 范围：SQLite FTS5 外部内容表 + trigram 评估，PostgreSQL `tsvector` + GIN；中文 2 字词、前缀、别名用例矩阵；

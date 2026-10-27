@@ -2655,3 +2655,16 @@ PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表
 两侧继续观看响应 sha256 相同（逐字节一致），首页响应也一致。`LUX_READ_MODEL_MODE=shadow` 下请求
 首页、继续观看第 1/2 页与 `pageSize=100`，`continue watching shadow * differs` 计数为 0。
 本机为 macOS arm64，不能据此外推 NAS/x86_64；首页 p95 的单次波动不代表回归。
+
+## 首页最近添加读模型 A/B（LUX-868，2026-10-27）
+
+同一 66k 夹具、arm64 release、`/api/v1/home` 各 15 次请求（前 3 次预热）：
+
+| 模式 | p50 | p95 | 响应字节 |
+|---|---:|---:|---:|
+| `off` | 109.05 ms | 122.20 ms | 93,909 |
+| `on` | 82.54 ms | 86.69 ms | 93,909 |
+
+两侧首页响应 sha256 相同；`LUX_READ_MODEL_MODE=shadow` 下首页与库列表请求的
+`recently added shadow * differs` 计数为 0。首版用 `library_id IN (...)` 排序时 `on` 反而慢约
+50 ms（跨库临时排序），改成每库有界子查询后回到上表。按库最新 rail 仍是权威查询，未计入本表。

@@ -6,6 +6,9 @@
 
 use crate::storage::{Database, StorageError};
 
+/// Watermark name for the `catalog_items` rebuild; its presence means the read model is complete.
+pub(crate) const CATALOG_ITEMS_CONSUMER: &str = "catalog_items_rebuild";
+
 /// Watermark name for the derived continue-watching pointers. The value only records that a full
 /// rebuild finished, so the `on` read path can trust the table.
 pub(crate) const USER_SERIES_NEXT_CONSUMER: &str = "user_series_next_rebuild";
@@ -57,7 +60,7 @@ async fn rebuild_catalog_read_model_from(
 /// Fills an empty read model once, in the background. Failures are logged; the next start retries.
 pub(crate) fn spawn_startup_catalog_read_model(database: Database) {
     tokio::spawn(async move {
-        let rebuild_done = match database.catalog_consumer("catalog_items_rebuild").await {
+        let rebuild_done = match database.catalog_consumer(CATALOG_ITEMS_CONSUMER).await {
             Ok(state) => state.is_some(),
             Err(error) => {
                 tracing::warn!(%error, "catalog read model watermark read failed");

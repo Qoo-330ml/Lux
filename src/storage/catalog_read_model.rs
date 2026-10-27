@@ -512,6 +512,133 @@ impl Database {
     }
 }
 
+/// Recently-added page derived from `catalog_items`, mirroring the authoritative query's shape:
+/// available items of the requested types plus containers without a source that still expose a
+/// visible child.
+pub(crate) struct RecentReadModelQuery<'a> {
+    pub(crate) library_ids: &'a [String],
+    pub(crate) media_only: bool,
+    pub(crate) offset: i64,
+    pub(crate) limit: i64,
+    pub(crate) include_total: bool,
+}
+
+impl Database {
+    #[allow(dead_code)] // wired by the `on` switch for the recently-added rail
+    pub(crate) async fn list_recent_read_model_ids(
+        &self,
+        query: &RecentReadModelQuery<'_>,
+    ) -> Result<(Vec<String>, i64), StorageError> {
+        if query.library_ids.is_empty() {
+            return Ok((Vec::new(), 0));
+        }
+        let (available_types, container_types) = if query.media_only {
+            (
+                "ci.item_type IN ('MOVIE', 'SERIES')",
+                "ci.item_type = 'SERIES'",
+            )
+        } else {
+            (
+                "ci.item_type <> 'FOLDER'",
+                "ci.item_type IN ('SERIES', 'SEASON', 'BOX_SET')",
+            )
+        };
+        let placeholders = std::iter::repeat_n("?", query.library_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let visible = format!(
+            "ci.removed_at IS NULL AND ci.merged_into IS NULL AND (
+                 ({available_types} AND ci.has_available_source = 1)
+                 OR ({container_types} AND ci.has_available_source = 0 AND (
+                     EXISTS (
+                         SELECT 1 FROM catalog_items visible_child
+                         WHERE visible_child.removed_at IS NULL
+                           AND visible_child.merged_into IS NULL
+                           AND visible_child.has_available_source = 1
+                           AND (visible_child.parent_id = ci.item_id
+                                OR visible_child.series_id = ci.item_id)
+                     )
+                     OR EXISTS (
+                         SELECT 1 FROM collection_items visible_collection_item
+                         JOIN collections visible_collection
+                           ON visible_collection.id = visible_collection_item.collection_id
+                         JOIN catalog_items visible_child
+                           ON visible_child.item_id = visible_collection_item.item_id
+                         WHERE visible_collection.item_id = ci.item_id
+                           AND visible_child.removed_at IS NULL
+                           AND visible_child.merged_into IS NULL
+                           AND visible_child.has_available_source = 1
+                     )
+                 ))
+             )"
+        );
+        // One bounded subquery per library keeps the `(library_id, effective_added_at)` index
+        // ordered and short-circuits at the page size; a single IN list would force SQLite to sort
+        // the whole candidate set across libraries.
+        let per_library_limit = query.limit.saturating_add(query.offset.max(0));
+        let per_library = query
+            .library_ids
+            .iter()
+            .map(|_| {
+                format!(
+                    "SELECT item_id, effective_added_at, sort_title FROM (
+                         SELECT ci.item_id, ci.effective_added_at, ci.sort_title
+                         FROM catalog_items ci
+                         JOIN libraries l ON l.id = ci.library_id AND l.is_enabled = 1
+                         WHERE ci.library_id = ? AND {visible}
+                         ORDER BY ci.effective_added_at DESC, ci.sort_title, ci.item_id
+                         LIMIT ?
+                     )"
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let list_sql = format!(
+            "SELECT item_id FROM ({per_library})
+             ORDER BY effective_added_at DESC, sort_title, item_id
+             LIMIT ? OFFSET ?"
+        );
+        let mut statement = self.query_as::<(String,)>(sqlx::AssertSqlSafe(list_sql));
+        for library_id in query.library_ids {
+            statement = statement.bind(library_id).bind(per_library_limit);
+        }
+        let ids = statement
+            .bind(query.limit)
+            .bind(query.offset.max(0))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?
+            .into_iter()
+            .map(|(item_id,)| item_id)
+            .collect::<Vec<_>>();
+        let total = if query.include_total {
+            let count_sql = format!(
+                "SELECT COUNT(*)
+                 FROM catalog_items ci
+                 JOIN libraries l ON l.id = ci.library_id AND l.is_enabled = 1
+                 WHERE ci.library_id IN ({placeholders}) AND {visible}"
+            );
+            let mut statement = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql));
+            for library_id in query.library_ids {
+                statement = statement.bind(library_id);
+            }
+            statement
+                .fetch_one(&self.pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+        } else {
+            0
+        };
+        Ok((ids, total))
+    }
+}
+
 #[derive(Debug, sqlx::FromRow)]
 struct ReadModelCoreRow {
     item_id: String,

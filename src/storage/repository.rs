@@ -84,7 +84,7 @@ mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;
 #[path = "catalog_read_model.rs"]
 mod catalog_read_model;
-pub(crate) use catalog_read_model::{ReadModelPageQuery, ReadModelSort};
+pub(crate) use catalog_read_model::{ReadModelPageQuery, ReadModelSort, RecentReadModelQuery};
 #[path = "metadata.rs"]
 mod metadata;
 #[path = "migration.rs"]

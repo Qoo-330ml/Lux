@@ -22280,6 +22280,97 @@ async fn catalog_read_model_shadow_matches_the_legacy_default_list()
 }
 
 #[tokio::test]
+async fn recently_added_read_model_matches_the_legacy_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for (id, name) in [("recent-lib-a", "A"), ("recent-lib-b", "B")] {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(id)
+            .bind(name)
+            .execute(database.pool())
+            .await?;
+    }
+    for (id, library_id, item_type, has_source, added_at) in [
+        ("recent-movie-old", "recent-lib-a", "MOVIE", 1_i64, 10_i64),
+        ("recent-movie-new", "recent-lib-b", "MOVIE", 1, 30),
+        ("recent-movie-copy", "recent-lib-a", "MOVIE", 0, 20),
+        ("recent-series", "recent-lib-a", "SERIES", 1, 15),
+        ("recent-series-empty", "recent-lib-b", "SERIES", 0, 25),
+        ("recent-folder", "recent-lib-a", "FOLDER", 1, 40),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(has_source)
+        .bind(added_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // A container without a source stays visible while one of its children is available.
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at, series_id, season_number, episode_number
+         ) VALUES ('recent-series-episode', 'recent-lib-b', 'EPISODE', 'Episode', 'episode',
+                   'LOCAL_CONFIRMED', 1, 5, 'recent-series-empty', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let library_ids = vec!["recent-lib-a".to_owned(), "recent-lib-b".to_owned()];
+    for media_only in [false, true] {
+        let (legacy_ids, legacy_total) = database
+            .list_recent_catalog_item_ids(&library_ids, 0, 10, media_only, None)
+            .await?;
+        let (read_model_ids, read_model_total) = database
+            .list_recent_read_model_ids(&RecentReadModelQuery {
+                library_ids: &library_ids,
+                media_only,
+                offset: 0,
+                limit: 10,
+                include_total: true,
+            })
+            .await?;
+        assert_eq!(
+            read_model_ids, legacy_ids,
+            "recently added page differs (media_only={media_only})"
+        );
+        assert_eq!(read_model_total, legacy_total);
+    }
+    let (ids, _) = database
+        .list_recent_read_model_ids(&RecentReadModelQuery {
+            library_ids: &library_ids,
+            media_only: false,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        })
+        .await?;
+    assert_eq!(
+        ids,
+        vec![
+            "recent-movie-new".to_owned(),
+            "recent-series-empty".to_owned(),
+            "recent-series".to_owned(),
+            "recent-movie-old".to_owned(),
+            "recent-series-episode".to_owned()
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_read_model_single_item_rows_match_the_legacy_join()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::test_database;

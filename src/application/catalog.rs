@@ -13,15 +13,16 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
-    application::catalog_read_model::USER_SERIES_NEXT_CONSUMER,
+    application::catalog_read_model::{CATALOG_ITEMS_CONSUMER, USER_SERIES_NEXT_CONSUMER},
     application::recommendations::{
         RECOMMENDATION_CANDIDATE_POOL, current_recommendation_batch_key,
         daily_recommendation_items, recommendation_library_scope_key,
     },
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
-        GLOBAL_COLLECTION_LIBRARY_ID, ResumeItemsQuery, ResumePointerQuery, StorageError,
-        StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter, UserContentRestrictions,
+        GLOBAL_COLLECTION_LIBRARY_ID, RecentReadModelQuery, ResumeItemsQuery, ResumePointerQuery,
+        StorageError, StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter,
+        UserContentRestrictions,
     },
 };
 
@@ -1831,6 +1832,37 @@ impl CatalogService {
         limit: i64,
         media_only: bool,
     ) -> Result<CatalogPage, CatalogError> {
+        // The read model does not carry the content-restriction index, so a restricted principal
+        // keeps the authoritative query instead of returning a filtered page.
+        let read_model_query = RecentReadModelQuery {
+            library_ids,
+            media_only,
+            offset,
+            limit,
+            include_total: true,
+        };
+        if self.read_model_mode == ReadModelMode::On && content_restrictions.is_none() {
+            let (item_ids, total) = self
+                .database
+                .list_recent_read_model_ids(&read_model_query)
+                .await?;
+            // An empty read model must not shadow the authoritative page: only trust it once the
+            // rebuild watermark exists.
+            let rebuilt = !(item_ids.is_empty() && total == 0)
+                || self
+                    .database
+                    .catalog_consumer(CATALOG_ITEMS_CONSUMER)
+                    .await?
+                    .is_some();
+            if rebuilt {
+                if let Some(page) = self
+                    .assemble_recent_page(&item_ids, total, offset, limit)
+                    .await?
+                {
+                    return Ok(page);
+                }
+            }
+        }
         let (item_ids, total) = self
             .database
             .list_recent_catalog_item_ids(
@@ -1841,6 +1873,10 @@ impl CatalogService {
                 content_restrictions,
             )
             .await?;
+        if self.read_model_mode == ReadModelMode::Shadow && content_restrictions.is_none() {
+            self.compare_recently_added(&read_model_query, &item_ids, total)
+                .await;
+        }
         let rows = self.database.list_catalog_rows_by_ids(&item_ids).await?;
         let mut items = assemble_items(rows);
         let details = self.database.list_catalog_details_by_ids(&item_ids).await?;
@@ -1851,6 +1887,57 @@ impl CatalogService {
         }
         let items = reorder_catalog_items(items, &item_ids);
         Ok(CatalogPage::new(items, total, offset, limit))
+    }
+
+    /// Assembles a recently-added page from read-model ids; `None` when a row is missing so the
+    /// caller falls back to the authoritative query.
+    async fn assemble_recent_page(
+        &self,
+        item_ids: &[String],
+        total: i64,
+        offset: i64,
+        limit: i64,
+    ) -> Result<Option<CatalogPage>, CatalogError> {
+        let rows = self.database.list_catalog_rows_by_ids(item_ids).await?;
+        let mut items = assemble_items(rows);
+        if items.len() != item_ids.len() {
+            return Ok(None);
+        }
+        let details = self.database.list_catalog_details_by_ids(item_ids).await?;
+        for item in &mut items {
+            if let Some(detail) = details.get(&item.id) {
+                apply_catalog_detail(item, detail);
+            }
+        }
+        let items = reorder_catalog_items(items, item_ids);
+        Ok(Some(CatalogPage::new(items, total, offset, limit)))
+    }
+
+    async fn compare_recently_added(
+        &self,
+        query: &RecentReadModelQuery<'_>,
+        legacy_ids: &[String],
+        legacy_total: i64,
+    ) {
+        match self.database.list_recent_read_model_ids(query).await {
+            Ok((ids, total)) => {
+                if total != legacy_total {
+                    tracing::warn!(
+                        legacy = legacy_total,
+                        read_model = total,
+                        "recently added shadow total differs"
+                    );
+                }
+                if ids != legacy_ids {
+                    tracing::warn!(
+                        legacy = ?legacy_ids,
+                        read_model = ?ids,
+                        "recently added shadow page differs"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "recently added shadow query failed"),
+        }
     }
 
     pub async fn list_recently_added_by_library(
@@ -5259,6 +5346,110 @@ mod tests {
             .await?;
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(second_page.items[0].id, "resume-switch-ep2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn recently_added_switch_matches_the_legacy_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::Database,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "recent-switch-viewer",
+                "Recent Switch Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Recent switch", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        for (item_id, has_source, added_at) in [
+            ("recent-switch-one", 1_i64, 10_i64),
+            ("recent-switch-two", 1, 20),
+            ("recent-switch-missing", 0, 30),
+        ] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source, added_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(item_id)
+            .bind(item_id)
+            .bind(has_source)
+            .bind(added_at)
+            .execute(database.pool())
+            .await?;
+        }
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let legacy = catalog.list_recently_added(principal, 0, 10).await?;
+        let legacy_ids = legacy
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            legacy_ids,
+            vec![
+                "recent-switch-two".to_owned(),
+                "recent-switch-one".to_owned()
+            ]
+        );
+
+        // Without a built read model the `on` switch keeps the authoritative page.
+        let pending = catalog
+            .clone()
+            .with_read_model_mode(super::ReadModelMode::On);
+        let pending_page = pending.list_recently_added(principal, 0, 10).await?;
+        assert_eq!(
+            pending_page
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            legacy_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        let switched = catalog
+            .clone()
+            .with_read_model_mode(super::ReadModelMode::On);
+        let page = switched.list_recently_added(principal, 0, 10).await?;
+        assert_eq!(page.total, legacy.total);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            legacy_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        assert_eq!(page.items[0].media_sources.len(), 0);
         Ok(())
     }
 
