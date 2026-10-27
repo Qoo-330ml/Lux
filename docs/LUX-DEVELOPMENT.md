@@ -18372,7 +18372,9 @@ p50/p95 为 off 1.72/2.59 ms、on 2.78/4.29 ms，均远低于 200 ms；on 每请
 `user_series_next`（用户+剧集主键、播放位置、played、更新时间索引）；存储层提供 upsert、按用户最近
 更新分页（≤1000）、按剧集删除；回归
 `user_series_next_round_trips_and_orders_by_recent_update`（增改查删、排序、用户删除级联清空）。
-尚未接入写入事务、重建与继续观看切换。
+重建已实现（`rebuild_user_series_next`：清空后按“最近已看完集之后的第一个未看集”重算，66k 级用户状态可一批完成），回归
+`user_series_next_rebuild_picks_the_next_unplayed_episode`（ep1/ep2 已看 → ep3；ep3 看完后无下一集）。
+尚未接入写入事务与继续观看切换。
 
 #### LUX-868：首页读模型
 

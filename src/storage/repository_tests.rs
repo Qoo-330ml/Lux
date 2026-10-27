@@ -22437,6 +22437,83 @@ async fn user_series_next_round_trips_and_orders_by_recent_update()
     Ok(())
 }
 
+#[tokio::test]
+async fn user_series_next_rebuild_picks_the_next_unplayed_episode()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Rebuild", "Rebuild", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('rebuild-lib', 'R', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('rebuild-series', 'rebuild-lib', 'SERIES', 'Series', 'series',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    for episode in 1..=3 {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number
+             ) VALUES (?, 'rebuild-lib', 'EPISODE', ?, ?, 'LOCAL_CONFIRMED', 1,
+                       'rebuild-series', 1, ?)",
+        )
+        .bind(format!("rebuild-episode-{episode}"))
+        .bind(format!("Episode {episode}"))
+        .bind(format!("episode {episode}"))
+        .bind(episode)
+        .execute(database.pool())
+        .await?;
+    }
+    for (episode, last_played_at) in [(1, 10), (2, 20)] {
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, position_ticks, is_played, play_count, last_played_at
+             ) VALUES (?, ?, 100, 1, 1, ?)",
+        )
+        .bind(&user_id)
+        .bind(format!("rebuild-episode-{episode}"))
+        .bind(last_played_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    assert_eq!(database.rebuild_user_series_next().await?, 1);
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].series_id, "rebuild-series");
+    assert_eq!(rows[0].next_item_id, "rebuild-episode-3");
+    assert_eq!(rows[0].played, 0);
+
+    // Finishing the last episode leaves no next pointer.
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES (?, 'rebuild-episode-3', 100, 1, 1, 30)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.rebuild_user_series_next().await?, 0);
+    assert!(
+        database
+            .list_user_series_next(&user_id, 0, 10)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
