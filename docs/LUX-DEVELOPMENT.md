@@ -18444,6 +18444,9 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
   `(library_id, latest_added_at DESC, item_id)` 索引，重建时按“剧集取可用分集最新入库时间，其余取
   `added_at`”写入。`EXPLAIN QUERY PLAN` 显示该 rail 现在走 `idx_catalog_items_latest_added`，只剩
   同值组的 `sort_title/id` 需要在临时 B 树里排。
+- 水位带版本：`catalog_items_rebuild@<READ_MODEL_SCHEMA_VERSION>`、
+  `user_series_next_rebuild@<同版本>`（当前 2）。旧构建写下的派生行不会被 `on` 路径直接信任，升级后
+  会先重建；回归 `read_model_watermarks_are_version_scoped`。改动派生行形状或其输入时必须递增该版本。
 - 延迟测量注意：同一份构建在本机会话后段明显变慢（同一配置首页 p95 依次出现 86.7 / 113.3 / 146.7 ms，
   release 构建耗时也逐次上升），判断为机器负载/散热噪声。66k 上读模型的延迟结论需要交错多轮复测，
   本轮只确认**响应逐字节一致 + shadow 零差异 + 索引命中**。

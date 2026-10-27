@@ -13,7 +13,7 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
-    application::catalog_read_model::{CATALOG_ITEMS_CONSUMER, USER_SERIES_NEXT_CONSUMER},
+    application::catalog_read_model::{catalog_items_consumer, user_series_next_consumer},
     application::recommendations::{
         RECOMMENDATION_CANDIDATE_POOL, current_recommendation_batch_key,
         daily_recommendation_items, recommendation_library_scope_key,
@@ -1705,7 +1705,7 @@ impl CatalogService {
             }
             let rebuilt = self
                 .database
-                .catalog_consumer(USER_SERIES_NEXT_CONSUMER)
+                .catalog_consumer(&user_series_next_consumer())
                 .await?
                 .is_some();
             return Ok(rebuilt.then_some((Vec::new(), 0)));
@@ -1851,7 +1851,7 @@ impl CatalogService {
             let rebuilt = !(item_ids.is_empty() && total == 0)
                 || self
                     .database
-                    .catalog_consumer(CATALOG_ITEMS_CONSUMER)
+                    .catalog_consumer(&catalog_items_consumer())
                     .await?
                     .is_some();
             if rebuilt {
@@ -2007,7 +2007,7 @@ impl CatalogService {
         if grouped_ids.is_empty() {
             let rebuilt = self
                 .database
-                .catalog_consumer(CATALOG_ITEMS_CONSUMER)
+                .catalog_consumer(&catalog_items_consumer())
                 .await?
                 .is_some();
             return Ok(rebuilt.then(Vec::new));
