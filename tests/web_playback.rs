@@ -890,20 +890,26 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     assert_eq!(strm_event.status(), reqwest::StatusCode::OK);
     assert_eq!(strm_event.json::<Value>().await?["accepted"], true);
     assert_eq!(webhook_service.process_ready_deliveries().await?, 2);
-    let web_stopped: Value = serde_json::from_slice(
-        &receiver
-            .recv()
-            .await
-            .ok_or("missing Web playback stop notification")?,
-    )?;
+    // Deliveries are dispatched by a concurrent worker pool (DELIVERY_CONCURRENCY), so the two
+    // notifications may arrive in either order; assert on the set instead of the sequence.
+    let mut delivered = Vec::new();
+    for _ in 0..2 {
+        delivered.push(serde_json::from_slice::<Value>(
+            &receiver
+                .recv()
+                .await
+                .ok_or("missing playback notification")?,
+        )?);
+    }
+    let web_stopped = delivered
+        .iter()
+        .find(|event| event["eventType"] == "PLAYBACK_STOPPED")
+        .ok_or("missing Web playback stop notification")?;
     assert_eq!(web_stopped["eventType"], "PLAYBACK_STOPPED");
-    let strm_started: Value = serde_json::from_slice(
-        &receiver
-            .recv()
-            .await
-            .ok_or("missing STRM playback notification")?,
-    )?;
-    assert_eq!(strm_started["eventType"], "PLAYBACK_STARTED");
+    let strm_started = delivered
+        .iter()
+        .find(|event| event["eventType"] == "PLAYBACK_STARTED")
+        .ok_or("missing STRM playback notification")?;
     assert_eq!(strm_started["playMethod"], "DirectStream");
     let failed_strm_range = client
         .get(format!("{base_url}{strm_range_url}"))
