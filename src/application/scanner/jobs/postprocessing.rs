@@ -10,7 +10,15 @@ struct ScanPostprocessingOptions {
     thumbnails: Option<ThumbnailService>,
 }
 
-const SCAN_IDLE_BATCH_BACKOFF: std::time::Duration = std::time::Duration::from_millis(50);
+/// Idle scan rounds back off instead of polling the database every 50 ms: the first idle round
+/// still reacts quickly, later ones reach a one-second cadence while another worker drains its
+/// outbox. Progress on any round resets the schedule.
+const SCAN_IDLE_BATCH_BACKOFF_MS: [u64; 3] = [250, 500, 1_000];
+
+fn scan_idle_batch_backoff(consecutive_idle_rounds: usize) -> std::time::Duration {
+    let index = consecutive_idle_rounds.min(SCAN_IDLE_BATCH_BACKOFF_MS.len() - 1);
+    std::time::Duration::from_millis(SCAN_IDLE_BATCH_BACKOFF_MS[index])
+}
 
 /// Incremental scans run on watcher events, so only a large batch is worth a full statistics pass.
 const INCREMENTAL_STATISTICS_REFRESH_MIN_CREATED_ITEMS: usize = 500;
@@ -366,6 +374,7 @@ impl ScanJobService {
         mut scan_permit: OwnedSemaphorePermit,
     ) -> Result<(ScanBatchReport, usize, OwnedSemaphorePermit), ScanJobError> {
         let mut created_items = 0_usize;
+        let mut idle_rounds = 0_usize;
         loop {
             let report = self
                 .run_batch_with_failure_handling(job_id, batch_size, true)
@@ -386,8 +395,12 @@ impl ScanJobService {
             }
             if report.processed == 0 {
                 // No progress this round means another worker still has to drain its outbox
-                // (or the batch had nothing claimable); sleeping avoids a hot loop on the DB.
-                tokio::time::sleep(SCAN_IDLE_BATCH_BACKOFF).await;
+                // (or the batch had nothing claimable); an increasing sleep avoids a hot loop on
+                // the database without making a busy scan wait longer than 250 ms.
+                tokio::time::sleep(scan_idle_batch_backoff(idle_rounds)).await;
+                idle_rounds = idle_rounds.saturating_add(1);
+            } else {
+                idle_rounds = 0;
             }
             tokio::task::yield_now().await;
         }
@@ -2205,5 +2218,20 @@ impl ScanJobService {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn scan_idle_backoff_grows_to_one_second_and_resets() {
+        let delays = (0..5)
+            .map(|round| scan_idle_batch_backoff(round).as_millis())
+            .collect::<Vec<_>>();
+        assert_eq!(delays, vec![250, 500, 1000, 1000, 1000]);
+        // Progress resets the schedule, so the next idle round is quick again.
+        assert_eq!(scan_idle_batch_backoff(0).as_millis(), 250);
     }
 }
