@@ -18389,20 +18389,28 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 - 迁移 `0232_user_series_next_last_played_at.sql` / PostgreSQL `0234_...` 为指针表补 `last_played_at`
   （产生指针的那一集的播放时间：进行中集本身，或最近已看完集），读模型据此保持与权威查询一致的排序，
   不再按写入时间排序。
+- 候选集与权威查询一致：`in_progress`（未看完、`position>0`、未隐藏，且满足
+  `played_percent`/`resume_min_ticks`/运行时长的阈值）∪ `latest_completed` 之后的第一个未看集；
+  指针取其中“季集号最大”的一条（同号再按播放时间、id），因此同一剧集有多集在播时，读模型与旧
+  查询选同一条。
 - 存储层 `list_resume_pointer_ids`：剧集取 `user_series_next`，进行中的电影/视频仍取
-  `user_item_state`（单用户窄索引扫描），两支都套用可见性、库、内容限制与 `played_percent`/
-  `resume_min_ticks` 阈值，排序 `resume_at DESC NULLS LAST, sort_title, id`。
+  `user_item_state`（单用户窄索引扫描，保留阈值过滤），两支都套用可见性、库与内容限制，
+  排序 `resume_at DESC NULLS LAST, sort_title, id`。
 - `on`：指针 id 页 + `catalog_items` 核心行 + 一次批量源/流查询（≤4 SQL），按 id 顺序还原（新增
   `read_model_rows_in_id_order`）；读模型缺行或尚未回填时整页回退旧查询，不会返回短页。
 - 启动后台回填一次指针（水位 `user_series_next_rebuild`）；重建与按条目刷新排除
   `hide_from_resume` 条目。
 - `shadow`：与旧查询比对 id 序列与总数，差异记 `continue watching shadow page/total differs`。
-- 回归：`continue_watching_read_model_matches_the_legacy_query`（跨剧集/进行中电影/隐藏集/下一集与
-  排序、总数、分页）、`continue_watching_switch_matches_the_legacy_page`（`off` 与 `on` 同页、未回填回退、
-  home 变体、第二页）。
-- 已知差异（`on` 才可见，默认关闭）：某剧集的进行中集若已越过 `played_percent`（或低于
-  `resume_min_ticks`），旧查询会退回到“下一未看集”，而指针只有一条行，该剧集会从列表消失；
-  需要完全等价时先保持 `off`，后续可在指针表增加回退列。
+- 回归：`continue_watching_read_model_matches_the_legacy_query`（跨剧集/进行中电影/隐藏集/同剧集多集
+  在播/下一集，排序、总数、分页）、`continue_watching_switch_matches_the_legacy_page`（`off` 与 `on`
+  同页、未回填回退、home 变体、第二页）、`user_series_next_rebuild_keeps_the_in_progress_episode`
+  （越过 `played_percent` 后退回“下一未看集”）。
+- 66k 夹具实测（arm64 release，40 条继续观看，pageSize=24）：`off` p50/p95 13.1/18.9 ms，
+  `on` 8.4/10.2 ms，两侧响应逐字节一致（40,324 B，sha256 相同）；`LUX_READ_MODEL_MODE=shadow`
+  下请求首页、继续观看前两页与 pageSize=100 共 4 次，`continue watching shadow * differs` 计 0。
+  远低于 300 ms 目标；`on` 依旧默认关闭，是否开启留待项目所有者决定。
+- 残留滞后（非等价场景）：恢复阈值只在重建/播放写入时求值，用户在设置里改动 `played_percent` 或
+  `resume_min_ticks` 后，指针不会立即重算；需要完全等价时保持 `off`，或下次重建后自然收敛。
 
 #### LUX-868：首页读模型
 

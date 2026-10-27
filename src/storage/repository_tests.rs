@@ -22621,10 +22621,10 @@ async fn user_series_next_rebuild_keeps_the_in_progress_episode()
         sqlx::query(
             "INSERT INTO media_items (
                  id, library_id, item_type, title, sort_title, identification_status,
-                 has_available_source, series_id, season_number, episode_number
+                 has_available_source, series_id, season_number, episode_number, runtime_ticks
              ) VALUES (?, 'progress-lib', ?, ?, ?, 'LOCAL_CONFIRMED', 1,
                        CASE WHEN ? = 'EPISODE' THEN 'progress-series' ELSE NULL END,
-                       CASE WHEN ? = 'EPISODE' THEN 1 ELSE NULL END, ?)",
+                       CASE WHEN ? = 'EPISODE' THEN 1 ELSE NULL END, ?, ?)",
         )
         .bind(id)
         .bind(item_type)
@@ -22633,13 +22633,14 @@ async fn user_series_next_rebuild_keeps_the_in_progress_episode()
         .bind(item_type)
         .bind(item_type)
         .bind(episode)
+        .bind(episode.map(|_| 7_200_000_000_i64))
         .execute(database.pool())
         .await?;
     }
     sqlx::query(
         "INSERT INTO user_item_state (
              user_id, item_id, position_ticks, is_played, last_played_at
-         ) VALUES (?, 'progress-ep1', 100, 1, 10), (?, 'progress-ep2', 50, 0, 20)",
+         ) VALUES (?, 'progress-ep1', 100, 1, 10), (?, 'progress-ep2', 1800000000, 0, 20)",
     )
     .bind(&user_id)
     .bind(&user_id)
@@ -22650,7 +22651,22 @@ async fn user_series_next_rebuild_keeps_the_in_progress_episode()
     let rows = database.list_user_series_next(&user_id, 0, 10).await?;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].next_item_id, "progress-ep2");
-    assert_eq!(rows[0].position_ticks, 50);
+    assert_eq!(rows[0].position_ticks, 1_800_000_000);
+
+    // Crossing the played percentage drops the episode from the resume candidates; the pointer
+    // then advances to it as the next unplayed episode, exactly like the authoritative query.
+    sqlx::query(
+        "UPDATE user_item_state SET position_ticks = 7000000000
+         WHERE user_id = ? AND item_id = 'progress-ep2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.rebuild_user_series_next().await?, 1);
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].next_item_id, "progress-ep2");
+    assert_eq!(rows[0].position_ticks, 0);
     Ok(())
 }
 
@@ -22693,6 +22709,13 @@ async fn continue_watching_read_model_matches_the_legacy_query()
             Some(3),
             Some(RUNTIME),
         ),
+        (
+            "resume-a-ep4",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(4),
+            Some(RUNTIME),
+        ),
         ("resume-series-b", "SERIES", None, None, None),
         (
             "resume-b-ep1",
@@ -22732,6 +22755,9 @@ async fn continue_watching_read_model_matches_the_legacy_query()
         ("resume-a-ep1", 0i64, 1, 0, 10),
         ("resume-a-ep2", 1_800_000_000, 0, 0, 20),
         ("resume-a-ep3", 1_800_000_000, 0, 1, 25),
+        // Watched longer ago than ep2 but with the higher episode number: the authoritative
+        // query prefers the higher episode inside one series, and the pointer must match.
+        ("resume-a-ep4", 1_800_000_000, 0, 0, 5),
         ("resume-b-ep1", 0, 1, 0, 40),
         ("resume-movie", 2_520_000_000, 0, 0, 30),
     ] {
@@ -22782,7 +22808,7 @@ async fn continue_watching_read_model_matches_the_legacy_query()
         vec![
             "resume-b-ep2".to_owned(),
             "resume-movie".to_owned(),
-            "resume-a-ep2".to_owned()
+            "resume-a-ep4".to_owned()
         ]
     );
     assert_eq!(legacy_total, 3);

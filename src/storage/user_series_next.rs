@@ -31,6 +31,20 @@ pub(crate) struct ResumePointerQuery<'a> {
     pub(crate) limit: i64,
 }
 
+/// `resume_min_ticks` server setting with the default the authoritative query also applies.
+const RESUME_MINIMUM_TICKS_SQL: &str = "COALESCE(
+    (SELECT CAST(value AS BIGINT) FROM server_settings WHERE key = 'resume_min_ticks'),
+    1200000000
+)";
+
+/// Per-user played percentage, defaulted and clamped like `home_resume_settings`.
+const RESUME_PLAYED_PERCENT_SQL: &str = "COALESCE(
+    (SELECT CASE WHEN played_percent < 1 THEN 1 WHEN played_percent > 100 THEN 100
+                 ELSE played_percent END
+     FROM user_playback_settings WHERE user_id = us.user_id),
+    95
+)";
+
 fn placeholders(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
@@ -168,11 +182,7 @@ impl Database {
                    AND mi.removed_at IS NULL
                    AND mi.library_id IN ({library_placeholders}){restriction}{CATALOG_VISIBLE_PREDICATE}
                    AND COALESCE(us.is_played, 0) = 0
-                   AND COALESCE(us.hide_from_resume, 0) = 0
-                   AND (usn.position_ticks = 0
-                        OR ({runtime_ticks} > 0
-                            AND usn.position_ticks >= ?
-                            AND usn.position_ticks * 100 < {runtime_ticks} * ?))"
+                   AND COALESCE(us.hide_from_resume, 0) = 0"
             ));
             binds.push(CatalogBind::Text(query.user_id));
             binds.extend(
@@ -187,8 +197,6 @@ impl Database {
                     .map(|library_id| CatalogBind::Text(library_id)),
             );
             binds.extend(restriction_binds.iter().copied());
-            binds.push(CatalogBind::Integer(query.minimum_ticks));
-            binds.push(CatalogBind::Integer(query.played_percent));
         }
         if !progress_types.is_empty() {
             let item_type_placeholders = placeholders(progress_types.len());
@@ -278,8 +286,10 @@ impl Database {
 impl Database {
     /// Rebuilds every user's pointer from `user_item_state` and the hierarchy.
     ///
-    /// The pointer is the in-progress episode when the latest activity left one unfinished;
-    /// otherwise it is the first unplayed, available episode after the latest completed one.
+    /// The candidate set mirrors the authoritative continue-watching query: the user's unfinished
+    /// episodes plus the first unplayed episode after the most recently completed one. The pointer
+    /// is the highest episode number in that set, so the derived list returns the same item as the
+    /// legacy aggregation.
     pub(crate) async fn rebuild_user_series_next(&self) -> Result<u64, StorageError> {
         self.query("DELETE FROM user_series_next")
             .execute(&self.pool)
@@ -288,11 +298,27 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        let result = self
-            .query(
-                "WITH candidates AS (
+        let statement_sql = format!(
+            "WITH in_progress AS (
+                     SELECT us.user_id, mi.series_id, mi.id, mi.season_number,
+                            mi.episode_number, us.position_ticks, us.last_played_at
+                     FROM media_items mi
+                     JOIN user_item_state us ON us.item_id = mi.id
+                     WHERE mi.item_type = 'EPISODE'
+                       AND mi.series_id IS NOT NULL
+                       AND mi.season_number IS NOT NULL
+                       AND mi.episode_number IS NOT NULL
+                       AND mi.removed_at IS NULL
+                       AND us.is_played = 0
+                       AND us.position_ticks > 0
+                       AND COALESCE(us.hide_from_resume, 0) = 0
+                       AND {runtime_ticks} > 0
+                       AND us.position_ticks >= {minimum_ticks}
+                       AND us.position_ticks * 100 < {runtime_ticks} * {played_percent}
+                 ),
+                 completed AS (
                      SELECT us.user_id, mi.series_id, mi.season_number, mi.episode_number,
-                            mi.id, us.is_played, us.position_ticks, us.last_played_at,
+                            mi.id, us.last_played_at,
                             ROW_NUMBER() OVER (
                                 PARTITION BY us.user_id, mi.series_id
                                 ORDER BY us.last_played_at DESC NULLS LAST,
@@ -306,23 +332,22 @@ impl Database {
                        AND mi.season_number IS NOT NULL
                        AND mi.episode_number IS NOT NULL
                        AND mi.removed_at IS NULL
-                       AND COALESCE(us.hide_from_resume, 0) = 0
-                       AND (us.is_played = 1 OR us.position_ticks > 0)
+                       AND us.is_played = 1
                  ),
-                 latest AS (
-                     SELECT user_id, series_id, season_number, episode_number, id,
-                            is_played, position_ticks, last_played_at
-                     FROM candidates WHERE played_rank = 1
+                 latest_completed AS (
+                     SELECT user_id, series_id, season_number, episode_number, last_played_at
+                     FROM completed WHERE played_rank = 1
                  ),
-                 next_episode AS (
-                     SELECT latest.user_id, latest.series_id, mi.id,
+                 next_episodes_ranked AS (
+                     SELECT latest.user_id, latest.series_id, mi.id, mi.season_number,
+                            mi.episode_number,
                             COALESCE(us.last_played_at, latest.last_played_at) AS last_played_at,
                             ROW_NUMBER() OVER (
                                 PARTITION BY latest.user_id, latest.series_id
                                 ORDER BY mi.season_number, mi.episode_number,
                                          mi.sort_title, mi.id
                             ) AS next_rank
-                     FROM latest
+                     FROM latest_completed latest
                      JOIN media_items mi
                        ON mi.series_id = latest.series_id
                       AND mi.item_type = 'EPISODE'
@@ -331,18 +356,29 @@ impl Database {
                             AND mi.episode_number > latest.episode_number))
                      LEFT JOIN user_item_state us
                        ON us.item_id = mi.id AND us.user_id = latest.user_id
-                     WHERE latest.is_played = 1
-                       AND mi.has_available_source = 1
+                     WHERE mi.has_available_source = 1
                        AND mi.removed_at IS NULL
                        AND COALESCE(us.is_played, 0) = 0
                        AND COALESCE(us.hide_from_resume, 0) = 0
                  ),
-                 resume AS (
-                     SELECT user_id, series_id, id, position_ticks, last_played_at
-                     FROM latest WHERE is_played = 0 AND position_ticks > 0
+                 candidates AS (
+                     SELECT user_id, series_id, id, season_number, episode_number,
+                            position_ticks, last_played_at, 0 AS candidate_priority
+                     FROM in_progress
                      UNION ALL
-                     SELECT user_id, series_id, id, 0, last_played_at
-                     FROM next_episode WHERE next_rank = 1
+                     SELECT user_id, series_id, id, season_number, episode_number,
+                            0 AS position_ticks, last_played_at, 1 AS candidate_priority
+                     FROM next_episodes_ranked WHERE next_rank = 1
+                 ),
+                 resume AS (
+                     SELECT user_id, series_id, id, position_ticks, last_played_at,
+                            ROW_NUMBER() OVER (
+                                PARTITION BY user_id, series_id
+                                ORDER BY season_number DESC, episode_number DESC,
+                                         candidate_priority,
+                                         last_played_at DESC NULLS LAST, id DESC
+                            ) AS resume_rank
+                     FROM candidates
                  )
                  INSERT INTO user_series_next (
                      user_id, series_id, next_item_id, position_ticks, played, last_played_at,
@@ -350,14 +386,19 @@ impl Database {
                  )
                  SELECT user_id, series_id, id, position_ticks, 0, last_played_at, unixepoch()
                  FROM resume
-                 WHERE 1 = 1
+                 WHERE resume_rank = 1
                  ON CONFLICT(user_id, series_id) DO UPDATE SET
                      next_item_id = excluded.next_item_id,
                      position_ticks = excluded.position_ticks,
                      played = 0,
                      last_played_at = excluded.last_played_at,
                      updated_at = unixepoch()",
-            )
+            runtime_ticks = resume_runtime_ticks_sql(),
+            minimum_ticks = RESUME_MINIMUM_TICKS_SQL,
+            played_percent = RESUME_PLAYED_PERCENT_SQL,
+        );
+        let result = self
+            .query(sqlx::AssertSqlSafe(statement_sql))
             .execute(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -407,10 +448,26 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        self.query(
-            "WITH candidates AS (
-                 SELECT mi.season_number, mi.episode_number, mi.id,
-                        us.is_played, us.position_ticks, us.last_played_at,
+        let statement_sql = format!(
+            "WITH in_progress AS (
+                 SELECT mi.id, mi.season_number, mi.episode_number, us.position_ticks,
+                        us.last_played_at
+                 FROM media_items mi
+                 JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
+                 WHERE mi.item_type = 'EPISODE'
+                   AND mi.series_id = ?
+                   AND mi.season_number IS NOT NULL
+                   AND mi.episode_number IS NOT NULL
+                   AND mi.removed_at IS NULL
+                   AND us.is_played = 0
+                   AND us.position_ticks > 0
+                   AND COALESCE(us.hide_from_resume, 0) = 0
+                   AND {runtime_ticks} > 0
+                   AND us.position_ticks >= {minimum_ticks}
+                   AND us.position_ticks * 100 < {runtime_ticks} * {played_percent}
+             ),
+             completed AS (
+                 SELECT mi.season_number, mi.episode_number, mi.id, us.last_played_at,
                         ROW_NUMBER() OVER (
                             ORDER BY us.last_played_at DESC NULLS LAST,
                                      mi.season_number DESC, mi.episode_number DESC, mi.id DESC
@@ -422,21 +479,19 @@ impl Database {
                    AND mi.season_number IS NOT NULL
                    AND mi.episode_number IS NOT NULL
                    AND mi.removed_at IS NULL
-                   AND COALESCE(us.hide_from_resume, 0) = 0
-                   AND (us.is_played = 1 OR us.position_ticks > 0)
+                   AND us.is_played = 1
              ),
-             latest AS (
-                 SELECT season_number, episode_number, id, is_played, position_ticks,
-                        last_played_at
-                 FROM candidates WHERE played_rank = 1
+             latest_completed AS (
+                 SELECT season_number, episode_number, last_played_at
+                 FROM completed WHERE played_rank = 1
              ),
-             next_episode AS (
-                 SELECT mi.id,
+             next_episodes_ranked AS (
+                 SELECT mi.id, mi.season_number, mi.episode_number,
                         COALESCE(us.last_played_at, latest.last_played_at) AS last_played_at,
                         ROW_NUMBER() OVER (
                             ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id
                         ) AS next_rank
-                 FROM latest
+                 FROM latest_completed latest
                  JOIN media_items mi
                    ON mi.series_id = ?
                   AND mi.item_type = 'EPISODE'
@@ -444,17 +499,28 @@ impl Database {
                     OR (mi.season_number = latest.season_number
                         AND mi.episode_number > latest.episode_number))
                  LEFT JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
-                 WHERE latest.is_played = 1
-                   AND mi.has_available_source = 1
+                 WHERE mi.has_available_source = 1
                    AND mi.removed_at IS NULL
                    AND COALESCE(us.is_played, 0) = 0
                    AND COALESCE(us.hide_from_resume, 0) = 0
              ),
-             resume AS (
-                 SELECT id, position_ticks, last_played_at
-                 FROM latest WHERE is_played = 0 AND position_ticks > 0
+             candidates AS (
+                 SELECT id, season_number, episode_number, position_ticks, last_played_at,
+                        0 AS candidate_priority
+                 FROM in_progress
                  UNION ALL
-                 SELECT id, 0, last_played_at FROM next_episode WHERE next_rank = 1
+                 SELECT id, season_number, episode_number, 0 AS position_ticks,
+                        last_played_at, 1 AS candidate_priority
+                 FROM next_episodes_ranked WHERE next_rank = 1
+             ),
+             resume AS (
+                 SELECT id, position_ticks, last_played_at,
+                        ROW_NUMBER() OVER (
+                            ORDER BY season_number DESC, episode_number DESC,
+                                     candidate_priority,
+                                     last_played_at DESC NULLS LAST, id DESC
+                        ) AS resume_rank
+                 FROM candidates
              )
              INSERT INTO user_series_next (
                  user_id, series_id, next_item_id, position_ticks, played, last_played_at,
@@ -462,26 +528,32 @@ impl Database {
              )
              SELECT ?, ?, id, position_ticks, 0, last_played_at, unixepoch()
              FROM resume
-             WHERE 1 = 1
+             WHERE resume_rank = 1
              ON CONFLICT(user_id, series_id) DO UPDATE SET
                  next_item_id = excluded.next_item_id,
                  position_ticks = excluded.position_ticks,
                  played = 0,
                  last_played_at = excluded.last_played_at,
                  updated_at = unixepoch()",
-        )
-        .bind(user_id)
-        .bind(series_id)
-        .bind(series_id)
-        .bind(user_id)
-        .bind(user_id)
-        .bind(series_id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            runtime_ticks = resume_runtime_ticks_sql(),
+            minimum_ticks = RESUME_MINIMUM_TICKS_SQL,
+            played_percent = RESUME_PLAYED_PERCENT_SQL,
+        );
+        self.query(sqlx::AssertSqlSafe(statement_sql))
+            .bind(user_id)
+            .bind(series_id)
+            .bind(user_id)
+            .bind(series_id)
+            .bind(series_id)
+            .bind(user_id)
+            .bind(user_id)
+            .bind(series_id)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
     }
 }
