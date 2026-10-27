@@ -22279,6 +22279,71 @@ async fn catalog_read_model_shadow_matches_the_legacy_default_list()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_read_model_single_item_rows_match_the_legacy_join()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('detail-lib', 'Detail', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at
+         ) VALUES ('detail-movie', 'detail-lib', 'MOVIE', 'Detail', 'detail',
+                   'LOCAL_CONFIRMED', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('detail-root', 'detail-lib', '/tmp', '/tmp', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+         ) VALUES ('detail-fe', 'detail-root', 'Detail.Movie.mkv', 'FILE', 1, 1, 1, 1,
+                   X'00', 'g1', 'NEW')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default,
+                                    probe_status)
+         VALUES ('detail-source', 'detail-movie', 'LOCAL_FILE', 'detail-fe', 1, 'READY')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, is_default)
+         VALUES ('detail-stream', 'detail-source', 0, 'VIDEO', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let legacy = database.find_catalog_rows("detail-movie").await?;
+    let read_model = database
+        .find_catalog_rows_from_read_model("detail-movie")
+        .await?;
+    assert_eq!(legacy.len(), read_model.len());
+    for (legacy, read_model) in legacy.iter().zip(read_model.iter()) {
+        assert_eq!(legacy.item_id, read_model.item_id);
+        assert_eq!(legacy.source_id, read_model.source_id);
+        assert_eq!(legacy.source_relative_path, read_model.source_relative_path);
+        assert_eq!(legacy.stream_id, read_model.stream_id);
+        assert_eq!(legacy.is_default, read_model.is_default);
+        assert_eq!(legacy.poster_image_tag, read_model.poster_image_tag);
+    }
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,

@@ -2029,7 +2029,21 @@ impl CatalogService {
         let Some(library_id) = self.database.find_item_library_id(item_id).await? else {
             return Ok(None);
         };
-        let rows = self.database.find_catalog_rows(item_id).await?;
+        let rows = if self.read_model_mode == ReadModelMode::On
+            && library_id != GLOBAL_COLLECTION_LIBRARY_ID
+        {
+            let rows = self
+                .database
+                .find_catalog_rows_from_read_model(item_id)
+                .await?;
+            if rows.is_empty() {
+                self.database.find_catalog_rows(item_id).await?
+            } else {
+                rows
+            }
+        } else {
+            self.database.find_catalog_rows(item_id).await?
+        };
         let Some(mut item) = assemble_items(rows).into_iter().next() else {
             return Ok(None);
         };

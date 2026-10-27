@@ -245,7 +245,7 @@ impl Database {
                        WHERE ii.item_id = mi.id AND ii.image_type = 'POSTER'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
                      (SELECT ii.id FROM item_images ii
-                       WHERE ii.item_id = mi.id AND ii.image_type = 'BACKDROP'
+                       WHERE ii.item_id = mi.id AND ii.image_type = 'FANART'
                        ORDER BY ii.image_index, ii.id LIMIT 1),
                      (SELECT ii.id FROM item_images ii
                        WHERE ii.item_id = mi.id AND ii.image_type = 'THUMB'
@@ -524,6 +524,8 @@ struct ReadModelCoreRow {
     title: String,
     sort_title: String,
     original_title: Option<String>,
+    overview: Option<String>,
+    rating_source: Option<String>,
     production_year: Option<i64>,
     rating: Option<f64>,
     runtime_ticks: Option<i64>,
@@ -571,8 +573,25 @@ impl Database {
         page: &ReadModelPageQuery<'_>,
     ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
         let (ids, total) = self.shadow_catalog_library_page(page).await?;
+        let rows = self.read_model_rows_for_ids(&ids).await?;
+        Ok((rows, total))
+    }
+
+    /// Single-item variant used by the detail route.
+    #[allow(dead_code)] // wired by the `on` detail switch
+    pub(crate) async fn find_catalog_rows_from_read_model(
+        &self,
+        item_id: &str,
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        self.read_model_rows_for_ids(&[item_id.to_owned()]).await
+    }
+
+    async fn read_model_rows_for_ids(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
         if ids.is_empty() {
-            return Ok((Vec::new(), total));
+            return Ok(Vec::new());
         }
         let placeholders = std::iter::repeat_n("?", ids.len())
             .collect::<Vec<_>>()
@@ -580,15 +599,17 @@ impl Database {
         let core_query = format!(
             "SELECT ci.item_id, ci.library_id, ci.item_type, ci.parent_id, ci.series_id,
                     ci.season_number, ci.episode_number, ci.title, ci.sort_title,
-                    ci.original_title, ci.production_year, ci.rating, ci.runtime_ticks,
+                    ci.original_title, mi.overview, mi.rating_source,
+                    ci.production_year, ci.rating, ci.runtime_ticks,
                     ci.added_at, ci.updated_at, ci.poster_tag, ci.backdrop_tag,
                     ci.thumb_tag, ci.logo_tag,
                     (SELECT s.title FROM media_items s WHERE s.id = ci.series_id) AS series_name
              FROM catalog_items ci
+             JOIN media_items mi ON mi.id = ci.item_id
              WHERE ci.item_id IN ({placeholders})"
         );
         let mut statement = self.query_as::<ReadModelCoreRow>(sqlx::AssertSqlSafe(core_query));
-        for id in &ids {
+        for id in ids {
             statement = statement.bind(id);
         }
         let cores = statement
@@ -619,7 +640,7 @@ impl Database {
              ORDER BY ms.item_id, ms.id, mt.stream_index"
         );
         let mut statement = self.query_as::<ReadModelSourceRow>(sqlx::AssertSqlSafe(source_query));
-        for id in &ids {
+        for id in ids {
             statement = statement.bind(id);
         }
         let sources =
@@ -649,7 +670,7 @@ impl Database {
                 rows.push(core_row_with_source(&core, &source));
             }
         }
-        Ok((rows, total))
+        Ok(rows)
     }
 }
 
@@ -666,10 +687,10 @@ fn core_row_without_source(core: &ReadModelCoreRow) -> StoredCatalogRow {
         title: core.title.clone(),
         sort_title: core.sort_title.clone(),
         original_title: core.original_title.clone(),
-        overview: None,
+        overview: core.overview.clone(),
         production_year: core.production_year,
         rating: core.rating,
-        rating_source: None,
+        rating_source: core.rating_source.clone(),
         runtime_ticks: core.runtime_ticks,
         added_at: core.added_at,
         updated_at: core.updated_at,
