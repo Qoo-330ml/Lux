@@ -2710,3 +2710,18 @@ PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表
 - 单轮数字仍会漂移（首页 p95 `off` 122 / `on` 153 ms，继续观看 `on` 反而更快 8.9 vs 12.9 ms），
   需要 `--rounds 3` 以上的中位数才有判别力；分段耗时（`stage = "latest_by_library"` 等）需要
   `RUST_LOG=debug` 才可见。
+
+### 两轮交错复测（2026-10-27，读数可信）
+
+`scripts/compare-read-model-modes.py --rounds 2 --requests 10`，每模式 2 轮、每轮 10 次请求：
+
+| 端点 | `off` p50/p95 | `on` p50/p95 | 逐字节一致 |
+|---|---:|---:|---|
+| `/api/v1/home` | 115.98 / 126.68 ms（p95 122.3–131.0） | 153.63 / 155.82 ms（p95 154.7–156.9） | ✅ 93,909 B |
+| `/api/v1/continue-watching` | 11.28 / 11.73 ms | 8.85 / 9.11 ms | ✅ 40,324 B |
+| `/api/v1/libraries` | 2.18 / 2.78 ms | 1.91 / 2.51 ms | ✅ 249 B |
+
+两轮区间不重叠，说明首页 `on` 慢约 38 ms 是可复现的，不是噪声；继续观看与库列表小幅变快。
+结论：**`on` 在首页仍净亏，必须保持默认关闭**；下一步要用 `RUST_LOG=debug` 抓
+`stage = "recently_added"` / `"latest_by_library"` 的耗时，定位这 38 ms 落在哪个 rail，再决定修查询
+还是回退该 rail 的切换。
