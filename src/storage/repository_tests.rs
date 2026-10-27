@@ -22578,6 +22578,61 @@ async fn marking_episodes_played_refreshes_the_next_pointer()
     Ok(())
 }
 
+#[tokio::test]
+async fn user_series_next_rebuild_keeps_the_in_progress_episode()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Progress", "Progress", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('progress-lib', 'P', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    for (id, item_type, episode) in [
+        ("progress-series", "SERIES", None),
+        ("progress-ep1", "EPISODE", Some(1)),
+        ("progress-ep2", "EPISODE", Some(2)),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number
+             ) VALUES (?, 'progress-lib', ?, ?, ?, 'LOCAL_CONFIRMED', 1,
+                       CASE WHEN ? = 'EPISODE' THEN 'progress-series' ELSE NULL END,
+                       CASE WHEN ? = 'EPISODE' THEN 1 ELSE NULL END, ?)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(item_type)
+        .bind(item_type)
+        .bind(episode)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, last_played_at
+         ) VALUES (?, 'progress-ep1', 100, 1, 10), (?, 'progress-ep2', 50, 0, 20)",
+    )
+    .bind(&user_id)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(database.rebuild_user_series_next().await?, 1);
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].next_item_id, "progress-ep2");
+    assert_eq!(rows[0].position_ticks, 50);
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,

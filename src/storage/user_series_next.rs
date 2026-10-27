@@ -105,8 +105,9 @@ impl Database {
             })?;
         let result = self
             .query(
-                "WITH completed AS (
+                "WITH candidates AS (
                      SELECT us.user_id, mi.series_id, mi.season_number, mi.episode_number,
+                            mi.id, us.is_played, us.position_ticks,
                             ROW_NUMBER() OVER (
                                 PARTITION BY us.user_id, mi.series_id
                                 ORDER BY us.last_played_at DESC NULLS LAST,
@@ -120,11 +121,12 @@ impl Database {
                        AND mi.season_number IS NOT NULL
                        AND mi.episode_number IS NOT NULL
                        AND mi.removed_at IS NULL
-                       AND us.is_played = 1
+                       AND (us.is_played = 1 OR us.position_ticks > 0)
                  ),
                  latest AS (
-                     SELECT user_id, series_id, season_number, episode_number
-                     FROM completed WHERE played_rank = 1
+                     SELECT user_id, series_id, season_number, episode_number, id,
+                            is_played, position_ticks
+                     FROM candidates WHERE played_rank = 1
                  ),
                  next_episode AS (
                      SELECT latest.user_id, latest.series_id, mi.id,
@@ -142,20 +144,28 @@ impl Database {
                             AND mi.episode_number > latest.episode_number))
                      LEFT JOIN user_item_state us
                        ON us.item_id = mi.id AND us.user_id = latest.user_id
-                     WHERE mi.has_available_source = 1
+                     WHERE latest.is_played = 1
+                       AND mi.has_available_source = 1
                        AND mi.removed_at IS NULL
                        AND COALESCE(us.is_played, 0) = 0
                        AND COALESCE(us.hide_from_resume, 0) = 0
+                 ),
+                 resume AS (
+                     SELECT user_id, series_id, id, position_ticks
+                     FROM latest WHERE is_played = 0 AND position_ticks > 0
+                     UNION ALL
+                     SELECT user_id, series_id, id, 0
+                     FROM next_episode WHERE next_rank = 1
                  )
                  INSERT INTO user_series_next (
                      user_id, series_id, next_item_id, position_ticks, played, updated_at
                  )
-                 SELECT user_id, series_id, id, 0, 0, unixepoch()
-                 FROM next_episode
-                 WHERE next_rank = 1
+                 SELECT user_id, series_id, id, position_ticks, 0, unixepoch()
+                 FROM resume
+                 WHERE 1 = 1
                  ON CONFLICT(user_id, series_id) DO UPDATE SET
                      next_item_id = excluded.next_item_id,
-                     position_ticks = 0,
+                     position_ticks = excluded.position_ticks,
                      played = 0,
                      updated_at = unixepoch()",
             )
@@ -209,8 +219,9 @@ impl Database {
                 source,
             })?;
         self.query(
-            "WITH completed AS (
-                 SELECT mi.season_number, mi.episode_number,
+            "WITH candidates AS (
+                 SELECT mi.season_number, mi.episode_number, mi.id,
+                        us.is_played, us.position_ticks,
                         ROW_NUMBER() OVER (
                             ORDER BY us.last_played_at DESC NULLS LAST,
                                      mi.season_number DESC, mi.episode_number DESC, mi.id DESC
@@ -222,10 +233,11 @@ impl Database {
                    AND mi.season_number IS NOT NULL
                    AND mi.episode_number IS NOT NULL
                    AND mi.removed_at IS NULL
-                   AND us.is_played = 1
+                   AND (us.is_played = 1 OR us.position_ticks > 0)
              ),
              latest AS (
-                 SELECT season_number, episode_number FROM completed WHERE played_rank = 1
+                 SELECT season_number, episode_number, id, is_played, position_ticks
+                 FROM candidates WHERE played_rank = 1
              ),
              next_episode AS (
                  SELECT mi.id,
@@ -240,16 +252,29 @@ impl Database {
                     OR (mi.season_number = latest.season_number
                         AND mi.episode_number > latest.episode_number))
                  LEFT JOIN user_item_state us ON us.item_id = mi.id AND us.user_id = ?
-                 WHERE mi.has_available_source = 1
+                 WHERE latest.is_played = 1
+                   AND mi.has_available_source = 1
                    AND mi.removed_at IS NULL
                    AND COALESCE(us.is_played, 0) = 0
                    AND COALESCE(us.hide_from_resume, 0) = 0
+             ),
+             resume AS (
+                 SELECT id, position_ticks
+                 FROM latest WHERE is_played = 0 AND position_ticks > 0
+                 UNION ALL
+                 SELECT id, 0 FROM next_episode WHERE next_rank = 1
              )
              INSERT INTO user_series_next (
                  user_id, series_id, next_item_id, position_ticks, played, updated_at
              )
-             SELECT ?, ?, id, 0, 0, unixepoch()
-             FROM next_episode WHERE next_rank = 1",
+             SELECT ?, ?, id, position_ticks, 0, unixepoch()
+             FROM resume
+             WHERE 1 = 1
+             ON CONFLICT(user_id, series_id) DO UPDATE SET
+                 next_item_id = excluded.next_item_id,
+                 position_ticks = excluded.position_ticks,
+                 played = 0,
+                 updated_at = unixepoch()",
         )
         .bind(user_id)
         .bind(series_id)
