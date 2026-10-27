@@ -170,10 +170,23 @@ pub(crate) struct CatalogReadModelSummary {
 }
 
 impl Database {
+    #[allow(dead_code)] // used by rebuild tests and diagnostics
     pub(crate) async fn catalog_items_count(&self) -> Result<i64, StorageError> {
         self.query_scalar("SELECT COUNT(*) FROM catalog_items")
             .fetch_one(&self.pool)
             .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Highest item id already materialized, used to resume an interrupted rebuild.
+    pub(crate) async fn catalog_items_max_item_id(&self) -> Result<Option<String>, StorageError> {
+        self.query_scalar("SELECT MAX(item_id) FROM catalog_items")
+            .fetch_optional(&self.pool)
+            .await
+            .map(|row| row.flatten())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,

@@ -13,11 +13,22 @@ pub(crate) struct CatalogRebuildReport {
 }
 
 /// Rebuilds every row and the library/global counters, returning the validation summary.
+#[allow(dead_code)] // used by tests and the future manual rebuild endpoint
 pub(crate) async fn rebuild_catalog_read_model(
     database: &Database,
     batch: i64,
 ) -> Result<CatalogRebuildReport, StorageError> {
-    let mut after: Option<String> = None;
+    rebuild_catalog_read_model_from(database, batch, None).await
+}
+
+/// Resumes a rebuild after `after`; startup uses the highest materialized id so an interrupted
+/// rebuild only redoes the missing tail.
+async fn rebuild_catalog_read_model_from(
+    database: &Database,
+    batch: i64,
+    after: Option<String>,
+) -> Result<CatalogRebuildReport, StorageError> {
+    let mut after = after;
     loop {
         let (processed, last) = database
             .rebuild_catalog_items_batch(after.as_deref(), batch)
@@ -29,6 +40,10 @@ pub(crate) async fn rebuild_catalog_read_model(
     }
     database.rebuild_catalog_item_stats().await?;
     let summary = database.catalog_items_checksum().await?;
+    // Marks the rebuild as complete; an interrupted rebuild leaves no watermark and is retried.
+    database
+        .advance_catalog_consumer("catalog_items_rebuild", summary.item_count)
+        .await?;
     Ok(CatalogRebuildReport {
         items: summary.item_count,
         content_sha256: summary.content_sha256,
@@ -38,21 +53,31 @@ pub(crate) async fn rebuild_catalog_read_model(
 /// Fills an empty read model once, in the background. Failures are logged; the next start retries.
 pub(crate) fn spawn_startup_catalog_read_model(database: Database) {
     tokio::spawn(async move {
-        match database.catalog_items_count().await {
-            Ok(count) if count > 0 => {}
-            Ok(_) => {
-                let started = std::time::Instant::now();
-                match rebuild_catalog_read_model(&database, 1_000).await {
-                    Ok(report) => tracing::info!(
-                        items = report.items,
-                        checksum = %report.content_sha256,
-                        elapsed_ms = started.elapsed().as_millis(),
-                        "catalog read model rebuilt"
-                    ),
-                    Err(error) => tracing::warn!(%error, "catalog read model rebuild failed"),
-                }
+        let rebuild_done = match database.catalog_consumer("catalog_items_rebuild").await {
+            Ok(state) => state.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "catalog read model watermark read failed");
+                false
             }
-            Err(error) => tracing::warn!(%error, "catalog read model count failed"),
+        };
+        if rebuild_done {
+            return;
+        }
+        {
+            let started = std::time::Instant::now();
+            let resume_after = database
+                .catalog_items_max_item_id()
+                .await
+                .unwrap_or(None);
+            match rebuild_catalog_read_model_from(&database, 1_000, resume_after).await {
+                Ok(report) => tracing::info!(
+                    items = report.items,
+                    checksum = %report.content_sha256,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "catalog read model rebuilt"
+                ),
+                Err(error) => tracing::warn!(%error, "catalog read model rebuild failed"),
+            }
         }
     });
 }

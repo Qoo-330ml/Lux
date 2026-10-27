@@ -18323,7 +18323,10 @@ PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。
 `contentSha256` 校验；应用层 `rebuild_catalog_read_model` 循环重建并在启动时为空则后台补建。
 验证：`catalog_read_model_rebuild_copies_authoritative_fields_and_validates`（4 行、图片/源/分级
 字段、季集计数、统计 4 行、重复重建校验和一致、截断）、`rebuild_reports_row_count_and_stable_checksum`、
-PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。尚未在 66k 夹具上跑全量重建与中断恢复计时。
+PostgreSQL bootstrap ignored 测试通过，Clippy 全绿。66k 夹具实测（release，ARM64）：完整重建 3.08 s（冷页缓存复制后首次 8.87 s），`catalog_items`
+66,000 行、`catalog_item_stats` 8 行；数据库 322.0 MB → 374.7 MB（+52.6 MB，+16%）。模拟“只完成一半
+再重启”：从最大已物化 id 续建剩余 33k 行，服务启动到水位 66,000 共 5.27 s；`resume` 与全量重建
+校验和一致（`catalog_items_rebuild_can_resume_from_the_materialized_prefix`）。
 
 #### LUX-865：库列表读模型切换（off/shadow/on）
 

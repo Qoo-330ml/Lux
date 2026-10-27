@@ -22122,6 +22122,53 @@ async fn catalog_read_model_rebuild_copies_authoritative_fields_and_validates()
     Ok(())
 }
 
+#[tokio::test]
+async fn catalog_items_rebuild_can_resume_from_the_materialized_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('resume-lib', 'Resume', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for index in 0..5 {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'resume-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(format!("resume-{index}"))
+        .bind(format!("Resume {index}"))
+        .bind(format!("resume {index}"))
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first, _) = database.rebuild_catalog_items_batch(None, 2).await?;
+    assert_eq!(first, 2);
+    let resume = database.catalog_items_max_item_id().await?;
+    assert_eq!(resume.as_deref(), Some("resume-1"));
+    let mut after = resume;
+    while let Some(cursor) = after.clone() {
+        let (rows, next) = database
+            .rebuild_catalog_items_batch(Some(&cursor), 2)
+            .await?;
+        if rows == 0 {
+            break;
+        }
+        after = next;
+    }
+    assert_eq!(database.catalog_items_count().await?, 5);
+    let resumed = database.catalog_items_checksum().await?;
+
+    database.truncate_catalog_read_model().await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+    let full = database.catalog_items_checksum().await?;
+    assert_eq!(resumed, full, "resuming must produce the same read model");
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
