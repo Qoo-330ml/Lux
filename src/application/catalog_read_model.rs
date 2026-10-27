@@ -6,6 +6,10 @@
 
 use crate::storage::{Database, StorageError};
 
+/// Watermark name for the derived continue-watching pointers. The value only records that a full
+/// rebuild finished, so the `on` read path can trust the table.
+pub(crate) const USER_SERIES_NEXT_CONSUMER: &str = "user_series_next_rebuild";
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub(crate) struct CatalogRebuildReport {
     pub(crate) items: i64,
@@ -75,6 +79,40 @@ pub(crate) fn spawn_startup_catalog_read_model(database: Database) {
                 ),
                 Err(error) => tracing::warn!(%error, "catalog read model rebuild failed"),
             }
+        }
+    });
+}
+
+/// Fills the derived continue-watching pointers once, in the background. Failures are logged and
+/// retried on the next start; the read switch falls back to the authoritative query until then.
+pub(crate) fn spawn_startup_user_series_next(database: Database) {
+    tokio::spawn(async move {
+        let rebuilt = match database.catalog_consumer(USER_SERIES_NEXT_CONSUMER).await {
+            Ok(state) => state.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "user_series_next watermark read failed");
+                false
+            }
+        };
+        if rebuilt {
+            return;
+        }
+        let started = std::time::Instant::now();
+        match database.rebuild_user_series_next().await {
+            Ok(pointers) => {
+                tracing::info!(
+                    pointers,
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "user_series_next rebuilt"
+                );
+                if let Err(error) = database
+                    .advance_catalog_consumer(USER_SERIES_NEXT_CONSUMER, 1)
+                    .await
+                {
+                    tracing::warn!(%error, "user_series_next watermark write failed");
+                }
+            }
+            Err(error) => tracing::warn!(%error, "user_series_next rebuild failed"),
         }
     });
 }

@@ -102,6 +102,7 @@ pub(crate) use sessions::{
 mod playback_history_archive;
 #[path = "user_series_next.rs"]
 mod user_series_next;
+pub(crate) use user_series_next::ResumePointerQuery;
 #[path = "users.rs"]
 mod users;
 #[path = "watch_state_archive.rs"]

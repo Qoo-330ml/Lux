@@ -711,6 +711,9 @@ impl AppState {
             crate::application::catalog_read_model::spawn_startup_catalog_read_model(
                 database.clone(),
             );
+            crate::application::catalog_read_model::spawn_startup_user_series_next(
+                database.clone(),
+            );
             crate::application::user_cleanup::spawn_user_cleanup_worker(
                 database.clone(),
                 avatars.clone(),

@@ -586,6 +586,27 @@ impl Database {
         self.read_model_rows_for_ids(&[item_id.to_owned()]).await
     }
 
+    /// Same as [`Self::read_model_rows_for_ids`] but keeps the requested id order, which derived
+    /// lists (continue watching) need to preserve their authoritative ordering.
+    pub(crate) async fn read_model_rows_in_id_order(
+        &self,
+        ids: &[String],
+    ) -> Result<Vec<StoredCatalogRow>, StorageError> {
+        let mut rows = self.read_model_rows_for_ids(ids).await?;
+        let position = ids
+            .iter()
+            .enumerate()
+            .map(|(index, id)| (id.as_str(), index))
+            .collect::<std::collections::HashMap<_, _>>();
+        rows.sort_by_key(|row| {
+            position
+                .get(row.item_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX)
+        });
+        Ok(rows)
+    }
+
     async fn read_model_rows_for_ids(
         &self,
         ids: &[String],

@@ -13,14 +13,15 @@ use tokio::sync::{Mutex, Notify, mpsc};
 
 use crate::{
     application::access::{AccessError, AccessPrincipal, MediaAccessService},
+    application::catalog_read_model::USER_SERIES_NEXT_CONSUMER,
     application::recommendations::{
         RECOMMENDATION_CANDIDATE_POOL, current_recommendation_batch_key,
         daily_recommendation_items, recommendation_library_scope_key,
     },
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
-        GLOBAL_COLLECTION_LIBRARY_ID, ResumeItemsQuery, StorageError, StoredCatalogDetail,
-        StoredCatalogRow, StoredMediaChapter, UserContentRestrictions,
+        GLOBAL_COLLECTION_LIBRARY_ID, ResumeItemsQuery, ResumePointerQuery, StorageError,
+        StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter, UserContentRestrictions,
     },
 };
 
@@ -1644,6 +1645,23 @@ impl CatalogService {
         content_restrictions: Option<&UserContentRestrictions>,
     ) -> Result<CatalogPage, CatalogError> {
         let (played_percent, minimum_ticks) = self.database.home_resume_settings(user_id).await?;
+        let pointer_query = ResumePointerQuery {
+            user_id,
+            library_ids,
+            item_types: &["MOVIE", "EPISODE", "VIDEO"],
+            content_restrictions,
+            played_percent,
+            minimum_ticks,
+            offset,
+            limit,
+        };
+        if self.read_model_mode == ReadModelMode::On && include_next_unplayed_episode {
+            if let Some((items, total)) =
+                self.continue_watching_from_pointers(&pointer_query).await?
+            {
+                return Ok(CatalogPage::new(items, total, offset, limit));
+            }
+        }
         let query = ResumeItemsQuery {
             user_id,
             library_ids,
@@ -1663,7 +1681,81 @@ impl CatalogService {
                 .list_resume_items_with_total(&query, true)
                 .await?
         };
+        if self.read_model_mode == ReadModelMode::Shadow && include_next_unplayed_episode {
+            self.compare_continue_watching(&pointer_query, &rows, total)
+                .await;
+        }
         Ok(CatalogPage::new(assemble_items(rows), total, offset, limit))
+    }
+
+    /// Serves continue watching from `user_series_next` plus the catalog read model.
+    ///
+    /// Returns `None` when the derived rows are not usable yet (unbuilt read model or missing
+    /// entries), so the caller falls back to the authoritative query instead of returning a short
+    /// page.
+    async fn continue_watching_from_pointers(
+        &self,
+        query: &ResumePointerQuery<'_>,
+    ) -> Result<Option<(Vec<CatalogItem>, i64)>, CatalogError> {
+        let (ids, total) = self.database.list_resume_pointer_ids(query).await?;
+        if ids.is_empty() {
+            if total > 0 {
+                return Ok(None);
+            }
+            let rebuilt = self
+                .database
+                .catalog_consumer(USER_SERIES_NEXT_CONSUMER)
+                .await?
+                .is_some();
+            return Ok(rebuilt.then_some((Vec::new(), 0)));
+        }
+        let rows = self.database.read_model_rows_in_id_order(&ids).await?;
+        let mut present = HashSet::with_capacity(ids.len());
+        for row in &rows {
+            present.insert(row.item_id.as_str());
+        }
+        if present.len() != ids.len() {
+            return Ok(None);
+        }
+        Ok(Some((assemble_items(rows), total)))
+    }
+
+    async fn compare_continue_watching(
+        &self,
+        query: &ResumePointerQuery<'_>,
+        legacy_rows: &[StoredCatalogRow],
+        legacy_total: i64,
+    ) {
+        match self.database.list_resume_pointer_ids(query).await {
+            Ok((ids, total)) => {
+                let mut legacy_ids: Vec<&str> = Vec::with_capacity(legacy_rows.len());
+                for row in legacy_rows {
+                    if !legacy_ids.contains(&row.item_id.as_str()) {
+                        legacy_ids.push(row.item_id.as_str());
+                    }
+                }
+                if total != legacy_total {
+                    tracing::warn!(
+                        legacy = legacy_total,
+                        read_model = total,
+                        "continue watching shadow total differs"
+                    );
+                }
+                if ids.len() != legacy_ids.len()
+                    || ids
+                        .iter()
+                        .zip(legacy_ids.iter())
+                        .any(|(predicted, legacy)| predicted != legacy)
+                {
+                    tracing::warn!(
+                        legacy = ?legacy_ids,
+                        read_model = ?ids,
+                        "continue watching shadow page differs"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "continue watching shadow query failed"),
+        }
     }
 
     async fn list_progress_items(
@@ -5008,6 +5100,165 @@ mod tests {
         assert_eq!(second_page.total, 2);
         assert_eq!(second_page.items.len(), 1);
         assert_eq!(second_page.items[0].id, "resume-policy-open-episode-2");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn continue_watching_switch_matches_the_legacy_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::Database,
+        };
+
+        const RUNTIME: i64 = 36_000_000_000;
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "resume-switch-viewer",
+                "Resume Switch Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Resume switch", LibraryKind::Series, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES ('resume-switch-series', ?, 'SERIES', 'Switch Series',
+                       'switch series', 0, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        for (item_id, episode_number) in [("resume-switch-ep1", 1_i64), ("resume-switch-ep2", 2)] {
+            sqlx::query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, series_id, season_number, episode_number,
+                     title, sort_title, runtime_ticks, identification_status,
+                     has_available_source
+                 ) VALUES (?, ?, 'EPISODE', 'resume-switch-series', 1, ?, ?, ?, ?, 
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(item_id)
+            .bind(&library_id)
+            .bind(episode_number)
+            .bind(item_id)
+            .bind(item_id)
+            .bind(RUNTIME)
+            .execute(database.pool())
+            .await?;
+        }
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES ('resume-switch-movie', ?, 'MOVIE', 'Switch Movie',
+                       'switch movie', ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .bind(RUNTIME)
+        .execute(database.pool())
+        .await?;
+        for (item_id, position_ticks, is_played, last_played_at) in [
+            ("resume-switch-ep1", RUNTIME, 1, 10),
+            ("resume-switch-ep2", 6_000_000_000, 0, 20),
+            ("resume-switch-movie", 9_000_000_000, 0, 30),
+        ] {
+            sqlx::query(
+                "INSERT INTO user_item_state (
+                     user_id, item_id, position_ticks, is_played, last_played_at
+                 ) VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&user_id)
+            .bind(item_id)
+            .bind(position_ticks)
+            .bind(is_played)
+            .bind(last_played_at)
+            .execute(database.pool())
+            .await?;
+        }
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let legacy = catalog
+            .list_continue_watching(principal, &user_id, 0, 10)
+            .await?;
+        let legacy_ids = legacy
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            legacy_ids,
+            vec![
+                "resume-switch-movie".to_owned(),
+                "resume-switch-ep2".to_owned()
+            ]
+        );
+
+        // Without a built read model the `on` switch keeps the authoritative page.
+        let pending = catalog
+            .clone()
+            .with_read_model_mode(super::ReadModelMode::On);
+        let pending_page = pending
+            .list_continue_watching(principal, &user_id, 0, 10)
+            .await?;
+        assert_eq!(pending_page.total, legacy.total);
+        assert_eq!(
+            pending_page
+                .items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            legacy_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+
+        database.rebuild_user_series_next().await?;
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        let switched = catalog
+            .clone()
+            .with_read_model_mode(super::ReadModelMode::On);
+        let page = switched
+            .list_continue_watching(principal, &user_id, 0, 10)
+            .await?;
+        assert_eq!(page.total, legacy.total);
+        assert_eq!(
+            page.items
+                .iter()
+                .map(|item| item.id.as_str())
+                .collect::<Vec<_>>(),
+            legacy_ids.iter().map(String::as_str).collect::<Vec<_>>()
+        );
+        let home = switched
+            .list_home_continue_watching(principal, &user_id, 0, 10)
+            .await?;
+        assert_eq!(home.total, legacy.total);
+        let second_page = switched
+            .list_continue_watching(principal, &user_id, 1, 1)
+            .await?;
+        assert_eq!(second_page.items.len(), 1);
+        assert_eq!(second_page.items[0].id, "resume-switch-ep2");
         Ok(())
     }
 

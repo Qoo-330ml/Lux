@@ -22384,10 +22384,24 @@ async fn user_series_next_round_trips_and_orders_by_recent_update()
     }
 
     database
-        .upsert_user_series_next(&user_id, "next-series-a", "next-episode-1", 120, false)
+        .upsert_user_series_next(
+            &user_id,
+            "next-series-a",
+            "next-episode-1",
+            120,
+            false,
+            Some(1_700),
+        )
         .await?;
     database
-        .upsert_user_series_next(&user_id, "next-series-b", "next-episode-2", 30, true)
+        .upsert_user_series_next(
+            &user_id,
+            "next-series-b",
+            "next-episode-2",
+            30,
+            true,
+            Some(1_800),
+        )
         .await?;
     let rows = database.list_user_series_next(&user_id, 0, 10).await?;
     assert_eq!(rows.len(), 2);
@@ -22405,7 +22419,14 @@ async fn user_series_next_round_trips_and_orders_by_recent_update()
     assert_eq!(a.played, 0);
 
     database
-        .upsert_user_series_next(&user_id, "next-series-a", "next-episode-2", 0, true)
+        .upsert_user_series_next(
+            &user_id,
+            "next-series-a",
+            "next-episode-2",
+            0,
+            true,
+            Some(1_900),
+        )
         .await?;
     let updated = database.list_user_series_next(&user_id, 0, 10).await?;
     let a = updated
@@ -22630,6 +22651,171 @@ async fn user_series_next_rebuild_keeps_the_in_progress_episode()
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].next_item_id, "progress-ep2");
     assert_eq!(rows[0].position_ticks, 50);
+    Ok(())
+}
+
+#[tokio::test]
+async fn continue_watching_read_model_matches_the_legacy_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    const RUNTIME: i64 = 7_200_000_000;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Resume", "Resume", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('resume-lib', 'R', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    for (id, item_type, series_id, episode, runtime_ticks) in [
+        ("resume-series-a", "SERIES", None, None, None),
+        (
+            "resume-a-ep1",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(1),
+            Some(RUNTIME),
+        ),
+        (
+            "resume-a-ep2",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(2),
+            Some(RUNTIME),
+        ),
+        (
+            "resume-a-ep3",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(3),
+            Some(RUNTIME),
+        ),
+        ("resume-series-b", "SERIES", None, None, None),
+        (
+            "resume-b-ep1",
+            "EPISODE",
+            Some("resume-series-b"),
+            Some(1),
+            Some(RUNTIME),
+        ),
+        (
+            "resume-b-ep2",
+            "EPISODE",
+            Some("resume-series-b"),
+            Some(2),
+            Some(RUNTIME),
+        ),
+        ("resume-movie", "MOVIE", None, None, Some(RUNTIME)),
+    ] {
+        let season_number = episode.map(|_| 1);
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number, runtime_ticks
+             ) VALUES (?, 'resume-lib', ?, ?, ?, 'LOCAL_CONFIRMED', 1, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(series_id)
+        .bind(season_number)
+        .bind(episode)
+        .bind(runtime_ticks)
+        .execute(database.pool())
+        .await?;
+    }
+    for (item_id, position_ticks, is_played, hide_from_resume, last_played_at) in [
+        ("resume-a-ep1", 0i64, 1, 0, 10),
+        ("resume-a-ep2", 1_800_000_000, 0, 0, 20),
+        ("resume-a-ep3", 1_800_000_000, 0, 1, 25),
+        ("resume-b-ep1", 0, 1, 0, 40),
+        ("resume-movie", 2_520_000_000, 0, 0, 30),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, position_ticks, is_played, hide_from_resume, play_count,
+                 last_played_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(item_id)
+        .bind(position_ticks)
+        .bind(is_played)
+        .bind(hide_from_resume)
+        .bind(i64::from(is_played))
+        .bind(last_played_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    // The hidden episode is skipped, so only the two live series keep a pointer.
+    assert_eq!(database.rebuild_user_series_next().await?, 2);
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let (played_percent, minimum_ticks) = database.home_resume_settings(&user_id).await?;
+    let library_ids = ["resume-lib".to_owned()];
+    let legacy_query = ResumeItemsQuery {
+        user_id: &user_id,
+        library_ids: &library_ids,
+        item_types: &["MOVIE", "EPISODE", "VIDEO"],
+        content_restrictions: None,
+        played_percent,
+        minimum_ticks,
+        offset: 0,
+        limit: 10,
+    };
+    let (legacy_rows, legacy_total) = database
+        .list_home_resume_items_with_total(&legacy_query, true)
+        .await?;
+    let mut legacy_ids: Vec<String> = Vec::new();
+    for row in &legacy_rows {
+        if !legacy_ids.contains(&row.item_id) {
+            legacy_ids.push(row.item_id.clone());
+        }
+    }
+    assert_eq!(
+        legacy_ids,
+        vec![
+            "resume-b-ep2".to_owned(),
+            "resume-movie".to_owned(),
+            "resume-a-ep2".to_owned()
+        ]
+    );
+    assert_eq!(legacy_total, 3);
+
+    let pointer_query = ResumePointerQuery {
+        user_id: &user_id,
+        library_ids: &library_ids,
+        item_types: &["MOVIE", "EPISODE", "VIDEO"],
+        content_restrictions: None,
+        played_percent,
+        minimum_ticks,
+        offset: 0,
+        limit: 10,
+    };
+    let (pointer_ids, pointer_total) = database.list_resume_pointer_ids(&pointer_query).await?;
+    assert_eq!(pointer_ids, legacy_ids);
+    assert_eq!(pointer_total, legacy_total);
+
+    let rows = database.read_model_rows_in_id_order(&pointer_ids).await?;
+    let read_model_ids = rows
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(read_model_ids, legacy_ids);
+
+    let paged = ResumePointerQuery {
+        offset: 1,
+        limit: 1,
+        ..pointer_query
+    };
+    let (paged_ids, paged_total) = database.list_resume_pointer_ids(&paged).await?;
+    assert_eq!(paged_ids, vec!["resume-movie".to_owned()]);
+    assert_eq!(paged_total, legacy_total);
     Ok(())
 }
 
