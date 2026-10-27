@@ -18368,6 +18368,12 @@ p50/p95 为 off 1.72/2.59 ms、on 2.78/4.29 ms，均远低于 200 ms；on 每请
 
 验收：66k 夹具继续观看 p95 ≤300 ms；剧集滚动、下一集、已看/进度更新用例全绿；开关关闭响应逐字节一致。
 
+进度（2026-10-27）：迁移 `0231_user_series_next.sql` / PostgreSQL `0233_user_series_next.sql` 建
+`user_series_next`（用户+剧集主键、播放位置、played、更新时间索引）；存储层提供 upsert、按用户最近
+更新分页（≤1000）、按剧集删除；回归
+`user_series_next_round_trips_and_orders_by_recent_update`（增改查删、排序、用户删除级联清空）。
+尚未接入写入事务、重建与继续观看切换。
+
 #### LUX-868：首页读模型
 
 范围：首页各 rail（最近添加、继续观看、推荐）优先走 `catalog_items`/`user_series_next`；其余计算逻辑不变。

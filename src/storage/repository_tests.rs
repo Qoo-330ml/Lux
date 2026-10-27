@@ -22344,6 +22344,99 @@ async fn catalog_read_model_single_item_rows_match_the_legacy_join()
     Ok(())
 }
 
+#[tokio::test]
+async fn user_series_next_round_trips_and_orders_by_recent_update()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Next", "Next", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('next-lib', 'Next', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    for id in [
+        "next-series-a",
+        "next-series-b",
+        "next-episode-1",
+        "next-episode-2",
+    ] {
+        let item_type = if id.contains("series") {
+            "SERIES"
+        } else {
+            "EPISODE"
+        };
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'next-lib', ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .upsert_user_series_next(&user_id, "next-series-a", "next-episode-1", 120, false)
+        .await?;
+    database
+        .upsert_user_series_next(&user_id, "next-series-b", "next-episode-2", 30, true)
+        .await?;
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 2);
+    let series = rows
+        .iter()
+        .map(|row| row.series_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(series.contains(&"next-series-a") && series.contains(&"next-series-b"));
+    let a = rows
+        .iter()
+        .find(|row| row.series_id == "next-series-a")
+        .ok_or("series a")?;
+    assert_eq!(a.next_item_id, "next-episode-1");
+    assert_eq!(a.position_ticks, 120);
+    assert_eq!(a.played, 0);
+
+    database
+        .upsert_user_series_next(&user_id, "next-series-a", "next-episode-2", 0, true)
+        .await?;
+    let updated = database.list_user_series_next(&user_id, 0, 10).await?;
+    let a = updated
+        .iter()
+        .find(|row| row.series_id == "next-series-a")
+        .ok_or("series a")?;
+    assert_eq!(a.next_item_id, "next-episode-2");
+    assert_eq!(a.played, 1);
+
+    assert!(
+        database
+            .delete_user_series_next(&user_id, "next-series-b")
+            .await?
+    );
+    assert_eq!(
+        database.list_user_series_next(&user_id, 0, 10).await?.len(),
+        1
+    );
+
+    // Deleting the user cascades the derived rows away.
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_series_next")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(remaining, 0);
+    Ok(())
+}
+
 fn invitation_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,

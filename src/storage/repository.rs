@@ -100,6 +100,8 @@ pub(crate) use sessions::{
 };
 #[path = "playback_history_archive.rs"]
 mod playback_history_archive;
+#[path = "user_series_next.rs"]
+mod user_series_next;
 #[path = "users.rs"]
 mod users;
 #[path = "watch_state_archive.rs"]
