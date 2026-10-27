@@ -20,9 +20,9 @@ use crate::{
     },
     storage::{
         CatalogFilterQuery, CatalogSearchQuery, CatalogSort as StorageCatalogSort, Database,
-        GLOBAL_COLLECTION_LIBRARY_ID, RecentReadModelQuery, ResumeItemsQuery, ResumePointerQuery,
-        StorageError, StoredCatalogDetail, StoredCatalogRow, StoredMediaChapter,
-        UserContentRestrictions,
+        GLOBAL_COLLECTION_LIBRARY_ID, RecentByLibraryReadModelQuery, RecentReadModelQuery,
+        ResumeItemsQuery, ResumePointerQuery, StorageError, StoredCatalogDetail, StoredCatalogRow,
+        StoredMediaChapter, UserContentRestrictions,
     },
 };
 
@@ -1957,6 +1957,14 @@ impl CatalogService {
         content_restrictions: Option<&UserContentRestrictions>,
         limit: i64,
     ) -> Result<Vec<(String, Vec<CatalogItem>)>, CatalogError> {
+        if self.read_model_mode == ReadModelMode::On && content_restrictions.is_none() {
+            if let Some(grouped) = self
+                .recent_by_library_from_read_model(library_ids, limit)
+                .await?
+            {
+                return Ok(grouped);
+            }
+        }
         let rows = self
             .database
             .list_recent_catalog_rows_by_library_with_restrictions(
@@ -1965,6 +1973,10 @@ impl CatalogService {
                 content_restrictions,
             )
             .await?;
+        if self.read_model_mode == ReadModelMode::Shadow && content_restrictions.is_none() {
+            self.compare_recent_by_library(library_ids, limit, &rows)
+                .await;
+        }
         let mut items = assemble_items(rows);
         self.populate_episode_counts(&mut items, content_restrictions)
             .await?;
@@ -1976,6 +1988,77 @@ impl CatalogService {
                 .push(item);
         }
         Ok(grouped.into_iter().collect())
+    }
+
+    /// Per-library "latest" rail from the read model; `None` when a row is missing so the caller
+    /// keeps the authoritative query.
+    async fn recent_by_library_from_read_model(
+        &self,
+        library_ids: &[String],
+        limit: i64,
+    ) -> Result<Option<Vec<(String, Vec<CatalogItem>)>>, CatalogError> {
+        let grouped_ids = self
+            .database
+            .list_recent_read_model_ids_by_library(&RecentByLibraryReadModelQuery {
+                library_ids,
+                limit_per_library: limit,
+            })
+            .await?;
+        if grouped_ids.is_empty() {
+            let rebuilt = self
+                .database
+                .catalog_consumer(CATALOG_ITEMS_CONSUMER)
+                .await?
+                .is_some();
+            return Ok(rebuilt.then(Vec::new));
+        }
+        let mut grouped = Vec::with_capacity(grouped_ids.len());
+        for (library_id, ids) in grouped_ids {
+            let rows = self.database.list_catalog_rows_by_ids(&ids).await?;
+            let mut items = assemble_items(rows);
+            if items.len() != ids.len() {
+                return Ok(None);
+            }
+            self.populate_episode_counts(&mut items, None).await?;
+            let items = reorder_catalog_items(items, &ids);
+            grouped.push((library_id, items));
+        }
+        Ok(Some(grouped))
+    }
+
+    async fn compare_recent_by_library(
+        &self,
+        library_ids: &[String],
+        limit: i64,
+        rows: &[StoredCatalogRow],
+    ) {
+        let mut legacy: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for row in rows {
+            let ids = legacy.entry(row.library_id.clone()).or_default();
+            if !ids.contains(&row.item_id) {
+                ids.push(row.item_id.clone());
+            }
+        }
+        match self
+            .database
+            .list_recent_read_model_ids_by_library(&RecentByLibraryReadModelQuery {
+                library_ids,
+                limit_per_library: limit,
+            })
+            .await
+        {
+            Ok(grouped) => {
+                let predicted = grouped.into_iter().collect::<BTreeMap<_, _>>();
+                if predicted != legacy {
+                    tracing::warn!(
+                        legacy = ?legacy,
+                        read_model = ?predicted,
+                        "recent by library shadow page differs"
+                    );
+                }
+            }
+            Err(error) => tracing::warn!(%error, "recent by library shadow query failed"),
+        }
     }
 
     pub async fn list_recommended(

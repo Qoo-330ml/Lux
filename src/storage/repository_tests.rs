@@ -22371,6 +22371,95 @@ async fn recently_added_read_model_matches_the_legacy_query()
 }
 
 #[tokio::test]
+async fn recent_by_library_read_model_matches_the_legacy_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for (id, name) in [("latest-lib-a", "A"), ("latest-lib-b", "B")] {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'SERIES')")
+            .bind(id)
+            .bind(name)
+            .execute(database.pool())
+            .await?;
+    }
+    for (id, library_id, item_type, has_source, added_at) in [
+        ("latest-movie-a", "latest-lib-a", "MOVIE", 1_i64, 10_i64),
+        ("latest-series-empty", "latest-lib-a", "SERIES", 1, 50),
+        ("latest-series-fresh", "latest-lib-a", "SERIES", 1, 5),
+        ("latest-movie-b", "latest-lib-b", "MOVIE", 1, 30),
+        ("latest-series-nosource", "latest-lib-b", "SERIES", 0, 5),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(has_source)
+        .bind(added_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // The series added first is "newest" through an episode added much later.
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at, series_id, season_number, episode_number
+         ) VALUES ('latest-series-fresh-ep', 'latest-lib-a', 'EPISODE', 'Episode', 'episode',
+                   'LOCAL_CONFIRMED', 1, 40, 'latest-series-fresh', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at, series_id, season_number, episode_number
+         ) VALUES ('latest-series-nosource-ep', 'latest-lib-b', 'EPISODE', 'Episode', 'episode',
+                   'LOCAL_CONFIRMED', 1, 7, 'latest-series-nosource', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let library_ids = vec!["latest-lib-a".to_owned(), "latest-lib-b".to_owned()];
+    let legacy_rows = database
+        .list_recent_catalog_rows_by_library_with_restrictions(&library_ids, 12, None)
+        .await?;
+    let mut legacy: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in &legacy_rows {
+        let ids = legacy.entry(row.library_id.clone()).or_default();
+        if !ids.contains(&row.item_id) {
+            ids.push(row.item_id.clone());
+        }
+    }
+    let read_model: std::collections::BTreeMap<String, Vec<String>> = database
+        .list_recent_read_model_ids_by_library(&RecentByLibraryReadModelQuery {
+            library_ids: &library_ids,
+            limit_per_library: 12,
+        })
+        .await?
+        .into_iter()
+        .collect();
+    assert_eq!(read_model, legacy);
+    assert_eq!(
+        legacy.get("latest-lib-a"),
+        Some(&vec![
+            "latest-series-empty".to_owned(),
+            "latest-series-fresh".to_owned(),
+            "latest-movie-a".to_owned()
+        ])
+    );
+    Ok(())
+}
+
+#[tokio::test]
 async fn catalog_read_model_single_item_rows_match_the_legacy_join()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::test_database;

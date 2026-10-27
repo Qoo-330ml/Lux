@@ -2668,3 +2668,17 @@ PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表
 两侧首页响应 sha256 相同；`LUX_READ_MODEL_MODE=shadow` 下首页与库列表请求的
 `recently added shadow * differs` 计数为 0。首版用 `library_id IN (...)` 排序时 `on` 反而慢约
 50 ms（跨库临时排序），改成每库有界子查询后回到上表。按库最新 rail 仍是权威查询，未计入本表。
+
+## 首页按库最新 rail A/B（LUX-868，2026-10-27）
+
+在最近添加 rail 已切换的基础上，再切按库最新 rail（同一 66k 夹具、arm64 release）：
+
+| 模式 | 首页 p50 | 首页 p95 | 响应字节 |
+|---|---:|---:|---:|
+| `off` | 111.55 ms | 115.04 ms | 93,909 |
+| `on` | 105.01 ms | 113.30 ms | 93,909 |
+
+两模式响应 sha256 相同，`shadow` 差异告警 0。该 rail 的排序键 `latest_added_at`
+（剧集取可用分集的最新入库时间）无法命中索引，读模型在这一规模没有收益：只切最近添加 rail 时
+`on` 的首页 p95 是 86.7 ms。要拿到收益，需把该排序键物化为列并建
+`(library_id, latest_added_at DESC, item_id)` 索引后再复测。

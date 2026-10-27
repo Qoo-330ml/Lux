@@ -18432,8 +18432,18 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
   未回填回退）。
 - 66k 夹具实测（arm64 release）：首页 `off` p50/p95 109.1/122.2 ms，`on` 82.5/86.7 ms，响应逐字节
   一致（93,909 B）；`shadow` 下首页与库列表请求的差异告警为 0。
-- 未完成：按库最新 rail（`list_recent_catalog_rows_by_library_with_restrictions`，SQLite/PostgreSQL
-  两套选区查询）仍走权威路径；扫描并发下首页 p95 比值（第 29 节验收）本轮未复测。
+- 按库最新 rail 也已接入 `catalog_items`：迁移 `0233_catalog_items_latest_episode_added_at.sql` /
+  PostgreSQL `0235_...` 增加“可用分集的最新入库时间”，因为 `latest_child_added_at` 会把季和已删除子项
+  也算进去；`list_recent_read_model_ids_by_library` 每库一条有界子查询，行仍由权威
+  `list_catalog_rows_by_ids` 组装，保证 DTO 逐字段一致。回归
+  `recent_by_library_read_model_matches_the_legacy_query`（跨库、空壳剧集、靠分集变新的剧集、
+  无源但有可见子项的剧集）。
+- 66k 复核：接入按库最新 rail 后首页两模式仍逐字节一致（93,909 B），`shadow` 差异告警 0，但
+  p95 `off` 115.0 ms / `on` 113.3 ms（p50 111.6 / 105.0 ms） —— 该 rail 的排序键 `latest_added_at` 没法走索引，读模型没有带来
+  收益（只接最近添加 rail 时 `on` 为 86.7 ms）。下一步需要把该排序键物化成列并建
+  `(library_id, latest_added_at DESC, item_id)` 索引，或维持该 rail 走权威查询。
+- 未完成：扫描并发下首页 p95 比值（第 29 节验收）本轮未复测；首页 `on` 的净收益取决于上一条的
+  排序键物化。
 
 #### LUX-869：搜索统一
 

@@ -230,8 +230,8 @@ impl Database {
                      rating, runtime_ticks, added_at, effective_added_at, updated_at,
                      removed_at, merged_into, has_available_source, default_source_id,
                      poster_tag, backdrop_tag, thumb_tag, logo_tag, season_count,
-                     episode_count, latest_child_added_at, restriction_code, metadata_state,
-                     nfo_fingerprint, applied_seq
+                     episode_count, latest_child_added_at, latest_episode_added_at,
+                     restriction_code, metadata_state, nfo_fingerprint, applied_seq
                  )
                  SELECT
                      mi.id, mi.library_id, mi.item_type, mi.parent_id, mi.series_id,
@@ -260,6 +260,11 @@ impl Database {
                          AND (child.series_id = mi.id OR child.parent_id = mi.id)),
                      (SELECT MAX(child.added_at) FROM media_items child
                        WHERE child.parent_id = mi.id OR child.series_id = mi.id),
+                     (SELECT MAX(child.added_at) FROM media_items child
+                       WHERE child.item_type = 'EPISODE'
+                         AND child.removed_at IS NULL
+                         AND child.has_available_source = 1
+                         AND (child.series_id = mi.id OR child.parent_id = mi.id)),
                      (SELECT cri.certification_code FROM media_content_restriction_index cri
                        WHERE cri.item_id = mi.id LIMIT 1),
                      mi.identification_status, mi.nfo_metadata_fingerprint, 0
@@ -292,6 +297,7 @@ impl Database {
                      season_count = excluded.season_count,
                      episode_count = excluded.episode_count,
                      latest_child_added_at = excluded.latest_child_added_at,
+                     latest_episode_added_at = excluded.latest_episode_added_at,
                      restriction_code = excluded.restriction_code,
                      metadata_state = excluded.metadata_state,
                      nfo_fingerprint = excluded.nfo_fingerprint,
@@ -636,6 +642,89 @@ impl Database {
             0
         };
         Ok((ids, total))
+    }
+}
+
+/// Per-library "latest" rail: at most `limit` ids per library, ordered like the authoritative
+/// query (available MOVIE/SERIES plus source-less series that still expose a visible child).
+pub(crate) struct RecentByLibraryReadModelQuery<'a> {
+    pub(crate) library_ids: &'a [String],
+    pub(crate) limit_per_library: i64,
+}
+
+impl Database {
+    #[allow(dead_code)] // wired by the `on` switch for the per-library rail
+    pub(crate) async fn list_recent_read_model_ids_by_library(
+        &self,
+        query: &RecentByLibraryReadModelQuery<'_>,
+    ) -> Result<Vec<(String, Vec<String>)>, StorageError> {
+        if query.library_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let branch = "SELECT id, library_id FROM (
+                SELECT ci.item_id AS id, ci.library_id,
+                       CASE WHEN ci.item_type = 'SERIES'
+                            THEN COALESCE(ci.latest_episode_added_at, ci.effective_added_at)
+                            ELSE ci.effective_added_at END AS latest_added_at,
+                       ci.sort_title
+                FROM catalog_items ci
+                WHERE ci.library_id = ?
+                  AND ci.removed_at IS NULL AND ci.merged_into IS NULL
+                  AND ci.item_type IN ('MOVIE', 'SERIES')
+                  AND (
+                      ci.has_available_source = 1
+                      OR (ci.item_type = 'SERIES' AND ci.has_available_source = 0 AND (
+                          EXISTS (
+                              SELECT 1 FROM catalog_items visible_child
+                              WHERE visible_child.removed_at IS NULL
+                                AND visible_child.merged_into IS NULL
+                                AND visible_child.has_available_source = 1
+                                AND (visible_child.parent_id = ci.item_id
+                                     OR visible_child.series_id = ci.item_id)
+                          )
+                          OR EXISTS (
+                              SELECT 1 FROM collection_items visible_collection_item
+                              JOIN collections visible_collection
+                                ON visible_collection.id = visible_collection_item.collection_id
+                              JOIN catalog_items visible_child
+                                ON visible_child.item_id = visible_collection_item.item_id
+                              WHERE visible_collection.item_id = ci.item_id
+                                AND visible_child.removed_at IS NULL
+                                AND visible_child.merged_into IS NULL
+                                AND visible_child.has_available_source = 1
+                          )
+                      ))
+                  )
+                ORDER BY latest_added_at DESC, ci.sort_title, ci.item_id
+                LIMIT ?
+            )";
+        let sql = query
+            .library_ids
+            .iter()
+            .map(|_| branch)
+            .collect::<Vec<_>>()
+            .join(" UNION ALL ");
+        let mut statement = self.query_as::<(String, String)>(sqlx::AssertSqlSafe(sql));
+        for library_id in query.library_ids {
+            statement = statement
+                .bind(library_id)
+                .bind(query.limit_per_library.max(1));
+        }
+        let rows = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
+        for (id, library_id) in rows {
+            match grouped.last_mut() {
+                Some((current, ids)) if *current == library_id => ids.push(id),
+                _ => grouped.push((library_id, vec![id])),
+            }
+        }
+        Ok(grouped)
     }
 }
 
