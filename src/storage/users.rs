@@ -78,6 +78,33 @@ fn normalize_user_content_restriction_tags(tags: &[String]) -> Result<Vec<String
 /// Upper bound for an unpaginated user-directory listing.
 const MAX_USER_DIRECTORY_ENTRIES: i64 = 1000;
 
+/// Typed projection of `user_item_state`; the flags are integers in both backends.
+#[derive(sqlx::FromRow)]
+struct UserItemStateRow {
+    item_id: String,
+    position_ticks: i64,
+    is_played: i64,
+    is_favorite: i64,
+    hide_from_resume: i64,
+    play_count: i64,
+    last_played_at: Option<i64>,
+    version: i64,
+}
+
+impl UserItemStateRow {
+    fn into_state(self) -> StoredUserItemState {
+        StoredUserItemState {
+            position_ticks: self.position_ticks,
+            is_played: self.is_played != 0,
+            is_favorite: self.is_favorite != 0,
+            hide_from_resume: self.hide_from_resume != 0,
+            play_count: self.play_count,
+            last_played_at: self.last_played_at,
+            version: self.version,
+        }
+    }
+}
+
 impl Database {
     // LUX-645 wires this storage primitive into the application preset service.
     #[allow(dead_code)]
@@ -2794,26 +2821,16 @@ impl Database {
         user_id: &str,
         item_id: &str,
     ) -> Result<Option<StoredUserItemState>, StorageError> {
-        self.query(
-            "SELECT position_ticks, is_played, is_favorite, hide_from_resume, play_count,
-                    last_played_at, version
+        self.query_as::<UserItemStateRow>(
+            "SELECT item_id, position_ticks, is_played, is_favorite, hide_from_resume,
+                    play_count, last_played_at, version
              FROM user_item_state WHERE user_id = ? AND item_id = ?",
         )
         .bind(user_id)
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredUserItemState {
-                position_ticks: row.get("position_ticks"),
-                is_played: row.get::<i64, _>("is_played") != 0,
-                is_favorite: row.get::<i64, _>("is_favorite") != 0,
-                hide_from_resume: row.get::<i64, _>("hide_from_resume") != 0,
-                play_count: row.get("play_count"),
-                last_played_at: row.get("last_played_at"),
-                version: row.get("version"),
-            })
-        })
+        .map(|row| row.map(UserItemStateRow::into_state))
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -3064,7 +3081,9 @@ impl Database {
                         last_played_at, version
                  FROM user_item_state WHERE user_id = ? AND item_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(user_id);
+            let mut statement = self
+                .query_as::<UserItemStateRow>(sqlx::AssertSqlSafe(query))
+                .bind(user_id);
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -3077,18 +3096,8 @@ impl Database {
                         source,
                     })?;
             for row in rows {
-                states.insert(
-                    row.get("item_id"),
-                    StoredUserItemState {
-                        position_ticks: row.get("position_ticks"),
-                        is_played: row.get::<i64, _>("is_played") != 0,
-                        is_favorite: row.get::<i64, _>("is_favorite") != 0,
-                        hide_from_resume: row.get::<i64, _>("hide_from_resume") != 0,
-                        play_count: row.get("play_count"),
-                        last_played_at: row.get("last_played_at"),
-                        version: row.get("version"),
-                    },
-                );
+                let item_id = row.item_id.clone();
+                states.insert(item_id, row.into_state());
             }
         }
         Ok(states)
