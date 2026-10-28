@@ -18316,7 +18316,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
 | W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（指纹+bytes+updated_at 校验；重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 部分完成（反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
-| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化 3 个热点查询（`user_item_state`、未播放计数、内容限制） | 部分完成（共享 45 列行需先统一 8 条 SELECT，已记录暂缓；`repository.rs` 仍 5.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
+| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化 4 个热点查询（`user_item_state`、未播放计数、内容限制、详情批量） | 部分完成（共享 45 列行需先统一 8 条 SELECT，已记录暂缓；`repository.rs` 仍 5.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
 
@@ -18723,8 +18723,10 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   (2) `list_unplayed_episode_counts`（首页/剧集列表每次请求都跑）→ `query_as::<(String, i64)>`，去掉
   两处按列名取值；
   (3) `user_content_restrictions`（受限用户的每个目录请求都会读）→ `#[derive(sqlx::FromRow)]
-  UserContentRestrictionRow`，tag 判定改用字段。SQL、契约、调用点均不变。验收：`--test users` 39/39、
-  `--test storage` 76/76、`--test catalog` 3/3、`--test series_api` 1/1、build/fmt/clippy 全绿。
+  UserContentRestrictionRow`，tag 判定改用字段；
+  (4) `list_catalog_details_by_ids`（详情页，含剧集名/季集数）→ `CatalogDetailRow`，单条 SELECT 列表，
+  9 列全部按字段读取。SQL、契约、调用点均不变。验收：`--test users` 39/39、`--test storage` 76/76、
+  `--test catalog` 3/3、`--test series_api` 1/1、build/fmt/clippy 全绿。
   **暂缓且有理由**：`StoredCatalogRow` 的 45 列共享行由 **8 条不同的 SELECT 列表**（`catalog.rs` 1622 /
   1754 / 2013 / 2230 / 2594 / 2739 / 2794 / 2852 行）喂给同一个 `fetch_catalog_rows_internal`，其中两列
   还依赖 `try_get(...).ok().flatten()` 的宽松取值；单一 FromRow 会在“某条查询没选这列”时直接报错。

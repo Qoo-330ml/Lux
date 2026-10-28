@@ -21,6 +21,20 @@ const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
+/// Typed projection of the catalog detail batch: one SELECT list, so the shape can be a struct.
+#[derive(sqlx::FromRow)]
+struct CatalogDetailRow {
+    item_id: String,
+    premiere_date: Option<String>,
+    last_air_date: Option<String>,
+    status: Option<String>,
+    original_language: Option<String>,
+    provider_ids_json: Option<String>,
+    series_name: Option<String>,
+    season_count: i64,
+    episode_count: i64,
+}
+
 fn user_library_access_filter(library_id_expression: &str, include_admin: bool) -> String {
     let active_library = format!(
         "EXISTS (
@@ -2998,7 +3012,7 @@ impl Database {
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
                  WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<CatalogDetailRow>(sqlx::AssertSqlSafe(query));
             for item_id in item_ids {
                 statement = statement.bind(item_id);
             }
@@ -3011,18 +3025,17 @@ impl Database {
                         source,
                     })?;
             for row in batch {
-                let item_id: String = row.get("item_id");
                 details.insert(
-                    item_id.clone(),
+                    row.item_id,
                     StoredCatalogDetail {
-                        premiere_date: row.get("premiere_date"),
-                        last_air_date: row.get("last_air_date"),
-                        status: row.get("status"),
-                        original_language: row.get("original_language"),
-                        provider_ids_json: row.get("provider_ids_json"),
-                        series_name: row.get("series_name"),
-                        season_count: row.get("season_count"),
-                        episode_count: row.get("episode_count"),
+                        premiere_date: row.premiere_date,
+                        last_air_date: row.last_air_date,
+                        status: row.status,
+                        original_language: row.original_language,
+                        provider_ids_json: row.provider_ids_json,
+                        series_name: row.series_name,
+                        season_count: row.season_count,
+                        episode_count: row.episode_count,
                     },
                 );
             }
