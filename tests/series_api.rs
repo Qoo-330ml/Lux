@@ -429,6 +429,12 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
         episodes_from_season_path_body["Items"][0]["SeasonId"],
         emby_season_id
     );
+    assert!(
+        episodes_from_season_path_body["Items"][0]
+            .get("MediaStreams")
+            .is_none(),
+        "an absent Fields parameter keeps the compact list response"
+    );
 
     let vidhub_episodes = client
         .get(format!(
@@ -456,6 +462,45 @@ async fn emby_series_seasons_episodes_and_next_up_return_hierarchy_and_user_stat
     assert_eq!(
         vidhub_episodes_body["Items"][0]["MediaSources"][0]["VideoType"],
         "2160p"
+    );
+
+    // Emby clients that ask for MediaStreams without MediaSources still expect the top-level
+    // projection on list responses; the list path used to drop that field silently.
+    let streams_only = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields=MediaStreams&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(streams_only.status(), reqwest::StatusCode::OK);
+    let streams_only_body: Value = streams_only.json().await?;
+    let projected_streams = streams_only_body["Items"][0]["MediaStreams"]
+        .as_array()
+        .expect("Fields=MediaStreams must be projected on list responses");
+    assert!(!projected_streams.is_empty());
+    assert_eq!(projected_streams[0]["DisplayTitle"], "2160p");
+    assert!(
+        streams_only_body["Items"][0].get("MediaSources").is_none(),
+        "MediaStreams alone must not pull in MediaSources"
+    );
+
+    let without_streams = client
+        .get(format!(
+            "{base_url}/Shows/{series_id}/Episodes?UserId={}&SeasonId={season_id}&Fields=BasicSyncInfo&Limit=10",
+            admin.id
+        ))
+        .header(headers[0].0, headers[0].1)
+        .send()
+        .await?;
+    assert_eq!(without_streams.status(), reqwest::StatusCode::OK);
+    let without_streams_body: Value = without_streams.json().await?;
+    assert!(
+        without_streams_body["Items"][0]
+            .get("MediaStreams")
+            .is_none(),
+        "MediaStreams must stay out of responses that do not request it"
     );
 
     let vidhub_episodes_small_limit = client

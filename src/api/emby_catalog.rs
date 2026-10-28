@@ -1764,7 +1764,11 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
                 can_delete,
                 fields,
                 primary_image_aspect_ratio: None,
-                include_top_level_media_streams: false,
+                // List responses project the top-level MediaStreams only when the caller names it
+                // explicitly: an absent Fields parameter keeps the compact default response. The
+                // data already rides along with the media sources, so this adds no query.
+                include_top_level_media_streams: fields
+                    .is_some_and(|fields| emby_fields_include(Some(fields), "MediaStreams")),
                 unplayed_item_count: unplayed_item_counts.get(&item.id).copied(),
             },
         );
@@ -2255,7 +2259,10 @@ pub(super) async fn emby_single_id_lookup_response(
             can_delete,
             fields: query.fields.as_deref(),
             primary_image_aspect_ratio: None,
-            include_top_level_media_streams: false,
+            include_top_level_media_streams: query
+                .fields
+                .as_deref()
+                .is_some_and(|fields| emby_fields_include(Some(fields), "MediaStreams")),
             unplayed_item_count,
         },
     );

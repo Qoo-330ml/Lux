@@ -18315,7 +18315,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` 只读查询、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%） | 部分完成（`Fields` 投影、NFO LRU、DTO `Value` 树未做；反馈默认值与阈值策略待所有者定） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`；ADR-049 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us`、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%）、列表 `MediaStreams` 投影 | 部分完成（列表 `People` 真批量、NFO LRU、DTO `Value` 树未做；反馈默认值与阈值策略待所有者定） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`；ADR-049 |
 | W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单） | 部分完成（热点 typed 化、存储接口拆分未做） | `docs/migration-map.json`、`docs/backend-branches.json`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
@@ -18586,6 +18586,14 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   收益已在“媒体车道确有 CPU 工作”的负载下验证：三轮交错“扫描期/空闲首页 p95”比值 `off`
   2.73/2.44/2.49 → `on` 1.77/2.07/1.88（均值 −25%），扫描期 p95 −20%，空闲 p95 持平；边界条件、
   另一种负载下的零差异，以及默认值取舍见「剩余」第 4 条。
+- `Fields` 投影：列表 `MediaStreams`（本次提交）：列表与 `Items?Ids=` 响应此前只按 `Fields` 发
+  `MediaSources`，客户端只点名 `MediaStreams` 时字段被静默丢掉。现在显式点名 `MediaStreams` 时补顶层
+  `MediaStreams`；缺省（不带 `Fields`）或只带其它字段时响应不变，数据取自已加载的 media source，
+  **不新增查询**。回归 `tests/series_api.rs` 三处断言（点名时投影且不引入 `MediaSources`、缺省时无
+  `MediaStreams`、只带 `BasicSyncInfo` 时无）；`--test series_api` 1/1，相邻 `catalog` 3/3、
+  `emby_counts` 1/1、`emby_system` 2/2，fmt/clippy 与两项清单校验通过。
+- 列表 `People`/`Overview` 已是按需：`Fields` 未点名时不读 NFO/演员关系（NFO 整页一次批量查询；演员
+  关系按页 8 路有界并发、逐条隔离失败）。真正的“一次批量查询”受文件后端限制，见「剩余」。
 - 新增依赖面（需所有者确认）：`tower-http` 的 `compression-gzip` 特性引入纯 Rust 的
   `async-compression` / `compression-codecs` / `compression-core`；`http-body`（原本经 axum 已在依赖树
   内）改为直接依赖，用于实现压缩谓词。未新增框架、数据库或编解码以外的能力。
@@ -18600,8 +18608,11 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   预热执行可能改变断言），暂按环境性处理并记录复跑结果。
 - DTO 仍走 `serde_json::Value` 中间树（首页 `lux_catalog_items_from_values` 逐项深克隆）。改成带
   `Serialize` 的结构体/借用视图需要重写首页四个 rail 的组装，收益要用 CPU/请求测量确认后再做。
-- 详情 NFO 解码 LRU、图片端点元数据根 canonicalize 缓存、`Fields` 投影（Overview/People/Streams
-  按需批量补）未做。
+- 列表 `People` 的“真批量”未做：演员关系是每个条目读 `people.json`（含 legacy 回退），按页 8 路有界
+  并发、逐条隔离失败；`person_image_url` 还会为每个演员做一次画像存在性检查。要再压这一块，需要
+  (a) 页级画像/关系缓存，或 (b) 把演员关系物化进 DB 后一次批量查询——两者都要先量 `Fields=People` 列表页
+  的 SQL/CPU/IO 占比，否则只是把文件读搬家。同理，详情 NFO 解码 LRU 与图片端点元数据根 canonicalize
+  缓存也仍待“先证明是热点”的证据。
 - 前台 p95 反馈的验证（2026-10-28）：判据达成与否取决于负载，结论分两半，默认开关仍关闭。
   1. **媒体车道确有 CPU 工作**（`scripts/probe-media-lane-ab.py --fake-media-cpu-ms 150`：合成 ffprobe
      每次烧 150 ms CPU，400 个从未扫描的文件，`LUX_READ_MODEL_MODE=off`，预算 9 → 媒体车道 4，阈值
