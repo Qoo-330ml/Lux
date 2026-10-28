@@ -18290,6 +18290,19 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 - [ ] 回滚演练：NFO 缓存回填中断、候选清理失败、批写部分失败均可恢复。
 - [ ] 经项目所有者确认后，才登记并进入 P2（读模型）任务。
 
+### 门禁豁免清单（2026-10-28）
+
+计划 §8.2 允许“门禁全绿**或**所有者书面豁免清单”。当前唯一未通过项按豁免处理，理由与证据如下；
+是否接受豁免由项目所有者决定，未确认前每次门禁都会看到它。
+
+| 用例 | 现象 | 证据 | 处置 |
+|---|---|---|---|
+| `tests/reidentify.rs::fill_missing_dispatcher_serializes_jobs_for_one_library` | `Error: Elapsed(())`，全量门禁 8 线程下偶发；单独复跑 1/8~5/8 不稳定 | ① 回退搜索触发器到 W4 之前仍 1/8 失败 → 与 W4 无关；② 等待放宽到 10 s 仍 4/12 失败（12.6 s）→ 不是窗口太紧；③ 同目标的完整 25 个用例稳定通过；④ 全局元数据许可 16、补全许可 4，第一个任务最多占 3 个 → 不是许可饥饿 | 另开独立 `LUX-*` 任务专查“另一个库的补全任务偶发长时间不启动”；不在数据路径重构里改调度器 |
+
+其它门禁项：`cargo test --locked --all-targets --no-fail-fast -- --test-threads=8` 为
+**2,246 通过 / 1 失败（上表）/ 76 ignored**；`cargo fmt`、`cargo clippy -D warnings` 通过；
+`python3 scripts/check-migration-parity.py` 与 `python3 scripts/check-backend-branches.py` 通过。
+
 ### 数据路径重构（W0–W6）实施状态（2026-10-28）
 
 本表是 `docs/LUX-DATA-PATH-PLAN.md` 七个工作包与已完成任务的总览；每项的验收细节与数字见本文件
