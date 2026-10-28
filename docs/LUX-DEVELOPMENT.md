@@ -18316,7 +18316,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
 | W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 部分完成（反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
-| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口首个域切片（邮件 outbox，`repository.rs` 9,222→8,897 行） | 部分完成（热点 typed 化未做；`repository.rs` 仍 8.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/mail_outbox.rs`；ADR-051 |
+| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行） | 部分完成（热点 typed 化未做；`repository.rs` 仍 5.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
 
@@ -18698,8 +18698,14 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   mod mail_outbox;` 挂在 `repository` 下，仍是 `impl Database`，契约、SQL、可见性不变，调用点零改动；
   `repository.rs` **9,222 → 8,897 行**（新文件 334 行）。回归：`--lib mail_outbox` 8/8、`--test users` 39/39、
   `--test admin_user_invitations` 1/1，`cargo build --locked`、fmt、`clippy -D warnings` 全绿。
-  下一个同类切片建议：邀请/注册（`create_user_invitation_with_mail` 等 20 余个方法，同文件 2,132–4,823 段）
-  或用户状态（`user_item_state` 写入与查询）。
+  **第二片**：邀请 / 邮箱变更 / 注册 / 邮件挑战的 5 个 `impl Database` 块（约 2,973 行）拆到
+  `src/storage/user_mail_flows.rs`，`repository.rs` 8,897 → **5,948 行**（两片合计 9,222 → 5,948，−35.5%）。
+  两处必要修正：迁移校验辅助函数 `sqlite_has_legacy_timestamp_migration_checksum` 属于连接代码，被切成两段后
+  回移到 `repository.rs`；新模块的 `super` 从 `storage` 变成 `repository`，因此把
+  `super::{RegistrationMode, StoredRegistrationMode, UserEmailChangeVerifyResult}` 改成 `crate::storage::…`。
+  回归：`--lib invitation` 16/16、`--lib registration` 13/13、`--lib email_change` 2/2、`--test users` 39/39、
+  `--test admin_user_invitations` 1/1、`--test admin_mail_settings` 1/1，`cargo build --locked`、fmt、clippy 全绿。
+  下一个切片建议：`user_item_state`（观看状态写入/查询）或收藏/评分；`repository.rs` 仍 5.9k 行。
 - 热点查询 typed 化：`catalog_items`/`media_search`/`user_series_next` 已走读模型与消费者，但仍是
   `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估——注意 `sqlx::query!` 宏需要
   编译期数据库，双后端下不可行，typed 化只能走 `query_as` + 手写行结构。
