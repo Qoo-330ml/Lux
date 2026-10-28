@@ -2894,3 +2894,25 @@ SQL 级补充（同一夹具，5,000 次标题更新，`synchronous=NORMAL`）�
 
 压缩 CPU 成本约 0.12 ms/60 KB（zlib level 6）。JSON 响应同时带强 ETag 与
 `Cache-Control: private, no-cache`，二次访问命中 `If-None-Match` 时返回 304 且不传 body。
+
+## CPU / 请求基线（W5，2026-10-28）
+
+`scripts/run-api-cpu-bench.py` 采样服务进程的累计 CPU 时间（user+sys），围绕固定次数顺序请求计算
+每请求 CPU；同时给出每请求墙钟，避免把 CPU 收益和延迟收益混淆。66k 夹具、arm64 release、
+`LUX_READ_MODEL_MODE=off`、每端点 150 次请求（先预热 20 次）：
+
+| 端点 | CPU/请求 | 墙钟/请求 |
+|---|---:|---:|
+| `/api/v1/home` | 277.5 ms | 107.0 ms |
+| `/api/v1/search?q=Spec%20Movie` | 21.3 ms | 21.2 ms |
+| 库列表 `pageSize=50` | 2.1 ms | 2.5 ms |
+| `/api/v1/continue-watching?pageSize=24` | 9.3 ms | 9.7 ms |
+| `/api/v1/libraries?pageSize=100` | 1.3 ms | 1.8 ms |
+
+观察：
+
+- 首页 CPU 远高于墙钟，说明 `off` 模式下多条 rail 的查询在不同线程上并行燃烧 CPU；这正是读模型
+  （`on`）要消除的部分，`on` 侧的数据在 W3 段。
+- 搜索的 21 ms CPU 不在 DTO 装配里：把装配阶段的逐条深克隆改成取得所有权后，CPU 没有变化
+  （21.3 → 21.8 ms，噪声内），说明成本在"匹配 5.6 万行 + 计算总数 + 排序"这条查询上。
+- 库列表与库入口的 CPU 已经很低（1–2 ms），继续压的空间有限。
