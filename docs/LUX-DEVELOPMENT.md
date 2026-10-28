@@ -18315,7 +18315,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` 只读查询 | 部分完成（把 p95 信号接入后台 `Probe`/`Metadata`/`Image` 配额、`Fields` 投影、NFO LRU、DTO `Value` 树未做） | 本文 W5 段；`scripts/run-api-cpu-bench.py`；ADR-049 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` 只读查询、前台 p95 → 后台媒体车道配额（默认关闭；A/B 未获益） | 部分完成（`Fields` 投影、NFO LRU、DTO `Value` 树未做；前台反馈的比值未下降，见 W5 剩余） | 本文 W5 段；`scripts/run-api-cpu-bench.py`；ADR-049 |
 | W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单） | 部分完成（热点 typed 化、存储接口拆分未做） | `docs/migration-map.json`、`docs/backend-branches.json`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
@@ -18570,6 +18570,20 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   同时下发 `Cache-Control: private, no-cache`；`If-None-Match` 命中时返回 304 且无 body。非 JSON
   响应不进入缓冲路径；压缩层包在其外层，304 不做压缩。回归
   `json_responses_answer_if_none_match_with_304`、`json_responses_are_gzipped_only_when_requested`。
+- 前台 p95 → 后台媒体车道配额（`3d7daa28`，**默认关闭**）：新增 `LUX_BACKGROUND_FOREGROUND_THROTTLE=on`
+  （`1`/`true`/`yes` 同义）开启，可选 `LUX_BACKGROUND_FOREGROUND_P95_MS` 改阈值；读取
+  `RequestMetrics::route_p95_us("/api/v1/home")`（有界样本，只读、不改快照结构）。p95 ≥ 阈值（默认
+  300 ms，与 `HOME_P95_DEGRADED_MS` 同口径）时把媒体车道——`Probe`/`LocalNfo`/`LocalImage`/
+  `Thumbnail` 共用的那条 semaphore——收掉一半名额（保留 `ceil(媒体容量/2)`，且至少 1 个），p95 回落
+  并连续 10 s 后整批归还；重新读信号最多 1 次/秒，取名额用非阻塞 `try_acquire_owned`，有任务在跑就
+  下一拍再取，因此不会阻塞等待、也不抢占已运行的工作。信号来源由 `AppState` 构造时注册一次（进程级
+  预算是单例，预算先创建也能事后补挂），降档只改后台并发，不触碰任何 SQL/DTO。回归 4 项
+  （`--lib application::background_work::tests` 15/15）：开关默认关闭与阈值解析、保留至少 1 个名额、
+  慢→收一半且冷却后归还、未挂载时媒体车道容量不变；`--test background_work_budget` 1/1。**未默认开启**。
+  真实进程验证（`RUST_LOG=luxd=info,lux=info` 才能看到 `lux::scan_performance`）：预算 9（媒体车道 4）下
+  日志出现 `enabled foreground latency feedback … media_capacity=4 kept_permits=2` 与
+  `withheld background media permits … withheld_permits=2`，扫描的 probe 阶段确实被压到 2 路。
+  收益测量未达成判据，数据与解读见「剩余」第 4 条。
 - 新增依赖面（需所有者确认）：`tower-http` 的 `compression-gzip` 特性引入纯 Rust 的
   `async-compression` / `compression-codecs` / `compression-core`；`http-body`（原本经 axum 已在依赖树
   内）改为直接依赖，用于实现压缩谓词。未新增框架、数据库或编解码以外的能力。
@@ -18586,14 +18600,20 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   `Serialize` 的结构体/借用视图需要重写首页四个 rail 的组装，收益要用 CPU/请求测量确认后再做。
 - 详情 NFO 解码 LRU、图片端点元数据根 canonicalize 缓存、`Fields` 投影（Overview/People/Streams
   按需批量补）未做。
-- 前台延迟反馈仍只在 home 路径。下一步的具体做法（等门禁绿后执行，不改变正确性）：
-  1. `observability::request_metrics` 已有路由模板级样本（`RouteKey`/`samples_us`），先给它加一个
-     “最近 N 秒 p95 超过阈值”的只读查询接口（不改写现有快照结构）；
-  2. 在 `src/application/background_work.rs` 的预算获取处读取该信号：前台 p95 超阈值时把
-     `BackgroundWorkStage::Probe`/`Metadata`/`Image` 的可用配额按比例下调，冷却后回升；
-  3. 降档只影响后台并发，不改变任何结果；用 `scripts/compare-read-model-modes.py --scan-libraries`
-     复测“扫描期间前台 p95 / 空闲 p95”的比值（W3 基线：首页 `off` 1.33、`on` 1.50）。
-  风险：这类反馈最容易写出抖动，必须先有 3 轮交错测量证明比值下降且空闲 p95 不变，否则不上。
+- 前台 p95 反馈**测过、未获益，保持默认关闭**（2026-10-28）：判据是“扫描期间首页 p95 / 空闲 p95”的比值
+  下降且空闲 p95 不变。`scripts/compare-read-model-modes.py` 无法回答这个问题——它的扫描库在 prepare
+  阶段已入库，测量期“重扫”只重走目录，媒体车道没有活；因此改用 `scripts/probe-media-lane-ab.py`
+  （实验 harness，不进必跑清单）：66k 夹具副本、`LUX_READ_MODEL_MODE=off`、预算 9（媒体车道 4）、
+  阈值 100 ms（本夹具首页空闲 p95 约 120–139 ms，默认 300 ms 不会触发）、库内 1,200 个从未扫描的
+  `.mkv`，每臂先测 20 次空闲首页、POST 扫描后再测 30 次。结果（p95，毫秒）：`off` 扫描期
+  417.2 / 456.8 / 464.8、空闲 139.3 / 123.4 / 128.0 → 比值 2.99 / 3.70 / 3.63；`on` 扫描期
+  463.6 / 446.1、空闲 138.2 / 122.4 → 比值 3.36 / 3.64（均值 `off` 3.44、`on` 3.50，噪声约 ±15%，
+  方向上没有下降）。同时确认开关生效（`withheld_permits=2`，probe 实际 2 路）。
+  解读：扫描期前台变慢的主要竞争者不是媒体车道，而是 discovery/fingerprint 的写入突发与 CPU；只压
+  probe 并发甚至把扫描拉长，就可能让干扰窗口更久。要压这个比值，应针对写入侧（W1/W4 的入队与批写、
+  或用 `BackgroundWorkStage::Discovery` 车道做同类反馈），而不是打开这个开关。是否保留该 opt-in 能力
+  （默认关闭、零行为变化）由项目所有者决定；不需要就回退 `3d7daa28`。开关未进 `DEPLOYMENT.md`/compose
+  环境变量清单。
 - CPU/请求基线已建立（`scripts/run-api-cpu-bench.py`，见 `PERFORMANCE.md`）：首页 277.5 ms、搜索
   21.3 ms、列表 50 条 2.1 ms、继续观看 9.3 ms、库入口 1.3 ms（每请求）。列表/搜索要再降 40% 需要
   改查询形状：搜索成本集中在“匹配数万行 + 总数 + 排序”，而总数是 API 契约的一部分；要么接受更粗的

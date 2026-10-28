@@ -9,8 +9,9 @@
 > 继续 Lux 数据路径重构（W4 已完成、W5/W6 部分完成）。先读 `docs/LUX-DEVELOPMENT.md` 的
 > 「数据路径重构（W0–W6）实施状态」表、W4/W5/W6 段与「门禁豁免清单」，以及
 > `docs/LUX-DATA-PATH-HANDOFF.md`。工作区 `/Volumes/Toshiba/mywork/Lux`，分支 `test`，
-> HEAD = `1fb11f07`（若已前进以 `git log` 为准）。下一步是实现 W5 的
-> “把 `request_metrics::route_p95_us` 接入 `background_work` 配额”，判据见 W5 段。
+> HEAD = `3d7daa28`（若已前进以 `git log` 为准）。W5 的“`route_p95_us` 接入后台配额”已实现（默认
+> 关闭）并测过：扫描期/空闲首页 p95 比值没有下降，见 W5 段「剩余」第 4 条。下一步是 W5 的 `Fields`
+> 投影，或按所有者取舍先处理该开关的去留。
 
 ## 1. 仓库与状态
 
@@ -21,7 +22,8 @@
   `5b880bce` JSON gzip → `782d9eaa` ETag/304 → `da5c2550` CPU 基线 → `5461942a` 缓存策略修复 →
   `d59ce734` storage 测试适配 → `7c5a5c9d` 迁移配对清单 → `e4652465` 后端分支清单 →
   `0b71c078` ADR-048–051 → `7227b538` 测量模板/回滚门 → `d69fd8e2` W5 计划 → `7bbe6d2a` 豁免清单 →
-  `ed385060` `route_p95_us` → `d979a936` 两项校验进基线 → `1fb11f07` 总览刷新。
+  `ed385060` `route_p95_us` → `d979a936` 两项校验进基线 → `1fb11f07` 总览刷新 → `3d7daa28` 前台 p95 →
+  后台媒体车道配额（默认关闭，A/B 未获益）。
 
 ## 2. 门禁
 
@@ -56,19 +58,15 @@ python3 -m unittest tools/migration-map/test_parity.py tools/backend-branches/te
 | W2 读模型切片 | 完成 | 同文件 §30 与 P2 阶段门状态 |
 | W3 首页/继续观看/搜索 | 完成 | LUX-867/868/869 段 + P3 完成状态；首页 p95 118.05→16.58 ms |
 | W4 触发器入队与写预算 | 完成（PG 等价入队未做） | 扫描 0.42→0.37 s、WAL 11.5→11.0 MiB；触发器开销 89→13 ms；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU/协议层 | 部分 | 空闲退避、gzip（首页 92,674→8,308 B）、ETag/304、CPU/请求基线（首页 277.5 / 搜索 21.3 / 列表 2.1 ms）、`route_p95_us`；ADR-049 |
+| W5 CPU/协议层 | 部分 | 空闲退避、gzip（首页 92,674→8,308 B）、ETag/304、CPU/请求基线（首页 277.5 / 搜索 21.3 / 列表 2.1 ms）、`route_p95_us`、前台 p95 → 媒体车道配额（默认关闭，比值 A/B 未获益）；ADR-049 |
 | W6 双后端与边界 | 部分 | 迁移配对 + 后端分支两清单与校验器（已入 `AGENTS.md`）；ADR-051 |
 
 ## 4. 下一步（按序，均可独立提交）
 
-1. **W5：前台延迟反馈 → 后台并发预算**
-   - 已有：`RequestMetrics::route_p95_us(route_needle)`（只读，复用有界样本）。
-   - 待做：在 `src/application/background_work.rs` 获取配额处读该信号（建议 needle `/api/v1/home`），
-     前台 p95 超阈值时按比例下调 `BackgroundWorkStage::Probe` / `Metadata` / `Image` 容量，冷却后回升；
-     先做成可关闭的开关，不改变任何结果。
-   - 判据：`scripts/compare-read-model-modes.py --scan-libraries 3 --scan-files 1000 --rounds 2` 下
-     “扫描期间 p95 / 空闲 p95”比值下降，且空闲 p95 不变；达不到就回退，只保留记录。
-   - 参考基线（W3 实测）：首页 `off` 比值 1.33、`on` 1.50；扫描期间 `on` p95 85.94 ms、空闲 57.39 ms。
+1. ~~**W5：前台延迟反馈 → 后台并发预算**~~ 已完成（`3d7daa28`，默认关闭）。结论：接线、开关、冷却、
+   真实进程验证都成立，但两轮交错 A/B 没有让“扫描期间 p95 / 空闲 p95”比值下降（`off` 2.99/3.70，
+   `on` 3.36/3.64），判据未达成 → 保持默认关闭。细节与解读见 `LUX-DEVELOPMENT.md` W5「剩余」第 4 条；
+   要继续压这个比值，方向应是写入突发（discovery/fingerprint）而不是媒体车道。开关去留待所有者决定。
 2. **W5：`Fields` 投影**（Overview/People/Streams 按需批量补，Emby 协议层）。
 3. **W5：NFO 解码 LRU**（`(item_id, fingerprint)`）。做之前先给证据说明它是热点：当前 CPU 基线显示
    列表 2.1 ms、搜索 21.3 ms 主要在 SQL（匹配/总数/排序），DTO 装配不是瓶颈（已实测：去掉搜索装配的
@@ -94,6 +92,11 @@ python3 scripts/compare-read-model-modes.py --work-dir /tmp/lux-rm-resume3 --rou
 python3 scripts/run-api-cpu-bench.py --work-dir /tmp/lux-rm-resume3 --requests 150
 # 扫描写入（墙钟 / WAL / 队列排空；--legacy-search-triggers 对比 W4 之前）
 python3 scripts/run-scan-write-bench.py --fixture-dir /tmp/lux-rm-resume3 --work-dir /tmp/lux-scan-bench --files 6000
+# 前台 p95 反馈的日志（默认 filter 不含 lux::scan_performance，必须带 RUST_LOG）
+RUST_LOG=luxd=info,lux=info LUX_BACKGROUND_FOREGROUND_THROTTLE=on <luxd>
+# 媒体车道降档的扫描期/空闲 p95 比值（每臂一次，off/on 交替）
+python3 scripts/probe-media-lane-ab.py --throttle off --work-dir /tmp/lux-rm-resume3
+python3 scripts/probe-media-lane-ab.py --throttle on  --work-dir /tmp/lux-rm-resume3
 ```
 
 66k 夹具位置：`/tmp/lux-rm-resume3/config/lux.db`（若已被清理，用 `scripts/run-api-performance.py`
