@@ -18315,8 +18315,8 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 部分完成（反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
-| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行） | 部分完成（热点 typed 化未做；`repository.rs` 仍 5.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（指纹+bytes+updated_at 校验；重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 部分完成（反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
+| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化首个查询（`user_item_state` 读取） | 部分完成（typed 化仅 1 个查询；`repository.rs` 仍 5.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
 
@@ -18614,6 +18614,11 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   （每次重复详情省 0.28–0.36 ms）；`scripts/measure-nfo-load.py` 同脚本跨构建 p50 1.91 / 1.89 → 1.71 / 1.77 ms，
   响应字节不变（133,340）。剩余 +0.37 ms（相对无 NFO 条目）现在主要花在生成与传输 133 KB 响应体上，不是读/解析，
   下一次要压它应走 NFO 字段投影或缩短该负载，而不是继续加缓存。
+  有效性判定补齐（`56d6c690`）：只比对指纹会破坏“损坏缓存自愈”契约——`tests/catalog.rs` 原地改坏 json 后
+  期望详情降级为 null 并清行，而旧指纹不变时会继续命中旧解码。现在命中还要求 `bytes` 与 `updated_at` 与
+  缓存时一致（两者都是廉价列），越界改写或修复都会失效并回到原修复路径。复测（release）：带 NFO 行
+  p50 1.51 / 1.50 ms、无 NFO 1.32 / 1.17 ms（差 +0.26 ms，主要是 133 KB 响应体）；
+  `--test catalog` 3/3（含自愈断言）、`--test metadata` 22/22、`--lib application::nfo::tests` 13/13。
 - 新增依赖面（需所有者确认）：`tower-http` 的 `compression-gzip` 特性引入纯 Rust 的
   `async-compression` / `compression-codecs` / `compression-core`；`http-body`（原本经 axum 已在依赖树
   内）改为直接依赖，用于实现压缩谓词。未新增框架、数据库或编解码以外的能力。
@@ -18706,6 +18711,11 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   回归：`--lib invitation` 16/16、`--lib registration` 13/13、`--lib email_change` 2/2、`--test users` 39/39、
   `--test admin_user_invitations` 1/1、`--test admin_mail_settings` 1/1，`cargo build --locked`、fmt、clippy 全绿。
   下一个切片建议：`user_item_state`（观看状态写入/查询）或收藏/评分；`repository.rs` 仍 5.9k 行。
+- **热点查询 typed 化（首个查询）**：`find_user_item_state` 与 `list_user_item_states` 改用
+  `#[derive(sqlx::FromRow)] UserItemStateRow` + `query_as`，整型布尔与 `last_played_at` 的转换收敛到
+  `into_state()`；SQL、契约、调用点不变。验收：`--test users` 39/39、`--test catalog` 3/3、fmt/clippy 绿。
+  剩余大头：`catalog.rs` 352 处 `row.get`、`repository.rs` 304 处、`emby_migration.rs` 117 处，按触达域
+  逐个查询改造。
 - 热点查询 typed 化：`catalog_items`/`media_search`/`user_series_next` 已走读模型与消费者，但仍是
   `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估——注意 `sqlx::query!` 宏需要
   编译期数据库，双后端下不可行，typed 化只能走 `query_as` + 手写行结构。
