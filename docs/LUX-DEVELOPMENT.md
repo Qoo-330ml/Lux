@@ -18558,8 +18558,14 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   `Serialize` 的结构体/借用视图需要重写首页四个 rail 的组装，收益要用 CPU/请求测量确认后再做。
 - 详情 NFO 解码 LRU、图片端点元数据根 canonicalize 缓存、`Fields` 投影（Overview/People/Streams
   按需批量补）未做。
-- 前台延迟反馈仍只在 home 路径；扩到路由模板级并联动 ffprobe/元数据/图片并发属于跨子系统改动，
-  需要先有 CPU/请求基线，否则无法判断降档是否有效。
+- 前台延迟反馈仍只在 home 路径。下一步的具体做法（等门禁绿后执行，不改变正确性）：
+  1. `observability::request_metrics` 已有路由模板级样本（`RouteKey`/`samples_us`），先给它加一个
+     “最近 N 秒 p95 超过阈值”的只读查询接口（不改写现有快照结构）；
+  2. 在 `src/application/background_work.rs` 的预算获取处读取该信号：前台 p95 超阈值时把
+     `BackgroundWorkStage::Probe`/`Metadata`/`Image` 的可用配额按比例下调，冷却后回升；
+  3. 降档只影响后台并发，不改变任何结果；用 `scripts/compare-read-model-modes.py --scan-libraries`
+     复测“扫描期间前台 p95 / 空闲 p95”的比值（W3 基线：首页 `off` 1.33、`on` 1.50）。
+  风险：这类反馈最容易写出抖动，必须先有 3 轮交错测量证明比值下降且空闲 p95 不变，否则不上。
 - CPU/请求基线已建立（`scripts/run-api-cpu-bench.py`，见 `PERFORMANCE.md`）：首页 277.5 ms、搜索
   21.3 ms、列表 50 条 2.1 ms、继续观看 9.3 ms、库入口 1.3 ms（每请求）。列表/搜索要再降 40% 需要
   改查询形状：搜索成本集中在“匹配数万行 + 总数 + 排序”，而总数是 API 契约的一部分；要么接受更粗的
