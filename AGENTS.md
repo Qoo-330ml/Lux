@@ -70,6 +70,8 @@ cargo build --locked
 cargo test --locked --all-targets
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
+python3 scripts/check-migration-parity.py
+python3 scripts/check-backend-branches.py
 ```
 
 For Web changes also run:
