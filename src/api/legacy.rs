@@ -591,7 +591,15 @@ impl AppState {
             user_events,
             web_playback,
             resources,
-            request_metrics: RequestMetrics::new(),
+            request_metrics: {
+                // Background work reads the foreground p95 from these samples; the feedback is
+                // opt-in, so this registration is inert unless it is enabled.
+                let request_metrics = RequestMetrics::new();
+                crate::application::background_work::install_foreground_request_metrics(
+                    request_metrics.clone(),
+                );
+                request_metrics
+            },
             remote_access: RemoteAccessPolicy,
             login_rate_limiter: LoginRateLimiter::default(),
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
