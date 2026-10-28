@@ -2727,14 +2727,15 @@ impl CatalogService {
     ) -> Result<CatalogPage, CatalogError> {
         let (ids, total) = self.database.search_catalog_item_ids(&search).await?;
         let rows = self.database.list_catalog_rows_by_ids(&ids).await?;
-        let items_by_id = assemble_items(rows)
+        let mut items_by_id = assemble_items(rows)
             .into_iter()
             .map(|item| (item.id.clone(), item))
             .collect::<HashMap<_, _>>();
         let details = self.database.list_catalog_details_by_ids(&ids).await?;
         let mut items = Vec::with_capacity(ids.len());
         for item_id in ids {
-            let Some(mut item) = items_by_id.get(&item_id).cloned() else {
+            // The row is only needed once; taking it out of the map avoids a deep clone per result.
+            let Some(mut item) = items_by_id.remove(&item_id) else {
                 continue;
             };
             if let Some(detail) = details.get(&item_id) {
