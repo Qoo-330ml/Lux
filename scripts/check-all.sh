@@ -14,6 +14,8 @@ python3 -m unittest tools/compatibility-probe/test_probe.py
 python3 -m unittest tools/catalog-fixture/test_generator.py
 python3 scripts/check-migration-parity.py
 python3 -m unittest tools/migration-map/test_parity.py
+python3 scripts/check-backend-branches.py
+python3 -m unittest tools/backend-branches/test_allowlist.py
 
 pnpm --dir web install --frozen-lockfile
 pnpm --dir web test

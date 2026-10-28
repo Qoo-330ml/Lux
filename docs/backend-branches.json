@@ -1,0 +1,136 @@
+{
+  "files": [
+    {
+      "path": "src/application/admin_health.rs",
+      "count": 2,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/application/reidentify.rs",
+      "count": 6,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/application/scanner/jobs/manifest_discovery.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/config/database.rs",
+      "count": 2,
+      "note": "configuration to backend enum mapping"
+    },
+    {
+      "path": "src/storage/catalog.rs",
+      "count": 11,
+      "note": "catalog SQL with backend-specific JSON/tsvector handling"
+    },
+    {
+      "path": "src/storage/database_cleanup.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/database_diagnostics.rs",
+      "count": 2,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/database_maintenance.rs",
+      "count": 10,
+      "note": "vacuum/analyze/pragma maintenance is engine specific"
+    },
+    {
+      "path": "src/storage/filesystem.rs",
+      "count": 4,
+      "note": "filesystem entry SQL uses backend-specific conflict targets"
+    },
+    {
+      "path": "src/storage/jobs/metadata_reidentify/fill_missing.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/jobs/metadata_reidentify/fill_missing/requests.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/jobs/scan/manifest/diff.rs",
+      "count": 4,
+      "note": "manifest diff SQL differs per backend"
+    },
+    {
+      "path": "src/storage/jobs/scan/manifest/discovery/checkpoint.rs",
+      "count": 4,
+      "note": "manifest checkpoint SQL differs per backend"
+    },
+    {
+      "path": "src/storage/jobs/scan/manifest/discovery/presence.rs",
+      "count": 3,
+      "note": "presence SQL differs per backend"
+    },
+    {
+      "path": "src/storage/library_deletion.rs",
+      "count": 24,
+      "note": "cascade/cleanup SQL differs per backend (no shared UNIQUE/cte semantics)"
+    },
+    {
+      "path": "src/storage/media.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/media_sources.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/metadata.rs",
+      "count": 2,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/migration.rs",
+      "count": 2,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/people.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/repository.rs",
+      "count": 64,
+      "note": "storage entry points that dispatch whole query families per backend"
+    },
+    {
+      "path": "src/storage/search_reindex.rs",
+      "count": 1,
+      "note": "PostgreSQL keeps the inline FTS maintenance for now (documented gap)"
+    },
+    {
+      "path": "src/storage/sessions.rs",
+      "count": 1,
+      "note": "unregistered backend branch"
+    },
+    {
+      "path": "src/storage/sql_query_benchmarks.rs",
+      "count": 26,
+      "note": "benchmark harness comparing both dialects"
+    },
+    {
+      "path": "src/storage/sql_templates.rs",
+      "count": 82,
+      "note": "SQL dialect templates: SQLite and PostgreSQL spell the same query differently"
+    },
+    {
+      "path": "src/storage/users.rs",
+      "count": 8,
+      "note": "user SQL with backend-specific upsert forms"
+    }
+  ],
+  "total": 265,
+  "rule": "New code must not add DatabaseBackend:: branches. Growing an existing file requires editing this manifest in the same commit, which documents the reason in review."
+}

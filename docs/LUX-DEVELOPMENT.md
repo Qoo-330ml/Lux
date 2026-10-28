@@ -18584,8 +18584,11 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
 
 剩余：
 
-- `sqlx::Any` 允许清单：尚未把现有 `DatabaseBackend::` 分支登记成白名单，也没加“新分支必须登记”
-  的检查。做法与迁移清单相同（JSON 清单 + 校验脚本），等下一轮补。
+- `sqlx::Any` 允许清单已落地：`docs/backend-branches.json` 登记 26 个文件、265 处
+  `DatabaseBackend::` 分支（每处附该文件为何需要后端分支的说明），
+  `scripts/check-backend-branches.py` 校验“新文件不得新增分支、已登记文件不得增长、减少可以但需
+  `--write` 记录”，已接入 `scripts/check-all.sh`，并有 `tools/backend-branches/test_allowlist.py`
+  6 项单测。规则：新增分支必须同一次提交里改清单，把理由写进 review。
 - 热点查询 typed 化：`catalog_items`/`media_search`/`user_series_next` 已走读模型与消费者，但仍是
   `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估。
 - 存储接口拆分：`storage` 仍是单一大模块，`repository.rs` 9k+ 行；按触达域拆分是纯重构，

@@ -1326,3 +1326,12 @@ SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在
 
 当前：169 对、51 个 SQLite 专有、19 个 PostgreSQL 专有。同名的相对顺序在两套历史里并不一致
 （`rank_mismatches = 84`），规则改为“新增迁移在两侧保持相邻”，计数不得增长。
+
+### `DatabaseBackend::` 分支清单（W6）
+
+除迁移清单外，后端分支本身也登记：`docs/backend-branches.json` 记录每个文件里
+`DatabaseBackend::` 的出现次数与理由，`scripts/check-backend-branches.py` 拒绝“新文件带分支”和
+“已登记文件增长”。当前 26 个文件、265 处，集中在 `sql_templates.rs`（SQL 方言模板）、
+`repository.rs`（整族查询分派）、`catalog.rs`/`library_deletion.rs`/`database_maintenance.rs`
+（JSON、级联与 pragma 差异）等；`search_reindex.rs` 里的一处是“PostgreSQL 仍走同步 FTS 维护”这个
+已记录的差距。
