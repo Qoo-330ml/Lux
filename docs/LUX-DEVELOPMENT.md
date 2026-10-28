@@ -18316,7 +18316,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
 | W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 部分完成（反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
-| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单） | 部分完成（热点 typed 化、存储接口拆分未做） | `docs/migration-map.json`、`docs/backend-branches.json`；ADR-051 |
+| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口首个域切片（邮件 outbox，`repository.rs` 9,222→8,897 行） | 部分完成（热点 typed 化未做；`repository.rs` 仍 8.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/mail_outbox.rs`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
 
@@ -18640,12 +18640,10 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   （10 名演员 ≈ 10–50 µs/演员）；Emby 50 项页按 8 路并发摊约 1–4 ms。
   结论：**默认不做**页级缓存或 DB 物化；先决条件是元数据在慢存储（NAS/远端）或页规模 ≥500——那时用同一
   脚本在同一存储复测，再在 (a) 页级画像/关系缓存 与 (b) 物化进 DB 批量查 之间选。
-  详情 NFO 解码**已有证据**（2026-10-28）：66k 夹具里有 200 条 `media_item_nfo_cache` 行、每行
-  131,042 B（按上限形态填充）。用 `scripts/measure-nfo-load.py` 交错测同一批详情请求：带该行 p50
-  1.91 / 1.89 ms、p95 2.20 / 2.22 ms，不带 1.54 / 1.48、1.82 / 1.91 → **+0.39 ms p50 / +0.34 ms p95**，
-  响应字节 1,623 → 133,340（NFO 字段确实进了详情 DTO）。结论：值得做 LRU，但关键不是“少解析一次”，而是
-  **少读一次 131 KB 的 JSON**——设计为 `(item_id, fingerprint)` 键，读取时先只取 `fingerprint` 列，
-  命中即跳过 json 读取与解码；列表页用批量 fingerprint + 逐项复用，未命中时退化为原路径，不影响正确性。
+  详情 NFO 解码**已有证据且已实现**（2026-10-28）：66k 夹具里 200 条 `media_item_nfo_cache` 行、每行
+  131,042 B；交错测同批详情：带该行 p50 1.91 / 1.89 ms、不带 1.54 / 1.48 ms（+0.39 ms），响应字节
+  1,623 → 133,340。据此实现的 `(item_id, fingerprint)` 解码缓存见「已完成」；剩余 +0.37 ms 花在 133 KB
+  响应体本身，不再由读/解析主导。
 - 前台 p95 反馈的验证（2026-10-28）：判据达成与否取决于负载，结论分两半，默认开关仍关闭。
   1. **媒体车道确有 CPU 工作**（`scripts/probe-media-lane-ab.py --fake-media-cpu-ms 150`：合成 ffprobe
      每次烧 150 ms CPU，400 个从未扫描的文件，`LUX_READ_MODEL_MODE=off`，预算 9 → 媒体车道 4，阈值
@@ -18695,10 +18693,18 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   `scripts/check-backend-branches.py` 校验“新文件不得新增分支、已登记文件不得增长、减少可以但需
   `--write` 记录”，已接入 `scripts/check-all.sh`，并有 `tools/backend-branches/test_allowlist.py`
   6 项单测。规则：新增分支必须同一次提交里改清单，把理由写进 review。
+- **存储接口按触达域拆分（首个切片）**：邮件 outbox 的 7 个方法（append / claim / ack / defer / fail /
+  retry / page）整块从 `repository.rs` 拆到 `src/storage/mail_outbox.rs`，以 `#[path = "mail_outbox.rs"]
+  mod mail_outbox;` 挂在 `repository` 下，仍是 `impl Database`，契约、SQL、可见性不变，调用点零改动；
+  `repository.rs` **9,222 → 8,897 行**（新文件 334 行）。回归：`--lib mail_outbox` 8/8、`--test users` 39/39、
+  `--test admin_user_invitations` 1/1，`cargo build --locked`、fmt、`clippy -D warnings` 全绿。
+  下一个同类切片建议：邀请/注册（`create_user_invitation_with_mail` 等 20 余个方法，同文件 2,132–4,823 段）
+  或用户状态（`user_item_state` 写入与查询）。
 - 热点查询 typed 化：`catalog_items`/`media_search`/`user_series_next` 已走读模型与消费者，但仍是
-  `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估。
-- 存储接口拆分：`storage` 仍是单一大模块，`repository.rs` 9k+ 行；按触达域拆分是纯重构，
-  收益只在可维护性，排在写路径与协议层之后。
+  `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估——注意 `sqlx::query!` 宏需要
+  编译期数据库，双后端下不可行，typed 化只能走 `query_as` + 手写行结构。
+- 存储接口拆分：首个切片已完成（见上），`repository.rs` 仍有 8.9k 行；后续切片按“一次一个域、纯移动、
+  只跑该域测试”的节奏推进。
 
 ### P3（W3）完成状态（2026-10-27）
 
