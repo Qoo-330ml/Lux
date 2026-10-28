@@ -113,6 +113,33 @@ impl RequestMetrics {
         metrics.samples_us.push_back(duration_us);
     }
 
+    /// p95 latency (microseconds) across the recorded samples of every route whose template
+    /// contains `route_needle`, or `None` when no matching route has samples yet.
+    ///
+    /// Read-only and cheap: the background scheduler uses it to notice that foreground requests are
+    /// currently slow without touching the snapshot structure the admin endpoint serves.
+    pub(crate) fn route_p95_us(&self, route_needle: &str) -> Option<u64> {
+        let state = self.inner.lock().ok()?;
+        let mut samples: Vec<u64> = Vec::new();
+        for (key, metrics) in &state.routes {
+            if !key.route.contains(route_needle) {
+                continue;
+            }
+            samples.extend(metrics.samples_us.iter().copied());
+        }
+        if samples.is_empty() {
+            return None;
+        }
+        samples.sort_unstable();
+        let index = samples
+            .len()
+            .saturating_mul(95)
+            .div_ceil(100)
+            .saturating_sub(1)
+            .min(samples.len() - 1);
+        Some(samples[index])
+    }
+
     pub(crate) fn snapshot(&self) -> RequestMetricsSnapshot {
         let now = unix_now();
         let Ok(state) = self.inner.lock() else {
@@ -212,6 +239,21 @@ mod tests {
 
     fn record_ms(metrics: &RequestMetrics, route: &str, ms: u64) {
         metrics.record("GET", route, 200, Duration::from_millis(ms));
+    }
+
+    #[test]
+    fn route_p95_us_reports_only_matching_routes() {
+        let metrics = RequestMetrics::new();
+        assert_eq!(metrics.route_p95_us("/api/v1/home"), None);
+        for value in 1..=100 {
+            record_ms(&metrics, "/api/v1/home", value);
+        }
+        record_ms(&metrics, "/api/v1/libraries/:id/items", 900);
+        let p95 = metrics
+            .route_p95_us("/api/v1/home")
+            .expect("home samples are recorded");
+        assert_eq!(p95, 95_000, "p95 over the home samples only");
+        assert_eq!(metrics.route_p95_us("/api/v1/unknown"), None);
     }
 
     #[test]
