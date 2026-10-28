@@ -8533,14 +8533,15 @@ impl Database {
         Ok(())
     }
 
-    pub(crate) async fn media_item_nfo_metadata_json(
+    /// Fingerprint of the cached NFO snapshot, without reading the (potentially large) JSON body.
+    pub(crate) async fn media_item_nfo_fingerprint(
         &self,
         item_id: &str,
-    ) -> Result<Option<String>, StorageError> {
+    ) -> Result<Option<Vec<u8>>, StorageError> {
         self.query_scalar(
-            "SELECT json
+            "SELECT fingerprint
              FROM media_item_nfo_cache
-             WHERE item_id = ?",
+             WHERE item_id = ? AND fingerprint IS NOT NULL",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
@@ -8551,12 +8552,12 @@ impl Database {
         })
     }
 
-    /// Batch variant of [`Self::media_item_nfo_metadata_json`] for list endpoints.
-    pub(crate) async fn media_item_nfo_metadata_json_batch(
+    /// Batch fingerprint lookup for list pages: one cheap query instead of a JSON body per item.
+    pub(crate) async fn media_item_nfo_fingerprints_batch(
         &self,
         item_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, String>, StorageError> {
-        let mut cached = std::collections::HashMap::new();
+    ) -> Result<std::collections::HashMap<String, Vec<u8>>, StorageError> {
+        let mut fingerprints = std::collections::HashMap::new();
         for chunk in item_ids.chunks(NFO_METADATA_BATCH_SIZE) {
             if chunk.is_empty() {
                 continue;
@@ -8565,7 +8566,65 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT item_id, json
+                "SELECT item_id, fingerprint
+                 FROM media_item_nfo_cache
+                 WHERE item_id IN ({placeholders}) AND fingerprint IS NOT NULL"
+            );
+            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            for item_id in chunk {
+                statement = statement.bind(item_id);
+            }
+            let rows =
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(|source| StorageError::Sqlx {
+                        path: self.path.clone(),
+                        source,
+                    })?;
+            for row in rows {
+                fingerprints.insert(row.get("item_id"), row.get("fingerprint"));
+            }
+        }
+        Ok(fingerprints)
+    }
+
+    /// JSON body plus fingerprint in one query so a cache miss does not pay an extra round trip.
+    pub(crate) async fn media_item_nfo_snapshot(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<(String, Option<Vec<u8>>)>, StorageError> {
+        let row = self
+            .query(
+                "SELECT json, fingerprint
+                 FROM media_item_nfo_cache
+                 WHERE item_id = ?",
+            )
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(row.map(|row| (row.get("json"), row.get("fingerprint"))))
+    }
+
+    /// Batch snapshot lookup for list endpoints.
+    pub(crate) async fn media_item_nfo_snapshot_batch(
+        &self,
+        item_ids: &[String],
+    ) -> Result<std::collections::HashMap<String, (String, Option<Vec<u8>>)>, StorageError> {
+        let mut snapshots = std::collections::HashMap::new();
+        for chunk in item_ids.chunks(NFO_METADATA_BATCH_SIZE) {
+            if chunk.is_empty() {
+                continue;
+            }
+            let placeholders = std::iter::repeat_n("?", chunk.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let query = format!(
+                "SELECT item_id, json, fingerprint
                  FROM media_item_nfo_cache
                  WHERE item_id IN ({placeholders})"
             );
@@ -8582,10 +8641,13 @@ impl Database {
                         source,
                     })?;
             for row in rows {
-                cached.insert(row.get("item_id"), row.get("json"));
+                snapshots.insert(
+                    row.get("item_id"),
+                    (row.get("json"), row.get("fingerprint")),
+                );
             }
         }
-        Ok(cached)
+        Ok(snapshots)
     }
 
     // LUX-684 consumes these bounded candidates in the background index worker.

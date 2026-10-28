@@ -18315,7 +18315,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码成本已量（+0.39 ms） | 部分完成（NFO LRU 待实现、DTO `Value` 树未做；反馈默认值与活体恢复验证待定） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（重复详情 −0.28…−0.36 ms） | 部分完成（DTO `Value` 树未做；反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
 | W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单） | 部分完成（热点 typed 化、存储接口拆分未做） | `docs/migration-map.json`、`docs/backend-branches.json`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
@@ -18600,6 +18600,20 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   `emby_counts` 1/1、`emby_system` 2/2，fmt/clippy 与两项清单校验通过。
 - 列表 `People`/`Overview` 已是按需：`Fields` 未点名时不读 NFO/演员关系（NFO 整页一次批量查询；演员
   关系按页 8 路有界并发、逐条隔离失败）。真正的“一次批量查询”受文件后端限制，见「剩余」。
+- 详情 NFO 解码缓存（本次提交）：`LocalNfoMetadataStore` 增加 256 条 `(item_id → fingerprint, details)` 缓存
+  （`Arc<Mutex<_>>`，clone 共享）。暖路径先查 `media_item_nfo_fingerprint`（单列，列表页用
+  `media_item_nfo_fingerprints_batch` 一页一条），指纹一致即返回已解码详情，**跳过 131 KB JSON 读取与
+  解析**；冷路径用 `media_item_nfo_snapshot(_batch)` 把 json 与 fingerprint 放在同一条查询里，不多一次往返。
+  写路径（`write_item`、`write_item_with_semantic_fingerprint`）与过大/坏 JSON 的清理都会失效对应条目；指纹为
+  NULL 或非 32 字节的行不缓存，走原路径；多实例之间靠指纹变化自然失效。回归 4 项：
+  `decoded_nfo_cache_is_bounded_and_gated_by_fingerprint`、
+  `decoded_nfo_cache_serves_the_batch_path_from_memory`（`--lib application::nfo::tests` 13/13）、
+  `decoded_nfo_cache_skips_the_json_read_until_the_fingerprint_changes`（`--test metadata` 22/22）、
+  存储侧 `nfo_metadata_batch_reads_a_page_with_one_query`（改用 snapshot 批量并断言无指纹时不缓存）。
+  实测（release，50 项带 131,042 B 行）：同一进程内首轮 p50 2.15 ms → 后续轮 1.87 / 1.87 / 1.87 / 1.79 ms
+  （每次重复详情省 0.28–0.36 ms）；`scripts/measure-nfo-load.py` 同脚本跨构建 p50 1.91 / 1.89 → 1.71 / 1.77 ms，
+  响应字节不变（133,340）。剩余 +0.37 ms（相对无 NFO 条目）现在主要花在生成与传输 133 KB 响应体上，不是读/解析，
+  下一次要压它应走 NFO 字段投影或缩短该负载，而不是继续加缓存。
 - 新增依赖面（需所有者确认）：`tower-http` 的 `compression-gzip` 特性引入纯 Rust 的
   `async-compression` / `compression-codecs` / `compression-core`；`http-body`（原本经 axum 已在依赖树
   内）改为直接依赖，用于实现压缩谓词。未新增框架、数据库或编解码以外的能力。

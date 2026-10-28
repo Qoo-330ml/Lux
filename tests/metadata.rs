@@ -6,7 +6,7 @@ use luxd::{
             MetadataSource, MetadataState, NfoMetadata, find_local_images, parse_nfo,
         },
         metadata_paths::{library_item_directory, people_directory},
-        nfo::LocalNfoMetadataStore,
+        nfo::{LocalNfoDetails, LocalNfoMetadataStore},
         people::PeopleService,
         scanner::{LibraryScanner, ScanJobService},
     },
@@ -82,6 +82,68 @@ async fn scan_job_metadata_microbatch_isolates_a_broken_series_target()
     Ok(())
 }
 
+#[tokio::test]
+async fn decoded_nfo_cache_skips_the_json_read_until_the_fingerprint_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie = root
+        .join("Cache Fixture (2024)")
+        .join("Cache.Fixture.2024.mkv");
+    tokio::fs::create_dir_all(movie.parent().ok_or("missing movie parent")?).await?;
+    tokio::fs::write(&movie, b"cache fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+
+    let store = LocalNfoMetadataStore::new(database.clone());
+    let details = LocalNfoDetails {
+        rating: Some(8.1),
+        genres: vec!["Action".to_owned()],
+        ..LocalNfoDetails::default()
+    };
+    let fingerprint = [7_u8; 32];
+    store.write_item(&item_id, &fingerprint, &details).await?;
+
+    let first = store.read_item(&item_id).await?.ok_or("first read")?;
+    assert_eq!(first.rating, Some(8.1));
+
+    // A hit must not read the JSON body: break it while keeping the fingerprint stable.
+    sqlx::query("UPDATE media_item_nfo_cache SET json = 'not json' WHERE item_id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let second = store.read_item(&item_id).await?.ok_or("cache hit")?;
+    assert_eq!(second.genres, vec!["Action".to_owned()]);
+
+    // A new fingerprint invalidates the entry, so the next read falls back to the stored JSON.
+    sqlx::query("UPDATE media_item_nfo_cache SET fingerprint = ? WHERE item_id = ?")
+        .bind(vec![9_u8; 32])
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        store.read_item(&item_id).await?.is_none(),
+        "the malformed JSON is only reached after the fingerprint changed"
+    );
+    Ok(())
+}
 #[test]
 fn metadata_merge_table_preserves_local_and_locked_values() {
     struct Case {

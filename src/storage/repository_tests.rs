@@ -32629,23 +32629,34 @@ async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn 
     }
 
     let item_ids = vec!["nfo-a".to_owned(), "nfo-b".to_owned(), "nfo-c".to_owned()];
-    let cached = database
-        .media_item_nfo_metadata_json_batch(&item_ids)
-        .await?;
+    let cached = database.media_item_nfo_snapshot_batch(&item_ids).await?;
     assert_eq!(
         cached.len(),
         2,
         "only items with a cached snapshot are returned"
     );
     assert_eq!(
-        cached.get("nfo-a").map(String::as_str),
+        cached.get("nfo-a").map(|(json, _)| json.as_str()),
         Some("{\"title\":\"A\"}")
     );
     assert_eq!(
-        cached.get("nfo-c").map(String::as_str),
+        cached.get("nfo-c").map(|(json, _)| json.as_str()),
         Some("{\"title\":\"C\"}")
     );
     assert!(!cached.contains_key("nfo-b"));
+    // No fingerprint column values in this fixture, so the cheap lookup stays empty and the store
+    // will not cache these rows.
+    assert!(
+        !cached
+            .values()
+            .any(|(_, fingerprint)| fingerprint.is_some())
+    );
+    assert!(
+        database
+            .media_item_nfo_fingerprints_batch(&item_ids)
+            .await?
+            .is_empty()
+    );
     Ok(())
 }
 
