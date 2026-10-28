@@ -2499,12 +2499,29 @@ fn sqlite_media_search_triggers_skip_only_ascii_case_equivalent_sort_titles() {
     assert!(migration.contains("ELSE NEW.sort_title"));
     assert!(migration.contains("CREATE TRIGGER media_items_search_ai"));
     assert!(migration.contains("CREATE TRIGGER media_items_search_au"));
+    // Since W4 the legacy rebuild only enqueues: the sort-title normalisation and the FTS write moved
+    // into the `search_reindex` consumer, so the invariant is checked there instead.
+    let consumer = include_str!("../src/storage/search_reindex.rs");
+    assert_eq!(
+        consumer
+            .matches("CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE")
+            .count()
+            + consumer
+                .matches("WHEN item.sort_title = item.title COLLATE NOCASE")
+                .count(),
+        1,
+        "the reindex consumer owns the sort-title normalisation"
+    );
     assert_eq!(
         legacy_rebuild
-            .matches("CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE THEN '' ELSE NEW.sort_title END")
+            .matches("INSERT INTO catalog_outbox (kind, item_id) VALUES ('search'")
             .count(),
-        2,
-        "legacy table rebuild must keep insert and update triggers in sync"
+        6,
+        "every search trigger in the legacy rebuild enqueues instead of writing the FTS index"
+    );
+    assert!(
+        !legacy_rebuild.contains("INSERT INTO media_search (rowid"),
+        "the rebuild must not write the FTS index inline any more"
     );
 }
 
