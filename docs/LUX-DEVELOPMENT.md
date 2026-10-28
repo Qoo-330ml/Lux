@@ -18314,7 +18314,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W1 数据生命周期与写放大 | LUX-857–860 | 完成 | 本文“阶段 29 门” |
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
-| W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
+| W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 + PostgreSQL 等价入队（语句级入队触发器 + PG 消费者） | 完成（PG 侧未做扫描写预算基准） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
 | W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（指纹+bytes+updated_at 校验；重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 剩余项已结论（唯一待定：降档默认值策略，需所有者定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
 | W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化 4 个热点查询（`user_item_state`、未播放计数、内容限制、详情批量） | 剩余项已结论（共享 45 列行需先统一 8 条 SELECT，已记录暂缓；`repository.rs` 剩余为连接层，拆分到此为止） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
 
@@ -18762,7 +18762,7 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   `web_playback` 里对 webhook 投递顺序的断言（`072a29af`，投递由 4 并发 worker 处理，改为断言集合）。
 - W4（触发器入队与写预算）、W5（CPU/协议层）待登记。
 
-### W4 触发器与写预算（进行中，2026-10-28）
+### W4 触发器与写预算（已完成，两后端均入队 2026-10-29）
 
 范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W4）：搜索/provider/内容限制失效触发器改为入队；消费者预算与
 优先级；SQLite 派生写池 `synchronous=NORMAL` 实验。验收：扫描墙钟 +≤5%、WAL +≤10%（相对基线）、
@@ -18791,6 +18791,21 @@ FTS/内容限制/collection 一致性回归全绿、故障注入后可恢复。
   另有 5,000 次标题更新的 SQL 级对比：写事务内维护 FTS 145 ms / 7,350 KiB WAL，入队 69 ms /
   6,767 KiB WAL，无触发器下限 56 ms / 6,353 KiB WAL —— 触发器开销从 89 ms 降到 13 ms（−85%），
   单条 WAL 从约 2.0 KiB 降到 0.08 KiB。
+- PostgreSQL 侧等价入队（本次提交）：迁移 `migrations-postgres/0239_search_reindex_outbox.sql`（与 SQLite
+  `0237` 配对，`docs/migration-map.json` 现为 170 对）把行级刷新触发器换成**语句级入队触发器**——
+  `media_items` 的 INSERT/UPDATE/DELETE 与 `item_aliases` 的增删改只向 `catalog_outbox(kind='search')`
+  追加（过渡表 + `DISTINCT`，一条语句一次插入），并删除旧的 `lux_refresh_media_search_*` 函数；升级时给
+  “没有 `media_search` 行”的条目补一次入队。消费者两后端共用入口，PG 分支 `reindex_search_items_postgres`
+  用 `INSERT … ON CONFLICT (item_id) DO UPDATE` 从权威表重建 title/sort_title/original_title/aliases 并清理
+  已删条目，`drain_search_reindex` 不再在 PG 上直接返回 0。**provider 索引保持同步**：`0143` 曾把 provider
+  刷新并进搜索插入函数，替换时必须保留（否则新条目的 `media_item_provider_ids` 不再写入，bootstrap 用例
+  当场暴露）；更新路径仍由 `media_item_provider_ids_au` 处理。既有 3 个 PG 用例断言的是旧的同步语义
+  （`FOR EACH ROW`、插入即可见、`media_search` 计数），已改为“写入只入队 → drain → 再断言”，其中
+  bootstrap 用例最后一次 `CatalogService::search_items` 正好验证“搜索前有界排空”的读己之写。回归（真 PG 16.15
+  `127.0.0.1:55432`）：`postgres_search_reindex_moves_to_the_outbox_consumer` 断言“写入只入队、行由消费者
+  建、别名与标题再入队、`overview` 不入队、删除后清行”；PG 全套 `--test postgres_database -- --ignored`
+  **34/34**（容器：OrbStack `lux-goal-postgres`，`127.0.0.1:55432`，用户 `lux`）；SQLite `--test search` 3/3；
+  迁移配对 170 对 / 50 SQLite-only / 19 PG-only。
 - provider 索引不改为入队的理由（附测量）：`media_item_provider_ids` 被合并、归档、库删除与
   provider 过滤查询在**同一流程内**直接读取，异步化会引入“刚写完元数据就做合并判定”读到旧行的窗口，
   可能影响合并去重；而它的成本远低于 FTS：5,000 次 provider 更新 34 ms vs 无触发器 20 ms
@@ -18810,9 +18825,9 @@ FTS/内容限制/collection 一致性回归全绿、故障注入后可恢复。
 - 消费者预算与优先级：当前只有 `search` 一种派生写类别，`user_item_state` 等用户写在提交后做的是
   有界定点刷新（LUX-867 已把整表重建改为单剧集刷新），因此暂不引入多类别优先级队列；等出现第二个
   派生类别时再按“用户写 > 任务控制 > 扫描派生”排序，机制入口已收敛在 `drain_*` + 每拍批量预算。
-- PostgreSQL 侧等价入队未做：PG 的 `media_search` 由行级触发器（`0219` 已按列过滤）维护，且本机没有
-  PG 实例可验证；`drain_search_reindex` 在 PG 上返回 0（不消费），行为与旧路径一致。差异记入
-  `COMPATIBILITY.md` 后续条目。
+- PostgreSQL 侧入队已做（见上），但**未做 PG 侧写预算基准**：本轮只验证语义与队列行为，没有在 PG 上复测
+  扫描墙钟/WAL（SQLite 的数字见上表）。PG 的写入放大改善预期来自同一机制（一条语句一次 outbox 插入），
+  需要真实 PG 扫描负载才能给数字。
 - 故障注入：单测覆盖“失败不推进水位 / 队列缺口全量重建 / 删除后清理行号映射”，尚无脚本化的断电或
   写失败演练。
 - 门禁遗留项（2026-10-28）：全量门禁（`--test-threads=8`，`test` @ `d59ce734`）结果为

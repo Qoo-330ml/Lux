@@ -844,6 +844,11 @@
       "name": "catalog_items_recent_sort_index",
       "sqlite": 236,
       "postgres": 238
+    },
+    {
+      "name": "search_reindex_outbox",
+      "sqlite": 237,
+      "postgres": 239
     }
   ],
   "sqlite_only": [
@@ -1095,11 +1100,6 @@
     {
       "name": "index_media_search_row_ids",
       "sqlite": 167,
-      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
-    },
-    {
-      "name": "search_reindex_outbox",
-      "sqlite": 237,
       "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
     }
   ],

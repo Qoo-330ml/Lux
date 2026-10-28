@@ -1,5 +1,13 @@
 # Lux 客户端兼容性矩阵
 
+## W4 PostgreSQL 搜索入队（2026-10-29）
+
+PostgreSQL 的 `media_search` 派生索引不再在写语句里同步维护：迁移 `0239_search_reindex_outbox.sql`
+把 `media_items` / `item_aliases` 的刷新触发器换成语句级入队触发器，只向
+`catalog_outbox(kind='search')` 追加，由 `search_reindex@1` 消费者重建。Lux/Emby API、DTO 与数据库对外
+模型不变；差异只在“写入后到消费者运行之间”的索引可见性：搜索请求进入匹配前仍会做一次有界排空
+（每请求最多 200 条），读己之写保持；后台 worker 每拍 500 条处理扫描积压。升级时为没有 `media_search`
+行的条目补一次入队，不会留下永久未索引的尾巴。SQLite 侧行为不变。
 ## PostgreSQL 迁移 208 启动修复（2026-10-22）
 
 `0208_content_restriction_index_queue.sql` 删除旧触发器时缺少 PostgreSQL 必需的

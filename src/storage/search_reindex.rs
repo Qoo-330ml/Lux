@@ -16,11 +16,10 @@ pub(crate) const SEARCH_REINDEX_CONSUMER: &str = "search_reindex@1";
 impl Database {
     /// Applies at most `batch` queued events, oldest first, and returns how many items were
     /// reindexed. Callers drain until it returns zero.
-    pub(crate) async fn drain_search_reindex(&self, batch: i64) -> Result<usize, StorageError> {
-        if self.backend == DatabaseBackend::Postgres {
-            // PostgreSQL still maintains `media_search` inline; nothing is queued there yet.
-            return Ok(0);
-        }
+    ///
+    /// Public so integration tests can exercise the consumer on both backends; application code
+    /// reaches it through the search request path and the background worker.
+    pub async fn drain_search_reindex(&self, batch: i64) -> Result<usize, StorageError> {
         // A trimmed or lost queue means events were skipped; re-enqueue everything rather than
         // leaving the index permanently missing rows.
         if let Some((applied_seq, oldest_remaining)) =
@@ -72,8 +71,11 @@ impl Database {
         })
     }
 
-    /// Rewrites the FTS rows for `item_ids` from the authoritative tables in one transaction.
+    /// Rewrites the search rows for `item_ids` from the authoritative tables in one transaction.
     async fn reindex_search_items(&self, item_ids: &[String]) -> Result<(), StorageError> {
+        if self.backend == DatabaseBackend::Postgres {
+            return self.reindex_search_items_postgres(item_ids).await;
+        }
         let placeholders = std::iter::repeat_n("?", item_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -128,6 +130,63 @@ impl Database {
             ),
         ];
         for sql in statements {
+            let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+            for item_id in item_ids {
+                statement = statement.bind(item_id);
+            }
+            statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?;
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// PostgreSQL variant: `media_search` is a plain table with a unique item_id, so the consumer
+    /// upserts from the authoritative tables and drops rows for items that no longer exist.
+    async fn reindex_search_items_postgres(&self, item_ids: &[String]) -> Result<(), StorageError> {
+        let placeholders = std::iter::repeat_n("?", item_ids.len())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut transaction = self
+            .pool
+            .begin()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        let upsert = format!(
+            "INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
+             SELECT item.id, item.title, item.sort_title, COALESCE(item.original_title, ''),
+                    COALESCE((SELECT string_agg(alias.alias, ' ')
+                              FROM item_aliases alias
+                              WHERE alias.item_id = item.id), '')
+             FROM media_items item
+             WHERE item.id IN ({placeholders})
+             ON CONFLICT (item_id) DO UPDATE SET
+                 title = EXCLUDED.title,
+                 sort_title = EXCLUDED.sort_title,
+                 original_title = EXCLUDED.original_title,
+                 aliases = EXCLUDED.aliases"
+        );
+        let drop_missing = format!(
+            "DELETE FROM media_search
+             WHERE item_id IN ({placeholders})
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_items WHERE media_items.id = media_search.item_id
+               )"
+        );
+        for sql in [upsert, drop_missing] {
             let mut statement = self.query(sqlx::AssertSqlSafe(sql));
             for item_id in item_ids {
                 statement = statement.bind(item_id);

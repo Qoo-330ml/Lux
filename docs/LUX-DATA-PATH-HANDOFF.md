@@ -62,7 +62,7 @@ python3 -m unittest tools/migration-map/test_parity.py tools/backend-branches/te
 | W1 生命周期与写放大 | 完成 | `LUX-DEVELOPMENT.md`「阶段 29 门」 |
 | W2 读模型切片 | 完成 | 同文件 §30 与 P2 阶段门状态 |
 | W3 首页/继续观看/搜索 | 完成 | LUX-867/868/869 段 + P3 完成状态；首页 p95 118.05→16.58 ms |
-| W4 触发器入队与写预算 | 完成（PG 等价入队未做） | 扫描 0.42→0.37 s、WAL 11.5→11.0 MiB；触发器开销 89→13 ms；`scripts/run-scan-write-bench.py`；ADR-050 |
+| W4 触发器入队与写预算 | 完成（两后端入队；PG 侧无写预算基准） | 扫描 0.42→0.37 s、WAL 11.5→11.0 MiB；触发器开销 89→13 ms；`scripts/run-scan-write-bench.py`；ADR-050 |
 | W5 CPU/协议层 | 部分（仅默认值待定） | 空闲退避、gzip（首页 92,674→8,308 B）、ETag/304、CPU/请求基线（首页 277.5 / 搜索 21.3 / 列表 2.1 ms）、前台 p95 → 媒体车道配额（默认关闭；比值 2.55→1.91；30 s 时间窗 + 模式阈值）、列表 `MediaStreams`、NFO 解码缓存（−0.28…0.36 ms/重复详情）、People/DTO 成本已量；ADR-049 |
 | W6 双后端与边界 | 部分 | 迁移配对 + 后端分支两清单与校验器（已入 `AGENTS.md`）、存储接口两片拆分（邮件 outbox、邀请/注册邮件流程；`repository.rs` 9,222→5,948）、typed 化首个查询（`user_item_state`）；ADR-051 |
 
