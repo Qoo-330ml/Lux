@@ -1335,3 +1335,24 @@ SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在
 `repository.rs`（整族查询分派）、`catalog.rs`/`library_deletion.rs`/`database_maintenance.rs`
 （JSON、级联与 pragma 差异）等；`search_reindex.rs` 里的一处是“PostgreSQL 仍走同步 FTS 维护”这个
 已记录的差距。
+
+## `TotalRecordCount` 与回滚步骤（W3/W5 收口）
+
+`TotalRecordCount`（Emby）与 `total`（Lux API）都表示**过滤后的匹配总数**，不是当前页条数：
+
+- 搜索与列表先应用 ACL、库启用状态与内容限制，再算总数；分页字段在总数之后计算。
+- 读模型 `on` 模式下，总数取自派生表；派生表缺行或未回填时**整页回退**权威查询，因此不会出现
+  “条目少一条、总数还是旧值”的短页。
+- 搜索的 FTS 命中为空时回退 LIKE，总数同样来自同一个 SQL 的计数，不会跨路径混用。
+- 已知上限：搜索/列表的总数在 66k 夹具上仍要遍历匹配集（搜索 “Spec” 命中 5.6 万行时 p95 约 106 ms），
+  若要再降需要改总数为有界/近似值，这属于 API 语义变更，需所有者确认（见 `LUX-DEVELOPMENT.md` W5 剩余）。
+
+回滚步骤（按改动类别）：
+
+| 改动 | 回滚方式 | 数据影响 |
+|---|---|---|
+| 读模型开关 `LUX_READ_MODEL_MODE=on` | 设回 `off`（默认值），无需迁移回退 | 派生表可保留，随时重建 |
+| 读模型派生行形状变更 | 递增 `READ_MODEL_SCHEMA_VERSION` 后重启，自动重建 | 旧行被忽略，新构建重建 |
+| 搜索入队（W4） | 迁移 `0237` 已随发布落地；回退需重新部署旧二进制，旧触发器由遗留修复路径重建 | FTS 会在旧二进制启动时由触发器继续维护；出队行残留在 `catalog_outbox`，可安全清空 |
+| JSON gzip/ETag（W5） | 移除 `CompressionLayer`/`json_response_etag` 两个 layer | 无数据影响；客户端立即回到整包传输 |
+| 迁移配对清单（W6） | 删除 `docs/migration-map.json` 即跳过校验 | 无运行期影响 |

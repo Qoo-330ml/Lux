@@ -2916,3 +2916,32 @@ SQL 级补充（同一夹具，5,000 次标题更新，`synchronous=NORMAL`）�
 - 搜索的 21 ms CPU 不在 DTO 装配里：把装配阶段的逐条深克隆改成取得所有权后，CPU 没有变化
   （21.3 → 21.8 ms，噪声内），说明成本在"匹配 5.6 万行 + 计算总数 + 排序"这条查询上。
 - 库列表与库入口的 CPU 已经很低（1–2 ms），继续压的空间有限。
+
+## 测量模板与回退门（W0/W5 收口）
+
+固定夹具（`scripts/run-api-performance.py` 生成，`tools/catalog-fixture/generate.py` 为生成器）：
+
+| 项 | 值 |
+|---|---|
+| 规模 | 10,000 电影 / 1,000 剧集 / 50,000 集（66,000 `media_items`；`catalog_items` 同数量） |
+| 用户状态 | 2,000 条 `user_item_state`，40 条继续观看 |
+| 库 | 3 个（2 个内容库 + 合集库）；`--scan-libraries` 可再种真实文件库 |
+| 数据库 | 约 375 MB（含读模型与索引）；WAL 模式 |
+| 认证 | 夹具直接种入 `lux_session=lux-api-performance-token`（含 CSRF `spec-csrf-token`） |
+| 机器 | macOS arm64；**不得**据此推断 NAS/x86_64 |
+
+每个端点按下面一行记录（模板，复制填写）：
+
+| 端点 | 模式 | p50 | p95 | 响应字节 | 响应字节(gzip) | SQL/请求 | CPU/请求 | 逐字节一致 | 夹具/提交 |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+
+- 延迟用 `scripts/compare-read-model-modes.py`（交错多轮取中位数，单轮数字不作为结论）。
+- 字节用同一脚本的 `bytes` 字段与手工 `Accept-Encoding: gzip` 对照。
+- CPU 用 `scripts/run-api-cpu-bench.py`（进程 CPU 采样，见“CPU / 请求基线”一节）。
+- 扫描写入用 `scripts/run-scan-write-bench.py`（墙钟、累计/峰值 WAL、队列排空）。
+
+**回退门**：任何读路径切换（`on`/`shadow`）或协议层改动，必须同时满足
+
+1. 响应逐字节一致（`off` 与 `on`，或改动前后），
+2. p95 不劣化超过 5%（多轮中位数，两模式区间不重叠才算差异），
+3. 失败或差异可解释——否则回退到上一模式并记录原因，不允许“先上线再看”。
