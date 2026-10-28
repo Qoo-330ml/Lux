@@ -8,6 +8,8 @@ pub(crate) struct CatalogSearchQuery<'a> {
     pub(crate) offset: i64,
     pub(crate) limit: i64,
     pub(crate) content_restrictions: Option<&'a repository::UserContentRestrictions>,
+    /// When false the backend skips the total count (search results then report a total of 0).
+    pub(crate) include_total: bool,
 }
 
 // LUX-564 lands the cache foundation before S3a adds its first production caller.

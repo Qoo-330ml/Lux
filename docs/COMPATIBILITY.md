@@ -1,5 +1,13 @@
 # Lux 客户端兼容性矩阵
 
+## gzip 压缩与搜索总数快路径（2026-10-29）
+
+- JSON 响应可能带 `Content-Encoding: gzip`：只压缩“成功、`application/json`、已知长度 ≤4 MiB”的响应；
+  媒体流、图片、SPA 回退、SSE 与 Range 请求不受影响。ETag 仍基于**未压缩** body，`If-None-Match` 命中
+  返回 304 且不压缩；响应同时带 `Cache-Control: private, no-cache`。`tower-http` 的 `compression-gzip`
+  及三个纯 Rust 传递依赖（`async-compression` / `compression-codecs` / `compression-core`）已由所有者批准。
+- 搜索新增 `count=false`（Lux `/api/v1/search`）与 Emby `EnableTotalRecordCount=false`：返回的条目与排序
+  不变，`total` / `TotalRecordCount` 报 0，后端跳过总数计算。默认（不传）仍返回精确总数与现有排序。
 ## W4 PostgreSQL 搜索入队（2026-10-29）
 
 PostgreSQL 的 `media_search` 派生索引不再在写语句里同步维护：迁移 `0239_search_reindex_outbox.sql`

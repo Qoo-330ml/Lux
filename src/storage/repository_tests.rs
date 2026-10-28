@@ -33201,6 +33201,7 @@ async fn search_pages_past_the_end_still_report_the_real_total()
 
     let page = database
         .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+            include_total: true,
             query: "Zebra",
             like_query: "%Zebra%",
             item_types: &["MOVIE".to_owned()],

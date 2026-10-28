@@ -10,7 +10,8 @@
 > 「数据路径重构（W0–W6）实施状态」表、W4/W5/W6 段与「门禁豁免清单」，以及
 > `docs/LUX-DATA-PATH-HANDOFF.md`。工作区 `/Volumes/Toshiba/mywork/Lux`，分支 `test`，
 > HEAD = `d0b1b9a8`（若已前进以 `git log` 为准）。W5/W6 的剩余项都已落地或有书面结论；剩下的是待所有者
-> 拍板的产品决定（前台降档默认值、搜索总数语义、门禁豁免、gzip 依赖）与“本机无 PG 实例”的环境阻塞。
+> 拍板的产品决定（前台降档默认值、门禁豁免）与“PG 侧写预算基准”的证据缺口；gzip 依赖与搜索总数语义已于
+> 2026-10-29 决定（见 §5）。
 > W5：前台 p95 → 媒体车道的降档已实现（默认关闭）并验证（媒体车道有活时比值 2.55 → 1.91、恢复 2.5 s），
 > 30 s 时间窗 + 按读模型模式阈值；`Fields` 列表 `MediaStreams`、NFO 解码缓存（−0.28…−0.36 ms/重复详情，
 > 指纹+bytes+updated_at 校验）、People 与 DTO 成本均已量。W6：迁移/分支两份清单与校验器、存储拆分两片
@@ -86,11 +87,12 @@ python3 -m unittest tools/migration-map/test_parity.py tools/backend-branches/te
 ## 5. 待决事项（需要项目所有者）
 
 1. 门禁豁免是否接受（见 §2）。
-2. `tower-http` 的 `compression-gzip` 依赖是否批准（计划 §11 第 2 条）：引入纯 Rust 的
+2. ~~`tower-http` 的 `compression-gzip` 依赖~~ **已批准（2026-10-29）**：引入纯 Rust 的
    `async-compression` / `compression-codecs` / `compression-core`，`http-body` 转直连依赖；
    收益见 W5 段。不同意可移除，ETag/304 不受影响。
-3. 搜索总数语义：若要继续压搜索 CPU（目标 −40%），需要接受“有界/近似总数”或“按相关度排序”之一，
-   两者都是 API 语义变更。当前搜索 p95 106.6 ms（拉丁词元，5.6 万命中）仍在 500 ms 预算内。
+3. ~~搜索总数语义~~ **已决定（2026-10-29）：不改契约**。保留精确总数与现有排序；新增 `count=false` /
+   Emby `EnableTotalRecordCount=false` 的“跳过计数”快路径（实测仅 −1.1 ms，成本主要在匹配与排序）。
+   “搜索 CPU −40%”记为受 API 契约限制未达成（p95 余量 4.7×）；相关度排序留作显式 `sort=relevance` 参数。
 4. 前台降档开关的默认值：时间窗与模式阈值已就位，翻默认是一行；未翻的两个理由（旧路径实例会常开、
    活体恢复验证需安静机器）见 W5「剩余」第 3 条。
 

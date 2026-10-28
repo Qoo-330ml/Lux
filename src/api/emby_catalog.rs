@@ -2408,13 +2408,14 @@ pub(super) async fn emby_catalog_page_from_query(
                 _ => vec!["MOVIE".to_owned(), "SERIES".to_owned()],
             });
         return catalog
-            .search_items_with_types(
+            .search_items_with_types_and_total(
                 principal,
                 &search_query,
                 &like_query,
                 item_types,
                 offset,
                 limit,
+                query.enable_total_record_count.unwrap_or(true),
             )
             .await
             .map_err(emby_catalog_error_status);

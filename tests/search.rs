@@ -217,6 +217,17 @@ async fn fts_search_matches_chinese_titles_and_aliases_with_acl()
     assert_eq!(lux_body["total"], 1);
     assert_eq!(lux_body["items"][0]["id"], chinese_id);
 
+    // `count=false` follows the list-endpoint contract: the same page, with the total skipped.
+    let without_total = client
+        .get(format!("{base_url}/api/v1/search?q=银河&count=false"))
+        .header("Cookie", format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(without_total.status(), reqwest::StatusCode::OK);
+    let without_total_body = without_total.json::<Value>().await?;
+    assert_eq!(without_total_body["total"], 0);
+    assert_eq!(without_total_body["items"][0]["id"], chinese_id);
+
     let multi_word = client
         .get(format!("{base_url}/api/v1/search?q=Hidden%20Movie"))
         .header("Cookie", format!("lux_session={session}"))

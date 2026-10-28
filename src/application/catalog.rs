@@ -134,6 +134,7 @@ struct SearchFlightKey {
     content_restriction_version: Option<i64>,
     offset: i64,
     limit: i64,
+    include_total: bool,
 }
 
 struct SearchFlight {
@@ -2611,6 +2612,26 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        self.search_items_with_types_and_total(
+            principal, query, like_query, item_types, offset, limit, true,
+        )
+        .await
+    }
+
+    /// Search with the caller's choice of whether the total is computed. Callers that do not read
+    /// the total pass `false`, so the backend can skip the window count that forces it to scan
+    /// every match.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn search_items_with_types_and_total(
+        &self,
+        principal: AccessPrincipal,
+        query: &str,
+        like_query: &str,
+        item_types: Vec<String>,
+        offset: i64,
+        limit: i64,
+        include_total: bool,
+    ) -> Result<CatalogPage, CatalogError> {
         self.apply_pending_search_reindex().await;
         let library_ids = if principal.is_admin {
             None
@@ -2636,6 +2657,7 @@ impl CatalogService {
                 .map(|restrictions| restrictions.version),
             offset,
             limit,
+            include_total,
         };
         let (key, flight) = self.search_flights.begin(key).await;
         match flight {
@@ -2659,6 +2681,7 @@ impl CatalogService {
                             offset,
                             limit,
                             content_restrictions: task_content_restrictions.as_ref(),
+                            include_total,
                         })
                         .await;
                     let page = result.as_ref().ok().map(|page| Arc::new(page.clone()));
@@ -2687,6 +2710,7 @@ impl CatalogService {
                     offset,
                     limit,
                     content_restrictions: content_restrictions.as_ref(),
+                    include_total,
                 })
                 .await
             }
@@ -2699,6 +2723,7 @@ impl CatalogService {
                     offset,
                     limit,
                     content_restrictions: content_restrictions.as_ref(),
+                    include_total,
                 })
                 .await
             }
@@ -3584,6 +3609,7 @@ mod tests {
     async fn failed_search_flight_does_not_leave_waiters_blocked() {
         let registry = SearchFlightRegistry::new();
         let key = SearchFlightKey {
+            include_total: true,
             user_id: "user-1".to_owned(),
             is_admin: false,
             library_ids: Some(vec!["library-1".to_owned()]),

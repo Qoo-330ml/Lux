@@ -108,6 +108,8 @@ struct CatalogSearchPageBindings<'a> {
     content_restriction_binds: &'a [CatalogBind<'a>],
     offset: i64,
     limit: i64,
+    /// Select the window count only when the caller asked for a total.
+    include_total: bool,
 }
 
 /// Number of `like_query` bindings in the fallback search branch: display title, original title,
@@ -1136,6 +1138,12 @@ impl Database {
         let library_ids = search.library_ids;
         let offset = search.offset;
         let limit = search.limit;
+        let include_total = search.include_total;
+        let total_projection = if include_total {
+            ", COUNT(*) OVER() AS total"
+        } else {
+            ""
+        };
         if item_types.is_empty() {
             return Ok((Vec::new(), 0));
         }
@@ -1181,7 +1189,7 @@ impl Database {
         // Complete-token searches are served by FTS alone. The LIKE branch remains
         // available for partial searches, but is avoided when FTS already has a page.
         let fts_page_query = format!(
-            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({fts_query}) matches
+            "SELECT matches.id{total_projection} FROM ({fts_query}) matches
              JOIN media_items mi ON mi.id = matches.id
              ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
         );
@@ -1196,6 +1204,7 @@ impl Database {
                     content_restriction_binds: &content_restriction_binds,
                     offset,
                     limit,
+                    include_total,
                 },
             )
             .await?;
@@ -1216,7 +1225,7 @@ impl Database {
             library_filter.as_deref().unwrap_or_default(),
         );
         let like_page_query = format!(
-            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({like_query_sql}) matches
+            "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
              JOIN media_items mi ON mi.id = matches.id
              ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
         );
@@ -1232,6 +1241,7 @@ impl Database {
                         content_restriction_binds: &content_restriction_binds,
                         offset,
                         limit,
+                        include_total,
                     },
                 )
                 .await;
@@ -1239,7 +1249,7 @@ impl Database {
 
         let union_query = format!("{fts_query} UNION {like_query_sql}");
         let union_page_query = format!(
-            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({union_query}) matches
+            "SELECT matches.id{total_projection} FROM ({union_query}) matches
              JOIN media_items mi ON mi.id = matches.id
              ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
         );
@@ -1253,6 +1263,7 @@ impl Database {
                 content_restriction_binds: &content_restriction_binds,
                 offset,
                 limit,
+                include_total,
             },
         )
         .await
@@ -1267,6 +1278,12 @@ impl Database {
         let library_ids = search.library_ids;
         let offset = search.offset;
         let limit = search.limit;
+        let include_total = search.include_total;
+        let total_projection = if include_total {
+            ", COUNT(*) OVER() AS total"
+        } else {
+            ""
+        };
         if let Some(library_ids) = library_ids
             && library_ids.is_empty()
         {
@@ -1305,7 +1322,7 @@ impl Database {
             library_filter.as_deref().unwrap_or_default(),
         );
         let page_query = format!(
-            "SELECT matches.id, COUNT(*) OVER() AS total FROM ({like_query_sql}) matches
+            "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
              JOIN media_items mi ON mi.id = matches.id
              ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
         );
@@ -1319,6 +1336,7 @@ impl Database {
                 content_restriction_binds: &content_restriction_binds,
                 offset,
                 limit,
+                include_total,
             },
         )
         .await
@@ -1379,6 +1397,9 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
+        if !bindings.include_total {
+            return Ok((rows.into_iter().map(|row| row.get("id")).collect(), 0));
+        }
         if rows.is_empty() && bindings.offset > 0 {
             // `COUNT(*) OVER()` only appears on returned rows, so a page past the end would
             // report a total of zero. Ask for the first page to learn the real total.

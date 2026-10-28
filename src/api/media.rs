@@ -49,6 +49,8 @@ pub(super) struct LuxSearchQuery {
     q: Option<String>,
     page: Option<i64>,
     page_size: Option<i64>,
+    /// Same contract as the list endpoints: `count=false` skips the total, which then reports 0.
+    count: Option<bool>,
 }
 
 pub(super) async fn lux_search(
@@ -80,7 +82,7 @@ pub(super) async fn lux_search(
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match catalog
-        .search_items_with_types(
+        .search_items_with_types_and_total(
             AccessPrincipal::new(user.id, user.is_admin),
             &search_query,
             &like_query,
@@ -90,6 +92,7 @@ pub(super) async fn lux_search(
                 .collect(),
             offset,
             limit,
+            query.count.unwrap_or(true),
         )
         .await
     {
