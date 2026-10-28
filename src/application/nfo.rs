@@ -1078,6 +1078,10 @@ fn push_credit(values: &mut Vec<LocalNfoCredit>, provider_id: String, name: &str
 /// replaces the fingerprint and therefore invalidates the entry.
 const NFO_DECODE_CACHE_CAPACITY: usize = 256;
 
+/// Fingerprint, byte length and update time of the cached row: cheap to fetch, and all three change
+/// when the row is rewritten or repaired, so a stale decode is detected without reading the JSON.
+type NfoValidity = (Vec<u8>, i64, i64);
+
 #[derive(Default)]
 struct LocalNfoDecodeCache {
     entries: HashMap<String, CachedNfoDetails>,
@@ -1085,20 +1089,20 @@ struct LocalNfoDecodeCache {
 }
 
 struct CachedNfoDetails {
-    fingerprint: Vec<u8>,
+    validity: NfoValidity,
     details: LocalNfoDetails,
 }
 
 impl LocalNfoDecodeCache {
-    fn fingerprint(&self, item_id: &str) -> Option<Vec<u8>> {
+    fn validity(&self, item_id: &str) -> Option<NfoValidity> {
         self.entries
             .get(item_id)
-            .map(|entry| entry.fingerprint.clone())
+            .map(|entry| entry.validity.clone())
     }
 
-    fn get(&mut self, item_id: &str, fingerprint: &[u8]) -> Option<LocalNfoDetails> {
+    fn get(&mut self, item_id: &str, validity: &NfoValidity) -> Option<LocalNfoDetails> {
         let entry = self.entries.get(item_id)?;
-        if entry.fingerprint != fingerprint {
+        if &entry.validity != validity {
             return None;
         }
         let details = entry.details.clone();
@@ -1106,14 +1110,9 @@ impl LocalNfoDecodeCache {
         Some(details)
     }
 
-    fn insert(&mut self, item_id: &str, fingerprint: &[u8], details: LocalNfoDetails) {
-        self.entries.insert(
-            item_id.to_owned(),
-            CachedNfoDetails {
-                fingerprint: fingerprint.to_vec(),
-                details,
-            },
-        );
+    fn insert(&mut self, item_id: &str, validity: NfoValidity, details: LocalNfoDetails) {
+        self.entries
+            .insert(item_id.to_owned(), CachedNfoDetails { validity, details });
         self.touch(item_id);
         while self.entries.len() > NFO_DECODE_CACHE_CAPACITY {
             let Some(oldest) = self.order.pop_front() else {
@@ -1226,18 +1225,18 @@ impl LocalNfoMetadataStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn cached_fingerprint(&self, item_id: &str) -> Option<Vec<u8>> {
-        self.lock_decoded().fingerprint(item_id)
+    fn cached_validity(&self, item_id: &str) -> Option<NfoValidity> {
+        self.lock_decoded().validity(item_id)
     }
 
-    fn cached_details(&self, item_id: &str, fingerprint: &[u8]) -> Option<LocalNfoDetails> {
-        self.lock_decoded().get(item_id, fingerprint)
+    fn cached_details(&self, item_id: &str, validity: &NfoValidity) -> Option<LocalNfoDetails> {
+        self.lock_decoded().get(item_id, validity)
     }
 
-    fn remember_details(&self, item_id: &str, fingerprint: &[u8], details: &LocalNfoDetails) {
-        if valid_nfo_content_fingerprint(fingerprint) {
+    fn remember_details(&self, item_id: &str, validity: NfoValidity, details: &LocalNfoDetails) {
+        if valid_nfo_content_fingerprint(&validity.0) {
             self.lock_decoded()
-                .insert(item_id, fingerprint, details.clone());
+                .insert(item_id, validity, details.clone());
         }
     }
 
@@ -1289,20 +1288,20 @@ impl LocalNfoMetadataStore {
         &self,
         item_id: &str,
     ) -> Result<Option<LocalNfoDetails>, LocalNfoMetadataStoreError> {
-        if let Some(cached_fingerprint) = self.cached_fingerprint(item_id) {
+        if let Some(cached_validity) = self.cached_validity(item_id) {
             let current = self
                 .database
-                .media_item_nfo_fingerprint(item_id)
+                .media_item_nfo_validity(item_id)
                 .await
                 .map_err(LocalNfoMetadataStoreError::Storage)?;
-            if current.as_deref() == Some(cached_fingerprint.as_slice())
-                && let Some(details) = self.cached_details(item_id, &cached_fingerprint)
+            if current.as_ref() == Some(&cached_validity)
+                && let Some(details) = self.cached_details(item_id, &cached_validity)
             {
                 return Ok(Some(details));
             }
             self.forget_details(item_id);
         }
-        let Some((json, fingerprint)) = self
+        let Some((json, fingerprint, bytes, updated_at)) = self
             .database
             .media_item_nfo_snapshot(item_id)
             .await
@@ -1313,9 +1312,9 @@ impl LocalNfoMetadataStore {
         };
         let details = self.decode_cached_nfo(item_id, &json).await?;
         if let Some(details) = details.as_ref()
-            && let Some(fingerprint) = fingerprint.as_deref()
+            && let Some(fingerprint) = fingerprint
         {
-            self.remember_details(item_id, fingerprint, details);
+            self.remember_details(item_id, (fingerprint, bytes, updated_at), details);
         }
         Ok(details)
     }
@@ -1333,8 +1332,8 @@ impl LocalNfoMetadataStore {
         let cached = item_ids
             .iter()
             .filter_map(|item_id| {
-                self.cached_fingerprint(item_id)
-                    .map(|fingerprint| (item_id.clone(), fingerprint))
+                self.cached_validity(item_id)
+                    .map(|validity| (item_id.clone(), validity))
             })
             .collect::<Vec<_>>();
         if !cached.is_empty() {
@@ -1345,12 +1344,12 @@ impl LocalNfoMetadataStore {
                 .collect::<Vec<_>>();
             let current = self
                 .database
-                .media_item_nfo_fingerprints_batch(&cached_ids)
+                .media_item_nfo_validities_batch(&cached_ids)
                 .await
                 .map_err(LocalNfoMetadataStoreError::Storage)?;
-            for (item_id, fingerprint) in cached {
-                if current.get(&item_id).map(Vec::as_slice) == Some(fingerprint.as_slice())
-                    && let Some(decoded) = self.cached_details(&item_id, &fingerprint)
+            for (item_id, validity) in cached {
+                if current.get(&item_id) == Some(&validity)
+                    && let Some(decoded) = self.cached_details(&item_id, &validity)
                 {
                     details.insert(item_id, decoded);
                 } else {
@@ -1371,10 +1370,10 @@ impl LocalNfoMetadataStore {
             .media_item_nfo_snapshot_batch(&pending)
             .await
             .map_err(LocalNfoMetadataStoreError::Storage)?;
-        for (item_id, (json, fingerprint)) in snapshots {
+        for (item_id, (json, fingerprint, bytes, updated_at)) in snapshots {
             if let Some(decoded) = self.decode_cached_nfo(&item_id, &json).await? {
-                if let Some(fingerprint) = fingerprint.as_deref() {
-                    self.remember_details(&item_id, fingerprint, &decoded);
+                if let Some(fingerprint) = fingerprint {
+                    self.remember_details(&item_id, (fingerprint, bytes, updated_at), &decoded);
                 }
                 details.insert(item_id, decoded);
             }
@@ -3988,33 +3987,40 @@ mod tests {
         );
     }
     #[test]
-    fn decoded_nfo_cache_is_bounded_and_gated_by_fingerprint() {
+    fn decoded_nfo_cache_is_bounded_and_gated_by_the_row_validity() {
         let mut cache = LocalNfoDecodeCache::default();
         let details = LocalNfoDetails {
             rating: Some(8.0),
             ..LocalNfoDetails::default()
         };
-        cache.insert("item-1", &[7_u8; 32], details);
+        let validity: NfoValidity = (vec![7_u8; 32], 4096, 1_700_000_000);
+        cache.insert("item-1", validity.clone(), details);
         assert_eq!(
             cache
-                .get("item-1", &[7_u8; 32])
+                .get("item-1", &validity)
                 .and_then(|details| details.rating),
             Some(8.0)
         );
-        assert!(
-            cache.get("item-1", &[9_u8; 32]).is_none(),
-            "a different fingerprint must miss"
-        );
+        for (label, changed) in [
+            ("fingerprint", (vec![9_u8; 32], 4096, 1_700_000_000)),
+            ("byte length", (vec![7_u8; 32], 4097, 1_700_000_000)),
+            ("update time", (vec![7_u8; 32], 4096, 1_700_000_001)),
+        ] {
+            assert!(
+                cache.get("item-1", &changed).is_none(),
+                "a changed {label} must miss"
+            );
+        }
         for index in 0..(NFO_DECODE_CACHE_CAPACITY + 8) {
             cache.insert(
                 &format!("bulk-{index}"),
-                &[index as u8; 32],
+                (vec![index as u8; 32], 1, 1),
                 LocalNfoDetails::default(),
             );
         }
         assert!(cache.entries.len() <= NFO_DECODE_CACHE_CAPACITY);
         assert!(
-            cache.get("item-1", &[7_u8; 32]).is_none(),
+            cache.get("item-1", &validity).is_none(),
             "the oldest entries are evicted first"
         );
     }

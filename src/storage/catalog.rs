@@ -8533,13 +8533,16 @@ impl Database {
         Ok(())
     }
 
-    /// Fingerprint of the cached NFO snapshot, without reading the (potentially large) JSON body.
-    pub(crate) async fn media_item_nfo_fingerprint(
+    /// Cheap validity stamp of the cached NFO snapshot: fingerprint, byte length and update time.
+    ///
+    /// None of these require reading the (potentially large) JSON body, and all three change when
+    /// the row is rewritten or repaired, so a decoded-details cache can tell whether it is stale.
+    pub(crate) async fn media_item_nfo_validity(
         &self,
         item_id: &str,
-    ) -> Result<Option<Vec<u8>>, StorageError> {
-        self.query_scalar(
-            "SELECT fingerprint
+    ) -> Result<Option<(Vec<u8>, i64, i64)>, StorageError> {
+        self.query_as::<(Vec<u8>, i64, i64)>(
+            "SELECT fingerprint, bytes, updated_at
              FROM media_item_nfo_cache
              WHERE item_id = ? AND fingerprint IS NOT NULL",
         )
@@ -8552,12 +8555,12 @@ impl Database {
         })
     }
 
-    /// Batch fingerprint lookup for list pages: one cheap query instead of a JSON body per item.
-    pub(crate) async fn media_item_nfo_fingerprints_batch(
+    /// Batch validity lookup for list pages: one cheap query instead of a JSON body per item.
+    pub(crate) async fn media_item_nfo_validities_batch(
         &self,
         item_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, Vec<u8>>, StorageError> {
-        let mut fingerprints = std::collections::HashMap::new();
+    ) -> Result<std::collections::HashMap<String, (Vec<u8>, i64, i64)>, StorageError> {
+        let mut validities = std::collections::HashMap::new();
         for chunk in item_ids.chunks(NFO_METADATA_BATCH_SIZE) {
             if chunk.is_empty() {
                 continue;
@@ -8566,7 +8569,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT item_id, fingerprint
+                "SELECT item_id, fingerprint, bytes, updated_at
                  FROM media_item_nfo_cache
                  WHERE item_id IN ({placeholders}) AND fingerprint IS NOT NULL"
             );
@@ -8583,20 +8586,27 @@ impl Database {
                         source,
                     })?;
             for row in rows {
-                fingerprints.insert(row.get("item_id"), row.get("fingerprint"));
+                validities.insert(
+                    row.get("item_id"),
+                    (
+                        row.get("fingerprint"),
+                        row.get("bytes"),
+                        row.get("updated_at"),
+                    ),
+                );
             }
         }
-        Ok(fingerprints)
+        Ok(validities)
     }
 
-    /// JSON body plus fingerprint in one query so a cache miss does not pay an extra round trip.
+    /// JSON body plus its validity stamp in one query, so a cache miss does not pay a second trip.
     pub(crate) async fn media_item_nfo_snapshot(
         &self,
         item_id: &str,
-    ) -> Result<Option<(String, Option<Vec<u8>>)>, StorageError> {
+    ) -> Result<Option<(String, Option<Vec<u8>>, i64, i64)>, StorageError> {
         let row = self
             .query(
-                "SELECT json, fingerprint
+                "SELECT json, fingerprint, bytes, updated_at
                  FROM media_item_nfo_cache
                  WHERE item_id = ?",
             )
@@ -8607,14 +8617,22 @@ impl Database {
                 path: self.path.clone(),
                 source,
             })?;
-        Ok(row.map(|row| (row.get("json"), row.get("fingerprint"))))
+        Ok(row.map(|row| {
+            (
+                row.get("json"),
+                row.get("fingerprint"),
+                row.get("bytes"),
+                row.get("updated_at"),
+            )
+        }))
     }
 
     /// Batch snapshot lookup for list endpoints.
     pub(crate) async fn media_item_nfo_snapshot_batch(
         &self,
         item_ids: &[String],
-    ) -> Result<std::collections::HashMap<String, (String, Option<Vec<u8>>)>, StorageError> {
+    ) -> Result<std::collections::HashMap<String, (String, Option<Vec<u8>>, i64, i64)>, StorageError>
+    {
         let mut snapshots = std::collections::HashMap::new();
         for chunk in item_ids.chunks(NFO_METADATA_BATCH_SIZE) {
             if chunk.is_empty() {
@@ -8624,7 +8642,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!(
-                "SELECT item_id, json, fingerprint
+                "SELECT item_id, json, fingerprint, bytes, updated_at
                  FROM media_item_nfo_cache
                  WHERE item_id IN ({placeholders})"
             );
@@ -8643,7 +8661,12 @@ impl Database {
             for row in rows {
                 snapshots.insert(
                     row.get("item_id"),
-                    (row.get("json"), row.get("fingerprint")),
+                    (
+                        row.get("json"),
+                        row.get("fingerprint"),
+                        row.get("bytes"),
+                        row.get("updated_at"),
+                    ),
                 );
             }
         }

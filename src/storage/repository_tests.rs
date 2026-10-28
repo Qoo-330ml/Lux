@@ -32636,11 +32636,11 @@ async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn 
         "only items with a cached snapshot are returned"
     );
     assert_eq!(
-        cached.get("nfo-a").map(|(json, _)| json.as_str()),
+        cached.get("nfo-a").map(|(json, ..)| json.as_str()),
         Some("{\"title\":\"A\"}")
     );
     assert_eq!(
-        cached.get("nfo-c").map(|(json, _)| json.as_str()),
+        cached.get("nfo-c").map(|(json, ..)| json.as_str()),
         Some("{\"title\":\"C\"}")
     );
     assert!(!cached.contains_key("nfo-b"));
@@ -32649,11 +32649,11 @@ async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn 
     assert!(
         !cached
             .values()
-            .any(|(_, fingerprint)| fingerprint.is_some())
+            .any(|(_, fingerprint, ..)| fingerprint.is_some())
     );
     assert!(
         database
-            .media_item_nfo_fingerprints_batch(&item_ids)
+            .media_item_nfo_validities_batch(&item_ids)
             .await?
             .is_empty()
     );
