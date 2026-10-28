@@ -18290,6 +18290,21 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 - [ ] 回滚演练：NFO 缓存回填中断、候选清理失败、批写部分失败均可恢复。
 - [ ] 经项目所有者确认后，才登记并进入 P2（读模型）任务。
 
+### 数据路径重构（W0–W6）实施状态（2026-10-28）
+
+本表是 `docs/LUX-DATA-PATH-PLAN.md` 七个工作包与已完成任务的总览；每项的验收细节与数字见本文件
+对应段落和 `PERFORMANCE.md`。
+
+| 工作包 | 任务 | 状态 | 证据位置 |
+|---|---|---|---|
+| W0 观测、夹具与门禁 | LUX-854–856 | 完成 | 本文 §29；`PERFORMANCE.md` 端点基线；`scripts/run-api-performance.py`、`tools/catalog-fixture/` |
+| W1 数据生命周期与写放大 | LUX-857–860 | 完成 | 本文“阶段 29 门” |
+| W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
+| W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
+| W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU 基线 | 部分完成（前台反馈联动、`Fields` 投影、NFO LRU、DTO `Value` 树未做） | 本文 W5 段；`scripts/run-api-cpu-bench.py`；ADR-049 |
+| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单 | 部分完成（热点 typed 化、存储接口拆分未做） | `docs/migration-map.json`、`docs/backend-branches.json`；ADR-051 |
+
 ## 30. P2 读模型任务（阶段 29 门通过后）
 
 项目所有者已于 2026-10-27 确认：接受扫描墙钟/吞吐复测、NFO 回填中断演练、PostgreSQL 端点延迟基线
