@@ -33,6 +33,19 @@ async fn json_response_etag(request: Request<Body>, next: Next) -> Response {
         Some(length) if length <= JSON_ETAG_MAX_BYTES as u64 => {}
         _ => return Response::from_parts(parts, body),
     }
+    // A handler that already declared a cache policy keeps it, and `no-store` responses are never
+    // tagged: the middleware must not rewrite an explicit policy.
+    let existing_cache_control = parts
+        .headers
+        .get(header::CACHE_CONTROL)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    if existing_cache_control
+        .as_deref()
+        .is_some_and(|value| value.contains("no-store"))
+    {
+        return Response::from_parts(parts, body);
+    }
     let bytes = match axum::body::to_bytes(body, JSON_ETAG_MAX_BYTES).await {
         Ok(bytes) => bytes,
         Err(error) => {
@@ -58,9 +71,11 @@ async fn json_response_etag(request: Request<Body>, next: Next) -> Response {
         return not_modified;
     }
     parts.headers.insert(header::ETAG, header_value(&etag));
-    parts
-        .headers
-        .insert(header::CACHE_CONTROL, header_value("private, no-cache"));
+    if existing_cache_control.is_none() {
+        parts
+            .headers
+            .insert(header::CACHE_CONTROL, header_value("private, no-cache"));
+    }
     Response::from_parts(parts, Body::from(bytes))
 }
 
