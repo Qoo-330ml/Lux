@@ -18315,7 +18315,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us`、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；People 成本已量）、列表 `MediaStreams` 投影 | 部分完成（NFO LRU、DTO `Value` 树未做；反馈的时间窗/默认默认值待改） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`；ADR-049 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量 | 部分完成（NFO LRU、DTO `Value` 树未做；反馈默认值与活体恢复验证待定） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`；ADR-049 |
 | W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单） | 部分完成（热点 typed 化、存储接口拆分未做） | `docs/migration-map.json`、`docs/backend-branches.json`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
@@ -18572,12 +18572,12 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   `json_responses_answer_if_none_match_with_304`、`json_responses_are_gzipped_only_when_requested`。
 - 前台 p95 → 后台媒体车道配额（`3d7daa28`，**默认关闭**）：新增 `LUX_BACKGROUND_FOREGROUND_THROTTLE=on`
   （`1`/`true`/`yes` 同义）开启，可选 `LUX_BACKGROUND_FOREGROUND_P95_MS` 改阈值；读取
-  `RequestMetrics::route_p95_us("/api/v1/home")`（有界样本，只读、不改快照结构）。p95 ≥ 阈值（默认
-  300 ms，与 `HOME_P95_DEGRADED_MS` 同口径）时把媒体车道——`Probe`/`LocalNfo`/`LocalImage`/
+  `RequestMetrics::route_p95_recent_us("/api/v1/home", 30 s)`（30 s 时间窗内的有界样本，只读、不改快照
+  结构）。p95 ≥ 阈值（`off` 300 ms / `on` 80 ms，可用环境变量覆盖）时把媒体车道——`Probe`/`LocalNfo`/`LocalImage`/
   `Thumbnail` 共用的那条 semaphore——收掉一半名额（保留 `ceil(媒体容量/2)`，且至少 1 个），p95 回落
   并连续 10 s 后整批归还；重新读信号最多 1 次/秒，取名额用非阻塞 `try_acquire_owned`，有任务在跑就
   下一拍再取，因此不会阻塞等待、也不抢占已运行的工作。信号来源由 `AppState` 构造时注册一次（进程级
-  预算是单例，预算先创建也能事后补挂），降档只改后台并发，不触碰任何 SQL/DTO。回归 4 项
+  预算是单例，预算先创建也能事后补挂），降档只改后台并发，不触碰任何 SQL/DTO。回归 5 项
   （`--lib application::background_work::tests` 15/15）：开关默认关闭与阈值解析、保留至少 1 个名额、
   慢→收一半且冷却后归还、未挂载时媒体车道容量不变；`--test background_work_budget` 1/1。**未默认开启**。
   真实进程验证（`RUST_LOG=luxd=info,lux=info` 才能看到 `lux::scan_performance`）：预算 9（媒体车道 4）下
@@ -18586,6 +18586,12 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   收益已在“媒体车道确有 CPU 工作”的负载下验证：三轮交错“扫描期/空闲首页 p95”比值 `off`
   2.73/2.44/2.49 → `on` 1.77/2.07/1.88（均值 −25%），扫描期 p95 −20%，空闲 p95 持平；边界条件、
   另一种负载下的零差异，以及默认值取舍见「剩余」第 4 条。
+- 反馈信号的两处修正（同一次提交）：(1) 改用**时间窗**——`RequestMetrics` 给每个样本记
+  `Instant`，新增 `route_p95_recent_us(needle, window)`（默认 30 s），快照结构不变；原因是原实现按
+  “最近 512 个样本”取 p95，低流量站点上一次扫描留下的慢样本会让降档多压几分钟。(2) 阈值**按读模型
+  模式**取默认：`off` 300 ms、`on` 80 ms（W3 实测 `on` 扫描期 85.94 ms），`LUX_BACKGROUND_FOREGROUND_P95_MS`
+  仍可覆盖。回归：`recent_p95_forgets_samples_outside_the_window`、`foreground_threshold_follows_the_read_model_mode`
+  （`--lib observability::request_metrics` 8/8、`--lib application::background_work::tests` 16/16）。
 - `Fields` 投影：列表 `MediaStreams`（本次提交）：列表与 `Items?Ids=` 响应此前只按 `Fields` 发
   `MediaSources`，客户端只点名 `MediaStreams` 时字段被静默丢掉。现在显式点名 `MediaStreams` 时补顶层
   `MediaStreams`；缺省（不带 `Fields`）或只带其它字段时响应不变，数据取自已加载的 media source，
@@ -18627,9 +18633,14 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   2. **媒体车道没有活**（重扫已入库目录；或本机没有 ffprobe/ffmpeg 时 probe 立即失败）：同一探针的
      1,200 个文件版本比值为 `off` 2.99 / 3.70 / 3.63 vs `on` 3.36 / 3.64，无差异——这类负载下打开它
      只是把扫描拉长。这也是早前“未获益”的真实原因，而不是“媒体车道不是竞争者”。
-  3. **默认值仍待所有者定**：默认阈值 300 ms 在 `on` 读模型（首页 p95 16–58 ms）永不触发，在 `off`
-     （120–139 ms）常开，取决于读模型模式与库规模。两条路：(a) 默认开启，并把阈值/档位改为按模式取值；
-     (b) 保持 opt-in，在 `DEPLOYMENT.md` 写清触发条件。当前代码为 (b)，未进 compose 环境变量清单。
+  3. **默认值仍待所有者定（当前保持默认关闭）**：时间窗（30 s）与按模式阈值（`off` 300 / `on` 80 ms）
+     已落地，但本机复测暴露两点仍需决定：(a) 绝对阈值对“本来就慢”的旧路径实例（扫描并发下首页
+     p95 357–476 ms）会长期常开，媒体车道被永久减半——要么接受，要么把触发改成相对基线（例如相对
+     同路由最近 p50）；(b) 活体“恢复”验证在这台负载机（load ≈4，空闲 p95 在 117–261 ms 间漂移）没能
+     稳定复现，release 逻辑目前只有确定性单测覆盖（`foreground_pressure_halves_the_media_lane_and_restores_after_the_cooldown`），
+     需要在安静机器上用 `scripts/probe-media-lane-ab.py --threshold-ms 0 --release-check` 补一次。
+     翻默认只需一行（`foreground_throttle_config_from` 的开关默认值改为 `on`），未进
+     `DEPLOYMENT.md`/compose 环境变量清单。
   4. 观察：本夹具上 `off` 读模型的空闲首页 p95 约 112–132 ms，与文档其它节的 118.05 / 357.89 ms 不同，
      差异来自夹具规模与是否附加扫描库，比较时只看同一次测量内的比值。
 - CPU/请求基线已建立（`scripts/run-api-cpu-bench.py`，见 `PERFORMANCE.md`）：首页 277.5 ms、搜索

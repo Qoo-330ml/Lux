@@ -16,6 +16,11 @@ never seen, measures `/api/v1/home` while that library is actually being scanned
 on a host without ffprobe/ffmpeg the fixture's probes fail instantly, the media lane holds a permit
 for microseconds, and the downgrade under test has nothing to hold back (measured: identical ratios).
 
+`--threshold-ms 0` derives the threshold from a pre-measured idle p50 (x2). `--release-check` waits
+out the 30 s sample window and rescans a fresh library to force a media-lane acquisition, but it
+needs a quiet host: on a loaded machine (load average ~4 here) the idle p95 drifted 117-261 ms, so a
+threshold that engages during the scan can also stay above the idle page and suppress the release.
+
 Only stdlib is used. It is an experiment harness, not a gate check: numbers describe this machine
 and this fixture (read model off, 66k catalog) and are not NAS/x86_64 results.
 """
@@ -129,11 +134,72 @@ def synthetic_media_tools(work: pathlib.Path, cpu_ms: int) -> pathlib.Path:
     return directory
 
 
+def wait_ready(base: str, timeout: float = 240.0) -> None:
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(f"{base}/health/ready", timeout=2) as response:
+                if response.status == 200:
+                    return
+        except Exception:
+            pass
+        time.sleep(0.25)
+    raise SystemExit("server did not become ready")
+
+
+def start_server(
+    binary: pathlib.Path,
+    config: pathlib.Path,
+    media_bin: pathlib.Path | None,
+    throttle: str,
+    threshold_ms: int,
+    budget: int,
+    log_path: pathlib.Path,
+):
+    port = free_port()
+    environment = dict(os.environ)
+    if media_bin is not None:
+        environment["PATH"] = f"{media_bin}{os.pathsep}{environment.get('PATH', '')}"
+    environment.update(
+        {
+            "LUX_CONFIG_DIR": str(config),
+            "LUX_READ_MODEL_MODE": "off",
+            "LUX_BACKGROUND_FOREGROUND_THROTTLE": throttle,
+            "LUX_BACKGROUND_FOREGROUND_P95_MS": str(threshold_ms),
+            "LUX_BACKGROUND_CPU_BUDGET": str(budget),
+            "LUX_DISCOVERY_BIND_ADDR": "127.0.0.1:0",
+            "LUX_HTTP_ADDR": f"127.0.0.1:{port}",
+            # The feedback logs under lux::scan_performance, which the default filter drops.
+            "RUST_LOG": "luxd=info,lux=info",
+        }
+    )
+    log = log_path.open("ab")
+    process = subprocess.Popen(
+        [str(binary)], cwd=str(ROOT), env=environment, stdout=log, stderr=log
+    )
+    base = f"http://127.0.0.1:{port}"
+    try:
+        wait_ready(base)
+    except BaseException:
+        stop_server(process, log)
+        raise
+    return process, log, base
+
+
+def stop_server(process, log) -> None:
+    process.terminate()
+    try:
+        process.wait(timeout=20)
+    except subprocess.TimeoutExpired:
+        process.kill()
+    log.close()
+
+
 def seed_unscanned_library(
-    database: pathlib.Path, media_root: pathlib.Path, files: int
+    database: pathlib.Path, media_root: pathlib.Path, files: int, name: str = "library-0"
 ) -> str:
     """Create a movie library with real files and no catalog rows, so the scan has work to do."""
-    root = media_root / "library-0"
+    root = media_root / name
     root.mkdir(parents=True, exist_ok=True)
     # Store the resolved path: on macOS /tmp is a symlink and the scanner compares the walked path
     # against the canonical root.
@@ -172,10 +238,20 @@ def main() -> int:
         required=True,
         help="directory whose config/lux.db is the fixture to copy",
     )
-    parser.add_argument("--threshold-ms", type=int, default=100)
+    parser.add_argument(
+        "--threshold-ms",
+        type=int,
+        default=100,
+        help="0 derives it from a pre-measured idle p50 (x2); p95 is too noisy on a loaded host",
+    )
     parser.add_argument("--files", type=int, default=1200)
     parser.add_argument("--requests", type=int, default=30)
     parser.add_argument("--budget", type=int, default=9)
+    parser.add_argument(
+        "--release-check",
+        action="store_true",
+        help="after the scan, wait out the sample window and prove the permits come back",
+    )
     parser.add_argument(
         "--fake-media-cpu-ms",
         type=int,
@@ -205,42 +281,34 @@ def main() -> int:
     if args.fake_media_cpu_ms > 0:
         media_bin = synthetic_media_tools(work, args.fake_media_cpu_ms)
 
-    port = free_port()
-    environment = dict(os.environ)
-    if media_bin is not None:
-        environment["PATH"] = f"{media_bin}{os.pathsep}{environment.get('PATH', '')}"
-    environment.update(
-        {
-            "LUX_CONFIG_DIR": str(config),
-            "LUX_READ_MODEL_MODE": "off",
-            "LUX_BACKGROUND_FOREGROUND_THROTTLE": args.throttle,
-            "LUX_BACKGROUND_FOREGROUND_P95_MS": str(args.threshold_ms),
-            "LUX_BACKGROUND_CPU_BUDGET": str(args.budget),
-            "LUX_DISCOVERY_BIND_ADDR": "127.0.0.1:0",
-            "LUX_HTTP_ADDR": f"127.0.0.1:{port}",
-            # The feedback logs under lux::scan_performance, which the default filter drops.
-            "RUST_LOG": "luxd=info,lux=info",
-        }
-    )
-    log_path = work / "server.log"
-    log = log_path.open("ab")
-    process = subprocess.Popen(
-        [str(args.binary)], cwd=str(ROOT), env=environment, stdout=log, stderr=log
-    )
-    base = f"http://127.0.0.1:{port}"
-    try:
-        deadline = time.monotonic() + 240
-        while time.monotonic() < deadline:
-            try:
-                with urllib.request.urlopen(f"{base}/health/ready", timeout=2) as response:
-                    if response.status == 200:
-                        break
-            except Exception:
-                pass
-            time.sleep(0.25)
-        else:
-            raise SystemExit("server did not become ready")
+    threshold_ms = args.threshold_ms
+    if threshold_ms == 0:
+        # A fixed millisecond threshold is fragile on a loaded host: idle p95 drifted 117-250 ms
+        # between runs here. Measure the idle page once with the feedback disabled, then target
+        # comfortably above it.
+        baseline_process, baseline_log, baseline_base = start_server(
+            args.binary, config, media_bin, "off", 300, args.budget, work / "baseline.log"
+        )
+        try:
+            for _ in range(4):
+                fetch(baseline_base, "/api/v1/home")
+            baseline = [fetch(baseline_base, "/api/v1/home")[1] for _ in range(20)]
+        finally:
+            stop_server(baseline_process, baseline_log)
+        # p50 is stable across runs here (112-140 ms) while p95 swings with host load, so derive
+        # from the median and leave headroom for the scan spike.
+        threshold_ms = max(150, int(median(baseline) * 2))
+        print(
+            "idle baseline p50={p50:.1f} p95={p95:.1f} ms -> threshold {threshold} ms".format(
+                p50=median(baseline), p95=percentile95(baseline), threshold=threshold_ms
+            )
+        )
 
+    log_path = work / "server.log"
+    process, log, base = start_server(
+        args.binary, config, media_bin, args.throttle, threshold_ms, args.budget, log_path
+    )
+    try:
         library_id = seed_unscanned_library(database, work / "scan-media", args.files)
 
         for _ in range(4):
@@ -268,12 +336,47 @@ def main() -> int:
             during.append(elapsed)
             scanned = scan_item_count(database, library_id)
 
+        release_seconds = None
+        if args.release_check:
+            # The feedback only sees samples from its window, so let it move past the scan while
+            # issuing idle requests, then force a media-lane acquisition with a second scan.
+            waited = 0.0
+            while waited < 40.0:
+                fetch(base, "/api/v1/home")
+                time.sleep(1.0)
+                waited += 1.0 + 0.2
+            # Re-walking an unchanged library does no media-lane work, so the feedback would never
+            # re-evaluate. A fresh library gives the second scan real probe work.
+            recovery_library = seed_unscanned_library(
+                database, work / "scan-media", 20, "library-recovery"
+            )
+            request = urllib.request.Request(
+                f"{base}/api/v1/admin/libraries/{recovery_library}/scan",
+                method="POST",
+                headers={
+                    "Cookie": f"{COOKIE}={TOKEN}",
+                    "X-CSRF-Token": CSRF_TOKEN,
+                    "Content-Length": "0",
+                },
+                data=b"",
+            )
+            started = time.monotonic()
+            with urllib.request.urlopen(request, timeout=120) as response:
+                response.read()
+            while time.monotonic() - started < 60:
+                if "restored background media permits" in log_path.read_text(
+                    errors="replace"
+                ):
+                    release_seconds = time.monotonic() - started
+                    break
+                time.sleep(0.5)
+
         text = log_path.read_text(errors="replace")
         print(
             "arm={arm} threshold={threshold}ms budget={budget} files={files} "
             "media_cpu={media}ms".format(
                 arm=args.throttle,
-                threshold=args.threshold_ms,
+                threshold=threshold_ms,
                 budget=args.budget,
                 files=args.files,
                 media=args.fake_media_cpu_ms,
@@ -304,14 +407,19 @@ def main() -> int:
                 restored=text.count("restored background media permits"),
             )
         )
+        if args.release_check:
+            print(
+                "release after recovery: {value}".format(
+                    value=(
+                        f"{release_seconds:.1f}s"
+                        if release_seconds is not None
+                        else "NOT OBSERVED"
+                    )
+                )
+            )
         return 0
     finally:
-        process.terminate()
-        try:
-            process.wait(timeout=20)
-        except subprocess.TimeoutExpired:
-            process.kill()
-        log.close()
+        stop_server(process, log)
         if not args.keep_work_dir:
             shutil.rmtree(work, ignore_errors=True)
 

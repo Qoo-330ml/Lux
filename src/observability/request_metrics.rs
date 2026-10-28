@@ -7,7 +7,7 @@
 use std::{
     collections::{HashMap, VecDeque},
     sync::{Arc, Mutex},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::Serialize;
@@ -45,7 +45,14 @@ struct RouteMetrics {
     errors: u64,
     max_us: u64,
     last_seen_at: Option<u64>,
-    samples_us: VecDeque<u64>,
+    // Timestamps let the background scheduler ask "is the foreground slow *now*" without changing
+    // the administrator snapshot, which keeps its own, time-agnostic view of the same samples.
+    samples: VecDeque<RouteSample>,
+}
+
+struct RouteSample {
+    recorded_at: Instant,
+    micros: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -107,17 +114,21 @@ impl RequestMetrics {
         }
         metrics.max_us = metrics.max_us.max(duration_us);
         metrics.last_seen_at = Some(now);
-        if metrics.samples_us.len() == SAMPLE_CAPACITY {
-            metrics.samples_us.pop_front();
+        if metrics.samples.len() == SAMPLE_CAPACITY {
+            metrics.samples.pop_front();
         }
-        metrics.samples_us.push_back(duration_us);
+        metrics.samples.push_back(RouteSample {
+            recorded_at: Instant::now(),
+            micros: duration_us,
+        });
     }
 
-    /// p95 latency (microseconds) across the recorded samples of every route whose template
-    /// contains `route_needle`, or `None` when no matching route has samples yet.
+    /// p95 latency (microseconds) across every retained sample of the matching routes.
     ///
-    /// Read-only and cheap: the background scheduler uses it to notice that foreground requests are
-    /// currently slow without touching the snapshot structure the admin endpoint serves.
+    /// This is the time-agnostic view: it keeps answering with the burst long after recovery, which
+    /// is why the background scheduler uses `route_p95_recent_us` instead. Tests use it
+    /// as the reference view of the per-route buffer.
+    #[cfg(test)]
     pub(crate) fn route_p95_us(&self, route_needle: &str) -> Option<u64> {
         let state = self.inner.lock().ok()?;
         let mut samples: Vec<u64> = Vec::new();
@@ -125,19 +136,34 @@ impl RequestMetrics {
             if !key.route.contains(route_needle) {
                 continue;
             }
-            samples.extend(metrics.samples_us.iter().copied());
+            samples.extend(metrics.samples.iter().map(|sample| sample.micros));
         }
-        if samples.is_empty() {
-            return None;
+        nearest_rank_p95(&mut samples)
+    }
+
+    /// p95 latency (microseconds) over the samples recorded within the last `window`.
+    ///
+    /// The retained window is counted in samples, not seconds, so a burst of slow requests would
+    /// otherwise keep the signal high for minutes on a quiet server. Background feedback uses this
+    /// form: it answers "is the foreground slow now" and stops applying pressure once the window
+    /// has moved past the burst.
+    pub(crate) fn route_p95_recent_us(&self, route_needle: &str, window: Duration) -> Option<u64> {
+        let state = self.inner.lock().ok()?;
+        let now = Instant::now();
+        let mut samples: Vec<u64> = Vec::new();
+        for (key, metrics) in &state.routes {
+            if !key.route.contains(route_needle) {
+                continue;
+            }
+            samples.extend(
+                metrics
+                    .samples
+                    .iter()
+                    .filter(|sample| now.saturating_duration_since(sample.recorded_at) < window)
+                    .map(|sample| sample.micros),
+            );
         }
-        samples.sort_unstable();
-        let index = samples
-            .len()
-            .saturating_mul(95)
-            .div_ceil(100)
-            .saturating_sub(1)
-            .min(samples.len() - 1);
-        Some(samples[index])
+        nearest_rank_p95(&mut samples)
     }
 
     pub(crate) fn snapshot(&self) -> RequestMetricsSnapshot {
@@ -174,7 +200,11 @@ impl RequestMetrics {
 }
 
 fn route_snapshot(key: &RouteKey, metrics: &RouteMetrics, now: u64) -> RouteSnapshot {
-    let mut samples = metrics.samples_us.iter().copied().collect::<Vec<_>>();
+    let mut samples = metrics
+        .samples
+        .iter()
+        .map(|sample| sample.micros)
+        .collect::<Vec<_>>();
     samples.sort_unstable();
     let avg_ms = if samples.is_empty() {
         0.0
@@ -199,6 +229,21 @@ fn route_snapshot(key: &RouteKey, metrics: &RouteMetrics, now: u64) -> RouteSnap
             .last_seen_at
             .map_or(0, |last_seen| now.saturating_sub(last_seen)),
     }
+}
+
+/// Nearest-rank p95 over an unordered sample list, or `None` when it is empty.
+fn nearest_rank_p95(samples: &mut [u64]) -> Option<u64> {
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_unstable();
+    let index = samples
+        .len()
+        .saturating_mul(95)
+        .div_ceil(100)
+        .saturating_sub(1)
+        .min(samples.len() - 1);
+    Some(samples[index])
 }
 
 /// Nearest-rank percentile over an ascending sample list.
@@ -254,6 +299,32 @@ mod tests {
             .expect("home samples are recorded");
         assert_eq!(p95, 95_000, "p95 over the home samples only");
         assert_eq!(metrics.route_p95_us("/api/v1/unknown"), None);
+    }
+
+    #[test]
+    fn recent_p95_forgets_samples_outside_the_window() {
+        let metrics = RequestMetrics::new();
+        for _ in 0..20 {
+            record_ms(&metrics, "/api/v1/home", 400);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+        for _ in 0..100 {
+            record_ms(&metrics, "/api/v1/home", 5);
+        }
+        // The retained-sample view still sees the burst; the time window does not.
+        assert_eq!(metrics.route_p95_us("/api/v1/home"), Some(400_000));
+        assert_eq!(
+            metrics.route_p95_recent_us("/api/v1/home", Duration::from_millis(200)),
+            Some(5_000)
+        );
+        assert_eq!(
+            metrics.route_p95_recent_us("/api/v1/home", Duration::from_secs(30)),
+            Some(400_000)
+        );
+        assert_eq!(
+            metrics.route_p95_recent_us("/api/v1/unknown", Duration::from_secs(30)),
+            None
+        );
     }
 
     #[test]

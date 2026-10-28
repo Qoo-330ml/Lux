@@ -17,7 +17,14 @@ const FOREGROUND_THROTTLE_ENV: &str = "LUX_BACKGROUND_FOREGROUND_THROTTLE";
 /// Optional p95 threshold in milliseconds for that feedback.
 const FOREGROUND_THRESHOLD_ENV: &str = "LUX_BACKGROUND_FOREGROUND_P95_MS";
 const FOREGROUND_P95_ROUTE: &str = "/api/v1/home";
-const DEFAULT_FOREGROUND_P95_THRESHOLD_MS: u64 = 300;
+/// Read-model `off` keeps the legacy path, whose home p95 baseline is an order of magnitude higher.
+const FOREGROUND_P95_OFF_MODE_MS: u64 = 300;
+/// Read-model `on` answers the home page at 16–58 ms; the W3 scan-concurrency run measured 85.94 ms,
+/// so this target has to sit well below the legacy default.
+const FOREGROUND_P95_ON_MODE_MS: u64 = 80;
+/// Only samples from this window count: the retained per-route buffer holds 512 samples, which on a
+/// quiet server is minutes of traffic and would keep the downgrade engaged long after recovery.
+const FOREGROUND_PRESSURE_WINDOW: Duration = Duration::from_secs(30);
 const FOREGROUND_PRESSURE_RECHECK: Duration = Duration::from_secs(1);
 const FOREGROUND_PRESSURE_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_BACKGROUND_BUDGET: usize = 32;
@@ -81,7 +88,7 @@ impl BackgroundWorkStage {
 
 /// Foreground-latency feedback for the background media lane.
 ///
-/// The sample source is the read-only [`RequestMetrics::route_p95_us`] snapshot of the last
+/// The sample source is the read-only [`RequestMetrics::route_p95_recent_us`] window over the
 /// requests per route template: when the foreground page p95 stays above the target, a share of the
 /// media lane permits is held back so scans stop competing with the request path. Held permits are
 /// released again only after a cooldown, and the lane keeps at least one permit, so the downgrade
@@ -90,6 +97,7 @@ impl BackgroundWorkStage {
 struct ForegroundThrottleConfig {
     route_needle: &'static str,
     threshold_us: u64,
+    window: Duration,
     recheck: Duration,
     cooldown: Duration,
 }
@@ -99,9 +107,21 @@ fn foreground_media_permits_kept(media_capacity: usize) -> usize {
     media_capacity.div_ceil(2).max(1)
 }
 
+fn default_foreground_threshold_ms(read_model_mode: Option<&str>) -> u64 {
+    match read_model_mode
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("on") => FOREGROUND_P95_ON_MODE_MS,
+        _ => FOREGROUND_P95_OFF_MODE_MS,
+    }
+}
+
 fn foreground_throttle_config_from(
     switch: Option<&str>,
     threshold_ms: Option<&str>,
+    read_model_mode: Option<&str>,
 ) -> Option<ForegroundThrottleConfig> {
     let switch = switch.unwrap_or_default().trim().to_ascii_lowercase();
     if !matches!(switch.as_str(), "on" | "1" | "true" | "yes") {
@@ -110,10 +130,11 @@ fn foreground_throttle_config_from(
     let threshold_ms = threshold_ms
         .and_then(|value| value.trim().parse::<u64>().ok())
         .filter(|value| *value > 0)
-        .unwrap_or(DEFAULT_FOREGROUND_P95_THRESHOLD_MS);
+        .unwrap_or_else(|| default_foreground_threshold_ms(read_model_mode));
     Some(ForegroundThrottleConfig {
         route_needle: FOREGROUND_P95_ROUTE,
         threshold_us: threshold_ms.saturating_mul(1000),
+        window: FOREGROUND_PRESSURE_WINDOW,
         recheck: FOREGROUND_PRESSURE_RECHECK,
         cooldown: FOREGROUND_PRESSURE_COOLDOWN,
     })
@@ -122,7 +143,12 @@ fn foreground_throttle_config_from(
 fn foreground_throttle_config() -> Option<ForegroundThrottleConfig> {
     let switch = env::var(FOREGROUND_THROTTLE_ENV).ok();
     let threshold = env::var(FOREGROUND_THRESHOLD_ENV).ok();
-    let config = foreground_throttle_config_from(switch.as_deref(), threshold.as_deref());
+    let read_model_mode = env::var("LUX_READ_MODEL_MODE").ok();
+    let config = foreground_throttle_config_from(
+        switch.as_deref(),
+        threshold.as_deref(),
+        read_model_mode.as_deref(),
+    );
     if config.is_none()
         && switch
             .as_deref()
@@ -181,7 +207,9 @@ impl ForegroundThrottle {
             return;
         }
         state.last_evaluated = Some(now);
-        let p95_us = self.metrics.route_p95_us(self.config.route_needle);
+        let p95_us = self
+            .metrics
+            .route_p95_recent_us(self.config.route_needle, self.config.window);
         let slow = p95_us.is_some_and(|value| value >= self.config.threshold_us);
         if slow {
             let was_throttled = !state.withheld.is_empty();
@@ -1364,6 +1392,7 @@ mod tests {
         ForegroundThrottleConfig {
             route_needle: "/api/v1/home",
             threshold_us: 300_000,
+            window: Duration::from_secs(30),
             recheck: Duration::ZERO,
             cooldown,
         }
@@ -1371,24 +1400,48 @@ mod tests {
 
     #[test]
     fn foreground_throttle_is_off_unless_explicitly_enabled() {
-        assert!(foreground_throttle_config_from(None, None).is_none());
-        assert!(foreground_throttle_config_from(Some(""), None).is_none());
-        assert!(foreground_throttle_config_from(Some(" off "), None).is_none());
-        assert!(foreground_throttle_config_from(Some("0"), None).is_none());
+        assert!(foreground_throttle_config_from(None, None, None).is_none());
+        assert!(foreground_throttle_config_from(Some(""), None, None).is_none());
+        assert!(foreground_throttle_config_from(Some(" off "), None, None).is_none());
+        assert!(foreground_throttle_config_from(Some("0"), None, None).is_none());
 
-        let enabled = foreground_throttle_config_from(Some("on"), None).expect("on enables");
+        let enabled =
+            foreground_throttle_config_from(Some("on"), None, Some("off")).expect("on enables");
         assert_eq!(enabled.route_needle, "/api/v1/home");
         assert_eq!(enabled.threshold_us, 300_000);
+        assert_eq!(enabled.window, Duration::from_secs(30));
 
-        let tuned = foreground_throttle_config_from(Some("ON"), Some("75")).expect("on enables");
+        let tuned =
+            foreground_throttle_config_from(Some("ON"), Some("75"), None).expect("on enables");
         assert_eq!(tuned.threshold_us, 75_000);
         for invalid in ["0", "abc", ""] {
-            let fallback =
-                foreground_throttle_config_from(Some("on"), Some(invalid)).expect("on enables");
+            let fallback = foreground_throttle_config_from(Some("on"), Some(invalid), None)
+                .expect("on enables");
             assert_eq!(
                 fallback.threshold_us, 300_000,
                 "{invalid} keeps the default"
             );
+        }
+    }
+
+    #[test]
+    fn foreground_threshold_follows_the_read_model_mode() {
+        // The legacy path needs a much looser target than the read-model path.
+        for (mode, expected_us) in [
+            (Some("on"), 80_000),
+            (Some("ON"), 80_000),
+            (Some("off"), 300_000),
+            (Some("shadow"), 300_000),
+            (None, 300_000),
+        ] {
+            let config = foreground_throttle_config_from(Some("on"), None, mode).expect("enabled");
+            assert_eq!(config.threshold_us, expected_us, "mode {mode:?}");
+        }
+        // An explicit override wins in both modes.
+        for mode in [Some("on"), Some("off")] {
+            let config =
+                foreground_throttle_config_from(Some("on"), Some("120"), mode).expect("enabled");
+            assert_eq!(config.threshold_us, 120_000, "mode {mode:?}");
         }
     }
 
