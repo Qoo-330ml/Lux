@@ -18303,6 +18303,12 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 **2,246 通过 / 1 失败（上表）/ 76 ignored**；`cargo fmt`、`cargo clippy -D warnings` 通过；
 `python3 scripts/check-migration-parity.py` 与 `python3 scripts/check-backend-branches.py` 通过。
 
+2026-10-29 复跑（HEAD `359e019d`，`--test-threads=8`，与 PG 容器测试和其它 cargo 任务并发）：128 个目标中
+126 个通过，`--lib` 与 `--test probe` 两个目标失败；这两个目标在**同线程数下单独复跑**均全绿
+（`--lib` 1,379 passed / 0 failed / 32 ignored，`--test probe` 21/21），且失败发生在宿主机 CPU 饱和时，
+因此按本机环境性时序抖动处理（与上面 `reidentify` 同类），不是功能回归。同一轮 `postgres_database` 的
+忽略用例在真机 PG 16 上 **34/34** 通过。
+
 ### 数据路径重构（W0–W6）实施状态（2026-10-28）
 
 本表是 `docs/LUX-DATA-PATH-PLAN.md` 七个工作包与已完成任务的总览；每项的验收细节与数字见本文件
