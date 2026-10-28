@@ -18717,11 +18717,14 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   回归：`--lib invitation` 16/16、`--lib registration` 13/13、`--lib email_change` 2/2、`--test users` 39/39、
   `--test admin_user_invitations` 1/1、`--test admin_mail_settings` 1/1，`cargo build --locked`、fmt、clippy 全绿。
   下一个切片建议：`user_item_state`（观看状态写入/查询）或收藏/评分；`repository.rs` 仍 5.9k 行。
-- **热点查询 typed 化（首个查询）**：`find_user_item_state` 与 `list_user_item_states` 改用
-  `#[derive(sqlx::FromRow)] UserItemStateRow` + `query_as`，整型布尔与 `last_played_at` 的转换收敛到
-  `into_state()`；SQL、契约、调用点不变。验收：`--test users` 39/39、`--test catalog` 3/3、fmt/clippy 绿。
-  剩余大头：`catalog.rs` 352 处 `row.get`、`repository.rs` 304 处、`emby_migration.rs` 117 处，按触达域
-  逐个查询改造。
+- **热点查询 typed 化**：
+  (1) `find_user_item_state` / `list_user_item_states` → `#[derive(sqlx::FromRow)] UserItemStateRow` +
+  `query_as`，整型布尔与 `last_played_at` 的转换收敛到 `into_state()`；
+  (2) `list_unplayed_episode_counts`（首页/剧集列表每次请求都跑）→ `query_as::<(String, i64)>`，去掉
+  两处按列名取值。SQL、契约、调用点均不变。验收：`--test users` 39/39、`--test catalog` 3/3、
+  `--test series_api` 1/1、`cargo build --locked`、fmt、clippy 全绿。
+  剩余大头：`catalog.rs` 约 350 处 `row.get`、`repository.rs` 约 300 处（连接/迁移层为主，优先级低）、
+  `emby_migration.rs` 117 处；按触达域逐个查询改造，每次只跑该域测试。
 - 热点查询 typed 化：`catalog_items`/`media_search`/`user_series_next` 已走读模型与消费者，但仍是
   `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估——注意 `sqlx::query!` 宏需要
   编译期数据库，双后端下不可行，typed 化只能走 `query_as` + 手写行结构。

@@ -1963,18 +1963,16 @@ impl Database {
                AND parent.removed_at IS NULL
              GROUP BY parent.id"
         );
-        let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(user_id);
+        let mut statement = self
+            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(query))
+            .bind(user_id);
         for item_id in item_ids {
             statement = statement.bind(item_id);
         }
         statement
             .fetch_all(&self.pool)
             .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| (row.get("id"), row.get("unplayed_episode_count")))
-                    .collect()
-            })
+            .map(|rows| rows.into_iter().collect())
             .map_err(|source| StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
