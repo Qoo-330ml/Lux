@@ -18739,6 +18739,9 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
 - 存储接口拆分：两片已完成（见上），`repository.rs` 由 9,222 行降到 **5,948 行**。剩下的内容已按“触达域”
   审查过一遍：连接/迁移引导、写事务与锁、`query*` 辅助、`Database` 基础访问器，以及各域的共享记录类型——
   这是一个内聚的连接层与 shared model，没有再能独立成域的边界；**拆分到此为止**，后续只在功能改动顺带搬移。
+  按 W6 规则同一次提交刷新了 `docs/backend-branches.json`：两片新文件带理由登记（邮件 outbox 的
+  `RETURNING` / `SKIP LOCKED` 差异、邀请注册流程的 `RETURNING` 与 JSON 处理），`repository.rs` 记减少后的数量，
+  总量仍是 265 处（28 文件），`check-backend-branches.py` 通过。
 
 ### P3（W3）完成状态（2026-10-27）
 

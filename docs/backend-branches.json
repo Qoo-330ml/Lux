@@ -76,6 +76,11 @@
       "note": "cascade/cleanup SQL differs per backend (no shared UNIQUE/cte semantics)"
     },
     {
+      "path": "src/storage/mail_outbox.rs",
+      "count": 4,
+      "note": "mail outbox claim/update SQL differs per backend (RETURNING vs CTE + FOR UPDATE SKIP LOCKED); moved verbatim out of repository.rs in W6"
+    },
+    {
       "path": "src/storage/media.rs",
       "count": 1,
       "note": "unregistered backend branch"
@@ -102,8 +107,8 @@
     },
     {
       "path": "src/storage/repository.rs",
-      "count": 64,
-      "note": "storage entry points that dispatch whole query families per backend"
+      "count": 50,
+      "note": "core connection, migrations, write transactions and query helpers; two domains moved out in W6, count reduced from 64"
     },
     {
       "path": "src/storage/search_reindex.rs",
@@ -124,6 +129,11 @@
       "path": "src/storage/sql_templates.rs",
       "count": 82,
       "note": "SQL dialect templates: SQLite and PostgreSQL spell the same query differently"
+    },
+    {
+      "path": "src/storage/user_mail_flows.rs",
+      "count": 10,
+      "note": "invitation/registration mail flows use backend-specific RETURNING and JSON handling; moved verbatim out of repository.rs in W6"
     },
     {
       "path": "src/storage/users.rs",
