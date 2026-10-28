@@ -9,9 +9,9 @@
 > 继续 Lux 数据路径重构（W4 已完成、W5/W6 部分完成）。先读 `docs/LUX-DEVELOPMENT.md` 的
 > 「数据路径重构（W0–W6）实施状态」表、W4/W5/W6 段与「门禁豁免清单」，以及
 > `docs/LUX-DATA-PATH-HANDOFF.md`。工作区 `/Volumes/Toshiba/mywork/Lux`，分支 `test`，
-> HEAD = `3d7daa28`（若已前进以 `git log` 为准）。W5 的“`route_p95_us` 接入后台配额”已实现（默认
-> 关闭）并测过：扫描期/空闲首页 p95 比值没有下降，见 W5 段「剩余」第 4 条。下一步是 W5 的 `Fields`
-> 投影，或按所有者取舍先处理该开关的去留。
+> HEAD = `fc4390d2`（若已前进以 `git log` 为准）。W5 的“`route_p95_us` 接入后台配额”已实现（默认
+> 关闭）并验证：媒体车道确有 CPU 工作时，扫描期/空闲首页 p95 比值 2.55 → 1.91（−25%），空闲不变；
+> 媒体车道空闲时无差异，边界见 W5 段「剩余」第 4 条。下一步是 W5 的 `Fields` 投影。
 
 ## 1. 仓库与状态
 
@@ -58,15 +58,15 @@ python3 -m unittest tools/migration-map/test_parity.py tools/backend-branches/te
 | W2 读模型切片 | 完成 | 同文件 §30 与 P2 阶段门状态 |
 | W3 首页/继续观看/搜索 | 完成 | LUX-867/868/869 段 + P3 完成状态；首页 p95 118.05→16.58 ms |
 | W4 触发器入队与写预算 | 完成（PG 等价入队未做） | 扫描 0.42→0.37 s、WAL 11.5→11.0 MiB；触发器开销 89→13 ms；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU/协议层 | 部分 | 空闲退避、gzip（首页 92,674→8,308 B）、ETag/304、CPU/请求基线（首页 277.5 / 搜索 21.3 / 列表 2.1 ms）、`route_p95_us`、前台 p95 → 媒体车道配额（默认关闭，比值 A/B 未获益）；ADR-049 |
+| W5 CPU/协议层 | 部分 | 空闲退避、gzip（首页 92,674→8,308 B）、ETag/304、CPU/请求基线（首页 277.5 / 搜索 21.3 / 列表 2.1 ms）、`route_p95_us`、前台 p95 → 媒体车道配额（默认关闭；媒体车道有活时比值 2.55→1.91）；ADR-049 |
 | W6 双后端与边界 | 部分 | 迁移配对 + 后端分支两清单与校验器（已入 `AGENTS.md`）；ADR-051 |
 
 ## 4. 下一步（按序，均可独立提交）
 
-1. ~~**W5：前台延迟反馈 → 后台并发预算**~~ 已完成（`3d7daa28`，默认关闭）。结论：接线、开关、冷却、
-   真实进程验证都成立，但两轮交错 A/B 没有让“扫描期间 p95 / 空闲 p95”比值下降（`off` 2.99/3.70，
-   `on` 3.36/3.64），判据未达成 → 保持默认关闭。细节与解读见 `LUX-DEVELOPMENT.md` W5「剩余」第 4 条；
-   要继续压这个比值，方向应是写入突发（discovery/fingerprint）而不是媒体车道。开关去留待所有者决定。
+1. ~~**W5：前台延迟反馈 → 后台并发预算**~~ 已完成（`3d7daa28`，默认关闭）并验证：媒体车道确有 CPU
+   工作时比值 2.73/2.44/2.49（off）→ 1.77/2.07/1.88（on），均值 −25%，空闲 p95 不变、扫描期 p95 −20%；
+   媒体车道空闲（重扫或本机无 ffprobe/ffmpeg）时无差异。默认阈值/开关策略仍待所有者定，细节见
+   `LUX-DEVELOPMENT.md` W5「剩余」第 4 条。
 2. **W5：`Fields` 投影**（Overview/People/Streams 按需批量补，Emby 协议层）。
 3. **W5：NFO 解码 LRU**（`(item_id, fingerprint)`）。做之前先给证据说明它是热点：当前 CPU 基线显示
    列表 2.1 ms、搜索 21.3 ms 主要在 SQL（匹配/总数/排序），DTO 装配不是瓶颈（已实测：去掉搜索装配的
@@ -94,9 +94,9 @@ python3 scripts/run-api-cpu-bench.py --work-dir /tmp/lux-rm-resume3 --requests 1
 python3 scripts/run-scan-write-bench.py --fixture-dir /tmp/lux-rm-resume3 --work-dir /tmp/lux-scan-bench --files 6000
 # 前台 p95 反馈的日志（默认 filter 不含 lux::scan_performance，必须带 RUST_LOG）
 RUST_LOG=luxd=info,lux=info LUX_BACKGROUND_FOREGROUND_THROTTLE=on <luxd>
-# 媒体车道降档的扫描期/空闲 p95 比值（每臂一次，off/on 交替）
-python3 scripts/probe-media-lane-ab.py --throttle off --work-dir /tmp/lux-rm-resume3
-python3 scripts/probe-media-lane-ab.py --throttle on  --work-dir /tmp/lux-rm-resume3
+# 媒体车道降档的扫描期/空闲 p95 比值（每臂一次，off/on 交替；--fake-media-cpu-ms 让媒体车道真有活）
+python3 scripts/probe-media-lane-ab.py --throttle off --work-dir /tmp/lux-rm-resume3 --fake-media-cpu-ms 150
+python3 scripts/probe-media-lane-ab.py --throttle on  --work-dir /tmp/lux-rm-resume3 --fake-media-cpu-ms 150
 ```
 
 66k 夹具位置：`/tmp/lux-rm-resume3/config/lux.db`（若已被清理，用 `scripts/run-api-performance.py`

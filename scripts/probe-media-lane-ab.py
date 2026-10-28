@@ -7,8 +7,14 @@ image, thumbnail) has no work to hold back. This probe seeds a library with file
 never seen, measures `/api/v1/home` while that library is actually being scanned, and prints the
 "scan / idle" p95 ratio. Run it once per arm and compare:
 
-    python3 scripts/probe-media-lane-ab.py --throttle off --keep-work-dir
-    python3 scripts/probe-media-lane-ab.py --throttle on --keep-work-dir
+    python3 scripts/probe-media-lane-ab.py --throttle off --work-dir /tmp/lux-rm-resume3 \
+        --fake-media-cpu-ms 150
+    python3 scripts/probe-media-lane-ab.py --throttle on --work-dir /tmp/lux-rm-resume3 \
+        --fake-media-cpu-ms 150
+
+`--fake-media-cpu-ms` installs synthetic ffprobe/ffmpeg that burn that much CPU per call. It matters:
+on a host without ffprobe/ffmpeg the fixture's probes fail instantly, the media lane holds a permit
+for microseconds, and the downgrade under test has nothing to hold back (measured: identical ratios).
 
 Only stdlib is used. It is an experiment harness, not a gate check: numbers describe this machine
 and this fixture (read model off, 66k catalog) and are not NAS/x86_64 results.
@@ -73,6 +79,56 @@ def scan_item_count(database: pathlib.Path, library_id: str) -> int:
         return 0
 
 
+FAKE_FFPROBE = """#!/bin/sh
+# Synthetic ffprobe: burns CPU for {cpu_ms} ms, then prints a probe result. Stands in for a real
+# ffprobe so the media lane actually occupies CPU while the scan runs.
+python3 - "$@" <<'PY'
+import time
+end = time.perf_counter() + {seconds}
+while time.perf_counter() < end:
+    pass
+print('{{"format":{{"format_name":"matroska","duration":"12.5","bit_rate":"500000"}},"streams":[{{"index":0,"codec_type":"video","codec_name":"h264","width":1920,"height":1080}}]}}')
+PY
+"""
+
+FAKE_FFMPEG = """#!/bin/sh
+# Synthetic ffmpeg: burns CPU briefly and writes a tiny jpeg to the last .jpg argument.
+python3 - "$@" <<'PY'
+import sys, time
+end = time.perf_counter() + {seconds}
+while time.perf_counter() < end:
+    pass
+targets = [argument for argument in sys.argv[1:] if argument.endswith(".jpg")]
+if targets:
+    with open(targets[-1], "wb") as handle:
+        handle.write(b"\\xff\\xd8lux-thumb\\xff\\xd9")
+PY
+"""
+
+
+def synthetic_media_tools(work: pathlib.Path, cpu_ms: int) -> pathlib.Path:
+    """Write fake ffprobe/ffmpeg into the work dir so the media lane does real (synthetic) CPU work.
+
+    Without them the fixture's probes and thumbnails fail instantly, the media lane never holds a
+    permit for long, and a downgrade test measures nothing. Every new executable is warmed once
+    because a first execution on this kind of host can be delayed by host-side scanning.
+    """
+    directory = work / "media-bin"
+    directory.mkdir(parents=True, exist_ok=True)
+    tools = {
+        "ffprobe": FAKE_FFPROBE.format(cpu_ms=cpu_ms, seconds=cpu_ms / 1000.0),
+        "ffmpeg": FAKE_FFMPEG.format(seconds=max(cpu_ms, 20) / 3000.0),
+    }
+    for name, body in tools.items():
+        path = directory / name
+        path.write_text(body)
+        path.chmod(0o755)
+    for _ in range(2):
+        subprocess.run([str(directory / "ffprobe"), "-version"], check=False,
+                       capture_output=True)
+    return directory
+
+
 def seed_unscanned_library(
     database: pathlib.Path, media_root: pathlib.Path, files: int
 ) -> str:
@@ -120,6 +176,12 @@ def main() -> int:
     parser.add_argument("--files", type=int, default=1200)
     parser.add_argument("--requests", type=int, default=30)
     parser.add_argument("--budget", type=int, default=9)
+    parser.add_argument(
+        "--fake-media-cpu-ms",
+        type=int,
+        default=0,
+        help="install synthetic ffprobe/ffmpeg that burn this much CPU per call (0 uses PATH)",
+    )
     parser.add_argument("--keep-work-dir", action="store_true")
     args = parser.parse_args()
 
@@ -139,8 +201,14 @@ def main() -> int:
             stale.unlink()
     database = config / "lux.db"
 
+    media_bin = None
+    if args.fake_media_cpu_ms > 0:
+        media_bin = synthetic_media_tools(work, args.fake_media_cpu_ms)
+
     port = free_port()
     environment = dict(os.environ)
+    if media_bin is not None:
+        environment["PATH"] = f"{media_bin}{os.pathsep}{environment.get('PATH', '')}"
     environment.update(
         {
             "LUX_CONFIG_DIR": str(config),
@@ -202,11 +270,13 @@ def main() -> int:
 
         text = log_path.read_text(errors="replace")
         print(
-            "arm={arm} threshold={threshold}ms budget={budget} files={files}".format(
+            "arm={arm} threshold={threshold}ms budget={budget} files={files} "
+            "media_cpu={media}ms".format(
                 arm=args.throttle,
                 threshold=args.threshold_ms,
                 budget=args.budget,
                 files=args.files,
+                media=args.fake_media_cpu_ms,
             )
         )
         print(
