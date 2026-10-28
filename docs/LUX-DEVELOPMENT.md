@@ -18315,8 +18315,8 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（指纹+bytes+updated_at 校验；重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 部分完成（反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
-| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化 4 个热点查询（`user_item_state`、未播放计数、内容限制、详情批量） | 部分完成（共享 45 列行需先统一 8 条 SELECT，已记录暂缓；`repository.rs` 仍 5.9k 行） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（指纹+bytes+updated_at 校验；重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 剩余项已结论（唯一待定：降档默认值策略，需所有者定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
+| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化 4 个热点查询（`user_item_state`、未播放计数、内容限制、详情批量） | 剩余项已结论（共享 45 列行需先统一 8 条 SELECT，已记录暂缓；`repository.rs` 剩余为连接层，拆分到此为止） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
 
@@ -18541,7 +18541,7 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 
 W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成并复测后再登记。
 
-### W5 CPU 与协议层收敛（进行中，2026-10-28）
+### W5 CPU 与协议层收敛（剩余项已结论，2026-10-28）
 
 范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W5）：缓存返回 `Arc`、去掉整页深克隆；详情 NFO 解码结果按
 `(item_id, fingerprint)` 做小 LRU；图片端点元数据根 canonicalize 缓存；扫描空闲轮询 50 ms → 自适应
@@ -18680,7 +18680,7 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   改查询形状：搜索成本集中在“匹配数万行 + 总数 + 排序”，而总数是 API 契约的一部分；要么接受更粗的
   总数（例如有上限的总数或近似值），要么改成按相关度排序，两者都需要项目所有者确认语义。
 
-### W6 双后端与工程边界（横切，进行中 2026-10-28）
+### W6 双后端与工程边界（横切，剩余项已结论 2026-10-28）
 
 范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W6）：迁移版本映射清单 + CI 校验；`sqlx::Any` 允许清单
 （新代码禁止新增 `DatabaseBackend::` 业务分支）；热点查询逐条 typed 化；存储接口只拆触达域，
