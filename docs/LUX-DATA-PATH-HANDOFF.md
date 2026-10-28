@@ -1,0 +1,100 @@
+# Lux 数据路径重构 · 交接说明（2026-10-28）
+
+本文用于**在新会话里继续目标**。它只记录已经验证过的事实、当前状态、待决事项和下一步；权威规格仍是
+`docs/LUX-DEVELOPMENT.md`（本文引用其段落编号不适用于其他文档）与计划工作稿
+`docs/LUX-DATA-PATH-PLAN.md`（**该文件被 .gitignore 忽略，只存在于本机工作区**）。
+
+## 0. 新会话开场提示（可直接粘贴）
+
+> 继续 Lux 数据路径重构（W4 已完成、W5/W6 部分完成）。先读 `docs/LUX-DEVELOPMENT.md` 的
+> 「数据路径重构（W0–W6）实施状态」表、W4/W5/W6 段与「门禁豁免清单」，以及
+> `docs/LUX-DATA-PATH-HANDOFF.md`。工作区 `/Volumes/Toshiba/mywork/Lux`，分支 `test`，
+> HEAD = `1fb11f07`（若已前进以 `git log` 为准）。下一步是实现 W5 的
+> “把 `request_metrics::route_p95_us` 接入 `background_work` 配额”，判据见 W5 段。
+
+## 1. 仓库与状态
+
+- 分支 `test`，工作区干净（只有长期未跟踪的 `.pnpm-store/`、`.rustc_info.json`、`.tscli/`、
+  `.vite/`、`debug/`）。
+- 本阶段关键提交（时间顺序，均在 `test`）：
+  `646a9147` 搜索入队 → `e96ff994` 队列缺口兜底 → `962d481f` 兼容性差异 → `9049503f` 扫描空闲退避 →
+  `5b880bce` JSON gzip → `782d9eaa` ETag/304 → `da5c2550` CPU 基线 → `5461942a` 缓存策略修复 →
+  `d59ce734` storage 测试适配 → `7c5a5c9d` 迁移配对清单 → `e4652465` 后端分支清单 →
+  `0b71c078` ADR-048–051 → `7227b538` 测量模板/回滚门 → `d69fd8e2` W5 计划 → `7bbe6d2a` 豁免清单 →
+  `ed385060` `route_p95_us` → `d979a936` 两项校验进基线 → `1fb11f07` 总览刷新。
+
+## 2. 门禁
+
+```
+cargo test --locked --all-targets --no-fail-fast -- --test-threads=8
+# → 2,246 passed / 1 failed / 76 ignored（日志示例 /tmp/final-gate-fast.log）
+cargo fmt --all -- --check                     # 通过
+cargo clippy --locked --all-targets --all-features -- -D warnings   # 通过
+python3 scripts/check-migration-parity.py      # 169 对 / 51 SQLite 专有 / 19 PG 专有
+python3 scripts/check-backend-branches.py      # 26 文件 / 265 处
+python3 -m unittest tools/migration-map/test_parity.py tools/backend-branches/test_allowlist.py  # 11 项
+```
+
+唯一失败：`tests/reidentify.rs::fill_missing_dispatcher_serializes_jobs_for_one_library`
+（`Error: Elapsed(())`）。**既有问题，非本次改动**：回退搜索触发器到 W4 之前仍 1/8 失败；把等待放宽到
+10 s 仍 4/12 失败（12.6 s）；同目标 25/25 通过；全局许可 16/补全许可 4，不是许可饥饿。
+豁免条目已写入 `docs/LUX-DEVELOPMENT.md`「门禁豁免清单」，**待所有者确认**；若选择修，另开独立任务查
+“另一个库的补全任务偶发长时间不启动”。
+
+环境注意事项（本机特有，别误判为回归）：
+- 新写入的可执行脚本**首次执行**会被宿主扫描阻塞（实测 16.75 s，同文件第二次 0.12 s）。写桩脚本并立刻
+  执行的测试在并行门禁下会超时；`emby_global_collection_playback` 已加“预热一次假 ffprobe”修掉。
+- 并行度过高（默认线程数）会放大上述超时；`--test-threads=8` 是实测可用的上限。
+- 工作树（`.agents/worktrees/*`）里跑 Web 相关测试需要 `web/dist`，否则 `web_static` 2 项 404。
+
+## 3. 各工作包状态
+
+| 包 | 状态 | 证据 |
+|---|---|---|
+| W0 观测/夹具/门禁 | 完成 | `scripts/run-api-performance.py`、`tools/catalog-fixture/`、`PERFORMANCE.md` 基线 |
+| W1 生命周期与写放大 | 完成 | `LUX-DEVELOPMENT.md`「阶段 29 门」 |
+| W2 读模型切片 | 完成 | 同文件 §30 与 P2 阶段门状态 |
+| W3 首页/继续观看/搜索 | 完成 | LUX-867/868/869 段 + P3 完成状态；首页 p95 118.05→16.58 ms |
+| W4 触发器入队与写预算 | 完成（PG 等价入队未做） | 扫描 0.42→0.37 s、WAL 11.5→11.0 MiB；触发器开销 89→13 ms；`scripts/run-scan-write-bench.py`；ADR-050 |
+| W5 CPU/协议层 | 部分 | 空闲退避、gzip（首页 92,674→8,308 B）、ETag/304、CPU/请求基线（首页 277.5 / 搜索 21.3 / 列表 2.1 ms）、`route_p95_us`；ADR-049 |
+| W6 双后端与边界 | 部分 | 迁移配对 + 后端分支两清单与校验器（已入 `AGENTS.md`）；ADR-051 |
+
+## 4. 下一步（按序，均可独立提交）
+
+1. **W5：前台延迟反馈 → 后台并发预算**
+   - 已有：`RequestMetrics::route_p95_us(route_needle)`（只读，复用有界样本）。
+   - 待做：在 `src/application/background_work.rs` 获取配额处读该信号（建议 needle `/api/v1/home`），
+     前台 p95 超阈值时按比例下调 `BackgroundWorkStage::Probe` / `Metadata` / `Image` 容量，冷却后回升；
+     先做成可关闭的开关，不改变任何结果。
+   - 判据：`scripts/compare-read-model-modes.py --scan-libraries 3 --scan-files 1000 --rounds 2` 下
+     “扫描期间 p95 / 空闲 p95”比值下降，且空闲 p95 不变；达不到就回退，只保留记录。
+   - 参考基线（W3 实测）：首页 `off` 比值 1.33、`on` 1.50；扫描期间 `on` p95 85.94 ms、空闲 57.39 ms。
+2. **W5：`Fields` 投影**（Overview/People/Streams 按需批量补，Emby 协议层）。
+3. **W5：NFO 解码 LRU**（`(item_id, fingerprint)`）。做之前先给证据说明它是热点：当前 CPU 基线显示
+   列表 2.1 ms、搜索 21.3 ms 主要在 SQL（匹配/总数/排序），DTO 装配不是瓶颈（已实测：去掉搜索装配的
+   深克隆后 CPU 21.3→21.8 ms，噪声内）。
+4. **W6：热点查询 typed 化、存储接口拆分**（`repository.rs` 9k+ 行，按触达域拆；纯重构，先量基线）。
+5. **W4：PostgreSQL 侧搜索入队**（需 PG 实例；本机没有，改动只能静态核对）。
+
+## 5. 待决事项（需要项目所有者）
+
+1. 门禁豁免是否接受（见 §2）。
+2. `tower-http` 的 `compression-gzip` 依赖是否批准（计划 §11 第 2 条）：引入纯 Rust 的
+   `async-compression` / `compression-codecs` / `compression-core`，`http-body` 转直连依赖；
+   收益见 W5 段。不同意可移除，ETag/304 不受影响。
+3. 搜索总数语义：若要继续压搜索 CPU（目标 −40%），需要接受“有界/近似总数”或“按相关度排序”之一，
+   两者都是 API 语义变更。当前搜索 p95 106.6 ms（拉丁词元，5.6 万命中）仍在 500 ms 预算内。
+
+## 6. 常用命令
+
+```bash
+# 读模型 off/on A/B（含扫描并发）
+python3 scripts/compare-read-model-modes.py --work-dir /tmp/lux-rm-resume3 --rounds 2 --requests 10
+# CPU/请求
+python3 scripts/run-api-cpu-bench.py --work-dir /tmp/lux-rm-resume3 --requests 150
+# 扫描写入（墙钟 / WAL / 队列排空；--legacy-search-triggers 对比 W4 之前）
+python3 scripts/run-scan-write-bench.py --fixture-dir /tmp/lux-rm-resume3 --work-dir /tmp/lux-scan-bench --files 6000
+```
+
+66k 夹具位置：`/tmp/lux-rm-resume3/config/lux.db`（若已被清理，用 `scripts/run-api-performance.py`
+重新生成；认证 cookie 为 `lux_session=lux-api-performance-token`，CSRF 为 `spec-csrf-token`）。
