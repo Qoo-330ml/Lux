@@ -18315,7 +18315,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
 | W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 | 完成（PostgreSQL 等价入队未做） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（重复详情 −0.28…−0.36 ms） | 部分完成（DTO `Value` 树未做；反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 部分完成（反馈默认值与活体恢复验证待定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
 | W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单） | 部分完成（热点 typed 化、存储接口拆分未做） | `docs/migration-map.json`、`docs/backend-branches.json`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
@@ -18626,8 +18626,12 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   会超时；逐个 target 单独运行全部通过。同一原因已让 `emby_global_collection_playback` 失败过一次，
   那次在测试里加了“探测前先预热一次假 ffprobe”修掉。是否给其余桩统一加预热需要权衡（桩有状态，
   预热执行可能改变断言），暂按环境性处理并记录复跑结果。
-- DTO 仍走 `serde_json::Value` 中间树（首页 `lux_catalog_items_from_values` 逐项深克隆）。改成带
-  `Serialize` 的结构体/借用视图需要重写首页四个 rail 的组装，收益要用 CPU/请求测量确认后再做。
+- 首页 DTO `Value` 树**已量、不值得重写**（2026-10-28）：抓一份真实 66k 首页响应（93,909 B），
+  `continueWatching 10 / recentlyAdded 12 / recommended 7 / libraries 2` 共 **31 个条目值、93,754 B**
+  （`libraries` 每项 25,765 B 占了 51 KB）。release 下把这 31 个 `serde_json::Value` 深克隆 2,000 轮，
+  **0.118 ms/页**——相对 `on` 首页 p95 16.58 ms 是 0.7%、相对 `off` 118 ms 是 0.1%、相对 CPU/请求基线
+  （首页 277.5 ms）可忽略。把四个 rail 换成带 `Serialize` 的结构体最多省到这一量级，因此**不做**这次重写；
+  若将来某个 rail 的条目值涨到几十 KB（或 `libraries` 继续变大），先重新量这一项再谈。
 - 列表 `People` 的“真批量”**测过、暂不做**（2026-10-28）：66k 夹具没有 metadata 目录（0 个
   `people.json`、0 个 `.nfo`），原成本只是每项两次失败 stat，量不出真实开销。用
   `scripts/measure-people-load.py` 给 50 个条目造 `people.json`（每项 10 名演员、provider tmdb、无画像）
