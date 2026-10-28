@@ -91,6 +91,18 @@ struct UserItemStateRow {
     version: i64,
 }
 
+/// Typed projection of the content-restriction join; `allow_unrated` is an integer flag.
+#[derive(sqlx::FromRow)]
+struct UserContentRestrictionRow {
+    rating_system: String,
+    maximum_rating: Option<String>,
+    allow_unrated: i64,
+    version: i64,
+    updated_at: i64,
+    tag_kind: Option<String>,
+    tag: Option<String>,
+}
+
 impl UserItemStateRow {
     fn into_state(self) -> StoredUserItemState {
         StoredUserItemState {
@@ -3442,7 +3454,7 @@ impl Database {
         user_id: &str,
     ) -> Result<Option<UserContentRestrictions>, StorageError> {
         let rows = self
-            .query(
+            .query_as::<UserContentRestrictionRow>(
                 "SELECT restrictions.rating_system, restrictions.maximum_rating,
                         restrictions.allow_unrated, restrictions.version, restrictions.updated_at,
                         tags.tag_kind, tags.tag
@@ -3466,12 +3478,10 @@ impl Database {
         let mut allowed_tags = Vec::new();
         let mut blocked_tags = Vec::new();
         for tag_row in &rows {
-            let tag_kind: Option<String> = tag_row.get("tag_kind");
-            let tag: Option<String> = tag_row.get("tag");
-            match (tag_kind.as_deref(), tag) {
+            match (tag_row.tag_kind.as_deref(), tag_row.tag.as_deref()) {
                 (None, None) => {}
-                (Some("ALLOW"), Some(tag)) => allowed_tags.push(tag),
-                (Some("BLOCK"), Some(tag)) => blocked_tags.push(tag),
+                (Some("ALLOW"), Some(tag)) => allowed_tags.push(tag.to_owned()),
+                (Some("BLOCK"), Some(tag)) => blocked_tags.push(tag.to_owned()),
                 _ => {
                     return Err(StorageError::Serialization(
                         "invalid user content restriction tag row".to_owned(),
@@ -3483,13 +3493,13 @@ impl Database {
         blocked_tags.sort_unstable();
 
         Ok(Some(UserContentRestrictions {
-            rating_system: row.get("rating_system"),
-            maximum_rating: row.get("maximum_rating"),
-            allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
+            rating_system: row.rating_system.clone(),
+            maximum_rating: row.maximum_rating.clone(),
+            allow_unrated: row.allow_unrated != 0,
             allowed_tags,
             blocked_tags,
-            version: row.get("version"),
-            updated_at: row.get("updated_at"),
+            version: row.version,
+            updated_at: row.updated_at,
         }))
     }
 
