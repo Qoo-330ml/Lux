@@ -9,7 +9,7 @@
 > 继续 Lux 数据路径重构（W4 已完成、W5/W6 部分完成）。先读 `docs/LUX-DEVELOPMENT.md` 的
 > 「数据路径重构（W0–W6）实施状态」表、W4/W5/W6 段与「门禁豁免清单」，以及
 > `docs/LUX-DATA-PATH-HANDOFF.md`。工作区 `/Volumes/Toshiba/mywork/Lux`，分支 `test`，
-> HEAD = `747f6571`（若已前进以 `git log` 为准）。W5/W6 的剩余项都已落地或有书面结论；剩下的是待所有者
+> HEAD = `8a7d4011`（若已前进以 `git log` 为准）。W5/W6 的剩余项都已落地或有书面结论；剩下的是待所有者
 > 拍板的产品决定（前台降档默认值、搜索总数语义、门禁豁免、gzip 依赖）与“本机无 PG 实例”的环境阻塞。
 > W5：前台 p95 → 媒体车道的降档已实现（默认关闭）并验证（媒体车道有活时比值 2.55 → 1.91、恢复 2.5 s），
 > 30 s 时间窗 + 按读模型模式阈值；`Fields` 列表 `MediaStreams`、NFO 解码缓存（−0.28…−0.36 ms/重复详情，
@@ -81,7 +81,7 @@ python3 -m unittest tools/migration-map/test_parity.py tools/backend-branches/te
    收藏/评分或媒体写入），每次一个域、纯移动、只跑该域测试。
 6. **W6：热点查询 typed 化**——`sqlx::query!` 在双后端下不可行，只能 `query_as` + 手写行结构；逐条评估，
    先看 CPU/请求基线里 SQL 占比最高的查询（搜索匹配/总数/排序、列表可见性）。
-7. **W4：PostgreSQL 侧搜索入队**（需 PG 实例；本机没有，改动只能静态核对）。
+7. ~~W4：PostgreSQL 侧搜索入队~~ 已完成（`8a7d4011`）：`migrations-postgres/0239` 语句级入队触发器 + PG 消费者；真机 PG 16（OrbStack 容器 `lux-goal-postgres`，`127.0.0.1:55432`）上 34/34 忽略用例通过。剩余只是 PG 侧写预算基准（无扫描负载测量）。
 
 ## 5. 待决事项（需要项目所有者）
 
