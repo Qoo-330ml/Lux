@@ -1,6 +1,7 @@
 use super::*;
 use axum::extract::MatchedPath;
 use axum::http::{HeaderMap, StatusCode, header};
+use http_body::Body as HttpBody;
 use tower::{ServiceExt, service_fn};
 use tower_http::compression::CompressionLayer;
 
@@ -10,6 +11,80 @@ const PERFORMANCE_PROBE_VALUE: &str = "v1";
 // Keep the existing per-pool concurrency for Home while isolating it from
 // unrelated catalog traffic that could otherwise hold every shared worker.
 const MAX_CONCURRENT_HOME_REQUESTS: usize = MAX_CONCURRENT_CATALOG_REQUESTS;
+
+/// Largest JSON body that still gets an ETag; bigger payloads (none today) skip the buffering.
+const JSON_ETAG_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// Tags JSON responses with a strong ETag over the uncompressed body and answers `If-None-Match`
+/// with 304, so re-opening the same page transfers no body at all.
+async fn json_response_etag(request: Request<Body>, next: Next) -> Response {
+    if !matches!(*request.method(), Method::GET | Method::HEAD) {
+        return next.run(request).await;
+    }
+    let request_headers = request.headers().clone();
+    let response = next.run(request).await;
+    if !response.status().is_success() || !is_json_response(&response) {
+        return response;
+    }
+    let (mut parts, body) = response.into_parts();
+    // Only buffer bodies whose size is known up front: hyper adds `content-length` while sending, so
+    // the body's own hint is the reliable signal here.
+    match body.size_hint().exact() {
+        Some(length) if length <= JSON_ETAG_MAX_BYTES as u64 => {}
+        _ => return Response::from_parts(parts, body),
+    }
+    let bytes = match axum::body::to_bytes(body, JSON_ETAG_MAX_BYTES).await {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            tracing::warn!(%error, "could not buffer a JSON response for its ETag");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let etag = format!("\"{}\"", json_etag_hex(&bytes));
+    if if_none_match_matches(&request_headers, &etag) {
+        let mut not_modified = Response::new(Body::empty());
+        *not_modified.status_mut() = StatusCode::NOT_MODIFIED;
+        let headers = not_modified.headers_mut();
+        headers.insert(header::ETAG, header_value(&etag));
+        for name in [
+            header::CACHE_CONTROL,
+            header::VARY,
+            header::CONTENT_ENCODING,
+        ] {
+            if let Some(value) = parts.headers.get(&name) {
+                headers.insert(name, value.clone());
+            }
+        }
+        return not_modified;
+    }
+    parts.headers.insert(header::ETAG, header_value(&etag));
+    parts
+        .headers
+        .insert(header::CACHE_CONTROL, header_value("private, no-cache"));
+    Response::from_parts(parts, Body::from(bytes))
+}
+
+fn is_json_response(response: &Response) -> bool {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("application/json"))
+}
+
+fn json_etag_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes)
+        .iter()
+        .take(16)
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+fn header_value(value: &str) -> axum::http::HeaderValue {
+    axum::http::HeaderValue::from_str(value)
+        .unwrap_or_else(|_| axum::http::HeaderValue::from_static(""))
+}
 
 /// Compresses JSON responses only: media streams, images, the SPA fallback and server-sent events
 /// must reach the client untouched, so the predicate is deliberately narrow.
@@ -54,6 +129,7 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 .fallback(ServeFile::new(web_root.join("index.html")).precompressed_gzip()),
         )
         .with_state(state)
+        .layer(middleware::from_fn(json_response_etag))
         .layer(
             // JSON responses only: media streams, images, the SPA fallback and server-sent events
             // must reach the client untouched.
