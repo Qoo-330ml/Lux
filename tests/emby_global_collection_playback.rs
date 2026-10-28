@@ -99,6 +99,12 @@ async fn global_collection_playback_uses_visible_original_copy_for_video_and_sub
 printf '%s' '{"format":{"format_name":"matroska","duration":"10","bit_rate":"1000"},"streams":[{"index":0,"codec_type":"video","codec_name":"h264"},{"index":1,"codec_type":"audio","codec_name":"aac"}]}'
 "#,
     )?;
+    // The first exec of a freshly written script can be delayed by host-side executable scanning
+    // (tens of seconds on this machine), which would burn the probe timeout before ffprobe starts.
+    // Warm the interpreter once so the probe budget only covers the probe itself.
+    let _ = std::process::Command::new(&fake_ffprobe)
+        .arg("-version")
+        .output();
     MediaProbeService::new(
         database.clone(),
         FfprobeRunner::new(fake_ffprobe, Duration::from_secs(5)),
