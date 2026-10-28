@@ -18513,6 +18513,49 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 
 W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成并复测后再登记。
 
+### W5 CPU 与协议层收敛（进行中，2026-10-28）
+
+范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W5）：缓存返回 `Arc`、去掉整页深克隆；详情 NFO 解码结果按
+`(item_id, fingerprint)` 做小 LRU；图片端点元数据根 canonicalize 缓存；扫描空闲轮询 50 ms → 自适应
+250 ms–1 s；ETag/304 + gzip；`Fields` 投影；前台延迟反馈扩到路由模板级并接入 ffprobe/元数据/图片
+有效并发。验收：CPU/请求下降（列表/搜索 ≥40%）、首屏字节下降、扫描期间前台 p95 比值下降、客户端
+契约全绿。
+
+已完成：
+
+- 扫描空闲退避（`9049503f`）：批量排空循环原本固定睡 50 ms，现在空闲轮从 250 ms 递增到 1 s，
+  任一轮有进展即重置；回归 `scan_idle_backoff_grows_to_one_second_and_resets`。
+- JSON gzip（`5b880bce`）：`tower-http` 开启 `compression-gzip`，用自定义谓词**只压缩**成功的
+  `application/json` 响应（媒体流、图片、SPA 回退与 SSE 保持原样，Range 请求不受影响），按 body 尺寸
+  提示跳过粗体与未知长度的流。66k 夹具实测（debug 构建，字节数与构建模式无关）：
+
+  | 端点 | 原始 | gzip | 占比 |
+  |---|---:|---:|---:|
+  | `/api/v1/home` | 92,674 B | **8,308 B** | 9.0% |
+  | `/api/v1/continue-watching?pageSize=24` | 40,324 B | 4,982 B | 12.4% |
+  | `/api/v1/search?q=Spec` | 99,614 B | 7,002 B | 7.0% |
+  | 库列表 `pageSize=50` | 99,464 B | 6,993 B | 7.0% |
+  | `/api/v1/libraries?pageSize=100` | 249 B | 194 B | 77.9% |
+
+  压缩 CPU 成本实测约 0.12 ms/60 KB（zlib level 6），相对每次首屏省下的 84 KB 可忽略。
+- JSON ETag/304（`782d9eaa`）：中间件对“已知长度且 ≤4 MiB”的 JSON 响应计算未压缩 body 的强 ETag，
+  同时下发 `Cache-Control: private, no-cache`；`If-None-Match` 命中时返回 304 且无 body。非 JSON
+  响应不进入缓冲路径；压缩层包在其外层，304 不做压缩。回归
+  `json_responses_answer_if_none_match_with_304`、`json_responses_are_gzipped_only_when_requested`。
+- 新增依赖面（需所有者确认）：`tower-http` 的 `compression-gzip` 特性引入纯 Rust 的
+  `async-compression` / `compression-codecs` / `compression-core`；`http-body`（原本经 axum 已在依赖树
+  内）改为直接依赖，用于实现压缩谓词。未新增框架、数据库或编解码以外的能力。
+
+剩余：
+
+- DTO 仍走 `serde_json::Value` 中间树（首页 `lux_catalog_items_from_values` 逐项深克隆）。改成带
+  `Serialize` 的结构体/借用视图需要重写首页四个 rail 的组装，收益要用 CPU/请求测量确认后再做。
+- 详情 NFO 解码 LRU、图片端点元数据根 canonicalize 缓存、`Fields` 投影（Overview/People/Streams
+  按需批量补）未做。
+- 前台延迟反馈仍只在 home 路径；扩到路由模板级并联动 ffprobe/元数据/图片并发属于跨子系统改动，
+  需要先有 CPU/请求基线，否则无法判断降档是否有效。
+- CPU/请求（列表/搜索 ≥40%）尚无基线数字：需要 release 构建 + 采样进程 CPU/请求数的脚本。
+
 ### P3（W3）完成状态（2026-10-27）
 
 - LUX-867–869 完成：继续观看、首页四条 rail、搜索语义统一与用例矩阵；`on` 仍默认关闭。

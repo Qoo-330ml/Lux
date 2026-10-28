@@ -2879,3 +2879,18 @@ SQL 级补充（同一夹具，5,000 次标题更新，`synchronous=NORMAL`）�
 
 批量提交已经把 fsync 次数压到 12 次/6k 行，独立派生池没有可测收益；两个池同库还会带来锁竞争和
 “运行中禁止 schema 变更”的运维约束，因此保持单池。断电恢复证据也因此不需要补做。
+
+## 响应字节与压缩（W5，2026-10-28）
+
+66k 夹具，同一台机器；gzip 由 `tower-http` 的 `CompressionLayer` 只对 `application/json` 生效：
+
+| 端点 | 原始字节 | gzip 字节 | 占比 |
+|---|---:|---:|---:|
+| `/api/v1/home` | 92,674 | **8,308** | 9.0% |
+| `/api/v1/continue-watching?pageSize=24` | 40,324 | 4,982 | 12.4% |
+| `/api/v1/search?q=Spec` | 99,614 | 7,002 | 7.0% |
+| 库列表 `pageSize=50` | 99,464 | 6,993 | 7.0% |
+| `/api/v1/libraries?pageSize=100` | 249 | 194 | 77.9% |
+
+压缩 CPU 成本约 0.12 ms/60 KB（zlib level 6）。JSON 响应同时带强 ETag 与
+`Cache-Control: private, no-cache`，二次访问命中 `If-None-Match` 时返回 304 且不传 body。
