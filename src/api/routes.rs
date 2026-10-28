@@ -1,6 +1,8 @@
 use super::*;
 use axum::extract::MatchedPath;
+use axum::http::{HeaderMap, StatusCode, header};
 use tower::{ServiceExt, service_fn};
+use tower_http::compression::CompressionLayer;
 
 const CATALOG_WORKER_WAIT_TIMEOUT: Duration = Duration::from_secs(2);
 const PERFORMANCE_PROBE_HEADER: &str = "x-lux-performance-probe";
@@ -8,6 +10,25 @@ const PERFORMANCE_PROBE_VALUE: &str = "v1";
 // Keep the existing per-pool concurrency for Home while isolating it from
 // unrelated catalog traffic that could otherwise hold every shared worker.
 const MAX_CONCURRENT_HOME_REQUESTS: usize = MAX_CONCURRENT_CATALOG_REQUESTS;
+
+/// Compresses JSON responses only: media streams, images, the SPA fallback and server-sent events
+/// must reach the client untouched, so the predicate is deliberately narrow.
+#[derive(Clone, Copy)]
+struct CompressJsonResponses;
+
+impl tower_http::compression::predicate::Predicate for CompressJsonResponses {
+    fn should_compress<B>(&self, response: &axum::http::Response<B>) -> bool
+    where
+        B: http_body::Body,
+    {
+        response.status().is_success()
+            && response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .is_some_and(|value| value.starts_with("application/json"))
+    }
+}
 
 pub(super) fn app_with_state(state: AppState) -> Router {
     let web_root = web_root();
@@ -33,6 +54,11 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                 .fallback(ServeFile::new(web_root.join("index.html")).precompressed_gzip()),
         )
         .with_state(state)
+        .layer(
+            // JSON responses only: media streams, images, the SPA fallback and server-sent events
+            // must reach the client untouched.
+            CompressionLayer::new().compress_when(CompressJsonResponses),
+        )
         .layer(middleware::from_fn_with_state(
             request_rate_limiter,
             limit_request_rate,
