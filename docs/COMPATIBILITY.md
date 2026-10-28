@@ -1313,3 +1313,16 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 因此两后端的**查询语义一致**（同样的 FTS/LIKE 组合在 `LUX-869` 已对齐），差异只在维护机制：
 SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在扫描路径上。PostgreSQL 的等价入队
 改造待有 PG 实例时再做（见 `LUX-DEVELOPMENT.md` W4「剩余」）。
+
+## W6：迁移配对清单（2026-10-28）
+
+两套迁移目录由各自的专有能力（SQLite 的 FTS5/rowid 映射/pragma，PostgreSQL 的扩展与语句级触发器）
+决定内容，因此允许存在单侧迁移，但**必须登记**。`docs/migration-map.json` + `scripts/check-migration-parity.py`
+（已接入 `scripts/check-all.sh`）保证：
+
+- 每个迁移文件都在清单里（新文件必须 `--write` 生成条目）；
+- 成对迁移两侧的版本号不得单边漂移（例如只改了 SQLite 的 0238 却忘了 PostgreSQL）；
+- 清单里登记为单侧的迁移不得悄悄变成双侧（或反之）。
+
+当前：169 对、51 个 SQLite 专有、19 个 PostgreSQL 专有。同名的相对顺序在两套历史里并不一致
+（`rank_mismatches = 84`），规则改为“新增迁移在两侧保持相邻”，计数不得增长。

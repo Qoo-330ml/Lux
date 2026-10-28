@@ -12,6 +12,8 @@ cargo clippy --locked --all-targets --all-features -- -D warnings
 bash -n scripts/*.sh
 python3 -m unittest tools/compatibility-probe/test_probe.py
 python3 -m unittest tools/catalog-fixture/test_generator.py
+python3 scripts/check-migration-parity.py
+python3 -m unittest tools/migration-map/test_parity.py
 
 pnpm --dir web install --frozen-lockfile
 pnpm --dir web test

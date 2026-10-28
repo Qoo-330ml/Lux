@@ -18565,6 +18565,32 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   改查询形状：搜索成本集中在“匹配数万行 + 总数 + 排序”，而总数是 API 契约的一部分；要么接受更粗的
   总数（例如有上限的总数或近似值），要么改成按相关度排序，两者都需要项目所有者确认语义。
 
+### W6 双后端与工程边界（横切，进行中 2026-10-28）
+
+范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W6）：迁移版本映射清单 + CI 校验；`sqlx::Any` 允许清单
+（新代码禁止新增 `DatabaseBackend::` 业务分支）；热点查询逐条 typed 化；存储接口只拆触达域，
+不重写 94k 行 storage；不再新增领域命令层。
+
+已完成：
+
+- **迁移配对清单与校验**：`docs/migration-map.json` 记录当前 169 对同名迁移、51 个 SQLite 专有与
+  19 个 PostgreSQL 专有迁移（含原因字段），`scripts/check-migration-parity.py` 校验
+  “新文件必须进清单、成对迁移的两侧版本不得单边漂移、清单里的文件不得消失”，已接入
+  `scripts/check-all.sh`，并有 `tools/migration-map/test_parity.py` 5 项单测。
+  清单里的 `ordering.rank_mismatches = 84` 是历史结果：两套历史因 SQLite/PG 专有迁移的交错不同，
+  同名迁移的相对顺序本来就不一致；规则是**新增迁移必须让一对在两侧相邻**，让这个计数不再增长。
+- 差异分类：SQLite 专有 = FTS5 表/rowid 映射/pragma/SQLite 触发器；PostgreSQL 专有 = 扩展、
+  语句级触发器函数、部分索引。新增差异必须写进清单原因字段，否则校验只报“未登记”。
+
+剩余：
+
+- `sqlx::Any` 允许清单：尚未把现有 `DatabaseBackend::` 分支登记成白名单，也没加“新分支必须登记”
+  的检查。做法与迁移清单相同（JSON 清单 + 校验脚本），等下一轮补。
+- 热点查询 typed 化：`catalog_items`/`media_search`/`user_series_next` 已走读模型与消费者，但仍是
+  `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估。
+- 存储接口拆分：`storage` 仍是单一大模块，`repository.rs` 9k+ 行；按触达域拆分是纯重构，
+  收益只在可维护性，排在写路径与协议层之后。
+
 ### P3（W3）完成状态（2026-10-27）
 
 - LUX-867–869 完成：继续观看、首页四条 rail、搜索语义统一与用例矩阵；`on` 仍默认关闭。
