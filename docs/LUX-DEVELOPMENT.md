@@ -18548,6 +18548,12 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
 
 剩余：
 
+- 门禁环境说明：这台机器上“新建可执行脚本的首次执行”会被宿主扫描阻塞（实测首个新脚本 16.75 s、
+  后续同文件 0.12 s，`/bin/sh -c true` 不受影响）。因此 `embedded_subtitle`（2 项）与
+  `playback::hls`/`playback::session`（8 项）这类“写脚本桩后立刻执行、且用秒级超时”的用例在并行门禁里
+  会超时；逐个 target 单独运行全部通过。同一原因已让 `emby_global_collection_playback` 失败过一次，
+  那次在测试里加了“探测前先预热一次假 ffprobe”修掉。是否给其余桩统一加预热需要权衡（桩有状态，
+  预热执行可能改变断言），暂按环境性处理并记录复跑结果。
 - DTO 仍走 `serde_json::Value` 中间树（首页 `lux_catalog_items_from_values` 逐项深克隆）。改成带
   `Serialize` 的结构体/借用视图需要重写首页四个 rail 的组装，收益要用 CPU/请求测量确认后再做。
 - 详情 NFO 解码 LRU、图片端点元数据根 canonicalize 缓存、`Fields` 投影（Overview/People/Streams
