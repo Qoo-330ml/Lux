@@ -15,12 +15,18 @@
   - `std::thread::sleep`；
   - 同步 `File` / `OpenOptions` 读写（`File::open` / `File::create` / `File::options` /
     `OpenOptions::new`），以及 `std::io::Read`/`Write` 在其上的同步读写；
+  - **同步路径 stat 谓词**：`Path::exists()` / `Path::is_file()` / `Path::is_dir()` /
+    `Path::is_symlink()`（每个都是一次 `stat`/`access` syscall）。这类调用与 `std::fs` 计数分开
+    统计（§4.8），因为它们是隐式 IO、容易漏看。
+- 明确排除的"看起来像 IO 但不是"的调用：`Metadata::is_file()`、`Metadata::is_dir()`、
+  `FileType::is_*()`（值是已取回的元数据，不再 syscall），以及 `ZipFile::is_dir()`
+  （zip crate 的归档条目属性）。
 - 排除：`#[cfg(test)] mod tests`、`*_tests.rs`、`tests.rs` 之后的所有测试代码。
 - 方法：
   1. 用脚本枚举所有候选调用点，并根据每个文件的 `use` 语句解析 `fs` 别名是 `std::fs` 还是
      `tokio::fs`（`use super::*` 形式的继承按父模块链解析）；带 `.await` 的调用判定为
      `tokio::fs`，不计入阻塞调用。
-  2. 对每个 `std::fs` / 同步 `File` 调用点，沿调用链向上确认最近的
+  2. 对每个 `std::fs` / 同步 `File` / 路径 stat 谓词调用点，沿调用链向上确认最近的
      `spawn_blocking` / `run_process_background_blocking` / 专用线程 / 启动期入口，得到归类。
      同步函数只要**存在一条**从 async 函数直达的调用路径就判为 (d)，不按调用点字面位置判断。
 - 基线数字（修复后重新统计）：上述四个目录内 `spawn_blocking` 43 处、
@@ -52,10 +58,15 @@
 | ├ 归类 (b) | 84 | 86 |
 | ├ 归类 (c)（含 c\*） | 17 | 20 |
 | └ 归类 (d) 违规 | **10** | **3** |
+| 同步路径 stat 谓词（`Path::exists/is_file/is_dir`，§4.8） | **8** | **7**（`plugins.rs` 1 处改用 `tokio::fs::metadata`） |
+| ├ 归类 (c)（含 c\*） | 7 | 7 |
+| └ 归类 (d) 违规 | **1** | **0** |
+| 合计阻塞调用点 | **132** | **129** |
+| 剩余 (d) | **11** | **3**（均为非阻塞的 `File::try_lock`，见 §6.1） |
 | 非测试代码中的 `std::process::Command` | **0** | **0** |
 | 非测试代码中的 `std::thread::sleep` | **0** | **0** |
 
-加总校验：124 = 13+84+17+10；122 = 13+86+20+3。
+加总校验：124 = 13+84+17+10；122 = 13+86+20+3；8 = 7+1；132 = 124+8；129 = 122+7。
 
 > **基线 (b)=84 / (d)=10 的更正**：首次审计把 `scanner/manifest.rs:1009`、`1028`
 > （`followed_symlink_observation` 内的 `std::fs::canonicalize` / `std::fs::metadata`）记成了 (b)。
@@ -65,17 +76,37 @@
 
 ### 3.2 结论摘要
 
-- 阻塞型**子进程**已经全部走 `tokio::process::Command`，非测试代码里没有
-  `std::process::Command`；`std::process::Stdio` 只是句柄类型。
+- 阻塞型**子进程**已经全部走 `tokio::process::Command`。非测试代码里共 **11 处**
+  `Command::new`，导入来源全部是 `tokio::process`，不构成阻塞调用
+  （`std::process::Stdio` 只是句柄类型）：
+
+  | 文件:行 | 启动的可执行文件 | 用途 |
+  | --- | --- | --- |
+  | `application/chapter_detector.rs:939` | `ffmpeg` | 章节探测 |
+  | `application/embedded_subtitle.rs:124` | `ffmpeg` | 内嵌字幕提取 |
+  | `application/playback/hls.rs:668` | `ffmpeg` | 硬件编码器可用性探测（`HARDWARE_PROBE_TIMEOUT`） |
+  | `application/playback/hls.rs:967` | `ffmpeg` | HLS 转码/remux |
+  | `application/playback/hls.rs:1996` | `pgrep` | 启动期回收孤儿 ffmpeg（`process_ids_matching`，按可执行文件与目录各调用一次） |
+  | `application/thumbnails.rs:647` | `ffmpeg` | 缩略图 |
+  | `application/thumbnails.rs:725` | `ffmpeg` | 海报 |
+  | `application/probe/runner.rs:103` | `ffprobe` | 媒体探测 |
+  | `application/admin_health.rs:186` | `ffprobe -version` | 管理员健康检查 |
+  | `application/plugin_runtime.rs:765` | 插件可执行文件 | 插件 RPC |
+  | `observability/resources.rs:688` | `df -P -k` | 媒体盘容量统计 |
+
+  全库唯一的 `std::process::Command::new`（`application/nfo.rs:4337` 的 `mkfifo`）位于
+  `#[cfg(test)] mod tests` 内，不计入。
 - 阻塞型**文件系统**工作绝大部分已经收敛到 `spawn_blocking` / 专用线程 / 启动期：
   扫描清单（`scanner/manifest.rs`，27 处）、日志存储（`observability/logs.rs`，37 处）、
   邮件配置（`mail.rs`，12 处）、插件发现（`plugin_runtime.rs`，12 处）都符合规则。
-- 审计基线的违规 (d) 共 10 处，集中在三类问题，本轮全部处理：
+- 审计基线的违规 (d) 共 11 处（10 处文件系统 + 1 处路径 stat），集中在四类问题，本轮全部处理：
   1. **扫描遍历器**同步 `std::fs::canonicalize` 根路径（2 处）→ 改用 `tokio::fs`；
   2. **扫描遍历器**同步判定符号链接目标（`manifest.rs:1009、1028`，2 处）→ 调用点包进
      `spawn_blocking`；
   3. **进程级惰性缓存**（`OnceLock`）在首次请求 / 首次扫描时才做文件系统读取
-     （`transcoding.rs`、`scanner/symlink.rs`，3 处）→ 启动期在阻塞线程上预热。
+     （`transcoding.rs`、`scanner/symlink.rs`，3 处）→ 启动期在阻塞线程上预热；
+  4. **请求路径上的同步 stat**：插件安装后的归档清理用 `Path::is_file()`（1 处）→ 改用
+     `tokio::fs::metadata`。
   剩余 3 处是**建议性文件锁**的 `File::try_lock()`（非阻塞 syscall，保留，见 §6.1）。
 - 另外 `plugin_runtime.rs` 的插件目录发现是**同步构造**（`PluginService::new`），目前只在启动期
   调用，属于 (c\*)；把它改成异步 + `spawn_blocking` 需要改动 `PluginService` 构造签名和十余处
@@ -183,6 +214,8 @@
 
 ### 4.4 `src/application/plugin_runtime.rs` — 12 处，全部 (c\*)
 
+（另有 4 处同步路径 stat 谓词，见 §4.8。）
+
 插件目录发现（`PluginCatalog::discover` → `discover_directory` / `discover_archive` /
 `read_manifest` / `verify_declared_files` / `extract_archive` / `sha256_file`）是同步实现。
 唯一"非阻塞包装"的入口是 `plugins.rs:2720 discover_plugin_catalog`（`spawn_blocking`）；
@@ -256,11 +289,28 @@
 | application/settings.rs:1054 | `std::fs::read_to_string`（`plugin-proxy-bypass`） | c\* | 合规：唯一调用方 `plugins.rs:201`（启动期构造） |
 | application/settings.rs:1086 | `std::fs::read_to_string`（`read_secret`） | c\* | 合规：唯一调用方 `main.rs:193`（启动期） |
 
+### 4.8 同步路径 stat 谓词 — 8 处
+
+这些调用每个都是一次 `stat`/`access` syscall，之前没有纳入审计口径，本轮补齐。
+
+| 文件:行 | 调用 | 归类 | 处理 |
+| --- | --- | --- | --- |
+| application/plugin_runtime.rs:90 | `source_path.is_dir()` | c\* | 插件目录发现（同步构造，启动期），随 §4.4 一起列入后续建议 |
+| application/plugin_runtime.rs:976 | `entrypoint.is_file()` | c\* | `resolve_entrypoint`，同上 |
+| application/plugin_runtime.rs:1005 | `path.is_file()` | c\* | `verify_declared_files`，同上 |
+| application/plugin_runtime.rs:1026 | `destination.exists()` | c\* | `extract_archive`，同上 |
+| application/transcoding.rs:37 | `Path::new("/dev/nvidiactl").exists()` | c | 同在 `detect_hardware_encoders()` 内，已被启动期 `warm_up()` 覆盖 |
+| application/container_gateway.rs:48 | `Path::new("/run/.dockerenv").exists()` | c\* | 同在 `implicit_trusted_proxy()` 内，已被 `container_gateway::warm_up()` 覆盖 |
+| application/container_gateway.rs:49 | `Path::new("/run/.containerenv").exists()` | c\* | 同上 |
+| application/plugins.rs:2508 | `path.is_file()` | d | **已修复**：改为 `fs::metadata(&path).await.is_ok_and(|m| m.is_file())`，保留"解析链接 + 出错即 false"的语义 |
+
+除 `plugins.rs` 一行（基线行号，修复后代码移到 2509–2512）外，本表行号均为修复后的当前位置。
+
 ## 5. `(d)` 违规与修复
 
 表中行号一律指**审计基线（修复前）**的位置；修复后部分代码已移动
 （例如 `scanner/library.rs` 的构造函数与 `main.rs` 的启动预热）。
-修复后的实际位置见 §3.1 / §4.7 的说明。
+修复后的实际位置见 §3.1 / §4.7 / §4.8 的说明。
 
 | # | 文件:行 | 调用 | 问题 | 修复 |
 | --- | --- | --- | --- | --- |
@@ -271,13 +321,14 @@
 | 5 | application/transcoding.rs:40 | `std::fs::read_dir("/dev/dri")` | `detected_hardware_encoders()` 的 `OnceLock` 首次填充发生在管理员设置请求里 | 新增 `warm_up()`，在 `main.rs::build_app_state` 的 `spawn_blocking` 里、`AppState` 构造之前预热 |
 | 6 | application/transcoding.rs:51 | `std::fs::read_to_string`（sysfs vendor） | 同上 | 同上 |
 | 7 | application/scanner/symlink.rs:152 | `std::fs::canonicalize` | `SymlinkPolicy::current()` 的 `OnceLock` 首次填充可能发生在扫描 / 请求路径 | 同上（经 `application::warm_up_startup_probes`） |
-| 8 | application/people/helpers.rs:1269 | `std::fs::File` 句柄字段 | 句柄来自 `tokio::fs::OpenOptions::…open().into_std().await`，打开本身是异步的 | 保留（见 §6.1） |
-| 9 | application/people/helpers.rs:1296 | `File::try_lock()` → `WouldBlock` | 非阻塞 `flock(LOCK_NB)`，立即返回 | 保留（见 §6.1） |
-| 10 | application/people/helpers.rs:1304 | `File::try_lock()` → `Error` | 同上 | 保留（见 §6.1） |
+| 8 | application/plugins.rs:2508 | `path.is_file()`（同步 stat） | `install_from_store` 在 async fn 里对每个已安装归档做同步 stat | 改为 `tokio::fs::metadata(&path).await` |
+| 9 | application/people/helpers.rs:1269 | `std::fs::File` 句柄字段 | 句柄来自 `tokio::fs::OpenOptions::…open().into_std().await`，打开本身是异步的 | 保留（见 §6.1） |
+| 10 | application/people/helpers.rs:1296 | `File::try_lock()` → `WouldBlock` | 非阻塞 `flock(LOCK_NB)`，立即返回 | 保留（见 §6.1） |
+| 11 | application/people/helpers.rs:1304 | `File::try_lock()` → `Error` | 同上 | 保留（见 §6.1） |
 
 ### 5.1 修复后状态
 
-见 §3.1 的两栏表（基线 124 / 修复后 122，剩余 (d) 3）。要点：
+见 §3.1 的两栏表（基线 124 / 修复后 122，路径 stat 8 / 7，剩余 (d) 3）。要点：
 
 - 修掉的 5 组：`scanner/library.rs` 根路径规范化（2）→ `tokio::fs`；
   `scanner/manifest.rs` 符号链接判定（2）→ `spawn_blocking`；
@@ -319,7 +370,7 @@
 ## 7. 后续建议（本次未做，超出单点 ~80 行预算）
 
 1. **`PluginService::new` 异步化**：把 `PluginCatalog::discover`（`plugin_runtime.rs`，12 处同步
-   `std::fs`，含 zip 解包与逐文件 SHA-256）搬到 `spawn_blocking`。现状只在
+   `std::fs` + 4 处同步路径 stat，含 zip 解包与逐文件 SHA-256）搬到 `spawn_blocking`。现状只在
    启动期执行（合规于 (c\*)，但启动期耗时可能达秒级）。需要把 `PluginService::new` /
    `new_with_proxy` 改成 `async fn`，并同步修改 `src/api/legacy.rs` 与十余处测试构造点，
    改动约 200+ 行。
@@ -335,4 +386,5 @@
    `application::warm_up_startup_probes()` 直接包含三项。
 4. **为 (d) 类加静态检查**：可以在 CI 里拒绝 `src/application|api|auth|observability` 下
    `#[cfg(not(test))]` 区域内新增的 `std::fs::` / `std::process::Command` / `std::thread::sleep`
-   要求显式 `#[allow]` 或白名单注释，避免回退。
+   / `Path::exists|is_file|is_dir|is_symlink`，要求显式 `#[allow]` 或白名单注释，避免回退。
+   本轮补齐的路径 stat 口径（§4.8）说明这类隐式 IO 确实会漏看。
