@@ -2560,8 +2560,9 @@ pub(super) async fn emby_item(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    // On the playback allow-list: a 302 proxy resolves the original STRM path through this route.
     let auth_principal =
-        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+        match require_playback_route_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
@@ -2727,8 +2728,9 @@ pub(super) async fn emby_user_item(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> Response {
+    // On the playback allow-list, like `/Items/{id}`.
     let auth_principal =
-        match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
+        match require_playback_route_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };

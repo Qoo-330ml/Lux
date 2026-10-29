@@ -2180,3 +2180,206 @@ async fn emby_login_and_existing_tokens_enforce_ip_blacklists_through_trusted_pr
     );
     Ok(())
 }
+
+/// A playback-only token is an `api_key` the browser puts into a media URL, so it must not be able
+/// to reach anything outside the playback allow-list even though the Emby routes accept it.
+#[tokio::test]
+async fn playback_token_is_confined_to_the_playback_allow_list()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let auth = EmbyAuthService::new(database.clone())?;
+    let user = auth
+        .authenticate("Admin", "correct password", &playback_device())
+        .await?
+        .ok_or("login failed")?
+        .user;
+    let token = auth
+        .issue_playback_token(
+            &user,
+            "play-session-1",
+            &playback_device(),
+            playback_token_expiry(),
+            None,
+        )
+        .await?
+        .ok_or("token was not issued")?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        // The server resolves credentials through its own service instance, so the token has to
+        // exist in the shared database before the server starts.
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    // `Auth/Keys` is exactly what an Emby proxy calls to validate the `api_key` it was handed.
+    let keys = client
+        .get(format!("http://{address}/emby/Auth/Keys"))
+        .query(&[("api_key", token.as_str())])
+        .send()
+        .await?;
+    assert_eq!(keys.status(), reqwest::StatusCode::OK);
+
+    for path in [
+        "/emby/Items/00000000-0000-0000-0000-000000000001",
+        "/Items/00000000-0000-0000-0000-000000000001",
+        "/emby/Users/00000000-0000-0000-0000-000000000001/Items/00000000-0000-0000-0000-000000000001",
+    ] {
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .query(&[("api_key", token.as_str())])
+            .send()
+            .await?;
+        // The item does not exist, so any answer but an authentication rejection proves the
+        // playback token was accepted on that route.
+        assert_ne!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
+
+    // `/Videos/{id}/stream` is also allowed; it fails on the missing item, never on auth.
+    let stream = client
+        .get(format!(
+            "http://{address}/emby/Videos/00000000-0000-0000-0000-000000000001/stream"
+        ))
+        .query(&[("api_key", token.as_str()), ("static", "true")])
+        .send()
+        .await?;
+    assert_ne!(stream.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // Anything else, including an Emby path Lux never registered, must not accept the token.
+    for path in [
+        "/emby/Users",
+        "/Users",
+        "/emby/System/Info",
+        "/emby/Sessions",
+        "/emby/Users/New",
+        "/emby/Library/Refresh",
+        "/emby/not-a-route",
+    ] {
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .query(&[("api_key", token.as_str())])
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "GET {path}"
+        );
+        let response = client
+            .post(format!("http://{address}{path}"))
+            .query(&[("api_key", token.as_str())])
+            .send()
+            .await?;
+        // A method the route does not serve answers 405 before any handler runs. That is still a
+        // refusal: the token never reaches a handler. Only a path the router *does* serve with
+        // that method could leak, and those are covered by the GET assertions above.
+        assert!(
+            matches!(
+                response.status(),
+                reqwest::StatusCode::UNAUTHORIZED | reqwest::StatusCode::METHOD_NOT_ALLOWED
+            ),
+            "POST {path} -> {}",
+            response.status()
+        );
+    }
+
+    // The header credential is the same credential, so the restriction has to hold there too.
+    let header = client
+        .get(format!("http://{address}/emby/Users"))
+        .header("X-Emby-Token", token.as_str())
+        .send()
+        .await?;
+    assert_eq!(header.status(), reqwest::StatusCode::UNAUTHORIZED);
+    Ok(())
+}
+
+/// An ordinary login token keeps the full Emby surface even though playback tokens are restricted.
+#[tokio::test]
+async fn ordinary_tokens_keep_the_full_emby_surface() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup
+        .complete("Admin", "Administrator", "correct password")
+        .await?;
+    let auth = EmbyAuthService::new(database.clone())?;
+    let login = auth
+        .authenticate("Admin", "correct password", &playback_device())
+        .await?
+        .ok_or("login failed")?;
+    let app = app_with_state(AppState::ready(
+        config.clone(),
+        database.clone(),
+        setup,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database.clone())?,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let _server = AbortOnDrop(tokio::spawn(
+        async move { axum::serve(listener, app).await },
+    ));
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    for path in ["/Users", "/emby/Users", "/emby/System/Info", "/Sessions"] {
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .query(&[("api_key", login.token.as_str())])
+            .send()
+            .await?;
+        assert_eq!(response.status(), reqwest::StatusCode::OK, "{path}");
+    }
+    Ok(())
+}
+
+/// Expiry far enough out that the 12-hour cap in `issue_playback_token` is what applies.
+fn playback_token_expiry() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_secs())
+            .unwrap_or_default(),
+    )
+    .unwrap_or_default()
+        + 600
+}
+
+fn playback_device() -> EmbyDeviceInfo {
+    EmbyDeviceInfo {
+        client: "Lux Web".to_owned(),
+        device: "Browser".to_owned(),
+        device_id: "9d0f0b4e-4f6e-4a02-8f75-2f5d5b1f3a11".to_owned(),
+        version: "1".to_owned(),
+        user_id: None,
+    }
+}

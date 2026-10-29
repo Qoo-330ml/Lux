@@ -446,6 +446,22 @@ pub(super) async fn emby_system_info(
     .into_response()
 }
 
+/// `Auth/Keys` is what Emby proxies call to validate an `api_key` before serving a stream. Lux
+/// never hands out individually managed keys, so a valid credential simply sees an empty list.
+/// Playback-only tokens reach this route (it is on the playback allow-list) but get no new keys.
+pub(super) async fn emby_auth_keys(
+    headers: HeaderMap,
+    Query(query): Query<EmbyTokenQuery>,
+    State(state): State<AppState>,
+) -> Response {
+    if let Err(status) =
+        require_playback_route_principal(&headers, &state, query.api_key.as_deref()).await
+    {
+        return status.into_response();
+    }
+    Json(json!({ "Items": [], "TotalRecordCount": 0 })).into_response()
+}
+
 pub(super) async fn emby_refresh_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -2526,10 +2542,26 @@ pub(super) async fn resolve_emby_user_with_auth(
     auth: &EmbyAuthService,
     client_ip: Option<std::net::IpAddr>,
 ) -> Result<UserRecord, StatusCode> {
+    resolve_emby_user_scoped(headers, query, auth, client_ip, false).await
+}
+
+async fn resolve_emby_user_scoped(
+    headers: &HeaderMap,
+    query: &EmbyTokenQuery,
+    auth: &EmbyAuthService,
+    client_ip: Option<std::net::IpAddr>,
+    allow_playback_token: bool,
+) -> Result<UserRecord, StatusCode> {
     let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
-    match auth.resolve_token_with_ip(&token, client_ip).await {
+    let resolved = if allow_playback_token {
+        auth.resolve_emby_route_token_with_ip(&token, client_ip)
+            .await
+    } else {
+        auth.resolve_token_with_ip(&token, client_ip).await
+    };
+    match resolved {
         Ok(Some(user)) => Ok(user),
         Ok(None) => Err(StatusCode::UNAUTHORIZED),
         Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {
@@ -2677,13 +2709,32 @@ pub(super) async fn require_emby_principal(
     state: &AppState,
     api_key: Option<&str>,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    require_emby_principal_allowing_playback_tokens(headers, state, api_key, false).await
+}
+
+/// Principal check for routes that belong to the playback allow-list. Only those routes accept a
+/// playback-only token; the router has already rejected every other Emby path for such a token.
+pub(super) async fn require_playback_route_principal(
+    headers: &HeaderMap,
+    state: &AppState,
+    api_key: Option<&str>,
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    require_emby_principal_allowing_playback_tokens(headers, state, api_key, true).await
+}
+
+async fn require_emby_principal_allowing_playback_tokens(
+    headers: &HeaderMap,
+    state: &AppState,
+    api_key: Option<&str>,
+    allow_playback_token: bool,
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
     let query = EmbyTokenQuery {
         api_key: api_key.map(str::to_owned),
         tag: None,
         fields: None,
         active_within_seconds: None,
     };
-    require_emby_principal_with_query(headers, state, &query).await
+    require_emby_principal_scoped(headers, state, &query, allow_playback_token).await
 }
 
 pub(super) async fn require_emby_principal_with_query(
@@ -2691,12 +2742,24 @@ pub(super) async fn require_emby_principal_with_query(
     state: &AppState,
     query: &EmbyTokenQuery,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
+    require_emby_principal_scoped(headers, state, query, false).await
+}
+
+async fn require_emby_principal_scoped(
+    headers: &HeaderMap,
+    state: &AppState,
+    query: &EmbyTokenQuery,
+    allow_playback_token: bool,
+) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
     let Some(auth) = state.emby_auth.as_ref() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
+    if crate::auth::emby::is_playback_token(&token) && !allow_playback_token {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
     let principal = if let Some(service) = state.admin_api_key.as_ref() {
         match service.resolve_principal(&token).await {
             Ok(Some(principal)) => Some(principal),
@@ -2712,7 +2775,13 @@ pub(super) async fn require_emby_principal_with_query(
         let client_ip = super::request_access_ip(headers, state)
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-        match auth.resolve_token_with_ip(&token, client_ip).await {
+        let resolved = if allow_playback_token {
+            auth.resolve_emby_route_token_with_ip(&token, client_ip)
+                .await
+        } else {
+            auth.resolve_token_with_ip(&token, client_ip).await
+        };
+        match resolved {
             Ok(Some(user)) => crate::auth::users::AuthenticationPrincipal::User(user),
             Ok(None) => return Err(StatusCode::UNAUTHORIZED),
             Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable) => {

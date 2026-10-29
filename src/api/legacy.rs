@@ -1113,6 +1113,54 @@ fn is_registered_emby_video_path(path: &str) -> bool {
         || is_emby_transcoding_path(path)
 }
 
+/// A playback-only token is a credential that travels inside a media URL, so it is accepted on
+/// the playback allow-list and nowhere else.
+///
+/// The Emby router's own middleware only sees paths that reach a registered route, and Lux API
+/// requests never call the Emby resolver at all. Rejecting here, before routing, keeps both cases
+/// identical: an unregistered Emby path must answer 401 rather than 404/405, and nothing outside
+/// `/emby` may accept the token.
+/// Credential exactly as the client sent it, for layers that run before normalization.
+fn emby_credential_from_request(request: &Request<Body>) -> Option<String> {
+    let headers = request.headers();
+    if let Some(token) = emby_token_from_headers(headers) {
+        return Some(token);
+    }
+    // Nested routers may have rewritten the URI by the time a later layer sees it.
+    let uri = request
+        .extensions()
+        .get::<axum::extract::OriginalUri>()
+        .map_or(request.uri(), |original| &original.0);
+    let query = uri.query()?;
+    url::form_urlencoded::parse(query.as_bytes()).find_map(|(name, value)| {
+        let name = name.to_ascii_lowercase();
+        let is_credential = name == "api_key"
+            || name == "apikey"
+            || name == "x-emby-token"
+            || name == "x-mediabrowser-token";
+        (is_credential && !value.is_empty()).then(|| value.into_owned())
+    })
+}
+
+async fn reject_playback_token_outside_allow_list(request: Request<Body>, next: Next) -> Response {
+    // This layer runs before `normalize_credentials`, so the credential is read from wherever
+    // the client put it rather than from the normalized header.
+    let Some(token) = emby_credential_from_request(&request) else {
+        return next.run(request).await;
+    };
+    if !crate::auth::emby::is_playback_token(&token) {
+        return next.run(request).await;
+    }
+    let is_allowed = match request.extensions().get::<axum::extract::OriginalUri>() {
+        Some(original) => emby::path_accepts_playback_token(original.0.path()),
+        None => emby::path_accepts_playback_token(request.uri().path()),
+    };
+    if is_allowed {
+        return next.run(request).await;
+    }
+    StatusCode::UNAUTHORIZED.into_response()
+}
+
 async fn reject_unmatched_emby_video_path(request: Request<Body>, next: Next) -> Response {
     let path = request.uri().path();
     if is_emby_video_path(path) && !is_registered_emby_video_path(path) {

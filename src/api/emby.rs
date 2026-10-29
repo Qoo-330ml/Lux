@@ -38,12 +38,19 @@ impl EmbyRouteBuilder {
     }
 }
 
+/// Whether `path` is one of the routes a playback-only token may call. Re-exported for the
+/// outer middleware, which sees requests that never reach this router.
+pub(super) fn path_accepts_playback_token(path: &str) -> bool {
+    credentials::is_playback_allow_listed_path(path)
+}
+
 pub(super) fn api_routes() -> (Router<AppState>, Vec<String>) {
     // Discovery and password login do not consume token credentials.
     let (public_routes, public_path_templates) = EmbyRouteBuilder::new()
         .route("/System/Info/Public", get(emby_public_system_info))
         .route("/System/Ping", get(emby_ping).post(emby_ping))
         .route("/Users/Public", get(emby_public_users))
+        .route("/Auth/Keys", get(emby_auth_keys))
         .route("/Users/AuthenticateByName", post(emby_authenticate))
         .route(
             "/Users/{user_id}/Authenticate",

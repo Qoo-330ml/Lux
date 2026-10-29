@@ -147,3 +147,20 @@ async fn playback_token_is_not_listed_as_a_login_session() -> Result<(), Box<dyn
     assert_eq!(before, after);
     Ok(())
 }
+
+#[tokio::test]
+async fn playback_token_resolves_through_the_route_resolver_with_an_admin_user()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_dir, auth, user) = auth_with_user().await?;
+    let token = auth
+        .issue_playback_token(&user, "play-session-9", &device(), now() + 600, None)
+        .await?
+        .ok_or("token was not issued")?;
+    assert!(
+        auth.resolve_emby_route_token_with_ip(&token, None)
+            .await?
+            .is_some(),
+        "route resolver rejected a freshly issued playback token"
+    );
+    Ok(())
+}

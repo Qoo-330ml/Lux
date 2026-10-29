@@ -2757,7 +2757,9 @@ pub(super) async fn emby_stream_principal(
         return Ok(AccessPrincipal::new(user_id, is_admin));
     }
 
-    let auth_principal = require_emby_principal(headers, state, query.api_key.as_deref()).await?;
+    // `/Videos/{id}/stream` is on the playback allow-list, so a playback-only token is honored here.
+    let auth_principal =
+        require_playback_route_principal(headers, state, query.api_key.as_deref()).await?;
     emby_access_principal(&auth_principal, None)
 }
 
