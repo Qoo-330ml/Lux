@@ -90,6 +90,16 @@ struct GlobalGeneratedMediaItem<'a> {
     has_available_source: bool,
 }
 
+/// `SUM` over a BIGINT is NUMERIC on PostgreSQL, which the `Any` driver cannot decode, so every
+/// aggregate is cast back to BIGINT; the refresh otherwise failed on every scheduler tick.
+const RECOMMENDATION_STATS_FINGERPRINT_QUERY: &str = "SELECT
+        (SELECT COUNT(*) FROM playback_sessions WHERE last_event_at > ?),
+        (SELECT COALESCE(MAX(last_event_at), 0) FROM playback_sessions WHERE last_event_at > ?),
+        (SELECT COUNT(*) FROM user_item_state WHERE is_favorite = 1),
+        (SELECT CAST(COALESCE(SUM(version), 0) AS BIGINT) FROM user_item_state),
+        (SELECT COUNT(*) FROM media_items WHERE removed_at IS NULL),
+        (SELECT COALESCE(MAX(updated_at), 0) FROM media_items)";
+
 const RECOMMENDATION_STATS_CLEANUP_QUERY: &str = "DELETE FROM recommendation_item_stats
              WHERE NOT EXISTS (
                  SELECT 1
@@ -612,23 +622,15 @@ impl Database {
         now: i64,
     ) -> Result<String, StorageError> {
         let window_start = now - RECOMMENDATION_PLAYBACK_WINDOW_SECONDS;
-        let (playback_count, playback_last_event_at, favorite_count, version_sum, visible_item_count, item_updated_at): (
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-            i64,
-        ) = self
-            .query_as(
-                "SELECT
-                    (SELECT COUNT(*) FROM playback_sessions WHERE last_event_at > ?),
-                    (SELECT COALESCE(MAX(last_event_at), 0) FROM playback_sessions WHERE last_event_at > ?),
-                    (SELECT COUNT(*) FROM user_item_state WHERE is_favorite = 1),
-                    (SELECT COALESCE(SUM(version), 0) FROM user_item_state),
-                    (SELECT COUNT(*) FROM media_items WHERE removed_at IS NULL),
-                    (SELECT COALESCE(MAX(updated_at), 0) FROM media_items)",
-            )
+        let (
+            playback_count,
+            playback_last_event_at,
+            favorite_count,
+            version_sum,
+            visible_item_count,
+            item_updated_at,
+        ): (i64, i64, i64, i64, i64, i64) = self
+            .query_as(RECOMMENDATION_STATS_FINGERPRINT_QUERY)
             .bind(window_start)
             .bind(window_start)
             .fetch_one(&self.pool)
@@ -10991,10 +10993,24 @@ mod tests {
 
     use super::{
         Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
-        filtered_catalog_list_query, postgres_recent_catalog_rows_by_library_query,
-        sqlite_recent_catalog_rows_by_library_query,
+        RECOMMENDATION_STATS_FINGERPRINT_QUERY, filtered_catalog_list_query,
+        postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
     };
     use crate::storage::repository::{CatalogFilterQuery, CatalogSort};
+
+    #[test]
+    fn recommendation_stats_fingerprint_casts_sums_to_bigint() {
+        assert_eq!(
+            RECOMMENDATION_STATS_FINGERPRINT_QUERY
+                .matches("SUM(")
+                .count(),
+            1
+        );
+        assert!(
+            RECOMMENDATION_STATS_FINGERPRINT_QUERY
+                .contains("CAST(COALESCE(SUM(version), 0) AS BIGINT)")
+        );
+    }
 
     #[test]
     fn recommendation_stats_cleanup_uses_an_indexable_exists_lookup() {
