@@ -8,7 +8,16 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ## [Unreleased]
 
-（暂无记录；下一个版本从这里开始累积）
+### Added
+
+- **PostgreSQL 查询统计自动就绪**：服务器已预加载 `pg_stat_statements` 时，Lux 启动后会在业务库自动创建该扩展，管理员数据库诊断随即返回 `queryStatistics`。需要超级用户权限，失败只记警告；`LUX_POSTGRES_QUERY_STATISTICS_EXTENSION=0` 可关闭。
+
+### Fixed
+
+- **PostgreSQL 空闲时持续占用 CPU**：电影 NFO 合集身份对账 worker 每秒轮询一次，在 PostgreSQL 上同时存在三个问题——重读语句对 `LEFT JOIN` 使用裸 `FOR UPDATE` 被拒绝、待处理项永远留在队首；部分索引仍要求已不再读取的 `nfo_metadata_json`，每次轮询都顺主键扫完 `media_items`；SQLite 的目录约束重建清单缺这个索引，全新库里根本没有。现按 `FOR UPDATE OF item` 加锁，在两个后端重建索引（SQLite 0240、PostgreSQL 0242），并把 `LIMIT` 隔离在连接之外让该索引成为驱动，生产规模数据上单次约 177 ms 降到约 6 ms。
+- **PostgreSQL 推荐统计永远刷新失败**：指纹查询里 `SUM(...)` 在 PostgreSQL 返回 `NUMERIC`，`Any` 驱动无法解码；现显式转为 `BIGINT`。
+- **读模型从未真正就绪**：重建完成时写入的水位名 `catalog_items_rebuild` 与读取方和增量消费者检查的 `catalog_items_rebuild@N` 不一致（LUX-868 只改了读取方），导致所有读取退回权威查询、每次启动整体重建、增量消费者不运行、`catalog_outbox` 持续堆积。现统一写入带版本号的名字，统计重算改为单事务，读者不会看到被清空的计数表。升级后的首次启动会触发一次队列缺口恢复，把全部条目重新入队并增量处理。
+- **PostgreSQL `media_search` 无变化也被重写**：重建索引的 upsert 现在只在标题、排序标题、原始标题或别名真的变化时才更新。
 
 ## [0.7.1] - 2026-10-29
 

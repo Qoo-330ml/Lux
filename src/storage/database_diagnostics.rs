@@ -310,7 +310,7 @@ impl Database {
         }))
     }
 
-    async fn collect_postgres_query_statistics(&self) -> Value {
+    pub(super) async fn collect_postgres_query_statistics(&self) -> Value {
         let configuration = self
             .query_as::<(String, bool)>(
                 "SELECT current_setting('shared_preload_libraries')::TEXT AS preload_libraries,
@@ -394,7 +394,7 @@ impl Database {
     }
 }
 
-fn shared_preload_contains_pg_stat_statements(preload_libraries: &str) -> bool {
+pub(super) fn shared_preload_contains_pg_stat_statements(preload_libraries: &str) -> bool {
     preload_libraries
         .split(',')
         .map(str::trim)

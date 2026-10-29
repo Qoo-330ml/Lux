@@ -40,6 +40,8 @@ const MAINTENANCE_INITIAL_DELAY_ENV: &str = "LUX_DATABASE_MAINTENANCE_INITIAL_DE
 /// A full SQLite `VACUUM` rewrites the entire file and holds the write lock for the
 /// whole rewrite, so the default budget stays short. Operators who accept the lock
 /// for an offline compaction can raise it.
+const QUERY_STATISTICS_EXTENSION_ENV: &str = "LUX_POSTGRES_QUERY_STATISTICS_EXTENSION";
+const QUERY_STATISTICS_EXTENSION_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_VACUUM_TIMEOUT_ENV: &str = "LUX_SQLITE_VACUUM_TIMEOUT_SECONDS";
 const DEFAULT_SQLITE_VACUUM_TIMEOUT_SECONDS: u64 = 120;
 
@@ -657,6 +659,133 @@ impl Database {
 
 /// Quotes a table name for interpolation into DDL that cannot take bind
 /// parameters. Names come from system catalogs, never user input.
+/// `LUX_POSTGRES_QUERY_STATISTICS_EXTENSION` defaults to on; `0`, `false`, `off` and `no` opt out.
+pub(crate) fn resolve_query_statistics_extension_enabled(configured: Option<&str>) -> bool {
+    !matches!(
+        configured
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum QueryStatisticsExtensionPlan {
+    Disabled,
+    /// Creating the extension without the preload would only make every query fail.
+    NotPreloaded,
+    AlreadyInstalled,
+    Create,
+}
+
+pub(crate) fn plan_query_statistics_extension(
+    enabled: bool,
+    preload_libraries: &str,
+    installed: bool,
+) -> QueryStatisticsExtensionPlan {
+    if !enabled {
+        QueryStatisticsExtensionPlan::Disabled
+    } else if installed {
+        QueryStatisticsExtensionPlan::AlreadyInstalled
+    } else if !super::database_diagnostics::shared_preload_contains_pg_stat_statements(
+        preload_libraries,
+    ) {
+        QueryStatisticsExtensionPlan::NotPreloaded
+    } else {
+        QueryStatisticsExtensionPlan::Create
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum QueryStatisticsExtensionOutcome {
+    NotApplicable,
+    Disabled,
+    NotPreloaded,
+    AlreadyInstalled,
+    Created,
+    Failed,
+}
+
+impl Database {
+    /// Installs `pg_stat_statements` in the business database when the server already preloads
+    /// it, so the administrator diagnostics can report query statistics without a manual step.
+    ///
+    /// Best effort: the extension needs a superuser on most servers, so a managed or external
+    /// PostgreSQL may refuse. A refusal is logged once and never affects startup.
+    pub(crate) async fn ensure_postgres_query_statistics_extension(
+        &self,
+    ) -> QueryStatisticsExtensionOutcome {
+        if self.backend != DatabaseBackend::Postgres {
+            return QueryStatisticsExtensionOutcome::NotApplicable;
+        }
+        let enabled = resolve_query_statistics_extension_enabled(
+            std::env::var(QUERY_STATISTICS_EXTENSION_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let state = match self
+            .query_as::<(String, bool)>(
+                "SELECT current_setting('shared_preload_libraries')::TEXT,
+                        EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')",
+            )
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(%error, "could not inspect the pg_stat_statements configuration");
+                return QueryStatisticsExtensionOutcome::Failed;
+            }
+        };
+        match plan_query_statistics_extension(enabled, &state.0, state.1) {
+            QueryStatisticsExtensionPlan::Disabled => QueryStatisticsExtensionOutcome::Disabled,
+            QueryStatisticsExtensionPlan::NotPreloaded => {
+                tracing::info!(
+                    "pg_stat_statements is not in shared_preload_libraries; query statistics stay unavailable"
+                );
+                QueryStatisticsExtensionOutcome::NotPreloaded
+            }
+            QueryStatisticsExtensionPlan::AlreadyInstalled => {
+                QueryStatisticsExtensionOutcome::AlreadyInstalled
+            }
+            QueryStatisticsExtensionPlan::Create => {
+                match tokio::time::timeout(
+                    QUERY_STATISTICS_EXTENSION_TIMEOUT,
+                    self.query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+                        .execute(&self.pool),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        tracing::info!("created the pg_stat_statements extension");
+                        QueryStatisticsExtensionOutcome::Created
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            "could not create pg_stat_statements; ask a database superuser to run CREATE EXTENSION pg_stat_statements"
+                        );
+                        QueryStatisticsExtensionOutcome::Failed
+                    }
+                    Err(_) => {
+                        tracing::warn!("creating pg_stat_statements timed out");
+                        QueryStatisticsExtensionOutcome::Failed
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs [`Self::ensure_postgres_query_statistics_extension`] once in the background, independent
+    /// of the periodic maintenance schedule.
+    pub fn spawn_postgres_query_statistics_extension(&self) {
+        let database = self.clone();
+        tokio::spawn(async move {
+            database.ensure_postgres_query_statistics_extension().await;
+        });
+    }
+}
+
 fn quote_identifier(name: &str) -> String {
     let escaped = name.replace('"', "\"\"");
     format!("\"{escaped}\"")
@@ -871,5 +1000,46 @@ mod tests {
             delay < interval,
             "first round must precede the daily cadence"
         );
+    }
+
+    #[test]
+    fn query_statistics_extension_is_created_only_when_preloaded_and_missing() {
+        use super::{QueryStatisticsExtensionPlan as Plan, plan_query_statistics_extension};
+        assert_eq!(
+            plan_query_statistics_extension(true, "pg_stat_statements", false),
+            Plan::Create
+        );
+        assert_eq!(
+            plan_query_statistics_extension(true, "auto_explain, \"pg_stat_statements\"", false),
+            Plan::Create
+        );
+        assert_eq!(
+            plan_query_statistics_extension(true, "pg_stat_statements", true),
+            Plan::AlreadyInstalled
+        );
+        // Without the preload the extension would exist but every query would fail.
+        assert_eq!(
+            plan_query_statistics_extension(true, "", false),
+            Plan::NotPreloaded
+        );
+        assert_eq!(
+            plan_query_statistics_extension(true, "auto_explain", false),
+            Plan::NotPreloaded
+        );
+        assert_eq!(
+            plan_query_statistics_extension(false, "pg_stat_statements", false),
+            Plan::Disabled
+        );
+    }
+
+    #[test]
+    fn query_statistics_extension_switch_defaults_on() {
+        use super::resolve_query_statistics_extension_enabled as resolve;
+        assert!(resolve(None));
+        assert!(resolve(Some("1")));
+        assert!(resolve(Some("yes please")));
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!resolve(Some(off)), "{off:?} must disable the extension");
+        }
     }
 }

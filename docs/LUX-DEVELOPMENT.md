@@ -18611,6 +18611,27 @@ token 与 Web 播放会话绑定：有效期不超过会话 `expires_at`，会�
 范围：命中 `proxy` 候选时客户端 MKV/HEVC 引擎与字幕旁路先做 `Range: bytes=0-0` 的 CORS 探测，通过才启用；播放会话与信息面板
 记录命中的候选类型。依赖：LUX-872。
 
+#### LUX-874：PostgreSQL 查询统计扩展自动就绪
+
+范围：LUX-436 明确写定诊断“不尝试创建 extension”，导致内置 PostgreSQL 虽已用
+`shared_preload_libraries=pg_stat_statements` 预加载（`compose.yaml` 的 `postgres` profile），管理员仍须手工在
+业务库执行 `CREATE EXTENSION` 才能拿到 `queryStatistics`，实际被漏做时诊断长期返回 `EXTENSION_MISSING`。
+启动后在后台尝试一次 `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`，与 `LUX_DATABASE_MAINTENANCE`
+无关、不进入维护周期；仅在服务器 `shared_preload_libraries` 已含该库且业务库尚未安装时执行，未预载时
+不创建（否则每次查询都会失败）。扩展不是 PostgreSQL 受信任扩展，需要超级用户：权限不足、超时或任何错误
+只记一条 warning，绝不阻塞启动，也绝不改变已有扩展的状态。`LUX_POSTGRES_QUERY_STATISTICS_EXTENSION`
+（`0`/`false`/`off`/`no` 关闭，默认开启）可退出。SQLite 完全空操作。更新 `docs/DEPLOYMENT.md` 与
+`docs/CHANGELOG.md`，并同步 `docs/backend-branches.json` 的分支计数。
+
+验收：`plan_query_statistics_extension` 的单测覆盖“已预载未安装→创建、已预载已安装→跳过、未预载→跳过、
+开关关闭→跳过”；纯逻辑单测 `query_statistics_extension_is_created_only_when_preloaded_and_missing` 与
+`query_statistics_extension_switch_defaults_on`；真实 PostgreSQL 集成（`--include-ignored`）
+`postgres_query_statistics_extension_is_created_once_when_preloaded` 与
+`postgres_query_statistics_extension_is_skipped_when_not_preloaded` 通过；非超级用户降级路径实测只记警告；
+SQLite 路径返回 `NotApplicable` 且不发起任何 DDL。build、fmt、clippy、迁移对齐、后端分支检查通过。
+
+依赖：LUX-436。
+
 范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W5）：缓存返回 `Arc`、去掉整页深克隆；详情 NFO 解码结果按
 `(item_id, fingerprint)` 做小 LRU；图片端点元数据根 canonicalize 缓存；扫描空闲轮询 50 ms → 自适应
 250 ms–1 s；ETag/304 + gzip；`Fields` 投影；前台延迟反馈扩到路由模板级并接入 ffprobe/元数据/图片
