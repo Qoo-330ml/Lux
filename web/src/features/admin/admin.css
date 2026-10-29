@@ -868,7 +868,7 @@ html[data-lux-theme="light"] .lux-library-override-modes label { background: rgb
 
 .lux-server-name-dialog-save:hover:not(:disabled) { background: color-mix(in srgb, var(--lux-accent) 86%, #fff); }
 
-.lux-now-playing-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 310px), 1fr)); width: 100%; justify-content: start; gap: 12px; }
+.lux-now-playing-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(min(100%, 310px), 336px)); width: 100%; justify-content: start; gap: 12px; }
 
 .lux-now-playing-card {
   --lux-now-card-bg: #151519;

@@ -1170,6 +1170,7 @@ export type AdminPlaybackSession = {
   parentIndexNumber?: number | null;
   indexNumber?: number | null;
   posterAvailable: boolean;
+  posterItemId?: string | null;
   positionTicks: number;
   durationTicks?: number | null;
   state: "PLAYING" | "PAUSED" | string;

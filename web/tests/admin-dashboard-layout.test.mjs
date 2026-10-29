@@ -153,7 +153,7 @@ test("now-playing cards use theme tokens and compact proportions", () => {
   const posterRule = baseRule(".lux-now-playing-poster");
 
   assert.match(cardRule, /background:\s*var\(--lux-now-card-bg\)/);
-  assert.match(gridRule, /grid-template-columns:\s*repeat\(auto-fit,\s*minmax\(min\(100%,\s*310px\),\s*1fr\)\)/);
+  assert.match(gridRule, /grid-template-columns:\s*repeat\(auto-fill,\s*minmax\(min\(100%,\s*310px\),\s*336px\)\)/);
   assert.match(gridRule, /width:\s*100%/);
   assert.match(bodyRule, /gap:\s*12px/);
   assert.match(bodyRule, /padding:\s*14px\s+14px\s+0/);

@@ -97,6 +97,12 @@ pub(crate) fn dashboard_playback_item_json(
         })
         .or_else(|| item.media_sources.iter().find(|source| source.is_default))
         .or_else(|| item.media_sources.first());
+    // Episodes show the series poster, never the season or episode image.
+    let poster_owner = if item.item_type == "EPISODE" {
+        series.filter(|series| series.poster_image_tag.is_some())
+    } else {
+        Some(item).filter(|item| item.poster_image_tag.is_some())
+    };
     json!({
         "id": session.id,
         "userId": session.user_id,
@@ -110,7 +116,8 @@ pub(crate) fn dashboard_playback_item_json(
         "productionYear": item.production_year,
         "parentIndexNumber": item.season_number,
         "indexNumber": item.episode_number,
-        "posterAvailable": item.poster_image_tag.is_some(),
+        "posterAvailable": poster_owner.is_some(),
+        "posterItemId": poster_owner.map(|owner| owner.id.as_str()),
         "positionTicks": session.position_ticks,
         "durationTicks": session.duration_ticks.or(item.runtime_ticks),
         "state": session.state,
