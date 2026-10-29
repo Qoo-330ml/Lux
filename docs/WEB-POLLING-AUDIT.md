@@ -47,8 +47,8 @@ grep -rn "refetchInterval\|setInterval" src
 | 17 | `src/features/admin/AdminOperationsPage.tsx:196` | 片头片尾检测任务（`adminChapterDetectionJobs`） | 5s | 否（默认） | 是（`jobs` scope） | 同上 |
 | 18 | `src/features/admin/AdminOperationsPage.tsx:202` | 弹幕匹配任务（`adminDanmakuMatchJobs`） | 5s | 否（默认） | 是（`jobs` scope） | 同上 |
 | 19 | `src/features/admin/AdminOperationsPage.tsx:208` | 媒体库封面任务（`adminLibraryCoverJobs`） | 5s | 否（默认） | 是（`jobs` scope） | 同上 |
-| 20 | `src/features/admin/AdminOperationsPage.tsx:214` | 媒体库删除任务（`adminLibraryDeletionJobs`） | 5s，仅「运行记录」标签页 | 否（默认） | 部分（`libraries`/`jobs` scope 不含该 key） | 保持：已按标签页关闭 |
-| 21 | `src/features/admin/AdminUserManagementPage.tsx:481` | 用户列表，存在待处理条目时 | 5s | 否（默认） | 是（`users` scope） | **该文件属于另一并行任务，本次只记录不改** |
+| 20 | `src/features/admin/AdminOperationsPage.tsx:214` | 媒体库删除任务（`adminLibraryDeletionJobs` → `["admin","library-deletion-jobs",…]`） | 5s，仅「运行记录」标签页 | 否（默认） | 否：`libraries` scope 只含 `["admin","libraries"]`，`jobs` scope 也不含 `library-deletion-jobs`，只有连接时 `all` 快照 | 保持（已按标签页关闭）；若要彻底去掉需后端补 scope 事件 |
+| 21 | `src/features/admin/user-management/detail/ContentIndexStatus.tsx:9`（拆分前为 `AdminUserManagementPage.tsx:481`） | 用户「内容分类索引」就绪状态（`AdminUserContentIndexStatus` → `api.adminContentRestrictionIndexStatus()`，key `["admin","content-restriction-index"]`） | 5s，仅 `pendingItems` 时 | 否（默认） | 否：`users` scope 只有 `["admin","users"]`、`["admin","user-access"]`、`["admin","libraries"]`、`["admin","dashboard"]`、`["admin","logs"]`，匹配不到 `content-restriction-index` | 保持轮询；要去掉需后端新增（例如 `metadata`/专用）scope 事件。该文件属另一并行任务，本次只记录不改 |
 | 22 | `src/features/detail/MediaDetailPage.tsx:19` | 详情页 `item` 查询的间隔常量 | 30s 或 `false` | — | — | 保持 |
 | 23 | `src/features/detail/MediaDetailPage.tsx:25` | 详情主数据（`item`） | 30s；连接时 `false` | 否（显式 `:26`） | 是（`item` scope） | 保持：已按 SSE 连接状态关闭兜底轮询 |
 | 24 | `src/features/detail/MediaDetailPage.tsx:26` | 上一条的后台开关 | — | 否（显式） | — | 保持 |
@@ -69,6 +69,22 @@ grep -rn "refetchInterval\|setInterval" src
 | 39 | `src/features/player/usePlayerInfoPanel.ts:67` | 播放会话服务端统计（`webPlaybackStats`） | 1s，仅信息面板打开时 | 否（默认） | 否（会话私有数据，无事件） | 保持；面板关闭即停 |
 | 40 | `src/features/player/usePlayerInfoPanel.ts:84` | 客户端统计采样（纯展示） | 1s，仅信息面板打开时 | **是（`window.setInterval`）→ 本次改为隐藏时跳过** | 不适用 | 已在 `document.hidden` 时跳过采样，见下 |
 | 41 | `src/features/player/usePlaybackReporting.ts:137` | 播放会话心跳（`webPlaybackHeartbeat`） | 60s，有会话时 | **是（有意为之）** | 不适用（这是服务端会话保活协议） | 保持：后台必须继续，不能暂停 |
+
+## SSE 覆盖核对
+
+「已有 SSE 可覆盖」一列按下面的键列表逐条核对（React Query 的 `invalidateQueries({ queryKey })` 是前缀匹配）：
+
+- 用户事件 `useUserEvents.ts`（`/api/v1/events`）：`["home"]`、`["libraries"]`、`["item"]`/`["item", id]`、`["item-images"]`/`["item-images", id]`、`["playback"]`/`["playback", id]`、`["children"]`、`["favorites"]`、`["collection"]`、`["person"]`、`["library"]`/`["library", id]`。
+  - 逐条对应：首页四项（`["home","carousel"]`、`["libraries"]`、`["home","continue-watching"]`、`["home","latest-libraries",…]`）落在 `["home"]`/`["libraries"]` 前缀下；详情页 `item`、`children`、`playback`、`item-images` 都直接命中。
+- 管理事件 `useAdminEvents.ts`（`/api/v1/admin/events`，`queryKeysByScope`）：
+  - `dashboard`：`["admin","dashboard"]`、`["admin","logs"]`
+  - `jobs`：`["admin","jobs"]`、`["admin","metadata-jobs"]`、`["admin","strm-probe-jobs"]`、`["admin","chapter-detection-jobs"]`、`["admin","danmaku-match-jobs"]`、`["admin","library-cover-jobs"]`、`["admin","task-activity"]`、`["admin","scheduled-tasks"]`、`["admin","dashboard"]`、`["admin","logs"]`
+  - `libraries`：`["admin","libraries"]`、`["admin","scheduled-tasks"]`、`["admin","dashboard"]`、`["admin","logs"]`
+  - `plugins`：`["admin","plugins"]`、`["admin","libraries"]`、`["admin","logs"]`
+  - `users`：`["admin","users"]`、`["admin","user-access"]`、`["admin","libraries"]`、`["admin","dashboard"]`、`["admin","logs"]`
+  - `metadata`：`["admin","logs"]`
+  - `settings`：`["admin","settings"]`、`["admin","dashboard"]`、`["admin","logs"]`
+  - 逐条对应：任务活动、仪表盘、四类任务列表（`strm-probe-jobs`/`chapter-detection-jobs`/`danmaku-match-jobs`/`library-cover-jobs`）命中 `jobs`/`dashboard`；`admin/emby-migrations`、`admin/transcoding/sessions`、`admin/library-deletion-jobs`、`admin/content-restriction-index` **都不在任何 scope 内**（只有连接时 `all` 快照，以及服务端 lag 时广播的 `all` 能覆盖），所以表中这四类标为「否」。核对时已修正媒体库删除任务（原写「部分」）与内容分类索引状态（原误标「是」）两行。
 
 ## 本次零风险改动
 
@@ -97,10 +113,11 @@ grep -rn "refetchInterval\|setInterval" src
 1. **管理端 SSE 连接状态**：`useAdminEvents` 不返回连接状态，导致管理页无法像用户侧那样在 SSE 已连接时关闭兜底轮询。建议在 SSE 语义任务中导出 `useAdminSseConnectionState()`（新增状态，不改事件语义），随后可关闭：仪表盘 15s、任务活动 5s、运行记录四类任务列表 5s。
 2. **管理事件 scope 缺口**：
    - 转码会话（`admin/transcoding/sessions`，2s）没有任何 scope，需要后端新增 `transcoding` 事件；
-   - Emby 迁移作业（`admin/emby-migrations*`）不在 `queryKeysByScope` 中，需要新增 `emby` scope 或归入 `jobs`。
-   两者都需要后端事件，属于「新增后端事件」范畴，本次只记录。
+   - Emby 迁移作业（`admin/emby-migrations*`）不在 `queryKeysByScope` 中，需要新增 `emby` scope 或归入 `jobs`；
+   - 媒体库删除任务（`admin/library-deletion-jobs`）与内容分类索引状态（`admin/content-restriction-index`）同样不在任何 scope 内，需要后端补 scope 事件。
+   这些都需要后端事件，属于「新增后端事件」范畴，本次只记录。
 3. **间隔过密**：`AdminTranscodingPage` 的 2s 是当前最密的前端轮询，在 scope 可用前不建议直接降间隔（会影响转码状态的实时性）。
-4. **用户管理页**（`AdminUserManagementPage.tsx:481`）归另一并行任务，本次未触碰。
+4. **用户管理页**（拆分前 `AdminUserManagementPage.tsx:481`，现 `web/src/features/admin/user-management/detail/ContentIndexStatus.tsx:9`）归另一并行任务，本次未触碰。
 
 ## 复核方式
 
