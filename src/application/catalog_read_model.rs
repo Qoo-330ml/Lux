@@ -62,7 +62,7 @@ async fn rebuild_catalog_read_model_from(
     let summary = database.catalog_items_checksum().await?;
     // Marks the rebuild as complete; an interrupted rebuild leaves no watermark and is retried.
     database
-        .advance_catalog_consumer("catalog_items_rebuild", summary.item_count)
+        .advance_catalog_consumer(&catalog_items_consumer(), summary.item_count)
         .await?;
     Ok(CatalogRebuildReport {
         items: summary.item_count,
@@ -342,6 +342,29 @@ mod tests {
         assert_eq!(first.content_sha256.len(), 64);
         let second = rebuild_catalog_read_model(&database, 2).await?;
         assert_eq!(second, first);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn rebuild_marks_the_version_scoped_watermark_that_readers_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        // Readers and the incremental worker look for `catalog_items_consumer()`; a rebuild that
+        // records any other name leaves the read model permanently "not ready".
+        let (_temp, database) = test_database().await?;
+        assert!(
+            database
+                .catalog_consumer(&catalog_items_consumer())
+                .await?
+                .is_none()
+        );
+        rebuild_catalog_read_model(&database, 10).await?;
+        assert!(
+            database
+                .catalog_consumer(&catalog_items_consumer())
+                .await?
+                .is_some(),
+            "rebuild must record the watermark under the version-scoped name"
+        );
         Ok(())
     }
 }

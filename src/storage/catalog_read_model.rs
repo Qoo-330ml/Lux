@@ -404,39 +404,37 @@ impl Database {
         Ok(item_ids.len())
     }
 
+    /// Recomputes the library/global counters in one transaction, so a concurrent reader never
+    /// sees the table emptied between the delete and the inserts.
     pub(crate) async fn rebuild_catalog_item_stats(&self) -> Result<(), StorageError> {
+        let sqlx_error = |source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        };
+        let mut transaction = self.pool.begin().await.map_err(sqlx_error)?;
         self.query("DELETE FROM catalog_item_stats")
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(sqlx_error)?;
         self.query(
             "INSERT INTO catalog_item_stats (scope, scope_id, item_type, total)
              SELECT 'library', library_id, item_type, COUNT(*)
              FROM catalog_items WHERE removed_at IS NULL
              GROUP BY library_id, item_type",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(sqlx_error)?;
         self.query(
             "INSERT INTO catalog_item_stats (scope, scope_id, item_type, total)
              SELECT 'global', '', item_type, COUNT(*)
              FROM catalog_items WHERE removed_at IS NULL
              GROUP BY item_type",
         )
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(sqlx_error)?;
+        transaction.commit().await.map_err(sqlx_error)
     }
 
     #[allow(dead_code)] // used by the read-model reset path in LUX-865
