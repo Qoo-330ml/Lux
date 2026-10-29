@@ -145,8 +145,8 @@ describe("AdminPluginsPage plugin cards", () => {
     currentPlugin = configuredPlugin;
     vi.spyOn(api, "adminPlugins").mockImplementation(async () => ({ plugins: [currentPlugin], total: 1 }));
     vi.spyOn(api, "adminInstalledPlugins").mockImplementation(async () => ({ plugins: currentPlugin.installed ? [currentPlugin] : [], total: currentPlugin.installed ? 1 : 0 }));
-    vi.spyOn(api, "adminPluginStore").mockResolvedValue({ url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
-    vi.spyOn(api, "updateAdminPluginStore").mockResolvedValue({ url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
+    vi.spyOn(api, "adminPluginStore").mockResolvedValue({ urls: ["https://github.com/Qoo-330ml/Lux-plugins"], url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
+    vi.spyOn(api, "updateAdminPluginStore").mockResolvedValue({ urls: ["https://github.com/Qoo-330ml/Lux-plugins"], url: "https://github.com/Qoo-330ml/Lux-plugins", defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins" });
     vi.spyOn(api, "updateAdminPluginConfig").mockResolvedValue({ plugin: configuredPlugin });
     vi.spyOn(api, "uploadAdminPluginConfigImage").mockResolvedValue({
       assetId: `sha256:${"a".repeat(64)}`,
@@ -225,13 +225,82 @@ describe("AdminPluginsPage plugin cards", () => {
     const input = dialog?.querySelector<HTMLInputElement>("#lux-plugin-store-url");
     expect(dialog).toBeTruthy();
     expect(dialog?.textContent).toContain("插件商店来源");
-    expect(input?.value).toBe("https://github.com/Qoo-330ml/Lux-plugins");
+    expect(input?.value).toBe("");
+    expect(dialog?.querySelectorAll(".lux-admin-plugin-store-source-tag")).toHaveLength(1);
+    expect(dialog?.textContent).toContain("https://github.com/Qoo-330ml/Lux-plugins");
     expect(dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(false);
 
     await act(async () => {
       dialog?.querySelector<HTMLButtonElement>('[aria-label="关闭插件商店来源设置"]')?.click();
     });
     expect(container.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("adds removals and saves plugin store sources as tags", async () => {
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="设置插件商店来源"]')?.click();
+    });
+    const dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const input = dialog?.querySelector<HTMLInputElement>("#lux-plugin-store-url");
+    expect(input).toBeTruthy();
+
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "https://plugins.example.com/index.json");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('[aria-label="添加插件商店来源"]')?.click();
+    });
+
+    expect(dialog?.querySelectorAll(".lux-admin-plugin-store-source-tag")).toHaveLength(2);
+    expect(dialog?.textContent).toContain("https://plugins.example.com/index.json");
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('[aria-label="移除插件商店来源 https://github.com/Qoo-330ml/Lux-plugins"]')?.click();
+    });
+    expect(dialog?.querySelectorAll(".lux-admin-plugin-store-source-tag")).toHaveLength(1);
+
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('button[type="submit"]')?.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(api.updateAdminPluginStore).toHaveBeenCalledWith(["https://plugins.example.com/index.json"]);
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+  });
+
+  it("discards unsaved plugin store tags when the dialog is cancelled", async () => {
+    await renderPage();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="设置插件商店来源"]')?.click();
+    });
+    let dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    const input = dialog?.querySelector<HTMLInputElement>("#lux-plugin-store-url");
+
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, "https://plugins.example.com/index.json");
+      input?.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    await act(async () => {
+      dialog?.querySelector<HTMLButtonElement>('[aria-label="添加插件商店来源"]')?.click();
+    });
+    expect(dialog?.querySelectorAll(".lux-admin-plugin-store-source-tag")).toHaveLength(2);
+
+    await act(async () => {
+      Array.from(dialog?.querySelectorAll<HTMLButtonElement>("button") ?? [])
+        .find((button) => button.textContent === "取消")?.click();
+    });
+    expect(container.querySelector('[role="dialog"]')).toBeNull();
+
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>('[aria-label="设置插件商店来源"]')?.click();
+    });
+    dialog = container.querySelector<HTMLElement>('[role="dialog"]');
+    expect(dialog?.querySelectorAll(".lux-admin-plugin-store-source-tag")).toHaveLength(1);
+    expect(dialog?.textContent).not.toContain("https://plugins.example.com/index.json");
   });
 
   it("keeps the plugin heading actions visible instead of clipping them", async () => {

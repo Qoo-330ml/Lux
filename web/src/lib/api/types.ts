@@ -632,6 +632,7 @@ export type ChapterSource = {
 };
 
 export type AdminPluginStore = {
+  urls: string[];
   url: string;
   defaultUrl: string;
 };

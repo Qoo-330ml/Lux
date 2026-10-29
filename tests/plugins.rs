@@ -500,10 +500,17 @@ async fn admin_can_read_and_update_plugin_store_source() -> Result<(), Box<dyn s
     assert_eq!(initial.status(), reqwest::StatusCode::OK);
     let initial_body: Value = initial.json().await?;
     assert_eq!(
+        initial_body["urls"],
+        json!(["https://github.com/Qoo-330ml/Lux-plugins"])
+    );
+    assert_eq!(
         initial_body["url"],
         "https://github.com/Qoo-330ml/Lux-plugins"
     );
-    assert_eq!(initial_body["defaultUrl"], initial_body["url"]);
+    assert_eq!(
+        initial_body["defaultUrl"],
+        "https://github.com/Qoo-330ml/Lux-plugins"
+    );
 
     let invalid = client
         .put(format!("{base_url}/api/v1/admin/plugin-store"))
@@ -518,13 +525,37 @@ async fn admin_can_read_and_update_plugin_store_source() -> Result<(), Box<dyn s
         .put(format!("{base_url}/api/v1/admin/plugin-store"))
         .header(COOKIE, &cookies)
         .header("x-csrf-token", &csrf)
-        .json(&json!({ "url": "https://example.com/lux/index.json" }))
+        .json(&json!({
+            "urls": [
+                "https://example.com/lux/index.json",
+                "https://plugins.example.com/index.json",
+                "https://example.com/lux/index.json"
+            ]
+        }))
         .send()
         .await?;
     assert_eq!(updated.status(), reqwest::StatusCode::OK);
+    let updated_body: Value = updated.json().await?;
     assert_eq!(
-        updated.json::<Value>().await?["url"],
-        "https://example.com/lux/index.json"
+        updated_body["urls"],
+        json!([
+            "https://example.com/lux/index.json",
+            "https://plugins.example.com/index.json"
+        ])
+    );
+    assert_eq!(updated_body["url"], "https://example.com/lux/index.json");
+
+    let legacy_update = client
+        .put(format!("{base_url}/api/v1/admin/plugin-store"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .json(&json!({ "url": "https://legacy.example.com/index.json" }))
+        .send()
+        .await?;
+    assert_eq!(legacy_update.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        legacy_update.json::<Value>().await?["urls"],
+        json!(["https://legacy.example.com/index.json"])
     );
 
     server.abort();

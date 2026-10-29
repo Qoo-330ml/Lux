@@ -37,7 +37,8 @@ org.lux.tmdb-1.0.0.zip
 ## 插件商店目录
 
 Lux 默认从 `https://github.com/Qoo-330ml/Lux-plugins` 读取插件目录；GitHub 仓库地址解析为
-`main/index.json`。管理员也可以配置其他 HTTPS `index.json` 地址。目录使用以下 v1 格式：
+`main/index.json`。管理员也可以配置最多 10 个其他 HTTPS `index.json` 地址。多个目录合并时按插件
+ID 去重，同一 ID 以最高 SemVer 版本为准。目录使用以下 v1 格式：
 
 ```json
 {

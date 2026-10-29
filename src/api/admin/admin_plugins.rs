@@ -141,8 +141,11 @@ pub(crate) async fn admin_plugin_store(
     let Some(plugins) = state.plugins.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
+    let urls = plugins.plugin_store_sources().await;
+    let url = urls.first().cloned();
     Json(json!({
-        "url": plugins.plugin_store_source().await,
+        "urls": urls,
+        "url": url,
         "defaultUrl": crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL,
     }))
     .into_response()
@@ -151,7 +154,10 @@ pub(crate) async fn admin_plugin_store(
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct PluginStoreUpdateRequest {
-    pub(crate) url: String,
+    #[serde(default)]
+    pub(crate) urls: Vec<String>,
+    #[serde(default)]
+    pub(crate) url: Option<String>,
 }
 
 pub(crate) async fn admin_update_plugin_store(
@@ -165,8 +171,13 @@ pub(crate) async fn admin_update_plugin_store(
     let Some(plugins) = state.plugins.as_ref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
-    match plugins.update_plugin_store_source(&request.url).await {
-        Ok(url) => {
+    let sources = if request.urls.is_empty() {
+        request.url.into_iter().collect()
+    } else {
+        request.urls
+    };
+    match plugins.update_plugin_store_sources(&sources).await {
+        Ok(urls) => {
             record_audit_event(
                 &state,
                 &headers,
@@ -176,7 +187,9 @@ pub(crate) async fn admin_update_plugin_store(
                 "{}",
             )
             .await;
+            let url = urls.first().cloned();
             Json(json!({
+                "urls": urls,
                 "url": url,
                 "defaultUrl": crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL,
             }))
@@ -189,6 +202,15 @@ pub(crate) async fn admin_update_plugin_store(
             StatusCode::BAD_REQUEST,
             lux::ApiErrorCode::InvalidRequest,
             "插件商店地址无效",
+        )
+        .into_response(),
+        Err(crate::application::plugins::PluginServiceError::Store(
+            crate::application::plugin_store::PluginStoreError::TooManySources,
+        )) => api_error(
+            &headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            "最多可保存 10 个插件商店地址",
         )
         .into_response(),
         Err(error) => plugin_error(&headers, error),

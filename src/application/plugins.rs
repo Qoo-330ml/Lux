@@ -53,6 +53,7 @@ use crate::{
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
             PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex, is_newer_version,
+            merge_catalogs,
         },
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
         schedule::{
@@ -2361,23 +2362,23 @@ impl PluginService {
         self.supervisor.stop_all().await;
     }
 
-    pub async fn plugin_store_source(&self) -> String {
+    pub async fn plugin_store_sources(&self) -> Vec<String> {
         if let Some(store) = self.store.as_ref() {
-            store.source().await
+            store.sources().await
         } else {
-            crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL.to_owned()
+            vec![crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL.to_owned()]
         }
     }
 
-    pub async fn update_plugin_store_source(
+    pub async fn update_plugin_store_sources(
         &self,
-        source: &str,
-    ) -> Result<String, PluginServiceError> {
+        sources: &[String],
+    ) -> Result<Vec<String>, PluginServiceError> {
         let Some(store) = self.store.as_ref() else {
             return Err(PluginServiceError::Store(PluginStoreError::InvalidSource));
         };
         store
-            .save_source(source)
+            .save_sources(sources)
             .await
             .map_err(PluginServiceError::Store)
     }
@@ -2393,20 +2394,26 @@ impl PluginService {
                 plugins: Vec::new(),
             };
         };
-        let source = store.source().await;
-        match store.fetch_catalog().await {
-            Ok(index) => index,
-            Err(_) if source == crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL => {
-                PluginStore::default_index().unwrap_or(PluginStoreIndex {
-                    format_version: 1,
-                    plugins: Vec::new(),
-                })
+        let results = store.fetch_catalogs().await;
+        let total = results.len();
+        let mut failed = 0;
+        let mut catalogs = Vec::with_capacity(total);
+        for (source, result) in results {
+            match result {
+                Ok(index) => catalogs.push(index),
+                Err(_) if source == crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL => {
+                    failed += 1;
+                    if let Ok(index) = PluginStore::default_index() {
+                        catalogs.push(index);
+                    }
+                }
+                Err(_) => failed += 1,
             }
-            Err(_) => PluginStoreIndex {
-                format_version: 1,
-                plugins: Vec::new(),
-            },
         }
+        if failed > 0 {
+            tracing::warn!(failed, total, "plugin store catalog fetch failed");
+        }
+        merge_catalogs(catalogs)
     }
 
     async fn install_remote_package(

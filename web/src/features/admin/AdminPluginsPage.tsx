@@ -19,6 +19,18 @@ const CONFIG_SELECT_FIELDS_RENDERED_EXPLICITLY = new Set([
 ]);
 const LOGIN_BACKGROUND_IMAGE_TYPES = new Set(["image/jpeg", "image/png", "image/webp"]);
 const MAX_PLUGIN_IMAGE_UPLOAD_BYTES = 5 * 1024 * 1024;
+const MAX_PLUGIN_STORE_SOURCES = 10;
+
+function validPluginStoreSource(value: string): string | null {
+  const source = value.trim();
+  try {
+    const url = new URL(source);
+    if (url.protocol !== "https:" || url.username || url.password || url.hash) return null;
+    return source;
+  } catch {
+    return null;
+  }
+}
 
 export function AdminPluginsPage() {
   const queryClient = useQueryClient();
@@ -26,19 +38,65 @@ export function AdminPluginsPage() {
   const plugins = useQuery({ queryKey: queryKeys.adminPlugins, queryFn: () => api.adminPlugins() });
   const installedPlugins = useQuery({ queryKey: queryKeys.adminInstalledPlugins, queryFn: () => api.adminInstalledPlugins() });
   const store = useQuery({ queryKey: queryKeys.adminPluginStore, queryFn: () => api.adminPluginStore() });
-  const [storeUrl, setStoreUrl] = useState("");
+  const [storeUrls, setStoreUrls] = useState<string[]>([]);
+  const [storeUrlDraft, setStoreUrlDraft] = useState("");
+  const [storeUrlError, setStoreUrlError] = useState("");
   const [storeDialogOpen, setStoreDialogOpen] = useState(false);
   const storeDialogCloseRef = useRef<HTMLButtonElement>(null);
   const closeStoreDialog = useCallback(() => setStoreDialogOpen(false), []);
   const updateStore = useMutation({
-    mutationFn: () => api.updateAdminPluginStore(storeUrl.trim()),
-    onSuccess: () => {
+    mutationFn: (urls: string[]) => api.updateAdminPluginStore(urls),
+    onSuccess: (data) => {
+      setStoreUrls(data.urls);
       closeStoreDialog();
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPluginStore });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminPlugins });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminInstalledPlugins });
     },
   });
+  const openStoreDialog = useCallback(() => {
+    setStoreUrls(store.data?.urls ?? []);
+    setStoreUrlDraft("");
+    setStoreUrlError("");
+    updateStore.reset();
+    setStoreDialogOpen(true);
+  }, [store.data?.urls, updateStore]);
+  const addStoreUrl = useCallback(() => {
+    const source = validPluginStoreSource(storeUrlDraft);
+    if (!source) {
+      setStoreUrlError("请输入以 https:// 开头的有效地址，且不要包含账号、密码或片段。");
+      return;
+    }
+    if (!storeUrls.includes(source) && storeUrls.length >= MAX_PLUGIN_STORE_SOURCES) {
+      setStoreUrlError(`最多可保存 ${MAX_PLUGIN_STORE_SOURCES} 个插件商店地址。`);
+      return;
+    }
+    setStoreUrls((current) => current.includes(source) ? current : [...current, source]);
+    setStoreUrlDraft("");
+    setStoreUrlError("");
+    updateStore.reset();
+  }, [storeUrlDraft, storeUrls, updateStore]);
+  const submitStoreSources = useCallback(() => {
+    let sources = storeUrls;
+    const draft = storeUrlDraft.trim();
+    if (draft) {
+      const source = validPluginStoreSource(draft);
+      if (!source) {
+        setStoreUrlError("请输入以 https:// 开头的有效地址，且不要包含账号、密码或片段。");
+        return;
+      }
+      if (!sources.includes(source)) {
+        if (sources.length >= MAX_PLUGIN_STORE_SOURCES) {
+          setStoreUrlError(`最多可保存 ${MAX_PLUGIN_STORE_SOURCES} 个插件商店地址。`);
+          return;
+        }
+        sources = [...sources, source];
+        setStoreUrls(sources);
+        setStoreUrlDraft("");
+      }
+    }
+    updateStore.mutate(sources);
+  }, [storeUrlDraft, storeUrls, updateStore]);
   const install = useMutation({
     mutationFn: (pluginId: string) => api.installAdminPlugin(pluginId),
     onSuccess: () => {
@@ -78,8 +136,8 @@ export function AdminPluginsPage() {
   });
 
   useEffect(() => {
-    if (store.data?.url) setStoreUrl(store.data.url);
-  }, [store.data?.url]);
+    if (!storeDialogOpen && store.data?.urls) setStoreUrls(store.data.urls);
+  }, [store.data, storeDialogOpen]);
 
   useEffect(() => {
     if (!storeDialogOpen) return;
@@ -107,7 +165,7 @@ export function AdminPluginsPage() {
         <div><h1>插件库</h1><p>从插件商店安装经过校验的插件，再为媒体库选择刮削器。</p></div>
         <div className="lux-admin-plugin-heading-actions">
           <LuxButton tone="secondary" size="compact" type="button" aria-label="检查插件更新" onClick={() => checkUpdates.mutate()} disabled={checkUpdates.isPending}><RefreshCw size={15} /> {checkUpdates.isPending ? "检查中…" : "检查更新"}</LuxButton>
-          <LuxButton tone="secondary" size="compact" className="lux-admin-plugin-store-trigger" type="button" aria-label="设置插件商店来源" aria-haspopup="dialog" aria-expanded={storeDialogOpen} onClick={() => setStoreDialogOpen(true)}><Globe2 size={15} /> 插件商店来源</LuxButton>
+          <LuxButton tone="secondary" size="compact" className="lux-admin-plugin-store-trigger" type="button" aria-label="设置插件商店来源" aria-haspopup="dialog" aria-expanded={storeDialogOpen} onClick={openStoreDialog}><Globe2 size={15} /> 插件商店来源</LuxButton>
         </div>
       </header>
       {auxiliaryLoading ? <p className="lux-admin-muted" role="status">当前列表已加载，正在读取其他插件数据…</p> : null}
@@ -116,16 +174,50 @@ export function AdminPluginsPage() {
         <div className="lux-admin-plugin-dialog-backdrop" role="presentation" onMouseDown={(event) => { if (event.target === event.currentTarget) closeStoreDialog(); }}>
           <section className="lux-admin-plugin-dialog lux-admin-plugin-store-dialog" role="dialog" aria-modal="true" aria-labelledby="plugin-store-source-dialog-title">
             <div className="lux-admin-plugin-dialog-heading">
-              <div><h2 id="plugin-store-source-dialog-title">插件商店来源</h2><p className="lux-admin-plugin-dialog-copy">填写插件目录地址；GitHub 仓库地址会自动读取其 main/index.json。</p></div>
+              <div><h2 id="plugin-store-source-dialog-title">插件商店来源</h2><p className="lux-admin-plugin-dialog-copy">可添加多个插件目录地址；GitHub 仓库地址会自动读取其 main/index.json。</p></div>
               <LuxIconButton className="lux-admin-plugin-dialog-close" ref={storeDialogCloseRef} type="button" aria-label="关闭插件商店来源设置" onClick={closeStoreDialog}><X size={17} /></LuxIconButton>
             </div>
-            <form className="lux-admin-plugin-dialog-form" onSubmit={(event) => { event.preventDefault(); updateStore.mutate(); }}>
+            <form className="lux-admin-plugin-dialog-form" onSubmit={(event) => { event.preventDefault(); submitStoreSources(); }}>
               {store.isPending ? <p className="lux-admin-muted" role="status">正在读取插件商店来源…</p> : null}
               {store.error ? <p className="lux-error-copy" role="alert">插件商店来源加载失败：{store.error.message}</p> : null}
-              <label htmlFor="lux-plugin-store-url">目录地址<LuxTextField id="lux-plugin-store-url" type="url" value={storeUrl} onChange={(event) => setStoreUrl(event.target.value)} placeholder={store.data?.defaultUrl} required /></label>
+              <div className="lux-admin-plugin-store-source-field">
+                <label htmlFor="lux-plugin-store-url">目录地址</label>
+                <div className="lux-admin-plugin-store-source-input">
+                  <LuxTextField
+                    id="lux-plugin-store-url"
+                    type="url"
+                    value={storeUrlDraft}
+                    onChange={(event) => { setStoreUrlDraft(event.target.value); setStoreUrlError(""); updateStore.reset(); }}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter") {
+                        event.preventDefault();
+                        addStoreUrl();
+                      }
+                    }}
+                    placeholder={store.data?.defaultUrl}
+                  />
+                  <LuxButton tone="secondary" type="button" aria-label="添加插件商店来源" onClick={addStoreUrl}>添加</LuxButton>
+                </div>
+                <div className="lux-admin-plugin-store-source-tags" aria-live="polite" aria-label="已添加的插件商店地址">
+                  {storeUrls.length === 0 ? <span className="lux-admin-plugin-store-source-placeholder">尚未添加来源，保存后将使用默认来源。</span> : storeUrls.map((url, index) => (
+                    <span className="lux-admin-plugin-store-source-tag" key={url} title={url}>
+                      <span>{url}</span>
+                      <button type="button" aria-label={`移除插件商店来源 ${url}`} onClick={() => {
+                        setStoreUrlError("");
+                        updateStore.reset();
+                        setStoreUrls((current) => current.filter((_, itemIndex) => itemIndex !== index));
+                      }}>
+                        <X size={12} aria-hidden="true" />
+                      </button>
+                    </span>
+                  ))}
+                </div>
+                <small>{storeUrls.length}/{MAX_PLUGIN_STORE_SOURCES} 个来源。回车可直接添加；同一插件 ID 以更高版本为准。</small>
+              </div>
+              {storeUrlError ? <p className="lux-error-copy" role="alert">{storeUrlError}</p> : null}
               <div className="lux-admin-plugin-dialog-actions">
                 <LuxButton tone="secondary" type="button" onClick={closeStoreDialog}>取消</LuxButton>
-                <LuxButton tone="primary" type="submit" disabled={updateStore.isPending || !storeUrl.trim()}>{updateStore.isPending ? "保存中…" : "保存来源"}</LuxButton>
+                <LuxButton tone="primary" type="submit" disabled={updateStore.isPending}>{updateStore.isPending ? "保存中…" : "保存来源"}</LuxButton>
               </div>
               {updateStore.error ? <span className="lux-error-copy" role="alert">{updateStore.error.message}</span> : null}
             </form>

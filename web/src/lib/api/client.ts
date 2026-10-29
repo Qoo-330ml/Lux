@@ -1118,10 +1118,10 @@ export class LuxApiClient {
     return this.request<AdminPluginStore>("/api/v1/admin/plugin-store");
   }
 
-  updateAdminPluginStore(url: string) {
+  updateAdminPluginStore(urls: string[]) {
     return this.request<AdminPluginStore>("/api/v1/admin/plugin-store", {
       method: "PUT",
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ urls }),
     });
   }
 
