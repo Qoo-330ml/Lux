@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act } from "react";
+import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -307,6 +307,56 @@ describe("usePlayerKeyboardShortcuts", () => {
     const { state } = mountHarness({ video, showInfo: false, showSettings: true });
     keydown("Escape");
     expect(state.setShowSettings).toHaveBeenCalledWith(false);
+  });
+});
+
+describe("usePlayerKeyboardShortcuts listener lifecycle", () => {
+  it("binds the window keydown listener once across re-renders", () => {
+    const addEventListener = vi.spyOn(window, "addEventListener");
+    const removeEventListener = vi.spyOn(window, "removeEventListener");
+    const toggleMute = vi.fn();
+    const navigate = vi.fn();
+    let rerender: () => void = () => undefined;
+
+    function Harness() {
+      const [tick, setTick] = useState(0);
+      rerender = () => setTick((value) => value + 1);
+      // PlayerPage passes a fresh inline arrow for `navigate` on every render;
+      // that must not re-bind the global listener.
+      usePlayerKeyboardShortcuts({
+        itemId: "movie-1",
+        volume: 1,
+        changeVolume: () => undefined,
+        seekRelative: () => undefined,
+        togglePlayPause: () => undefined,
+        toggleMute,
+        toggleFullscreen: () => undefined,
+        resetControlsTimeout: () => undefined,
+        showInfo: false,
+        showSettings: false,
+        setShowInfo: () => undefined,
+        setShowSettings: () => undefined,
+        navigate: (to) => navigate(to),
+      });
+      return <output data-testid="tick">{tick}</output>;
+    }
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    act(() => root?.render(<Harness />));
+
+    for (let index = 0; index < 5; index += 1) {
+      act(() => rerender());
+    }
+
+    const keydownAdds = addEventListener.mock.calls.filter(([type]) => type === "keydown");
+    const keydownRemoves = removeEventListener.mock.calls.filter(([type]) => type === "keydown");
+    expect(keydownAdds).toHaveLength(1);
+    expect(keydownRemoves).toHaveLength(0);
+
+    keydown("m");
+    expect(toggleMute).toHaveBeenCalledTimes(1);
   });
 });
 

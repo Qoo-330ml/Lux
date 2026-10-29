@@ -1,4 +1,4 @@
-import { useEffect, type Dispatch, type SetStateAction } from "react";
+import { useEffect, useRef } from "react";
 
 type PlayerKeyboardShortcutOptions = {
   itemId: string;
@@ -11,30 +11,24 @@ type PlayerKeyboardShortcutOptions = {
   resetControlsTimeout: () => void;
   showInfo: boolean;
   showSettings: boolean;
-  setShowInfo: Dispatch<SetStateAction<boolean>>;
-  setShowSettings: Dispatch<SetStateAction<boolean>>;
+  setShowInfo: (value: boolean | ((visible: boolean) => boolean)) => void;
+  setShowSettings: (value: boolean | ((visible: boolean) => boolean)) => void;
   navigate: (to: number | string) => void;
 };
 
 /**
  * Global player shortcuts. Typing targets keep their own key handling, and
  * Escape unwinds overlays before it ever navigates away.
+ *
+ * The listener is bound once per mount and reads the latest callbacks through a
+ * ref, mirroring usePlayerPlatform: playback re-renders the page roughly ten
+ * times per second, so depending on callback identity here would detach and
+ * reattach the window listener on every tick.
  */
-export function usePlayerKeyboardShortcuts({
-  itemId,
-  volume,
-  changeVolume,
-  seekRelative,
-  togglePlayPause,
-  toggleMute,
-  toggleFullscreen,
-  resetControlsTimeout,
-  showInfo,
-  showSettings,
-  setShowInfo,
-  setShowSettings,
-  navigate,
-}: PlayerKeyboardShortcutOptions) {
+export function usePlayerKeyboardShortcuts(options: PlayerKeyboardShortcutOptions) {
+  const optionsRef = useRef(options);
+  optionsRef.current = options;
+
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const target = e.target as HTMLElement | null;
@@ -46,6 +40,22 @@ export function usePlayerKeyboardShortcuts({
       ) {
         return;
       }
+
+      const {
+        itemId,
+        navigate,
+        resetControlsTimeout,
+        setShowInfo,
+        setShowSettings,
+        showInfo,
+        showSettings,
+        volume,
+        changeVolume,
+        seekRelative,
+        toggleFullscreen,
+        toggleMute,
+        togglePlayPause,
+      } = optionsRef.current;
 
       resetControlsTimeout();
 
@@ -114,19 +124,5 @@ export function usePlayerKeyboardShortcuts({
     return () => {
       window.removeEventListener("keydown", handleKeyDown);
     };
-  }, [
-    changeVolume,
-    itemId,
-    navigate,
-    resetControlsTimeout,
-    seekRelative,
-    showInfo,
-    showSettings,
-    setShowInfo,
-    setShowSettings,
-    toggleFullscreen,
-    toggleMute,
-    togglePlayPause,
-    volume,
-  ]);
+  }, []);
 }
