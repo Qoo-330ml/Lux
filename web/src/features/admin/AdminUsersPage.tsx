@@ -370,8 +370,7 @@ export function AdminUsersPage() {
                 <span className="lux-users-tag">按删除时间排序</span>
               )}
               <div className="lux-users-toolbar-end">
-                <span className="lux-users-count">共 {totalCount} 人</span>
-                <LuxSelectField className="lux-users-select" aria-label="排序方式" value={sortBy} onChange={(event) => setSortBy(event.target.value as AdminUserSortBy)}>
+                <LuxSelectField aria-label="排序方式" value={sortBy} onChange={(event) => setSortBy(event.target.value as AdminUserSortBy)}>
                   <option value="lastActivityAt">最近活动</option>
                   <option value="lastLoginAt">最近登录</option>
                   <option value="createdAt">创建时间</option>

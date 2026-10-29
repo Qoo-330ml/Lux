@@ -46,8 +46,6 @@
 
 .lux-users-subnav { align-self: start; width: fit-content; max-width: 100%; overflow-x: auto; }
 
-.lux-users-count { color: var(--lux-subtle); font-size: .72rem; white-space: nowrap; }
-
 .lux-users-note { margin: 0; padding: 12px 16px 0; color: var(--lux-muted); font-size: .74rem; }
 
 .lux-users-pane { display: grid; gap: 16px; min-width: 0; }
@@ -74,10 +72,6 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--lux-line-soft);
-  border-radius: 14px;
-  background: var(--lux-surface);
 }
 
 .lux-users-search {
@@ -559,20 +553,6 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
   .lux-users-detail-facts span + span::before { display: none; }
 }
 
-.lux-users-select {
-  min-height: 34px;
-  padding: 0 10px;
-  border: 1px solid var(--lux-line-soft);
-  border-radius: 9px;
-  outline: 0;
-  color: var(--lux-text);
-  background: rgba(255, 255, 255, .05);
-  font: inherit;
-  font-size: .74rem;
-}
-
-.lux-users-select:focus { border-color: color-mix(in srgb, var(--lux-accent) 60%, var(--lux-line-soft)); }
-
 /* ---------- 详情页按需展开区 ---------- */
 
 .lux-users-disclosure { display: grid; gap: 12px; min-width: 0; }
@@ -598,8 +578,7 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 /* ---------- 浅色主题 ---------- */
 
 html[data-lux-theme="light"] .lux-users-search,
-html[data-lux-theme="light"] .lux-users-chips,
-html[data-lux-theme="light"] .lux-users-select {
+html[data-lux-theme="light"] .lux-users-chips {
   background: rgba(28, 28, 34, .04);
 }
 
