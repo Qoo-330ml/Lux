@@ -2644,6 +2644,59 @@ async fn postgres_catalog_read_model_rebuild_and_stats_are_consistent()
 }
 
 #[tokio::test]
+#[ignore = "requires a local PostgreSQL instance started with shared_preload_libraries=pg_stat_statements"]
+async fn postgres_query_statistics_extension_is_created_once_when_preloaded()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let before = database.collect_postgres_query_statistics().await["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(before, "EXTENSION_MISSING");
+        let first = database.ensure_postgres_query_statistics_extension().await;
+        assert_eq!(
+            first,
+            super::database_maintenance::QueryStatisticsExtensionOutcome::Created
+        );
+        let second = database.ensure_postgres_query_statistics_extension().await;
+        assert_eq!(
+            second,
+            super::database_maintenance::QueryStatisticsExtensionOutcome::AlreadyInstalled
+        );
+        assert_ne!(
+            database.collect_postgres_query_statistics().await["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            "EXTENSION_MISSING"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance started WITHOUT shared_preload_libraries=pg_stat_statements"]
+async fn postgres_query_statistics_extension_is_skipped_when_not_preloaded()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        assert_eq!(
+            database.ensure_postgres_query_statistics_extension().await,
+            super::database_maintenance::QueryStatisticsExtensionOutcome::NotPreloaded
+        );
+        let installed: bool = database
+            .query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert!(!installed);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_scan_write_transaction_uses_local_async_commit()
 -> Result<(), Box<dyn std::error::Error>> {

@@ -37,7 +37,7 @@
     },
     {
       "path": "src/storage/database_maintenance.rs",
-      "count": 10,
+      "count": 11,
       "note": "vacuum/analyze/pragma maintenance is engine specific"
     },
     {
@@ -141,6 +141,6 @@
       "note": "user SQL with backend-specific upsert forms"
     }
   ],
-  "total": 265,
+  "total": 266,
   "rule": "New code must not add DatabaseBackend:: branches. Growing an existing file requires editing this manifest in the same commit, which documents the reason in review."
 }

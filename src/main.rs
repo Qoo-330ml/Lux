@@ -132,6 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     database.spawn_removed_media_item_purge();
     database.spawn_task_history_retention();
+    database.spawn_postgres_query_statistics_extension();
     database.spawn_database_maintenance();
     database.spawn_detached_state_reconcile();
     database.spawn_query_statistics_refresh();
