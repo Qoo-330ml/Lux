@@ -24,6 +24,13 @@
 *.key
 .DS_Store
 
+# Local tool caches and build artifacts (never part of a commit)
+/.pnpm-store/
+/.vite/
+/.tscli/
+/.rustc_info.json
+/debug/
+
 # Local-only design drafts and visual QA artifacts
 /posters/
 /.tmp/
