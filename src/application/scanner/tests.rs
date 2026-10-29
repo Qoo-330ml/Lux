@@ -3407,3 +3407,34 @@ fn link_observation_replaces_the_real_path_in_a_batch() {
         .collect();
     assert_eq!(paths, ["Link.mkv", "Other.mkv"]);
 }
+
+#[tokio::test]
+async fn batch_walker_canonicalizes_its_root_before_symlink_checks()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp = tempfile::tempdir()?;
+    let real_root = temp.path().join("Media");
+    std::fs::create_dir(&real_root)?;
+    let real_file = real_root.join("Real.Movie.2024.mkv");
+    std::fs::write(&real_file, b"fixture")?;
+    let link = real_root.join("Linked.Movie.2024.mkv");
+    std::os::unix::fs::symlink(&real_file, &link)?;
+    // The libraries are registered with a canonical path, so feed the walker a path that still
+    // needs resolving: containment checks only pass when the walker canonicalizes it itself.
+    let aliased_root = temp.path().join("Aliased");
+    std::os::unix::fs::symlink(&real_root, &aliased_root)?;
+
+    let mut walker = super::library::FileBatchWalker::new(&aliased_root).await;
+    let files = walker
+        .next_batch(16)
+        .await?
+        .expect("the walker must yield the batch");
+    assert!(
+        files.contains(&aliased_root.join("Real.Movie.2024.mkv")),
+        "regular files under the root must be walked"
+    );
+    assert!(
+        files.contains(&aliased_root.join("Linked.Movie.2024.mkv")),
+        "a file link inside the canonicalized root must be followed"
+    );
+    Ok(())
+}
