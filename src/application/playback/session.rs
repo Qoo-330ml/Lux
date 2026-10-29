@@ -1476,6 +1476,13 @@ impl WebPlaybackSessionService {
         self.database
             .release_playback_admission(user_id, &session.play_session_id, now)
             .await?;
+        // The playback-only Emby token exists solely to carry this session's media URLs, so it
+        // must not outlive it, even if the caller forgets to drop the URL.
+        // The playback-only Emby token exists solely to carry this session's media URLs, so it
+        // must not outlive it, even if the caller forgets to drop the URL.
+        self.database
+            .revoke_playback_access_tokens(session_id)
+            .await?;
         Ok(())
     }
 
@@ -1696,6 +1703,15 @@ async fn record_and_stop_hls_sessions(
 ) {
     for session in &sessions {
         record_transcoding_snapshot(database, hls, session, outcome, None).await;
+        // Expired and stale sessions are reaped without going through `stop`, so their
+        // playback-only tokens are revoked here instead.
+        if let Err(error) = database.revoke_playback_access_tokens(&session.id).await {
+            tracing::warn!(
+                session_id = %session.id,
+                %error,
+                "failed to revoke playback tokens of a reaped session"
+            );
+        }
     }
     stop_hls_sessions(hls, sessions).await;
 }
@@ -2244,6 +2260,104 @@ mod tests {
             ),
             "video transcoding cannot be allowed when the current HLS output also transcodes audio"
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stopping_a_session_revokes_its_playback_tokens()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let owner_id = owner.id.to_string();
+        let auth = crate::auth::emby::EmbyAuthService::new(database.clone())?;
+        for session_id in ["session-a", "session-b"] {
+            database
+                .insert_web_playback_session(NewWebPlaybackSession {
+                    id: session_id,
+                    user_id: &owner_id,
+                    item_id: &item_id,
+                    media_source_id: None,
+                    play_session_id: &format!("lux-web:{session_id}"),
+                    tier: i64::from(ServerTier::Remux.number()),
+                    plan: "SERVER_HLS",
+                    temp_dir: None,
+                    is_admin: false,
+                    expires_at: unix_timestamp() + 900,
+                    now: unix_timestamp(),
+                })
+                .await?;
+        }
+        let device = crate::auth::emby::EmbyDeviceInfo {
+            client: "Lux Web".to_owned(),
+            device: "Browser".to_owned(),
+            device_id: Uuid::now_v7().to_string(),
+            version: "1".to_owned(),
+            user_id: None,
+        };
+        let mut tokens = Vec::new();
+        for session_id in ["session-a", "session-b"] {
+            tokens.push(
+                auth.issue_playback_token(
+                    &owner,
+                    session_id,
+                    &device,
+                    unix_timestamp() + 900,
+                    None,
+                )
+                .await?
+                .ok_or("token was not issued")?,
+            );
+        }
+        for token in &tokens {
+            assert!(
+                auth.resolve_emby_route_token_with_ip(token, None)
+                    .await?
+                    .is_some(),
+                "a fresh playback token must resolve"
+            );
+        }
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+        };
+        service.stop("session-a", &owner_id).await?;
+
+        assert!(
+            auth.resolve_emby_route_token_with_ip(&tokens[0], None)
+                .await?
+                .is_none(),
+            "a stopped session must not keep its playback token alive"
+        );
+        assert!(
+            auth.resolve_emby_route_token_with_ip(&tokens[1], None)
+                .await?
+                .is_some(),
+            "stopping one session must leave another session's token alone"
+        );
+        Ok(())
     }
 
     #[cfg(unix)]
