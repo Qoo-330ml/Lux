@@ -1380,12 +1380,9 @@ impl Database {
                 .map_err(self.sqlx_err())?;
             for row in rows {
                 let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                let sort_title = row.try_get::<String, _>("sort_title").map_err(|source| {
-                    StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    }
-                })?;
+                let sort_title = row
+                    .try_get::<String, _>("sort_title")
+                    .map_err(self.sqlx_err())?;
                 let production_year = row
                     .try_get::<Option<i64>, _>("production_year")
                     .map_err(self.sqlx_err())?;
@@ -1464,12 +1461,9 @@ impl Database {
                 .map_err(self.sqlx_err())?;
             for row in rows {
                 let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                let identity_key = row.try_get::<String, _>("identity_key").map_err(|source| {
-                    StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    }
-                })?;
+                let identity_key = row
+                    .try_get::<String, _>("identity_key")
+                    .map_err(self.sqlx_err())?;
                 folders.insert(identity_key, id);
             }
         }
@@ -1586,13 +1580,9 @@ impl Database {
                     .map_err(self.sqlx_err())?;
                 for row in &inserted_rows {
                     let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                    let identity_key =
-                        row.try_get::<String, _>("identity_key").map_err(|source| {
-                            StorageError::Sqlx {
-                                path: self.path.clone(),
-                                source,
-                            }
-                        })?;
+                    let identity_key = row
+                        .try_get::<String, _>("identity_key")
+                        .map_err(self.sqlx_err())?;
                     folder_cache.insert(identity_key.clone(), id);
                     touched_folders.insert(identity_key);
                 }
@@ -1618,19 +1608,10 @@ impl Database {
                             .await
                             .map_err(self.sqlx_err())?;
                         for row in rows {
-                            let id = row.try_get::<String, _>("id").map_err(|source| {
-                                StorageError::Sqlx {
-                                    path: self.path.clone(),
-                                    source,
-                                }
-                            })?;
-                            let identity_key =
-                                row.try_get::<String, _>("identity_key").map_err(|source| {
-                                    StorageError::Sqlx {
-                                        path: self.path.clone(),
-                                        source,
-                                    }
-                                })?;
+                            let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
+                            let identity_key = row
+                                .try_get::<String, _>("identity_key")
+                                .map_err(self.sqlx_err())?;
                             folder_cache.insert(identity_key, id);
                         }
                     }
@@ -2736,12 +2717,9 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let identity_key = row.try_get::<String, _>("identity_key").map_err(|source| {
-                    StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    }
-                })?;
+                let identity_key = row
+                    .try_get::<String, _>("identity_key")
+                    .map_err(self.sqlx_err())?;
                 let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
                 if row
                     .try_get::<Option<i64>, _>("removed_at")

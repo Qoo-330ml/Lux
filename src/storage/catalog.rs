@@ -9048,12 +9048,12 @@ impl Database {
             for source_url in unique_urls {
                 statement = statement.bind(source_url);
             }
-            existing.extend(statement.fetch_all(&self.pool).await.map_err(|source| {
-                StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                }
-            })?);
+            existing.extend(
+                statement
+                    .fetch_all(&self.pool)
+                    .await
+                    .map_err(self.sqlx_err())?,
+            );
         }
         Ok(existing)
     }

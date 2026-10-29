@@ -698,12 +698,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                confirmed.push(row.try_get("relative_path").map_err(|source| {
-                    StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    }
-                })?);
+                confirmed.push(row.try_get("relative_path").map_err(self.sqlx_err())?);
             }
         }
         Ok(confirmed)
