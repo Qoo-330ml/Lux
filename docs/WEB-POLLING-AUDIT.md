@@ -19,7 +19,9 @@ grep -rn "refetchInterval\|setInterval" src
 
 ## 关键前提
 
-- React Query v5 的 `refetchIntervalInBackground` **默认就是 `false`**，实现上只有 `focusManager.isFocused()` 为真时才会按间隔重取（见 `@tanstack/query-core` 的 `queryObserver`：`if (this.options.refetchIntervalInBackground || focusManager.isFocused())`）。因此**所有 `refetchInterval` 轮询在标签页不可见/窗口失焦时已经暂停**，不需要再加开关；本文件把显式写了 `refetchIntervalInBackground: false` 的行标注为「显式」，未写的标注为「默认」。
+- React Query v5 的 `refetchIntervalInBackground` **默认就是 `false`**，实现上只有 `focusManager.isFocused()` 为真时才会按间隔重取（见 `@tanstack/query-core` 的 `queryObserver`：`if (this.options.refetchIntervalInBackground || focusManager.isFocused())`）。
+  本仓库安装的是 `@tanstack/query-core@5.101.4`，其 `FocusManager` 默认**只监听 `visibilitychange`**，`isFocused()` 在未显式设置时回退为 `document.visibilityState !== "hidden"`；仓库内没有调用 `focusManager.setEventListener` 自定义过监听（`grep -rn "focusManager" web/src` 为空）。
+  因此实际语义是：**标签页隐藏（`document.hidden === true`）时暂停；窗口可见但失去焦点（例如切到另一个应用窗口）时仍会继续轮询**。任务要求的「页面不可见」正是 `document.hidden`/`visibilityState === "hidden"` 这一条件，所以「查询类轮询无需再加开关」的结论仍然成立。下表「页面不可见时仍轮询」一列即指标签页隐藏时是否仍轮询；本文件把显式写了 `refetchIntervalInBackground: false` 的行标注为「显式」，未写的标注为「默认」。
 - 真正会在后台继续跑的是 `window.setInterval`：心跳（必须继续）和客户端统计采样（纯展示，本次改为隐藏时暂停）。
 - 用户事件 SSE：`/api/v1/events`（`useUserEvents`），通过 `SseConnectionContext` + `useSseConnectionState()` 暴露连接状态，事件里的 `scope` 会 invalidate `home`、`libraries`、`item`、`item-images`、`playback`、`children`、`favorites`、`collection`、`person`、`library:<id>`。
 - 管理事件 SSE：`/api/v1/admin/events`（`useAdminEvents`），`scope` 取值 `all | dashboard | jobs | libraries | plugins | users | metadata | settings`，按 `queryKeysByScope` invalidate 对应查询；**当前没有暴露连接状态**，所以前端无法按连接状态关闭兜底轮询。
@@ -104,7 +106,7 @@ grep -rn "refetchInterval\|setInterval" src
 
 ### 未改动但已确认的部分
 
-- 全部 `refetchInterval` 轮询在后台已经暂停（React Query 默认），因此「页面不可见时暂停纯展示轮询」对查询类轮询**无需改动**；本次只处理了唯一的裸 `setInterval`。
+- 全部 `refetchInterval` 轮询在标签页隐藏时已经暂停（React Query 默认，见上文说明；窗口可见但失焦时仍轮询，这不属于「页面不可见」），因此「页面不可见时暂停纯展示轮询」对查询类轮询**无需改动**；本次只处理了唯一的裸 `setInterval`。
 - 心跳是会话保活协议的一部分，必须后台继续，未改动。
 - 明细/首页系列轮询都已经按 `useSseConnectionState() === "connected"` 关闭了兜底轮询，没有遗漏点。
 
