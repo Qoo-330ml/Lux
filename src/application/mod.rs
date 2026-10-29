@@ -21,6 +21,7 @@ pub mod catalog;
 pub(crate) mod catalog_read_model;
 pub mod chapter_detector;
 pub mod collections;
+pub mod container_gateway;
 pub(crate) mod content_restriction_index;
 pub mod danmaku;
 pub mod database_diagnostics;

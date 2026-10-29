@@ -19,6 +19,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = Config::from_env()?;
     let discovery_config = DiscoveryConfig::from_env(config.http_addr)?;
     let (_logging_guard, _log_store) = observability::init(&config.config_dir).await;
+    // Resolve the container runtime gateway once, off the request path: the access-IP resolver
+    // reads it for every forwarded request, and `/proc` lookups must not run on Tokio workers.
+    luxd::application::container_gateway::warm_up();
     luxd::application::plugin_compat::migrate_legacy_tmdb_config(&config.config_dir).await?;
     let explicit_database_configuration = config.load_explicit_database_configuration().await?;
     let legacy_sqlite_database = config.has_legacy_sqlite_database().await;

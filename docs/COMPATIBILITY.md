@@ -88,6 +88,14 @@ IPv4/IPv6；`Forwarded` 按 [RFC 7239](https://www.rfc-editor.org/rfc/rfc7239.ht
 因此展示的 `remoteIp` 与 IP/CIDR 封禁所用访问 IP 可能不同，显示为真实地址本身不能证明黑名单已命中。
 反向代理未传递可验证的对端/转发链时，Lux 无法恢复未提供的客户端地址。
 
+容器部署例外（隐式可信代理）：Docker 桥接网络下发布端口会改写源地址，连接对端恒为网桥网关
+（`172.17.0.1`、`172.18.0.1`、`172.31.0.1` …，随地址池变化）。Lux 在检测到自身运行于容器
+（`/.dockerenv`、`/run/.containerenv` 或 cgroup 容器标记）时，把 `/proc/net/route` /
+`/proc/net/ipv6_route` 中的默认网关作为单个 `/32` 或 `/128` 隐式可信代理并入解析列表。
+该信任只覆盖网关主机地址，不覆盖整个网桥网段，管理员配置的 `trustedProxyCidrs` 仍是叠加项；
+非容器部署不启用该逻辑，行为与之前完全一致。因此 Docker 部署无需再手工填写网段配置。
+网关自身无法区分的场景（客户端直接连接发布端口、不经任何反代）仍只能显示网关地址。
+
 自动化验证范围：本机 ARM64/SQLite，真实回环 HTTP 的根路径及 `/emby` 播放回调、
 数据库 `playback_sessions.remote_ip` 和 `/Sessions` 的 `RemoteEndPoint`；可信代理链、伪造头和 IP 黑名单另有解析/认证/播放回归，
 具体见开发规格 LUX-592、LUX-761–772、LUX-818–820。真实 Lucky、FNOS/x86_64 及第三方播放器部署验证仍未进行；

@@ -43,9 +43,12 @@
 - Validate every external input, canonicalize media paths, and enforce the configured library root.
 - Lux may use `X-Forwarded-For` for IP/CIDR blacklist decisions only through the access-IP
   resolver: it starts from the connection peer attached by server middleware, consults explicitly
-  configured trusted-proxy CIDRs, and walks the complete chain from right to left. Raw forwarded
-  values and untrusted peers must never be used for ACL decisions. `X-Forwarded-Proto` remains
-  display/transport metadata only and must not be used for authentication, authorization, or ACLs.
+  configured trusted-proxy CIDRs plus the single container default gateway detected from
+  `/proc/net/route` when the process runs inside a container, and walks the complete chain from
+  right to left. The implicit gateway trust is limited to one host address, never the bridge
+  subnet, and is disabled outside containers. Raw forwarded values and untrusted peers must never
+  be used for ACL decisions. `X-Forwarded-Proto` remains display/transport metadata only and must
+  not be used for authentication, authorization, or ACLs.
 - Do not use `unwrap`, `expect`, or `panic` in production paths without a task-specific justification.
 - Do not execute blocking filesystem or process work on Tokio core workers.
 - Do not scan a whole library, call TMDb, parse NFO, or run `ffprobe` in a user request.

@@ -1256,13 +1256,10 @@ async fn request_access_ip(
     let trusted_proxy_values = crate::application::settings::read_trusted_proxy_cidrs(database)
         .await
         .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
-    let trusted_proxies = trusted_proxy_values
-        .iter()
-        .map(|value| {
-            crate::application::user_access_rules::IpCidr::parse(value)
-                .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let trusted_proxies = trusted_proxy_networks(
+        &trusted_proxy_values,
+        crate::application::container_gateway::implicit_trusted_proxy(),
+    )?;
     crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
         peer,
         &forwarded_for_values,
@@ -1279,6 +1276,30 @@ enum AccessIpResolutionError {
     MalformedForwardedFor,
 }
 
+/// Merge the administrator-configured trusted proxy CIDRs with the container runtime gateway.
+///
+/// A container runtime rewrites the source address of published-port traffic to the bridge
+/// gateway, so the configured list alone never matches the connection peer. The detected gateway
+/// is additive and limited to a single host address; administrator-supplied CIDRs keep their
+/// meaning, and a deployment without container detection behaves exactly as before.
+fn trusted_proxy_networks(
+    configured: &[String],
+    implicit_gateway: Option<crate::application::user_access_rules::IpCidr>,
+) -> Result<Vec<crate::application::user_access_rules::IpCidr>, AccessIpResolutionError> {
+    let mut networks = configured
+        .iter()
+        .map(|value| {
+            crate::application::user_access_rules::IpCidr::parse(value)
+                .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if let Some(gateway) = implicit_gateway {
+        if !networks.contains(&gateway) {
+            networks.push(gateway);
+        }
+    }
+    Ok(networks)
+}
 fn login_attempt_key(headers: &HeaderMap, username: &str) -> String {
     format!(
         "{}:{}",
@@ -1828,7 +1849,7 @@ mod tests {
         lux_catalog_source_json, metadata_candidate_error, metadata_candidate_failure_kind,
         normalize_strm_http_location, playback_client_label, playback_identifier_prefix,
         record_activity_event, request_access_ip, safe_trace_path, secure_cookie_for_request,
-        validate_media_strategy,
+        trusted_proxy_networks, validate_media_strategy,
     };
     use crate::application::admin_events::{AdminEventHub, AdminEventScope};
     use crate::application::candidates::MetadataCandidateError;
@@ -2198,6 +2219,62 @@ mod tests {
 
         assert_eq!(request_access_ip(&headers, &state).await, Ok(None));
         Ok(())
+    }
+
+    #[test]
+    fn trusted_proxy_networks_keep_configured_cidrs_untouched() {
+        let networks =
+            trusted_proxy_networks(&["10.0.0.0/8".to_owned(), "2001:db8::/32".to_owned()], None)
+                .expect("valid configured cidrs");
+
+        assert_eq!(
+            networks,
+            vec![
+                crate::application::user_access_rules::IpCidr::parse("10.0.0.0/8").expect("cidr"),
+                crate::application::user_access_rules::IpCidr::parse("2001:db8::/32")
+                    .expect("cidr"),
+            ]
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_networks_add_the_container_gateway_without_a_configured_value() {
+        let gateway =
+            crate::application::user_access_rules::IpCidr::parse("172.31.0.1/32").expect("cidr");
+
+        let networks = trusted_proxy_networks(&[], Some(gateway)).expect("implicit gateway");
+
+        assert_eq!(networks, vec![gateway]);
+        assert_eq!(
+            crate::application::user_access_rules::resolve_client_ip_from_trusted_proxies(
+                "172.31.0.1".parse().expect("peer"),
+                &["39.183.141.86"],
+                &networks,
+            ),
+            Ok("39.183.141.86".parse().expect("client"))
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_networks_do_not_duplicate_an_equivalent_configured_network() {
+        let gateway =
+            crate::application::user_access_rules::IpCidr::parse("172.31.0.1/32").expect("cidr");
+
+        let networks =
+            trusted_proxy_networks(&["172.31.0.1/32".to_owned()], Some(gateway)).expect("networks");
+
+        assert_eq!(networks, vec![gateway]);
+    }
+
+    #[test]
+    fn trusted_proxy_networks_still_reject_malformed_configuration() {
+        let gateway =
+            crate::application::user_access_rules::IpCidr::parse("172.31.0.1/32").expect("cidr");
+
+        assert_eq!(
+            trusted_proxy_networks(&["not-a-cidr".to_owned()], Some(gateway)),
+            Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
     }
 
     #[test]
