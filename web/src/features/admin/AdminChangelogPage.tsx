@@ -15,6 +15,33 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.7.2",
+    date: "2026-10-30",
+    sections: [
+      { kind: "added", items: [
+        "插件商店多来源：可同时保存最多 10 个 HTTPS 目录地址，已填写地址以可移除标签展示，重复地址自动去重；多个目录并发拉取，单个失败只记告警、不影响其余目录，合并后按插件 ID 去重并取最高 SemVer 版本；旧版单地址配置与 { url } 请求字段继续兼容，空列表回退默认仓库。",
+        "播放专用 Emby 令牌：令牌带 scope=PLAYBACK 并绑定播放会话，随会话结束过期（最长 12 小时）、使用不刷新；除 Items/{id}、Users/{id}/Items/{id}、Videos/{id}/stream|original、Auth/Keys 外，其余 Emby 路径一律 401，默认解析、登录会话列表与设备校验都不接受它；停止或回收会话即吊销。",
+        "Web 直放候选链：远程 HTTP(S) .strm 依次尝试同源 Emby 流入口（302 代理可接管）、签名 Lux 入口、origin；候选 8 秒内报错或拿不到元数据就交给下一个，可用类型会被记住（只记类型），下次失败即忘记。",
+        "PostgreSQL 查询统计自动就绪：服务器已预加载 pg_stat_statements 时，Lux 启动后会在业务库自动创建该扩展，管理员数据库诊断随即返回 queryStatistics；需要超级用户权限，失败只记警告，LUX_POSTGRES_QUERY_STATISTICS_EXTENSION=0 可关闭。",
+        "继续观看文案分级：先按进度状态（即将看完、刚开始、下一集），再按时间段与电影/剧集措辞，不再统一是「看到这里」。",
+        "转码只列出本机可用的硬件编码器：启动时探测设备节点（macOS 的 VideoToolbox、NVENC 的 /dev/nvidiactl、VAAPI 的 DRM render node、QSV 的 Intel vendor ID），设置页只展示检测到的编码器，已保存的选择仍可见。",
+      ] },
+      { kind: "changed", items: [
+        "容器内访问 IP 识别：Docker 发布端口会把源地址改写成网桥网关，严格的可信代理列表匹配不到连接对端，会话一律记成 172.31.0.1 这类地址；现在启动时从 /proc/net/route（回退 /proc/net/ipv6_route）读取默认网关，把这一个主机地址并入可信列表，显式 trustedProxyCidrs 仍累加，非容器部署行为不变。",
+        "用户列表工具栏扁平化：去掉工具栏外层卡片与重复的人数显示，人数回到分页行（显示 X–Y 条，共 N 条），排序下拉使用统一样式。",
+        "浅色主题改用语义状态色：后台状态、插件控件与媒体弹窗里固定的深色十六进制值换成 --lux-status-* 令牌，浅色下每个令牌都满足 4.5:1 对比度；删除按钮有独立的浅色配色，批量操作结果改用 is-success/is-failure 样式而不是内联颜色。",
+      ] },
+      { kind: "fixed", items: [
+        "PostgreSQL 空闲时持续占用 CPU：NFO 合集身份对账 worker 的每秒轮询在 PostgreSQL 上用裸 FOR UPDATE 加锁被拒、部分索引仍要求已不再读取的列、且顺主键扫完 media_items；现按 FOR UPDATE OF item 加锁并在两个后端重建索引（SQLite 0240、PostgreSQL 0242），单次约 177 ms 降到约 6 ms。",
+        "PostgreSQL 推荐统计永远刷新失败：指纹查询里 SUM(...) 返回 NUMERIC，Any 驱动无法解码，现显式转为 BIGINT。",
+        "读模型从未真正就绪：重建完成写入的水位名 catalog_items_rebuild 与读取方检查的 catalog_items_rebuild@N 不一致，导致读取退回权威查询、每次启动整体重建、增量消费者不运行；现统一写入带版本号的名字，升级后首次启动会重新入队并增量处理。",
+        "PostgreSQL media_search 无变化也被重写：重建索引的 upsert 只在标题、排序标题、原始标题或别名真的变化时才更新。",
+        "STRM 探测被宿主超时打断：探测沿用插件 30 秒调用预算，慢速远程源会被杀掉；探测改用 130 秒预算，相对本地目标按 .strm 所在目录解析，SMB 与其他不支持的协议直接给出原因。",
+        "后台「正在播放」排版：卡片左对齐，剧集显示所属剧集海报，不再沿用单集残留图。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.1",
     date: "2026-10-29",
     sections: [
