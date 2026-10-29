@@ -23,9 +23,7 @@ pub(crate) async fn admin_database_diagnostics_status(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(diagnostics) = state.database_diagnostics.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let diagnostics = require_service!(state.database_diagnostics);
     let mut response = Json(diagnostics.status().await).into_response();
     response.headers_mut().insert(
         CACHE_CONTROL,
@@ -41,9 +39,7 @@ pub(crate) async fn admin_start_database_diagnostics(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(diagnostics) = state.database_diagnostics.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let diagnostics = require_service!(state.database_diagnostics);
     match diagnostics.request_collection().await {
         Ok(status) => {
             let mut response = (StatusCode::ACCEPTED, Json(status)).into_response();
@@ -72,9 +68,7 @@ pub(crate) async fn admin_export_database_diagnostics(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(diagnostics) = state.database_diagnostics.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let diagnostics = require_service!(state.database_diagnostics);
     let Some(report) = diagnostics.report().await else {
         return api_error(
             &headers,
