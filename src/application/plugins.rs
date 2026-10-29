@@ -2505,7 +2505,12 @@ impl PluginService {
             .map_err(PluginServiceError::ConfigIo)?
         {
             let path = entry_result.path();
-            if path.is_file()
+            // `Path::is_file` resolves links and turns errors into `false`; mirror both instead of
+            // using the dirent type, which would not resolve a linked archive.
+            let is_file = fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
+            if is_file
                 && path.extension().is_some_and(|extension| extension == "zip")
                 && path
                     .file_name()
