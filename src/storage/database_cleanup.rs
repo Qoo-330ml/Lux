@@ -2053,3 +2053,147 @@ mod task_history_retention_tests {
         Ok(())
     }
 }
+
+/// Manual measurement harness for `docs/STARTUP-REPAIRS.md`.
+///
+/// It opens a catalog fixture seeded by `tools/catalog-fixture/generate.py`, runs every startup
+/// repair once so the one-time markers are recorded, then measures the second, steady-state run.
+/// Query counts come from `Database::query_count`; write statements are counted from the
+/// `sqlx::query` events the subscriber prints between the step markers.
+///
+/// `LUX_STARTUP_REPAIR_FIXTURE_DIR=/tmp/lux-startup-measure/config \
+///  cargo test --release --locked --lib \
+///  storage::database_cleanup::startup_repair_measurements -- --ignored --nocapture`
+#[cfg(test)]
+mod startup_repair_measurements {
+    use super::*;
+    use crate::{
+        application::{image_repairs, scanner::LibraryScanner},
+        config::Config,
+    };
+    use std::time::Instant;
+
+    const FIXTURE_DIR_ENV: &str = "LUX_STARTUP_REPAIR_FIXTURE_DIR";
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual measurement: seeds a catalog fixture and prints the steady-state cost"]
+    async fn startup_repairs_on_a_steady_catalog() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(fixture_dir) = std::env::var_os(FIXTURE_DIR_ENV) else {
+            eprintln!("{FIXTURE_DIR_ENV} is not set; nothing measured");
+            return Ok(());
+        };
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::FmtSubscriber::builder()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("warn,sqlx::query=debug"))
+                .with_writer(std::io::stderr)
+                .finish(),
+        );
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: fixture_dir.into(),
+        })
+        .await?;
+        let media_items: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM media_items")
+            .fetch_one(&database.pool)
+            .await?;
+        let media_sources: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM media_sources")
+            .fetch_one(&database.pool)
+            .await?;
+        let filesystem_entries: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM filesystem_entries")
+            .fetch_one(&database.pool)
+            .await?;
+        eprintln!(
+            "fixture media_items={media_items} media_sources={media_sources} \
+             filesystem_entries={filesystem_entries}"
+        );
+        measure_startup_repairs(&database, "warmup").await;
+        eprintln!("steady state below: one-time markers are now recorded");
+        measure_startup_repairs(&database, "steady").await;
+        Ok(())
+    }
+
+    async fn measure_startup_repairs(database: &Database, pass: &str) {
+        macro_rules! step {
+            ($name:expr, $body:expr) => {{
+                eprintln!("== {pass} / {} start", $name);
+                database.reset_query_count();
+                let started = Instant::now();
+                let outcome: String = $body.await;
+                let elapsed = started.elapsed();
+                eprintln!(
+                    "== {pass} / {} elapsed_ms={:.3} queries={} result={}",
+                    $name,
+                    elapsed.as_secs_f64() * 1_000.0,
+                    database.query_count(),
+                    outcome,
+                );
+            }};
+        }
+
+        step!("migrate_legacy_scan_job_events_to_logs", async {
+            match database.migrate_legacy_scan_job_events_to_logs().await {
+                Ok(migrated) => format!("migrated={migrated}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("migrate_legacy_audit_events_to_logs", async {
+            match database.migrate_legacy_audit_events_to_logs().await {
+                Ok(migrated) => format!("migrated={migrated}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("repair_episode_image_path_conflicts", async {
+            match image_repairs::repair_episode_image_path_conflicts(database).await {
+                Ok(report) => format!("repaired={} skipped={}", report.repaired, report.skipped),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("normalize_media_source_defaults", async {
+            match database.normalize_media_source_defaults().await {
+                Ok(repaired) => format!("repaired={repaired}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("run_database_lifecycle_cleanup", async {
+            match database.run_database_lifecycle_cleanup().await {
+                Ok(report) => format!("{report:?}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("repair_legacy_identity_keys", async {
+            match LibraryScanner::new(database.clone())
+                .repair_legacy_identity_keys()
+                .await
+            {
+                Ok(repaired) => format!("repaired={repaired}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        // The fingerprint migration only spawns a worker at startup; its first statement runs after
+        // a one minute delay, so measure what that worker repeats once per library.
+        step!("scan_fingerprint_migration_start", async {
+            match database.list_scan_fingerprint_migration_library_ids().await {
+                Ok(library_ids) => {
+                    let mut outcome = format!("libraries={}", library_ids.len());
+                    for library_id in &library_ids {
+                        match database
+                            .ensure_scan_fingerprint_migration_state(library_id)
+                            .await
+                        {
+                            Ok(cursor) => outcome.push_str(&format!(
+                                " {library_id}:completed={}",
+                                cursor.completed_at.is_some()
+                            )),
+                            Err(error) => outcome.push_str(&format!(" error={error}")),
+                        }
+                    }
+                    outcome
+                }
+                Err(error) => format!("error={error}"),
+            }
+        });
+    }
+}
