@@ -22,6 +22,12 @@ pub(crate) fn detected_hardware_encoders() -> &'static [&'static str] {
     DETECTED.get_or_init(detect_hardware_encoders).as_slice()
 }
 
+/// Resolves the device-node probe at startup so the `/dev/dri` reads never first run inside an
+/// admin settings request. Safe and cheap to call repeatedly.
+pub(crate) fn warm_up() {
+    let _ = detected_hardware_encoders();
+}
+
 fn detect_hardware_encoders() -> Vec<&'static str> {
     let mut found = Vec::new();
     if cfg!(target_os = "macos") {
@@ -327,10 +333,23 @@ pub(crate) async fn write_transcoding_settings(
 #[cfg(test)]
 mod tests {
     use super::{
-        DEFAULT_HARDWARE_DEVICE, HARDWARE_ENCODER_NONE, TranscodingSettings,
-        TranscodingSettingsError, read_transcoding_settings, write_transcoding_settings,
+        DEFAULT_HARDWARE_DEVICE, HARDWARE_ENCODER_NONE, HARDWARE_ENCODERS, TranscodingSettings,
+        TranscodingSettingsError, detected_hardware_encoders, read_transcoding_settings, warm_up,
+        write_transcoding_settings,
     };
     use crate::{config::Config, storage::Database};
+
+    #[test]
+    fn startup_warm_up_resolves_only_known_encoders() {
+        warm_up();
+        warm_up();
+        assert!(
+            detected_hardware_encoders()
+                .iter()
+                .all(|encoder| HARDWARE_ENCODERS.contains(encoder)),
+            "the warmed probe must stay inside the runtime allowlist"
+        );
+    }
 
     #[test]
     fn defaults_match_the_previous_built_in_limits() {
