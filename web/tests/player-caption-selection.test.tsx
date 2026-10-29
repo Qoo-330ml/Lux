@@ -71,6 +71,7 @@ function mountHarness(initial: HarnessProps) {
       nativeCaptionTracksSupported: props.nativeCaptionTracksSupported ?? false,
       requestedSubtitleStreamIndex: props.requestedSubtitleStreamIndex ?? null,
       resetControlsTimeout: state.resetControlsTimeout,
+      engineRef: { current: null },
     });
     return null;
   }

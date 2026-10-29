@@ -8,7 +8,6 @@ import {
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError } from "../../lib/api/client";
-import type { WebPlaybackTrackSelection } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
 import { usePlayerTimelineScrubber } from "./usePlayerTimelineScrubber";
@@ -18,6 +17,8 @@ import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
 import { usePlayerVideoElement } from "./usePlayerVideoElement";
 import { usePlayerNavigation } from "./usePlayerNavigation";
+import { usePlaybackSessionGate } from "./usePlaybackSessionGate";
+import { usePlayerControlsVisibility } from "./usePlayerControlsVisibility";
 import type { PlaybackEngine } from "./playback-engine";
 import {
   clearRememberedCandidate,
@@ -60,7 +61,6 @@ import {
   isMatroskaSource,
 } from "./player-page-helpers";
 
-const AUTO_HIDE_DELAY_MS = 3_000;
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
 
 export function PlayerPage() {
@@ -87,28 +87,17 @@ export function PlayerPage() {
   const [showSettings, setShowSettings] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
-  const [controlsVisible, setControlsVisible] = useState(true);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
-  const [controlActivity, setControlActivity] = useState(0);
   const [danmuVisible, setDanmuVisible] = useState(true);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
   const currentTimeRef = useRef(0);
   const durationRef = useRef(0);
   const bufferedEndRef = useRef(0);
+  const engineRef = useRef<PlaybackEngine | null>(null);
 
   const requestedSourceId = searchParams.get("sourceId");
   const requestedAudioStreamIndex = searchParams.get("audioStreamIndex");
   const requestedSubtitleStreamIndex = searchParams.get("subtitleStreamIndex");
-  const trackSelection = useMemo<WebPlaybackTrackSelection | undefined>(() => {
-    const audioStreamIndex = requestedAudioStreamIndex?.trim() ? Number(requestedAudioStreamIndex) : undefined;
-    const subtitleStreamIndex = requestedSubtitleStreamIndex?.trim() ? Number(requestedSubtitleStreamIndex) : undefined;
-    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex)
-      ? {
-        ...(Number.isInteger(audioStreamIndex) ? { audioStreamIndex } : {}),
-        ...(Number.isInteger(subtitleStreamIndex) ? { subtitleStreamIndex } : {}),
-      }
-      : undefined;
-  }, [requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
   const {
     playbackBootstrap,
     item,
@@ -132,16 +121,15 @@ export function PlayerPage() {
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
     playbackAttempt,
-    trackSelection,
   });
 
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
-  // The controls auto-hide timer is owned by the effect below; this callback only
-  // requests "show again", so it can be created before the caption selection hook.
-  const resetControlsTimeout = useCallback(() => {
-    setControlsVisible(true);
-    setControlActivity((activity) => activity + 1);
-  }, []);
+  const {
+    controlsVisible,
+    setControlsVisible,
+    setControlActivity,
+    resetControlsTimeout,
+  } = usePlayerControlsVisibility({ playing, showSettings, isPointerInteracting });
   const {
     captionOptions,
     selectedCaptionOption,
@@ -165,12 +153,8 @@ export function PlayerPage() {
     nativeCaptionTracksSupported,
     requestedSubtitleStreamIndex,
     resetControlsTimeout,
+    engineRef,
   });
-  useEffect(() => {
-    const controller = engineRef.current?.captionController;
-    if (!controller) return;
-    controller.select(nativeCaptionTrackId);
-  }, [nativeCaptionTrackId]);
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const remoteDirectUrl = remoteHttpSource ? source?.externalUrl ?? null : null;
   // The remembered kind is read once per plan so recording a success below cannot reorder a ladder
@@ -210,12 +194,10 @@ export function PlayerPage() {
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
   const lastVideoRef = useRef<HTMLVideoElement | null>(null);
-  const engineRef = useRef<PlaybackEngine | null>(null);
   const runtimeRef = useRef<LuxPlayerRuntime | null>(null);
   const hasRestoredPositionRef = useRef(false);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const fallbackRequestedRef = useRef(false);
-  const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
   const {
@@ -371,29 +353,16 @@ export function PlayerPage() {
     setBufferedEnd(0);
   }, [itemId, requestedAudioStreamIndex, requestedSourceId]);
 
-  useEffect(() => {
-    if (sessionGateKey === playbackKey) return;
-    const previousSessionId = playbackSessionIdRef.current;
-    playbackSessionIdRef.current = null;
-    resetSequence();
-    let active = true;
-    sessionTransitionRef.current = sessionTransitionRef.current
-      .catch(() => undefined)
-      .then(() => previousSessionId ? stopActiveSession(previousSessionId) : undefined)
-      .finally(() => {
-        if (active) setSessionGateKey(playbackKey);
-      });
-    return () => {
-      active = false;
-    };
-  }, [playbackKey, resetSequence, sessionGateKey, stopActiveSession]);
-
-  useEffect(() => {
-    if (sessionGateKey !== playbackKey) return;
-    if (playbackSession?.sessionId) sessionStartedRef.current = true;
-    playbackSessionIdRef.current = playbackSession?.sessionId ?? null;
-    resetSequence();
-  }, [playbackKey, playbackSession?.sessionId, resetSequence, sessionGateKey]);
+  usePlaybackSessionGate({
+    playbackKey,
+    sessionGateKey,
+    setSessionGateKey,
+    playbackSession,
+    playbackSessionIdRef,
+    sessionStartedRef,
+    stopActiveSession,
+    resetSequence,
+  });
 
   usePlaybackRuntime({
     playbackKey,
@@ -473,12 +442,6 @@ export function PlayerPage() {
     onStatusChange: setCaptionStatus,
     clearCues: clearRuntimeCaptionCues,
   });
-
-  useEffect(() => {
-    if (!playing || !controlsVisible || showSettings || isPointerInteracting) return;
-    const timeout = window.setTimeout(() => setControlsVisible(false), AUTO_HIDE_DELAY_MS);
-    return () => window.clearTimeout(timeout);
-  }, [controlActivity, controlsVisible, isPointerInteracting, playing, showSettings]);
 
   const { screenshotStatus, takeScreenshot } = usePlayerScreenshot({ videoRef, media });
 

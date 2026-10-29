@@ -13,6 +13,7 @@ import {
   type PlayerRuntimeCaptionTrack,
 } from "./components/player-captions";
 import type { Dispatch, SetStateAction } from "react";
+import type { PlaybackEngine } from "./playback-engine";
 
 export type RuntimeCaptionCueInput = {
   trackId: string;
@@ -51,6 +52,7 @@ type CaptionSelectionOptions = {
   nativeCaptionTracksSupported: boolean;
   requestedSubtitleStreamIndex: string | null;
   resetControlsTimeout: () => void;
+  engineRef: { current: PlaybackEngine | null };
 };
 
 /**
@@ -64,6 +66,7 @@ export function useCaptionSelection({
   nativeCaptionTracksSupported,
   requestedSubtitleStreamIndex,
   resetControlsTimeout,
+  engineRef,
 }: CaptionSelectionOptions): CaptionSelection {
   const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
   const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
@@ -117,6 +120,12 @@ export function useCaptionSelection({
       previous === defaultCaptionId ? previous : defaultCaptionId
     ));
   }, [captionSourceId, defaultCaptionId, source?.id]);
+
+  useEffect(() => {
+    const controller = engineRef.current?.captionController;
+    if (!controller) return;
+    controller.select(nativeCaptionTrackId);
+  }, [engineRef, nativeCaptionTrackId]);
 
   const selectCaption = useCallback((id: string | null) => {
     captionSelectionTouchedRef.current = true;

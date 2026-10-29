@@ -1,4 +1,4 @@
-import { useRef, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
@@ -19,7 +19,6 @@ type PlayerPlaybackSessionOptions = {
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
   playbackAttempt: number;
-  trackSelection: WebPlaybackTrackSelection | undefined;
 };
 
 export type PlayerPlaybackSession = {
@@ -55,8 +54,17 @@ export function usePlayerPlaybackSession({
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
   playbackAttempt,
-  trackSelection,
 }: PlayerPlaybackSessionOptions): PlayerPlaybackSession {
+  const trackSelection = useMemo<WebPlaybackTrackSelection | undefined>(() => {
+    const audioStreamIndex = requestedAudioStreamIndex?.trim() ? Number(requestedAudioStreamIndex) : undefined;
+    const subtitleStreamIndex = requestedSubtitleStreamIndex?.trim() ? Number(requestedSubtitleStreamIndex) : undefined;
+    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex)
+      ? {
+        ...(Number.isInteger(audioStreamIndex) ? { audioStreamIndex } : {}),
+        ...(Number.isInteger(subtitleStreamIndex) ? { subtitleStreamIndex } : {}),
+      }
+      : undefined;
+  }, [requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
   const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
 
@@ -149,6 +157,7 @@ export function usePlayerPlaybackSession({
 }
 
 type BootstrapQueryOptions = PlayerPlaybackSessionOptions & {
+  trackSelection: WebPlaybackTrackSelection | undefined;
   bootstrapKey: string;
   sessionGateKey: string;
 };
