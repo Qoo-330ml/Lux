@@ -39,7 +39,7 @@
 
 ## 3. 汇总
 
-### 3.1 计数
+### 3.1 计数（审计基线 = 修复前）
 
 | 项 | 数量 |
 | --- | --- |
@@ -249,7 +249,28 @@
 | 7 | application/people/helpers.rs:1296 | `File::try_lock()` → `WouldBlock` | 非阻塞 `flock(LOCK_NB)`，立即返回 | 保留（见 §6.1） |
 | 8 | application/people/helpers.rs:1304 | `File::try_lock()` → `Error` | 同上 | 保留（见 §6.1） |
 
-修复后 (d) 剩余 **3** 处（均为 §6.1 中记录为可接受的非阻塞调用）。
+### 5.1 修复后状态
+
+| 项 | 修复前 | 修复后 |
+| --- | --- | --- |
+| 非测试代码中的阻塞文件系统调用点 | 124 | **119**（`scanner/library.rs:294`、`303` 改用 `tokio::fs::canonicalize`，不再计入） |
+| (a) | 13 | 13 |
+| (b) | 86 | 86 |
+| (c)（含 c\*） | 17 | **20**（`transcoding.rs:34`、`45`、`scanner/symlink.rs:145` 改为启动期预热） |
+| (d) 违规 | 8 | **3**（`people/helpers.rs:1269`、`1296`、`1304`，见 §6.1） |
+| 非测试代码中的 `std::process::Command` | 0 | 0 |
+| 非测试代码中的 `std::thread::sleep` | 0 | 0 |
+
+修复后的相关测试：
+
+- `cargo test --locked --lib scanner::` — 含新增
+  `batch_walker_canonicalizes_its_root_before_symlink_checks`（未修复时会失败，
+  已用临时回退验证过 Red）。
+- `cargo test --locked --lib transcoding::` — 含新增
+  `startup_warm_up_resolves_only_known_encoders`。
+- `cargo test --locked --lib symlink::` — 含新增
+  `startup_warm_up_keeps_the_single_process_wide_policy`。
+- `cargo test --locked --lib api::legacy::` — 覆盖 `AppState` 构造。
 
 ## 6. 保留的 (d) 类及理由
 
