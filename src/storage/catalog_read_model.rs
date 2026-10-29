@@ -46,10 +46,7 @@ impl Database {
         .bind(library_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Reads at most `limit` events after `after_seq`, oldest first.
@@ -69,10 +66,7 @@ impl Database {
         .bind(limit.clamp(1, 5_000))
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn catalog_consumer(
@@ -86,10 +80,7 @@ impl Database {
         .bind(name)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Advances a consumer watermark. The watermark never moves backwards, so a retried batch is
@@ -113,10 +104,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn record_catalog_consumer_error(
@@ -136,10 +124,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Drops the already-applied events of one `kind`, oldest first and bounded so a long backlog
@@ -175,10 +160,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() as i64)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Detects that the queue was trimmed past a consumer's watermark.
@@ -200,10 +182,7 @@ impl Database {
             .bind(kind)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .flatten();
         Ok(oldest.and_then(|oldest| {
             (oldest > applied_seq.saturating_add(1)).then_some((applied_seq, oldest))
@@ -223,10 +202,7 @@ impl Database {
         self.query_scalar("SELECT COUNT(*) FROM catalog_items")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Highest item id already materialized, used to resume an interrupted rebuild.
@@ -235,10 +211,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await
             .map(|row| row.flatten())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Rebuilds one keyset page of `catalog_items` from the authoritative tables.
@@ -262,10 +235,7 @@ impl Database {
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if rows.is_empty() {
             return Ok((0, None));
         }
@@ -279,10 +249,7 @@ impl Database {
             .bind(last.as_deref())
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((upsert.rows_affected(), last))
     }
 
@@ -309,10 +276,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Removes derived rows whose authoritative item is gone, so a deletion disappears from the
@@ -340,10 +304,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Queues every authoritative item once; used after a detected queue gap so the derived table
@@ -356,10 +317,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() as i64)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Applies at most `batch` queued `kind = 'catalog'` events, oldest first, and returns how many
@@ -442,18 +400,12 @@ impl Database {
         self.query("DELETE FROM catalog_item_stats")
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query("DELETE FROM catalog_items")
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Stable hash of the read model's user-visible columns, used by rebuild validation.
@@ -469,10 +421,7 @@ impl Database {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut hasher = Sha256::new();
         for (item_id, sort_title, added, available) in &rows {
             hasher.update(item_id.as_bytes());
@@ -574,10 +523,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(|(id,)| id)
             .collect::<Vec<_>>();
@@ -595,10 +541,7 @@ impl Database {
             count_statement
                 .fetch_one(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
         } else {
             0
         };
@@ -707,10 +650,7 @@ impl Database {
                         .map(|(item_id,)| item_id)
                         .collect::<Vec<_>>()
                 })
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })
+                .map_err(self.sqlx_err())
         };
         if !query.include_total {
             return Ok((list_future.await?, 0));
@@ -767,19 +707,13 @@ impl Database {
                 count_scope(&available_count_sql)
                     .fetch_one(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })
+                    .map_err(self.sqlx_err())
             },
             async {
                 count_scope(&container_count_sql)
                     .fetch_one(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })
+                    .map_err(self.sqlx_err())
             },
         )?;
         Ok((ids, available_total.saturating_add(container_total)))
@@ -852,10 +786,7 @@ impl Database {
         let rows = statement
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
         for (id, library_id) in rows {
             match grouped.last_mut() {
@@ -991,10 +922,7 @@ impl Database {
         let cores = statement
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let source_query = format!(
             "SELECT ms.item_id,
                     (SELECT fe.relative_path FROM filesystem_entries fe
@@ -1019,14 +947,10 @@ impl Database {
         for id in ids {
             statement = statement.bind(id);
         }
-        let sources =
-            statement
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let sources = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
         let mut by_item: std::collections::HashMap<String, Vec<ReadModelSourceRow>> =
             std::collections::HashMap::new();
         for source in sources {

@@ -202,10 +202,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_item_library_id(
@@ -221,10 +218,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn is_collection_container(
@@ -242,10 +236,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_item_media_strategy_settings(
@@ -265,10 +256,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(|row| (row.get("library_strategy"), row.get("global_strategy"))))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_item_scan_source_path(
@@ -307,10 +295,7 @@ impl Database {
                 relative_path: row.get("relative_path"),
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_item_media_strategy_settings_by_ids(
@@ -340,14 +325,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 strategies.insert(
                     row.get("item_id"),
@@ -375,10 +356,7 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .map(|row| {
                 (
                     row.get::<String, _>("library_id"),
@@ -432,10 +410,7 @@ impl Database {
         let total = total_statement
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let rows_query = format!(
             "SELECT mi.id, mi.library_id, mi.parent_id, mi.title, mi.identity_key
              FROM media_items mi
@@ -455,10 +430,7 @@ impl Database {
             .bind(offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let folders = rows
             .into_iter()
             .filter_map(|row| {
@@ -509,10 +481,7 @@ impl Database {
                 production_year: row.get("production_year"),
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_item_by_source_locator(
@@ -550,10 +519,7 @@ impl Database {
                 production_year: row.get("production_year"),
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_items_by_source_fingerprint(
@@ -598,10 +564,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_item_scraper_configurations_by_ids(
@@ -629,14 +592,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let item_id = row.get::<String, _>("item_id");
                 let legacy_scraper_id = row
@@ -680,10 +639,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn apply_manifest_existing_file_in_transaction(
@@ -736,10 +692,7 @@ impl Database {
             .bind(base_fingerprint)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if result.rows_affected() != 1 {
             return Ok(false);
         }
@@ -762,10 +715,7 @@ impl Database {
         .bind(filesystem_entry_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "DELETE FROM media_chapters
              WHERE media_source_id IN (
@@ -775,10 +725,7 @@ impl Database {
         .bind(filesystem_entry_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if expected_missing {
             self.restore_media_items_for_filesystem_entries(
                 transaction,
@@ -859,10 +806,7 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             applied_ids.extend(rows.into_iter().map(|row| row.get::<String, _>("id")));
         }
 
@@ -909,10 +853,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let applied_ids = applied_ids.into_iter().collect::<Vec<_>>();
@@ -937,10 +878,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let restored_ids = updates
@@ -990,10 +928,7 @@ impl Database {
         sqlx::query("SAVEPOINT lux_manifest_add_fs_claim_fast_path")
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut all_chunks_inserted = true;
         for chunk in entries.chunks(batch_size) {
             let values =
@@ -1025,10 +960,7 @@ impl Database {
             let result = statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if usize::try_from(result.rows_affected()).unwrap_or(usize::MAX) != chunk.len() {
                 all_chunks_inserted = false;
                 break;
@@ -1039,10 +971,7 @@ impl Database {
             sqlx::query("RELEASE SAVEPOINT lux_manifest_add_fs_claim_fast_path")
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let mut inserted_paths = HashSet::with_capacity(entries.len());
             inserted_paths.extend(entries.iter().map(|entry| entry.relative_path.to_owned()));
             return Ok(inserted_paths);
@@ -1051,17 +980,11 @@ impl Database {
         sqlx::query("ROLLBACK TO SAVEPOINT lux_manifest_add_fs_claim_fast_path")
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         sqlx::query("RELEASE SAVEPOINT lux_manifest_add_fs_claim_fast_path")
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         self.claim_manifest_add_filesystem_entries_with_returning(
             transaction,
@@ -1113,10 +1036,7 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             inserted_paths.extend(rows.into_iter().map(|row| row.get("relative_path")));
         }
         Ok(inserted_paths)
@@ -1164,10 +1084,7 @@ impl Database {
             .bind(positive.base_fingerprint.as_deref())
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1283,10 +1200,7 @@ impl Database {
             let item_ids = item_write
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .into_iter()
                 .map(|row| {
                     Ok((
@@ -1295,10 +1209,7 @@ impl Database {
                     ))
                 })
                 .collect::<Result<HashMap<_, _>, sqlx::Error>>()
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
 
             let source_values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
                 .collect::<Vec<_>>()
@@ -1342,10 +1253,7 @@ impl Database {
             source_insert
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -1383,10 +1291,7 @@ impl Database {
                 .bind(&identity_key)
                 .fetch_optional(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let folder_id = if let Some(folder_id) = folder_id {
                 self.query(
                     "UPDATE media_items
@@ -1404,10 +1309,7 @@ impl Database {
                 .bind(&folder_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
                 folder_id
             } else {
                 let folder_id = Uuid::now_v7().to_string();
@@ -1426,10 +1328,7 @@ impl Database {
                 .bind(&identity_key)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
                 folder_id
             };
             parent_id = folder_id.clone();
@@ -1478,47 +1377,27 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             for row in rows {
-                let id = row
-                    .try_get::<String, _>("id")
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
                 let sort_title = row.try_get::<String, _>("sort_title").map_err(|source| {
                     StorageError::Sqlx {
                         path: self.path.clone(),
                         source,
                     }
                 })?;
-                let production_year =
-                    row.try_get::<Option<i64>, _>("production_year")
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
-                let parent_id =
-                    row.try_get::<Option<String>, _>("parent_id")
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                let production_year = row
+                    .try_get::<Option<i64>, _>("production_year")
+                    .map_err(self.sqlx_err())?;
+                let parent_id = row
+                    .try_get::<Option<String>, _>("parent_id")
+                    .map_err(self.sqlx_err())?;
                 let provider_ids_json = row
                     .try_get::<Option<String>, _>("provider_ids_json")
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 let removed_at = row
                     .try_get::<Option<i64>, _>("removed_at")
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 movie_items
                     .entry((sort_title, production_year))
                     .or_insert(PrefetchedMovieItem {
@@ -1582,17 +1461,9 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             for row in rows {
-                let id = row
-                    .try_get::<String, _>("id")
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
                 let identity_key = row.try_get::<String, _>("identity_key").map_err(|source| {
                     StorageError::Sqlx {
                         path: self.path.clone(),
@@ -1709,21 +1580,12 @@ impl Database {
                         .bind(&folder.title)
                         .bind(&folder.identity_key);
                 }
-                let inserted_rows =
-                    statement
-                        .fetch_all(&mut **transaction)
-                        .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                let inserted_rows = statement
+                    .fetch_all(&mut **transaction)
+                    .await
+                    .map_err(self.sqlx_err())?;
                 for row in &inserted_rows {
-                    let id =
-                        row.try_get::<String, _>("id")
-                            .map_err(|source| StorageError::Sqlx {
-                                path: self.path.clone(),
-                                source,
-                            })?;
+                    let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
                     let identity_key =
                         row.try_get::<String, _>("identity_key").map_err(|source| {
                             StorageError::Sqlx {
@@ -1751,14 +1613,10 @@ impl Database {
                         for folder in unresolved_chunk {
                             statement = statement.bind(&folder.identity_key);
                         }
-                        let rows =
-                            statement
-                                .fetch_all(&mut **transaction)
-                                .await
-                                .map_err(|source| StorageError::Sqlx {
-                                    path: self.path.clone(),
-                                    source,
-                                })?;
+                        let rows = statement
+                            .fetch_all(&mut **transaction)
+                            .await
+                            .map_err(self.sqlx_err())?;
                         for row in rows {
                             let id = row.try_get::<String, _>("id").map_err(|source| {
                                 StorageError::Sqlx {
@@ -1891,10 +1749,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -1931,10 +1786,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -1973,10 +1825,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -2017,10 +1866,7 @@ impl Database {
             .await
             .map(|value| value != 0)
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if parent_is_current {
             return Ok(());
         }
@@ -2041,17 +1887,8 @@ impl Database {
         .bind(item_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn insert_movie_files_batch(
@@ -2074,13 +1911,7 @@ impl Database {
                 files,
             )
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(inserted)
     }
 
@@ -2268,10 +2099,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             }
         }
 
@@ -2345,10 +2173,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         record_manifest_storage_stage(
             "movie_item_insert",
@@ -2430,10 +2255,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         record_manifest_storage_stage(
             "movie_source_insert",
@@ -2485,10 +2307,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         record_manifest_storage_stage(
             "derived_index",
@@ -2520,13 +2339,7 @@ impl Database {
                 files,
             )
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(inserted)
     }
 
@@ -2652,10 +2465,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             }
         }
 
@@ -2863,10 +2673,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let strm_item_ids = files
@@ -2896,10 +2703,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         Ok(missing_series.len() + missing_seasons.len() + missing_episodes.len())
@@ -2930,10 +2734,7 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let identity_key = row.try_get::<String, _>("identity_key").map_err(|source| {
                     StorageError::Sqlx {
@@ -2941,18 +2742,10 @@ impl Database {
                         source,
                     }
                 })?;
-                let id = row
-                    .try_get::<String, _>("id")
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
                 if row
                     .try_get::<Option<i64>, _>("removed_at")
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .is_some()
                 {
                     removed_ids.insert(identity_key.clone());
@@ -3019,10 +2812,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -3087,10 +2877,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -3135,10 +2922,7 @@ impl Database {
             }
         };
         row.map(|row| row.map(stored_media_item))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn movie_metadata_identity_conflict(
@@ -3174,10 +2958,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn movie_metadata_pending_identity_conflict(
@@ -3220,10 +3001,7 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_media_item_by_identity(
@@ -3241,10 +3019,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_media_item))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn adopt_media_item_identity(
@@ -3252,14 +3027,7 @@ impl Database {
         item_id: &str,
         identity_key: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let occupied = self
             .query_scalar::<i64>(
                 "SELECT COUNT(*) FROM media_items
@@ -3269,18 +3037,9 @@ impl Database {
             .bind(item_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if occupied != 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         self.query(
@@ -3292,17 +3051,8 @@ impl Database {
         .bind(item_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -3327,18 +3077,9 @@ impl Database {
             .bind(episode_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((episode_id, season_id, series_id)) = hierarchy else {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         };
 
@@ -3357,18 +3098,9 @@ impl Database {
             .bind(&episode_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if conflicts != 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
 
@@ -3386,18 +3118,9 @@ impl Database {
             .bind(item_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -3421,10 +3144,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(|row| row.get::<String, _>("role")))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_media_item_metadata(
@@ -3479,14 +3199,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let item_id = row.get::<String, _>("item_id");
                 metadata.insert(item_id, stored_media_metadata(row));
@@ -3539,14 +3255,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let item_id = row.get::<String, _>("item_id");
                 let library_id = row.get::<String, _>("library_id");
@@ -3568,10 +3280,7 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(item_type) = item_type else {
             return Ok(Vec::new());
         };
@@ -3594,13 +3303,7 @@ impl Database {
         if matches!(item_type.as_str(), "SERIES" | "SEASON") {
             query = query.bind(item_id);
         }
-        query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        query.fetch_all(&self.pool).await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_media_item_image_identity(
@@ -3644,10 +3347,7 @@ impl Database {
                 }
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_movie_identity(
@@ -3676,10 +3376,7 @@ impl Database {
                 })
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn upsert_collection(
@@ -3698,14 +3395,7 @@ impl Database {
         } = collection;
         let provider_name = provider.to_ascii_uppercase();
         let provider_key = provider.to_ascii_lowercase();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let existing = self
             .query(
                 "SELECT id, item_id
@@ -3717,10 +3407,7 @@ impl Database {
             .bind(provider_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let (collection_id, item_id) = if let Some(row) = existing {
             (row.get::<String, _>("id"), row.get::<String, _>("item_id"))
         } else {
@@ -3747,10 +3434,7 @@ impl Database {
             .bind(identity_key)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO collections (
                     id, item_id, library_id, provider, provider_id,
@@ -3768,10 +3452,7 @@ impl Database {
             .bind(backdrop_path)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             (collection_id, item_id)
         };
         self.query(
@@ -3787,10 +3468,7 @@ impl Database {
         .bind(&collection_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE media_items
              SET title = ?, sort_title = ?, original_title = ?, overview = ?,
@@ -3804,18 +3482,12 @@ impl Database {
         .bind(&item_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query("DELETE FROM collection_items WHERE collection_id = ?")
             .bind(&collection_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut matched_members = Vec::with_capacity(member_provider_ids.len());
         for (chunk_index, chunk) in member_provider_ids
             .chunks(BATCH_INSERT_CHUNK_SIZE)
@@ -3853,10 +3525,7 @@ impl Database {
                 .bind(library_id)
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let mut seen_ordinals = HashSet::new();
             for row in rows {
                 let ordinal = row.get::<i64, _>("ordinal");
@@ -3892,19 +3561,10 @@ impl Database {
             let result = statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             member_count += result.rows_affected() as usize;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(StoredCollectionRefresh {
             collection_item_id: item_id,
             member_count,
@@ -3963,10 +3623,7 @@ impl Database {
         let total = count_statement
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let mut list_statement = self
             .query(sqlx::AssertSqlSafe(format!(
@@ -3992,10 +3649,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((
             rows.into_iter().map(|row| row.get("item_id")).collect(),
             total,
@@ -4011,14 +3665,7 @@ impl Database {
         if title.is_empty() {
             return Ok(None);
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let library_id = if let Some(item_id) = item_ids.first() {
             self.query_scalar::<Option<String>>(
                 "SELECT mi.library_id
@@ -4029,10 +3676,7 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         } else {
             None
         };
@@ -4044,10 +3688,7 @@ impl Database {
                 )
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .flatten(),
         };
         let Some(library_id) = library_id else {
@@ -4064,10 +3705,7 @@ impl Database {
             .bind(title)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let collection_item_id = if let Some(row) = existing {
             row.get::<String, _>("item_id")
         } else {
@@ -4088,10 +3726,7 @@ impl Database {
             .bind(&identity_key)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO collections (
                     id, item_id, library_id, provider, provider_id, title
@@ -4104,10 +3739,7 @@ impl Database {
             .bind(title)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             item_id
         };
         self.add_emby_collection_members_in_transaction(
@@ -4117,13 +3749,7 @@ impl Database {
             item_ids,
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(StoredEmbyCollection {
             collection_item_id,
             library_id,
@@ -4136,14 +3762,7 @@ impl Database {
         collection_item_id: &str,
         item_ids: &[String],
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let Some(row) = self
             .query(
                 "SELECT c.library_id, c.title
@@ -4153,10 +3772,7 @@ impl Database {
             .bind(collection_item_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         else {
             return Ok(None);
         };
@@ -4169,13 +3785,7 @@ impl Database {
             item_ids,
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(StoredEmbyCollection {
             collection_item_id: collection_item_id.to_owned(),
             library_id,
@@ -4188,14 +3798,7 @@ impl Database {
         collection_item_id: &str,
         item_ids: &[String],
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let Some(row) = self
             .query(
                 "SELECT c.id, c.library_id, c.title
@@ -4205,10 +3808,7 @@ impl Database {
             .bind(collection_item_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         else {
             return Ok(None);
         };
@@ -4233,18 +3833,9 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(StoredEmbyCollection {
             collection_item_id: collection_item_id.to_owned(),
             library_id,
@@ -4271,10 +3862,7 @@ impl Database {
             .bind(collection_item_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let collection_id = row.get::<String, _>("id");
         let mut sort_order = row.get::<i64, _>("max_sort_order");
         let mut seen = HashSet::new();
@@ -4311,10 +3899,7 @@ impl Database {
                 .bind(library_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }

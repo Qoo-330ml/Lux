@@ -121,10 +121,7 @@ impl Database {
         .bind(schema_version)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.list_person_index_rebuild_jobs(0, 500).await
     }
 
@@ -149,10 +146,7 @@ impl Database {
                 .map(stored_person_index_rebuild_job)
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn get_person_index_rebuild_job(
@@ -169,20 +163,14 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_person_index_rebuild_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_person_index_rebuild_jobs(&self) -> Result<i64, StorageError> {
         self.query_scalar("SELECT COUNT(*) FROM person_index_rebuild_jobs")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn request_person_index_rebuild_job(
@@ -195,10 +183,7 @@ impl Database {
             .bind(library_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if !enabled {
             return Ok(false);
@@ -221,10 +206,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| true)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_person_index_rebuild_job(
@@ -243,10 +225,7 @@ impl Database {
             .bind(library_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -267,10 +246,7 @@ impl Database {
             .bind(library_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -293,10 +269,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|value: Option<i64>| value != Some(0))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_person_index_rebuild_progress(
@@ -321,10 +294,7 @@ impl Database {
             .bind(run_token)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((result.rows_affected() == 1).then_some(()))
     }
 
@@ -354,10 +324,7 @@ impl Database {
             .bind(run_token)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -426,13 +393,7 @@ impl Database {
                 )
                 .await?;
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -482,10 +443,7 @@ impl Database {
             .bind(item_id)
             .fetch_all(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(|row| PersonCreditKey {
                 person_id: row.get("person_id"),
@@ -523,10 +481,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let change_predicate = person_credit_change_predicate();
         const PERSON_CREDIT_INSERT_CHUNK_SIZE: usize = 40;
@@ -597,10 +552,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         if duplicates_skipped > 0 {
             tracing::debug!(
@@ -624,10 +576,7 @@ impl Database {
         .bind(relation_checksum)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -641,25 +590,13 @@ impl Database {
             .bind(item_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query("DELETE FROM person_index_item_state WHERE item_id = ?")
             .bind(item_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 
@@ -686,19 +623,10 @@ impl Database {
             .bind(provider_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         {
             let stored = stored_canonical_person(person);
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(stored);
         }
 
@@ -707,20 +635,14 @@ impl Database {
                 .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let candidate = format!("lux-{sequence:06}");
             let exists: Option<i64> = self
                 .query_scalar("SELECT 1 FROM people WHERE id = ?")
                 .bind(&candidate)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if exists.is_none() {
                 break candidate;
             }
@@ -738,10 +660,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO person_identities (
                 person_id, provider, provider_id, match_method, confidence,
@@ -759,10 +678,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let person = self
             .query(
@@ -775,28 +691,16 @@ impl Database {
             .bind(provider_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let stored = stored_canonical_person(person);
         if stored.id != person_id {
             self.query("DELETE FROM people WHERE id = ?")
                 .bind(&person_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(stored)
     }
 
@@ -816,10 +720,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_canonical_person))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_canonical_people_by_identities(
@@ -847,14 +748,10 @@ impl Database {
             for (provider, provider_id) in chunk {
                 statement = statement.bind(provider).bind(provider_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             matches.extend(rows.into_iter().map(|row| {
                 (
                     row.get::<String, _>("provider"),
@@ -874,10 +771,7 @@ impl Database {
             .bind(person_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_canonical_people_by_normalized_name(
@@ -896,10 +790,7 @@ impl Database {
             .bind(normalized_name)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut matches = Vec::<StoredCanonicalPersonMatch>::new();
         for row in rows {
             let id: String = row.get("id");
@@ -965,10 +856,7 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query_scalar::<String>(
             "SELECT id FROM person_match_candidates
              WHERE item_id = ? AND provider = ? AND provider_id = ?",
@@ -978,10 +866,7 @@ impl Database {
         .bind(provider_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn restore_person_match_candidate(
@@ -1027,10 +912,7 @@ impl Database {
         .bind(restore.updated_at)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query_scalar::<String>(
             "SELECT id FROM person_match_candidates
              WHERE item_id = ? AND provider = ? AND provider_id = ?",
@@ -1040,20 +922,14 @@ impl Database {
         .bind(restore.provider_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_pending_person_match_candidates(&self) -> Result<i64, StorageError> {
         self.query_scalar("SELECT COUNT(*) FROM person_match_candidates WHERE status = 'PENDING'")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_pending_person_match_candidates(
@@ -1080,10 +956,7 @@ impl Database {
                 .map(stored_person_match_candidate)
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_person_match_candidate(
@@ -1101,10 +974,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_person_match_candidate))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn reject_person_match_candidate(
@@ -1123,10 +993,7 @@ impl Database {
             .bind(candidate_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if result.rows_affected() == 0 {
             return Err(StorageError::Conflict(format!(
                 "person match candidate '{candidate_id}' is missing or not pending"
@@ -1142,14 +1009,7 @@ impl Database {
         evidence_json: &str,
     ) -> Result<StoredPersonIdentityMove, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let candidate = self
             .query(
                 "SELECT id, item_id, provider, provider_id,
@@ -1161,10 +1021,7 @@ impl Database {
             .bind(candidate_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .map(stored_person_match_candidate)
             .ok_or_else(|| {
                 StorageError::Conflict(format!("person match candidate '{candidate_id}' not found"))
@@ -1191,10 +1048,7 @@ impl Database {
             .bind(target_person_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if !target_exists {
             return Err(StorageError::Conflict(format!(
@@ -1210,10 +1064,7 @@ impl Database {
             .bind(&candidate.provider_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if previous_person_id.as_deref() != Some(target_person_id) {
             self.query(
                 "DELETE FROM person_identities
@@ -1223,10 +1074,7 @@ impl Database {
             .bind(&candidate.provider_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO person_identities (
                     person_id, provider, provider_id, match_method, confidence,
@@ -1242,10 +1090,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE person_credits SET lux_person_id = ?
                  WHERE provider = ? AND person_id = ?",
@@ -1255,10 +1100,7 @@ impl Database {
             .bind(&candidate.provider_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE person_match_candidates
@@ -1273,17 +1115,8 @@ impl Database {
         .bind(candidate_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(StoredPersonIdentityMove { previous_person_id })
     }
 
@@ -1293,14 +1126,7 @@ impl Database {
         evidence_json: &str,
     ) -> Result<StoredPersonIdentityMove, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let candidate = self
             .query(
                 "SELECT id, item_id, provider, provider_id,
@@ -1312,10 +1138,7 @@ impl Database {
             .bind(candidate_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .map(stored_person_match_candidate)
             .ok_or_else(|| {
                 StorageError::Conflict(format!("person match candidate '{candidate_id}' not found"))
@@ -1340,10 +1163,7 @@ impl Database {
             .bind(&candidate.provider_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if current_owner.as_deref() != Some(target_person_id.as_str()) {
             return Err(StorageError::Conflict(
                 "provider identity no longer belongs to the confirmed target".to_owned(),
@@ -1356,10 +1176,7 @@ impl Database {
                 .bind(previous_person_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .is_some();
             if !previous_exists {
                 return Err(StorageError::Conflict(
@@ -1375,10 +1192,7 @@ impl Database {
         .bind(&candidate.provider_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if let Some(previous_person_id) = previous_person_id.as_deref() {
             self.query(
                 "INSERT INTO person_identities (
@@ -1395,10 +1209,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE person_credits SET lux_person_id = ?
@@ -1409,10 +1220,7 @@ impl Database {
         .bind(&candidate.provider_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE person_match_candidates
              SET status = 'REJECTED', evidence_json = ?, updated_at = ?
@@ -1423,17 +1231,8 @@ impl Database {
         .bind(candidate_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(StoredPersonIdentityMove { previous_person_id })
     }
 
@@ -1446,14 +1245,7 @@ impl Database {
         evidence_json: &str,
     ) -> Result<StoredCanonicalPerson, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let owner = self
             .query_scalar::<String>(
                 "SELECT person_id FROM person_identities
@@ -1463,10 +1255,7 @@ impl Database {
             .bind(provider_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .ok_or_else(|| {
                 StorageError::Conflict(format!(
                     "provider identity '{provider}:{provider_id}' does not exist"
@@ -1482,20 +1271,14 @@ impl Database {
                 .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let candidate = format!("lux-{sequence:06}");
             let exists: Option<i64> = self
                 .query_scalar("SELECT 1 FROM people WHERE id = ?")
                 .bind(&candidate)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if exists.is_none() {
                 break candidate;
             }
@@ -1513,19 +1296,13 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query("DELETE FROM person_identities WHERE provider = ? AND provider_id = ?")
             .bind(provider)
             .bind(provider_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO person_identities (
                 person_id, provider, provider_id, match_method, confidence,
@@ -1541,10 +1318,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE person_credits SET lux_person_id = ?
              WHERE provider = ? AND person_id = ?",
@@ -1554,17 +1328,8 @@ impl Database {
         .bind(provider_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(StoredCanonicalPerson { id: new_person_id })
     }
 
@@ -1575,14 +1340,7 @@ impl Database {
         identities: &[(&str, &str)],
     ) -> Result<StoredCanonicalPerson, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let mut identity_owners = HashMap::<(String, String), String>::new();
         for chunk in identities.chunks(PERSON_MANIFEST_IDENTITY_BATCH_SIZE) {
             let conditions = std::iter::repeat_n("(provider = ? AND provider_id = ?)", chunk.len())
@@ -1599,10 +1357,7 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             identity_owners.extend(rows.into_iter().map(|row| {
                 (
                     (
@@ -1641,10 +1396,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if let Some(sequence) = person_id
             .strip_prefix("lux-")
             .and_then(|value| value.parse::<i64>().ok())
@@ -1656,10 +1408,7 @@ impl Database {
             .bind(sequence)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             if self.backend == DatabaseBackend::Postgres {
                 self.query(
                     "SELECT setval(
@@ -1670,10 +1419,7 @@ impl Database {
                 )
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
         for chunk in identities.chunks(PERSON_MANIFEST_IDENTITY_BATCH_SIZE) {
@@ -1701,28 +1447,16 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let row = self
             .query("SELECT id FROM people WHERE id = ?")
             .bind(person_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let stored = stored_canonical_person(row);
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(stored)
     }
 
@@ -1738,10 +1472,7 @@ impl Database {
             .bind(schema_version)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(status.as_deref() != Some("COMPLETED"))
     }
 
@@ -1762,13 +1493,7 @@ impl Database {
             for person_id in chunk {
                 query = query.bind(person_id);
             }
-            let rows = query
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            let rows = query.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
             states.extend(rows.into_iter().map(|row| {
                 (
                     row.get::<String, _>("person_id"),
@@ -1794,10 +1519,7 @@ impl Database {
             .bind(schema_version)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(status.as_deref() != Some("COMPLETED"))
     }
 
@@ -1817,10 +1539,7 @@ impl Database {
         .bind(current_unix_timestamp())
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -1842,10 +1561,7 @@ impl Database {
         .bind(current_unix_timestamp())
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -1865,10 +1581,7 @@ impl Database {
         .bind(current_unix_timestamp())
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -1891,10 +1604,7 @@ impl Database {
             .bind(manifest_schema_version)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if unchanged {
             return Ok(false);
@@ -1917,10 +1627,7 @@ impl Database {
         .bind(current_unix_timestamp())
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -1934,14 +1641,7 @@ impl Database {
         evidence_json: &str,
     ) -> Result<StoredCanonicalPerson, StorageError> {
         let now = current_unix_timestamp();
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let person = self
             .query(
                 "SELECT id
@@ -1950,10 +1650,7 @@ impl Database {
             .bind(person_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .ok_or_else(|| {
                 StorageError::Conflict(format!("canonical person '{person_id}' does not exist"))
             })?;
@@ -1975,10 +1672,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let owner_id: String = self
             .query_scalar(
@@ -1989,22 +1683,13 @@ impl Database {
             .bind(provider_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if owner_id != person_id {
             return Err(StorageError::Conflict(format!(
                 "provider identity '{provider}:{provider_id}' belongs to '{owner_id}'"
             )));
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(stored_canonical_person(person))
     }
 
@@ -2024,10 +1709,7 @@ impl Database {
             .bind(person_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .ok_or_else(|| {
                 StorageError::Conflict(format!("canonical person '{person_id}' does not exist"))
             })?;
@@ -2060,10 +1742,7 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let mut owners = HashMap::new();
@@ -2085,10 +1764,7 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             owners.extend(rows.into_iter().map(|row| {
                 (
                     (
@@ -2110,13 +1786,7 @@ impl Database {
             }
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(stored_canonical_person(person))
     }
 
@@ -2177,10 +1847,7 @@ impl Database {
             .bind(limit.clamp(1, 1000))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(rows.into_iter().map(|row| row.get("item_id")).collect())
     }
 
@@ -2245,10 +1912,7 @@ impl Database {
             .bind(person_type)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let list_query = format!(
             "WITH eligible_person_credits AS (
                  SELECT pc.item_id,
@@ -2345,10 +2009,7 @@ impl Database {
             .bind(options.offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
             .collect();
@@ -2405,10 +2066,7 @@ impl Database {
             .bind(&like_query)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let list_query = format!(
             "WITH eligible_person_credits AS (
                  SELECT pc.item_id,
@@ -2507,10 +2165,7 @@ impl Database {
             .bind(offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
             .collect();
@@ -2583,10 +2238,7 @@ impl Database {
             .bind(person_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
             .collect();
@@ -2653,10 +2305,7 @@ impl Database {
             .bind(person_name)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
             .collect();
@@ -2689,10 +2338,7 @@ impl Database {
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_person_index_items(
@@ -2707,9 +2353,6 @@ impl Database {
         .bind(library_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }

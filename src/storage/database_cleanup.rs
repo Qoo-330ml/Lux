@@ -60,10 +60,7 @@ impl Database {
             .query_scalar("SELECT COUNT(*) FROM scan_job_events")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if source_event_count == 0 {
             self.mark_config_log_migration_complete(SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER)
                 .await?;
@@ -81,10 +78,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if rows.is_empty() {
                 break;
             }
@@ -205,10 +199,7 @@ impl Database {
             let deleted = statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             self.log_store
                 .prune_archives()
@@ -235,10 +226,7 @@ impl Database {
             .query_scalar("SELECT COUNT(*) FROM audit_events")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if source_event_count == 0 {
             self.mark_config_log_migration_complete(AUDIT_EVENTS_LOG_MIGRATION_MARKER)
                 .await?;
@@ -260,10 +248,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if rows.is_empty() {
                 break;
             }
@@ -378,10 +363,7 @@ impl Database {
             let deleted = statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             self.log_store
                 .prune_archives()
@@ -403,10 +385,7 @@ impl Database {
             .bind(key)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(value.as_deref() == Some(DATABASE_CLEANUP_COMPLETED))
     }
 
@@ -417,20 +396,14 @@ impl Database {
             .bind(key)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if updated.rows_affected() == 0 {
             self.query("INSERT INTO lux_meta (key, value) VALUES (?, ?)")
                 .bind(key)
                 .bind(DATABASE_CLEANUP_COMPLETED)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -498,10 +471,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn claim_database_cleanup(&self) -> Result<bool, StorageError> {
@@ -516,10 +486,7 @@ impl Database {
             .bind(DATABASE_CLEANUP_PENDING)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -535,10 +502,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn mark_database_cleanup_completed(&self) -> Result<(), StorageError> {
@@ -553,10 +517,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn perform_database_cleanup(
@@ -593,10 +554,7 @@ impl Database {
         )
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let scan_manifest_directories_deleted =
             self.delete_completed_scan_manifest_directories().await?;
         let scan_local_metadata_batches_deleted =
@@ -640,10 +598,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -670,10 +625,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -700,10 +652,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -731,10 +680,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -762,10 +708,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -793,10 +736,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -826,10 +766,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -862,10 +799,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -894,10 +828,7 @@ impl Database {
             )
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 }
@@ -1079,10 +1010,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.mail_outbox = self
             .query(
@@ -1096,10 +1024,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.mail_challenges = self
             .query(
@@ -1114,10 +1039,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.user_devices = self
             .query(
@@ -1131,10 +1053,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.media_merge_records = self
             .query(
@@ -1148,10 +1067,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.user_registration_requests = self
             .query(
@@ -1166,10 +1082,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.emby_migration_jobs = self
             .query(
@@ -1184,10 +1097,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         // Pending candidates past their expiry can never be selected. The retention worker also
         // removes them, but it only runs daily; the minute-level cleanup keeps the table small.
@@ -1205,10 +1115,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         Ok(purge)
     }
@@ -1255,10 +1162,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.access_tokens = self
             .query(
@@ -1274,10 +1178,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.web_playback_sessions = self
             .query(
@@ -1291,10 +1192,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.playback_sessions = self
             .query(
@@ -1308,10 +1206,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         purge.playback_admissions = self
             .query(
@@ -1325,10 +1220,7 @@ impl Database {
             .bind(batch)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         Ok(purge)
     }
@@ -1446,10 +1338,7 @@ impl Database {
                 .bind(batch_size)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if candidates.is_empty() {
                 break;
             }
@@ -1471,18 +1360,9 @@ impl Database {
             let count = statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             if count == 0 {
                 break;
             }
@@ -1534,10 +1414,7 @@ impl Database {
                 .bind(batch_size)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -1565,10 +1442,7 @@ impl Database {
             .bind(key)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(value.as_deref() == Some("1"))
     }
 
@@ -1584,10 +1458,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub async fn normalize_media_source_defaults(&self) -> Result<u64, StorageError> {
@@ -1609,10 +1480,7 @@ impl Database {
                 .bind(SOURCE_DEFAULT_REPAIR_BATCH_SIZE)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if item_ids.is_empty() {
                 break;
             }
@@ -1636,10 +1504,7 @@ impl Database {
             statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             repaired = repaired.saturating_add(item_ids.len() as u64);
             if repaired > 100_000_000 {
                 break;
@@ -1673,41 +1538,19 @@ impl Database {
                 .execute(&self.pool)
                 .await
                 .map(|result| result.rows_affected())
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                });
+                .map_err(self.sqlx_err());
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         sqlx::query(RETENTION_STATEMENT_TIMEOUT)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let deleted = query
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(deleted)
     }
 
