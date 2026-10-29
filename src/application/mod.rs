@@ -103,3 +103,13 @@ pub(crate) mod user_permission_copy;
 pub(crate) mod user_presets;
 pub mod watch;
 pub mod webhooks;
+
+/// Resolves the process-wide probes that read the filesystem the first time they are used.
+///
+/// Blocking. Call it from a blocking thread before the HTTP state is built: otherwise the first
+/// admin settings request pays for the device probe and the first scan or request pays for
+/// canonicalizing `LUX_SYMLINK_TARGET_ROOTS`, both on a Tokio worker.
+pub fn warm_up_startup_probes() {
+    transcoding::warm_up();
+    scanner::warm_up_symlink_policy();
+}

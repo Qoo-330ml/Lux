@@ -325,11 +325,6 @@ impl AppState {
             );
         }
         let config_dir = config.config_dir.clone();
-        // Resolve the process-wide device and symlink probes once, before any request or scan can
-        // reach them: both read the filesystem on first use and must not do so on a Tokio worker
-        // that is already serving traffic.
-        crate::application::transcoding::warm_up();
-        crate::application::scanner::symlink::warm_up();
         let log_store = LogStore::new(&config_dir);
         let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
         let resources = ResourceMetrics::new();

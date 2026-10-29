@@ -309,6 +309,13 @@ impl ScanReport {
     }
 }
 
+/// Resolves the process-wide symlink policy, which canonicalizes
+/// `LUX_SYMLINK_TARGET_ROOTS` the first time it is built. Blocking; see
+/// [`crate::application::warm_up_startup_probes`].
+pub fn warm_up_symlink_policy() {
+    symlink::warm_up();
+}
+
 pub fn compute_file_fingerprint(
     relative_path: &str,
     size: i64,

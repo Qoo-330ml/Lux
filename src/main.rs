@@ -175,6 +175,12 @@ async fn build_app_state(
     requires_database_selection: bool,
     control_tx: watch::Sender<ShutdownReason>,
 ) -> Result<AppState, BoxError> {
+    // Resolve the device-node and symlink probes once, on a blocking thread, before the state
+    // exists: both read the filesystem the first time they are used, and neither the first admin
+    // request nor the first scan may pay for that on a Tokio worker.
+    tokio::task::spawn_blocking(luxd::application::warm_up_startup_probes)
+        .await
+        .map_err(|error| BoxError::from(std::io::Error::other(error.to_string())))?;
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
