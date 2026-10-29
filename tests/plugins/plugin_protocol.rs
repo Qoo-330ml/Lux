@@ -668,13 +668,13 @@ fn rejects_invalid_login_background_manifest_category_capabilities_and_hosts() {
 #[test]
 fn accepts_versioned_login_background_sdk_manifest_and_result_fixtures() {
     let manifest_value = serde_json::from_str(include_str!(
-        "fixtures/plugin-sdk/login-background/manifest-v1.json"
+        "../fixtures/plugin-sdk/login-background/manifest-v1.json"
     ))
     .expect("manifest fixture should be JSON");
     let manifest = PluginManifest::from_value(manifest_value)
         .expect("login background manifest fixture should validate");
     let result_value = serde_json::from_str(include_str!(
-        "fixtures/plugin-sdk/login-background/poster-feed-v1.json"
+        "../fixtures/plugin-sdk/login-background/poster-feed-v1.json"
     ))
     .expect("RPC result fixture should be JSON");
     let result = LoginBackgroundRpcResult::validate(result_value, &manifest)
@@ -686,7 +686,7 @@ fn accepts_versioned_login_background_sdk_manifest_and_result_fixtures() {
     assert_eq!(result.items[0].title.as_deref(), Some("Example film"));
 
     let single_image_value = serde_json::from_str(include_str!(
-        "fixtures/plugin-sdk/login-background/single-image-v1.json"
+        "../fixtures/plugin-sdk/login-background/single-image-v1.json"
     ))
     .expect("single image RPC fixture should be JSON");
     let single_image = LoginBackgroundRpcResult::validate(single_image_value, &manifest)
