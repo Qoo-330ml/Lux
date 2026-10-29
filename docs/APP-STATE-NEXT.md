@@ -7,8 +7,10 @@
 
 - `AppState`（`src/api/legacy.rs:169`）共 62 个字段，其中 **49 个 `Option<...>`**。
 - 已被 `require_service!(state.<field>)` 收敛的"服务未初始化 → 裸 503"let-else：**308 处**（22 个文件，净减 548 行）。
-- 仍是 let-else 的：**58 处**，else 分支带日志、`api_error(...)` 或别的状态码（`state.setup`、
-  `database_setup`、`webhooks`、`people`、`plugins` 等），第一阶段按要求原样保留。
+- 仍是 let-else 的 **118 处**（统计：`grep -r "as_ref() else {" src/api | wc -l` 得 123，减去 3 处非 `state`
+  接收者、`src/api/mod.rs` 的宏体与宏文档示例各 1 处；脚本按块分类）：59 处 `api_error(.., DatabaseUnavailable)`、
+  39 处直接返回状态码（37 处裸 503 变体，另有 NOT_FOUND 5 / NOT_IMPLEMENTED 1）、18 处降级返回（`return;`、
+  `Ok(None)`、`false`、默认值）、2 处带日志。字段以 `plugins` 13、`database` 12、`people` 12 居多。
 - 另有 60 处 `return StatusCode::SERVICE_UNAVAILABLE.into_response();` 出现在 `match` 分支或宏体里。
 - 运行期模式仍是"一个 `Router` + 一个 `AppState`"：`app()` 即 `app_with_state(AppState::default())`，
   setup 与业务路由共用同一状态类型，"未就绪"由字段是否为 `None`（加上 `database_selection_required`）判定。
@@ -18,8 +20,7 @@
 ## 2. 目标
 
 - setup / 未就绪模式：状态里**没有**业务服务，业务路由**不注册**（而不是"注册了但返回 503"）。
-- ready 模式：49 个服务字段**不是 `Option`**，handler 直接拿到 `&Service`，308 处守卫在编译期消失。
-- 响应契约不变：真正的运行期故障（数据库断开等）仍保持现有的 503 / 错误映射。
+- ready 模式：49 个服务字段**不是 `Option`**，handler 直接拿 `&Service`，308 处守卫在编译期消失；运行期故障仍走现有 503。
 
 ## 3. 两个可行方案
 
@@ -57,12 +58,12 @@ pub struct ReadyAppState { core: CoreState, /* 49 个服务字段，非 Option *
 
 1. **抽 `ReadyServices`**：把 49 个 `Option<Service>` 从 `AppState` 搬进 `ReadyServices`，`AppState` 只留
    `core` 与 `Option<Arc<ReadyServices>>`；`require_service!` 内部改读 `services.<field>`（调用点不变）。
-2. **加 `require_ready!`**：在 handler 顶部取一次 `Arc<ReadyServices>`，把 308 处 `require_service!` 收缩为
-   每 handler 一次守卫；此步可分批（同第一阶段按文件分批提交）。
+2. **加 `require_ready!`**：每个 handler 顶部取一次 `Arc<ReadyServices>`，把 308 处 `require_service!` 收缩为
+   一次守卫（可分批提交）。
 3. **拆 Router**：新增 `SetupState` 与 `setup_router()`，把 `/api/v1/setup/*` 与启动探针搬到 setup 侧；
    `ready_router()` 的状态类型持有 `ReadyAppState`（服务字段非 `Option`）。需先落地 §3 的前置工作。
-4. **删守卫**：删除 308 处（此时约等于 handler 数的）守卫，把 58 处带日志/`api_error` 的 let-else 里
-   纯"未就绪"语义的部分一并删除；保留真正运行期故障的分支。
+4. **删守卫**：删除 308 处（此时约等于 handler 数的）守卫；118 处残余 let-else 里只删明确是"未就绪"的分支
+   （59 处 `api_error` + 37 处裸 503），保留 18 处降级返回、5 处 NOT_FOUND / 1 处 NOT_IMPLEMENTED 与日志分支。
 5. **收尾**：`database_selection_required` 随状态类型消失；4 处 `AppState::default()` 测试构造改用 `SetupState`。
 
 ## 5. 改动面与风险
@@ -74,7 +75,6 @@ pub struct ReadyAppState { core: CoreState, /* 49 个服务字段，非 Option *
 | 中间件共用 | `request_access_ip`、限流、SSE 预算等中间件在两种模式下都要用，不能整体塞进 `ReadyServices` | 明确放进 `CoreState` |
 | 错误映射两种形态 | 裸 503 与 `api_error(..., DatabaseUnavailable, ..)` 并存，语义不同（前者无 body） | 迁移中逐个文件核对，禁止批量替换 |
 | 后台任务持有 `Arc` 副本 | worker、plugin、SSE 持有服务引用，状态类型拆分后生命周期需重新梳理 | 保留 `Arc<ReadyServices>` 共享，不 clone 个体服务 |
-| 增量过大 | 49 字段 × 308 调用点，一次性改动难以 review | 按 §4 分五步、每步分批提交 |
 
 结论：**先做方案 A（低风险、可分批），方案 B 作为目标形态**。B 的"启动时定型 Router"并不被现有行为支持：
 必须先补"setup 完成后重启"或"进程内热切换"二者之一，这是它的前置成本与产品决策点，而非既有事实。
