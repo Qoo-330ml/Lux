@@ -303,7 +303,7 @@ impl Database {
             .execute(&mut **transaction)
             .await
             .map(|result| result.rows_affected())
-            .map_err(|source| self.storage_error(source))
+            .map_err(self.sqlx_err())
     }
 
     /// Reattaches detached watch state to the items that carry the same identity again.
@@ -341,10 +341,7 @@ impl Database {
                         .await?;
                 }
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| self.storage_error(source))?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
         }
         Ok(restored)
     }
@@ -359,29 +356,17 @@ impl Database {
             .bind(batch_size)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| self.storage_error(source))?;
+            .map_err(self.sqlx_err())?;
         for row in &archived {
             candidates.push(RestoreCandidate {
-                user_id: row
-                    .try_get("user_id")
-                    .map_err(|source| self.storage_error(source))?,
-                target_item_id: row
-                    .try_get("target_item_id")
-                    .map_err(|source| self.storage_error(source))?,
-                state: WatchState::from_row(row).map_err(|source| self.storage_error(source))?,
+                user_id: row.try_get("user_id").map_err(self.sqlx_err())?,
+                target_item_id: row.try_get("target_item_id").map_err(self.sqlx_err())?,
+                state: WatchState::from_row(row).map_err(self.sqlx_err())?,
                 archive: Some(ArchiveKey {
-                    user_id: row
-                        .try_get("user_id")
-                        .map_err(|source| self.storage_error(source))?,
-                    item_type: row
-                        .try_get("item_type")
-                        .map_err(|source| self.storage_error(source))?,
-                    provider: row
-                        .try_get("provider")
-                        .map_err(|source| self.storage_error(source))?,
-                    provider_id: row
-                        .try_get("provider_id")
-                        .map_err(|source| self.storage_error(source))?,
+                    user_id: row.try_get("user_id").map_err(self.sqlx_err())?,
+                    item_type: row.try_get("item_type").map_err(self.sqlx_err())?,
+                    provider: row.try_get("provider").map_err(self.sqlx_err())?,
+                    provider_id: row.try_get("provider_id").map_err(self.sqlx_err())?,
                 }),
             });
         }
@@ -390,16 +375,12 @@ impl Database {
             .bind(batch_size)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| self.storage_error(source))?;
+            .map_err(self.sqlx_err())?;
         for row in &removed {
             candidates.push(RestoreCandidate {
-                user_id: row
-                    .try_get("user_id")
-                    .map_err(|source| self.storage_error(source))?,
-                target_item_id: row
-                    .try_get("target_item_id")
-                    .map_err(|source| self.storage_error(source))?,
-                state: WatchState::from_row(row).map_err(|source| self.storage_error(source))?,
+                user_id: row.try_get("user_id").map_err(self.sqlx_err())?,
+                target_item_id: row.try_get("target_item_id").map_err(self.sqlx_err())?,
+                state: WatchState::from_row(row).map_err(self.sqlx_err())?,
                 archive: None,
             });
         }
@@ -426,11 +407,10 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| self.storage_error(source))?;
+            .map_err(self.sqlx_err())?;
         let merged = match existing.as_ref() {
             Some(row) => {
-                let current =
-                    WatchState::from_row(row).map_err(|source| self.storage_error(source))?;
+                let current = WatchState::from_row(row).map_err(self.sqlx_err())?;
                 let merged = current.fold(incoming);
                 if merged == current {
                     return Ok(false);
@@ -464,7 +444,7 @@ impl Database {
         .bind(merged.last_played_at)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| self.storage_error(source))?;
+        .map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -484,7 +464,7 @@ impl Database {
         .execute(&mut **transaction)
         .await
         .map(|_| ())
-        .map_err(|source| self.storage_error(source))
+        .map_err(self.sqlx_err())
     }
 
     /// Reattaches detached watch state and playback history on a schedule.

@@ -1769,6 +1769,15 @@ impl Database {
         }
     }
 
+    /// Borrows [`Database::storage_error`] as a reusable `map_err` argument.
+    ///
+    /// Call sites read `.map_err(database.sqlx_err())` instead of spelling out the
+    /// `StorageError::Sqlx` literal. The returned closure only borrows `self`, so nothing is
+    /// allocated up front and the database path is still cloned on the error path alone.
+    pub(super) fn sqlx_err(&self) -> impl Fn(sqlx::Error) -> StorageError + '_ {
+        move |source| self.storage_error(source)
+    }
+
     fn query(
         &self,
         sql: impl sqlx::SqlSafeStr,
@@ -5929,6 +5938,53 @@ mod mail_outbox_tests {
                 .iter()
                 .any(|message| message.id == next_page.messages[0].id)
         );
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod storage_error_mapping_tests {
+    use super::*;
+    use crate::storage::test_database;
+
+    #[tokio::test]
+    async fn sqlx_err_maps_failures_exactly_like_storage_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_first_dir, first) = test_database().await?;
+        let (_second_dir, second) = test_database().await?;
+
+        let mapped_by_helper = first.sqlx_err()(sqlx::Error::RowNotFound);
+        let mapped_by_method = first.storage_error(sqlx::Error::RowNotFound);
+
+        let (
+            StorageError::Sqlx {
+                path: helper_path,
+                source: helper_source,
+            },
+            StorageError::Sqlx {
+                path: method_path,
+                source: method_source,
+            },
+        ) = (&mapped_by_helper, &mapped_by_method)
+        else {
+            return Err("expected StorageError::Sqlx from both mappings".into());
+        };
+        assert_eq!(helper_path, method_path);
+        assert_eq!(helper_path, &first.path);
+        assert!(matches!(helper_source, sqlx::Error::RowNotFound));
+        assert!(matches!(method_source, sqlx::Error::RowNotFound));
+        assert_eq!(mapped_by_helper.to_string(), mapped_by_method.to_string());
+        assert_eq!(
+            format!("{mapped_by_helper:?}"),
+            format!("{mapped_by_method:?}")
+        );
+
+        let other_path = match second.sqlx_err()(sqlx::Error::RowNotFound) {
+            StorageError::Sqlx { path, .. } => path,
+            _ => return Err("expected StorageError::Sqlx from the second database".into()),
+        };
+        assert_eq!(&other_path, &second.path);
+        assert_ne!(other_path.as_path(), helper_path.as_path());
         Ok(())
     }
 }
