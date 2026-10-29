@@ -15,6 +15,8 @@ import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
 import { usePlayerTimelineScrubber } from "./usePlayerTimelineScrubber";
 import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
+import { usePlayerScreenshot } from "./usePlayerScreenshot";
+import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { NativeVideoEngine, type PlaybackEngine } from "./playback-engine";
 import {
   clearRememberedCandidate,
@@ -27,13 +29,7 @@ import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerInfoPanel } from "./components/player-info-panel";
-import {
-  buildPlayerInfoGroups,
-  createClientStatsSampler,
-  playerInfoCopyText,
-  summarizeSource,
-  type PlayerClientStats,
-} from "./player-stats";
+import { playerInfoCopyText } from "./player-stats";
 import type { PlayerSettingsSourceOption } from "./components/player-settings-panel";
 import { PlayerErrorState, PlayerLoadingState } from "./components/player-state";
 import { LuxPlayer } from "./components/lux-player";
@@ -63,7 +59,6 @@ import {
   episodeNavigationFor,
   getSubtitleInfo,
   isMatroskaSource,
-  screenshotFileName,
 } from "./player-page-helpers";
 
 const AUTO_HIDE_DELAY_MS = 3_000;
@@ -92,13 +87,11 @@ export function PlayerPage() {
   const [flip, setFlip] = useState<PlayerFlip>("normal");
   const [showSettings, setShowSettings] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
-  const [clientStats, setClientStats] = useState<PlayerClientStats | null>(null);
   const [isRemainingTime, setIsRemainingTime] = useState(false);
   const [controlsVisible, setControlsVisible] = useState(true);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
   const [controlActivity, setControlActivity] = useState(0);
   const [danmuVisible, setDanmuVisible] = useState(true);
-  const [screenshotStatus, setScreenshotStatus] = useState<string | null>(null);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
   const currentTimeRef = useRef(0);
   const durationRef = useRef(0);
@@ -234,17 +227,7 @@ export function PlayerPage() {
     ? webPlaybackSession.data
     : playbackBootstrap.data?.session ?? webPlaybackSession.data;
   const playbackPlan = playbackSession?.plan;
-  // The information panel polls the server only while it is open: one request per second reads a
-  // stored row plus the in-memory FFmpeg snapshot, so it never touches media files.
   const playbackSessionId = playbackSession?.sessionId ?? null;
-  const infoStats = useQuery({
-    queryKey: queryKeys.webPlaybackStats(playbackSessionId ?? ""),
-    queryFn: ({ signal }) => api.webPlaybackStats(playbackSessionId ?? "", signal),
-    enabled: showInfo && Boolean(playbackSessionId),
-    retry: false,
-    refetchInterval: showInfo ? 1_000 : false,
-    staleTime: 0,
-  });
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const remoteDirectUrl = remoteHttpSource ? source?.externalUrl ?? null : null;
   // The remembered kind is read once per plan so recording a success below cannot reorder a ladder
@@ -287,7 +270,6 @@ export function PlayerPage() {
   const engineRef = useRef<PlaybackEngine | null>(null);
   const runtimeRef = useRef<LuxPlayerRuntime | null>(null);
   const hasRestoredPositionRef = useRef(false);
-  const screenshotStatusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const fallbackRequestedRef = useRef(false);
   const sessionTransitionRef = useRef(Promise.resolve());
@@ -347,6 +329,24 @@ export function PlayerPage() {
     resetControlsTimeout,
   });
 
+  const { infoGroups } = usePlayerInfoPanel({
+    playbackSessionId,
+    showInfo,
+    playbackKey,
+    playbackPlan,
+    tier: playbackSession?.tier ?? null,
+    source,
+    engineRef,
+    videoRef,
+    lastVideoRef,
+    currentTime,
+    duration,
+    playbackRate,
+    volume,
+    isMuted,
+    playing,
+  });
+
   usePlayerKeyboardShortcuts({
     itemId,
     volume,
@@ -362,23 +362,6 @@ export function PlayerPage() {
     setShowSettings,
     navigate: (to) => navigate(to as never),
   });
-
-  useEffect(() => {
-    if (!showInfo) {
-      setClientStats(null);
-      return;
-    }
-    const sampler = createClientStatsSampler();
-    const sample = () => {
-      setClientStats(sampler({
-        engine: engineRef.current,
-        video: videoRef.current ?? lastVideoRef.current,
-      }));
-    };
-    sample();
-    const interval = window.setInterval(sample, 1_000);
-    return () => window.clearInterval(interval);
-  }, [showInfo, playbackKey]);
 
   const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
     if (!video) {
@@ -566,55 +549,7 @@ export function PlayerPage() {
     return () => window.clearTimeout(timeout);
   }, [controlActivity, controlsVisible, isPointerInteracting, playing, showSettings]);
 
-  useEffect(() => () => {
-    if (screenshotStatusTimeoutRef.current) clearTimeout(screenshotStatusTimeoutRef.current);
-  }, []);
-
-  const showScreenshotStatus = useCallback((message: string) => {
-    setScreenshotStatus(message);
-    if (screenshotStatusTimeoutRef.current) clearTimeout(screenshotStatusTimeoutRef.current);
-    screenshotStatusTimeoutRef.current = setTimeout(() => setScreenshotStatus(null), 2_500);
-  }, []);
-
-  const takeScreenshot = useCallback(() => {
-    const video = videoRef.current;
-    if (!video || video.videoWidth <= 0 || video.videoHeight <= 0) {
-      showScreenshotStatus("当前视频帧尚未就绪");
-      return;
-    }
-
-    const canvas = document.createElement("canvas");
-    canvas.width = video.videoWidth;
-    canvas.height = video.videoHeight;
-    const context = canvas.getContext("2d");
-    if (!context) {
-      showScreenshotStatus("当前浏览器无法生成截图");
-      return;
-    }
-
-    try {
-      context.drawImage(video, 0, 0, canvas.width, canvas.height);
-      canvas.toBlob((blob) => {
-        if (!blob) {
-          showScreenshotStatus("当前媒体不允许截图");
-          return;
-        }
-        try {
-          const objectUrl = URL.createObjectURL(blob);
-          const anchor = document.createElement("a");
-          anchor.href = objectUrl;
-          anchor.download = screenshotFileName(media ? mediaTitle(media) : "lux-screenshot");
-          anchor.click();
-          window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
-          showScreenshotStatus("截图已保存");
-        } catch {
-          showScreenshotStatus("当前浏览器无法保存截图");
-        }
-      }, "image/png");
-    } catch {
-      showScreenshotStatus("当前媒体不允许截图");
-    }
-  }, [media, showScreenshotStatus]);
+  const { screenshotStatus, takeScreenshot } = usePlayerScreenshot({ videoRef, media });
 
   const handleBack = () => {
     if (window.history.length > 1) {
@@ -674,25 +609,6 @@ export function PlayerPage() {
   const surfaceFailure = playbackFailure
     ?? planFailure
     ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
-  const infoGroups = showInfo
-    ? buildPlayerInfoGroups({
-      plan: playbackPlan?.type ?? null,
-      tier: playbackSession?.tier ?? null,
-      source: summarizeSource(source),
-      server: infoStats.data ?? null,
-      serverPending: infoStats.isPending,
-      serverError: infoStats.error instanceof Error ? infoStats.error.message : null,
-      client: clientStats,
-      playback: {
-        positionSeconds: currentTime,
-        durationSeconds: duration,
-        rate: playbackRate,
-        volume,
-        muted: isMuted,
-        paused: !playing,
-      },
-    })
-    : [];
   const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
