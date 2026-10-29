@@ -68,10 +68,7 @@ impl Database {
             )
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let rows = self
             .query(
@@ -269,10 +266,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let mut libraries = Vec::<StoredLibraryPipelineActivity>::new();
         for row in rows {

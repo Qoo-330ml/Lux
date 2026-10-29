@@ -173,10 +173,7 @@ impl Database {
             )
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(active != 0)
     }
 
@@ -202,10 +199,7 @@ impl Database {
             .query_scalar(sqlx::AssertSqlSafe(query))
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(active != 0)
     }
 
@@ -233,10 +227,7 @@ impl Database {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut candidates = Vec::with_capacity(rows.len());
         for row in rows {
             let table: String = row.try_get("table_name").unwrap_or_default();
@@ -266,18 +257,12 @@ impl Database {
             .query_scalar("PRAGMA freelist_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let page_count: i64 = self
             .query_scalar("PRAGMA page_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         // SQLite tracks no per-table dead tuples. Model the database-wide
         // freelist as one synthetic candidate so the round can run `VACUUM` when
         // enough pages are reclaimable, and skip it otherwise.
@@ -298,10 +283,7 @@ impl Database {
         self.query_scalar("PRAGMA auto_vacuum")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Returns free pages to the filesystem in bounded steps. Incremental vacuum only
@@ -360,10 +342,7 @@ impl Database {
         self.query_scalar("PRAGMA freelist_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     async fn run_maintenance_vacuum(&self, table: &str, report: &mut MaintenanceReport) -> bool {
@@ -444,10 +423,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 }
 
@@ -502,10 +478,7 @@ impl Database {
             .query_scalar("SELECT EXISTS(SELECT 1 FROM media_items)")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if has_items == 0 {
             return Ok(SqliteStatisticsRefresh::SkippedEmpty);
         }
@@ -516,10 +489,7 @@ impl Database {
             )
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if analyzed == 0 {
             self.analyze_catalog().await?;
             return Ok(SqliteStatisticsRefresh::Analyzed);
@@ -527,10 +497,7 @@ impl Database {
         self.query("PRAGMA optimize")
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(SqliteStatisticsRefresh::Optimized)
     }
 
@@ -556,10 +523,7 @@ impl Database {
             .query_scalar("SELECT EXISTS(SELECT 1 FROM media_items)")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if has_items == 0 {
             return Ok(SqliteStatisticsRefresh::SkippedEmpty);
         }
@@ -590,17 +554,11 @@ impl Database {
             .query_scalar("PRAGMA analysis_limit")
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query("PRAGMA analysis_limit = 0")
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let analyzed = tokio::time::timeout(
             SQLITE_ANALYZE_TIMEOUT,
             self.query("ANALYZE").execute(&self.pool),

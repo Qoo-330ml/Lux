@@ -26,10 +26,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_notification_destination(
@@ -45,10 +42,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_notification_destination))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_notification_destinations(
@@ -71,10 +65,7 @@ impl Database {
                 .map(stored_notification_destination)
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_enabled_notification_destinations(
@@ -94,10 +85,7 @@ impl Database {
                 .map(stored_notification_destination)
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_notification_destination(
@@ -130,10 +118,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn delete_notification_destination(
@@ -145,10 +130,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() == 1)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn insert_notification_event_with_deliveries(
@@ -156,14 +138,7 @@ impl Database {
         event: NewNotificationEvent<'_>,
         destination_ids: &[String],
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let inserted = self
             .query(
                 "INSERT INTO notification_events (
@@ -180,10 +155,7 @@ impl Database {
             .execute(&mut *transaction)
             .await
             .map(|result| result.rows_affected() == 1)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if inserted {
             for batch in destination_ids.chunks(MAX_NOTIFICATION_DELIVERY_INSERT_BATCH_SIZE) {
                 let mut sql = String::from(
@@ -209,19 +181,10 @@ impl Database {
                 statement
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(inserted)
     }
 
@@ -250,10 +213,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Deletes one bounded batch of delivered/failed delivery rows and then
@@ -279,10 +239,7 @@ impl Database {
             .bind(batch_limit.clamp(1, 2_000))
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         let events = self
             .query(
@@ -302,10 +259,7 @@ impl Database {
             .bind(batch_limit.clamp(1, 2_000))
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         Ok((deliveries, events))
     }
@@ -333,10 +287,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_notification_delivery(
@@ -360,10 +311,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_notification_delivered(
@@ -382,10 +330,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_notification_retry(
@@ -410,10 +355,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn retry_notification_delivery(&self, id: &str) -> Result<bool, StorageError> {
@@ -427,9 +369,6 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }

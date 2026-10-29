@@ -230,10 +230,7 @@ impl Database {
         .bind(limit.clamp(1, 5_000))
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Deletes exactly the archived event ids. Callers must only pass ids whose lines reached disk.
@@ -257,10 +254,7 @@ impl Database {
             deleted += statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
         }
         Ok(deleted)

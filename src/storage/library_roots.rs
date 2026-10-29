@@ -5,14 +5,7 @@ impl Database {
         &self,
         root: NewLibraryRoot<'_>,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let active_library = self
             .query(
                 "UPDATE libraries SET updated_at = updated_at
@@ -21,18 +14,9 @@ impl Database {
             .bind(root.library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_library.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         self.query(
@@ -48,17 +32,8 @@ impl Database {
         .bind(database_flag(root.is_writable))
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -77,10 +52,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_library_root).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_library_roots_by_ids(
@@ -106,14 +78,10 @@ impl Database {
             for root_id in root_ids {
                 statement = statement.bind(root_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let root = stored_library_root(row);
                 roots.insert(root.id.clone(), root);
@@ -146,14 +114,10 @@ impl Database {
             for library_id in library_ids {
                 statement = statement.bind(library_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let library_id: String = row.get("library_id");
                 roots
@@ -170,14 +134,7 @@ impl Database {
         library_id: &str,
         root_id: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let active_library = self
             .query(
                 "UPDATE libraries SET updated_at = updated_at
@@ -186,18 +143,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_library.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         let history = self
@@ -214,18 +162,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if history.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         self.query("DELETE FROM library_roots WHERE id = ? AND library_id = ?")
@@ -233,17 +172,8 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -261,10 +191,7 @@ impl Database {
         .bind(canonical_path)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn delete_library_root_history(
@@ -281,10 +208,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_all_library_roots(
@@ -299,10 +223,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_library_root).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_enabled_library_roots(
@@ -321,10 +242,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_library_root).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_library_last_scan(
@@ -336,10 +254,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_root_scan_cursor(
@@ -353,10 +268,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_library_root(
@@ -373,10 +285,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_library_root))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_library_root_availability(
@@ -399,9 +308,6 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }

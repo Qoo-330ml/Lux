@@ -38,10 +38,7 @@ impl Database {
             .bind(nested_children)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
             .map(|row| StoredMediaSourcePath {
@@ -80,14 +77,7 @@ impl Database {
             ));
         }
 
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let current = self
             .query_scalar::<i64>(
                 "SELECT 1 FROM scan_job_file_changes
@@ -101,10 +91,7 @@ impl Database {
             .bind(revision)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if !current {
             return Ok(false);
@@ -121,10 +108,7 @@ impl Database {
                 .bind(&change.relative_path)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         } else {
             for track in tracks {
@@ -138,10 +122,7 @@ impl Database {
                     .bind(&track.media_source_id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 }
                 let existing = self
                     .query(
@@ -154,10 +135,7 @@ impl Database {
                     .bind(&change.relative_path)
                     .fetch_optional(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 if let Some(existing) = existing {
                     self.query(
                         "UPDATE media_streams
@@ -173,10 +151,7 @@ impl Database {
                     .bind(existing.get::<String, _>("id"))
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 } else {
                     let stream_index = self
                         .query_scalar::<i64>(
@@ -186,10 +161,7 @@ impl Database {
                         .bind(&track.media_source_id)
                         .fetch_one(&mut *transaction)
                         .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                        .map_err(self.sqlx_err())?;
                     self.query(
                         "INSERT INTO media_streams (
                              id, media_source_id, stream_index, stream_type, codec,
@@ -208,10 +180,7 @@ impl Database {
                     .bind(database_flag(track.is_forced))
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 }
             }
         }
@@ -229,22 +198,13 @@ impl Database {
             .bind(revision)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected()
             == 1;
         if !completed {
             return Ok(false);
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -302,10 +262,7 @@ impl Database {
                 root_path: row.get("root_path"),
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     #[allow(dead_code)]
@@ -386,24 +343,14 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_external_subtitle(
         &self,
         update: ExternalSubtitleUpdate<'_>,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let exists = self
             .query_scalar::<i64>(
                 "SELECT 1 FROM media_streams mt
@@ -417,10 +364,7 @@ impl Database {
             .bind(update.stream_index)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if !exists {
             return Ok(false);
@@ -435,10 +379,7 @@ impl Database {
             .bind(update.media_source_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE media_streams
@@ -455,17 +396,8 @@ impl Database {
         .bind(update.stream_index)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 }
