@@ -1,4 +1,5 @@
 use super::*;
+use std::future::Future;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const DATABASE_CLEANUP_MARKER: &str = "database_lifecycle_cleanup_v1";
@@ -1428,6 +1429,196 @@ impl Database {
     }
 }
 
+/// Prefix of the `lux_meta` keys that record how far a startup repair has completed.
+const STARTUP_REPAIR_KEY_PREFIX: &str = "startup_repair:";
+/// A claim writes this prefix plus its unix timestamp, so a crashed run can be recognised.
+const STARTUP_REPAIR_RUNNING_PREFIX: &str = "RUNNING:";
+/// A claim older than this is treated as left behind by a process that died mid-repair.
+const STARTUP_REPAIR_CLAIM_STALE_SECONDS: i64 = 60 * 60;
+
+/// What the `lux_meta` row of one startup repair currently says.
+enum StartupRepairMarker {
+    /// The repair never completed on this database, or the row is unreadable.
+    Absent,
+    /// Version recorded by the last completed run.
+    Completed(i64),
+    /// A run started at this unix timestamp and has not finished.
+    Running(i64),
+}
+
+fn startup_repair_claim_is_stale(claimed_at: i64) -> bool {
+    current_unix_timestamp().saturating_sub(claimed_at) >= STARTUP_REPAIR_CLAIM_STALE_SECONDS
+}
+
+impl Database {
+    /// Runs an idempotent startup repair once per database and records the completed version.
+    ///
+    /// The registration lives in `lux_meta` under `startup_repair:<name>`; its value is the
+    /// version that finished. A recorded version at or above `version` skips the repair after a
+    /// single marker read, so restarting an already repaired database pays one statement instead
+    /// of repeating the work, and bumping the version constant at the call site forces one more
+    /// run. Nothing else is created: no table, no migration.
+    ///
+    /// The claim follows [`Database::claim_database_cleanup`]: only one process can claim a
+    /// repair, and the marker is written after the repair succeeded. A failed repair releases the
+    /// claim so the next start retries; a claim left behind by a crashed process expires after
+    /// [`STARTUP_REPAIR_CLAIM_STALE_SECONDS`].
+    ///
+    /// The repair returns `Ok(None)` when it found nothing to do, for example because another
+    /// process already completed the underlying one-time migration. That outcome leaves the
+    /// marker untouched, because this process did not finish the work.
+    pub async fn run_startup_repair_once<Repair, Fut, T>(
+        &self,
+        name: &str,
+        version: i64,
+        repair: Repair,
+    ) -> Result<Option<T>, StorageError>
+    where
+        Repair: FnOnce() -> Fut,
+        Fut: Future<Output = Result<Option<T>, StorageError>>,
+    {
+        let key = format!("{STARTUP_REPAIR_KEY_PREFIX}{name}");
+        match self.startup_repair_marker(&key).await? {
+            StartupRepairMarker::Completed(completed) if completed >= version => return Ok(None),
+            StartupRepairMarker::Running(claimed_at) => {
+                if !startup_repair_claim_is_stale(claimed_at) {
+                    return Ok(None);
+                }
+                self.clear_startup_repair_claim(&key, claimed_at).await?;
+            }
+            StartupRepairMarker::Absent | StartupRepairMarker::Completed(_) => {}
+        }
+        let Some(claim) = self.claim_startup_repair(&key).await? else {
+            return Ok(None);
+        };
+        match repair().await {
+            Ok(Some(value)) => {
+                self.record_startup_repair_version(&key, version).await?;
+                Ok(Some(value))
+            }
+            Ok(None) => {
+                // Nothing was finished here, so the claim is released instead of recorded: the
+                // next start decides again whether the repair still has work to do.
+                let _ = self.release_startup_repair_claim(&key, &claim).await;
+                Ok(None)
+            }
+            Err(error) => {
+                let _ = self.release_startup_repair_claim(&key, &claim).await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn startup_repair_marker(&self, key: &str) -> Result<StartupRepairMarker, StorageError> {
+        let value: Option<String> = self
+            .query_scalar("SELECT value FROM lux_meta WHERE key = ?")
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(match value.as_deref() {
+            None => StartupRepairMarker::Absent,
+            Some(value) => match value.strip_prefix(STARTUP_REPAIR_RUNNING_PREFIX) {
+                Some(claimed_at) => {
+                    StartupRepairMarker::Running(claimed_at.parse().unwrap_or_default())
+                }
+                None => match value.parse::<i64>() {
+                    Ok(completed) => StartupRepairMarker::Completed(completed),
+                    Err(_) => StartupRepairMarker::Absent,
+                },
+            },
+        })
+    }
+
+    /// Returns the value this process wrote when it won the claim, or `None` when another process
+    /// owns it. Both statements are conditional on the row not being claimed, so two concurrent
+    /// starts cannot both believe they won.
+    async fn claim_startup_repair(&self, key: &str) -> Result<Option<String>, StorageError> {
+        let claim = format!(
+            "{STARTUP_REPAIR_RUNNING_PREFIX}{}",
+            current_unix_timestamp()
+        );
+        let updated = self
+            .query("UPDATE lux_meta SET value = ? WHERE key = ? AND value NOT LIKE ?")
+            .bind(&claim)
+            .bind(key)
+            .bind(format!("{STARTUP_REPAIR_RUNNING_PREFIX}%"))
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if updated.rows_affected() == 1 {
+            return Ok(Some(claim));
+        }
+        let inserted = self
+            .query(
+                "INSERT INTO lux_meta (key, value) VALUES (?, ?)
+                 ON CONFLICT(key) DO NOTHING",
+            )
+            .bind(key)
+            .bind(&claim)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok((inserted.rows_affected() == 1).then_some(claim))
+    }
+
+    async fn clear_startup_repair_claim(
+        &self,
+        key: &str,
+        claimed_at: i64,
+    ) -> Result<(), StorageError> {
+        self.query("DELETE FROM lux_meta WHERE key = ? AND value = ?")
+            .bind(key)
+            .bind(format!("{STARTUP_REPAIR_RUNNING_PREFIX}{claimed_at}"))
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(self.sqlx_err())
+    }
+
+    async fn release_startup_repair_claim(
+        &self,
+        key: &str,
+        claim: &str,
+    ) -> Result<(), StorageError> {
+        self.query("DELETE FROM lux_meta WHERE key = ? AND value = ?")
+            .bind(key)
+            .bind(claim)
+            .execute(&self.pool)
+            .await
+            .map(|_| ())
+            .map_err(self.sqlx_err())
+    }
+
+    async fn record_startup_repair_version(
+        &self,
+        key: &str,
+        version: i64,
+    ) -> Result<(), StorageError> {
+        let value = version.to_string();
+        let updated = self
+            .query("UPDATE lux_meta SET value = ? WHERE key = ?")
+            .bind(&value)
+            .bind(key)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if updated.rows_affected() > 0 {
+            return Ok(());
+        }
+        self.query(
+            "INSERT INTO lux_meta (key, value) VALUES (?, ?)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        )
+        .bind(key)
+        .bind(&value)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(self.sqlx_err())
+    }
+}
+
 const SOURCE_DEFAULT_REPAIR_BATCH_SIZE: i64 = 500;
 
 impl Database {
@@ -2195,5 +2386,313 @@ mod startup_repair_measurements {
                 Err(error) => format!("error={error}"),
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod startup_repair_tests {
+    use super::*;
+    use crate::config::Config;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::sync::Semaphore;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        Ok((directory, database))
+    }
+
+    async fn marker(database: &Database, name: &str) -> Result<Option<String>, StorageError> {
+        database
+            .query_scalar("SELECT value FROM lux_meta WHERE key = ?")
+            .bind(format!("{STARTUP_REPAIR_KEY_PREFIX}{name}"))
+            .fetch_optional(&database.pool)
+            .await
+            .map_err(database.sqlx_err())
+    }
+
+    #[tokio::test]
+    async fn startup_repair_runs_once_and_records_the_completed_version()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let recorded_calls = Arc::clone(&calls);
+        let first = database
+            .run_startup_repair_once("test_repair", 3, move || async move {
+                recorded_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<Option<&'static str>, StorageError>(Some("ran"))
+            })
+            .await?;
+        assert_eq!(first, Some("ran"));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("3")
+        );
+
+        // The recorded version skips the repair. The skip costs the single `lux_meta` read that
+        // the marker itself needs and never touches the repair body.
+        database.reset_query_count();
+        let skipped_calls = Arc::clone(&calls);
+        let second = database
+            .run_startup_repair_once("test_repair", 3, move || async move {
+                skipped_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<Option<&'static str>, StorageError>(Some("ran again"))
+            })
+            .await?;
+        assert_eq!(second, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(database.query_count(), 1);
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("3")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_repair_reruns_after_the_version_increases()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+
+        let recorded_calls = Arc::clone(&calls);
+        assert_eq!(
+            database
+                .run_startup_repair_once("test_repair", 1, move || async move {
+                    recorded_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Option<u8>, StorageError>(Some(1))
+                })
+                .await?,
+            Some(1)
+        );
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("1")
+        );
+
+        let bumped_calls = Arc::clone(&calls);
+        assert_eq!(
+            database
+                .run_startup_repair_once("test_repair", 2, move || async move {
+                    bumped_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Option<u8>, StorageError>(Some(2))
+                })
+                .await?,
+            Some(2)
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("2")
+        );
+
+        // A request for an older version never rolls the recorded version back.
+        let older_calls = Arc::clone(&calls);
+        assert_eq!(
+            database
+                .run_startup_repair_once("test_repair", 1, move || async move {
+                    older_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok::<Option<u8>, StorageError>(Some(3))
+                })
+                .await?,
+            None
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("2")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn startup_repair_keeps_no_marker_when_the_repair_fails()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+
+        let failed = database
+            .run_startup_repair_once("test_repair", 1, || async {
+                Err::<Option<u8>, StorageError>(StorageError::Conflict("boom".to_owned()))
+            })
+            .await;
+        assert!(failed.is_err());
+        assert_eq!(marker(&database, "test_repair").await?, None);
+
+        // The failed claim was released, so the next start retries immediately.
+        let retried = database
+            .run_startup_repair_once("test_repair", 1, || async {
+                Ok::<_, StorageError>(Some(7))
+            })
+            .await?;
+        assert_eq!(retried, Some(7));
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("1")
+        );
+        Ok(())
+    }
+
+    /// A closure that reports "nothing to do" did not finish the work, so it must not record the
+    /// version: the process that owns the claim is the one that completes it.
+    #[tokio::test]
+    async fn startup_repair_records_nothing_when_the_repair_finds_nothing_to_do()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+
+        let outcome = database
+            .run_startup_repair_once("test_repair", 1, || async {
+                Ok::<Option<u8>, StorageError>(None)
+            })
+            .await?;
+        assert_eq!(outcome, None);
+        assert_eq!(marker(&database, "test_repair").await?, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn concurrent_startup_repairs_claim_the_repair_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let calls = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+
+        let first_database = database.clone();
+        let first_calls = Arc::clone(&calls);
+        let first_entered = Arc::clone(&entered);
+        let first_release = Arc::clone(&release);
+        let first = tokio::spawn(async move {
+            first_database
+                .run_startup_repair_once("test_repair", 1, move || async move {
+                    first_calls.fetch_add(1, Ordering::SeqCst);
+                    first_entered.add_permits(1);
+                    let _permit = first_release
+                        .acquire()
+                        .await
+                        .map_err(|error| StorageError::Conflict(error.to_string()))?;
+                    Ok::<Option<u8>, StorageError>(Some(1))
+                })
+                .await
+        });
+
+        // Wait until the first start is inside the repair body, then start the second one.
+        let _entered = entered
+            .acquire()
+            .await
+            .map_err(|error| StorageError::Conflict(error.to_string()))?;
+        let second_calls = Arc::clone(&calls);
+        let second = database
+            .run_startup_repair_once("test_repair", 1, move || async move {
+                second_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<Option<u8>, StorageError>(Some(2))
+            })
+            .await?;
+        assert_eq!(second, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        release.add_permits(1);
+        assert_eq!(first.await??, Some(1));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("1")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_claim_left_by_a_dead_process_is_retried() -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        let stale = current_unix_timestamp() - STARTUP_REPAIR_CLAIM_STALE_SECONDS - 1;
+        insert_marker(
+            &database,
+            &format!("{STARTUP_REPAIR_RUNNING_PREFIX}{stale}"),
+        )
+        .await?;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let repaired_calls = Arc::clone(&calls);
+        let outcome = database
+            .run_startup_repair_once("test_repair", 1, move || async move {
+                repaired_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<Option<u8>, StorageError>(Some(9))
+            })
+            .await?;
+        assert_eq!(outcome, Some(9));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("1")
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_live_claim_from_another_process_is_skipped() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_directory, database) = test_database().await?;
+        let claim = format!(
+            "{STARTUP_REPAIR_RUNNING_PREFIX}{}",
+            current_unix_timestamp()
+        );
+        insert_marker(&database, &claim).await?;
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let skipped_calls = Arc::clone(&calls);
+        let outcome = database
+            .run_startup_repair_once("test_repair", 1, move || async move {
+                skipped_calls.fetch_add(1, Ordering::SeqCst);
+                Ok::<Option<u8>, StorageError>(Some(5))
+            })
+            .await?;
+        assert_eq!(outcome, None);
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        // The other process still owns the claim, so it must survive untouched.
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some(&*claim)
+        );
+        Ok(())
+    }
+
+    /// Marker values written by the older per-repair helpers ("1", "COMPLETED") cannot be read as
+    /// a version of this repair; they are treated as "never ran" instead of aborting startup.
+    #[tokio::test]
+    async fn an_unreadable_marker_is_treated_as_not_completed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        insert_marker(&database, "COMPLETED").await?;
+
+        let outcome = database
+            .run_startup_repair_once("test_repair", 1, || async {
+                Ok::<_, StorageError>(Some(4))
+            })
+            .await?;
+        assert_eq!(outcome, Some(4));
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("1")
+        );
+        Ok(())
+    }
+
+    async fn insert_marker(database: &Database, value: &str) -> Result<(), StorageError> {
+        database
+            .query("INSERT INTO lux_meta (key, value) VALUES (?, ?)")
+            .bind(format!("{STARTUP_REPAIR_KEY_PREFIX}test_repair"))
+            .bind(value)
+            .execute(&database.pool)
+            .await
+            .map(|_| ())
+            .map_err(database.sqlx_err())
     }
 }
