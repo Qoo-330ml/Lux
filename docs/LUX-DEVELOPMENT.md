@@ -18297,7 +18297,7 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 
 | 用例 | 现象 | 证据 | 处置 |
 |---|---|---|---|
-| `tests/reidentify.rs::fill_missing_dispatcher_serializes_jobs_for_one_library` | `Error: Elapsed(())`，全量门禁 8 线程下偶发；单独复跑 1/8~5/8 不稳定 | ① 回退搜索触发器到 W4 之前仍 1/8 失败 → 与 W4 无关；② 等待放宽到 10 s 仍 4/12 失败（12.6 s）→ 不是窗口太紧；③ 同目标的完整 25 个用例稳定通过；④ 全局元数据许可 16、补全许可 4，第一个任务最多占 3 个 → 不是许可饥饿 | 另开独立 `LUX-*` 任务专查“另一个库的补全任务偶发长时间不启动”；不在数据路径重构里改调度器 |
+| `tests/reidentify.rs::fill_missing_dispatcher_serializes_jobs_for_one_library` | `Error: Elapsed(())`，全量门禁 8 线程下偶发；单独复跑 1/8~5/8 不稳定 | ① 回退搜索触发器到 W4 之前仍 1/8 失败 → 与 W4 无关；② 等待放宽到 10 s 仍 4/12 失败（12.6 s）→ 不是窗口太紧；③ 同目标的完整 25 个用例稳定通过；④ 全局元数据许可 16、补全许可 4，第一个任务最多占 3 个 → 不是许可饥饿 | 另开独立 `LUX-870` 任务专查“另一个库的补全任务偶发长时间不启动”（所有者 2026-10-29 接受豁免）；不在数据路径重构里改调度器 |
 
 其它门禁项：`cargo test --locked --all-targets --no-fail-fast -- --test-threads=8` 为
 **2,246 通过 / 1 失败（上表）/ 76 ignored**；`cargo fmt`、`cargo clippy -D warnings` 通过；
@@ -18308,6 +18308,13 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 （`--lib` 1,379 passed / 0 failed / 32 ignored，`--test probe` 21/21），且失败发生在宿主机 CPU 饱和时，
 因此按本机环境性时序抖动处理（与上面 `reidentify` 同类），不是功能回归。同一轮 `postgres_database` 的
 忽略用例在真机 PG 16 上 **34/34** 通过。
+
+所有者决定（2026-10-29）：
+
+- `reidentify` 那条**接受豁免**，登记后续任务 `LUX-870`（未开始）专查“另一个库的补全任务长时间不启动”；
+- `--lib` / `--test probe` 的并发失败按**环境观察**记录，不占豁免名额；**空闲时的全量门禁重跑暂缓**
+  （所有者决定先不跑），需要取证时按本段命令原样重跑，并确认这两个目标单独复跑仍全绿；
+- 门禁现状口径：**1 条书面豁免 + 1 条环境观察，不是全绿**；阶段门按此登记，不把偶发失败说成通过。
 
 ### 数据路径重构（W0–W6）实施状态（2026-10-28）
 
@@ -18320,9 +18327,9 @@ flush 调用该批量接口，再补“批量失败整体回滚”用例。
 | W1 数据生命周期与写放大 | LUX-857–860 | 完成 | 本文“阶段 29 门” |
 | W2 revision + outbox + 列表/详情读模型 | LUX-863–866 | 完成 | 本文 §30 与 P2 阶段门状态 |
 | W3 首页、继续观看与搜索 | LUX-867–869 | 完成 | 本文 LUX-867/868/869 与 P3 完成状态 |
-| W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 + PostgreSQL 等价入队（语句级入队触发器 + PG 消费者） | 完成（PG 侧未做扫描写预算基准） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
-| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（指纹+bytes+updated_at 校验；重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 剩余项已结论（唯一待定：降档默认值策略，需所有者定；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
-| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化 4 个热点查询（`user_item_state`、未播放计数、内容限制、详情批量） | 剩余项已结论（共享 45 列行需先统一 8 条 SELECT，已记录暂缓；`repository.rs` 剩余为连接层，拆分到此为止） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
+| W4 触发器与写预算 | 搜索触发器入队 + 消费者 + 队列缺口兜底 + PostgreSQL 等价入队（语句级入队触发器 + PG 消费者） | 完成（PG 写预算基准由所有者 2026-10-29 决定暂不跑） | 本文 W4 段；`scripts/run-scan-write-bench.py`；ADR-050 |
+| W5 CPU 与协议层收敛 | 空闲退避、JSON gzip、ETag/304、CPU/请求基线、`route_p95_us` + 30 s 时间窗、前台 p95 → 后台媒体车道配额（默认关闭；媒体车道有活时比值 −25%；阈值按读模型模式）、列表 `MediaStreams` 投影、People 成本已量、NFO 解码缓存（指纹+bytes+updated_at 校验；重复详情 −0.28…−0.36 ms）、首页 DTO 深克隆已量（0.118 ms/页，不做重写） | 所有者已确认（降档默认 `off`；搜索 −40% 受契约限制；NFO 剩余成本是 133 KB 响应体本身） | 本文 W5 段；`scripts/run-api-cpu-bench.py`、`scripts/probe-media-lane-ab.py`、`scripts/measure-people-load.py`、`scripts/measure-nfo-load.py`；ADR-049 |
+| W6 双后端与工程边界 | 迁移配对清单、后端分支允许清单、两个校验器（已进 `AGENTS.md` 必跑清单）、存储接口两片拆分（邮件 outbox + 邀请/注册邮件流程，`repository.rs` 9,222→5,948 行）、typed 化 4 个热点查询（`user_item_state`、未播放计数、内容限制、详情批量） | 所有者已确认范围收口（共享 45 列行需先统一 8 条 SELECT，暂缓；`repository.rs` 剩余为连接层，拆分到此为止） | `docs/migration-map.json`、`docs/backend-branches.json`、`src/storage/{mail_outbox,user_mail_flows}.rs`；ADR-051 |
 
 ## 30. P2 读模型任务（阶段 29 门通过后）
 
@@ -18442,7 +18449,7 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 - 66k 夹具实测（arm64 release，40 条继续观看，pageSize=24）：`off` p50/p95 13.1/18.9 ms，
   `on` 8.4/10.2 ms，两侧响应逐字节一致（40,324 B，sha256 相同）；`LUX_READ_MODEL_MODE=shadow`
   下请求首页、继续观看前两页与 pageSize=100 共 4 次，`continue watching shadow * differs` 计 0。
-  远低于 300 ms 目标；`on` 依旧默认关闭，是否开启留待项目所有者决定。
+  远低于 300 ms 目标；`on` 依旧默认关闭（所有者 2026-10-29 确认保持 `off` 默认，收益留待 1M/深页复测）。
 - 残留滞后（非等价场景）：恢复阈值只在重建/播放写入时求值，用户在设置里改动 `played_percent` 或
   `resume_min_ticks` 后，指针不会立即重算；需要完全等价时保持 `off`，或下次重建后自然收敛。
 - 容器已看状态同步的写入放大已修（`288f9f51`）：`sync_played_container_states` 原先每次都在提交后
@@ -18535,7 +18542,7 @@ position，已看完存下一未看集；补回归 `user_series_next_rebuild_kee
 - tsvector 评估：PostgreSQL 现状的 `pg_trgm` GIN 已让 ILIKE 走索引，且 ILIKE 的“包含”语义与 SQLite
   的 LIKE 回退一致；改用 `tsvector` 会引入词元化差异（中文会被切成一整段），与“不得改变 Lux API
   语义”冲突，本轮保留 `pg_trgm`，差异写入兼容性矩阵。
-- 与规格的差异（需项目所有者确认）：(1) 未把 `media_search` 改成外部内容表——FTS5 external content
+- 与规格的差异（所有者 2026-10-29 接受现状，理由如下）：(1) 未把 `media_search` 改成外部内容表——FTS5 external content
   要求单一内容表，而搜索列来自 `media_items` + `item_aliases`，现有“触发器 + 行号映射”已避免长期
   漂移；(2) 未采用 trigram/tsvector，理由如上；(3) 未新增搜索开关——本轮改动只是补齐两后端同一
   路径的语义，`off` 语义即现有 FTS+LIKE 路径，没有需要灰度回滚的新实现。
@@ -18669,11 +18676,12 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
      104.7 ms → 自动阈值 209 ms；扫描期 p95 228.7 ms 触发降档（`withheld=1`），恢复后 2.5 s 由一次
      新库扫描的 media-lane 取用观察回 `restored=1`。此前在 load ≈4、空闲 p95 于 117–261 ms 漂移时
      复现不了，是阈值选取问题，不是逻辑问题。
-  4. **默认值仍待所有者定（当前保持默认关闭）**：时间窗（30 s）与按模式阈值（`off` 300 / `on` 80 ms）
+  4. **默认值：所有者 2026-10-29 决定保持 `off`**（opt-in）。时间窗（30 s）与按模式阈值（`off` 300 / `on` 80 ms）
      已落地，剩下的决定只有一项：绝对阈值对“本来就慢”的旧路径实例（扫描并发下首页 p95 357–476 ms）
      会长期常开、媒体车道被永久减半——要么接受，要么把触发改成相对基线（例如相对同路由最近 p50）。
      翻默认只需一行（`foreground_throttle_config_from` 的开关默认值改为 `on`），未进
-     `DEPLOYMENT.md`/compose 环境变量清单。
+     `DEPLOYMENT.md`/compose 环境变量清单。重新评估的触发条件：改成相对基线触发（相对同路由最近 p50），
+     或在目标部署（NAS）上拿到媒体车道竞争的真实数据。
   5. 文档口径的 A/B（`scripts/compare-read-model-modes.py --rounds 2 --scan-libraries 3 --scan-files 1000`）
      也照实记录：`off` 臂首页 p95 空闲 351.27 / 扫描 458.05（比值 1.30），同一臂 `on` 读模型 60.14 /
      81.84（1.36）；开降档（阈值 400 ms，只在扫描期触发）后 366.77 / 444.04（1.21）与 54.81 / 92.69
@@ -18749,7 +18757,7 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
 - 热点查询 typed 化：`catalog_items`/`media_search`/`user_series_next` 已走读模型与消费者，但仍是
   `sqlx::Any` 动态 SQL；改动面大，需要先有 CPU/请求基线（已建立）再逐条评估——注意 `sqlx::query!` 宏需要
   编译期数据库，双后端下不可行，typed 化只能走 `query_as` + 手写行结构。
-- 存储接口拆分：两片已完成（见上），`repository.rs` 由 9,222 行降到 **5,948 行**。剩下的内容已按“触达域”
+- 存储接口拆分（所有者 2026-10-29 确认**到此为止**）：两片已完成（见上），`repository.rs` 由 9,222 行降到 **5,948 行**。剩下的内容已按“触达域”
   审查过一遍：连接/迁移引导、写事务与锁、`query*` 辅助、`Database` 基础访问器，以及各域的共享记录类型——
   这是一个内聚的连接层与 shared model，没有再能独立成域的边界；**拆分到此为止**，后续只在功能改动顺带搬移。
   按 W6 规则同一次提交刷新了 `docs/backend-branches.json`：两片新文件带理由登记（邮件 outbox 的
@@ -18767,7 +18775,7 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
 - 新增两后端迁移：`0235`/PG `0237` 覆盖索引 `idx_catalog_items_visibility`、`0236`/PG `0238`
   排序索引 `idx_catalog_items_recent_sort`。派生行形状未变，`READ_MODEL_SCHEMA_VERSION` 保持 2。
 - 未完成/风险：PostgreSQL 侧只在 SQL 层核对了搜索分支（无本机 PG 实例）；1M 规模与深页收益待复测；
-  LUX-869 的三处规格偏差（外部内容表、trigram/tsvector、搜索开关）需项目所有者确认。
+  LUX-869 的三处规格偏差（外部内容表、trigram/tsvector、搜索开关）已由所有者 2026-10-29 接受、保持现状。
 - 门禁（2026-10-28，`9d172ca4`）：`cargo test --locked --all-targets --no-fail-fast` **EXIT=0，
   128 个目标全部通过（2,242 项通过、0 失败）**；`cargo fmt --all -- --check` 与
   `cargo clippy --locked --all-targets --all-features -- -D warnings` 通过。首轮门禁暴露两个问题并已修：
@@ -18775,6 +18783,19 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
   `web_playback` 里对 webhook 投递顺序的断言（`072a29af`，投递由 4 并发 worker 处理，改为断言集合）。
 - W4（触发器入队与写预算）、W5（CPU/协议层）待登记。
 
+### P5（W5 + 清理）阶段门状态（2026-10-29，所有者确认“部分达成”）
+
+- 已达成：JSON gzip（首页 92,674→8,308 B）、ETag/304、列表 `MediaStreams` 投影、NFO 解码缓存
+  （重复详情 −0.28…−0.36 ms）、前台 p95 → 媒体车道降档（opt-in；媒体车道有活时比值 2.55→1.91、恢复 2.5 s）、
+  People/DTO 成本已量（结论都是“不做”）、首页 DTO 深克隆已量（0.118 ms/页，不重写）。
+- 未达成、受 API 契约限制：列表/搜索 CPU/请求 −40%。所有者 2026-10-29 决定不改总数契约（`total` 是分页
+  状态机的一部分），最坏搜索 65 ms 对 500 ms 预算余量 4.7×；只保留 `count=false` 跳计数快路径（−1.1 ms）
+  与测量数据。
+- 未达成、待数据：PG 侧写预算基准（所有者决定暂不跑）；降档默认值保持 `off`。
+- 清理（旧路径删除）：**现在不能删**——读模型 `on` 仍默认关闭，删除会失去回退能力。顺序是：① 所有者决定
+  把 `LUX_READ_MODEL_MODE` 默认切到 `on` 并稳定一个发布周期；② 期间 shadow 差异保持 0；③ 之后在下一个
+  发布周期删除 `off` 分支与旧查询，同时移除 W5 段里 `off`/`on` 的对比项。
+- 门禁口径：见「门禁豁免清单」——1 条书面豁免 + 1 条环境观察，不是全绿。
 ### W4 触发器与写预算（已完成，两后端均入队 2026-10-29）
 
 范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W4）：搜索/provider/内容限制失效触发器改为入队；消费者预算与
@@ -18838,7 +18859,7 @@ FTS/内容限制/collection 一致性回归全绿、故障注入后可恢复。
 - 消费者预算与优先级：当前只有 `search` 一种派生写类别，`user_item_state` 等用户写在提交后做的是
   有界定点刷新（LUX-867 已把整表重建改为单剧集刷新），因此暂不引入多类别优先级队列；等出现第二个
   派生类别时再按“用户写 > 任务控制 > 扫描派生”排序，机制入口已收敛在 `drain_*` + 每拍批量预算。
-- PostgreSQL 侧入队已做（见上），但**未做 PG 侧写预算基准**：本轮只验证语义与队列行为，没有在 PG 上复测
+- PostgreSQL 侧入队已做（见上）；**PG 侧写预算基准：所有者 2026-10-29 决定暂不跑**。本轮只验证语义与队列行为，没有在 PG 上复测
   扫描墙钟/WAL（SQLite 的数字见上表）。PG 的写入放大改善预期来自同一机制（一条语句一次 outbox 插入），
   需要真实 PG 扫描负载才能给数字。
 - 故障注入：单测覆盖“失败不推进水位 / 队列缺口全量重建 / 删除后清理行号映射”，尚无脚本化的断电或
