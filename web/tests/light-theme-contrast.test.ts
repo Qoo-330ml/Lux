@@ -138,7 +138,7 @@ describe("light theme contrast", () => {
   });
 
   it("uses contrast-safe colors for feedback and task statuses", () => {
-    for (const token of ["--lux-status-danger", "--lux-status-success", "--lux-status-warning", "--lux-status-active"]) {
+    for (const token of ["--lux-status-danger", "--lux-status-success", "--lux-status-warning", "--lux-status-active", "--lux-status-info"]) {
       const color = lightStatusColor(token);
       expect(color, `${token} should be defined in the light theme`).toMatch(/^#[\da-f]{6}$/i);
       expect(contrastRatio(color, "#f4f3f1"), `${token} should meet 4.5:1 on the light surface`).toBeGreaterThanOrEqual(4.5);
@@ -157,6 +157,54 @@ describe("light theme contrast", () => {
     expect(lightThemeRule(".lux-user-badge.is-warn")).toContain("color: var(--lux-status-warning)");
     expect(lightThemeRule(".lux-notification-result")).toContain("color: var(--lux-status-success)");
     expect(lightThemeRule(".lux-job-icon.is-active")).toContain("color: var(--lux-status-active)");
+  });
+
+  it("keeps dialog copy, plugin controls, and admin statuses theme-aware", () => {
+    expect(cssRule(":root")).toContain("--lux-status-success: #9bdcb3");
+    expect(cssRule(":root")).toContain("--lux-status-danger: #f3a6a6");
+    expect(cssRule(":root")).toContain("--lux-danger: var(--lux-status-danger)");
+    expect(cssRule(":root")).toContain("--lux-success: var(--lux-status-success)");
+
+    expect(cssRule(".lux-delete-dialog-body p")).toContain("color: var(--lux-text)");
+    expect(lightThemeRule(".lux-button-danger")).toContain("background: #a13d53");
+    expect(cssRule(".lux-subtitle-option:hover, .lux-subtitle-option.is-active")).toContain("color: var(--lux-text)");
+    expect(cssRule('.lux-subtitle-form input[type="text"], .lux-subtitle-form input:not([type])')).toContain(
+      "color: var(--lux-text)",
+    );
+    expect(cssRule('.lux-subtitle-form input[type="text"], .lux-subtitle-form input:not([type])')).toContain(
+      "background: color-mix(in srgb, var(--lux-text)",
+    );
+
+    expect(cssRule(".lux-admin-plugin-toggle strong")).toContain("color: var(--lux-text)");
+    expect(cssRule(".lux-admin-plugin-image-field")).toContain("background: color-mix(in srgb, var(--lux-text)");
+    expect(cssRule(".lux-admin-plugin-dialog-form .lux-admin-plugin-toggle")).toContain(
+      "background: color-mix(in srgb, var(--lux-text)",
+    );
+    expect(stylesheet).toMatch(
+      /\.lux-admin-plugin-install-status:focus-visible,[\s\S]*?\.lux-admin-plugin-dialog-close:focus-visible \{\s*outline: 2px solid var\(--lux-focus-ring\);/,
+    );
+
+    expect(cssRule(".lux-admin-transcoding-state.is-ok")).toContain("color: var(--lux-status-success)");
+    expect(cssRule(".lux-admin-transcoding-state.is-error")).toContain("color: var(--lux-status-danger)");
+    expect(cssRule(".lux-transcoding-session-state.is-finished")).toContain("color: var(--lux-status-warning)");
+    expect(cssRule(".lux-transcoding-history-reason")).toContain("color: var(--lux-status-danger)");
+    expect(cssRule(".lux-transcoding-outcome.is-ok")).toContain("color: var(--lux-status-success)");
+    expect(cssRule(".lux-transcoding-outcome.is-error")).toContain("color: var(--lux-status-danger)");
+    expect(cssRule(".lux-now-playing-kv-value.is-direct")).toContain("color: var(--lux-status-success)");
+    expect(cssRule(".lux-now-playing-kv-value.is-transcode")).toContain("color: var(--lux-status-warning)");
+    expect(cssRule(".lux-now-playing-kv-value.is-source")).toContain("color: var(--lux-status-info)");
+    expect(cssRule(".lux-danger-icon")).toContain("color: var(--lux-danger)");
+  });
+
+  it("uses semantic colors for user batch results without inline overrides", () => {
+    expect(cssRule(".lux-users-selection-results li.is-success")).toContain("color: var(--lux-success)");
+    expect(cssRule(".lux-users-selection-results li.is-failure")).toContain("color: var(--lux-danger)");
+    expect(cssRule('.lux-users-card-body [role="status"] li.is-success')).toContain("color: var(--lux-success)");
+    expect(cssRule('.lux-users-card-body [role="status"] li.is-failure')).toContain("color: var(--lux-danger)");
+
+    const usersPage = readFileSync(new URL("../src/features/admin/AdminUsersPage.tsx", import.meta.url), "utf8");
+    expect(usersPage).not.toContain('style={{ color: result.success ? "#9bdcb3"');
+    expect(usersPage).not.toContain("var(--lux-danger, #ee9eaa)");
   });
 
   it("uses light gradients for loading skeletons", () => {

@@ -286,7 +286,7 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 .lux-users-menu button:hover,
 .lux-users-menu a:hover { background: rgba(255, 255, 255, .07); }
 
-.lux-users-menu button.is-danger { color: var(--lux-danger, #ee9eaa); }
+.lux-users-menu button.is-danger { color: var(--lux-danger); }
 
 .lux-users-menu-divider { height: 1px; margin: 5px 4px; background: var(--lux-line-soft); }
 
@@ -342,9 +342,13 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 
 .lux-users-selection-results ul { display: grid; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
 
-.lux-users-selection-results li.is-success { color: #9bdcb3; }
+.lux-users-selection-results li.is-success { color: var(--lux-success); }
 
-.lux-users-selection-results li.is-failure { color: var(--lux-danger, #ee9eaa); }
+.lux-users-selection-results li.is-failure { color: var(--lux-danger); }
+
+.lux-users-card-body [role="status"] li.is-success { color: var(--lux-success); }
+
+.lux-users-card-body [role="status"] li.is-failure { color: var(--lux-danger); }
 
 /* ---------- 页脚分页 ---------- */
 
@@ -399,9 +403,9 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 
 .lux-users-drawer-form { display: flex; flex: 1; flex-direction: column; min-height: 0; }
 
-.lux-users-danger-text { color: var(--lux-danger, #ee9eaa); }
+.lux-users-danger-text { color: var(--lux-danger); }
 
-.lux-users-danger-text:hover { border-color: color-mix(in srgb, var(--lux-danger, #ee9eaa) 55%, transparent); }
+.lux-users-danger-text:hover { border-color: color-mix(in srgb, var(--lux-danger) 55%, transparent); }
 
 .lux-users-drawer-body { display: grid; gap: 14px; padding: 20px 22px; overflow: auto; }
 

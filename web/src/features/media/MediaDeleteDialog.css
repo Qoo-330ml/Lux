@@ -1,10 +1,13 @@
 .lux-delete-dialog { width: min(470px, 100%); }
 .lux-delete-dialog-body { display: grid; justify-items: center; gap: 13px; padding: 26px; text-align: center; }
-.lux-delete-dialog-icon { display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid rgba(243,170,184,.35); border-radius: 50%; color: #f3aab8; background: rgba(243,170,184,.1); }
-.lux-delete-dialog-body p { margin: 0; color: #fff; font-size: .96rem; line-height: 1.55; }
+.lux-delete-dialog-icon { display: grid; place-items: center; width: 52px; height: 52px; border: 1px solid color-mix(in srgb, var(--lux-status-danger) 35%, transparent); border-radius: 50%; color: var(--lux-status-danger); background: color-mix(in srgb, var(--lux-status-danger) 10%, transparent); }
+.lux-delete-dialog-body p { margin: 0; color: var(--lux-text); font-size: .96rem; line-height: 1.55; }
 .lux-delete-dialog-body small { max-width: 350px; color: var(--lux-subtle); font-size: .74rem; line-height: 1.6; }
 .lux-delete-dialog-body .lux-editor-error { width: 100%; text-align: left; }
 .lux-delete-dialog-actions { display: flex; justify-content: center; gap: 9px; margin-top: 6px; }
 .lux-delete-dialog-actions .lux-button { padding: 0 18px; }
 .lux-button-danger { border-color: rgba(243,170,184,.34); color: #fff; background: rgba(170,53,77,.78); }
 .lux-button-danger:hover { border-color: rgba(255,208,218,.58); background: rgba(185,62,87,.95); }
+
+html[data-lux-theme="light"] .lux-button-danger { border-color: rgba(161,61,83,.42); color: #fff; background: #a13d53; }
+html[data-lux-theme="light"] .lux-button-danger:hover { border-color: rgba(161,61,83,.62); background: #8d3448; }
