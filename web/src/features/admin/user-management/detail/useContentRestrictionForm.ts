@@ -13,7 +13,7 @@ export const contentRatingLevels = {
   BBFC: ["U", "PG", "12", "12A", "15", "18", "R18"],
 } as const;
 
-export type ContentRestrictionFormDraft = Pick<
+type ContentRestrictionFormDraft = Pick<
   AdminUserContentRestrictionPolicy,
   "ratingSystem" | "maximumRating" | "allowUnrated"
 > & {
