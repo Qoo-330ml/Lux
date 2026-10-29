@@ -370,7 +370,9 @@ pub(crate) fn admin_settings_json(
         })),
         // Advertised so the admin UI never hard-codes a list the server would reject.
         "transcodingOptions": {
-            "hardwareEncoders": crate::application::transcoding::HARDWARE_ENCODERS,
+            "hardwareEncoders": crate::application::transcoding::offered_hardware_encoders(
+                &settings.transcoding.hardware_encoder,
+            ),
             "softwarePresets": crate::application::transcoding::SOFTWARE_PRESETS,
         },
         "networkProxy": settings.network_proxy,

@@ -285,9 +285,14 @@ async fn transcoding_settings_are_admin_only_validated_and_persisted()
     assert_eq!(transcoding["softwareSessions"], json!(1));
     assert_eq!(transcoding["softwarePreset"], json!("veryfast"));
     assert_eq!(transcoding["audioBitrateKbps"], json!(192));
-    assert_eq!(
-        initial["transcodingOptions"]["hardwareEncoders"],
-        json!(["h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"])
+    // Only encoders detected on the host are offered, so the list depends on the machine.
+    let known = ["h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"];
+    assert!(
+        initial["transcodingOptions"]["hardwareEncoders"]
+            .as_array()
+            .is_some_and(|encoders| encoders
+                .iter()
+                .all(|encoder| known.iter().any(|name| encoder == name)))
     );
     assert!(
         initial["transcodingOptions"]["softwarePresets"]

@@ -15,6 +15,58 @@ pub(crate) const HARDWARE_ENCODER_NONE: &str = "NONE";
 /// Encoders Lux knows how to ask FFmpeg for. Mirrors the allowlist enforced at runtime.
 pub(crate) const HARDWARE_ENCODERS: [&str; 4] =
     ["h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"];
+/// Hardware encoders that look usable on this host, probed once from device nodes only (no
+/// process is spawned). The saved self-test remains the authority on whether one really works.
+pub(crate) fn detected_hardware_encoders() -> &'static [&'static str] {
+    static DETECTED: std::sync::OnceLock<Vec<&'static str>> = std::sync::OnceLock::new();
+    DETECTED.get_or_init(detect_hardware_encoders).as_slice()
+}
+
+fn detect_hardware_encoders() -> Vec<&'static str> {
+    let mut found = Vec::new();
+    if cfg!(target_os = "macos") {
+        found.push("h264_videotoolbox");
+        return found;
+    }
+    if std::path::Path::new("/dev/nvidiactl").exists() {
+        found.push("h264_nvenc");
+    }
+    let nodes: Vec<String> = std::fs::read_dir("/dev/dri")
+        .map(|entries| {
+            entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.starts_with("renderD"))
+                .collect()
+        })
+        .unwrap_or_default();
+    if !nodes.is_empty() {
+        let intel = nodes.iter().any(|node| {
+            std::fs::read_to_string(format!("/sys/class/drm/{node}/device/vendor"))
+                .map(|vendor| vendor.trim() == "0x8086")
+                .unwrap_or(false)
+        });
+        if intel {
+            found.push("h264_qsv");
+        }
+        found.push("h264_vaapi");
+    }
+    found
+}
+
+/// Encoders to offer in the admin UI: detected ones, plus the saved choice so it stays visible.
+pub(crate) fn offered_hardware_encoders(current: &str) -> Vec<&'static str> {
+    let mut offered: Vec<&'static str> = detected_hardware_encoders().to_vec();
+    if let Some(saved) = HARDWARE_ENCODERS
+        .iter()
+        .find(|known| known.eq_ignore_ascii_case(current))
+    {
+        if !offered.contains(saved) {
+            offered.push(saved);
+        }
+    }
+    offered
+}
 /// libx264 presets offered in the admin UI; the runtime only accepts these.
 pub(crate) const SOFTWARE_PRESETS: [&str; 6] = [
     "ultrafast",
