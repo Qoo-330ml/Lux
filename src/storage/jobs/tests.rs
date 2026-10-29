@@ -1685,6 +1685,8 @@ async fn manifest_discovery_chunk_does_not_complete_directory_after_cancel_reque
         inode: None,
         fingerprint: Vec::new(),
         fingerprint_pending: false,
+        is_symlink: false,
+        resolved_path: None,
     }];
     let chunk = NewScanManifestDiscoveryChunk {
         manifest_id: "manifest",
@@ -1783,6 +1785,8 @@ async fn manifest_discovery_does_not_count_a_path_already_seen_in_the_generation
         inode: None,
         fingerprint: vec![1_u8; 32],
         fingerprint_pending: false,
+        is_symlink: false,
+        resolved_path: None,
     }];
     let chunk = NewScanManifestDiscoveryChunk {
         manifest_id: "manifest",
@@ -1887,6 +1891,8 @@ async fn manifest_discovery_presence_update_preserves_fingerprint_cas()
             inode: None,
             fingerprint: vec![1_u8; 32],
             fingerprint_pending: false,
+            is_symlink: false,
+            resolved_path: None,
         },
         NewScanManifestEntry {
             relative_path: "Changed.mkv".to_owned(),
@@ -1897,6 +1903,8 @@ async fn manifest_discovery_presence_update_preserves_fingerprint_cas()
             inode: None,
             fingerprint: vec![3_u8; 32],
             fingerprint_pending: false,
+            is_symlink: false,
+            resolved_path: None,
         },
         NewScanManifestEntry {
             relative_path: "Missing.mkv".to_owned(),
@@ -1907,6 +1915,8 @@ async fn manifest_discovery_presence_update_preserves_fingerprint_cas()
             inode: None,
             fingerprint: vec![4_u8; 32],
             fingerprint_pending: false,
+            is_symlink: false,
+            resolved_path: None,
         },
     ];
     let seen_filesystem_entries = [
@@ -2040,6 +2050,8 @@ async fn manifest_discovery_finalize_does_not_ignore_cancel_request()
         inode: None,
         fingerprint: Vec::new(),
         fingerprint_pending: false,
+        is_symlink: false,
+        resolved_path: None,
     }];
     let chunk = NewScanManifestDiscoveryChunk {
         manifest_id: "manifest",

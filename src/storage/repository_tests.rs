@@ -30798,6 +30798,8 @@ async fn manifest_discovery_presence_templates_preserve_path_and_generation_resu
         inode: None,
         fingerprint: fingerprint.to_vec(),
         fingerprint_pending: false,
+        is_symlink: false,
+        resolved_path: None,
     };
     let seen_entry =
         |id: &str, relative_path: &str, fingerprint: &[u8]| NewScanManifestSeenFilesystemEntry {

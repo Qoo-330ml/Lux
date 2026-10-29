@@ -88,6 +88,7 @@ mod jobs;
 mod library;
 mod manifest;
 mod names;
+pub(crate) mod symlink;
 
 #[cfg(test)]
 use jobs::local_metadata::{
@@ -462,6 +463,8 @@ fn manifest_entry_observation(
         inode: inode.and_then(|inode| i64::try_from(inode).ok()),
         fingerprint,
         fingerprint_pending,
+        is_symlink: false,
+        resolved_path: None,
     })
 }
 
@@ -511,6 +514,8 @@ fn manifest_entry_observation_from_stat(
         inode: i64::try_from(inode).ok(),
         fingerprint,
         fingerprint_pending,
+        is_symlink: false,
+        resolved_path: None,
     })
 }
 

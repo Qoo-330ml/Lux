@@ -24,7 +24,7 @@ use super::{
     metadata_auto_match_policy_for_scan_job_snapshot, normalize_incremental_path,
     notify_local_metadata_images_waiter, parse_episode_filename, parse_movie_filename,
     prepare_manifest_filename, read_manifest_strm_target, resolve_local_metadata_auto_match_policy,
-    safe_scan_activity_label, scan_lock_database_wait_backoff,
+    retain_link_observations, safe_scan_activity_label, scan_lock_database_wait_backoff,
     stat_manifest_directory_file_batch_sync, stat_manifest_relative_file_sync,
     stat_manifest_root_sync,
 };
@@ -3079,6 +3079,8 @@ fn manifest_root_without_stable_identity_is_never_authoritative() {
         inode: None,
         fingerprint: Vec::new(),
         fingerprint_pending: false,
+        is_symlink: false,
+        resolved_path: None,
     };
 
     assert!(!manifest_root_identity_matches(None, None, &observed));
@@ -3138,4 +3140,270 @@ async fn mixed_classification_cache_reuses_the_series_nfo_probe() {
         MixedClassification::Unresolved
     ));
     assert_eq!(cache.nfo_roots.len(), 1);
+}
+
+#[cfg(unix)]
+mod symlink_discovery {
+    use super::super::symlink::{DirectoryLinkPolicy, SymlinkPolicy};
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, symlink};
+    use std::path::Path;
+
+    fn discover(
+        root: &Path,
+        policy: SymlinkPolicy,
+    ) -> Result<Vec<NewScanManifestEntry>, Box<dyn std::error::Error>> {
+        let mut pending = vec![String::new()];
+        let mut entries = Vec::new();
+        while let Some(relative_directory) = pending.pop() {
+            let mut reader = ManifestDirectoryReader::open_with_policy(
+                root,
+                &relative_directory,
+                policy.clone(),
+            )?;
+            loop {
+                let (next_reader, batch) = reader.next_batch(64)?;
+                reader = next_reader;
+                pending.extend(batch.child_directories);
+                entries.extend(batch.entries);
+                if batch.completed {
+                    break;
+                }
+            }
+        }
+        Ok(entries
+            .into_iter()
+            .filter(|entry| entry.entry_kind == "FILE")
+            .collect())
+    }
+
+    fn fixture(
+        target_inside: bool,
+    ) -> Result<(tempfile::TempDir, PathBuf, PathBuf), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("Media");
+        std::fs::create_dir_all(root.join("Links"))?;
+        let target_directory = if target_inside {
+            std::fs::create_dir_all(root.join("Inside"))?;
+            root.join("Inside")
+        } else {
+            std::fs::create_dir_all(temp.path().join("Outside"))?;
+            temp.path().join("Outside")
+        };
+        let target = target_directory.join("Some.Movie.2024.mkv");
+        std::fs::write(&target, b"abcdef")?;
+        symlink(&target, root.join("Links").join("Some.Movie.2024.mkv"))?;
+        Ok((
+            temp,
+            std::fs::canonicalize(root)?,
+            std::fs::canonicalize(target)?,
+        ))
+    }
+
+    fn root_children() -> SymlinkPolicy {
+        SymlinkPolicy::new(DirectoryLinkPolicy::RootChildren, Vec::new())
+    }
+
+    #[test]
+    fn media_file_symlink_inside_the_root_is_observed_through_the_target()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, root, target) = fixture(true)?;
+        let entries = discover(&root, root_children())?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.relative_path == "Links/Some.Movie.2024.mkv")
+            .ok_or("the media symlink must be discovered")?;
+        assert_eq!(entry.size, 6, "size must come from the target");
+        assert_eq!(
+            entry.inode.and_then(|value| u64::try_from(value).ok()),
+            Some(std::fs::metadata(&target)?.ino()),
+            "identity must come from the target"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn media_file_symlink_outside_the_root_is_skipped_by_default()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, root, _target) = fixture(false)?;
+        let entries = discover(&root, root_children())?;
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.relative_path == "Links/Some.Movie.2024.mkv"),
+            "a target outside the library root must not be indexed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn configured_target_root_allows_an_external_media_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, root, target) = fixture(false)?;
+        let allowed = target.parent().ok_or("target has no parent")?.to_owned();
+        let entries = discover(
+            &root,
+            SymlinkPolicy::new(DirectoryLinkPolicy::RootChildren, vec![allowed]),
+        )?;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.relative_path == "Links/Some.Movie.2024.mkv"),
+            "an explicitly allowed target root must be followed"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn dangling_media_symlink_is_skipped_without_failing_the_scan()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("Media");
+        std::fs::create_dir_all(root.join("Links"))?;
+        symlink(
+            temp.path().join("Missing").join("Gone.2024.mkv"),
+            root.join("Links").join("Gone.2024.mkv"),
+        )?;
+        let root = std::fs::canonicalize(root)?;
+        let entries = discover(&root, root_children())?;
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.relative_path.starts_with("Links/"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn recheck_observes_the_symlink_target_with_the_same_policy()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, root, _target) = fixture(true)?;
+        let reader = ManifestDirectoryReader::open_with_policy(&root, "Links", root_children())?;
+        let (reader, batch) = reader.next_batch(8)?;
+        let expected = batch
+            .entries
+            .into_iter()
+            .find(|entry| entry.relative_path == "Links/Some.Movie.2024.mkv")
+            .ok_or("expected symlink observation")?;
+        let observed = stat_manifest_directory_file_batch_sync(
+            &root,
+            &reader.root_observation,
+            &reader.directory_observation,
+            std::slice::from_ref(&expected),
+        )?
+        .into_iter()
+        .next()
+        .flatten()
+        .ok_or("the recheck must still see the symlinked file")?;
+        assert_eq!(observed.size, expected.size);
+        assert_eq!(observed.inode, expected.inode);
+        Ok(())
+    }
+
+    #[test]
+    fn symlink_observation_records_its_resolved_path() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, root, target) = fixture(true)?;
+        let entries = discover(&root, root_children())?;
+        let entry = entries
+            .iter()
+            .find(|entry| entry.relative_path == "Links/Some.Movie.2024.mkv")
+            .ok_or("the media symlink must be discovered")?;
+        assert!(entry.is_symlink);
+        let expected = target.to_str().ok_or("target path is not utf8")?;
+        assert_eq!(entry.resolved_path.as_deref(), Some(expected));
+        Ok(())
+    }
+
+    #[test]
+    fn root_child_directory_symlink_is_walked() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("Media");
+        std::fs::create_dir_all(root.join("Real"))?;
+        std::fs::write(root.join("Real").join("Inside.2024.mkv"), b"x")?;
+        symlink(root.join("Real"), root.join("Alias"))?;
+        let root = std::fs::canonicalize(root)?;
+        let entries = discover(&root, root_children())?;
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.relative_path == "Real/Inside.2024.mkv")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.relative_path == "Alias/Inside.2024.mkv"),
+            "a linked directory directly under the root must be entered"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_directory_symlink_is_not_walked_under_root_children()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("Media");
+        std::fs::create_dir_all(root.join("A").join("B"))?;
+        std::fs::create_dir_all(root.join("Other"))?;
+        std::fs::write(root.join("Other").join("Deep.2024.mkv"), b"x")?;
+        symlink(root.join("Other"), root.join("A").join("B").join("Alias"))?;
+        let root = std::fs::canonicalize(root)?;
+        let entries = discover(&root, root_children())?;
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.relative_path.starts_with("A/B/Alias/")),
+            "root_children must stop at one level"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn directory_symlink_outside_the_root_is_not_walked() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("Media");
+        std::fs::create_dir_all(root.join("Links"))?;
+        std::fs::create_dir_all(temp.path().join("Outside"))?;
+        std::fs::write(temp.path().join("Outside").join("Hidden.2024.mkv"), b"x")?;
+        symlink(
+            temp.path().join("Outside"),
+            root.join("Links").join("Alias"),
+        )?;
+        let root = std::fs::canonicalize(root)?;
+        let entries = discover(&root, root_children())?;
+        assert!(
+            !entries
+                .iter()
+                .any(|entry| entry.relative_path.starts_with("Links/Alias/")),
+            "a linked directory outside the root must stay closed"
+        );
+        Ok(())
+    }
+}
+
+#[test]
+fn link_observation_replaces_the_real_path_in_a_batch() {
+    let entry = |relative_path: &str, is_symlink: bool, inode: i64| NewScanManifestEntry {
+        relative_path: relative_path.to_owned(),
+        entry_kind: "FILE".to_owned(),
+        size: 4,
+        modified_at: 7,
+        device: Some(11),
+        inode: Some(inode),
+        fingerprint: Vec::new(),
+        fingerprint_pending: false,
+        is_symlink,
+        resolved_path: is_symlink.then(|| "/media/real.mkv".to_owned()),
+    };
+    let mut observations = vec![
+        entry("Real.mkv", false, 42),
+        entry("Link.mkv", true, 42),
+        entry("Other.mkv", false, 43),
+    ];
+    retain_link_observations(&mut observations);
+    let paths: Vec<&str> = observations
+        .iter()
+        .map(|entry| entry.relative_path.as_str())
+        .collect();
+    assert_eq!(paths, ["Link.mkv", "Other.mkv"]);
 }

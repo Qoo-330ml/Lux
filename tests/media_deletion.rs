@@ -150,3 +150,58 @@ fn assert_no_staged_deletion_files(root: &Path) -> Result<(), Box<dyn std::error
     }
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn deleting_a_link_removes_the_link_and_keeps_the_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    fs::create_dir_all(root.join("Titles"))?;
+    let target = root.join("Titles").join("Example.Movie.2024.mkv");
+    fs::write(&target, b"fixture")?;
+    let link = root.join("Titles").join("Organised.Movie.2024.mkv");
+    symlink(&target, &link)?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-UTF-8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let (item_id, source_id): (String, String) = sqlx::query_as(
+        "SELECT mi.id, ms.id FROM media_items mi
+         JOIN media_sources ms ON ms.item_id = mi.id
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE mi.library_id = ? AND fe.relative_path LIKE '%Organised.Movie.2024.mkv' LIMIT 1",
+    )
+    .bind(library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+
+    MediaDeleteService::new(database.clone())
+        .delete(&item_id, Some(&source_id))
+        .await?;
+
+    assert!(
+        fs::symlink_metadata(&link).is_err(),
+        "the link itself must be removed"
+    );
+    assert_eq!(
+        fs::read(&target)?,
+        b"fixture",
+        "the link target must survive the deletion"
+    );
+    Ok(())
+}

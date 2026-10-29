@@ -29,6 +29,8 @@ impl ScanJobService {
                 .flatten()
                 .and_then(|value| usize::try_from(value).ok()),
             cancellation_flags: Arc::new(Mutex::new(HashMap::new())),
+            symlink_origins: Arc::new(Mutex::new(HashMap::new())),
+            visited_directories: Arc::new(Mutex::new(HashMap::new())),
             scan_run_registry: Arc::new(Mutex::new(ScanRunRegistry::default())),
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_metadata_image_notifications: Arc::new(Mutex::new(HashMap::new())),

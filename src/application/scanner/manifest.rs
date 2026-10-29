@@ -29,6 +29,7 @@ use std::os::{
     unix::{ffi::OsStrExt, fs::OpenOptionsExt},
 };
 
+use super::symlink::SymlinkPolicy;
 use super::{
     LibraryScanner, MANIFEST_STREAMED_ENTRY_BATCH_SIZE, MAX_STRM_TARGET_BYTES,
     ManifestFilenameInput, MixedClassification, PreparedManifestFilename, ScannerError,
@@ -327,6 +328,8 @@ pub(super) struct ManifestDirectoryReader {
     pub(super) root_observation: NewScanManifestEntry,
     pub(super) root_observation_emitted: bool,
     pub(super) directory_observation: NewScanManifestEntry,
+    pub(super) canonical_root: PathBuf,
+    pub(super) policy: SymlinkPolicy,
 }
 
 // The DIR stream is exclusively owned and is only accessed by one blocking task at a time.
@@ -346,9 +349,44 @@ unsafe impl Send for ManifestDirectoryReader {}
     target_os = "macos",
     target_os = "ios"
 ))]
+fn manifest_error_is_link_redirect(error: &ScannerError) -> bool {
+    match error {
+        ScannerError::InvalidRelativePath(_) => true,
+        ScannerError::Io { source, .. } => {
+            source.kind() == std::io::ErrorKind::NotADirectory
+                || source.raw_os_error() == Some(libc::ELOOP)
+        }
+        _ => false,
+    }
+}
+
+/// Open a linked directory through its canonical target when the policy allows it.
+fn open_allowed_linked_directory(
+    root_path: &Path,
+    display_path: &Path,
+    policy: &SymlinkPolicy,
+) -> Option<std::fs::File> {
+    let canonical_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_owned());
+    let canonical_target = std::fs::canonicalize(display_path).ok()?;
+    if !policy.allows_target(&canonical_root, &canonical_target) {
+        tracing::warn!(
+            path = %display_path.display(),
+            target = %canonical_target.display(),
+            "skipped a directory symbolic link whose target is outside the allowed roots"
+        );
+        return None;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(&canonical_target)
+        .ok()
+}
+
 pub(super) fn open_manifest_directory_identity(
     root_path: &Path,
     relative_directory: &str,
+    policy: &SymlinkPolicy,
 ) -> Result<(std::fs::File, NewScanManifestEntry, NewScanManifestEntry), ScannerError> {
     if !root_path.is_absolute() {
         return Err(ScannerError::InvalidRelativePath(
@@ -389,18 +427,39 @@ pub(super) fn open_manifest_directory_identity(
     let root_observation =
         manifest_entry_observation(String::new(), "DIRECTORY", &root_metadata, root_path)?;
 
+    let at_root = !relative_directory.contains('/');
     for component in Path::new(relative_directory).components() {
         let Component::Normal(name) = component else {
             return Err(ScannerError::InvalidRelativePath(
                 relative_directory.to_owned(),
             ));
         };
-        directory = open_manifest_directory_component(
+        match open_manifest_directory_component(
             directory.as_raw_fd(),
             name,
             &display_path,
             relative_directory,
-        )?;
+        ) {
+            Ok(next) => directory = next,
+            // A linked directory cannot be opened component by component: Linux
+            // reports ELOOP, macOS reports ENOTDIR for O_DIRECTORY. Fall back to
+            // the canonical target, which the policy must already allow.
+            Err(error)
+                if policy.follows_directory_at(at_root)
+                    && manifest_error_is_link_redirect(&error) =>
+            {
+                match open_allowed_linked_directory(root_path, &display_path, policy) {
+                    Some(linked) => {
+                        directory = linked;
+                        break;
+                    }
+                    // Keep the original error class: a link that is not allowed
+                    // must look like an absent directory, not a fatal scan error.
+                    None => return Err(error),
+                }
+            }
+            Err(error) => return Err(error),
+        }
     }
 
     let metadata = directory.metadata().map_err(|source| ScannerError::Io {
@@ -424,9 +483,21 @@ pub(super) fn open_manifest_directory_identity(
 ))]
 impl ManifestDirectoryReader {
     pub(super) fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
+        Self::open_with_policy(
+            root_path,
+            relative_directory,
+            SymlinkPolicy::current().clone(),
+        )
+    }
+
+    pub(super) fn open_with_policy(
+        root_path: &Path,
+        relative_directory: &str,
+        policy: SymlinkPolicy,
+    ) -> Result<Self, ScannerError> {
         let display_path = root_path.join(relative_directory);
         let (directory, root_observation, directory_observation) =
-            open_manifest_directory_identity(root_path, relative_directory)?;
+            open_manifest_directory_identity(root_path, relative_directory, &policy)?;
         // SAFETY: directory owns a valid descriptor, and fcntl does not take ownership.
         let entries_fd = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
         if entries_fd < 0 {
@@ -456,6 +527,9 @@ impl ManifestDirectoryReader {
             root_observation,
             root_observation_emitted: false,
             directory_observation,
+            canonical_root: std::fs::canonicalize(root_path)
+                .unwrap_or_else(|_| root_path.to_owned()),
+            policy,
         })
     }
 
@@ -546,6 +620,35 @@ impl ManifestDirectoryReader {
             // SAFETY: fstatat initialized the struct on success.
             let stat = unsafe { stat.assume_init() };
             let file_type = stat.st_mode & libc::S_IFMT;
+            if file_type == libc::S_IFLNK {
+                if is_supported_movie_file(Path::new(name))
+                    || super::library::is_supported_incremental_sidecar_file(Path::new(name))
+                {
+                    if let Some(FollowedSymlink::File(observation)) = followed_symlink_observation(
+                        &self.policy,
+                        &self.canonical_root,
+                        &path,
+                        &relative_path,
+                        self.relative_directory.is_empty(),
+                        true,
+                    ) {
+                        observations.push(observation);
+                    }
+                } else if let Some(FollowedSymlink::Directory(observation)) =
+                    followed_symlink_observation(
+                        &self.policy,
+                        &self.canonical_root,
+                        &path,
+                        &relative_path,
+                        self.relative_directory.is_empty(),
+                        false,
+                    )
+                {
+                    child_directories.push(relative_path.clone());
+                    observations.push(observation);
+                }
+                continue;
+            }
             let is_directory = file_type == libc::S_IFDIR;
             let is_regular_file = file_type == libc::S_IFREG;
             if !(is_directory
@@ -576,6 +679,7 @@ impl ManifestDirectoryReader {
         if completed && !self.directory_observation.relative_path.is_empty() {
             observations.push(self.directory_observation.clone());
         }
+        retain_link_observations(&mut observations);
         Ok((
             self,
             ManifestDirectoryBatch {
@@ -776,7 +880,23 @@ pub(super) fn stat_manifest_relative_file_sync(
     }
     // SAFETY: fstatat initialized the struct on success.
     let stat = unsafe { stat.assume_init() };
-    if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+    let file_type = stat.st_mode & libc::S_IFMT;
+    if file_type == libc::S_IFLNK {
+        return Ok(
+            match followed_symlink_observation(
+                &reader.policy,
+                &reader.canonical_root,
+                &root_path.join(relative_path),
+                relative_path,
+                false,
+                true,
+            ) {
+                Some(FollowedSymlink::File(observation)) => Some(observation),
+                _ => None,
+            },
+        );
+    }
+    if file_type != libc::S_IFREG {
         return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
     }
     manifest_entry_observation_from_stat(
@@ -842,10 +962,145 @@ pub(super) fn stat_manifest_relative_file_sync(
         Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(source) => return Err(ScannerError::Io { path, source }),
     };
+    if metadata.file_type().is_symlink() {
+        return Ok(
+            match followed_symlink_observation(
+                &reader.policy,
+                &reader.canonical_root,
+                &path,
+                relative_path,
+                false,
+                true,
+            ) {
+                Some(FollowedSymlink::File(observation)) => Some(observation),
+                _ => None,
+            },
+        );
+    }
     if !metadata.file_type().is_file() {
         return Err(ScannerError::InvalidRelativePath(relative_path.to_owned()));
     }
     manifest_entry_observation(relative_path.to_owned(), "FILE", &metadata, &path).map(Some)
+}
+
+pub(super) enum FollowedSymlink {
+    File(NewScanManifestEntry),
+    // Constructed once directory links are entered; kept here so the resolver
+    // owns the whole decision instead of scattering it across call sites.
+    #[allow(dead_code)]
+    Directory(NewScanManifestEntry),
+}
+
+/// Resolve a symbolic link found during discovery.
+///
+/// The link name decides whether an entry is a media candidate; the target
+/// decides type, size, mtime and identity, so later "did this file change"
+/// checks observe the target and not the link. A dangling link, a target of the
+/// wrong kind, or a target outside the allowed range is skipped with a
+/// diagnostic and never fails the scan.
+pub(super) fn followed_symlink_observation(
+    policy: &SymlinkPolicy,
+    canonical_root: &Path,
+    link_path: &Path,
+    relative_path: &str,
+    at_root: bool,
+    expects_media_file: bool,
+) -> Option<FollowedSymlink> {
+    let canonical_target = match std::fs::canonicalize(link_path) {
+        Ok(target) => target,
+        Err(source) => {
+            tracing::warn!(
+                path = %link_path.display(),
+                error = %source,
+                "skipped a symbolic link whose target cannot be resolved"
+            );
+            return None;
+        }
+    };
+    if !policy.allows_target(canonical_root, &canonical_target) {
+        tracing::warn!(
+            path = %link_path.display(),
+            target = %canonical_target.display(),
+            "skipped a symbolic link whose target is outside the allowed roots"
+        );
+        return None;
+    }
+    let metadata = match std::fs::metadata(&canonical_target) {
+        Ok(metadata) => metadata,
+        Err(source) => {
+            tracing::warn!(
+                path = %link_path.display(),
+                error = %source,
+                "skipped a symbolic link whose target cannot be read"
+            );
+            return None;
+        }
+    };
+    let resolved_path = canonical_target.to_string_lossy().into_owned();
+    if expects_media_file {
+        if !metadata.is_file() {
+            return None;
+        }
+        let mut observation =
+            manifest_entry_observation(relative_path.to_owned(), "FILE", &metadata, link_path)
+                .ok()?;
+        observation.is_symlink = true;
+        observation.resolved_path = Some(resolved_path);
+        return Some(FollowedSymlink::File(observation));
+    }
+    if !metadata.is_dir() || !policy.follows_directory_at(at_root) {
+        return None;
+    }
+    let mut observation =
+        manifest_entry_observation(relative_path.to_owned(), "DIRECTORY", &metadata, link_path)
+            .ok()?;
+    observation.is_symlink = true;
+    observation.resolved_path = Some(resolved_path);
+    Some(FollowedSymlink::Directory(observation))
+}
+
+/// Keep the user's link path when a batch observes the same file twice.
+///
+/// A directory can hold both `Some.Movie.2024.mkv` and a link to it. Both carry
+/// the same `(device, inode)`, and the link is the path the user organised the
+/// library around, so the real name is dropped here instead of becoming a
+/// second entry for the same bytes.
+pub(super) fn retain_link_observations(observations: &mut Vec<NewScanManifestEntry>) {
+    let link_identities: std::collections::HashSet<(i64, i64)> = observations
+        .iter()
+        .filter(|entry| entry.entry_kind == "FILE" && entry.is_symlink)
+        .filter_map(|entry| entry.device.zip(entry.inode))
+        .collect();
+    if link_identities.is_empty() {
+        return;
+    }
+    observations.retain(|entry| {
+        if entry.entry_kind != "FILE" || entry.is_symlink {
+            return true;
+        }
+        match (entry.device, entry.inode) {
+            (Some(device), Some(inode)) => !link_identities.contains(&(device, inode)),
+            _ => true,
+        }
+    });
+}
+
+/// Whether a media link may be collected by a non-manifest walker.
+///
+/// Shares the resolver and the policy with the manifest reader so both
+/// discovery paths accept exactly the same links.
+pub(super) fn followed_symlink_file_is_allowed(canonical_root: &Path, link_path: &Path) -> bool {
+    matches!(
+        followed_symlink_observation(
+            SymlinkPolicy::current(),
+            canonical_root,
+            link_path,
+            &link_path.to_string_lossy(),
+            false,
+            true,
+        ),
+        Some(FollowedSymlink::File(_))
+    )
 }
 
 pub(super) fn manifest_directory_observation_matches(
@@ -1001,7 +1256,23 @@ pub(super) fn verify_manifest_directory_observation_sync(
             path: directory_path.clone(),
             source,
         })?;
-    if canonical_directory != directory_path || !directory_metadata.is_dir() {
+    let directory_metadata = if directory_metadata.file_type().is_symlink() {
+        if !crate::application::scanner::symlink::path_is_allowed(
+            &canonical_root,
+            &canonical_directory,
+        ) {
+            return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+        }
+        std::fs::metadata(&directory_path).map_err(|source| ScannerError::Io {
+            path: directory_path.clone(),
+            source,
+        })?
+    } else if canonical_directory != directory_path {
+        return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
+    } else {
+        directory_metadata
+    };
+    if !directory_metadata.is_dir() {
         return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
     }
     let current_directory = manifest_entry_observation(
@@ -1064,6 +1335,7 @@ pub(super) fn stat_manifest_directory_file_batch_sync(
     let (directory, current_root, current_directory) = match open_manifest_directory_identity(
         root_path,
         &expected_directory_observation.relative_path,
+        SymlinkPolicy::current(),
     ) {
         Ok(observations) => observations,
         Err(ScannerError::InvalidRelativePath(_)) => {
@@ -1081,8 +1353,11 @@ pub(super) fn stat_manifest_directory_file_batch_sync(
     ) {
         return Err(ScannerError::RootIdentityChanged(root_path.to_owned()));
     }
+    let canonical_root = std::fs::canonicalize(root_path).unwrap_or_else(|_| root_path.to_owned());
     let current_files = stat_manifest_directory_files_from_handle(
         root_path,
+        &canonical_root,
+        SymlinkPolicy::current(),
         &directory,
         &expected_directory_observation.relative_path,
         expected_files,
@@ -1139,6 +1414,8 @@ pub(super) fn stat_manifest_directory_file_batch_sync(
 ))]
 pub(super) fn stat_manifest_directory_files_from_handle(
     root_path: &Path,
+    canonical_root: &Path,
+    policy: &SymlinkPolicy,
     directory: &std::fs::File,
     relative_directory: &str,
     expected_files: &[NewScanManifestEntry],
@@ -1174,7 +1451,24 @@ pub(super) fn stat_manifest_directory_files_from_handle(
         }
         // SAFETY: fstatat initialized the stat value on success.
         let stat = unsafe { stat.assume_init() };
-        if stat.st_mode & libc::S_IFMT != libc::S_IFREG {
+        let file_type = stat.st_mode & libc::S_IFMT;
+        if file_type == libc::S_IFLNK {
+            observations.push(
+                match followed_symlink_observation(
+                    policy,
+                    canonical_root,
+                    &root_path.join(&expected.relative_path),
+                    &expected.relative_path,
+                    false,
+                    true,
+                ) {
+                    Some(FollowedSymlink::File(observation)) => Some(observation),
+                    _ => None,
+                },
+            );
+            continue;
+        }
+        if file_type != libc::S_IFREG {
             observations.push(None);
             continue;
         }
@@ -1440,6 +1734,10 @@ pub(super) async fn prepare_manifest_delta(
         inode,
         fingerprint,
         fingerprint_pending: false,
+        // Deltas do not carry link provenance; de-duplication runs on the
+        // observation side, before a delta is produced.
+        is_symlink: false,
+        resolved_path: None,
     };
     let filename_input = if library_kind == "HOMEVIDEOS" {
         ManifestFilenameInput::HomeVideos
@@ -1655,6 +1953,8 @@ pub(super) struct ManifestDirectoryReader {
     pub(super) root_observation: NewScanManifestEntry,
     pub(super) root_observation_emitted: bool,
     pub(super) directory_observation: NewScanManifestEntry,
+    pub(super) canonical_root: PathBuf,
+    pub(super) policy: SymlinkPolicy,
 }
 
 #[cfg(not(any(
@@ -1665,6 +1965,18 @@ pub(super) struct ManifestDirectoryReader {
 )))]
 impl ManifestDirectoryReader {
     pub(super) fn open(root_path: &Path, relative_directory: &str) -> Result<Self, ScannerError> {
+        Self::open_with_policy(
+            root_path,
+            relative_directory,
+            SymlinkPolicy::current().clone(),
+        )
+    }
+
+    pub(super) fn open_with_policy(
+        root_path: &Path,
+        relative_directory: &str,
+        policy: SymlinkPolicy,
+    ) -> Result<Self, ScannerError> {
         let canonical_root_path =
             std::fs::canonicalize(root_path).map_err(|source| ScannerError::Io {
                 path: root_path.to_owned(),
@@ -1718,11 +2030,13 @@ impl ManifestDirectoryReader {
         Ok(Self {
             root_path: root_path.to_owned(),
             relative_directory: relative_directory.to_owned(),
-            directory_path: canonical_directory_path,
+            directory_path: canonical_directory_path.clone(),
             entries,
             root_observation,
             root_observation_emitted: false,
             directory_observation,
+            canonical_root: canonical_root_path,
+            policy,
         })
     }
 
@@ -1767,6 +2081,41 @@ impl ManifestDirectoryReader {
                 path: path.clone(),
                 source,
             })?;
+            if file_type.is_symlink() {
+                let relative_path = path
+                    .strip_prefix(&self.root_path)
+                    .map_err(|error| ScannerError::InvalidRelativePath(error.to_string()))?
+                    .to_str()
+                    .ok_or(ScannerError::NonUtf8Path)?
+                    .to_owned();
+                if is_supported_movie_file(&path)
+                    || super::library::is_supported_incremental_sidecar_file(&path)
+                {
+                    if let Some(FollowedSymlink::File(observation)) = followed_symlink_observation(
+                        &self.policy,
+                        &self.canonical_root,
+                        &path,
+                        &relative_path,
+                        self.relative_directory.is_empty(),
+                        true,
+                    ) {
+                        observations.push(observation);
+                    }
+                } else if let Some(FollowedSymlink::Directory(observation)) =
+                    followed_symlink_observation(
+                        &self.policy,
+                        &self.canonical_root,
+                        &path,
+                        &relative_path,
+                        self.relative_directory.is_empty(),
+                        false,
+                    )
+                {
+                    child_directories.push(relative_path.clone());
+                    observations.push(observation);
+                }
+                continue;
+            }
             if !(file_type.is_dir()
                 || file_type.is_file()
                     && (is_supported_movie_file(&path)
@@ -1805,6 +2154,7 @@ impl ManifestDirectoryReader {
         if completed && !self.directory_observation.relative_path.is_empty() {
             observations.push(self.directory_observation.clone());
         }
+        retain_link_observations(&mut observations);
         Ok((
             self,
             ManifestDirectoryBatch {

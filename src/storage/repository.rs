@@ -2816,6 +2816,10 @@ pub(crate) struct NewScanManifestEntry {
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
     pub(crate) fingerprint_pending: bool,
+    /// The observation was produced by a symbolic link rather than by the file
+    /// itself; `resolved_path` holds the canonical target it resolved to.
+    pub(crate) is_symlink: bool,
+    pub(crate) resolved_path: Option<String>,
 }
 
 pub(crate) struct NewScanManifestDiscoveryChunk<'a> {

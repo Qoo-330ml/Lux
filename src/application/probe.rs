@@ -1338,7 +1338,9 @@ async fn confine_to_root(root_path: &str, path: PathBuf) -> Option<PathBuf> {
     ) else {
         return Some(path);
     };
-    if canonical.starts_with(&root) {
+    if canonical.starts_with(&root)
+        || crate::application::scanner::symlink::path_is_allowed(&root, &canonical)
+    {
         Some(canonical)
     } else {
         tracing::warn!(
@@ -1387,7 +1389,9 @@ pub(crate) async fn read_media_info_sidecar_from_root(
     })?;
     let root = fs::canonicalize(root_path).await.map_err(ProbeError::Io)?;
     let path = fs::canonicalize(path).await.map_err(ProbeError::Io)?;
-    if !path.starts_with(root) {
+    if !path.starts_with(&root)
+        && !crate::application::scanner::symlink::path_is_allowed(&root, &path)
+    {
         return Err(ProbeError::InvalidOutput(
             "media info path is outside its library root".to_owned(),
         ));

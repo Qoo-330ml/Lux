@@ -162,20 +162,23 @@ impl Database {
                 continue;
             }
             if let Some(sequence_start) = observation_sequence_start {
-                let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", entry_chunk.len())
-                    .collect::<Vec<_>>()
-                    .join(", ");
+                let values =
+                    std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", entry_chunk.len())
+                        .collect::<Vec<_>>()
+                        .join(", ");
                 let query = format!(
                     "WITH incoming (
                          relative_path, observation_sequence, entry_kind, size,
-                         modified_at, device, inode, fingerprint
+                         modified_at, device, inode, fingerprint, is_symlink, resolved_path
                      ) AS (VALUES {values})
                      INSERT INTO scan_manifest_entries (
                          manifest_id, library_root_id, relative_path, observation_sequence,
-                         entry_kind, size, modified_at, device, inode, fingerprint, observed_at
+                         entry_kind, size, modified_at, device, inode, fingerprint,
+                         is_symlink, resolved_path, observed_at
                      )
                      SELECT ?, ?, relative_path, observation_sequence, entry_kind, size,
-                            modified_at, device, inode, fingerprint, unixepoch()
+                            modified_at, device, inode, fingerprint, is_symlink,
+                            resolved_path, unixepoch()
                      FROM incoming"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -197,7 +200,9 @@ impl Database {
                         .bind(entry.modified_at)
                         .bind(entry.device)
                         .bind(entry.inode)
-                        .bind(entry.fingerprint.as_slice());
+                        .bind(entry.fingerprint.as_slice())
+                        .bind(i64::from(entry.is_symlink))
+                        .bind(entry.resolved_path.as_deref());
                 }
                 statement = statement
                     .bind(chunk.manifest_id)
@@ -215,7 +220,7 @@ impl Database {
                             (SELECT COALESCE(MAX(observation_sequence), 0) + 1
                              FROM scan_manifest_entries
                              WHERE manifest_id = ? AND library_root_id = ? AND relative_path = ?),
-                            ?, ?, ?, ?, ?, ?, unixepoch()",
+                            ?, ?, ?, ?, ?, ?, ?, ?, unixepoch()",
                     entry_chunk.len(),
                 )
                 .collect::<Vec<_>>()
@@ -223,7 +228,8 @@ impl Database {
                 let query = format!(
                     "INSERT INTO scan_manifest_entries (
                          manifest_id, library_root_id, relative_path, observation_sequence,
-                         entry_kind, size, modified_at, device, inode, fingerprint, observed_at
+                         entry_kind, size, modified_at, device, inode, fingerprint,
+                         is_symlink, resolved_path, observed_at
                      ) {selects}"
                 );
                 let mut statement = self.query(sqlx::AssertSqlSafe(query));
@@ -240,7 +246,9 @@ impl Database {
                         .bind(entry.modified_at)
                         .bind(entry.device)
                         .bind(entry.inode)
-                        .bind(entry.fingerprint.as_slice());
+                        .bind(entry.fingerprint.as_slice())
+                        .bind(i64::from(entry.is_symlink))
+                        .bind(entry.resolved_path.as_deref());
                 }
                 statement
                     .execute(&mut **transaction)
@@ -261,7 +269,7 @@ pub(super) fn observation_batch_row_cap(
     backend: crate::config::DatabaseBackend,
     has_sequence: bool,
 ) -> usize {
-    let binds_per_row = if has_sequence { 8 } else { 12 };
+    let binds_per_row = if has_sequence { 10 } else { 14 };
     super::super::max_sql_bind_parameters(backend)
         .saturating_sub(2)
         .checked_div(binds_per_row)
@@ -276,24 +284,24 @@ mod tests {
 
     #[test]
     fn observation_rows_are_capped_by_the_statement_bind_budget() {
-        // SQLite accepts 32,766 variables: 12 binds per row leaves room for 2,730 rows; the
-        // sequence shape uses 8 binds per row.
+        // SQLite accepts 32,766 variables: 14 binds per row (link provenance adds two)
+        // leaves room for 2,340 rows; the sequence shape uses 10 binds per row.
         assert_eq!(
             observation_batch_row_cap(DatabaseBackend::Sqlite, false),
-            2_730
+            2_340
         );
         assert_eq!(
             observation_batch_row_cap(DatabaseBackend::Sqlite, true),
-            4_095
+            3_276
         );
-        // PostgreSQL's 65,535 budget stays above the discovery page for both shapes.
+        // PostgreSQL's 65,535 budget: 4,680 rows without a sequence, 6,553 with one.
         assert_eq!(
             observation_batch_row_cap(DatabaseBackend::Postgres, false),
-            5_461
+            4_680
         );
         assert_eq!(
             observation_batch_row_cap(DatabaseBackend::Postgres, true),
-            8_191
+            6_553
         );
     }
 }

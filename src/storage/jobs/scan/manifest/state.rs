@@ -451,6 +451,173 @@ impl Database {
             })
     }
 
+    /// Project link provenance from this manifest's observations onto the
+    /// canonical filesystem rows.
+    ///
+    /// Discovery runs in batches and cannot dedupe across directories, so the
+    /// link marker is carried by the observation table and copied here once the
+    /// apply pass has settled the rows. Rows that stopped being links are reset,
+    /// otherwise a link replaced by a real file would keep a stale target.
+    pub(crate) async fn project_scan_manifest_symlink_origin(
+        &self,
+        manifest_id: &str,
+    ) -> Result<(), StorageError> {
+        // COUNT keeps the probe backend-neutral: SQLite returns INTEGER for
+        // EXISTS while PostgreSQL returns BOOLEAN.
+        let link_observations: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM scan_manifest_entries
+                 WHERE manifest_id = ? AND entry_kind = 'FILE' AND is_symlink = 1",
+            )
+            .bind(manifest_id)
+            .fetch_one(self.pool())
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        if link_observations == 0 {
+            return Ok(());
+        }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        self.query(
+            "UPDATE filesystem_entries
+             SET is_symlink = 1,
+                 resolved_path = (
+                     SELECT observation.resolved_path
+                     FROM scan_manifest_entries AS observation
+                     WHERE observation.manifest_id = ?
+                       AND observation.library_root_id = filesystem_entries.library_root_id
+                       AND observation.relative_path = filesystem_entries.relative_path
+                       AND observation.entry_kind = 'FILE'
+                       AND observation.is_symlink = 1
+                     ORDER BY observation.observation_sequence DESC
+                     LIMIT 1
+                 )
+             WHERE EXISTS (
+                 SELECT 1
+                 FROM scan_manifest_entries AS observation
+                 WHERE observation.manifest_id = ?
+                   AND observation.library_root_id = filesystem_entries.library_root_id
+                   AND observation.relative_path = filesystem_entries.relative_path
+                   AND observation.entry_kind = 'FILE'
+                   AND observation.is_symlink = 1
+             )",
+        )
+        .bind(manifest_id)
+        .bind(manifest_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        self.query(
+            "UPDATE filesystem_entries
+             SET is_symlink = 0, resolved_path = NULL
+             WHERE is_symlink = 1
+               AND EXISTS (
+                   SELECT 1
+                   FROM scan_manifest_entries AS observation
+                   WHERE observation.manifest_id = ?
+                     AND observation.library_root_id = filesystem_entries.library_root_id
+                     AND observation.relative_path = filesystem_entries.relative_path
+                     AND observation.entry_kind = 'FILE'
+               )
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM scan_manifest_entries AS observation
+                   WHERE observation.manifest_id = ?
+                     AND observation.library_root_id = filesystem_entries.library_root_id
+                     AND observation.relative_path = filesystem_entries.relative_path
+                     AND observation.entry_kind = 'FILE'
+                     AND observation.is_symlink = 1
+               )",
+        )
+        .bind(manifest_id)
+        .bind(manifest_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })?;
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Mark the settled filesystem rows that discovery observed through a link.
+    ///
+    /// Called once per job after indexing, with the identities collected during
+    /// discovery. Matching on `(device, inode, relative_path)` keeps it precise
+    /// even when the same bytes are reachable through several paths.
+    pub(crate) async fn mark_filesystem_entry_symlink_origins(
+        &self,
+        origins: &[(i64, i64, String, String)],
+    ) -> Result<u64, StorageError> {
+        if origins.is_empty() {
+            return Ok(0);
+        }
+        let mut transaction = self.begin_scan_write_transaction().await?;
+        let mut updated = 0_u64;
+        for (device, inode, relative_path, resolved_path) in origins {
+            updated = updated.saturating_add(
+                self.query(
+                    "UPDATE filesystem_entries
+                     SET is_symlink = 1, resolved_path = ?
+                     WHERE device = ? AND inode = ? AND relative_path = ?
+                       AND entry_kind = 'FILE'",
+                )
+                .bind(resolved_path)
+                .bind(device)
+                .bind(inode)
+                .bind(relative_path)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected(),
+            );
+            // The same bytes may also be reachable through another path that the
+            // scan happened to settle first, in a different directory or batch.
+            // One identity keeps one entry, and the link path is the one the user
+            // organised the library around.
+            updated = updated.saturating_add(
+                self.query(
+                    "UPDATE filesystem_entries
+                     SET is_missing = 1
+                     WHERE device = ? AND inode = ? AND relative_path <> ?
+                       AND entry_kind = 'FILE' AND is_missing = 0",
+                )
+                .bind(device)
+                .bind(inode)
+                .bind(relative_path)
+                .execute(&mut *transaction)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: self.path.clone(),
+                    source,
+                })?
+                .rows_affected(),
+            );
+        }
+        transaction
+            .commit()
+            .await
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })?;
+        Ok(updated)
+    }
+
     pub(crate) async fn get_scan_manifest_root_identity(
         &self,
         manifest_id: &str,

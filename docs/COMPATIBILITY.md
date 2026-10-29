@@ -1371,4 +1371,5 @@ SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在
 | 读模型派生行形状变更 | 递增 `READ_MODEL_SCHEMA_VERSION` 后重启，自动重建 | 旧行被忽略，新构建重建 |
 | 搜索入队（W4） | 迁移 `0237` 已随发布落地；回退需重新部署旧二进制，旧触发器由遗留修复路径重建 | FTS 会在旧二进制启动时由触发器继续维护；出队行残留在 `catalog_outbox`，可安全清空 |
 | JSON gzip/ETag（W5） | 移除 `CompressionLayer`/`json_response_etag` 两个 layer | 无数据影响；客户端立即回到整包传输 |
+| 符号链接媒体源（0.7.1） | 把 `LUX_SYMLINK_POLICY` 设为 `none` 只停用目录链接；文件链接按目标识别是固定的，完全回到旧行为需重新部署 0.7.0 二进制 | 迁移 `0239`/`0241` 只加 `is_symlink`、`resolved_path` 两列，旧二进制可忽略；链接布局若已入库，重扫会按策略不再发现这些路径，条目按缺失处理，目标文件不受影响 |
 | 迁移配对清单（W6） | 删除 `docs/migration-map.json` 即跳过校验 | 无运行期影响 |

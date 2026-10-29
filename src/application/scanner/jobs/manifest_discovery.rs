@@ -3,6 +3,90 @@ use crate::application::background_work::{
     BackgroundWorkStage, acquire_process_background_work, run_process_background_blocking,
 };
 
+impl ScanJobService {
+    /// Remember which files this job observed through a symbolic link.
+    ///
+    /// Discovery is the only place that knows a row came from a link; the row
+    /// itself is settled later, possibly in a batch that never touches the
+    /// observation table.
+    fn record_symlink_observations(&self, job_id: &str, entries: &[NewScanManifestEntry]) {
+        if !entries.iter().any(|entry| entry.is_symlink) {
+            return;
+        }
+        let Ok(mut origins) = self.symlink_origins.lock() else {
+            return;
+        };
+        let job = origins.entry(job_id.to_owned()).or_default();
+        for entry in entries {
+            let (Some(device), Some(inode), Some(resolved_path)) =
+                (entry.device, entry.inode, entry.resolved_path.as_deref())
+            else {
+                continue;
+            };
+            job.insert(
+                (device, inode),
+                (entry.relative_path.clone(), resolved_path.to_owned()),
+            );
+        }
+    }
+
+    /// Drop child directories whose identity this job already walked.
+    ///
+    /// The first path that claims a directory identity wins, so a linked subtree
+    /// and a real subtree never yield two copies of the same files, and a link
+    /// pointing back at an ancestor stops instead of looping.
+    fn filter_visited_directories(
+        &self,
+        job_id: &str,
+        observations: &[NewScanManifestEntry],
+        child_directories: &mut Vec<String>,
+    ) {
+        if child_directories.is_empty() {
+            return;
+        }
+        let Ok(mut registry) = self.visited_directories.lock() else {
+            return;
+        };
+        let visited = registry.entry(job_id.to_owned()).or_default();
+        let pending: std::collections::HashSet<&str> =
+            child_directories.iter().map(String::as_str).collect();
+        // The directory this batch belongs to is already walked; record it so a
+        // link pointing back at it is recognised as a cycle.
+        for entry in observations
+            .iter()
+            .filter(|entry| entry.entry_kind == "DIRECTORY")
+            .filter(|entry| !pending.contains(entry.relative_path.as_str()))
+        {
+            if let (Some(device), Some(inode)) = (entry.device, entry.inode) {
+                visited.insert((device, inode));
+            }
+        }
+        let identities: HashMap<&str, (i64, i64)> = observations
+            .iter()
+            .filter(|entry| entry.entry_kind == "DIRECTORY")
+            .filter_map(|entry| {
+                entry
+                    .device
+                    .zip(entry.inode)
+                    .map(|identity| (entry.relative_path.as_str(), identity))
+            })
+            .collect();
+        let mut kept = Vec::with_capacity(child_directories.len());
+        for relative in child_directories.drain(..) {
+            match identities.get(relative.as_str()) {
+                Some(identity) if !visited.insert(*identity) => {
+                    tracing::debug!(
+                        directory = %relative,
+                        "skipped a directory whose identity is already walked"
+                    );
+                }
+                _ => kept.push(relative),
+            }
+        }
+        *child_directories = kept;
+    }
+}
+
 fn complete_pending_manifest_fingerprints_sync(
     entries: &mut [NewScanManifestEntry],
     baselines: &HashMap<String, crate::storage::StoredScanManifestFilesystemBaseline>,
@@ -232,6 +316,8 @@ impl ScanJobService {
             let completed = batch.completed;
             let mut child_directories = batch.child_directories;
             let mut observations = batch.entries;
+            self.record_symlink_observations(context.job_id, &observations);
+            self.filter_visited_directories(context.job_id, &observations, &mut child_directories);
             result
                 .child_directories
                 .extend(child_directories.iter().cloned());
@@ -785,6 +871,8 @@ impl ScanJobService {
 
                 let mut child_directories = batch.child_directories;
                 let mut entries = batch.entries;
+                self.record_symlink_observations(context.job_id, &entries);
+                self.filter_visited_directories(context.job_id, &entries, &mut child_directories);
                 result
                     .child_directories
                     .extend(child_directories.iter().cloned());

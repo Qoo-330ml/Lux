@@ -9488,3 +9488,171 @@ async fn finish_scan(
     jobs.run_to_completion(job_id, 100, None).await?;
     Ok(())
 }
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_observation_replaces_the_real_path_entry() -> Result<(), Box<dyn std::error::Error>>
+{
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Some.Movie.2024");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    let real = movie_dir.join("Some.Movie.2024.mkv");
+    tokio::fs::write(&real, b"movie").await?;
+    symlink(&real, movie_dir.join("Organised.Movie.2024.mkv"))?;
+    // Keep the job on the persisted manifest path instead of the lite path.
+    for index in 0..4 {
+        tokio::fs::write(root.join(format!("Filler.{index}.2024.mkv")), b"filler").await?;
+    }
+    let root = tokio::fs::canonicalize(&root).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let stored: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+        "SELECT relative_path, is_symlink, resolved_path FROM filesystem_entries
+         WHERE library_root_id = ? AND entry_kind = 'FILE' AND is_missing = 0
+           AND relative_path LIKE 'Some.Movie.2024/%'
+         ORDER BY relative_path",
+    )
+    .bind(root_record.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        stored.len(),
+        1,
+        "one file identity must keep one entry: {stored:?}"
+    );
+    assert!(
+        stored[0].0.ends_with("Organised.Movie.2024.mkv"),
+        "the link path is the one the user organised the library around: {stored:?}"
+    );
+    assert_eq!(stored[0].1, 1, "the entry must be marked as a link");
+    assert!(
+        stored[0]
+            .2
+            .as_deref()
+            .is_some_and(|path| path.ends_with("Some.Movie.2024.mkv")),
+        "the resolved target must be persisted: {stored:?}"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn directory_link_pointing_at_the_root_does_not_loop()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(root.join("Titles")).await?;
+    tokio::fs::write(root.join("Titles").join("Loop.Movie.2024.mkv"), b"movie").await?;
+    // A link that points back at the root must be recognised as an already
+    // walked identity instead of being re-entered forever.
+    symlink(&root, root.join("Back"))?;
+    let root = tokio::fs::canonicalize(&root).await?;
+    let root_record = libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?
+        .root;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT relative_path FROM filesystem_entries
+         WHERE library_root_id = ? AND entry_kind = 'FILE' AND is_missing = 0
+         ORDER BY relative_path",
+    )
+    .bind(root_record.id.to_string())
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        stored,
+        vec!["Titles/Loop.Movie.2024.mkv".to_owned()],
+        "the loop link must not duplicate the subtree"
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn one_file_identity_keeps_one_source_across_directories()
+-> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::symlink;
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(root.join("Shelved")).await?;
+    tokio::fs::create_dir_all(root.join("Originals")).await?;
+    let real = root.join("Originals").join("Shared.Movie.2024.mkv");
+    tokio::fs::write(&real, b"movie").await?;
+    // A second directory reaches the same bytes through a link, so the scan
+    // observes one identity under two paths in different batches.
+    symlink(&real, root.join("Shelved").join("Shared.Movie.2024.mkv"))?;
+    let root = tokio::fs::canonicalize(&root).await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+
+    let sources: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT fe.relative_path, fe.is_symlink FROM media_sources ms
+         JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+         WHERE fe.device IS NOT NULL AND fe.relative_path LIKE '%Shared.Movie.2024.mkv'
+           AND fe.is_missing = 0
+         ORDER BY fe.relative_path",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        sources.len(),
+        1,
+        "one identity must settle as one source: {sources:?}"
+    );
+    assert!(
+        sources[0].0.contains("Shelved"),
+        "the link path must be the surviving one: {sources:?}"
+    );
+    assert_eq!(sources[0].1, 1);
+    Ok(())
+}

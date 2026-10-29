@@ -282,6 +282,7 @@ pub(super) struct FileBatchWalker {
     directories: Vec<PathBuf>,
     current: Option<(PathBuf, fs::ReadDir)>,
     include_sidecars: bool,
+    canonical_root: PathBuf,
 }
 
 impl FileBatchWalker {
@@ -290,6 +291,7 @@ impl FileBatchWalker {
             directories: vec![root.to_owned()],
             current: None,
             include_sidecars: false,
+            canonical_root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned()),
         }
     }
 
@@ -298,6 +300,7 @@ impl FileBatchWalker {
             directories: vec![root.to_owned()],
             current: None,
             include_sidecars: true,
+            canonical_root: std::fs::canonicalize(root).unwrap_or_else(|_| root.to_owned()),
         }
     }
 
@@ -334,6 +337,17 @@ impl FileBatchWalker {
                         path: path.clone(),
                         source,
                     })?;
+                    if file_type.is_symlink() {
+                        let candidate = is_supported_movie_file(&path)
+                            || (self.include_sidecars
+                                && is_supported_incremental_sidecar_file(&path));
+                        if candidate
+                            && followed_symlink_file_is_allowed(&self.canonical_root, &path)
+                        {
+                            files.push(path);
+                        }
+                        continue;
+                    }
                     if file_type.is_file()
                         && (is_supported_movie_file(&path)
                             || (self.include_sidecars

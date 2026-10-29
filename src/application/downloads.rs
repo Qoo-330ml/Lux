@@ -117,7 +117,10 @@ impl DownloadService {
     ) -> Result<DownloadArtifact, DownloadError> {
         let root = fs::canonicalize(root_path).await?;
         let media_path = fs::canonicalize(root.join(relative_path)).await?;
-        if !media_path.starts_with(&root) || media_path == root {
+        if media_path == root
+            || (!media_path.starts_with(&root)
+                && !crate::application::scanner::symlink::path_is_allowed(&root, &media_path))
+        {
             return Err(DownloadError::PathOutsideRoot(media_path));
         }
         let metadata = fs::metadata(&media_path).await?;
