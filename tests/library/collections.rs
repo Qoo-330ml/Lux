@@ -1,7 +1,7 @@
 use std::time::Duration;
 
-use axum::{Json, Router, routing::get};
 use crate::common::{TestScraper, TestScraperConfig};
+use axum::{Json, Router, routing::get};
 use luxd::{
     api::{AppState, app_with_state},
     application::{

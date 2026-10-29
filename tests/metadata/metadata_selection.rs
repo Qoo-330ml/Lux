@@ -6,6 +6,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use crate::common::{TestScraper, TestScraperConfig};
 use axum::{
     Json, Router,
     body::Body,
@@ -14,7 +15,6 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get},
 };
-use crate::common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{

@@ -15,7 +15,6 @@ use axum::{
     routing::any,
 };
 
-
 use crate::common::{TestScraper, TestScraperConfig};
 use luxd::application::{
     candidates::MetadataSelectionService,

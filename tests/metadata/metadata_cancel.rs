@@ -6,8 +6,8 @@ use std::{
     time::Duration,
 };
 
-use axum::{Json, Router, extract::State, http::Uri, routing::any};
 use crate::common::{TestScraper, TestScraperConfig};
+use axum::{Json, Router, extract::State, http::Uri, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
