@@ -5,7 +5,7 @@ use luxd::{
     application::restart::{RestartHandle, ShutdownReason},
     application::{settings::read_network_proxy_url, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
-    config::Config,
+    config::{Config, DatabaseConfiguration},
     discovery::{DiscoveryConfig, DiscoveryService},
     observability,
     storage::{Database, StorageError},
@@ -14,8 +14,10 @@ use std::net::SocketAddr;
 use tokio::{net::TcpListener, sync::watch};
 use tracing::{error, info};
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn main() -> Result<(), BoxError> {
     let config = Config::from_env()?;
     let discovery_config = DiscoveryConfig::from_env(config.http_addr)?;
     let (_logging_guard, _log_store) = observability::init(&config.config_dir).await;
@@ -23,6 +25,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // reads it for every forwarded request, and `/proc` lookups must not run on Tokio workers.
     luxd::application::container_gateway::warm_up();
     luxd::application::plugin_compat::migrate_legacy_tmdb_config(&config.config_dir).await?;
+    let (database, requires_database_selection) = prepare_database(&config).await?;
+    repair_historical_data(&database).await;
+    start_shared_workers(&database).await?;
+    let (control_tx, control_rx) = watch::channel(ShutdownReason::Running);
+    let app_state = build_app_state(
+        &config,
+        &database,
+        requires_database_selection,
+        control_tx.clone(),
+    )
+    .await?;
+    serve(
+        &config,
+        discovery_config,
+        database,
+        app_state,
+        control_tx,
+        control_rx,
+    )
+    .await
+}
+
+/// Opens the database, applies migrations, and drains the legacy log tables.
+async fn prepare_database(config: &Config) -> Result<(Database, bool), BoxError> {
     let explicit_database_configuration = config.load_explicit_database_configuration().await?;
     let legacy_sqlite_database = config.has_legacy_sqlite_database().await;
     if explicit_database_configuration.is_none() && !legacy_sqlite_database {
@@ -30,34 +56,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     let database_configuration = explicit_database_configuration
         .clone()
-        .or_else(|| legacy_sqlite_database.then_some(luxd::config::DatabaseConfiguration::Sqlite));
+        .or_else(|| legacy_sqlite_database.then_some(DatabaseConfiguration::Sqlite));
     let database = match database_configuration.as_ref() {
-        Some(configuration) => Database::connect_with_configuration(&config, configuration).await?,
-        None => Database::connect(&config).await?,
+        Some(configuration) => Database::connect_with_configuration(config, configuration).await?,
+        None => Database::connect(config).await?,
     };
     let schema_version = database.schema_version().await?;
     info!(schema_version, "database migrations applied");
     let migrated_scan_events = match database.migrate_legacy_scan_job_events_to_logs().await {
         Ok(migrated) => migrated,
         Err(error) => {
-            let error_code = match &error {
-                StorageError::Io { source, .. }
-                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                    "CONFIG_LOG_PERMISSION_DENIED"
-                }
-                StorageError::Io { source, .. }
-                    if source.kind() == std::io::ErrorKind::InvalidData =>
-                {
-                    "CONFIG_LOG_INVALID_DATA"
-                }
-                StorageError::Io { .. } => "CONFIG_LOG_WRITE_FAILED",
-                StorageError::Sqlx { .. } => "DATABASE_LOG_MIGRATION_FAILED",
-                StorageError::Conflict(_) => "LEGACY_LOG_DATA_INVALID",
-                _ => "LOG_MIGRATION_FAILED",
-            };
             error!(
-                error_code,
+                error_code = legacy_log_migration_error_code(&error),
                 "legacy scan event migration failed; startup stopped"
             );
             return Err(std::io::Error::other("legacy scan event migration failed").into());
@@ -72,24 +82,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let migrated_audit_events = match database.migrate_legacy_audit_events_to_logs().await {
         Ok(migrated) => migrated,
         Err(error) => {
-            let error_code = match &error {
-                StorageError::Io { source, .. }
-                    if source.kind() == std::io::ErrorKind::PermissionDenied =>
-                {
-                    "CONFIG_LOG_PERMISSION_DENIED"
-                }
-                StorageError::Io { source, .. }
-                    if source.kind() == std::io::ErrorKind::InvalidData =>
-                {
-                    "CONFIG_LOG_INVALID_DATA"
-                }
-                StorageError::Io { .. } => "CONFIG_LOG_WRITE_FAILED",
-                StorageError::Sqlx { .. } => "DATABASE_LOG_MIGRATION_FAILED",
-                StorageError::Conflict(_) => "LEGACY_LOG_DATA_INVALID",
-                _ => "LOG_MIGRATION_FAILED",
-            };
             error!(
-                error_code,
+                error_code = legacy_log_migration_error_code(&error),
                 "legacy audit event migration failed; startup stopped"
             );
             return Err(std::io::Error::other("legacy audit event migration failed").into());
@@ -101,7 +95,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "legacy audit events migrated to config logs"
         );
     }
-    match luxd::application::image_repairs::repair_episode_image_path_conflicts(&database).await {
+    let requires_database_selection =
+        explicit_database_configuration.is_none() && !legacy_sqlite_database;
+    Ok((database, requires_database_selection))
+}
+
+/// Maps a legacy-log migration failure to the `error_code` logged by both startup migrations.
+fn legacy_log_migration_error_code(error: &StorageError) -> &'static str {
+    match error {
+        StorageError::Io { source, .. } => match source.kind() {
+            std::io::ErrorKind::PermissionDenied => "CONFIG_LOG_PERMISSION_DENIED",
+            std::io::ErrorKind::InvalidData => "CONFIG_LOG_INVALID_DATA",
+            _ => "CONFIG_LOG_WRITE_FAILED",
+        },
+        StorageError::Sqlx { .. } => "DATABASE_LOG_MIGRATION_FAILED",
+        StorageError::Conflict(_) => "LEGACY_LOG_DATA_INVALID",
+        _ => "LOG_MIGRATION_FAILED",
+    }
+}
+
+/// Applies the one-time repairs that must finish before the HTTP listener accepts requests.
+async fn repair_historical_data(database: &Database) {
+    match luxd::application::image_repairs::repair_episode_image_path_conflicts(database).await {
         Ok(report) if report.repaired > 0 || report.skipped > 0 => {
             info!(
                 repaired = report.repaired,
@@ -133,6 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Ok(None) => {}
         Err(error) => error!(%error, "one-time database lifecycle cleanup failed"),
     }
+}
+
+/// Spawns the maintenance workers and clears work a previous run left behind.
+async fn start_shared_workers(database: &Database) -> Result<(), BoxError> {
     database.spawn_removed_media_item_purge();
     database.spawn_task_history_retention();
     database.spawn_postgres_query_statistics_extension();
@@ -146,10 +165,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             "unfinished background jobs cancelled before startup"
         );
     }
+    Ok(())
+}
+
+/// Builds the HTTP state and starts every worker the request path hands work to.
+async fn build_app_state(
+    config: &Config,
+    database: &Database,
+    requires_database_selection: bool,
+    control_tx: watch::Sender<ShutdownReason>,
+) -> Result<AppState, BoxError> {
     let setup = SetupService::new(database.clone())?;
     let auth = WebAuthService::new(database.clone())?;
     let emby_auth = EmbyAuthService::new(database.clone())?;
-    let (control_tx, control_rx) = watch::channel(ShutdownReason::Running);
     let mut app_state = AppState::ready_with_proxy(
         config.clone(),
         database.clone(),
@@ -158,8 +186,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         emby_auth,
         read_network_proxy_url(&config.config_dir),
     )
-    .with_restart_handle(RestartHandle::new(control_tx.clone()));
-    if explicit_database_configuration.is_none() && !legacy_sqlite_database {
+    .with_restart_handle(RestartHandle::new(control_tx));
+    if requires_database_selection {
         app_state = app_state.require_database_selection();
     }
     app_state.start_content_restriction_index_worker();
@@ -169,6 +197,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker().await;
+    Ok(app_state)
+}
+
+/// Binds the listeners, serves until shutdown, then drains and closes everything exactly once.
+async fn serve(
+    config: &Config,
+    discovery_config: DiscoveryConfig,
+    database: Database,
+    app_state: AppState,
+    control_tx: watch::Sender<ShutdownReason>,
+    control_rx: watch::Receiver<ShutdownReason>,
+) -> Result<(), BoxError> {
+    // These workers must not delay the listener; only the mail worker needs draining on shutdown.
     let mail_worker = luxd::application::mail_worker::MailDeliveryWorker::start(
         database.clone(),
         config.config_dir.clone(),
@@ -186,7 +227,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             Err(error) => error!(%error, "legacy media identity repair failed"),
         }
     });
-
     let discovery = DiscoveryService::bind_with_database(discovery_config, &database).await?;
     let discovery_addr = discovery.local_addr()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -222,7 +262,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {
         return Err(std::io::Error::other(error).into());
     }
-
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
             info!(
@@ -298,7 +337,7 @@ async fn shutdown_signal(
 }
 
 #[cfg(unix)]
-fn restart_process() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn restart_process() -> Result<(), BoxError> {
     use std::os::unix::process::CommandExt;
 
     let executable = std::env::current_exe()?;
@@ -309,6 +348,6 @@ fn restart_process() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 #[cfg(not(unix))]
-fn restart_process() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn restart_process() -> Result<(), BoxError> {
     Err("在线重启当前平台的 Lux 进程不可用".into())
 }
