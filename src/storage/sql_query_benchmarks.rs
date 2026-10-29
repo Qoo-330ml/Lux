@@ -1,4 +1,7 @@
-use super::{DatabaseBackend, NewEpisodeFile, NewMovieFile, adapt_sql_for_backend};
+use super::{
+    DatabaseBackend, NewEpisodeFile, NewMovieFile, adapt_postgres_sql_uncached,
+    adapt_sql_for_backend,
+};
 use crate::storage::sql_templates::{
     SqlTemplateCache, filesystem_entries_by_paths_template, manifest_delta_finalize_template,
     manifest_delta_insert_template, manifest_delta_verify_template,
@@ -845,7 +848,11 @@ fn adaptation_wide_in_list_sql(placeholder_count: usize) -> &'static str {
 fn adaptation_benchmark_cases() -> Vec<(&'static str, &'static str, usize)> {
     vec![
         ("short_insert_3_placeholders", ADAPTATION_SHORT_SQL, 20_000),
-        ("typical_select_3_placeholders", ADAPTATION_TYPICAL_SQL, 20_000),
+        (
+            "typical_select_3_placeholders",
+            ADAPTATION_TYPICAL_SQL,
+            20_000,
+        ),
         ("long_join_2_placeholders", ADAPTATION_LONG_JOIN_SQL, 20_000),
         (
             "wide_in_list_128_placeholders",
@@ -874,14 +881,77 @@ fn report_postgres_adaptation(case: &str, sql: &'static str, iterations: usize) 
         snapshot,
     );
     let adapted = adapt_sql_for_backend(DatabaseBackend::Postgres, sql);
-    assert_ne!(adapted.as_str(), sql, "case {case} must rewrite placeholders");
+    assert_ne!(
+        adapted.as_str(),
+        sql,
+        "case {case} must rewrite placeholders"
+    );
     assert!(adapted.as_str().contains('$'), "case {case} must use $n");
+}
+
+/// The pre-cache behaviour, kept as the reference point for the memo comparison.
+fn report_postgres_adaptation_uncached(case: &str, sql: &'static str, iterations: usize) {
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        || adapt_postgres_sql_uncached(sql),
+        || adapt_postgres_sql_uncached(sql),
+    );
+    report_allocation_case(
+        &format!("postgres_rewrite_uncached_{case}"),
+        iterations,
+        elapsed,
+        snapshot,
+    );
+    let expected = adapt_postgres_sql_uncached(sql);
+    assert_eq!(
+        adapt_sql_for_backend(DatabaseBackend::Postgres, sql).as_str(),
+        expected.as_str(),
+        "cached and uncached rewrites must agree for case {case}"
+    );
 }
 
 #[test]
 #[ignore = "run explicitly to record the A2 PostgreSQL placeholder adaptation baseline"]
 fn postgres_placeholder_adaptation_benchmark() {
     for (case, sql, iterations) in adaptation_benchmark_cases() {
+        report_postgres_adaptation_uncached(case, sql, iterations);
         report_postgres_adaptation(case, sql, iterations);
     }
+}
+
+/// Same five statements, but hammered from four threads through the shared cache, to record what
+/// the memo mutex costs once several Tokio workers adapt SQL at the same time.
+#[test]
+#[ignore = "run explicitly to record the A2 cache contention cost"]
+fn postgres_placeholder_adaptation_contention_benchmark() {
+    const THREADS: usize = 4;
+    const ITERATIONS_PER_THREAD: usize = 5_000;
+    let cases = adaptation_benchmark_cases();
+    // Warm the memo so every thread measures the steady state.
+    for (_, sql, _) in &cases {
+        drop(adapt_sql_for_backend(DatabaseBackend::Postgres, *sql));
+    }
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..ITERATIONS_PER_THREAD {
+                    for (_, sql, _) in &cases {
+                        drop(black_box(adapt_sql_for_backend(
+                            DatabaseBackend::Postgres,
+                            *sql,
+                        )));
+                    }
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    let operations = THREADS
+        .saturating_mul(ITERATIONS_PER_THREAD)
+        .saturating_mul(cases.len());
+    println!(
+        "postgres_adapt_contention threads={THREADS} operations={operations} elapsed_ns_per_op={}",
+        elapsed.as_nanos() / u128::try_from(operations).unwrap_or(1)
+    );
 }
