@@ -1,11 +1,10 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { FormEvent, useRef, useState } from "react";
 import { ApiError, api } from "../../../../lib/api/client";
-import type { AdminRegistrationSettings as AdminRegistrationSettings, RegistrationMode } from "../../../../lib/api/types";
+import type { AdminRegistrationSettings, RegistrationMode } from "../../../../lib/api/types";
 import { LuxButton, LuxSelectField } from "../../../../components/ui";
 
 const adminRegistrationSettingsQueryKey = ["admin", "settings", "registration"] as const;
-
 
 export function AdminUserRegistrationSettings() {
   const queryClient = useQueryClient();
