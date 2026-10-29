@@ -14,10 +14,7 @@ import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type {
-  MediaItem,
-  MediaSource,
   PlaybackEventState,
-  WebPlaybackCapabilities,
   WebPlaybackTrackSelection,
 } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
@@ -29,7 +26,6 @@ import {
 } from "./playback-engine";
 import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
-import { canUseHls } from "./hls-capabilities";
 import {
   DIRECT_CANDIDATE_TIMEOUT_MS,
   clearRememberedCandidate,
@@ -43,7 +39,6 @@ import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
-import type { PlayerEpisodeNavigation } from "./components/player-controls";
 import { PlayerSettingsPanel } from "./components/player-settings-panel";
 import { PlayerInfoPanel } from "./components/player-info-panel";
 import {
@@ -74,6 +69,16 @@ import {
   type PlayerFailure,
 } from "./components/player-diagnostics";
 import { usePlayerPlatform } from "./components/player-platform";
+import { webPlaybackCapabilities } from "./playback-capabilities";
+import {
+  TICKS_PER_SECOND,
+  episodeNavigationFor,
+  getSubtitleInfo,
+  isMatroskaSource,
+  screenshotFileName,
+  timelinePosition,
+  useClientEngine,
+} from "./player-page-helpers";
 import {
   defaultCaptionSelection,
   nativeCaptionTrack,
@@ -82,7 +87,6 @@ import {
   type PlayerRuntimeCaptionTrack,
 } from "./components/player-captions";
 
-const TICKS_PER_SECOND = 10_000_000;
 const PROGRESS_REPORT_INTERVAL_MS = 10_000;
 const TIMELINE_UI_UPDATE_INTERVAL_MS = 100;
 const AUTO_HIDE_DELAY_MS = 3_000;
@@ -101,100 +105,6 @@ const HEVC_RUNTIME_ASSETS = {
   wasmModuleUrl: "/hevc/hevc-decode-module.js",
   wasmBinaryUrl: "/hevc/hevc-decode.wasm",
 };
-
-function getSubtitleInfo(media?: MediaItem | null) {
-  if (!media) return null;
-  if (media.itemType === "EPISODE") {
-    const season = media.parentIndexNumber != null ? `第 ${media.parentIndexNumber} 季 ` : "";
-    const episode = media.indexNumber != null ? `第 ${media.indexNumber} 集` : "";
-    return `${season}${episode}`.trim() || null;
-  }
-  if (media.productionYear) {
-    return String(media.productionYear);
-  }
-  return null;
-}
-
-function screenshotFileName(title: string) {
-  const normalized = title
-    .replace(/[\\/:*?"<>|]/g, "-")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 80);
-  return `${normalized || "lux-screenshot"}-${new Date().toISOString().replace(/[:.]/g, "-")}.png`;
-}
-
-export function webPlaybackCapabilities(
-  source: MediaSource | undefined,
-  attempt: number,
-  videoOverride?: HTMLVideoElement | null,
-): WebPlaybackCapabilities {
-  const streams = source?.streams ?? [];
-  const video = videoOverride ?? (typeof document === "undefined" ? null : document.createElement("video"));
-  const videoCodec = (streams.find((stream) => stream.type?.toUpperCase() === "VIDEO")?.codec ?? "").toLowerCase();
-  const audioCodec = (streams.find((stream) => stream.type?.toUpperCase() === "AUDIO")?.codec ?? "").toLowerCase();
-  const videoCopyToFmp4 = supportsMp4Codec(video, "video", videoCodec);
-  const audioCopyToFmp4 = !audioCodec || supportsMp4Codec(video, "audio", audioCodec);
-  return {
-    directPlay: attempt === 0,
-    hls: canUseHls(video),
-    videoCopyToFmp4,
-    audioCopyToFmp4,
-    hardwareTranscode: false,
-    softwareTranscode: true,
-  };
-}
-
-function supportsMp4Codec(
-  video: HTMLVideoElement | null,
-  kind: "audio" | "video",
-  codec: string,
-): boolean {
-  if (!video || !codec) return false;
-  const candidates = codecCandidates(kind, codec);
-  return candidates.some((candidate) => {
-    const mime = `${kind}/mp4; codecs="${candidate}"`;
-    if (video.canPlayType(mime) !== "") return true;
-    return typeof MediaSource !== "undefined"
-      && typeof MediaSource.isTypeSupported === "function"
-      && MediaSource.isTypeSupported(mime);
-  });
-}
-
-function codecCandidates(kind: "audio" | "video", codec: string): string[] {
-  const normalized = codec.toLowerCase();
-  if (kind === "audio") {
-    if (/^(aac|mp4a)(\.|$)/.test(normalized)) return [codec, "mp4a.40.2", "mp4a"];
-    if (normalized === "ac3" || normalized === "ac-3") return [codec, "ac-3"];
-    if (normalized === "eac3" || normalized === "ec-3") return [codec, "ec-3"];
-    return [codec];
-  }
-  if (/^(h264|avc|avc1)(\.|$)/.test(normalized)) return [codec, "avc1"];
-  if (/^(hevc|h265|hvc1|hev1)(\.|$)/.test(normalized)) return [codec, "hvc1"];
-  if (/^(vp9|vp09)(\.|$)/.test(normalized)) return [codec, "vp09"];
-  if (/^(av1|av01)(\.|$)/.test(normalized)) return [codec, "av01"];
-  return [codec];
-}
-
-function timelinePosition(bar: HTMLDivElement, clientX: number, duration: number) {
-  const rect = bar.getBoundingClientRect();
-  if (rect.width <= 0 || duration <= 0) return 0;
-  const progress = Math.max(0, Math.min(1, (clientX - rect.left) / rect.width));
-  return progress * duration;
-}
-
-export function episodeNavigationFor(episodes: MediaItem[], currentEpisodeId: string): PlayerEpisodeNavigation {
-  const playableEpisodes = episodes.filter((episode) =>
-    episode.itemType === "EPISODE" && (episode.mediaSources?.length ?? 0) > 0,
-  );
-  const currentIndex = playableEpisodes.findIndex((episode) => episode.id === currentEpisodeId);
-  return {
-    previousEpisodeId: currentIndex > 0 ? playableEpisodes[currentIndex - 1].id : null,
-    nextEpisodeId: currentIndex >= 0 && currentIndex < playableEpisodes.length - 1
-      ? playableEpisodes[currentIndex + 1].id
-      : null,
-  };
-}
 
 export function PlayerPage() {
   const { itemId = "" } = useParams();
@@ -1677,12 +1587,4 @@ export function PlayerPage() {
       />
     </LuxPlayer>
   );
-}
-
-function isMatroskaSource(source: MediaSource | undefined) {
-  return (source?.container ?? "").toLowerCase().split(",").some((part) => part.trim() === "mkv" || part.trim() === "matroska" || part.trim() === "webm");
-}
-
-function useClientEngine(engine: PlaybackEngine) {
-  return engine.kind === "client-mkv" || engine.kind === "client-hevc";
 }
