@@ -475,9 +475,9 @@ button:disabled { cursor: not-allowed; opacity: 0.55; }
 
 .lux-media-card:hover .lux-media-hover-play { opacity: 1; transform: translate(-50%, -50%) scale(1); }
 
-.lux-progress { position: absolute; right: 0; bottom: 0; left: 0; height: 4px; background: rgba(255,255,255,.16); }
+.lux-media-art .lux-progress { position: absolute; right: 0; bottom: 0; left: 0; height: 4px; background: rgba(255,255,255,.16); }
 
-.lux-progress span { display: block; height: 100%; background: var(--lux-accent); box-shadow: 0 0 12px color-mix(in srgb, var(--lux-accent) 70%, transparent); }
+.lux-media-art .lux-progress span { display: block; height: 100%; background: var(--lux-accent); box-shadow: 0 0 12px color-mix(in srgb, var(--lux-accent) 70%, transparent); }
 
 .lux-media-copy { padding: var(--lux-card-copy-padding); }
 

@@ -19,7 +19,7 @@ export function LuxProgress({ value, max = 100, label, size = "default", classNa
   const percent = indeterminate ? 0 : Math.round((clamped / clampedMax) * 1000) / 10;
 
   return (
-    <div className={cx("lux-progress", size === "compact" && "lux-progress-compact", indeterminate && "is-indeterminate", className)}>
+    <div className={cx("lux-progress-bar", size === "compact" && "lux-progress-compact", indeterminate && "is-indeterminate", className)}>
       <div
         className="lux-progress-track"
         role="progressbar"
