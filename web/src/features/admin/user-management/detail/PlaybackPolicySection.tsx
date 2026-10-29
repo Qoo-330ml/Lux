@@ -1,9 +1,7 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { FormEvent, useState } from "react";
-import { api } from "../../../../lib/api/client";
-import type { AdminUser, AdminUserPlaybackPolicy } from "../../../../lib/api/types";
+import type { AdminUser } from "../../../../lib/api/types";
 import { LuxButton, LuxSwitch, LuxTextField } from "../../../../components/ui";
 import { AdminUserManagementState } from "../AdminUserManagementState";
+import { usePlaybackPolicyForm } from "./usePlaybackPolicyForm";
 
 export function AdminUserPlaybackPolicySection({ user }: { user: AdminUser }) {
   if (user.deletedAt != null) {
@@ -18,51 +16,19 @@ export function AdminUserPlaybackPolicySection({ user }: { user: AdminUser }) {
 }
 
 function AdminUserPlaybackPolicyEditor({ user }: { user: AdminUser }) {
-  const queryClient = useQueryClient();
-  const queryKey = ["admin", "user", user.id, "playback-policy"];
-  const policyQuery = useQuery({
-    queryKey,
-    queryFn: () => api.adminUserPlaybackPolicy(user.id),
-  });
-  const [draft, setDraft] = useState<AdminUserPlaybackPolicy | null>(null);
-  const [limitDraft, setLimitDraft] = useState<string | null>(null);
-  const [notice, setNotice] = useState("");
-  const [error, setError] = useState("");
-  const save = useMutation({
-    mutationFn: (policy: AdminUserPlaybackPolicy) => api.updateAdminUserPlaybackPolicy(user.id, policy),
-    onSuccess: ({ policy }) => {
-      setDraft(policy);
-      setLimitDraft(String(policy.maxSimultaneousPlaybacks));
-      setError("");
-      setNotice("播放策略已保存。");
-      queryClient.setQueryData(queryKey, { policy });
-    },
-    onError: (cause) => {
-      setNotice("");
-      setError(cause.message || "播放策略保存失败，请重试。");
-    },
-  });
-  const currentPolicy = policyQuery.data?.policy;
-  const currentDraft = draft ?? currentPolicy;
-  const limitInput = limitDraft ?? (currentPolicy ? String(currentPolicy.maxSimultaneousPlaybacks) : "");
-  const parsedLimit = Number(limitInput);
-  const validLimit = limitInput.trim() !== "" && Number.isSafeInteger(parsedLimit) && parsedLimit >= 0;
-  const updatedDraft = currentDraft && validLimit ? { ...currentDraft, maxSimultaneousPlaybacks: parsedLimit } : currentDraft;
-  const hasChanges = updatedDraft != null && currentPolicy != null && (
-    updatedDraft.canPlay !== currentPolicy.canPlay
-    || updatedDraft.maxSimultaneousPlaybacks !== currentPolicy.maxSimultaneousPlaybacks
-    || updatedDraft.allowRemux !== currentPolicy.allowRemux
-    || updatedDraft.allowAudioTranscode !== currentPolicy.allowAudioTranscode
-    || updatedDraft.allowVideoTranscode !== currentPolicy.allowVideoTranscode
-  );
-
-  function submit(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    if (!updatedDraft || !validLimit) return;
-    setNotice("");
-    setError("");
-    save.mutate(updatedDraft);
-  }
+  const {
+    policyQuery,
+    currentDraft,
+    setDraft,
+    setLimitDraft,
+    limitInput,
+    validLimit,
+    hasChanges,
+    notice,
+    error,
+    save,
+    submit,
+  } = usePlaybackPolicyForm(user);
 
   if (policyQuery.isPending) return <AdminUserManagementState label="正在读取播放策略…" />;
   if (policyQuery.error) return <AdminUserManagementState label={policyQuery.error.message || "暂时无法读取播放策略。"} error />;
