@@ -102,13 +102,7 @@ impl Database {
         );
         let result = result?;
         let transaction_commit_started = Instant::now();
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         record_manifest_storage_stage(
             "transaction_commit",
             transaction_commit_started,

@@ -42,10 +42,7 @@ impl Database {
                 self.query("DROP TABLE IF EXISTS temp.lux_manifest_presence_incoming")
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 self.query(
                     "CREATE TEMP TABLE lux_manifest_presence_incoming (
                          filesystem_entry_id TEXT PRIMARY KEY NOT NULL,
@@ -59,10 +56,7 @@ impl Database {
                 )
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
             for entries in seen_filesystem_entries.chunks(
                 super::manifest_seen_filesystem_update_chunk_size(self.backend()),
@@ -129,10 +123,7 @@ impl Database {
                         .bind(chunk.library_root_id)
                         .execute(&mut **transaction)
                         .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                        .map_err(self.sqlx_err())?;
                     usize::try_from(updated.rows_affected()).unwrap_or(usize::MAX)
                 };
                 if updated_count == entries.len() {
@@ -182,10 +173,7 @@ impl Database {
                     .bind(generation)
                     .fetch_all(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 successfully_seen_paths.extend(
                     successful_rows
                         .into_iter()
@@ -247,10 +235,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         self.record_scan_job_processed_media_items_in_transaction(
@@ -276,10 +261,7 @@ impl Database {
         self.query("DELETE FROM temp.lux_manifest_presence_incoming")
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?)", entries.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -301,10 +283,7 @@ impl Database {
         insert
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let updated = self
             .query(
                 "UPDATE filesystem_entries
@@ -334,10 +313,7 @@ impl Database {
             .bind(library_root_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(usize::try_from(updated.rows_affected()).unwrap_or(usize::MAX))
     }
 
@@ -394,10 +370,7 @@ impl Database {
                 .bind(generation)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             processed_media_count = processed_media_count
                 .checked_add(inserted.rows_affected())
                 .ok_or_else(|| {
@@ -423,10 +396,7 @@ impl Database {
             .bind(chunk.job_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if updated.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "scan job stopped accepting processed media progress".to_owned(),

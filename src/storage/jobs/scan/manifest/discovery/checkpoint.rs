@@ -102,10 +102,7 @@ impl Database {
             .bind(input.chunk.manifest_id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .ok_or_else(|| {
                 StorageError::Conflict("manifest root is not available for discovery".to_owned())
             })?;
@@ -210,10 +207,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             } else {
                 let selects = std::iter::repeat_n(
                     "SELECT ?, ?, ?,
@@ -253,10 +247,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             }
         }
 

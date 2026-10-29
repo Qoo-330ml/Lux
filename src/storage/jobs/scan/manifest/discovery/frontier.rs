@@ -49,10 +49,7 @@ impl Database {
             let result = statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             inserted_directory_count = inserted_directory_count
                 .checked_add(result.rows_affected())
                 .ok_or_else(|| {
@@ -104,10 +101,7 @@ impl Database {
             let completed = statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             completed_directory_count = completed_directory_count
                 .checked_add(i64::try_from(completed.rows_affected()).map_err(|_| {
                     StorageError::Conflict("manifest directory count overflow".to_owned())

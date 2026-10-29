@@ -51,13 +51,7 @@ impl Database {
             for id in chunk {
                 query = query.bind(id);
             }
-            let rows = query
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            let rows = query.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
             for row in rows {
                 states.insert(
                     row.get("id"),
@@ -110,10 +104,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map(|rows| rows.into_iter().map(stored_scan_job).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 }
 
@@ -213,10 +204,7 @@ impl Database {
             .bind(change_kind)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -258,10 +246,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
             .map(|row| StoredScanJobPath {
@@ -287,10 +272,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     #[allow(dead_code)]
@@ -326,10 +308,7 @@ impl Database {
             .bind(error)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -356,10 +335,7 @@ impl Database {
         transaction
             .commit()
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
             .map(|_| changed)
     }
 
@@ -400,14 +376,10 @@ impl Database {
             for path in paths {
                 source_statement = source_statement.bind(path);
             }
-            let source_result =
-                source_statement
-                    .execute(&mut **transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let source_result = source_statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(self.sqlx_err())?;
             changed |= source_result.rows_affected() > 0;
 
             let item_query = format!(
@@ -431,14 +403,10 @@ impl Database {
             for path in paths {
                 item_statement = item_statement.bind(path);
             }
-            let item_result =
-                item_statement
-                    .execute(&mut **transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let item_result = item_statement
+                .execute(&mut **transaction)
+                .await
+                .map_err(self.sqlx_err())?;
             changed |= item_result.rows_affected() > 0;
         }
         Ok(changed)
@@ -481,10 +449,7 @@ impl Database {
         transaction
             .commit()
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
             .map(|_| changed)
     }
 
@@ -520,10 +485,7 @@ impl Database {
                 .bind(library_root_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             return Ok(result.rows_affected() > 0);
         }
         let mut changed = false;
@@ -541,10 +503,7 @@ impl Database {
                 .bind(library_root_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             changed |= result.rows_affected() > 0;
         }
         Ok(changed)
@@ -587,10 +546,7 @@ impl Database {
             source_statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
 
             let item_query = format!(
                 "INSERT INTO scan_job_targets (
@@ -615,10 +571,7 @@ impl Database {
             item_statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -664,10 +617,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             }
         }
         Ok(())
@@ -708,10 +658,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn load_scan_job_metadata_page(
@@ -842,10 +789,7 @@ impl Database {
             .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let (job_type, job_status, auto_metadata_match, has_pending) = rows
             .first()
@@ -961,10 +905,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_job_target_home_video_items_page(
@@ -1012,10 +953,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_job_target_series_items_page(
@@ -1069,10 +1007,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn local_metadata_completion_wait_state(
@@ -1100,10 +1035,7 @@ impl Database {
             .bind(job_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((
             row.get::<i64, _>("has_pending_targets") != 0,
             row.get::<i64, _>("job_missing_or_cancelled") != 0,
@@ -1126,10 +1058,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_pending_local_metadata_item_ids(
@@ -1160,14 +1089,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             pending.extend(rows.into_iter().map(|row| row.get("item_id")));
         }
         Ok(pending)
@@ -1216,10 +1141,7 @@ impl Database {
             statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -1251,10 +1173,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn ensure_scan_job_thumbnail_targets(
@@ -1283,10 +1202,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn clear_completed_scan_job_targets(
@@ -1304,10 +1220,7 @@ impl Database {
             .bind(job_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1327,10 +1240,7 @@ impl Database {
         .bind(job_id)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_job_targets
              SET probe_state = CASE WHEN probe_state = 'FAILED' THEN 'PENDING' ELSE probe_state END,
@@ -1346,10 +1256,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }
 

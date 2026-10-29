@@ -191,10 +191,7 @@ impl Database {
                     != 0,
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn get_scan_manifest_by_job(
@@ -236,10 +233,7 @@ impl Database {
                     != 0,
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn get_scan_manifest_postprocessing_state_by_job(
@@ -293,10 +287,7 @@ impl Database {
             .bind(job_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let mut state: Option<StoredScanManifestPostprocessingState> = None;
         for row in rows {
@@ -388,10 +379,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_scan_manifest_root_unavailable(
@@ -411,10 +399,7 @@ impl Database {
         .bind(library_root_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE library_roots
              SET is_available = 0, last_checked_at = unixepoch(),
@@ -424,10 +409,7 @@ impl Database {
         .bind(library_root_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_manifest_directories
              SET state = 'FAILED', error = 'filesystem root could not be read',
@@ -438,17 +420,8 @@ impl Database {
         .bind(library_root_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// Project link provenance from this manifest's observations onto the
@@ -472,10 +445,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(self.pool())
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if link_observations == 0 {
             return Ok(());
         }
@@ -508,10 +478,7 @@ impl Database {
         .bind(manifest_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE filesystem_entries
              SET is_symlink = 0, resolved_path = NULL
@@ -538,17 +505,8 @@ impl Database {
         .bind(manifest_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// Mark the settled filesystem rows that discovery observed through a link.
@@ -579,10 +537,7 @@ impl Database {
                 .bind(relative_path)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected(),
             );
             // The same bytes may also be reachable through another path that the
@@ -601,20 +556,11 @@ impl Database {
                 .bind(relative_path)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected(),
             );
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(updated)
     }
 
@@ -643,10 +589,7 @@ impl Database {
         .bind(library_root_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_manifest_root_discovery_baselines(
@@ -675,10 +618,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_lite_scan_manifest_roots(
@@ -695,10 +635,7 @@ impl Database {
         .bind(manifest_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_manifest_directories
              SET state = 'COMPLETE', error = NULL, updated_at = unixepoch()
@@ -707,17 +644,8 @@ impl Database {
         .bind(manifest_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_scan_manifest_discovery(
@@ -734,10 +662,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let pending_roots: i64 = self
             .query_scalar(
                 "SELECT COUNT(*) FROM scan_manifest_roots
@@ -746,10 +671,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if pending_directories != 0 || pending_roots != 0 {
             return Err(StorageError::Conflict(
                 "manifest discovery cannot complete while frontier or roots remain unresolved"
@@ -761,19 +683,13 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let processed_count: i64 = self
             .query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let total_count = discovered_file_count.max(processed_count);
         let job_update = self
             .query(
@@ -785,10 +701,7 @@ impl Database {
             .bind(job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if job_update.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "scan job is no longer accepting manifest discovery completion".to_owned(),
@@ -803,22 +716,13 @@ impl Database {
             .bind(manifest_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if manifest_update.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "manifest is no longer accepting discovery completion".to_owned(),
             ));
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(total_count)
     }
 
@@ -844,10 +748,7 @@ impl Database {
         .bind(job_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_manifest_roots
              SET state = 'INCOMPLETE', error = 'scan did not complete this root',
@@ -858,17 +759,8 @@ impl Database {
         .bind(job_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     #[allow(dead_code)] // Lifecycle owners use this compare-and-swap in LUX-266 onward.
@@ -904,17 +796,8 @@ impl Database {
             .bind(expected_state)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -938,9 +821,6 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }
