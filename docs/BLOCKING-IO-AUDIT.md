@@ -14,16 +14,17 @@
   - `std::process::Command` 及同步子进程 API；
   - `std::thread::sleep`；
   - 同步 `File` / `OpenOptions` 读写（`File::open` / `File::create` / `File::options` /
-    `OpenOptions::new`），以及 `std::io::Read`/`Write` 在其上的同步读写。
+    `OpenOptions::new`），以及 `std::io::Read`/`Write` 在其上的同步读写；
 - 排除：`#[cfg(test)] mod tests`、`*_tests.rs`、`tests.rs` 之后的所有测试代码。
 - 方法：
   1. 用脚本枚举所有候选调用点，并根据每个文件的 `use` 语句解析 `fs` 别名是 `std::fs` 还是
      `tokio::fs`（`use super::*` 形式的继承按父模块链解析）；带 `.await` 的调用判定为
      `tokio::fs`，不计入阻塞调用。
-  2. 对每个 `std::fs` / 同步 `File` 调用点，沿调用链向上确认最近的 `spawn_blocking` /
-     `run_process_background_blocking` / 专用线程 / 启动期入口，得到归类。
-- 基线数字：全库 `spawn_blocking` 42 处、`run_process_background_blocking` 17 处（含导入），
-  全部位于上述四个目录内。
+  2. 对每个 `std::fs` / 同步 `File` 调用点，沿调用链向上确认最近的
+     `spawn_blocking` / `run_process_background_blocking` / 专用线程 / 启动期入口，得到归类。
+     同步函数只要**存在一条**从 async 函数直达的调用路径就判为 (d)，不按调用点字面位置判断。
+- 基线数字（修复后重新统计）：上述四个目录内 `spawn_blocking` 43 处、
+  `run_process_background_blocking` 17 处（含导入语句）。
 
 ## 2. 归类定义
 
@@ -39,32 +40,43 @@
 
 ## 3. 汇总
 
-### 3.1 计数（审计基线 = 修复前）
+### 3.1 计数
 
-| 项 | 数量 |
-| --- | --- |
-| 非测试代码中的阻塞文件系统调用点 | **124** |
-| 归类 (a) | 13 |
-| 归类 (b) | 86 |
-| 归类 (c)（含 c\*） | 17 |
-| 归类 (d) 违规 | **8** |
-| 修复后剩余 (d) | **3**（均为非阻塞的 `File::try_lock`，见 §6.1） |
-| 非测试代码中的 `std::process::Command` | **0** |
-| 非测试代码中的 `std::thread::sleep` | **0** |
+「审计基线」= 首次审计（提交 `b9c49816`）时的状态；「修复后」= 本轮（审查意见 1–4）全部修完
+之后的状态。两组数字的分项都能加总回合计。
+
+| 项 | 审计基线 | 修复后 |
+| --- | --- | --- |
+| 阻塞文件系统调用点（`std::fs` / 同步 `File`） | **124** | **122**（`scanner/library.rs` 2 处改用 `tokio::fs::canonicalize`） |
+| ├ 归类 (a) | 13 | 13 |
+| ├ 归类 (b) | 84 | 86 |
+| ├ 归类 (c)（含 c\*） | 17 | 20 |
+| └ 归类 (d) 违规 | **10** | **3** |
+| 非测试代码中的 `std::process::Command` | **0** | **0** |
+| 非测试代码中的 `std::thread::sleep` | **0** | **0** |
+
+加总校验：124 = 13+84+17+10；122 = 13+86+20+3。
+
+> **基线 (b)=84 / (d)=10 的更正**：首次审计把 `scanner/manifest.rs:1009`、`1028`
+> （`followed_symlink_observation` 内的 `std::fs::canonicalize` / `std::fs::metadata`）记成了 (b)。
+> 该函数虽然本身是同步的，但被 `scanner/library.rs` 的 async 遍历器直接调用，所以审计基线里
+> 它实际属于 (d)。审查意见 1 指出后，这两处已在修复中变成真正的 (b)（调用方包进
+> `spawn_blocking`），因此修复后的 (b) 是 84+2=86、(d) 是 10−7=3。
 
 ### 3.2 结论摘要
 
-- 阻塞型**子进程**已经全部走 `tokio::process::Command`：全库 7 处 `Command::new`
-  （`chapter_detector.rs:939`、`embedded_subtitle.rs:124`、`playback/hls.rs:967`、
-  `plugin_runtime.rs:765`、`probe/runner.rs:103`、`thumbnails.rs:647`、`thumbnails.rs:725`）
-  的导入来源均为 `tokio::process`，不构成阻塞调用；`std::process::Stdio` 只是句柄类型。
+- 阻塞型**子进程**已经全部走 `tokio::process::Command`，非测试代码里没有
+  `std::process::Command`；`std::process::Stdio` 只是句柄类型。
 - 阻塞型**文件系统**工作绝大部分已经收敛到 `spawn_blocking` / 专用线程 / 启动期：
   扫描清单（`scanner/manifest.rs`，27 处）、日志存储（`observability/logs.rs`，37 处）、
   邮件配置（`mail.rs`，12 处）、插件发现（`plugin_runtime.rs`，12 处）都符合规则。
-- 真正的违规 (d) 只有 8 处，集中在两类问题：
-  1. **扫描遍历器的构造函数**用 `std::fs::canonicalize`（2 处）；
-  2. **进程级惰性缓存**（`OnceLock`）在首次请求 / 首次扫描时才做文件系统读取（3 处）。
-  3. **建议性文件锁**的 `File::try_lock()`（3 处，非阻塞 syscall，保留）。
+- 审计基线的违规 (d) 共 10 处，集中在三类问题，本轮全部处理：
+  1. **扫描遍历器**同步 `std::fs::canonicalize` 根路径（2 处）→ 改用 `tokio::fs`；
+  2. **扫描遍历器**同步判定符号链接目标（`manifest.rs:1009、1028`，2 处）→ 调用点包进
+     `spawn_blocking`；
+  3. **进程级惰性缓存**（`OnceLock`）在首次请求 / 首次扫描时才做文件系统读取
+     （`transcoding.rs`、`scanner/symlink.rs`，3 处）→ 启动期在阻塞线程上预热。
+  剩余 3 处是**建议性文件锁**的 `File::try_lock()`（非阻塞 syscall，保留，见 §6.1）。
 - 另外 `plugin_runtime.rs` 的插件目录发现是**同步构造**（`PluginService::new`），目前只在启动期
   调用，属于 (c\*)；把它改成异步 + `spawn_blocking` 需要改动 `PluginService` 构造签名和十余处
   测试调用点，超出单点约 80 行的改动预算，列入后续建议。
@@ -79,6 +91,11 @@
 `run_process_background_blocking(BackgroundWorkStage::ManifestPreparation, …)`
 （本文件 733、756、776、1174、1196、1300）或 `spawn_blocking`
 （`scanner/jobs/manifest_discovery.rs` 237、277、798、826）。
+
+> **本轮更正**：表中的 1009 与 1028 两行（`followed_symlink_observation`）在审计基线里被误判为
+> (b)。它们的调用方 `followed_symlink_file_is_allowed` 被 `FileBatchWalker::next_batch` 的
+> async 遍历器逐条链接直接调用，属于 (d)。修复后该调用方改走
+> `spawn_blocking`（`scanner/library.rs` 的 `link_target_is_allowed`），这两处才真正满足 (b)。
 
 | 文件:行 | 调用 | 归类 | 处理 |
 | --- | --- | --- | --- |
@@ -226,46 +243,58 @@
 | application/scan_fingerprint_migration.rs:362 | `std::fs::metadata` | b | 合规 |
 | application/watch.rs:525 | `std::fs::canonicalize` | b | 合规（`normalize_root` ← `LibraryWatcher::new`，只在 `lux-watcher-init` 专用线程执行） |
 
-### 4.7 `(c)` / `(c*)` 其余 — 5 处
+### 4.7 `(c)` / `(c*)` 其余 — 8 处
 
 | 文件:行 | 调用 | 归类 | 处理 |
 | --- | --- | --- | --- |
 | application/container_gateway.rs:50 | `std::fs::read_to_string`（`/proc/self/cgroup`） | c\* | 合规：`main.rs:26` 显式 `warm_up()` 预热 `OnceLock` |
 | application/container_gateway.rs:51 | `std::fs::read_to_string`（`/proc/net/route`） | c\* | 同上 |
 | application/container_gateway.rs:52 | `std::fs::read_to_string`（`/proc/net/ipv6_route`） | c\* | 同上 |
+| application/transcoding.rs:40 | `std::fs::read_dir("/dev/dri")` | c | `warm_up()` 在 `main.rs::build_app_state` 的 `spawn_blocking` 内预热 |
+| application/transcoding.rs:51 | `std::fs::read_to_string`（sysfs vendor） | c | 同上 |
+| application/scanner/symlink.rs:152 | `std::fs::canonicalize`（`LUX_SYMLINK_TARGET_ROOTS`） | c | 同上（经 `application::warm_up_startup_probes`） |
 | application/settings.rs:1054 | `std::fs::read_to_string`（`plugin-proxy-bypass`） | c\* | 合规：唯一调用方 `plugins.rs:201`（启动期构造） |
-| application/settings.rs:1086 | `std::fs::read_to_string`（`read_secret`） | c\* | 合规：唯一调用方 `main.rs:187`（启动期） |
+| application/settings.rs:1086 | `std::fs::read_to_string`（`read_secret`） | c\* | 合规：唯一调用方 `main.rs:193`（启动期） |
 
 ## 5. `(d)` 违规与修复
+
+表中行号一律指**审计基线（修复前）**的位置；修复后部分代码已移动
+（例如 `scanner/library.rs` 的构造函数与 `main.rs` 的启动预热）。
+修复后的实际位置见 §3.1 / §4.7 的说明。
 
 | # | 文件:行 | 调用 | 问题 | 修复 |
 | --- | --- | --- | --- | --- |
 | 1 | application/scanner/library.rs:294 | `std::fs::canonicalize` | `FileBatchWalker::new` 在 async 扫描循环中同步规范化根路径 | 改为 `async fn` + `tokio::fs::canonicalize`；5 处调用点加 `.await` |
 | 2 | application/scanner/library.rs:303 | `std::fs::canonicalize` | `FileBatchWalker::new_with_sidecars` 同上 | 同上 |
-| 3 | application/transcoding.rs:34 | `std::fs::read_dir("/dev/dri")` | `detected_hardware_encoders()` 的 `OnceLock` 首次填充发生在管理员设置请求里 | 新增 `warm_up()`，在启动期 `AppState::ready_with_proxy_and_image_config` 预热 |
-| 4 | application/transcoding.rs:45 | `std::fs::read_to_string`（sysfs vendor） | 同上 | 同上 |
-| 5 | application/scanner/symlink.rs:145 | `std::fs::canonicalize` | `SymlinkPolicy::current()` 的 `OnceLock` 首次填充可能发生在扫描 / 请求路径 | 新增 `warm_up()`，在启动期预热 |
-| 6 | application/people/helpers.rs:1269 | `std::fs::File` 句柄字段 | 句柄来自 `tokio::fs::OpenOptions::…open().into_std().await`，打开本身是异步的 | 保留（见 §6.1） |
-| 7 | application/people/helpers.rs:1296 | `File::try_lock()` → `WouldBlock` | 非阻塞 `flock(LOCK_NB)`，立即返回 | 保留（见 §6.1） |
-| 8 | application/people/helpers.rs:1304 | `File::try_lock()` → `Error` | 同上 | 保留（见 §6.1） |
+| 3 | application/scanner/manifest.rs:1009 | `std::fs::canonicalize` | `followed_symlink_observation` 被 `FileBatchWalker::next_batch` 的 async 遍历器逐条符号链接同步调用 | 新增 `library::link_target_is_allowed`，把整段判定（owned `PathBuf`）交给 `spawn_blocking` |
+| 4 | application/scanner/manifest.rs:1028 | `std::fs::metadata` | 同上 | 同上 |
+| 5 | application/transcoding.rs:40 | `std::fs::read_dir("/dev/dri")` | `detected_hardware_encoders()` 的 `OnceLock` 首次填充发生在管理员设置请求里 | 新增 `warm_up()`，在 `main.rs::build_app_state` 的 `spawn_blocking` 里、`AppState` 构造之前预热 |
+| 6 | application/transcoding.rs:51 | `std::fs::read_to_string`（sysfs vendor） | 同上 | 同上 |
+| 7 | application/scanner/symlink.rs:152 | `std::fs::canonicalize` | `SymlinkPolicy::current()` 的 `OnceLock` 首次填充可能发生在扫描 / 请求路径 | 同上（经 `application::warm_up_startup_probes`） |
+| 8 | application/people/helpers.rs:1269 | `std::fs::File` 句柄字段 | 句柄来自 `tokio::fs::OpenOptions::…open().into_std().await`，打开本身是异步的 | 保留（见 §6.1） |
+| 9 | application/people/helpers.rs:1296 | `File::try_lock()` → `WouldBlock` | 非阻塞 `flock(LOCK_NB)`，立即返回 | 保留（见 §6.1） |
+| 10 | application/people/helpers.rs:1304 | `File::try_lock()` → `Error` | 同上 | 保留（见 §6.1） |
 
 ### 5.1 修复后状态
 
-| 项 | 修复前 | 修复后 |
-| --- | --- | --- |
-| 非测试代码中的阻塞文件系统调用点 | 124 | **119**（`scanner/library.rs:294`、`303` 改用 `tokio::fs::canonicalize`，不再计入） |
-| (a) | 13 | 13 |
-| (b) | 86 | 86 |
-| (c)（含 c\*） | 17 | **20**（`transcoding.rs:34`、`45`、`scanner/symlink.rs:145` 改为启动期预热） |
-| (d) 违规 | 8 | **3**（`people/helpers.rs:1269`、`1296`、`1304`，见 §6.1） |
-| 非测试代码中的 `std::process::Command` | 0 | 0 |
-| 非测试代码中的 `std::thread::sleep` | 0 | 0 |
+见 §3.1 的两栏表（基线 124 / 修复后 122，剩余 (d) 3）。要点：
 
-修复后的相关测试：
+- 修掉的 5 组：`scanner/library.rs` 根路径规范化（2）→ `tokio::fs`；
+  `scanner/manifest.rs` 符号链接判定（2）→ `spawn_blocking`；
+  `transcoding.rs` + `scanner/symlink.rs` 惰性缓存（3）→ 启动期阻塞线程预热；
+  `plugins.rs` 归档 stat（1）→ `tokio::fs`。
+  其中 `scanner/library.rs` 的 2 处是**消除**（不再计入），其余是**重分类**（(d) → (a)/(b) 或 (c)）。
+- 数字变化：文件系统调用点 124 → 122（只删掉 2 处），(b) 84 → 86（两处更正），
+  (c) 17 → 20（三处重分类），(d) 10 → 3。总数与分项一致。
+
+修复后的相关测试（均为窄测试，未跑 `--all-targets`）：
 
 - `cargo test --locked --lib scanner::` — 含新增
-  `batch_walker_canonicalizes_its_root_before_symlink_checks`（未修复时会失败，
-  已用临时回退验证过 Red）。
+  `batch_walker_canonicalizes_its_root_before_symlink_checks`（根规范化，未修复时会失败，
+  已用临时回退验证过 Red）与
+  `batch_walker_follows_only_file_links_inside_the_root`（符号链接判定语义：库内链接保留、
+  库外链接与断链跳过；在修复前后都通过，用于锁定语义）。
+- `cargo test --locked --lib plugins::` — 覆盖 `install_from_store` 归档清理路径。
 - `cargo test --locked --lib transcoding::` — 含新增
   `startup_warm_up_resolves_only_known_encoders`。
 - `cargo test --locked --lib symlink::` — 含新增
@@ -290,15 +319,20 @@
 ## 7. 后续建议（本次未做，超出单点 ~80 行预算）
 
 1. **`PluginService::new` 异步化**：把 `PluginCatalog::discover`（`plugin_runtime.rs`，12 处同步
-   `std::fs`，含 zip 解包与逐文件 SHA-256）搬到 `spawn_blocking`。现状只在启动期执行（合规于
-   (c\*)，但启动期耗时可能达秒级）。需要把 `PluginService::new` / `new_with_proxy` 改成
-   `async fn`，并同步修改 `src/api/legacy.rs` 与十余处测试构造点，改动约 200+ 行。
+   `std::fs`，含 zip 解包与逐文件 SHA-256）搬到 `spawn_blocking`。现状只在
+   启动期执行（合规于 (c\*)，但启动期耗时可能达秒级）。需要把 `PluginService::new` /
+   `new_with_proxy` 改成 `async fn`，并同步修改 `src/api/legacy.rs` 与十余处测试构造点，
+   改动约 200+ 行。
 2. **启动期阻塞收敛**：把 `main.rs` 的 `build_app_state` 中对 `AppState::ready_*` 的调用整体
-   包进 `spawn_blocking`（或把 `ready_*` 拆成"纯数据"与"文件系统初始化"两段）。涉及
-   `src/main.rs`（本次禁改）与 `src/api/legacy.rs` 的构造顺序，建议单独任务处理。
-3. **启动期预热统一入口**：目前 `container_gateway::warm_up()` 在 `main.rs`、本次新增的
-   `transcoding::warm_up()` 与 `scanner::symlink::warm_up()` 在 `api/legacy.rs`，位置分散；
-   建议后续统一为一个 `startup::warm_up_caches()`。
+   包进 `spawn_blocking`（或把 `ready_*` 拆成"纯数据"与"文件系统初始化"两段）。本轮只把
+   两个 `warm_up()` 移到了 `spawn_blocking`（审查意见 2），`AppState::ready_*` 内部仍有
+   `PluginService::new` 等同步文件系统工作，仍在启动期的 Tokio worker 上执行，建议单独任务处理。
+   `main.rs:26` 的 `container_gateway::warm_up()` 有同样的问题（在 `async fn main` 里直接调用），
+   本轮按要求未改动启动逻辑，建议一并迁入同一个 `spawn_blocking`。
+3. **启动期预热统一入口**：`container_gateway::warm_up()` 在 `main.rs`，
+   `application::warm_up_startup_probes()`（`transcoding` + `symlink`）在 `build_app_state` 的
+   `spawn_blocking` 里，位置仍分散；建议后续合并为一个
+   `application::warm_up_startup_probes()` 直接包含三项。
 4. **为 (d) 类加静态检查**：可以在 CI 里拒绝 `src/application|api|auth|observability` 下
-   `#[cfg(not(test))]` 区域内新增的 `std::fs::` / `std::process::Command` / `std::thread::sleep`，
+   `#[cfg(not(test))]` 区域内新增的 `std::fs::` / `std::process::Command` / `std::thread::sleep`
    要求显式 `#[allow]` 或白名单注释，避免回退。
