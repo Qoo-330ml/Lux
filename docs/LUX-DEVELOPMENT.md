@@ -18556,6 +18556,54 @@ W4（触发器入队与写预算）、W5（CPU/协议层）在 867–869 完成�
 
 ### W5 CPU 与协议层收敛（剩余项已结论，2026-10-28）
 
+#### LUX-870：Web 直放候选链（302 代理优先）
+
+背景：用户通过 302 代理访问 Lux 时，第三方 Emby 客户端经 `/Videos/{id}/stream` 被 302 软件接管并正常播放；
+Lux Web 对 HTTP(S) `.strm` 却始终先连 `externalUrl`，绕过了代理。该任务取代 LUX-245 中“原生 `<video>` 使用原始
+`externalUrl`、Web 不使用 `proxyUrl`”的部分；LUX-245 中客户端 Matroska/HEVC fallback 与远程字幕读取器直连
+`externalUrl`、Lux 不接收远程媒体字节的边界保持不变（302 由代理或 Lux 307 完成，Lux 仍不转发字节）。
+
+范围：仅 `web/`。Direct 计划的原生播放按固定顺序尝试候选：`proxy`（计划的 `proxyUrl`，同源 `/Videos/{id}/stream`）
+→ `lux`（计划的签名 Lux 入口）→ `origin`（HTTP(S) `.strm` 的 `externalUrl`，仅最后手段）。候选失败的判据为 `error`
+事件或 8 秒内未取得 `loadedmetadata`；切换候选保留当前位置与播放状态。命中的候选类型按页面 origin 记入
+`localStorage`（仅记录类型，不记录 URL），下次从该候选起试。候选链逻辑从 `PlayerPage.tsx` 抽出为独立模块并有单测。
+客户端 MKV/HEVC 引擎与远程字幕读取器的输入 URL 不变。
+
+验收：
+
+- [ ] HTTP(S) `.strm` 在存在 `proxyUrl` 时原生播放首选 `proxyUrl`；无 `proxyUrl` 时行为与改动前一致。
+- [ ] `proxy` 失败后依次回落到 `lux`、`origin`；全部失败给出现有的可诊断错误；`origin` 不早于前两者。
+- [ ] 路径型 `.strm`、本地媒体、`SERVER_HLS` 行为不回归；客户端引擎输入仍为 `externalUrl`。
+- [ ] 记忆的候选类型不含 URL、token；多次播放不会让已失效的候选永久锁定（失败后清除记忆）。
+
+验证：`pnpm --dir web test`（`player-fallback`、新增候选链单测）、`pnpm --dir web build`、`git diff --check`。
+
+依赖：LUX-234、LUX-245。
+
+#### LUX-871：Web 播放短期 token（Emby 兼容、仅播放范围）
+
+范围：为 Web 播放会话签发 Emby 兼容的短期 `api_key`，供 302 软件用其回查 `Items/{id}` 取得 `.strm` 原始 `Path`。
+token 与 Web 播放会话绑定：有效期不超过会话 `expires_at`，会话停止/过期/用户被禁用/IP 或设备黑名单命中时作废；
+只读，允许范围限定为 `Videos/{id}/stream|original`、`Items/{id}`、`Users/{id}/Items/{id}` 与 `Auth/Keys`，其他 Emby
+接口一律拒绝；不得写入日志与错误信息。需要迁移（SQLite 与 PostgreSQL，`scripts/check-migration-parity.py` 通过）。
+
+验收与验证在任务开始时按当前实现补全；开始前须先核对 `src/auth/emby.rs`、`src/storage` 的 access token 表与本条范围。
+
+依赖：LUX-870。
+
+#### LUX-872：Direct 计划 `candidates` 字段
+
+范围：Direct 计划新增有序 `candidates`（`proxy`/`lux`/`origin`），`proxy` 候选为带 LUX-871 短期 token 与标准
+`DeviceId`/`PlaySessionId`/`UserId`/`static=true` 的 Emby 风格 URL。旧字段 `url`/`proxyUrl`/`rangeUrl` 保留一个版本。
+更新 `docs/API.md`、`docs/COMPATIBILITY.md`，并让 LUX-870 的候选链改读 `candidates`。
+
+依赖：LUX-870、LUX-871。
+
+#### LUX-873：跨域能力探测与候选命中统计
+
+范围：命中 `proxy` 候选时客户端 MKV/HEVC 引擎与字幕旁路先做 `Range: bytes=0-0` 的 CORS 探测，通过才启用；播放会话与信息面板
+记录命中的候选类型。依赖：LUX-872。
+
 范围（`docs/LUX-DATA-PATH-PLAN.md` §5 W5）：缓存返回 `Arc`、去掉整页深克隆；详情 NFO 解码结果按
 `(item_id, fingerprint)` 做小 LRU；图片端点元数据根 canonicalize 缓存；扫描空闲轮询 50 ms → 自适应
 250 ms–1 s；ETag/304 + gzip；`Fields` 投影；前台延迟反馈扩到路由模板级并接入 ffprobe/元数据/图片
