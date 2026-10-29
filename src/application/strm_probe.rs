@@ -19,7 +19,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    application::strm_target::{StrmTargetKind, classify_strm_target},
+    application::strm_target::{StrmTargetKind, canonical_local_strm_target, classify_strm_target},
     application::{
         images::{
             acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
@@ -859,6 +859,12 @@ impl StrmProbeService {
                 "STRM source has no external URL".to_owned(),
             );
         };
+        let url = match probe_target(&url, &source.root_path, &source.relative_path).await {
+            Ok(target) => target,
+            Err(message) => {
+                return SourceOutcome::failed(&source.source_id, "FAILED", message.to_owned());
+            }
+        };
         if !validate_remote_media_url(&url) {
             return SourceOutcome::failed(
                 &source.source_id,
@@ -1326,6 +1332,47 @@ mod tests {
     use crate::config::Config;
 
     #[tokio::test]
+    async fn probe_target_resolves_relative_paths_and_rejects_unreadable_protocols() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("lib");
+        tokio::fs::create_dir_all(root.join("nested"))
+            .await
+            .expect("dirs");
+        tokio::fs::write(root.join("movie.mkv"), b"x")
+            .await
+            .expect("media");
+        tokio::fs::write(root.join("nested/a.strm"), b"../movie.mkv")
+            .await
+            .expect("strm");
+        let root_str = root.to_str().expect("utf8");
+
+        let resolved = super::probe_target("../movie.mkv", root_str, "nested/a.strm").await;
+        assert_eq!(
+            resolved.map(std::path::PathBuf::from),
+            Ok(root.join("movie.mkv").canonicalize().expect("canonical"))
+        );
+        assert_eq!(
+            super::probe_target("https://h/v.mkv", root_str, "nested/a.strm").await,
+            Ok("https://h/v.mkv".to_owned())
+        );
+        assert!(
+            super::probe_target("smb://nas/v.mkv", root_str, "nested/a.strm")
+                .await
+                .is_err()
+        );
+        assert!(
+            super::probe_target("magnet:?xt=1", root_str, "nested/a.strm")
+                .await
+                .is_err()
+        );
+        assert!(
+            super::probe_target("missing.mkv", root_str, "nested/a.strm")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn completed_operation_is_removed_from_registry() {
         let temp_dir = tempfile::tempdir().expect("temporary directory");
         let config = Config {
@@ -1650,6 +1697,28 @@ impl SourceOutcome {
             thumbnail_needed: false,
             failure_status: status.to_owned(),
             error,
+        }
+    }
+}
+
+/// Turns the stored STRM target into something `ffprobe` can open from the plugin process, whose
+/// working directory is the plugin root. Relative local paths are resolved against the `.strm`
+/// file; protocols `ffprobe` cannot read are rejected here with a clear reason.
+async fn probe_target(
+    target: &str,
+    root_path: &str,
+    strm_relative_path: &str,
+) -> Result<String, &'static str> {
+    let classified = classify_strm_target(target);
+    match classified.kind {
+        StrmTargetKind::Url | StrmTargetKind::Ftp => Ok(target.trim().to_owned()),
+        StrmTargetKind::Path => canonical_local_strm_target(root_path, strm_relative_path, target)
+            .await
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|_| "STRM local target is missing or not a file"),
+        StrmTargetKind::Smb => Err("STRM SMB targets cannot be probed"),
+        StrmTargetKind::Empty | StrmTargetKind::Unsupported => {
+            Err("STRM target protocol is not supported for probing")
         }
     }
 }

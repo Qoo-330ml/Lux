@@ -82,6 +82,9 @@ const PLUGIN_CONFIG_DIR: &str = "plugin-config";
 const MEDIA_INFO_EXISTING_INFO_POLICY_KEY: &str = "existingInfoPolicy";
 const MEDIA_INFO_EXISTING_INFO_POLICY_SKIP: &str = "SKIP";
 const MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE: &str = "OVERWRITE";
+/// Must exceed the plugin's own worst case (ffprobe 30s + duration ffprobe 30s + ffmpeg 60s) so the
+/// plugin reports its classified error instead of being killed mid-probe by the host.
+const MEDIA_PROBE_CALL_TIMEOUT: Duration = Duration::from_secs(130);
 const MAX_MEDIA_PROBE_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 30;
 pub const MIN_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 1;
@@ -2212,7 +2215,7 @@ impl PluginService {
         }
         let value = self
             .supervisor
-            .call_isolated(
+            .call_isolated_with_timeout(
                 MEDIA_INFO_PLUGIN_ID,
                 "media.probe",
                 serde_json::json!({
@@ -2221,6 +2224,7 @@ impl PluginService {
                     "includeThumbnail": include_thumbnail,
                     "thumbnailPositionPercent": thumbnail_position_percent,
                 }),
+                MEDIA_PROBE_CALL_TIMEOUT,
             )
             .await
             .map_err(PluginServiceError::Runtime)?;
