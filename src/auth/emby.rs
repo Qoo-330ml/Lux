@@ -20,8 +20,9 @@ use crate::{
     },
     domain::ids::UserId,
     storage::{
-        Database, NewAccessToken, StorageError, StoredEmbyLoginSessionSummary,
-        UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+        Database, NewAccessToken, NewPlaybackAccessToken, StorageError,
+        StoredEmbyLoginSessionSummary, UserAccessBlacklistIpRuleQuery,
+        UserAccessBlacklistRuleMatchQuery,
     },
 };
 
@@ -359,8 +360,39 @@ impl EmbyAuthService {
         token: &str,
         client_ip: Option<IpAddr>,
     ) -> Result<Option<UserRecord>, EmbyAuthError> {
+        self.resolve_token_scoped(token, client_ip, false).await
+    }
+
+    /// Resolver for the Emby-compatible routes only: unlike [`Self::resolve_token_with_ip`] it also
+    /// honors playback-only tokens. The router restricts those tokens to the playback allow-list
+    /// before any handler runs.
+    pub async fn resolve_emby_route_token_with_ip(
+        &self,
+        token: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<UserRecord>, EmbyAuthError> {
+        self.resolve_token_scoped(token, client_ip, true).await
+    }
+
+    async fn resolve_token_scoped(
+        &self,
+        token: &str,
+        client_ip: Option<IpAddr>,
+        allow_playback_scope: bool,
+    ) -> Result<Option<UserRecord>, EmbyAuthError> {
+        let is_playback_token = is_playback_token(token);
+        if is_playback_token && !allow_playback_scope {
+            return Ok(None);
+        }
         let token_hash = hash_token(token);
-        let Some(stored) = self.database.find_user_by_access_token(&token_hash).await? else {
+        let stored = if allow_playback_scope {
+            self.database
+                .find_user_by_emby_route_access_token(&token_hash)
+                .await?
+        } else {
+            self.database.find_user_by_access_token(&token_hash).await?
+        };
+        let Some(stored) = stored else {
             // Unknown tokens must not reach the activity UPDATE below; otherwise any random
             // string would still open a write transaction on every request.
             return Ok(None);
@@ -380,11 +412,64 @@ impl EmbyAuthService {
             self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
-        if self.should_touch_access_token(&token_hash) {
+        // A playback token keeps the expiry it was issued with; it is never refreshed by use.
+        if !is_playback_token && self.should_touch_access_token(&token_hash) {
             self.database.touch_access_token(&token_hash).await?;
             self.mark_access_token_touched(&token_hash);
         }
         user_record(stored).map(Some)
+    }
+
+    /// Issues a short-lived, playback-only token bound to one Web playback session. It expires no
+    /// later than `expires_at` (and never more than [`PLAYBACK_TOKEN_MAX_TTL_SECONDS`] from now).
+    pub async fn issue_playback_token(
+        &self,
+        user: &UserRecord,
+        playback_session_id: &str,
+        device: &EmbyDeviceInfo,
+        expires_at: i64,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<String>, EmbyAuthError> {
+        let user_id = user.id.to_string();
+        if self.user_access_blacklist_matches(&user_id, device).await?
+            || self.is_user_ip_blacklisted(&user_id, client_ip).await?
+        {
+            return Ok(None);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        let expires_at = expires_at.min(now.saturating_add(PLAYBACK_TOKEN_MAX_TTL_SECONDS));
+        let token = format!("{PLAYBACK_TOKEN_PREFIX}{}", generate_token()?);
+        let token_id = UserId::new().to_string();
+        let token_hash = hash_token(&token);
+        self.database
+            .create_playback_access_token(NewPlaybackAccessToken {
+                id: &token_id,
+                token_hash: &token_hash,
+                user_id: &user_id,
+                device_id: &device.device_id,
+                client_name: &device.client,
+                device_name: &device.device,
+                client_version: &device.version,
+                playback_session_id,
+                expires_at,
+            })
+            .await?;
+        Ok(Some(token))
+    }
+
+    /// Revokes every playback token issued for a playback session.
+    pub async fn revoke_playback_tokens(
+        &self,
+        playback_session_id: &str,
+    ) -> Result<u64, EmbyAuthError> {
+        Ok(self
+            .database
+            .revoke_playback_access_tokens(playback_session_id)
+            .await?)
     }
 
     fn should_touch_access_token(&self, token_hash: &[u8]) -> bool {
@@ -506,6 +591,15 @@ pub struct EmbyAuthResult {
     pub session_id: String,
     pub user: UserRecord,
     pub device: EmbyDeviceInfo,
+}
+
+/// Prefix that marks a playback-only token so the router can restrict it without a lookup.
+pub const PLAYBACK_TOKEN_PREFIX: &str = "luxpb_";
+const PLAYBACK_TOKEN_MAX_TTL_SECONDS: i64 = 12 * 60 * 60;
+
+/// Whether `token` has the shape of a playback-only token (it may still be unknown or expired).
+pub fn is_playback_token(token: &str) -> bool {
+    token.starts_with(PLAYBACK_TOKEN_PREFIX)
 }
 
 fn generate_token() -> Result<String, EmbyAuthError> {

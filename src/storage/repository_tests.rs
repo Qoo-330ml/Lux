@@ -21922,6 +21922,21 @@ async fn session_history_purge_removes_only_terminal_old_rows()
         .execute(database.pool())
         .await?;
     }
+    // Playback tokens are never revoked by use, so an expired one is purged by its expiry alone.
+    for (id, expires_at) in [("at-playback-old", old), ("at-playback-live", now + 600)] {
+        sqlx::query(
+            "INSERT INTO access_tokens (id, token_hash, user_id, device_id, client_name,
+                                        device_name, client_version, scope,
+                                        playback_session_id, expires_at)
+             VALUES (?, randomblob(16), ?, 'device', 'client', 'device', '1', 'PLAYBACK',
+                     'play-session', ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(expires_at)
+        .execute(database.pool())
+        .await?;
+    }
     for (id, state, expires_at) in [
         ("wps-stopped", "STOPPED", old),
         ("wps-active", "ACTIVE", old),
@@ -21973,12 +21988,13 @@ async fn session_history_purge_removes_only_terminal_old_rows()
 
     let purge = database.purge_expired_session_history(now, 100).await?;
     assert_eq!(purge.web_sessions, 2);
-    assert_eq!(purge.access_tokens, 1);
+    assert_eq!(purge.access_tokens, 2);
     assert_eq!(purge.web_playback_sessions, 1);
     assert_eq!(purge.playback_sessions, 1);
     assert_eq!(purge.playback_admissions, 1);
 
     for (table, kept, gone) in [
+        ("access_tokens", "at-playback-live", "at-playback-old"),
         ("web_sessions", "ws-active", "ws-old"),
         ("access_tokens", "at-fresh", "at-old"),
         ("web_playback_sessions", "wps-active", "wps-stopped"),

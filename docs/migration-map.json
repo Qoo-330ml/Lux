@@ -864,6 +864,11 @@
       "name": "nfo_collection_pending_index_without_stale_predicate",
       "sqlite": 240,
       "postgres": 242
+    },
+    {
+      "name": "playback_access_tokens",
+      "sqlite": 241,
+      "postgres": 243
     }
   ],
   "sqlite_only": [
@@ -1216,7 +1221,7 @@
     }
   ],
   "ordering": {
-    "shared_names": 173,
+    "shared_names": 174,
     "rank_mismatches": 84,
     "note": "Migration histories evolved with different SQLite-only/PostgreSQL-only interleaving, so the shared names are not in the same relative order. New migrations must keep a pair adjacent in both directories, which keeps this count from growing."
   }

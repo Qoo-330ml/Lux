@@ -5030,6 +5030,19 @@ pub(crate) struct NewAccessToken<'a> {
     pub(crate) device_type: Option<&'a str>,
 }
 
+/// A playback-only credential issued for one Web playback session.
+pub(crate) struct NewPlaybackAccessToken<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) token_hash: &'a [u8],
+    pub(crate) user_id: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) client_name: &'a str,
+    pub(crate) device_name: &'a str,
+    pub(crate) client_version: &'a str,
+    pub(crate) playback_session_id: &'a str,
+    pub(crate) expires_at: i64,
+}
+
 pub(crate) struct NewDevicePairing<'a> {
     pub(crate) id: &'a str,
     pub(crate) user_id: &'a str,

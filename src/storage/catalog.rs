@@ -10439,7 +10439,7 @@ impl Database {
         self.query_scalar(
             "SELECT CASE WHEN EXISTS(
                 SELECT 1 FROM access_tokens
-                WHERE token_hash = ? AND revoked_at IS NULL
+                WHERE token_hash = ? AND revoked_at IS NULL AND scope = 'FULL'
                   AND (expires_at IS NULL OR expires_at > unixepoch())
             ) THEN 1 ELSE 0 END",
         )

@@ -1653,7 +1653,7 @@ impl Database {
                 SET last_seen_at = unixepoch(),
                     updated_at = unixepoch(),
                     expires_at = unixepoch() + ?
-              WHERE token_hash = ? AND revoked_at IS NULL",
+              WHERE token_hash = ? AND revoked_at IS NULL AND scope = 'FULL'",
         )
         .bind(EMBY_ACCESS_TOKEN_TTL_SECONDS)
         .bind(token_hash)
@@ -1824,6 +1824,7 @@ impl Database {
                             WHERE at.user_id = ud.user_id
                               AND at.device_id = ud.device_id
                               AND at.revoked_at IS NULL
+                              AND at.scope = 'FULL'
                         ) THEN CAST(1 AS BIGINT) ELSE CAST(0 AS BIGINT) END AS has_active_login
                  FROM user_devices ud
                  WHERE ud.user_id = ?
@@ -2379,6 +2380,25 @@ impl Database {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<StoredUser>, StorageError> {
+        self.find_user_by_scoped_access_token(token_hash, false)
+            .await
+    }
+
+    /// Resolves a token for Emby routes, which also honor playback-only tokens. Callers must have
+    /// already restricted the request to the playback allow-list.
+    pub(crate) async fn find_user_by_emby_route_access_token(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<StoredUser>, StorageError> {
+        self.find_user_by_scoped_access_token(token_hash, true)
+            .await
+    }
+
+    async fn find_user_by_scoped_access_token(
+        &self,
+        token_hash: &[u8],
+        allow_playback_scope: bool,
+    ) -> Result<Option<StoredUser>, StorageError> {
         self.query(
             "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
                     u.has_password, u.is_disabled, u.is_admin, u.can_manage_server,
@@ -2392,12 +2412,61 @@ impl Database {
              FROM access_tokens at
              JOIN users u ON u.id = at.user_id
              WHERE at.token_hash = ? AND at.revoked_at IS NULL
-               AND (at.expires_at IS NULL OR at.expires_at > unixepoch())",
+               AND (at.expires_at IS NULL OR at.expires_at > unixepoch())
+               AND (at.scope = 'FULL' OR CAST(? AS BIGINT) = 1)",
         )
         .bind(token_hash)
+        .bind(i64::from(allow_playback_scope))
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_user))
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn create_playback_access_token(
+        &self,
+        token: NewPlaybackAccessToken<'_>,
+    ) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO access_tokens (
+                id, token_hash, user_id, device_id, client_name, device_name,
+                client_version, scope, playback_session_id, expires_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'PLAYBACK', ?, ?)",
+        )
+        .bind(token.id)
+        .bind(token.token_hash)
+        .bind(token.user_id)
+        .bind(token.device_id)
+        .bind(token.client_name)
+        .bind(token.device_name)
+        .bind(token.client_version)
+        .bind(token.playback_session_id)
+        .bind(token.expires_at)
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    pub(crate) async fn revoke_playback_access_tokens(
+        &self,
+        playback_session_id: &str,
+    ) -> Result<u64, StorageError> {
+        self.query(
+            "UPDATE access_tokens
+             SET revoked_at = unixepoch(), updated_at = unixepoch()
+             WHERE playback_session_id = ? AND scope = 'PLAYBACK' AND revoked_at IS NULL",
+        )
+        .bind(playback_session_id)
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected())
         .map_err(|source| StorageError::Sqlx {
             path: self.path.clone(),
             source,
@@ -2443,7 +2512,7 @@ impl Database {
         let total_count = self
             .query_scalar(
                 "SELECT COUNT(*) FROM access_tokens
-                 WHERE user_id = ? AND revoked_at IS NULL",
+                 WHERE user_id = ? AND revoked_at IS NULL AND scope = 'FULL'",
             )
             .bind(user_id)
             .fetch_one(&self.pool)
@@ -2457,7 +2526,7 @@ impl Database {
                 "SELECT id, device_id, device_name, device_type, client_name, client_version,
                         created_at, updated_at, last_seen_at
                  FROM access_tokens
-                 WHERE user_id = ? AND revoked_at IS NULL
+                 WHERE user_id = ? AND revoked_at IS NULL AND scope = 'FULL'
                  ORDER BY COALESCE(last_seen_at, updated_at) DESC, id DESC
                  LIMIT ? OFFSET ?",
             )
@@ -2496,7 +2565,7 @@ impl Database {
         self.query(
             "UPDATE access_tokens
              SET revoked_at = unixepoch(), updated_at = unixepoch()
-             WHERE user_id = ? AND id = ? AND revoked_at IS NULL",
+             WHERE user_id = ? AND id = ? AND revoked_at IS NULL AND scope = 'FULL'",
         )
         .bind(user_id)
         .bind(session_id)

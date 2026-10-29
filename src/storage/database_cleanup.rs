@@ -1264,10 +1264,12 @@ impl Database {
             .query(
                 "DELETE FROM access_tokens WHERE id IN (
                      SELECT id FROM access_tokens
-                     WHERE revoked_at IS NOT NULL AND revoked_at < ?
-                     ORDER BY revoked_at, id LIMIT ?
+                     WHERE (revoked_at IS NOT NULL AND revoked_at < ?)
+                        OR (scope = 'PLAYBACK' AND expires_at < ?)
+                     ORDER BY COALESCE(revoked_at, expires_at), id LIMIT ?
                  )",
             )
+            .bind(cutoff)
             .bind(cutoff)
             .bind(batch)
             .execute(&self.pool)
