@@ -2960,3 +2960,100 @@ SQL 级补充（同一夹具，5,000 次标题更新，`synchronous=NORMAL`）�
 
 若要把这一项变成运行时指标，需要给 `Database` 的查询入口加每请求计数（任务局部计数器 + 中间件），
 这会触碰所有查询路径，暂未做。
+
+## release profile 评估（A3，2026-10-30，arm64）
+
+动机：`Cargo.toml` 原本只有 `[profile.dev]` / `[profile.test]`，release 走 cargo 默认（`codegen-units = 16`、
+无 LTO、保留符号表）。本节用构建耗时、二进制体积和每请求 CPU 评估是否值得加 release 优化配置。
+
+前提：
+
+| 项 | 值 |
+|---|---|
+| 机器 | Apple M4，`uname -m` = `arm64`，10 核，16 GiB，macOS 26.5 |
+| 工具链 | rustc / cargo 1.97.1（`rust-toolchain.toml` 为 stable） |
+| 基线提交 | `5e03e7b1`（`test` 分支），独立 worktree、独立 `target/` |
+| 数据来源 | arm64 开发机；**不得**据此推断 NAS / x86_64 的耗时、体积或 CPU |
+
+构建期间同机还有其它 worktree 的 `cargo build` / `cargo test` 并发运行，绝对秒数不可复现（同一配置
+两次全量构建可以差到 3 倍，见下文“噪声”）。这里的用法是只把超过整机波动的差异当信号。
+
+### 构建成本与体积
+
+| 配置 | 全量构建 | 只改 `src/lib.rs` 后重编 | `target/release/luxd` | 相对基线 | `nm -a` 符号数 |
+|---|---:|---:|---:|---:|---:|
+| 基线（无 `[profile.release]`） | 642 s（首次冷缓存）；220 s（暖缓存重建） | 204 s | 85,166,320 B（81.2 MiB） | — | 130,512 |
+| `strip = "symbols"` | 205 s（暖缓存） | 272 s | 69,806,800 B（66.6 MiB） | **−18.0%** | 273 |
+| `lto = "thin"` + `codegen-units = 1` + `strip` | 1062 s（profile 变更导致全量重编，当时并发负载更高） | 584 s | 45,480,528 B（43.4 MiB） | **−46.6%** | 268 |
+
+- 642 s 是这台机器上第一次 release 构建（依赖全部冷编译）；暖缓存的全量重建是 220 s。同一配置的
+  增量重编 204 s（基线）也是在这台有并发编译的机器上测的。
+- `strip` 单独：体积 −18%，全量重建与基线持平（205 s vs 220 s），增量重编 272 s（并发负载下的噪声，
+  低于 204 s 的 1.35 倍）。
+- `lto = "thin"` + `codegen-units = 1`：相对基线再省 23.2 MiB，但增量重编 584 s 是基线 204 s 的
+  **2.9 倍**，全量重编 1062 s，超过“构建耗时恶化 > 2 倍”的门限；两次独立测量方向一致。
+- 未设置 `panic = "abort"`：panic 行为保持不变。
+
+### CPU / 请求（`scripts/run-api-cpu-bench.py`）
+
+66k 夹具（66,000 `media_items` / `catalog_items` / FTS 行，338 MB），`LUX_READ_MODEL_MODE=off`，
+每端点 150 次请求、预热 20 次；三种配置交错执行，每种 7 轮。值为中位（最小–最大），单位 ms：
+
+| 端点 | 基线 | `strip` 单独 | `thin LTO`+CGU=1+`strip` | 判定 |
+|---|---:|---:|---:|---|
+| `/api/v1/home` | 465.7（290.1–643.6） | 585.7（294.5–644.3） | 341.2（287.4–473.6） | 区间完全重叠，无差异 |
+| `/api/v1/search?q=Spec%20Movie` | 25.1（24.7–36.5） | 30.3（24.8–46.7） | 24.3（24.3–29.9） | 区间完全重叠，无差异 |
+| 库列表 `pageSize=50` | 2.3（2.2–5.1） | 3.5（2.1–5.9） | 2.1（2.0–3.1） | 区间完全重叠，无差异 |
+| `/api/v1/continue-watching?pageSize=24` | 10.9（9.4–15.2） | 13.1（9.7–22.3） | 10.9（9.5–12.5） | 区间完全重叠，无差异 |
+| `/api/v1/libraries?pageSize=100` | 1.9（1.5–3.1） | 2.8（1.5–3.1） | 1.7（1.4–2.6） | 区间完全重叠，无差异 |
+
+观察：
+
+- 只走一次库列表查询的 `libraries` 是最干净的噪声标尺：三种配置都各自出现 1.4–1.9 ms 和 2.6–3.1 ms
+  两个簇，说明这台机器存在约 2 倍的整轮次波动（所有端点同向漂移，与配置无关）。其余端点的差异都
+  落在同一个波动内，因此**没有可归因于 profile 的每请求 CPU 收益**。墙上时间与 CPU/请求同向漂移，
+  也没有 config 差异。
+- 与预期一致：读路径的成本主要在 SQLite 查询与 serde 序列化，`thin LTO` / `codegen-units = 1` 能
+  改变的是跨 crate 内联和单线程 codegen，不在这条热点上。
+
+复用夹具的注意事项（本次踩到的坑）：
+
+- `scripts/run-api-performance.py --keep-work-dir` 生成的夹具在 `catalog_outbox` 里留下了
+  `kind='search'` 的约 320 万行积压，服务启动后反复触发 “search reindex queue gap → 全量重建”，
+  每次启动都在后台重索引。此时测出的 CPU/请求被抬到 `home` 721 ms、`search` 1790 ms（墙钟
+  2 s/请求），A/B 结论完全被后台工作污染。
+- 清掉积压（`DELETE FROM catalog_outbox WHERE kind='search'`，随后 `VACUUM`，库文件 642 MB → 354 MB）
+  并确认启动日志里没有 `search reindex applied` 之后，数字才回到 W5 记录的量级（`home` 126 ms
+  墙钟、`search` 24 ms）。做 profile A/B 或复跑 W5 基线前，先确认这一条，否则测的是后台重索引。
+
+### Dockerfile 静态检查
+
+`Dockerfile` 的依赖预构建层只拷 `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml`，写占位
+`src/lib.rs` + `src/main.rs`，先跑一次 `cargo build --release --locked --bin luxd`，真实源码放在下一层。
+加入 `[profile.release]` 后逐条核对：
+
+1. profile 来自被复制进该层的 `Cargo.toml`，所以依赖层和源码层用同一套编译参数，两层继续共用同一份
+   `target`。本地用同样的占位工程 + 现有 `target` 复现：占位构建 0.71 s 完成、没有重编任何依赖；
+   随后换回真实源码，只重编 `luxd` 一个 crate（3m52s）。
+2. `strip = "symbols"` 由 rustc 自己执行（`-C strip=symbols`），镜像里不需要额外装 `strip`/binutils。
+3. 占位层没有 `src/bin/lux-plugin-danmaku.rs` 不影响 `--bin luxd`（本次复现也没有提供该目标文件）。
+4. `panic` 保持默认 `unwind`，panic 行为不变。
+
+### 结论：部分采用
+
+**采用 `strip = "symbols"`，不启用 `lto = "thin"` + `codegen-units = 1`。**
+
+- `strip = "symbols"` 让发布二进制从 81.2 MiB 降到 66.6 MiB（−18.0%），符号表 130,512 → 273 项；
+  构建耗时与基线持平（205 s vs 220 s 全量、272 s vs 204 s 增量，都在并发噪声内），运行时行为与
+  CPU/请求无变化。
+- `thin LTO` + `codegen-units = 1` 再多省 23.2 MiB（总计 −46.6%），换来的是 release 重编约 2.9 倍
+  （584 s vs 204 s）的耗时，并且在本夹具上没有测到任何每请求 CPU 收益。容器镜像体积由
+  `LUX_RUNTIME_IMAGE` 基础镜像主导，多省 23 MiB 不值得把每次发布构建拉长到这个程度。
+- 如果以后镜像体积成为实际约束，可以单独再评估只开 `lto = "thin"`（不带 `codegen-units = 1`）；
+  本次数据不支持现在就启用。
+
+风险：
+
+- `strip = "symbols"` 之后，线上二进制的 panic backtrace 与采样工具（`perf` / `dtrace`）会失去符号名，
+  排查现场问题时需要用同一个 tag 临时去掉 `strip` 重新构建。
+- 本节所有数字来自 arm64 开发机，NAS / x86_64 的构建耗时与体积未测，不能按比例外推。

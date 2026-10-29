@@ -73,6 +73,15 @@ debug = "line-tables-only"
 debug = "line-tables-only"
 incremental = false
 
+# Release builds ship stripped. Measured in docs/PERFORMANCE.md
+# ("release profile 评估"): `strip = "symbols"` alone removes ~18% of the
+# binary for no measurable build cost. `lto = "thin"` + `codegen-units = 1`
+# would remove another ~28% but measurably slows release rebuilds, and the
+# benchmark showed no CPU win, so they are not enabled.
+# `panic` is left at the default "unwind" so panic behaviour is unchanged.
+[profile.release]
+strip = "symbols"
+
 # Rust 1.94 enables these style-only suggestions across existing code. Keep
 # them explicit until they can be handled outside the PostgreSQL bug fix.
 [lints.clippy]
