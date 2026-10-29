@@ -115,6 +115,13 @@ impl SymlinkPolicy {
     }
 }
 
+/// Resolves the process-wide symlink policy at startup so canonicalizing
+/// `LUX_SYMLINK_TARGET_ROOTS` never first runs on a scan or request path. Safe and cheap to call
+/// repeatedly.
+pub(crate) fn warm_up() {
+    let _ = SymlinkPolicy::current();
+}
+
 /// Whether a canonical provider path may be served or probed for `canonical_root`.
 ///
 /// The default range is the library root that owns the link. Targets outside it
@@ -150,8 +157,19 @@ fn parse_target_roots(configured: Option<std::ffi::OsString>) -> Vec<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::{DirectoryLinkPolicy, SymlinkPolicy};
+    use super::{DirectoryLinkPolicy, SymlinkPolicy, warm_up};
     use std::path::{Path, PathBuf};
+
+    #[test]
+    fn startup_warm_up_keeps_the_single_process_wide_policy() {
+        warm_up();
+        let warmed = SymlinkPolicy::current();
+        warm_up();
+        assert!(
+            std::ptr::eq(warmed, SymlinkPolicy::current()),
+            "warm_up must not replace the cached policy"
+        );
+    }
 
     #[test]
     fn root_children_enters_only_direct_child_directories() {

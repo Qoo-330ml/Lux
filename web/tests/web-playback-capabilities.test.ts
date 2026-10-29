@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { webPlaybackCapabilities } from "../src/features/player/PlayerPage";
+import { webPlaybackCapabilities } from "../src/features/player/playback-capabilities";
 
 describe("webPlaybackCapabilities", () => {
   beforeEach(() => {
