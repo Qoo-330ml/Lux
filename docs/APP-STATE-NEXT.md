@@ -5,18 +5,15 @@
 
 ## 1. 第一阶段交付后的基线
 
-- `AppState`（`src/api/legacy.rs:169`）共 62 个字段，其中 **49 个 `Option<Service>`**。
-- 已被 `require_service!(state.<field>)` 收敛的"服务未初始化 → 裸 503"let-else：**308 处**，
-  分布于 22 个 handler 文件；`git diff` 净减 548 行。
-- 仍是 let-else 的：**58 处**，else 分支里带日志、`api_error(...)` 或别的状态码
-  （`state.setup`、`state.database_setup`、`state.webhooks`、`state.people`、`state.plugins` 等），
-  第一阶段按要求原样保留。
+- `AppState`（`src/api/legacy.rs:169`）共 62 个字段，其中 **49 个 `Option<...>`**。
+- 已被 `require_service!(state.<field>)` 收敛的"服务未初始化 → 裸 503"let-else：**308 处**（22 个文件，净减 548 行）。
+- 仍是 let-else 的：**58 处**，else 分支带日志、`api_error(...)` 或别的状态码（`state.setup`、
+  `database_setup`、`webhooks`、`people`、`plugins` 等），第一阶段按要求原样保留。
 - 另有 60 处 `return StatusCode::SERVICE_UNAVAILABLE.into_response();` 出现在 `match` 分支或宏体里。
-- 运行期模式仍是"**一个 `Router` + 一个 `AppState`**"：`app()` 就是 `app_with_state(AppState::default())`，
-  setup 路由与业务路由共用同一状态类型，"未就绪"由字段是否为 `None`（以及 `database_selection_required`
-  这个 `bool`）在请求期临时判定。
+- 运行期模式仍是"一个 `Router` + 一个 `AppState`"：`app()` 即 `app_with_state(AppState::default())`，
+  setup 与业务路由共用同一状态类型，"未就绪"由字段是否为 `None`（加上 `database_selection_required`）判定。
 
-宏只消除了重复文本，没有消除"新增服务时忘记加检查"的类别性风险：编译器不会提醒任何 handler。
+宏只消除重复文本，没有消除"新增服务时忘记加检查"的类别性风险：编译器不会提醒任何 handler。
 
 ## 2. 目标
 
@@ -48,8 +45,12 @@ pub struct ReadyAppState { core: CoreState, /* 49 个服务字段，非 Option *
 
 - `setup_router() -> Router<SetupState>` 只挂 `/api/v1/setup/*`、健康/就绪探针、静态资源、登录前必需端点；
   `ready_router() -> Router<ReadyAppState>` 挂业务、Emby、admin、播放等路由。
-- 关键有利条件：今天 setup 完成本来就走 `restart_handle.request_restart()` **进程重启**，不存在"同一进程内从
-  setup 切到 ready"的在途请求，因此"启动时一次性决定 Router 类型"不需要热切换机制，风险远低于一般类型状态重构。
+- 前置事实（2026-10-30 核对代码）：今天**没有**"setup 完成即重启"。`setup_complete`（`users.rs:601`）成功后
+  返回 `201`；`request_restart()` 唯一调用点是 `setup_database_restart`（`users.rs:546`，数据库配置变更后）；
+  `build_app_state`（`src/main.rs:172`）不管 setup 是否完成都构建完整 `AppState`，`main.rs:251` 的
+  `app_with_state(app_state)` 无条件注册全部路由（`requires_database_selection` 只是状态上的 `bool`）。
+- 因此"启动时一次性决定 Router 类型"**不成立**：方案 B 必须先补前置工作——(a) setup 完成后触发进程重启
+  （复用 `RestartHandle`，前端补"正在重启"引导），或 (b) 进程内热切换（外层持有可替换的 `Router`）。
 - 方案 A 是 B 的中间态（B 只是把 `Option<Arc<ReadyServices>>` 变成"两种状态类型各一份"）。
 
 ## 4. 迁移步骤（每步可独立回滚、每步跑 `cargo build --locked` + 窄测试）
@@ -59,22 +60,21 @@ pub struct ReadyAppState { core: CoreState, /* 49 个服务字段，非 Option *
 2. **加 `require_ready!`**：在 handler 顶部取一次 `Arc<ReadyServices>`，把 308 处 `require_service!` 收缩为
    每 handler 一次守卫；此步可分批（同第一阶段按文件分批提交）。
 3. **拆 Router**：新增 `SetupState` 与 `setup_router()`，把 `/api/v1/setup/*` 与启动探针搬到 setup 侧；
-   `ready_router()` 的状态类型持有 `ReadyAppState`（服务字段非 `Option`）。
+   `ready_router()` 的状态类型持有 `ReadyAppState`（服务字段非 `Option`）。需先落地 §3 的前置工作。
 4. **删守卫**：删除 308 处（此时约等于 handler 数的）守卫，把 58 处带日志/`api_error` 的 let-else 里
    纯"未就绪"语义的部分一并删除；保留真正运行期故障的分支。
-5. **收尾**：`database_selection_required` 布尔字段随状态类型消失；`AppState::default()`（4 处测试构造）改用
-   `SetupState`/测试构造器。
+5. **收尾**：`database_selection_required` 随状态类型消失；4 处 `AppState::default()` 测试构造改用 `SetupState`。
 
 ## 5. 改动面与风险
 
 | 风险 | 说明 | 缓解 |
 | --- | --- | --- |
-| `Router` 泛型扩散 | 每个 handler 签名与 `State<T>` 绑定，路由构造集中在 `routes.rs`/`users.rs`/`admin.rs`，改动会触及它们的返回类型 | 方案 A 先行，B 只在 setup/业务边界切换 |
+| `Router` 泛型扩散 | 每个 handler 签名与 `State<T>` 绑定，路由构造集中在 `routes.rs`/`users.rs`/`admin.rs`，改动会触及它们的返回类型 | 方案 A 先行；B 必须先做 §3 的前置工作（setup 完成后重启或热切换） |
 | 测试构造点 | `..AppState::default()` 的局部构造、`app_with_state(AppState::default())` 若签名变化，`tests/**` 需同步（本阶段禁止改动） | 保留 `app_with_state` 兼容入口 |
 | 中间件共用 | `request_access_ip`、限流、SSE 预算等中间件在两种模式下都要用，不能整体塞进 `ReadyServices` | 明确放进 `CoreState` |
 | 错误映射两种形态 | 裸 503 与 `api_error(..., DatabaseUnavailable, ..)` 并存，语义不同（前者无 body） | 迁移中逐个文件核对，禁止批量替换 |
 | 后台任务持有 `Arc` 副本 | worker、plugin、SSE 持有服务引用，状态类型拆分后生命周期需重新梳理 | 保留 `Arc<ReadyServices>` 共享，不 clone 个体服务 |
 | 增量过大 | 49 字段 × 308 调用点，一次性改动难以 review | 按 §4 分五步、每步分批提交 |
 
-结论：**先做方案 A（低风险、可分批），同时把方案 B 作为目标形态**，其成立前提已在现有"setup 完成即重启"的
-行为上得到验证；真正需要产品决策的是 setup 侧路由清单的边界，而非技术可行性。
+结论：**先做方案 A（低风险、可分批），方案 B 作为目标形态**。B 的"启动时定型 Router"并不被现有行为支持：
+必须先补"setup 完成后重启"或"进程内热切换"二者之一，这是它的前置成本与产品决策点，而非既有事实。
