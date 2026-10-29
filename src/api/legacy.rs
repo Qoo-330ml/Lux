@@ -723,6 +723,9 @@ impl AppState {
                 database.clone(),
             );
             crate::application::catalog_read_model::spawn_search_reindex_worker(database.clone());
+            crate::application::catalog_read_model::spawn_catalog_items_incremental_worker(
+                database.clone(),
+            );
             crate::application::user_cleanup::spawn_user_cleanup_worker(
                 database.clone(),
                 avatars.clone(),

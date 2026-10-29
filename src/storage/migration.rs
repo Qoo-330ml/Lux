@@ -1,5 +1,105 @@
 use super::*;
 
+/// `catalog_outbox` fan-out for the derived `catalog_items` read model, keyed by `kind = 'catalog'`.
+/// Migration 0238 creates the same triggers; they are repeated here because the rebuild
+/// migration recreates `media_items` and would otherwise drop them.
+const CATALOG_ITEMS_OUTBOX_TRIGGERS: [&str; 12] = [
+    "CREATE TRIGGER IF NOT EXISTS media_items_catalog_ai
+     AFTER INSERT ON media_items
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.parent_id
+         WHERE NEW.parent_id IS NOT NULL AND NEW.parent_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.series_id
+         WHERE NEW.series_id IS NOT NULL AND NEW.series_id IS NOT NEW.id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_items_catalog_au
+     AFTER UPDATE ON media_items
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.parent_id
+         WHERE NEW.parent_id IS NOT NULL AND NEW.parent_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.parent_id
+         WHERE OLD.parent_id IS NOT NULL
+           AND OLD.parent_id IS NOT OLD.id
+           AND OLD.parent_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.series_id
+         WHERE NEW.series_id IS NOT NULL AND NEW.series_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.series_id
+         WHERE OLD.series_id IS NOT NULL
+           AND OLD.series_id IS NOT OLD.id
+           AND OLD.series_id IS NOT NEW.id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_items_catalog_ad
+     AFTER DELETE ON media_items
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.parent_id
+         WHERE OLD.parent_id IS NOT NULL AND OLD.parent_id IS NOT OLD.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.series_id
+         WHERE OLD.series_id IS NOT NULL AND OLD.series_id IS NOT OLD.id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_sources_catalog_ai
+     AFTER INSERT ON media_sources
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_sources_catalog_au
+     AFTER UPDATE ON media_sources
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_sources_catalog_ad
+     AFTER DELETE ON media_sources
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS item_images_catalog_ai
+     AFTER INSERT ON item_images
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS item_images_catalog_au
+     AFTER UPDATE ON item_images
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS item_images_catalog_ad
+     AFTER DELETE ON item_images
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_content_restriction_catalog_ai
+     AFTER INSERT ON media_content_restriction_index
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_content_restriction_catalog_au
+     AFTER UPDATE ON media_content_restriction_index
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_content_restriction_catalog_ad
+     AFTER DELETE ON media_content_restriction_index
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.item_id);
+     END",
+];
+
 const MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER: &str =
     "CREATE TRIGGER IF NOT EXISTS trg_media_items_content_restriction_index_invalidate_nfo
      AFTER UPDATE OF nfo_metadata_json ON media_items
@@ -113,6 +213,15 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 path: path.to_path_buf(),
                 source,
             })?;
+        for statement in CATALOG_ITEMS_OUTBOX_TRIGGERS {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        }
         return Ok(());
     }
 
@@ -132,7 +241,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 path: path.to_path_buf(),
                 source,
             })?;
-        let statements = [
+        let mut statements = vec![
             "CREATE TABLE libraries_new (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
@@ -187,6 +296,18 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             "DROP TRIGGER IF EXISTS item_aliases_search_ai",
             "DROP TRIGGER IF EXISTS item_aliases_search_au",
             "DROP TRIGGER IF EXISTS item_aliases_search_ad",
+            "DROP TRIGGER IF EXISTS media_items_catalog_ai",
+            "DROP TRIGGER IF EXISTS media_items_catalog_au",
+            "DROP TRIGGER IF EXISTS media_items_catalog_ad",
+            "DROP TRIGGER IF EXISTS media_sources_catalog_ai",
+            "DROP TRIGGER IF EXISTS media_sources_catalog_au",
+            "DROP TRIGGER IF EXISTS media_sources_catalog_ad",
+            "DROP TRIGGER IF EXISTS item_images_catalog_ai",
+            "DROP TRIGGER IF EXISTS item_images_catalog_au",
+            "DROP TRIGGER IF EXISTS item_images_catalog_ad",
+            "DROP TRIGGER IF EXISTS media_content_restriction_catalog_ai",
+            "DROP TRIGGER IF EXISTS media_content_restriction_catalog_au",
+            "DROP TRIGGER IF EXISTS media_content_restriction_catalog_ad",
             "DROP TRIGGER IF EXISTS media_item_provider_ids_ai",
             "DROP TRIGGER IF EXISTS media_item_provider_ids_au",
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_insert",
@@ -502,6 +623,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER,
             MEDIA_CONTENT_RESTRICTION_INDEX_QUEUE_TRIGGER,
         ];
+        statements.extend(CATALOG_ITEMS_OUTBOX_TRIGGERS);
         for statement in statements {
             sqlx::query(statement)
                 .execute(&mut *transaction)

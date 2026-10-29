@@ -85,11 +85,12 @@ pub(crate) use media_merge::StoredMediaMerge;
 #[path = "catalog_read_model.rs"]
 mod catalog_read_model;
 pub(crate) use catalog_read_model::{
-    ReadModelPageQuery, ReadModelSort, RecentByLibraryReadModelQuery, RecentReadModelQuery,
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND, ReadModelPageQuery, ReadModelSort,
+    RecentByLibraryReadModelQuery, RecentReadModelQuery,
 };
 #[path = "search_reindex.rs"]
 mod search_reindex;
-pub(crate) use search_reindex::SEARCH_REINDEX_CONSUMER;
+pub(crate) use search_reindex::{SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_KIND};
 #[path = "mail_outbox.rs"]
 mod mail_outbox;
 #[path = "metadata.rs"]

@@ -1367,7 +1367,7 @@ SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在
 
 | 改动 | 回滚方式 | 数据影响 |
 |---|---|---|
-| 读模型开关 `LUX_READ_MODEL_MODE=on` | 设回 `off`（默认值），无需迁移回退 | 派生表可保留，随时重建 |
+| 读模型开关 `LUX_READ_MODEL_MODE=on`（默认） | 设回 `off`，无需迁移回退 | 派生表可保留，随时重建；增量消费者停用不影响权威数据 |
 | 读模型派生行形状变更 | 递增 `READ_MODEL_SCHEMA_VERSION` 后重启，自动重建 | 旧行被忽略，新构建重建 |
 | 搜索入队（W4） | 迁移 `0237` 已随发布落地；回退需重新部署旧二进制，旧触发器由遗留修复路径重建 | FTS 会在旧二进制启动时由触发器继续维护；出队行残留在 `catalog_outbox`，可安全清空 |
 | JSON gzip/ETag（W5） | 移除 `CompressionLayer`/`json_response_etag` 两个 layer | 无数据影响；客户端立即回到整包传输 |

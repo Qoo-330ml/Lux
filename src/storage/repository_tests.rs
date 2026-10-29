@@ -1035,15 +1035,16 @@ async fn search_reindex_queue_defers_fts_writes_until_drained() {
     );
     // Applied events are reclaimed; a fresh event survives until it is applied too.
     let trimmed = database
-        .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, 100)
+        .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_KIND, 100)
         .await
         .expect("trim outbox");
     assert!(trimmed >= 2);
-    let queued_after_trim: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE item_id = 'queued-item'")
-            .fetch_one(database.pool())
-            .await
-            .expect("outbox after trim");
+    let queued_after_trim: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search' AND item_id = 'queued-item'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("outbox after trim");
     assert_eq!(queued_after_trim, 0);
 
     let remaining: i64 =
@@ -22112,7 +22113,12 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
     use crate::storage::test_database;
 
     let (_temp, database) = test_database().await?;
-    assert_eq!(database.catalog_outbox_gap("catalog_items").await?, None);
+    assert_eq!(
+        database
+            .catalog_outbox_gap("catalog_items", "item_upsert")
+            .await?,
+        None
+    );
 
     let first = database
         .append_catalog_outbox("item_upsert", "item-a", Some("lib"))
@@ -22188,7 +22194,9 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
         .advance_catalog_consumer("stale_consumer", 1)
         .await?;
     assert_eq!(
-        database.catalog_outbox_gap("stale_consumer").await?,
+        database
+            .catalog_outbox_gap("stale_consumer", "item_upsert")
+            .await?,
         None,
         "the remaining sequence follows the watermark"
     );
@@ -22200,9 +22208,115 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
         .append_catalog_outbox("item_upsert", "item-d", None)
         .await?;
     assert_eq!(
-        database.catalog_outbox_gap("stale_consumer").await?,
+        database
+            .catalog_outbox_gap("stale_consumer", "item_upsert")
+            .await?,
         Some((1, 4))
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_items_incremental_tracks_inserts_updates_images_merges_and_deletes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::catalog_read_model::rebuild_catalog_read_model;
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Incremental", LibraryKind::Movie, false)
+        .await?;
+    // The consumer only runs once the full rebuild left its watermark.
+    rebuild_catalog_read_model(&database, 100).await?;
+    let triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'media_items_catalog_ai'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(triggers, 1, "catalog trigger is installed");
+
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('inc-movie', ?, 'MOVIE', 'Original', 'original', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database.drain_catalog_items_incremental(100).await? >= 1,
+        "a new item must reach the derived table"
+    );
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(title, "Original");
+
+    // A metadata update shows up on the next pass.
+    sqlx::query(
+        "UPDATE media_items SET title = 'Renamed', sort_title = 'renamed'
+         WHERE id = 'inc-movie'",
+    )
+    .execute(database.pool())
+    .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(title, "Renamed");
+
+    // A new poster updates the derived image tag without touching media_items.
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('poster-1', 'inc-movie', 'POSTER', 0, 'poster.jpg')",
+    )
+    .execute(database.pool())
+    .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let poster: Option<String> =
+        sqlx::query_scalar("SELECT poster_tag FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(poster.as_deref(), Some("poster-1"));
+
+    // Merging keeps the row and mirrors the redirect.
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('inc-canonical', ?, 'MOVIE', 'Canonical', 'canonical', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET merged_into_item_id = 'inc-canonical'
+         WHERE id = 'inc-movie'",
+    )
+    .execute(database.pool())
+    .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let merged: Option<String> =
+        sqlx::query_scalar("SELECT merged_into FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(merged.as_deref(), Some("inc-canonical"));
+
+    // Deleting the authoritative row removes the derived row on the next pass.
+    sqlx::query("DELETE FROM media_items WHERE id = 'inc-movie'")
+        .execute(database.pool())
+        .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining, 0);
     Ok(())
 }
 

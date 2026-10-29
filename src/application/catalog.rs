@@ -90,9 +90,17 @@ pub struct CatalogService {
     search_flights: Arc<SearchFlightRegistry>,
     recommendation_compute_lock: Arc<Mutex<()>>,
     read_model_mode: ReadModelMode,
+    /// Set once the full rebuild watermark exists: the `on` paths must never read a half-built
+    /// derived table (the incremental consumer has the same gate).
+    read_model_ready: Arc<AtomicBool>,
 }
 
-/// Read-model rollout switch. `on` stays unavailable until shadow parity is proven.
+/// Read-model rollout switch.
+///
+/// `on` is the default: the derived tables are maintained incrementally (`catalog_items_incremental@1`)
+/// so scans, metadata updates, deletions and merges reach the read paths within about a second.
+/// `off` keeps the authoritative queries, `shadow` serves the authoritative page while comparing the
+/// derived page and logging the difference (`LUX_READ_MODEL_MODE=off|shadow|on`).
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum ReadModelMode {
     Off,
@@ -108,9 +116,9 @@ impl ReadModelMode {
             .to_ascii_lowercase()
             .as_str()
         {
+            "off" => Self::Off,
             "shadow" => Self::Shadow,
-            "on" => Self::On,
-            _ => Self::Off,
+            _ => Self::On,
         }
     }
 }
@@ -267,6 +275,7 @@ impl LibraryPageCache {
         database: Database,
         access: MediaAccessService,
         search_flights: Arc<SearchFlightRegistry>,
+        read_model_ready: Arc<AtomicBool>,
     ) -> Arc<Self> {
         let (refresh_tx, mut refresh_rx) = mpsc::channel(1);
         let cache = Arc::new(Self {
@@ -293,6 +302,7 @@ impl LibraryPageCache {
                     search_flights: search_flights.clone(),
                     recommendation_compute_lock: Arc::new(Mutex::new(())),
                     read_model_mode: ReadModelMode::Off,
+                    read_model_ready: read_model_ready.clone(),
                 };
                 cache.refresh_entries(&service).await;
             }
@@ -458,10 +468,32 @@ impl CatalogService {
         self
     }
 
+    /// True once the full rebuild watermark exists. Cached after the first positive answer.
+    async fn read_model_ready(&self) -> bool {
+        if self.read_model_ready.load(Ordering::Relaxed) {
+            return true;
+        }
+        let ready = matches!(
+            self.database
+                .catalog_consumer(&catalog_items_consumer())
+                .await,
+            Ok(Some(_))
+        );
+        if ready {
+            self.read_model_ready.store(true, Ordering::Relaxed);
+        }
+        ready
+    }
+
     pub fn new(database: Database, access: MediaAccessService) -> Self {
         let search_flights = SearchFlightRegistry::new();
-        let library_page_cache =
-            LibraryPageCache::new(database.clone(), access.clone(), search_flights.clone());
+        let read_model_ready = Arc::new(AtomicBool::new(false));
+        let library_page_cache = LibraryPageCache::new(
+            database.clone(),
+            access.clone(),
+            search_flights.clone(),
+            read_model_ready.clone(),
+        );
         Self {
             database,
             access,
@@ -469,6 +501,7 @@ impl CatalogService {
             search_flights,
             recommendation_compute_lock: Arc::new(Mutex::new(())),
             read_model_mode: ReadModelMode::Off,
+            read_model_ready: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1144,8 +1177,10 @@ impl CatalogService {
             limit: request.limit,
         };
         let read_model_sort = self.read_model_sort(&query);
+        let read_model_ready =
+            self.read_model_mode == ReadModelMode::On && self.read_model_ready().await;
         let (rows, total) = match (self.read_model_mode, read_model_sort) {
-            (ReadModelMode::On, Some(sort)) => {
+            (ReadModelMode::On, Some(sort)) if read_model_ready => {
                 let fetch_limit = if query.include_total {
                     query.limit
                 } else {
@@ -1657,7 +1692,10 @@ impl CatalogService {
             offset,
             limit,
         };
-        if self.read_model_mode == ReadModelMode::On && include_next_unplayed_episode {
+        if self.read_model_mode == ReadModelMode::On
+            && include_next_unplayed_episode
+            && self.read_model_ready().await
+        {
             if let Some((items, total)) =
                 self.continue_watching_from_pointers(&pointer_query).await?
             {
@@ -1842,7 +1880,10 @@ impl CatalogService {
             limit,
             include_total: true,
         };
-        if self.read_model_mode == ReadModelMode::On && content_restrictions.is_none() {
+        if self.read_model_mode == ReadModelMode::On
+            && content_restrictions.is_none()
+            && self.read_model_ready().await
+        {
             let (item_ids, total) = self
                 .database
                 .list_recent_read_model_ids(&read_model_query)
@@ -1958,7 +1999,10 @@ impl CatalogService {
         content_restrictions: Option<&UserContentRestrictions>,
         limit: i64,
     ) -> Result<Vec<(String, Vec<CatalogItem>)>, CatalogError> {
-        if self.read_model_mode == ReadModelMode::On && content_restrictions.is_none() {
+        if self.read_model_mode == ReadModelMode::On
+            && content_restrictions.is_none()
+            && self.read_model_ready().await
+        {
             if let Some(grouped) = self
                 .recent_by_library_from_read_model(library_ids, limit)
                 .await?
@@ -2294,6 +2338,7 @@ impl CatalogService {
         };
         let rows = if self.read_model_mode == ReadModelMode::On
             && library_id != GLOBAL_COLLECTION_LIBRARY_ID
+            && self.read_model_ready().await
         {
             let rows = self
                 .database

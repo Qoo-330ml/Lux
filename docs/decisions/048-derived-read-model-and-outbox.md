@@ -26,9 +26,13 @@
    旧水位不被信任，升级后会先重建，避免“信任旧构建写下的行”。
 4. **写路径只入队**：`catalog_outbox` 是追加型队列，权威写入（`media_items`/`item_aliases` 的搜索类变更）
    只向它追加一行；消费者按水位批量应用（`search_reindex@1` 现在负责 FTS 重建）。
-5. **读路径开关**：`LUX_READ_MODEL_MODE=off|shadow|on`，默认 `off`。`shadow` 比对派生页与权威页并记录
-   差异；`on` 只在派生行完整时使用，缺行或未回填时整页回退权威查询，绝不返回短页。
+5. **读路径开关**：`LUX_READ_MODEL_MODE=off|shadow|on`，默认 `on`（2026-10-29 由所有者放宽）。`shadow`
+   比对派生页与权威页并记录差异；`on` 只在派生行完整时使用，缺行或未回填时整页回退权威查询，绝不返回短页。
 6. **兜底**：队列缺口检测（水位 + 1 < 最老事件）触发全量重新入队；drain 失败不推进水位，重试幂等。
+7. **增量维护**：权威写入（`media_items` 的增改删、`media_sources`、`item_images`、内容限制索引）通过触发器
+   只追加 `kind = 'catalog'` 事件；消费者 `catalog_items_incremental@1` 每拍按 item id 重算受影响行（含父级与
+   剧集的计数/最近子项时间），权威行消失时删除派生行。队列删除按 `kind` 隔离，搜索与目录两个消费者互不干扰。
+   因此 `on` 不再依赖重建窗口：默认值的正确性来自 ≤1 s 的收敛，而不是“重建之后才可信”。
 
 ## 后果
 
@@ -37,7 +41,8 @@
   两模式响应逐字节一致。
 - 索引是这项决策的代价：`catalog_items_visibility`、`catalog_items_recent_sort`、`catalog_items_latest_added`
   三个索引让 66k 库多占约 10 MB，但把计数与排序从整表扫描变成索引行走。
-- 搜索在 SQLite 上最多滞后约 1 秒（队列消费者 1 s 一拍）；`FTS 空页 → LIKE 回退` 保证不会返回空结果。
+- 搜索与目录读模型在 SQLite 上最多滞后约 1 秒（队列消费者 1 s 一拍）；`FTS 空页 → LIKE 回退` 保证搜索不会
+  返回空结果，目录侧则由整页回退权威查询兜底。
   PostgreSQL 目前仍走同步维护（见 ADR-051 与 `COMPATIBILITY.md`）。
 - 派生数据必须能重建，因此任何把“不可重建状态”塞进派生表的做法都被禁止；写路径也不得在请求里聚合
   全库（沿用 `docs/LUX-DEVELOPMENT.md` 的边界）。

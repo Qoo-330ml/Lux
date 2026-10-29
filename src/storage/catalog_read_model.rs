@@ -2,6 +2,13 @@
 
 use super::*;
 
+/// Outbox kind for `catalog_items` maintenance events; the search consumer owns `search`.
+pub(crate) const CATALOG_OUTBOX_KIND: &str = "catalog";
+
+/// Versioned consumer name for incremental `catalog_items` maintenance. A change to the derived row
+/// shape bumps `READ_MODEL_SCHEMA_VERSION` instead, which forces a full rebuild.
+pub(crate) const CATALOG_ITEMS_INCREMENTAL_CONSUMER: &str = "catalog_items_incremental@1";
+
 #[allow(dead_code)] // LUX-864 wires the consumer.
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
 pub(crate) struct CatalogOutboxEntry {
@@ -135,12 +142,15 @@ impl Database {
         })
     }
 
-    /// Drops events the named consumer has already applied, oldest first and bounded so a long
-    /// backlog never turns into one huge delete. Every other consumer of the queue must be added to
-    /// the floor before this can be widened beyond a single consumer.
+    /// Drops the already-applied events of one `kind`, oldest first and bounded so a long backlog
+    /// never turns into one huge delete.
+    ///
+    /// The delete is scoped by `kind` so the search and catalog consumers can drain the shared queue
+    /// independently: trimming one kind never removes events the other consumer still needs.
     pub(crate) async fn trim_catalog_outbox(
         &self,
         consumer: &str,
+        kind: &str,
         limit: i64,
     ) -> Result<i64, StorageError> {
         let applied_seq = self
@@ -153,10 +163,13 @@ impl Database {
         }
         self.query(
             "DELETE FROM catalog_outbox
-             WHERE id IN (
-                 SELECT id FROM catalog_outbox WHERE id <= ? ORDER BY id LIMIT ?
-             )",
+             WHERE kind = ?
+               AND id IN (
+                   SELECT id FROM catalog_outbox WHERE kind = ? AND id <= ? ORDER BY id LIMIT ?
+               )",
         )
+        .bind(kind)
+        .bind(kind)
         .bind(applied_seq)
         .bind(limit.clamp(1, 10_000))
         .execute(&self.pool)
@@ -175,6 +188,7 @@ impl Database {
     pub(crate) async fn catalog_outbox_gap(
         &self,
         name: &str,
+        kind: &str,
     ) -> Result<Option<(i64, i64)>, StorageError> {
         let applied_seq = self
             .catalog_consumer(name)
@@ -182,7 +196,8 @@ impl Database {
             .map(|state| state.applied_seq)
             .unwrap_or(0);
         let oldest = self
-            .query_scalar::<Option<i64>>("SELECT MIN(id) FROM catalog_outbox")
+            .query_scalar::<Option<i64>>("SELECT MIN(id) FROM catalog_outbox WHERE kind = ?")
+            .bind(kind)
             .fetch_optional(&self.pool)
             .await
             .map_err(|source| StorageError::Sqlx {
@@ -255,97 +270,11 @@ impl Database {
             return Ok((0, None));
         }
         let last = rows.last().cloned();
+        let upsert_sql = format!(
+            "{CATALOG_ITEM_UPSERT_SELECT}mi.id > ? AND mi.id <= ?{CATALOG_ITEM_UPSERT_CONFLICT}"
+        );
         let upsert = self
-            .query(
-                "INSERT INTO catalog_items (
-                     item_id, library_id, item_type, parent_id, series_id, season_number,
-                     episode_number, title, sort_title, original_title, production_year,
-                     rating, runtime_ticks, added_at, effective_added_at, updated_at,
-                     removed_at, merged_into, has_available_source, default_source_id,
-                     poster_tag, backdrop_tag, thumb_tag, logo_tag, season_count,
-                     episode_count, latest_child_added_at, latest_episode_added_at,
-                     latest_added_at, restriction_code, metadata_state, nfo_fingerprint,
-                     applied_seq
-                 )
-                 SELECT
-                     mi.id, mi.library_id, mi.item_type, mi.parent_id, mi.series_id,
-                     mi.season_number, mi.episode_number, mi.title, mi.sort_title,
-                     mi.original_title, mi.production_year, mi.rating, mi.runtime_ticks,
-                     mi.added_at, mi.added_at, mi.updated_at, mi.removed_at,
-                     mi.merged_into_item_id, mi.has_available_source,
-                     (SELECT ms.id FROM media_sources ms WHERE ms.item_id = mi.id
-                       ORDER BY ms.is_default DESC, ms.id LIMIT 1),
-                     (SELECT ii.id FROM item_images ii
-                       WHERE ii.item_id = mi.id AND ii.image_type = 'POSTER'
-                       ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT ii.id FROM item_images ii
-                       WHERE ii.item_id = mi.id AND ii.image_type = 'FANART'
-                       ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT ii.id FROM item_images ii
-                       WHERE ii.item_id = mi.id AND ii.image_type = 'THUMB'
-                       ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT ii.id FROM item_images ii
-                       WHERE ii.item_id = mi.id AND ii.image_type = 'LOGO'
-                       ORDER BY ii.image_index, ii.id LIMIT 1),
-                     (SELECT COUNT(*) FROM media_items child
-                       WHERE child.series_id = mi.id AND child.item_type = 'SEASON'),
-                     (SELECT COUNT(*) FROM media_items child
-                       WHERE child.item_type = 'EPISODE'
-                         AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                     (SELECT MAX(child.added_at) FROM media_items child
-                       WHERE child.parent_id = mi.id OR child.series_id = mi.id),
-                     (SELECT MAX(child.added_at) FROM media_items child
-                       WHERE child.item_type = 'EPISODE'
-                         AND child.removed_at IS NULL
-                         AND child.has_available_source = 1
-                         AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                     CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
-                         (SELECT MAX(child.added_at) FROM media_items child
-                          WHERE child.item_type = 'EPISODE'
-                            AND child.removed_at IS NULL
-                            AND child.has_available_source = 1
-                            AND (child.series_id = mi.id OR child.parent_id = mi.id)),
-                         mi.added_at)
-                     ELSE mi.added_at END,
-                     (SELECT cri.certification_code FROM media_content_restriction_index cri
-                       WHERE cri.item_id = mi.id LIMIT 1),
-                     mi.identification_status, mi.nfo_metadata_fingerprint, 0
-                 FROM media_items mi
-                 WHERE mi.id > ? AND mi.id <= ?
-                 ON CONFLICT(item_id) DO UPDATE SET
-                     library_id = excluded.library_id,
-                     item_type = excluded.item_type,
-                     parent_id = excluded.parent_id,
-                     series_id = excluded.series_id,
-                     season_number = excluded.season_number,
-                     episode_number = excluded.episode_number,
-                     title = excluded.title,
-                     sort_title = excluded.sort_title,
-                     original_title = excluded.original_title,
-                     production_year = excluded.production_year,
-                     rating = excluded.rating,
-                     runtime_ticks = excluded.runtime_ticks,
-                     added_at = excluded.added_at,
-                     effective_added_at = excluded.effective_added_at,
-                     updated_at = excluded.updated_at,
-                     removed_at = excluded.removed_at,
-                     merged_into = excluded.merged_into,
-                     has_available_source = excluded.has_available_source,
-                     default_source_id = excluded.default_source_id,
-                     poster_tag = excluded.poster_tag,
-                     backdrop_tag = excluded.backdrop_tag,
-                     thumb_tag = excluded.thumb_tag,
-                     logo_tag = excluded.logo_tag,
-                     season_count = excluded.season_count,
-                     episode_count = excluded.episode_count,
-                     latest_child_added_at = excluded.latest_child_added_at,
-                     latest_episode_added_at = excluded.latest_episode_added_at,
-                     latest_added_at = excluded.latest_added_at,
-                     restriction_code = excluded.restriction_code,
-                     metadata_state = excluded.metadata_state,
-                     nfo_fingerprint = excluded.nfo_fingerprint,
-                     applied_seq = excluded.applied_seq",
-            )
+            .query(sqlx::AssertSqlSafe(upsert_sql))
             .bind(after)
             .bind(last.as_deref())
             .execute(&self.pool)
@@ -355,6 +284,124 @@ impl Database {
                 source,
             })?;
         Ok((upsert.rows_affected(), last))
+    }
+
+    /// Re-derives the `catalog_items` row of every given item from the authoritative tables.
+    ///
+    /// Returns the number of affected rows; an item that no longer exists is handled by
+    /// [`Self::delete_orphaned_catalog_items`].
+    pub(crate) async fn upsert_catalog_items_by_ids(
+        &self,
+        item_ids: &[String],
+    ) -> Result<u64, StorageError> {
+        if item_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; item_ids.len()].join(", ");
+        let sql = format!(
+            "{CATALOG_ITEM_UPSERT_SELECT}mi.id IN ({placeholders}){CATALOG_ITEM_UPSERT_CONFLICT}"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+        for item_id in item_ids {
+            statement = statement.bind(item_id);
+        }
+        statement
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Removes derived rows whose authoritative item is gone, so a deletion disappears from the
+    /// read-model paths on the next consumer pass instead of waiting for a rebuild.
+    pub(crate) async fn delete_orphaned_catalog_items(
+        &self,
+        item_ids: &[String],
+    ) -> Result<u64, StorageError> {
+        if item_ids.is_empty() {
+            return Ok(0);
+        }
+        let placeholders = vec!["?"; item_ids.len()].join(", ");
+        let sql = format!(
+            "DELETE FROM catalog_items
+             WHERE item_id IN ({placeholders})
+               AND NOT EXISTS (
+                   SELECT 1 FROM media_items WHERE media_items.id = catalog_items.item_id
+               )"
+        );
+        let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+        for item_id in item_ids {
+            statement = statement.bind(item_id);
+        }
+        statement
+            .execute(&self.pool)
+            .await
+            .map(|result| result.rows_affected())
+            .map_err(|source| StorageError::Sqlx {
+                path: self.path.clone(),
+                source,
+            })
+    }
+
+    /// Queues every authoritative item once; used after a detected queue gap so the derived table
+    /// cannot stay permanently stale.
+    pub(crate) async fn enqueue_full_catalog_items(&self) -> Result<i64, StorageError> {
+        self.query(
+            "INSERT INTO catalog_outbox (kind, item_id)
+             SELECT 'catalog', id FROM media_items",
+        )
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() as i64)
+        .map_err(|source| StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        })
+    }
+
+    /// Applies at most `batch` queued `kind = 'catalog'` events, oldest first, and returns how many
+    /// distinct items were refreshed. Callers drain until it returns zero.
+    pub(crate) async fn drain_catalog_items_incremental(
+        &self,
+        batch: i64,
+    ) -> Result<usize, StorageError> {
+        if let Some((applied_seq, oldest_remaining)) = self
+            .catalog_outbox_gap(CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND)
+            .await?
+        {
+            tracing::warn!(
+                applied_seq,
+                oldest_remaining,
+                "catalog read model queue gap; re-queueing every item"
+            );
+            self.enqueue_full_catalog_items().await?;
+        }
+        let applied_seq = self
+            .catalog_consumer(CATALOG_ITEMS_INCREMENTAL_CONSUMER)
+            .await?
+            .map(|state| state.applied_seq)
+            .unwrap_or(0);
+        let entries = self.read_catalog_outbox_after(applied_seq, batch).await?;
+        let Some(last_seq) = entries.last().map(|entry| entry.id) else {
+            return Ok(0);
+        };
+        let mut item_ids = entries
+            .into_iter()
+            .filter(|entry| entry.kind == CATALOG_OUTBOX_KIND)
+            .map(|entry| entry.item_id)
+            .collect::<Vec<_>>();
+        item_ids.sort_unstable();
+        item_ids.dedup();
+        if !item_ids.is_empty() {
+            self.upsert_catalog_items_by_ids(&item_ids).await?;
+            self.delete_orphaned_catalog_items(&item_ids).await?;
+        }
+        self.advance_catalog_consumer(CATALOG_ITEMS_INCREMENTAL_CONSUMER, last_seq)
+            .await?;
+        Ok(item_ids.len())
     }
 
     pub(crate) async fn rebuild_catalog_item_stats(&self) -> Result<(), StorageError> {
@@ -1080,3 +1127,95 @@ fn core_row_with_source(core: &ReadModelCoreRow, source: &ReadModelSourceRow) ->
     row.stream_is_forced = source.stream_is_forced.map(|value| value != 0);
     row
 }
+
+/// Shared `catalog_items` upsert body; callers append their own `WHERE` clause so the full rebuild
+/// (keyset) and the incremental consumer (explicit ids) derive rows with exactly the same columns.
+const CATALOG_ITEM_UPSERT_SELECT: &str = "INSERT INTO catalog_items (
+                     item_id, library_id, item_type, parent_id, series_id, season_number,
+                     episode_number, title, sort_title, original_title, production_year,
+                     rating, runtime_ticks, added_at, effective_added_at, updated_at,
+                     removed_at, merged_into, has_available_source, default_source_id,
+                     poster_tag, backdrop_tag, thumb_tag, logo_tag, season_count,
+                     episode_count, latest_child_added_at, latest_episode_added_at,
+                     latest_added_at, restriction_code, metadata_state, nfo_fingerprint,
+                     applied_seq
+                 )
+                 SELECT
+                     mi.id, mi.library_id, mi.item_type, mi.parent_id, mi.series_id,
+                     mi.season_number, mi.episode_number, mi.title, mi.sort_title,
+                     mi.original_title, mi.production_year, mi.rating, mi.runtime_ticks,
+                     mi.added_at, mi.added_at, mi.updated_at, mi.removed_at,
+                     mi.merged_into_item_id, mi.has_available_source,
+                     (SELECT ms.id FROM media_sources ms WHERE ms.item_id = mi.id
+                       ORDER BY ms.is_default DESC, ms.id LIMIT 1),
+                     (SELECT ii.id FROM item_images ii
+                       WHERE ii.item_id = mi.id AND ii.image_type = 'POSTER'
+                       ORDER BY ii.image_index, ii.id LIMIT 1),
+                     (SELECT ii.id FROM item_images ii
+                       WHERE ii.item_id = mi.id AND ii.image_type = 'FANART'
+                       ORDER BY ii.image_index, ii.id LIMIT 1),
+                     (SELECT ii.id FROM item_images ii
+                       WHERE ii.item_id = mi.id AND ii.image_type = 'THUMB'
+                       ORDER BY ii.image_index, ii.id LIMIT 1),
+                     (SELECT ii.id FROM item_images ii
+                       WHERE ii.item_id = mi.id AND ii.image_type = 'LOGO'
+                       ORDER BY ii.image_index, ii.id LIMIT 1),
+                     (SELECT COUNT(*) FROM media_items child
+                       WHERE child.series_id = mi.id AND child.item_type = 'SEASON'),
+                     (SELECT COUNT(*) FROM media_items child
+                       WHERE child.item_type = 'EPISODE'
+                         AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                     (SELECT MAX(child.added_at) FROM media_items child
+                       WHERE child.parent_id = mi.id OR child.series_id = mi.id),
+                     (SELECT MAX(child.added_at) FROM media_items child
+                       WHERE child.item_type = 'EPISODE'
+                         AND child.removed_at IS NULL
+                         AND child.has_available_source = 1
+                         AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                     CASE WHEN mi.item_type = 'SERIES' THEN COALESCE(
+                         (SELECT MAX(child.added_at) FROM media_items child
+                          WHERE child.item_type = 'EPISODE'
+                            AND child.removed_at IS NULL
+                            AND child.has_available_source = 1
+                            AND (child.series_id = mi.id OR child.parent_id = mi.id)),
+                         mi.added_at)
+                     ELSE mi.added_at END,
+                     (SELECT cri.certification_code FROM media_content_restriction_index cri
+                       WHERE cri.item_id = mi.id LIMIT 1),
+                     mi.identification_status, mi.nfo_metadata_fingerprint, 0
+                 FROM media_items mi
+                 WHERE ";
+
+const CATALOG_ITEM_UPSERT_CONFLICT: &str = " ON CONFLICT(item_id) DO UPDATE SET
+                     library_id = excluded.library_id,
+                     item_type = excluded.item_type,
+                     parent_id = excluded.parent_id,
+                     series_id = excluded.series_id,
+                     season_number = excluded.season_number,
+                     episode_number = excluded.episode_number,
+                     title = excluded.title,
+                     sort_title = excluded.sort_title,
+                     original_title = excluded.original_title,
+                     production_year = excluded.production_year,
+                     rating = excluded.rating,
+                     runtime_ticks = excluded.runtime_ticks,
+                     added_at = excluded.added_at,
+                     effective_added_at = excluded.effective_added_at,
+                     updated_at = excluded.updated_at,
+                     removed_at = excluded.removed_at,
+                     merged_into = excluded.merged_into,
+                     has_available_source = excluded.has_available_source,
+                     default_source_id = excluded.default_source_id,
+                     poster_tag = excluded.poster_tag,
+                     backdrop_tag = excluded.backdrop_tag,
+                     thumb_tag = excluded.thumb_tag,
+                     logo_tag = excluded.logo_tag,
+                     season_count = excluded.season_count,
+                     episode_count = excluded.episode_count,
+                     latest_child_added_at = excluded.latest_child_added_at,
+                     latest_episode_added_at = excluded.latest_episode_added_at,
+                     latest_added_at = excluded.latest_added_at,
+                     restriction_code = excluded.restriction_code,
+                     metadata_state = excluded.metadata_state,
+                     nfo_fingerprint = excluded.nfo_fingerprint,
+                     applied_seq = excluded.applied_seq";

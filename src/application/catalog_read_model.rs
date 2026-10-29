@@ -6,7 +6,10 @@
 
 use std::time::Duration;
 
-use crate::storage::{Database, SEARCH_REINDEX_CONSUMER, StorageError};
+use crate::storage::{
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND, Database, SEARCH_REINDEX_CONSUMER,
+    SEARCH_REINDEX_KIND, StorageError,
+};
 
 /// Bumped whenever the derived row shape or its inputs change, so a read model written by an older
 /// build is rebuilt instead of trusted.
@@ -139,6 +142,83 @@ const SEARCH_REINDEX_INTERVAL: Duration = Duration::from_secs(1);
 /// Applied queue rows are reclaimed in bounded batches on the same tick.
 const SEARCH_REINDEX_TRIM_BATCH: i64 = 2_000;
 
+/// How often the incremental `catalog_items` consumer runs; an authoritative write therefore
+/// reaches the read-model paths within about one tick.
+const CATALOG_ITEMS_INCREMENTAL_INTERVAL: Duration = Duration::from_secs(1);
+const CATALOG_ITEMS_INCREMENTAL_BATCH: i64 = 500;
+const CATALOG_ITEMS_TRIM_BATCH: i64 = 2_000;
+/// Counters are recomputed at most this often: the grouping scans the whole derived table, while a
+/// stale count is only cosmetic for a few seconds.
+const CATALOG_ITEMS_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+
+/// Applies queued `kind = 'catalog'` events so inserts, metadata updates, deletions and merges reach
+/// `catalog_items` within a tick instead of waiting for the next full rebuild.
+pub(crate) fn spawn_catalog_items_incremental_worker(database: Database) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(CATALOG_ITEMS_INCREMENTAL_INTERVAL);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut stats_dirty = false;
+        let mut last_stats_refresh = std::time::Instant::now();
+        loop {
+            ticker.tick().await;
+            // Only trust derived rows once the full rebuild watermark exists: the consumer must
+            // never mix incremental rows into a half-built table.
+            let rebuilt = matches!(
+                database.catalog_consumer(&catalog_items_consumer()).await,
+                Ok(Some(_))
+            );
+            if !rebuilt {
+                continue;
+            }
+            loop {
+                match database
+                    .drain_catalog_items_incremental(CATALOG_ITEMS_INCREMENTAL_BATCH)
+                    .await
+                {
+                    Ok(0) => match database
+                        .trim_catalog_outbox(
+                            CATALOG_ITEMS_INCREMENTAL_CONSUMER,
+                            CATALOG_OUTBOX_KIND,
+                            CATALOG_ITEMS_TRIM_BATCH,
+                        )
+                        .await
+                    {
+                        Ok(0) => break,
+                        Ok(trimmed) => tracing::debug!(trimmed, "catalog outbox trimmed"),
+                        Err(error) => {
+                            tracing::warn!(%error, "catalog outbox trim failed");
+                            break;
+                        }
+                    },
+                    Ok(items) => {
+                        stats_dirty = true;
+                        tracing::debug!(items, "catalog read model applied");
+                    }
+                    Err(error) => {
+                        tracing::warn!(%error, "catalog read model incremental apply failed");
+                        let _ = database
+                            .record_catalog_consumer_error(
+                                CATALOG_ITEMS_INCREMENTAL_CONSUMER,
+                                &error.to_string(),
+                            )
+                            .await;
+                        break;
+                    }
+                }
+            }
+            if stats_dirty && last_stats_refresh.elapsed() >= CATALOG_ITEMS_STATS_REFRESH_INTERVAL {
+                match database.rebuild_catalog_item_stats().await {
+                    Ok(()) => {
+                        stats_dirty = false;
+                        last_stats_refresh = std::time::Instant::now();
+                    }
+                    Err(error) => tracing::warn!(%error, "catalog item stats refresh failed"),
+                }
+            }
+        }
+    });
+}
+
 /// Drains queued search-reindex events in the background so a scan leaves a short queue instead of
 /// writing the FTS index inside every item transaction.
 pub(crate) fn spawn_search_reindex_worker(database: Database) {
@@ -152,7 +232,11 @@ pub(crate) fn spawn_search_reindex_worker(database: Database) {
                     Ok(0) => {
                         // Everything queued has been applied; reclaim the rows we no longer need.
                         match database
-                            .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_TRIM_BATCH)
+                            .trim_catalog_outbox(
+                                SEARCH_REINDEX_CONSUMER,
+                                SEARCH_REINDEX_KIND,
+                                SEARCH_REINDEX_TRIM_BATCH,
+                            )
                             .await
                         {
                             Ok(0) => break,

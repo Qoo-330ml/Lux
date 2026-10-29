@@ -13,6 +13,9 @@ use super::*;
 /// Versioned consumer name so a rewrite of the reindex logic can start from a fresh watermark.
 pub(crate) const SEARCH_REINDEX_CONSUMER: &str = "search_reindex@1";
 
+/// Outbox kind owned by this consumer; the catalog read model uses `catalog`.
+pub(crate) const SEARCH_REINDEX_KIND: &str = "search";
+
 impl Database {
     /// Applies at most `batch` queued events, oldest first, and returns how many items were
     /// reindexed. Callers drain until it returns zero.
@@ -22,8 +25,9 @@ impl Database {
     pub async fn drain_search_reindex(&self, batch: i64) -> Result<usize, StorageError> {
         // A trimmed or lost queue means events were skipped; re-enqueue everything rather than
         // leaving the index permanently missing rows.
-        if let Some((applied_seq, oldest_remaining)) =
-            self.catalog_outbox_gap(SEARCH_REINDEX_CONSUMER).await?
+        if let Some((applied_seq, oldest_remaining)) = self
+            .catalog_outbox_gap(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_KIND)
+            .await?
         {
             tracing::warn!(
                 applied_seq,

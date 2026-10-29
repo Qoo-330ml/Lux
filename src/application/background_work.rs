@@ -108,13 +108,14 @@ fn foreground_media_permits_kept(media_capacity: usize) -> usize {
 }
 
 fn default_foreground_threshold_ms(read_model_mode: Option<&str>) -> u64 {
+    // The read model is the default, so an unset switch targets the faster budget too.
     match read_model_mode
         .map(str::trim)
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("on") => FOREGROUND_P95_ON_MODE_MS,
-        _ => FOREGROUND_P95_OFF_MODE_MS,
+        Some("off") | Some("shadow") => FOREGROUND_P95_OFF_MODE_MS,
+        _ => FOREGROUND_P95_ON_MODE_MS,
     }
 }
 
@@ -1417,22 +1418,21 @@ mod tests {
         for invalid in ["0", "abc", ""] {
             let fallback = foreground_throttle_config_from(Some("on"), Some(invalid), None)
                 .expect("on enables");
-            assert_eq!(
-                fallback.threshold_us, 300_000,
-                "{invalid} keeps the default"
-            );
+            // An unset read-model switch means `on`, so the fallback is the read-model budget.
+            assert_eq!(fallback.threshold_us, 80_000, "{invalid} keeps the default");
         }
     }
 
     #[test]
     fn foreground_threshold_follows_the_read_model_mode() {
-        // The legacy path needs a much looser target than the read-model path.
+        // The legacy path needs a much looser target than the read-model path, and the read model
+        // is the default when the switch is unset.
         for (mode, expected_us) in [
             (Some("on"), 80_000),
             (Some("ON"), 80_000),
             (Some("off"), 300_000),
             (Some("shadow"), 300_000),
-            (None, 300_000),
+            (None, 80_000),
         ] {
             let config = foreground_throttle_config_from(Some("on"), None, mode).expect("enabled");
             assert_eq!(config.threshold_us, expected_us, "mode {mode:?}");
