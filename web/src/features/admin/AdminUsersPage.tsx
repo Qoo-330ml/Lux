@@ -1,5 +1,5 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { ArrowDown, ArrowUp, Ban, KeyRound, Plus, RotateCcw, Search, ShieldCheck, Trash2, UserCheck, X } from "lucide-react";
+import { Ban, KeyRound, Plus, RotateCcw, Search, ShieldCheck, Trash2, UserCheck, X } from "lucide-react";
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { Link, useSearchParams } from "react-router-dom";
 import { api } from "../../lib/api/client";
@@ -336,22 +336,17 @@ export function AdminUsersPage() {
 
   return (
     <div className="lux-admin-page lux-users-page">
-      <header className="lux-users-heading">
-        <div>
-          <span className="lux-admin-eyebrow">账户与访问</span>
-          <h1>用户与权限</h1>
-          <p>管理工作区里的账户、审批与访问策略。</p>
-        </div>
-        <div className="lux-users-heading-actions">
-          <LuxButton tone="secondary" type="button" onClick={() => changeView("invitations")}>邀请成员</LuxButton>
-          {view === "users" ? (
+      <UsersWorkspace
+        activeView={view}
+        actions={view === "users" ? (
+          <>
+            <LuxButton tone="secondary" type="button" onClick={() => changeView("invitations")}>邀请成员</LuxButton>
             <LuxButton tone="primary" ref={createButtonRef} type="button" onClick={() => { setFormError(""); setCreateOpen(true); }}>
               <Plus size={16} aria-hidden="true" />创建用户
             </LuxButton>
-          ) : null}
-        </div>
-      </header>
-      <UsersWorkspace activeView={view}>
+          </>
+        ) : undefined}
+      >
         {view === "pending" ? <AdminUserRegistrationsPanel /> : view === "invitations" ? <AdminUserInvitationsPanel /> : (
           <>
             <section className="lux-users-toolbar" aria-label={`${VIEW_LABELS[view]}筛选`}>
@@ -375,29 +370,17 @@ export function AdminUsersPage() {
                 <span className="lux-users-tag">按删除时间排序</span>
               )}
               <div className="lux-users-toolbar-end">
+                <span className="lux-users-count">共 {totalCount} 人</span>
                 <LuxSelectField className="lux-users-select" aria-label="排序方式" value={sortBy} onChange={(event) => setSortBy(event.target.value as AdminUserSortBy)}>
                   <option value="lastActivityAt">最近活动</option>
                   <option value="lastLoginAt">最近登录</option>
                   <option value="createdAt">创建时间</option>
                 </LuxSelectField>
-                <LuxIconButton className="lux-icon-button-small"
-                  type="button"
-                  aria-label={sortOrder === "desc" ? "当前最新优先，切换为最早优先" : "当前最早优先，切换为最新优先"}
-                  title={sortOrder === "desc" ? "最新优先" : "最早优先"}
-                  onClick={() => setSortOrder((order) => order === "desc" ? "asc" : "desc")}
-                >
-                  {sortOrder === "desc" ? <ArrowDown size={15} aria-hidden="true" /> : <ArrowUp size={15} aria-hidden="true" />}
-                </LuxIconButton>
               </div>
             </section>
             <section className="lux-users-card lux-users-table-card" aria-labelledby="lux-users-list-title">
-              <div className="lux-users-card-heading">
-                <div>
-                  <h2 id="lux-users-list-title" ref={listHeadingRef} tabIndex={-1}>{view === "deleted" ? "已删除用户" : "全部用户"}</h2>
-                  <p>{view === "deleted" ? `账号会保留 ${deletionGraceDays ?? "配置的"} 天后自动清理。` : "点击行内的「⋯」执行启用、禁用或移入回收站。"}</p>
-                </div>
-                <span className="lux-status-pill">共 {totalCount} 个用户</span>
-              </div>
+              <h2 className="lux-visually-hidden" id="lux-users-list-title" ref={listHeadingRef} tabIndex={-1}>{view === "deleted" ? "已删除用户" : "全部用户"}</h2>
+              {view === "deleted" ? <p className="lux-users-note">账号会保留 {deletionGraceDays ?? "配置的"} 天后自动清理。</p> : null}
               {actionError ? <p className="lux-error-copy" role="alert" style={{ padding: "10px 20px 0" }}>{actionError}</p> : null}
               {users.error ? <p className="lux-error-copy" role="alert" style={{ padding: "10px 20px 0" }}>列表更新失败：{users.error.message}</p> : null}
               {items.length ? (

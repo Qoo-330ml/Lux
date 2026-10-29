@@ -76,7 +76,7 @@ export function AdminUserDetailPage() {
 
   return (
     <div className="lux-admin-page lux-users-page lux-users-detail">
-      <Link className="lux-users-detail-back" to="/admin/users"><ArrowLeft size={15} aria-hidden="true" />返回用户列表</Link>
+      <Link className="lux-users-detail-back" to="/admin/users"><ArrowLeft size={15} aria-hidden="true" />用户与权限</Link>
       <header className="lux-users-detail-head">
         <div className="lux-users-detail-identity">
           <span className="lux-users-avatar is-large" aria-hidden="true">{avatarInitial(displayName)}</span>
@@ -89,6 +89,14 @@ export function AdminUserDetailPage() {
             <p className="lux-users-detail-facts">
               {facts.map((fact) => <span key={fact}>{fact}</span>)}
             </p>
+            <div className="lux-users-tags lux-users-detail-tags">
+              {[
+                user.canRemoteAccess ? "允许远程访问" : "仅本地访问",
+                user.canDownload ? "允许下载" : "禁止下载",
+                user.presetSource ? `预设：${user.presetSource}` : null,
+                (user.currentPlaybackCount ?? 0) > 0 ? `播放中 ${user.currentPlaybackCount} 路` : null,
+              ].filter((tag): tag is string => Boolean(tag)).map((tag) => <span key={tag} className="lux-users-tag">{tag}</span>)}
+            </div>
           </div>
         </div>
       </header>
@@ -108,7 +116,6 @@ export function AdminUserDetailPage() {
           </>
         ) : sectionId === "access" ? (
           <>
-            <AdminUserPermissionSummary user={user} />
             <AdminUserPermissionsSection key={`permissions-${user.id}`} user={user} />
             <AdminUserPlaybackPolicySection key={`playback-${user.id}`} user={user} />
             <AdminUserContentRestrictionSection user={user} />
@@ -122,24 +129,6 @@ export function AdminUserDetailPage() {
         )}
       </div>
     </div>
-  );
-}
-
-function AdminUserPermissionSummary({ user }: { user: AdminUser }) {
-  const chips = [
-    user.canManageServer ? "服务器管理员" : "普通用户",
-    user.canRemoteAccess ? "允许远程访问" : "仅本地访问",
-    user.canDownload ? "允许下载" : "禁止下载",
-    user.presetSource ? `预设来源：${user.presetSource}` : "未应用角色预设",
-    (user.currentPlaybackCount ?? 0) > 0 ? `播放中 ${user.currentPlaybackCount} 路` : null,
-  ].filter((chip): chip is string => Boolean(chip));
-  return (
-    <section className="lux-users-card" aria-label="权限摘要">
-      <div className="lux-users-card-body lux-users-summary">
-        <span className="lux-admin-eyebrow">权限摘要</span>
-        {chips.map((chip) => <span key={chip} className="lux-users-tag">{chip}</span>)}
-      </div>
-    </section>
   );
 }
 
@@ -1915,16 +1904,6 @@ export function AdminUserSettingsPage() {
 
   return (
     <div className="lux-admin-page lux-users-page">
-      <header className="lux-users-heading">
-        <div>
-          <span className="lux-admin-eyebrow">用户与权限 · 策略</span>
-          <h1>策略与安全</h1>
-          <p>下面的设置对新用户与全站生效，不针对单个用户。</p>
-        </div>
-        <div className="lux-users-heading-actions">
-          <Link className={luxButtonClass({ tone: "secondary" })} to="/admin/users"><ArrowLeft size={15} aria-hidden="true" />返回用户列表</Link>
-        </div>
-      </header>
       <UsersWorkspace activeSection={activeSection}>
         <div className="lux-users-policy-body">
           {groupId === "registration" ? (
