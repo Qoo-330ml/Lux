@@ -1,5 +1,4 @@
 import "./player.css";
-import { useQuery } from "@tanstack/react-query";
 import {
   useCallback,
   useEffect,
@@ -8,8 +7,7 @@ import {
   useState,
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
-import { ApiError, api } from "../../lib/api/client";
-import { queryKeys } from "../../lib/api/query-keys";
+import { ApiError } from "../../lib/api/client";
 import type { WebPlaybackTrackSelection } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
@@ -17,7 +15,10 @@ import { usePlayerTimelineScrubber } from "./usePlayerTimelineScrubber";
 import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
 import { usePlayerScreenshot } from "./usePlayerScreenshot";
 import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
-import { NativeVideoEngine, type PlaybackEngine } from "./playback-engine";
+import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
+import { usePlayerVideoElement } from "./usePlayerVideoElement";
+import { usePlayerNavigation } from "./usePlayerNavigation";
+import type { PlaybackEngine } from "./playback-engine";
 import {
   clearRememberedCandidate,
   directCandidates,
@@ -50,13 +51,11 @@ import {
   type PlayerFailure,
 } from "./components/player-diagnostics";
 import { usePlayerPlatform } from "./components/player-platform";
-import { webPlaybackCapabilities } from "./playback-capabilities";
 import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
 import { useRuntimeCaptionReader } from "./useRuntimeCaptionReader";
 import { usePlaybackRuntime } from "./usePlaybackRuntime";
 import {
-  episodeNavigationFor,
   getSubtitleInfo,
   isMatroskaSource,
 } from "./player-page-helpers";
@@ -110,57 +109,32 @@ export function PlayerPage() {
       }
       : undefined;
   }, [requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
-  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
-  const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
-  const bootstrapCapabilities = webPlaybackCapabilities(undefined, playbackAttempt);
-  const playbackBootstrap = useQuery({
-    queryKey: queryKeys.playbackBootstrap(itemId, requestedSourceId, playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
-    queryFn: ({ signal }) => api.createWebPlaybackBootstrap(
-      itemId,
-      requestedSourceId ?? undefined,
-      bootstrapCapabilities,
-      signal,
-      trackSelection,
-    ),
-    enabled: Boolean(itemId) && playbackAttempt === 0 && sessionGateKey === bootstrapKey,
-    retry: false,
-    staleTime: Number.POSITIVE_INFINITY,
-    placeholderData: (previous) => previous,
+  const {
+    playbackBootstrap,
+    item,
+    webPlaybackSession,
+    playbackDataRef,
+    media,
+    source,
+    episodeNavigation,
+    playbackSession,
+    playbackPlan,
+    playbackSessionId,
+    playbackKey,
+    sessionGateKey,
+    setSessionGateKey,
+    sessionStartedRef,
+    playbackSessionIdRef,
+    useLegacyPlaybackQueries,
+  } = usePlayerPlaybackSession({
+    itemId,
+    requestedSourceId,
+    requestedAudioStreamIndex,
+    requestedSubtitleStreamIndex,
+    playbackAttempt,
+    trackSelection,
   });
-  const useLegacyPlaybackQueries = playbackAttempt !== 0 || playbackBootstrap.isError;
-  const item = useQuery({
-    queryKey: queryKeys.item(itemId),
-    queryFn: () => api.item(itemId),
-    enabled: Boolean(itemId) && useLegacyPlaybackQueries,
-  });
-  const playback = useQuery({
-    queryKey: queryKeys.playback(itemId),
-    queryFn: () => api.playback(itemId),
-    enabled: Boolean(itemId) && useLegacyPlaybackQueries,
-  });
-  const playbackData = playbackBootstrap.isPlaceholderData
-    ? playback.data
-    : playbackBootstrap.data?.playback ?? playback.data;
-  const playbackDataRef = useRef(playbackData);
-  playbackDataRef.current = playbackData;
 
-  const media = playbackBootstrap.data?.item ?? item.data;
-  const episodeSiblings = useQuery({
-    queryKey: queryKeys.children(media?.seriesId ?? "", "EPISODE", media?.parentId ?? undefined),
-    queryFn: () => api.children(media?.seriesId ?? "", {
-      itemType: "EPISODE",
-      seasonId: media?.parentId ?? undefined,
-    }),
-    enabled: media?.itemType === "EPISODE" && Boolean(media.seriesId) && Boolean(media.parentId),
-    staleTime: 60_000,
-  });
-  const episodeNavigation = media?.itemType === "EPISODE"
-    ? episodeNavigationFor(episodeSiblings.data?.items ?? [], media.id)
-    : null;
-  const source =
-    media?.mediaSources?.find((entry) => entry.id === requestedSourceId) ??
-    media?.mediaSources?.find((entry) => entry.isDefault) ??
-    media?.mediaSources?.[0];
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
   // The controls auto-hide timer is owned by the effect below; this callback only
   // requests "show again", so it can be created before the caption selection hook.
@@ -197,37 +171,6 @@ export function PlayerPage() {
     if (!controller) return;
     controller.select(nativeCaptionTrackId);
   }, [nativeCaptionTrackId]);
-  // For the first bootstrap request, keep the key tied to the URL selection
-  // (or the default slot) rather than changing it when the response resolves
-  // its default source. This prevents the newly-created bootstrap session from
-  // being mistaken for an old session during the initial render.
-  const playbackKeySourceId = playbackAttempt === 0 && !requestedSourceId
-    ? ""
-    : source?.id ?? requestedSourceId ?? "";
-  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${playbackAttempt}`;
-  const sessionStartedRef = useRef(false);
-  const playbackSessionIdRef = useRef<string | null>(null);
-  const capabilities = webPlaybackCapabilities(source, playbackAttempt);
-  const webPlaybackSession = useQuery({
-    queryKey: queryKeys.webPlaybackSession(itemId, source?.id ?? "", playbackAttempt, requestedAudioStreamIndex, requestedSubtitleStreamIndex),
-    queryFn: ({ signal }) => api.createWebPlaybackSession(
-      itemId,
-      source?.id ?? "",
-      capabilities,
-      signal,
-      trackSelection,
-    ),
-    enabled: Boolean(itemId && source?.id) && useLegacyPlaybackQueries
-      && (sessionGateKey === playbackKey
-        || (!sessionStartedRef.current && playbackSessionIdRef.current === null)),
-    retry: false,
-    staleTime: Number.POSITIVE_INFINITY,
-  });
-  const playbackSession = playbackBootstrap.isPlaceholderData
-    ? webPlaybackSession.data
-    : playbackBootstrap.data?.session ?? webPlaybackSession.data;
-  const playbackPlan = playbackSession?.plan;
-  const playbackSessionId = playbackSession?.sessionId ?? null;
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const remoteDirectUrl = remoteHttpSource ? source?.externalUrl ?? null : null;
   // The remembered kind is read once per plan so recording a success below cannot reorder a ladder
@@ -363,26 +306,14 @@ export function PlayerPage() {
     navigate: (to) => navigate(to as never),
   });
 
-  const setVideoRef = useCallback((video: HTMLVideoElement | null) => {
-    if (!video) {
-      const runtime = runtimeRef.current;
-      runtimeRef.current = null;
-      if (runtime?.element) {
-        runtime.destroy();
-      } else {
-        engineRef.current?.destroy();
-      }
-      engineRef.current = null;
-      videoRef.current = null;
-      setNativeCaptionTracks([]);
-      setAirPlayVideo(null);
-      return;
-    }
-    videoRef.current = video;
-    lastVideoRef.current = video;
-    setAirPlayVideo(video);
-    engineRef.current = new NativeVideoEngine(video);
-  }, []);
+  const setVideoRef = usePlayerVideoElement({
+    videoRef,
+    lastVideoRef,
+    engineRef,
+    runtimeRef,
+    setAirPlayVideo,
+    setNativeCaptionTracks,
+  });
 
   const requestServerFallback = useCallback(async (reason?: unknown) => {
     if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
@@ -551,18 +482,11 @@ export function PlayerPage() {
 
   const { screenshotStatus, takeScreenshot } = usePlayerScreenshot({ videoRef, media });
 
-  const handleBack = () => {
-    if (window.history.length > 1) {
-      navigate(-1);
-    } else {
-      navigate(itemId ? `/items/${encodeURIComponent(itemId)}` : "/");
-    }
-  };
-
-  const navigateToEpisode = useCallback((episodeId: string) => {
-    setShowSettings(false);
-    navigate(`/watch/${encodeURIComponent(episodeId)}`);
-  }, [navigate]);
+  const { handleBack, navigateToEpisode } = usePlayerNavigation({
+    itemId,
+    navigate: (to) => navigate(to as never),
+    setShowSettings,
+  });
 
   if (playbackBootstrap.isPending || (useLegacyPlaybackQueries && item.isPending)) {
     return <PlayerLoadingState message="正在准备播放器…" />;
