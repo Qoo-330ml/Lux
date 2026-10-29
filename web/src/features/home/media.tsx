@@ -12,7 +12,7 @@ import { useImageVariants } from "./image-variants";
 import { MediaCardOverlay } from "./media-card-overlay";
 import { usePopoverPosition } from "../media/usePopoverPosition";
 import type { MediaCardEditor } from "./media-card-editors";
-import { EpisodeCount, MediaPlaceholder, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, remainingRuntimeLabel } from "./media-display";
+import { EpisodeCount, MediaPlaceholder, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackProgress, playbackPositionTicks, remainingRuntimeLabel } from "./media-display";
 export { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, mediaTypeLabel, playbackPositionTicks, playbackProgress, posterUrlWithFallback, remainingRuntimeLabel, runtimeLabel } from "./media-display";
 
 export const MediaCard = memo(function MediaCard({ item, landscape = false, metadataAttention = false, detailSearch, selectionMode = false, selected = false, folderHref, detailHref: detailHrefOverride, readOnly = false, onSelectionChange }: { item: MediaItem; landscape?: boolean; metadataAttention?: boolean; detailSearch?: string; selectionMode?: boolean; selected?: boolean; folderHref?: string; detailHref?: string; readOnly?: boolean; onSelectionChange?: (itemId: string, selected: boolean) => void }) {
@@ -111,7 +111,7 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
     : item.itemType === "MOVIE" && item.productionYear != null
       ? String(item.productionYear)
       : mediaTypeLabel(item.itemType);
-  const recency = recentPlaybackLabel(item.userData?.lastPlayedAt);
+  const recency = recentPlaybackLabel(item);
   const accessibleLabel = `继续播放 ${title}，${subtitle}${remaining ? `，还剩 ${remaining}` : ""}${recency ? `，${recency}` : ""}`;
   return (
     <Link className="lux-continue-card" to={`/watch/${item.id}`} aria-label={accessibleLabel}>
@@ -133,7 +133,16 @@ function ContinueWatchingCard({ item }: { item: MediaItem }) {
   );
 }
 
-export function recentPlaybackLabel(lastPlayedAt?: number | null, now = Date.now()) {
+export function recentPlaybackLabel(item: MediaItem, now = Date.now()) {
+  const isEpisode = item.itemType === "EPISODE";
+  const position = playbackPositionTicks(item);
+  const knownRuntime = remainingRuntimeLabel(item) !== undefined;
+  const progress = playbackProgress(item);
+  if (isEpisode && position <= 0) return "下一集在等你";
+  if (progress >= 90) return "就差一点点了";
+  if (knownRuntime && position > 0 && progress < 5) return "刚开了个头";
+
+  const lastPlayedAt = item.userData?.lastPlayedAt;
   if (lastPlayedAt == null || !Number.isSafeInteger(lastPlayedAt) || lastPlayedAt <= 0) return undefined;
   const playedAt = new Date(lastPlayedAt * 1000);
   const elapsed = now - playedAt.getTime();
@@ -141,28 +150,27 @@ export function recentPlaybackLabel(lastPlayedAt?: number | null, now = Date.now
 
   const minute = 60_000;
   const hour = 60 * minute;
-  if (elapsed < 5 * minute) return "刚才看到这里";
+  if (elapsed < 5 * minute) return "刚刚还在看";
   if (elapsed < hour) {
     const minutes = Math.floor(elapsed / minute);
-    return minutes >= 28 && minutes <= 32
-      ? "半小时前看到这里"
-      : `${minutes} 分钟前看到这里`;
+    return minutes >= 28 && minutes <= 32 ? "半小时前停下的" : `${minutes} 分钟前停下的`;
   }
 
   const today = new Date(now);
   const playedDay = Math.floor(Date.UTC(playedAt.getFullYear(), playedAt.getMonth(), playedAt.getDate()) / 86_400_000);
   const todayDay = Math.floor(Date.UTC(today.getFullYear(), today.getMonth(), today.getDate()) / 86_400_000);
   const daysAgo = todayDay - playedDay;
+  const hours = playedAt.getHours();
+  const verb = isEpisode ? "追到这里" : "看到这儿";
   if (daysAgo === 0) {
-    if (elapsed >= 6 * hour) {
-      const period = playedAt.getHours() < 12 ? "上午" : playedAt.getHours() < 18 ? "下午" : "晚上";
-      return `今天${period}看到这里`;
-    }
-    return `${Math.floor(elapsed / hour)} 小时前看到这里`;
+    if (elapsed < 6 * hour) return `${Math.floor(elapsed / hour)} 小时前停下的`;
+    return `${hours >= 18 ? "今晚" : hours < 12 ? "今天上午" : "今天下午"}停在这里`;
   }
-  if (daysAgo === 1) return "昨天看到这里，接着来";
-  if (daysAgo > 1 && daysAgo < 7) return `${daysAgo} 天前看到这里`;
-  return "上次看到这里，回来接着看";
+  if (daysAgo === 1) return `${hours >= 18 ? "昨晚" : hours < 12 ? "昨天上午" : "昨天下午"}${verb}`;
+  if (daysAgo === 2) return `前天${verb}`;
+  if (daysAgo < 7) return `${daysAgo} 天前停下的`;
+  if (daysAgo < 30) return `搁置 ${Math.floor(daysAgo / 7)} 周了`;
+  return "好久没看了";
 }
 
 export function MediaRail({ title, items, landscape = false, linkTo }: { title: string; items: MediaItem[]; landscape?: boolean; linkTo?: string }) {
