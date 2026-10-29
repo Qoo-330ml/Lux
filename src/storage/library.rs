@@ -63,10 +63,7 @@ impl Database {
                 .bind(task_type)
                 .fetch_optional(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if let Some((
                 id,
                 task_name,
@@ -123,10 +120,7 @@ impl Database {
             .bind(plugin_id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         if let Some((
             id,
@@ -173,10 +167,7 @@ impl Database {
         .bind(resource_limit_json)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         if let Some(library_id) = library_id {
             self.remove_library_from_other_task_plans(transaction, library_id, task_type, &id)
@@ -213,10 +204,7 @@ impl Database {
         .bind(task_type)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -243,10 +231,7 @@ impl Database {
             .bind(plugin_id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let (id, is_new) = match existing {
             Some(id) => (id, false),
             None => (Uuid::now_v7().to_string(), true),
@@ -270,10 +255,7 @@ impl Database {
             .bind(resource_limit_json)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         } else {
             self.query(
                 "UPDATE scheduled_task_plans
@@ -289,10 +271,7 @@ impl Database {
             .bind(&id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         Ok(id)
     }
@@ -321,23 +300,13 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
 
     pub(crate) async fn insert_library(&self, library: NewLibrary<'_>) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO libraries (
                 id, name, kind, is_enabled, realtime_watch_enabled,
@@ -359,10 +328,7 @@ impl Database {
         .bind(library.chapter_source_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         self.insert_library_scrapers_in_transaction(&mut transaction, library.id, library.scrapers)
             .await?;
@@ -422,10 +388,7 @@ impl Database {
             .bind(library.id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO scheduled_task_configs (
                     owner_type, owner_id, task_type, task_name, task_description,
@@ -445,18 +408,9 @@ impl Database {
             .bind(&assignment.id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn person_index_item_state_matches_snapshot(
@@ -478,10 +432,7 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(row.is_some_and(|row| {
             row.get::<Option<String>, _>("source_fingerprint")
                 .as_deref()
@@ -514,10 +465,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_library_scrapers_by_library_ids(
@@ -542,14 +490,10 @@ impl Database {
             for library_id in library_ids {
                 statement = statement.bind(library_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let library_id: String = row.get("library_id");
                 scrapers
@@ -580,10 +524,7 @@ impl Database {
                 )
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         let library_ids = rows
             .iter()
             .map(|row| row.get::<String, _>("id"))
@@ -639,10 +580,7 @@ impl Database {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut identities = Vec::<StoredLibraryIdentity>::new();
         for row in rows {
             let id: String = row.get("id");
@@ -681,10 +619,7 @@ impl Database {
             .bind(id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -723,14 +658,7 @@ impl Database {
         if library_ids.is_empty() {
             return Ok(());
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         for chunk in library_ids.chunks(100) {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
@@ -749,32 +677,16 @@ impl Database {
             query
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn register_auto_library_cover_task(
         &self,
         library_id: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let assignment = self
             .ensure_library_task_plan(
                 &mut transaction,
@@ -797,10 +709,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let result = self
             .query(
                 "INSERT INTO scheduled_task_configs (
@@ -827,17 +736,8 @@ impl Database {
             .bind(&assignment.id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -858,10 +758,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_library_cover_job(
@@ -877,10 +774,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_library_cover_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_library_cover_jobs(
@@ -914,10 +808,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map(|rows| rows.into_iter().map(stored_library_cover_job).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_active_library_cover_job_ids(
@@ -929,10 +820,7 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn has_active_library_cover_job(
@@ -949,10 +837,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_library_cover_job(&self, id: &str) -> Result<bool, StorageError> {
@@ -966,10 +851,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_library_cover_job_progress(
@@ -987,10 +869,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_library_cover_job(
@@ -1014,21 +893,11 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn delete_library(&self, id: &str) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "DELETE FROM scheduled_task_configs
              WHERE owner_type = 'LIBRARY' AND owner_id = ?",
@@ -1036,10 +905,7 @@ impl Database {
         .bind(id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "DELETE FROM strm_probe_jobs
              WHERE library_id = ?
@@ -1051,10 +917,7 @@ impl Database {
         .bind(id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         // Delete targets explicitly on both backends: PostgreSQL has no cascade from scan_jobs
         // here, and the explicit delete is a harmless no-op where SQLite already cascades.
         self.query(
@@ -1064,28 +927,16 @@ impl Database {
         .bind(id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let deleted = self
             .query("DELETE FROM libraries WHERE id = ?")
             .bind(id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected()
             == 1;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(deleted)
     }
 
@@ -1094,14 +945,7 @@ impl Database {
         library_id: &str,
         settings: LibrarySettingsUpdate<'_>,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
 
         let active_library = self
             .query(
@@ -1111,18 +955,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_library.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
 
@@ -1143,10 +978,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.kind {
             self.query(
@@ -1158,10 +990,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.is_enabled {
             self.query(
@@ -1173,10 +1002,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.realtime_watch_enabled {
             self.query(
@@ -1188,10 +1014,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.realtime_metadata_auto_match_enabled {
             self.query(
@@ -1203,10 +1026,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.reconciliation_schedule {
             self.query(
@@ -1218,10 +1038,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.metadata_schedule {
             self.query(
@@ -1233,20 +1050,14 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(scrapers) = settings.scrapers {
             self.query("DELETE FROM library_scrapers WHERE library_id = ?")
                 .bind(library_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             self.insert_library_scrapers_in_transaction(&mut transaction, library_id, scrapers)
                 .await?;
             let primary_scraper = scrapers.first().map(|scraper| scraper.scraper_id.as_str());
@@ -1259,19 +1070,13 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         } else if let Some(value) = settings.scraper_id {
             self.query("DELETE FROM library_scrapers WHERE library_id = ?")
                 .bind(library_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if let Some(scraper_id) = value {
                 self.query(
                     "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
@@ -1281,10 +1086,7 @@ impl Database {
                 .bind(scraper_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
             self.query(
                 "UPDATE libraries
@@ -1295,10 +1097,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.chapter_source_id {
             self.query(
@@ -1310,10 +1109,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.media_strategy_json {
             self.query(
@@ -1325,10 +1121,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.scan_concurrency {
             self.query(
@@ -1340,10 +1133,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         if let Some(value) = settings.probe_concurrency {
             self.query(
@@ -1355,10 +1145,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
 
         let current: (Option<String>, Option<String>, i64, i64, Option<String>) = self
@@ -1370,10 +1157,7 @@ impl Database {
             .bind(library_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let resources = format!(
             "{{\"scanConcurrency\":{},\"probeConcurrency\":{}}}",
@@ -1432,19 +1216,10 @@ impl Database {
             .bind(task_type)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -1468,10 +1243,7 @@ impl Database {
             .bind(task_type)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((task_name, task_description, _old_source_type, _old_resource, old_plan_id)) =
             existing
         else {
@@ -1503,10 +1275,7 @@ impl Database {
                 .bind(old_plan_id)
                 .fetch_optional(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             match plan_state {
                 Some((
                     is_default,
@@ -1554,10 +1323,7 @@ impl Database {
             .bind(resource_limit_json)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "DELETE FROM scheduled_task_plan_libraries
                  WHERE library_id = ? AND plan_id IN (
@@ -1568,10 +1334,7 @@ impl Database {
             .bind(task_type)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
                  VALUES (?, ?)",
@@ -1580,10 +1343,7 @@ impl Database {
             .bind(library_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         } else {
             self.query(
                 "UPDATE scheduled_task_plans
@@ -1599,10 +1359,7 @@ impl Database {
             .bind(&plan_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE scheduled_task_configs
@@ -1621,10 +1378,7 @@ impl Database {
         .bind(task_type)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -1637,10 +1391,7 @@ impl Database {
             .query_scalar::<i64>("SELECT COUNT(*) FROM scheduled_task_configs")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let rows = self
             .query(
                 "SELECT s.owner_type, s.owner_id, s.task_type, s.plan_id, s.task_name,
@@ -1658,10 +1409,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((rows.into_iter().map(stored_scheduled_task).collect(), total))
     }
 
@@ -1698,10 +1446,7 @@ impl Database {
             .bind(search_pattern.as_deref())
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let rows = self
             .query(sqlx::AssertSqlSafe(format!(
                 "SELECT p.id, p.task_type, p.plan_name, p.task_name,
@@ -1724,10 +1469,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut plans = rows
             .into_iter()
             .map(stored_scheduled_task_plan)
@@ -1759,13 +1501,7 @@ impl Database {
         for plan_id in plan_ids {
             query = query.bind(plan_id);
         }
-        let rows = query
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let rows = query.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
         let mut by_plan = HashMap::<String, Vec<StoredScheduledTaskPlanLibrary>>::new();
         for row in rows {
             by_plan
@@ -1796,10 +1532,7 @@ impl Database {
             .bind(plan_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -1843,10 +1576,7 @@ impl Database {
             let rows = query
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             configs.extend(rows.into_iter().map(
                 |(library_id, actual_source_type, actual_plugin_id)| {
                     (library_id, (actual_source_type, actual_plugin_id))
@@ -1890,14 +1620,7 @@ impl Database {
         resource_limit_json: &str,
         library_ids: &[String],
     ) -> Result<Option<StoredScheduledTaskPlan>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.validate_scheduled_task_plan_libraries(
             &mut transaction,
             task_type,
@@ -1925,10 +1648,7 @@ impl Database {
         .bind(resource_limit_json)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.move_libraries_to_scheduled_task_plan(
             &mut transaction,
             id,
@@ -1943,13 +1663,7 @@ impl Database {
             library_ids,
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         self.find_scheduled_task_plan(id).await
     }
 
@@ -1967,14 +1681,7 @@ impl Database {
         plugin_id: Option<&str>,
         resource_limit_json: &str,
     ) -> Result<Option<StoredScheduledTaskPlan>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let existing: Option<(String, String, i64)> = self
             .query_as(
                 "SELECT task_type, scope_type, is_default
@@ -1983,10 +1690,7 @@ impl Database {
             .bind(plan_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((task_type, scope_type, is_default)) = existing else {
             return Ok(None);
         };
@@ -2008,10 +1712,7 @@ impl Database {
             .bind(plan_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if is_default != 0 && current_ids.iter().any(|id| !library_ids.contains(id)) {
             return Err(StorageError::Conflict(
                 "默认计划不能移出媒体库，请创建新的自定义计划".to_owned(),
@@ -2035,10 +1736,7 @@ impl Database {
         .bind(plan_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if is_default == 0 {
             let removed_ids = current_ids
                 .into_iter()
@@ -2061,10 +1759,7 @@ impl Database {
                     .bind(plugin_id)
                     .fetch_optional(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 let Some(default_plan_id) = default_plan_id else {
                     return Err(StorageError::Conflict(
                         "没有可接收移出媒体库的默认计划".to_owned(),
@@ -2087,10 +1782,7 @@ impl Database {
                     .bind(&default_plan_id)
                     .fetch_one(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 let placeholders = std::iter::repeat_n("?", removed_ids.len())
                     .collect::<Vec<_>>()
                     .join(", ");
@@ -2118,10 +1810,7 @@ impl Database {
                 update_query
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 const MAX_MOVED_LIBRARY_IDS_PER_BATCH: usize = 500;
                 for batch in removed_ids.chunks(MAX_MOVED_LIBRARY_IDS_PER_BATCH) {
                     let placeholders = std::iter::repeat_n("?", batch.len())
@@ -2141,10 +1830,7 @@ impl Database {
                     insert_query
                         .execute(&mut *transaction)
                         .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                        .map_err(self.sqlx_err())?;
 
                     let mut delete_query = self.query(sqlx::AssertSqlSafe(format!(
                         "DELETE FROM scheduled_task_plan_libraries
@@ -2157,10 +1843,7 @@ impl Database {
                     delete_query
                         .execute(&mut *transaction)
                         .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                        .map_err(self.sqlx_err())?;
                 }
             }
         }
@@ -2178,13 +1861,7 @@ impl Database {
             library_ids,
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         self.find_scheduled_task_plan(plan_id).await
     }
 
@@ -2192,14 +1869,7 @@ impl Database {
         &self,
         plan_id: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let existing: Option<(String, String, i64, String, Option<String>)> = self
             .query_as(
                 "SELECT task_type, scope_type, is_default, source_type, plugin_id
@@ -2208,10 +1878,7 @@ impl Database {
             .bind(plan_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((task_type, scope_type, is_default, source_type, plugin_id)) = existing else {
             return Ok(false);
         };
@@ -2234,10 +1901,7 @@ impl Database {
             .bind(plan_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if !library_ids.is_empty() {
             let default_plan: Option<String> = self
                 .query_scalar(
@@ -2253,10 +1917,7 @@ impl Database {
                 .bind(plugin_id.as_deref())
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let Some(default_plan_id) = default_plan else {
                 return Err(StorageError::Conflict(
                     "没有可接收计划媒体库的默认计划".to_owned(),
@@ -2279,10 +1940,7 @@ impl Database {
                 .bind(&default_plan_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE scheduled_task_configs
                  SET plan_id = ?, task_name = ?, task_description = ?, source_type = ?,
@@ -2302,10 +1960,7 @@ impl Database {
             .bind(plan_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
                  SELECT ?, library_id FROM scheduled_task_plan_libraries
@@ -2315,34 +1970,19 @@ impl Database {
             .bind(plan_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
         self.query("DELETE FROM scheduled_task_plan_libraries WHERE plan_id = ?")
             .bind(plan_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query("DELETE FROM scheduled_task_plans WHERE id = ?")
             .bind(plan_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -2376,10 +2016,7 @@ impl Database {
             .bind(task_type)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut update_query = self.query(sqlx::AssertSqlSafe(format!(
             "UPDATE scheduled_task_configs
              SET plan_id = ?, task_name = ?, task_description = ?, source_type = ?,
@@ -2404,10 +2041,7 @@ impl Database {
         update_query
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         const MAX_LIBRARY_MEMBERS_PER_INSERT: usize = 100;
         for batch in library_ids.chunks(MAX_LIBRARY_MEMBERS_PER_INSERT) {
             let values = std::iter::repeat_n("(?, ?)", batch.len())
@@ -2424,10 +2058,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -2440,14 +2071,7 @@ impl Database {
         schedule: Option<&str>,
         is_enabled: bool,
     ) -> Result<Option<StoredScheduledTaskConfig>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let existing: Option<LegacyScheduledTaskConfigRow> = self
             .query_as(
                 "SELECT task_name, task_description, source_type, plugin_id,
@@ -2460,10 +2084,7 @@ impl Database {
             .bind(task_type)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((
             _task_name,
             _task_description,
@@ -2499,10 +2120,7 @@ impl Database {
             .bind(task_type)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             if let Some(plan_id) = plan_id {
                 self.query(
                     "UPDATE scheduled_task_plans
@@ -2514,19 +2132,10 @@ impl Database {
                 .bind(plan_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         self.find_scheduled_task_config(owner_type, owner_id, task_type)
             .await
     }
@@ -2545,14 +2154,7 @@ impl Database {
         resource_limit_json: &str,
     ) -> Result<(), StorageError> {
         if owner_type == "GLOBAL" {
-            let mut transaction = self
-                .pool
-                .begin()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
             let plan_id = self
                 .ensure_global_task_plan(
                     &mut transaction,
@@ -2594,17 +2196,8 @@ impl Database {
             .bind(&plan_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(());
         }
         self.query(
@@ -2634,10 +2227,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2662,14 +2252,7 @@ impl Database {
         if unique_owner_ids.is_empty() {
             return Ok(());
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         for chunk in unique_owner_ids.chunks(100) {
             let rows =
                 std::iter::repeat_n("('LIBRARY', ?, ?, ?, ?, 'PLUGIN', ?, ?, ?, ?)", chunk.len())
@@ -2704,18 +2287,9 @@ impl Database {
             query
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn disable_plugin_scheduled_tasks(
@@ -2729,14 +2303,7 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", task_types.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let mut config_update = self.query(sqlx::AssertSqlSafe(format!(
             "UPDATE scheduled_task_configs
              SET is_enabled = 0, updated_at = unixepoch()
@@ -2750,10 +2317,7 @@ impl Database {
         config_update
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut plan_update = self.query(sqlx::AssertSqlSafe(format!(
             "UPDATE scheduled_task_plans
              SET is_enabled = 0, updated_at = unixepoch()
@@ -2767,17 +2331,8 @@ impl Database {
         plan_update
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn upsert_strm_media_info_task(
@@ -2785,14 +2340,7 @@ impl Database {
         schedule: &str,
         is_enabled: bool,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let plan_id = self
             .ensure_global_task_plan(
                 &mut transaction,
@@ -2829,28 +2377,12 @@ impl Database {
         .bind(&plan_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn disable_strm_media_info_task(&self) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scheduled_task_configs
              SET is_enabled = 0, cron_or_interval = NULL, updated_at = unixepoch()
@@ -2859,10 +2391,7 @@ impl Database {
         )
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scheduled_task_plans
              SET is_enabled = 0, cron_or_interval = NULL, updated_at = unixepoch()
@@ -2871,28 +2400,12 @@ impl Database {
         )
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn disable_chapter_detection_tasks(&self) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scheduled_task_configs
              SET is_enabled = 0, updated_at = unixepoch()
@@ -2900,10 +2413,7 @@ impl Database {
         )
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scheduled_task_plans
              SET is_enabled = 0, updated_at = unixepoch()
@@ -2911,17 +2421,8 @@ impl Database {
         )
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2939,14 +2440,7 @@ impl Database {
         let resource_limit_json = format!(
             "{{\"concurrency\":{concurrency},\"introWindowSeconds\":{intro_window_seconds},\"creditsWindowSeconds\":{credits_window_seconds},\"matchThreshold\":{match_threshold}}}"
         );
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let assignment = self
             .ensure_library_task_plan(
                 &mut transaction,
@@ -2981,10 +2475,7 @@ impl Database {
         .bind(&assignment.id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
              VALUES (?, ?) ON CONFLICT DO NOTHING",
@@ -2993,10 +2484,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO scheduled_task_configs (
                 owner_type, owner_id, task_type, task_name, task_description,
@@ -3026,17 +2514,8 @@ impl Database {
         .bind(&assignment.id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_scheduled_task_config(
@@ -3062,10 +2541,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_scheduled_task))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scheduled_task_configs_by_owner_ids(
@@ -3105,13 +2581,7 @@ impl Database {
             for owner_id in chunk {
                 query = query.bind(owner_id);
             }
-            let rows = query
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            let rows = query.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
             for row in rows {
                 let config = stored_scheduled_task(row);
                 configs.insert(config.owner_id.clone(), config);
@@ -3128,10 +2598,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_library_cover(
@@ -3159,10 +2626,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_library_cover_if_missing(
@@ -3190,10 +2654,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_library_cover_if_auto(
@@ -3223,10 +2684,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }
 

@@ -7,10 +7,7 @@ impl Database {
         self.query_scalar("SELECT id FROM libraries WHERE system_kind IS NULL ORDER BY id")
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn ensure_scan_fingerprint_migration_state(
@@ -24,10 +21,7 @@ impl Database {
         .bind(library_id)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let row = self
             .query(
                 "SELECT cursor_root_id, cursor_relative_path, completed_at
@@ -36,10 +30,7 @@ impl Database {
             .bind(library_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(row.map_or(
             StoredScanFingerprintMigrationCursor {
                 root_id: None,
@@ -109,10 +100,7 @@ impl Database {
                     attempts: row.get("attempts"),
                 })
             })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn scan_fingerprint_migration_has_pending_entries(
@@ -132,10 +120,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn clear_one_missing_scan_fingerprint(
@@ -158,10 +143,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn advance_scan_fingerprint_migration_cursor(
@@ -182,10 +164,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_scan_fingerprint_migration_lease(
@@ -193,14 +172,7 @@ impl Database {
         library_id: &str,
         lease_token: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO scan_fingerprint_migration_state (library_id)
              VALUES (?) ON CONFLICT (library_id) DO NOTHING",
@@ -208,10 +180,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_fingerprint_migration_state SET updated_at = updated_at
              WHERE library_id = ?",
@@ -219,10 +188,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let lease_is_active: i64 = self
             .query_scalar(
                 "SELECT CASE WHEN lease_token IS NOT NULL
@@ -233,18 +199,9 @@ impl Database {
             .bind(library_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if lease_is_active != 0 {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         let active_scan_job: i64 = self
@@ -259,10 +216,7 @@ impl Database {
             .bind(library_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let active_chapter_job: i64 = self
             .query_scalar(
                 "SELECT CASE WHEN EXISTS (
@@ -273,18 +227,9 @@ impl Database {
             .bind(library_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_scan_job != 0 || active_chapter_job != 0 {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         let result = self
@@ -298,18 +243,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let claimed = result.rows_affected() == 1;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(claimed)
     }
 
@@ -328,10 +264,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn defer_scan_fingerprint_migration_root(
@@ -354,10 +287,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn reset_scan_fingerprint_migration_cursor(
@@ -374,10 +304,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn complete_scan_fingerprint_migration_library(
@@ -405,10 +332,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn defer_scan_fingerprint_migration_candidate(
@@ -417,14 +341,7 @@ impl Database {
         retry_at: i64,
         reason: &str,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO scan_fingerprint_migration_deferred (
                 filesystem_entry_id, attempts, retry_at, reason
@@ -440,10 +357,7 @@ impl Database {
         .bind(reason)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_fingerprint_migration_state
              SET cursor_root_id = ?, cursor_relative_path = ?, completed_at = NULL,
@@ -455,17 +369,8 @@ impl Database {
         .bind(&candidate.library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn migrate_scan_fingerprint_candidate(
@@ -481,14 +386,7 @@ impl Database {
             inode,
             lease_token,
         } = commit;
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_fingerprint_migration_state SET updated_at = updated_at
              WHERE library_id = ?",
@@ -496,10 +394,7 @@ impl Database {
         .bind(&candidate.library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let owns_active_lease: i64 = self
             .query_scalar(
                 "SELECT CASE WHEN lease_token = ? AND lease_expires_at > unixepoch()
@@ -510,10 +405,7 @@ impl Database {
             .bind(&candidate.library_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if owns_active_lease == 0 {
             self.query(
                 "UPDATE scan_fingerprint_migration_state
@@ -524,17 +416,8 @@ impl Database {
             .bind(lease_token)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         let result = self
@@ -563,10 +446,7 @@ impl Database {
             .bind(lease_token)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let migrated = result.rows_affected() == 1;
         if migrated {
             self.query(
@@ -576,10 +456,7 @@ impl Database {
             .bind(&candidate.entry_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE scan_fingerprint_migration_state
                  SET cursor_root_id = ?, cursor_relative_path = ?, completed_at = NULL,
@@ -593,10 +470,7 @@ impl Database {
             .bind(lease_token)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         } else {
             self.query(
                 "UPDATE scan_fingerprint_migration_state
@@ -607,18 +481,9 @@ impl Database {
             .bind(lease_token)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(migrated)
     }
 }

@@ -329,22 +329,12 @@ impl Database {
         library_id: &str,
         job_id: &str,
     ) -> Result<Option<StoredLibraryDeletionJob>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == DatabaseBackend::Postgres {
             self.query("SET LOCAL lock_timeout = '2s'")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let active_job = self
@@ -357,18 +347,9 @@ impl Database {
             .bind(library_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if let Some(row) = active_job {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(Some(stored_library_deletion_job(row)));
         }
 
@@ -383,10 +364,7 @@ impl Database {
             .bind(library_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .map(|row| row.get::<String, _>("name"));
 
         let Some(library_name) = library_name else {
@@ -399,17 +377,8 @@ impl Database {
                 .bind(library_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(existing.map(stored_library_deletion_job));
         };
 
@@ -423,10 +392,7 @@ impl Database {
         .bind(library_name)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let row = self
             .query(sqlx::AssertSqlSafe(format!(
                 "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
@@ -435,17 +401,8 @@ impl Database {
             .bind(job_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(stored_library_deletion_job(row)))
     }
 
@@ -461,10 +418,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_library_deletion_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_library_deletion_jobs(
@@ -495,10 +449,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(rows.into_iter().map(stored_library_deletion_job).collect())
     }
 
@@ -516,10 +467,7 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(count)
     }
 
@@ -542,10 +490,7 @@ impl Database {
             .bind(job_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if result.rows_affected() == 0 {
             return self.get_library_deletion_job(job_id).await;
         }
@@ -566,10 +511,7 @@ impl Database {
             .bind(job_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -588,10 +530,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Best-effort WAL trimming between stages. `PASSIVE` never blocks readers, so
@@ -622,10 +561,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn delete_library_deletion_batch(
@@ -637,22 +573,12 @@ impl Database {
     ) -> Result<Option<u64>, StorageError> {
         // One checked-out connection per batch: the reduced-durability pragmas must
         // never be inherited by a pooled connection that a later request reuses.
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut connection = self.pool.acquire().await.map_err(self.sqlx_err())?;
         for &pragma in deletion_durability_pragmas(self.backend()) {
             self.query(pragma)
                 .execute(&mut *connection)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let result = self
             .delete_library_deletion_batch_on(&mut connection, job_id, library_id, batch, limit)
@@ -673,30 +599,18 @@ impl Database {
         batch: LibraryDeletionBatch,
         limit: i64,
     ) -> Result<Option<u64>, StorageError> {
-        let mut transaction = connection
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = connection.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == DatabaseBackend::Postgres {
             // Every batch is idempotent and the job restarts from committed data,
             // so the commit fsync is not worth paying for on a multi-hour deletion.
             self.query("SET LOCAL synchronous_commit = off")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             self.query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let running_job = self
             .query(
@@ -706,18 +620,9 @@ impl Database {
             .bind(job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if running_job.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(None);
         }
         if batch == LibraryDeletionBatch::MediaItems {
@@ -739,10 +644,7 @@ impl Database {
                     .bind(limit)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             }
         }
         let result = match batch {
@@ -1000,10 +902,7 @@ impl Database {
                 .await
             }
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let deleted = result.rows_affected();
         if deleted > 0 {
             self.query(
@@ -1015,18 +914,9 @@ impl Database {
             .bind(job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(deleted))
     }
 
@@ -1035,22 +925,12 @@ impl Database {
         job_id: &str,
         library_id: &str,
     ) -> Result<Option<bool>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == DatabaseBackend::Postgres {
             self.query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let running_job = self
             .query(
@@ -1061,18 +941,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if running_job.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(None);
         }
         self.query(
@@ -1082,19 +953,13 @@ impl Database {
         .bind(library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let deleted = self
             .query("DELETE FROM libraries WHERE id = ? AND deletion_state = 'DELETING'")
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected()
             == 1;
         if deleted {
@@ -1108,18 +973,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(deleted))
     }
 }

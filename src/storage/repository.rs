@@ -1297,10 +1297,7 @@ impl Database {
         } else {
             self.pool.begin().await
         };
-        transaction.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        transaction.map_err(self.sqlx_err())
     }
 
     // LUX-620 consumes this transaction helper through the admission methods in `sessions`.
@@ -1313,10 +1310,7 @@ impl Database {
         } else {
             self.pool.begin().await
         };
-        transaction.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        transaction.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn begin_scan_write_transaction(
@@ -1327,19 +1321,13 @@ impl Database {
         } else {
             self.pool.begin().await
         };
-        let mut transaction = transaction.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let mut transaction = transaction.map_err(self.sqlx_err())?;
         if self.backend == DatabaseBackend::Postgres {
             // Keep the reduced commit durability limited to this rebuildable scan transaction.
             sqlx::query("SET LOCAL synchronous_commit = off")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(transaction)
     }
@@ -1356,10 +1344,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_fingerprint_migration_state SET updated_at = updated_at
              WHERE library_id = ?",
@@ -1367,10 +1352,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query_scalar(
             "SELECT CASE WHEN lease_token IS NOT NULL
                               AND lease_expires_at > unixepoch()
@@ -1381,10 +1363,7 @@ impl Database {
         .fetch_one(&mut **transaction)
         .await
         .map(|value: i64| value == 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn lock_media_items_for_update(
@@ -1413,10 +1392,7 @@ impl Database {
             statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -1543,10 +1519,7 @@ impl Database {
             .bind(&persistent_key)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         {
             let calculated_at: i64 = row.get("calculated_at");
             if recommendation_rating_cache_is_fresh(now, calculated_at) {
@@ -1588,14 +1561,10 @@ impl Database {
         for library_id in &cache_key {
             statement = statement.bind(library_id);
         }
-        let median =
-            statement
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let median = statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
         let calculated_at = current_unix_timestamp();
         self.query(
             "INSERT INTO recommendation_rating_cache
@@ -1610,10 +1579,7 @@ impl Database {
         .bind(calculated_at)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.recommendation_rating_median_cache
             .lock()
             .await
@@ -1633,10 +1599,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map(|row| row.get::<i64, _>("version"))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn identity_stability_repair_completed(&self) -> Result<bool, StorageError> {
@@ -1646,10 +1609,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|value| value.as_deref() == Some("completed"))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_identity_stability_repair_completed(
@@ -1663,10 +1623,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Verifies that SQLite can commit a real write transaction.
@@ -1692,14 +1649,7 @@ impl Database {
     }
 
     async fn probe_write_once(&self) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO lux_meta (key, value)
              VALUES ('__lux_write_probe__', ?)
@@ -1708,17 +1658,8 @@ impl Database {
         .bind(format!("lux-write-probe-{}", Uuid::now_v7()))
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// Truncates the write-ahead log, then retires the pool.
