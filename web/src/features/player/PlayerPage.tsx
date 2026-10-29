@@ -6,15 +6,15 @@ import {
   useMemo,
   useRef,
   useState,
-  type KeyboardEvent as ReactKeyboardEvent,
-  type MouseEvent as ReactMouseEvent,
-  type PointerEvent as ReactPointerEvent,
 } from "react";
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { WebPlaybackTrackSelection } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
+import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
+import { usePlayerTimelineScrubber } from "./usePlayerTimelineScrubber";
+import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
 import { NativeVideoEngine, type PlaybackEngine } from "./playback-engine";
 import {
   clearRememberedCandidate,
@@ -64,7 +64,6 @@ import {
   getSubtitleInfo,
   isMatroskaSource,
   screenshotFileName,
-  timelinePosition,
 } from "./player-page-helpers";
 
 const AUTO_HIDE_DELAY_MS = 3_000;
@@ -88,13 +87,9 @@ export function PlayerPage() {
   const [currentTime, setCurrentTime] = useState(0);
   const [duration, setDuration] = useState(0);
   const [bufferedEnd, setBufferedEnd] = useState(0);
-  const [volume, setVolume] = useState(1);
-  const [isMuted, setIsMuted] = useState(false);
-  const [playbackRate, setPlaybackRate] = useState(1.0);
   const [loopPlayback, setLoopPlayback] = useState(false);
   const [aspectRatio, setAspectRatio] = useState<PlayerAspectRatio>("default");
   const [flip, setFlip] = useState<PlayerFlip>("normal");
-  const [isFullscreen, setIsFullscreen] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
   const [showInfo, setShowInfo] = useState(false);
   const [clientStats, setClientStats] = useState<PlayerClientStats | null>(null);
@@ -102,9 +97,6 @@ export function PlayerPage() {
   const [controlsVisible, setControlsVisible] = useState(true);
   const [isPointerInteracting, setIsPointerInteracting] = useState(false);
   const [controlActivity, setControlActivity] = useState(0);
-  const [centerSplash, setCenterSplash] = useState<"play" | "pause" | null>(null);
-  const [hoverTime, setHoverTime] = useState<number | null>(null);
-  const [hoverPercent, setHoverPercent] = useState<number | null>(null);
   const [danmuVisible, setDanmuVisible] = useState(true);
   const [screenshotStatus, setScreenshotStatus] = useState<string | null>(null);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
@@ -295,11 +287,8 @@ export function PlayerPage() {
   const engineRef = useRef<PlaybackEngine | null>(null);
   const runtimeRef = useRef<LuxPlayerRuntime | null>(null);
   const hasRestoredPositionRef = useRef(false);
-  const splashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenshotStatusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
-  const isDraggingScrubberRef = useRef(false);
-  const scrubberPointerIdRef = useRef<number | null>(null);
   const fallbackRequestedRef = useRef(false);
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
@@ -315,6 +304,63 @@ export function PlayerPage() {
     videoRef,
     lastVideoRef,
     sessionId: playbackSession?.sessionId ?? null,
+  });
+
+  const {
+    volume,
+    isMuted,
+    playbackRate,
+    isFullscreen,
+    centerSplash,
+    togglePlayPause,
+    seekTo,
+    seekRelative,
+    toggleMute,
+    changeVolume,
+    changePlaybackRate,
+    toggleFullscreen,
+    togglePictureInPicture,
+  } = usePlayerPlaybackControls({
+    videoRef,
+    runtimeRef,
+    playerContainerRef,
+    duration,
+    setCurrentTime,
+  });
+
+  const {
+    hoverTime,
+    hoverPercent,
+    isDraggingScrubberRef,
+    handleScrubberPointerDown,
+    handleScrubberPointerMove,
+    finishScrubberPointer,
+    handleScrubberMouseMove,
+    handleScrubberMouseLeave,
+    handleTimelineKeyDown,
+  } = usePlayerTimelineScrubber({
+    progressBarRef,
+    duration,
+    seekTo,
+    seekRelative,
+    setIsPointerInteracting,
+    resetControlsTimeout,
+  });
+
+  usePlayerKeyboardShortcuts({
+    itemId,
+    volume,
+    changeVolume,
+    seekRelative,
+    togglePlayPause,
+    toggleMute,
+    toggleFullscreen,
+    resetControlsTimeout,
+    showInfo,
+    showSettings,
+    setShowInfo,
+    setShowSettings,
+    navigate: (to) => navigate(to as never),
   });
 
   useEffect(() => {
@@ -473,67 +519,6 @@ export function PlayerPage() {
     setClientEngineActive,
   });
 
-  // Fullscreen change listener
-  useEffect(() => {
-    const handleFullscreenChange = () => {
-      setIsFullscreen(Boolean(document.fullscreenElement));
-    };
-    document.addEventListener("fullscreenchange", handleFullscreenChange);
-    return () => {
-      document.removeEventListener("fullscreenchange", handleFullscreenChange);
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!playing || !controlsVisible || showSettings || isPointerInteracting) return;
-    const timeout = window.setTimeout(() => setControlsVisible(false), AUTO_HIDE_DELAY_MS);
-    return () => window.clearTimeout(timeout);
-  }, [controlActivity, controlsVisible, isPointerInteracting, playing, showSettings]);
-
-  useEffect(() => () => {
-    if (splashTimeoutRef.current) clearTimeout(splashTimeoutRef.current);
-    if (screenshotStatusTimeoutRef.current) clearTimeout(screenshotStatusTimeoutRef.current);
-  }, []);
-
-  const showCenterSplash = (type: "play" | "pause") => {
-    setCenterSplash(type);
-    if (splashTimeoutRef.current) clearTimeout(splashTimeoutRef.current);
-    splashTimeoutRef.current = setTimeout(() => {
-      setCenterSplash(null);
-    }, 600);
-  };
-
-  const togglePlayPause = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (video.paused) {
-      void video.play().then(() => {
-        showCenterSplash("play");
-      });
-    } else {
-      video.pause();
-      showCenterSplash("pause");
-    }
-  }, []);
-
-  const seekTo = useCallback((seconds: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    const maximum = Number.isFinite(video.duration) && video.duration > 0
-      ? video.duration
-      : Math.max(0, duration);
-    const target = Math.max(0, Math.min(maximum, seconds));
-    if (runtimeRef.current) runtimeRef.current.seek(target);
-    else video.currentTime = target;
-    setCurrentTime(target);
-  }, [duration]);
-
-  const seekRelative = useCallback((seconds: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    seekTo(video.currentTime + seconds);
-  }, [seekTo]);
-
   usePlayerPlatform({
     enabled: Boolean(streamUrl),
     title: media?.title ?? media?.name ?? "Lux",
@@ -561,51 +546,6 @@ export function PlayerPage() {
     };
   }, [resetControlsTimeout]);
 
-  const toggleMute = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    const nextMuted = !video.muted;
-    video.muted = nextMuted;
-    setIsMuted(nextMuted);
-  }, []);
-
-  const changeVolume = useCallback((newVol: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    const bounded = Math.max(0, Math.min(1, newVol));
-    video.volume = bounded;
-    video.muted = bounded === 0;
-    setVolume(bounded);
-    setIsMuted(bounded === 0);
-  }, []);
-
-  const toggleFullscreen = useCallback(() => {
-    const container = playerContainerRef.current;
-    if (!container) return;
-    if (!document.fullscreenElement) {
-      void container.requestFullscreen().catch(() => undefined);
-    } else {
-      void document.exitFullscreen().catch(() => undefined);
-    }
-  }, []);
-
-  const togglePictureInPicture = useCallback(() => {
-    const video = videoRef.current;
-    if (!video) return;
-    if (document.pictureInPictureElement) {
-      void document.exitPictureInPicture().catch(() => undefined);
-    } else if (document.pictureInPictureEnabled) {
-      void video.requestPictureInPicture().catch(() => undefined);
-    }
-  }, []);
-
-  const changePlaybackRate = useCallback((rate: number) => {
-    const video = videoRef.current;
-    if (!video) return;
-    video.playbackRate = rate;
-    setPlaybackRate(rate);
-  }, []);
-
   useRuntimeCaptionReader({
     clientEngineActive,
     clientMkvSourceUrl,
@@ -619,6 +559,16 @@ export function PlayerPage() {
     onStatusChange: setCaptionStatus,
     clearCues: clearRuntimeCaptionCues,
   });
+
+  useEffect(() => {
+    if (!playing || !controlsVisible || showSettings || isPointerInteracting) return;
+    const timeout = window.setTimeout(() => setControlsVisible(false), AUTO_HIDE_DELAY_MS);
+    return () => window.clearTimeout(timeout);
+  }, [controlActivity, controlsVisible, isPointerInteracting, playing, showSettings]);
+
+  useEffect(() => () => {
+    if (screenshotStatusTimeoutRef.current) clearTimeout(screenshotStatusTimeoutRef.current);
+  }, []);
 
   const showScreenshotStatus = useCallback((message: string) => {
     setScreenshotStatus(message);
@@ -665,179 +615,6 @@ export function PlayerPage() {
       showScreenshotStatus("当前媒体不允许截图");
     }
   }, [media, showScreenshotStatus]);
-
-  // Keyboard shortcut listener
-  useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      const target = e.target as HTMLElement | null;
-      if (
-        target &&
-        (target.tagName === "INPUT" ||
-          target.tagName === "TEXTAREA" ||
-          target.isContentEditable)
-      ) {
-        return;
-      }
-
-      resetControlsTimeout();
-
-      switch (e.key) {
-        case " ":
-        case "k":
-        case "K":
-          e.preventDefault();
-          togglePlayPause();
-          break;
-        case "ArrowLeft":
-        case "j":
-        case "J":
-          e.preventDefault();
-          seekRelative(-10);
-          break;
-        case "ArrowRight":
-        case "l":
-        case "L":
-          e.preventDefault();
-          seekRelative(10);
-          break;
-        case "ArrowUp":
-          e.preventDefault();
-          changeVolume(volume + 0.05);
-          break;
-        case "ArrowDown":
-          e.preventDefault();
-          changeVolume(volume - 0.05);
-          break;
-        case "i":
-        case "I":
-          e.preventDefault();
-          setShowInfo((visible) => !visible);
-          break;
-        case "m":
-        case "M":
-          e.preventDefault();
-          toggleMute();
-          break;
-        case "f":
-        case "F":
-          e.preventDefault();
-          toggleFullscreen();
-          break;
-        case "Escape":
-          if (showInfo) {
-            e.preventDefault();
-            setShowInfo(false);
-          } else if (showSettings) {
-            e.preventDefault();
-            setShowSettings(false);
-          } else if (!document.fullscreenElement) {
-            e.preventDefault();
-            if (window.history.length > 1) {
-              navigate(-1);
-            } else {
-              navigate(itemId ? `/items/${encodeURIComponent(itemId)}` : "/");
-            }
-          }
-          break;
-      }
-    };
-
-    window.addEventListener("keydown", handleKeyDown);
-    return () => {
-      window.removeEventListener("keydown", handleKeyDown);
-    };
-  }, [
-    changeVolume,
-    itemId,
-    navigate,
-    resetControlsTimeout,
-    seekRelative,
-    showInfo,
-    showSettings,
-    toggleFullscreen,
-    toggleMute,
-    togglePlayPause,
-    volume,
-  ]);
-
-  // Scrubber scrubbing handlers
-  const handleScrubberPointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
-    const bar = progressBarRef.current;
-    if (
-      !bar
-      || !duration
-      || scrubberPointerIdRef.current !== null
-      || (e.pointerType === "mouse" && e.button !== 0)
-    ) return;
-
-    isDraggingScrubberRef.current = true;
-    scrubberPointerIdRef.current = e.pointerId;
-    setIsPointerInteracting(true);
-    resetControlsTimeout();
-    try {
-      bar.setPointerCapture?.(e.pointerId);
-    } catch {
-      // A cancelled pointer can no longer be captured; the timeline still
-      // receives its element-scoped fallback events.
-    }
-    seekTo(timelinePosition(bar, e.clientX, duration));
-  };
-
-  const handleScrubberPointerMove = (event: ReactPointerEvent<HTMLDivElement>) => {
-    const bar = progressBarRef.current;
-    if (!bar || scrubberPointerIdRef.current !== event.pointerId) return;
-    seekTo(timelinePosition(bar, event.clientX, duration));
-  };
-
-  const finishScrubberPointer = (
-    event: ReactPointerEvent<HTMLDivElement>,
-    commitPosition: boolean,
-  ) => {
-    const bar = progressBarRef.current;
-    if (!bar || scrubberPointerIdRef.current !== event.pointerId) return;
-    try {
-      if (event.currentTarget.hasPointerCapture?.(event.pointerId)) {
-        event.currentTarget.releasePointerCapture?.(event.pointerId);
-      }
-    } catch {
-      // Browsers may release capture before a pointercancel reaches React.
-    }
-    isDraggingScrubberRef.current = false;
-    scrubberPointerIdRef.current = null;
-    setIsPointerInteracting(false);
-    if (commitPosition) seekTo(timelinePosition(bar, event.clientX, duration));
-    resetControlsTimeout();
-  };
-
-  const handleScrubberMouseMove = (e: ReactMouseEvent<HTMLDivElement>) => {
-    const bar = progressBarRef.current;
-    if (!bar || !duration) return;
-    const rect = bar.getBoundingClientRect();
-    const pos = Math.max(0, Math.min(1, (e.clientX - rect.left) / rect.width));
-    setHoverPercent(pos * 100);
-    setHoverTime(pos * duration);
-  };
-
-  const handleScrubberMouseLeave = () => {
-    setHoverTime(null);
-    setHoverPercent(null);
-  };
-
-  const handleTimelineKeyDown = (event: ReactKeyboardEvent<HTMLDivElement>) => {
-    if (event.key === "ArrowLeft") {
-      event.preventDefault();
-      seekRelative(-5);
-    } else if (event.key === "ArrowRight") {
-      event.preventDefault();
-      seekRelative(5);
-    } else if (event.key === "Home") {
-      event.preventDefault();
-      seekTo(0);
-    } else if (event.key === "End") {
-      event.preventDefault();
-      seekTo(duration);
-    }
-  };
 
   const handleBack = () => {
     if (window.history.length > 1) {
