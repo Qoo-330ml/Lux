@@ -11,14 +11,7 @@ impl Database {
     /// This is deliberately one transaction so startup and shutdown never
     /// leave a mixed set of job tables eligible for automatic recovery.
     pub async fn cancel_incomplete_jobs_for_shutdown(&self) -> Result<u64, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let mut cancelled = 0_u64;
         let mut legacy_scan_events = Vec::new();
 
@@ -42,10 +35,7 @@ impl Database {
             .bind(Self::LEGACY_SCAN_REQUIRES_NEW_MANIFEST)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         cancelled = cancelled.saturating_add(legacy_scan_rows.len() as u64);
         legacy_scan_events.extend(
             legacy_scan_rows
@@ -97,20 +87,11 @@ impl Database {
                 .bind(SHUTDOWN_JOB_ERROR_CODE)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             cancelled = cancelled.saturating_add(result.rows_affected());
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         for job_id in legacy_scan_events {
             let event_id = uuid::Uuid::now_v7().to_string();
             self.log_store

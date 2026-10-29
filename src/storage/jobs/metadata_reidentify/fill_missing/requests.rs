@@ -141,10 +141,7 @@ impl Database {
             for row in statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
             {
                 let job_id: String = row.get("job_id");
                 let item_id: String = row.get("item_id");
@@ -330,10 +327,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         for (job_id, updates) in queued_updates {
@@ -381,10 +375,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
             }
         }
         for (job_id, count) in completed_queued_updates {
@@ -400,10 +391,7 @@ impl Database {
             .bind(job_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
 
         self.enqueue_fill_missing_jobs_in_transaction(

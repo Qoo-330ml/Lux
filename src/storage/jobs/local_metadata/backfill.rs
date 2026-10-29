@@ -28,10 +28,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     #[allow(dead_code)] // Exercised by storage tests for backfill-root idempotency.
@@ -53,10 +50,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_next_scan_local_metadata_backfill_page(
@@ -84,18 +78,9 @@ impl Database {
                 )
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let Some(library_root_id) = next_root else {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                transaction.commit().await.map_err(self.sqlx_err())?;
                 return Ok(None);
             };
             let claimed: Option<(Option<String>, i64, String)> = self
@@ -110,18 +95,9 @@ impl Database {
                 .bind(&library_root_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             let Some((cursor_entry_id, attempts, non_retryable_item_ids_json)) = claimed else {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                transaction.commit().await.map_err(self.sqlx_err())?;
                 continue;
             };
             let non_retryable_item_ids = parse_scan_local_metadata_non_retryable_item_ids(
@@ -148,10 +124,7 @@ impl Database {
                 .bind(query_limit)
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if entry_ids.is_empty() {
                 self.query(
                     "UPDATE scan_local_metadata_backfills
@@ -166,17 +139,8 @@ impl Database {
                 .bind(cursor_entry_id.as_deref())
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                .map_err(self.sqlx_err())?;
+                transaction.commit().await.map_err(self.sqlx_err())?;
                 continue;
             }
 
@@ -187,13 +151,7 @@ impl Database {
             let next_cursor_entry_id = entry_ids.last().cloned().ok_or_else(|| {
                 StorageError::Conflict("scan metadata backfill returned an empty page".into())
             })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(Some(StoredScanLocalMetadataBackfillPage {
                 library_root_id,
                 cursor_entry_id,
@@ -248,10 +206,7 @@ impl Database {
             .bind(page.cursor_entry_id.as_deref())
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -325,10 +280,7 @@ impl Database {
             .bind(page.cursor_entry_id.as_deref())
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -345,10 +297,7 @@ impl Database {
             )
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 }

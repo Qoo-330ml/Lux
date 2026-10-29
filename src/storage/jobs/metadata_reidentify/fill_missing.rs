@@ -59,10 +59,7 @@ impl Database {
             .bind(i64::try_from(remaining.len()).unwrap_or(i64::MAX))
             .fetch_all(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         for (queued_job_id, queued_count) in queued_jobs {
             if remaining.is_empty() {
                 break;
@@ -82,10 +79,7 @@ impl Database {
                 .bind(&queued_job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
                 job_ids.push(queued_job_id);
             }
         }
@@ -105,10 +99,7 @@ impl Database {
             .bind(dispatch_source)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
             self.insert_fill_missing_job_items(transaction, &job_id, chunk)
                 .await?;
@@ -174,18 +165,9 @@ impl Database {
             .bind(limit)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if rows.is_empty() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(Vec::new());
         }
         let item_ids = rows
@@ -234,10 +216,7 @@ impl Database {
                 .bind(library_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let job_ids = self
             .enqueue_or_update_fill_missing_requests_in_transaction(
@@ -246,13 +225,7 @@ impl Database {
                 &requests,
             )
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(job_ids)
     }
 
@@ -297,10 +270,7 @@ impl Database {
         let active_rows = statement
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut active_items = std::collections::HashSet::with_capacity(active_rows.len());
         let mut existing_job_id = None;
         for row in active_rows {
@@ -337,13 +307,7 @@ impl Database {
             .next()
             .ok_or_else(|| StorageError::Conflict("fill-missing job was not created".to_owned()))?
         };
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(job_id)
     }
 
@@ -381,10 +345,7 @@ impl Database {
         statement
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(())
     }
 }

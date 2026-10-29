@@ -15,13 +15,7 @@ impl Database {
         let inserted = self
             .enqueue_scan_local_metadata_batch_in_transaction(&mut transaction, batch)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(inserted)
     }
 
@@ -74,10 +68,7 @@ impl Database {
             .bind(source_count)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if inserted.is_some() {
             return Ok(true);
         }
@@ -93,10 +84,7 @@ impl Database {
             .bind(batch.batch_sequence)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((existing_id, existing_sources, existing_count)) = existing else {
             return Err(StorageError::Conflict(
                 "scan local metadata batch id already belongs to another batch".into(),
@@ -185,10 +173,7 @@ impl Database {
             let inserted_sequences = insert
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .into_iter()
                 .map(|row| row.get::<i64, _>(0))
                 .collect::<std::collections::HashSet<_>>();
@@ -216,14 +201,10 @@ impl Database {
             for batch_sequence in &existing_sequences {
                 select = select.bind(batch_sequence);
             }
-            let existing_batches =
-                select
-                    .fetch_all(&mut **transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let existing_batches = select
+                .fetch_all(&mut **transaction)
+                .await
+                .map_err(self.sqlx_err())?;
             if existing_batches.len() != existing_sequences.len()
                 || existing_batches
                     .iter()
@@ -291,10 +272,7 @@ impl Database {
                 ));
             }
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
             .map(stored_scan_local_metadata_batch)
@@ -314,10 +292,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn has_pending_scan_local_metadata_images(
@@ -335,10 +310,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_next_scan_local_metadata_batch(
@@ -355,18 +327,9 @@ impl Database {
             )
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(next_id) = next_id else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(None);
         };
         let claimed = self
@@ -381,17 +344,8 @@ impl Database {
             .bind(next_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(claimed.map(stored_scan_local_metadata_batch))
     }
 
@@ -432,10 +386,7 @@ impl Database {
             .bind(batch_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -484,10 +435,7 @@ impl Database {
             .bind(batch_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -521,17 +469,8 @@ impl Database {
             .execute(&mut *transaction)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -551,17 +490,8 @@ impl Database {
             .bind(job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 
@@ -579,17 +509,8 @@ impl Database {
             )
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 }
