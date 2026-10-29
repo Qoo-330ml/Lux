@@ -15,6 +15,30 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "0.7.0",
+    date: "2026-10-29",
+    sections: [
+      { kind: "added", items: [
+        "数据路径重构：新增 catalog_items / catalog_item_stats / user_series_next 派生读模型，支持后台重建、中断续建与校验；LUX_READ_MODEL_MODE=off|shadow|on 三档开关默认 off，打开后首页、继续观看、库列表与详情改走派生表，关闭时响应逐字节一致。",
+        "搜索索引改为「触发器只入队、消费者批量重建」，SQLite 与 PostgreSQL 同语义（PostgreSQL 首次具备等价实现）；搜索请求前有界排空 200 条、后台每拍 500 条，扫描积压不再拖慢单个搜索请求。",
+        "搜索支持 count=false（Lux）与 EnableTotalRecordCount=false（Emby）：页面与排序不变、跳过总数计算，总数报 0；默认仍返回精确总数。",
+        "协议层：成功的 JSON 响应按需 gzip，并下发基于未压缩 body 的强 ETag，If-None-Match 命中返回 304；媒体流、图片、SPA 回退、SSE 与 Range 请求不受影响。",
+        "详情 NFO 解码缓存：重复打开同一详情时跳过 130 KB 级 JSON 读取与解析；缓存按条目指纹、字节数与更新时间校验，写入或修复后自动失效。",
+        "Emby 列表在显式请求 Fields=MediaStreams 时补齐顶层 MediaStreams；此前该字段会被静默丢弃。",
+        "后台媒体车道支持前台延迟反馈：LUX_BACKGROUND_FOREGROUND_THROTTLE=on 开启（默认关闭），可用 LUX_BACKGROUND_FOREGROUND_P95_MS 调整阈值；前台变慢时 probe/NFO/图片并发按比例回落，冷却后恢复。",
+      ] },
+      { kind: "changed", items: [
+        "扫描空闲退避：批量排空循环从固定 50 ms 改为自适应 250 ms–1 s，任一轮有进展即重置。",
+        "升级注意（0.6.20 → 0.7.0）：首次启动自动执行 14 对迁移并在后台重建读模型；66k 夹具上重建约 3 秒、数据库体积增加约 16%，条目越多越久。migration 只向前、不支持回滚，升级前请备份 /config、/media（使用 PostgreSQL 时连同数据库）。",
+        "SQLite 在有媒体条目后执行一次全量 ANALYZE，之后每 15 分钟运行 PRAGMA optimize，并在扫描或元数据任务运行期间让路；每个连接设置 journal_size_limit，正常关闭时截断 WAL。",
+      ] },
+      { kind: "fixed", items: [
+        "损坏或超限的 NFO 缓存行仍会被识别、清除并等待后台重建（缓存命中条件包含字节数与更新时间，不只看指纹）。",
+        "已初始化过的配置目录在数据库文件缺失或为空时拒绝启动并打印恢复指引，不再静默创建空库并展示安装向导。",
+      ] },
+    ],
+  },
+  {
     version: "0.6.20",
     date: "2026-10-25",
     sections: [
