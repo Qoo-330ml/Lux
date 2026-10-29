@@ -105,6 +105,7 @@ describe("PlayerPage client fallback status", () => {
   let root: Root | undefined;
 
   beforeEach(() => {
+    window.localStorage.clear();
     mockPlaybackBootstrap();
     fallbackState.assets.length = 0;
     fallbackState.hevcSources.length = 0;
@@ -243,7 +244,7 @@ describe("PlayerPage client fallback status", () => {
     );
   });
 
-  it("keeps remote Matroska STRM on the original URL while reading selected captions directly", async () => {
+  it("plays remote Matroska STRM through the proxy entry while reading selected captions from the original URL", async () => {
     vi.mocked(shouldUseClientHevc).mockResolvedValue(false);
     vi.mocked(api.item).mockResolvedValue({
       id: "remote-mkv-strm",
@@ -297,7 +298,7 @@ describe("PlayerPage client fallback status", () => {
     });
 
     const video = container.querySelector<HTMLVideoElement>("video");
-    expect(video?.getAttribute("src")).toBe("https://media.example.test/video.mkv");
+    expect(video?.getAttribute("src")).toContain("/Videos/remote-mkv-strm/stream.mkv");
     expect(shouldUseClientMkv).toHaveBeenCalled();
     expect(container?.textContent).not.toContain("播放器引擎失败");
 
@@ -308,7 +309,7 @@ describe("PlayerPage client fallback status", () => {
     expect(captionOptions[1]?.disabled).toBe(false);
     expect(container?.textContent).not.toContain("浏览器未暴露远程内嵌字幕");
     expect(shouldUseClientMkv).toHaveBeenCalled();
-    expect(container?.querySelector("video")?.getAttribute("src")).toBe("https://media.example.test/video.mkv");
+    expect(container?.querySelector("video")?.getAttribute("src")).toContain("/Videos/remote-mkv-strm/stream.mkv");
 
     const captionChoices = await luxOptions(container, "选择字幕");
     await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
@@ -541,6 +542,110 @@ describe("PlayerPage client fallback status", () => {
     expect(fallbackState.mkvSources).toHaveLength(0);
     expect(container.textContent).not.toContain("播放器引擎失败");
     expect(api.stopWebPlaybackSession).not.toHaveBeenCalled();
+  });
+
+  async function renderRemoteNativeStrm(itemId: string, plan: Record<string, unknown>) {
+    vi.mocked(shouldUseClientHevc).mockResolvedValue(false);
+    vi.mocked(shouldUseClientMkv).mockResolvedValue(false);
+    vi.mocked(api.item).mockResolvedValue({
+      id: itemId,
+      title: "远程 STRM",
+      itemType: "MOVIE",
+      mediaSources: [{
+        id: `${itemId}-source`,
+        isDefault: true,
+        sourceKind: "STRM_URL",
+        externalUrl: "https://media.example.test/video.mp4",
+        container: "mp4",
+        streams: [{ index: 0, type: "VIDEO", codec: "H264" }],
+      }],
+    });
+    vi.mocked(api.createWebPlaybackSession).mockResolvedValue({
+      sessionId: `web-${itemId}`,
+      playSessionId: `lux-web:web-${itemId}`,
+      sourceId: `${itemId}-source`,
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: { type: "DIRECT", ...plan } as never,
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={[`/watch/${itemId}`]}>
+            <Routes><Route path="watch/:itemId" element={<PlayerPage />} /></Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    return container.querySelector("video") as HTMLVideoElement;
+  }
+
+  it("plays a remote HTTP STRM through the 302 proxy entry first and falls back to Lux then the origin", async () => {
+    const video = await renderRemoteNativeStrm("remote-proxy-first", {
+      url: "/api/v1/playback/sessions/web-remote-proxy-first/direct?expires=1900000000&signature=test",
+      proxyUrl: "/Videos/remote-proxy-first/stream.mp4?MediaSourceId=remote-proxy-first-source",
+    });
+    expect(video.getAttribute("src")).toContain("/Videos/remote-proxy-first/stream.mp4");
+
+    await act(async () => {
+      video.dispatchEvent(new Event("error"));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    expect(video.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-proxy-first/direct");
+
+    await act(async () => {
+      video.dispatchEvent(new Event("error"));
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    });
+    expect(video.getAttribute("src")).toBe("https://media.example.test/video.mp4");
+  });
+
+  const proxyPlan = (id: string) => ({
+    url: `/api/v1/playback/sessions/web-${id}/direct?expires=1900000000&signature=test`,
+    proxyUrl: `/Videos/${id}/stream.mp4?MediaSourceId=${id}-source`,
+  });
+
+  it("remembers the candidate kind that delivered metadata and starts from it next time", async () => {
+    const video = await renderRemoteNativeStrm("remote-remember", proxyPlan("remote-remember"));
+    await act(async () => video.dispatchEvent(new Event("loadedmetadata")));
+    expect(window.localStorage.getItem("lux.player.directCandidate")).toBe("proxy");
+    expect(Object.values(window.localStorage).join("")).not.toContain("/Videos/");
+
+    act(() => root?.unmount());
+    root = undefined;
+    container?.remove();
+    window.localStorage.setItem("lux.player.directCandidate", "lux");
+    const next = await renderRemoteNativeStrm("remote-remember", proxyPlan("remote-remember"));
+    expect(next.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-remember/direct");
+  });
+
+  it("moves to the next candidate when metadata does not arrive in time", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      const video = await renderRemoteNativeStrm("remote-timeout", proxyPlan("remote-timeout"));
+      expect(video.getAttribute("src")).toContain("/Videos/remote-timeout/stream.mp4");
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(8_100);
+      });
+      expect(video.getAttribute("src")).toContain("/api/v1/playback/sessions/web-remote-timeout/direct");
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the origin URL for a remote HTTP STRM when the plan has no proxy entry", async () => {
+    const video = await renderRemoteNativeStrm("remote-no-proxy", {
+      url: "/api/v1/playback/sessions/web-remote-no-proxy/direct?expires=1900000000&signature=test",
+    });
+    expect(video.getAttribute("src")).toBe("https://media.example.test/video.mp4");
   });
 
   it("keeps native playback and the selected option when the remote codec pair cannot enter MSE", async () => {

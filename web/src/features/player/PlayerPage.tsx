@@ -30,6 +30,14 @@ import {
 import { normalizeCaptionOffset } from "./caption-offset";
 import type { LuxCaptionCue } from "./caption-parser";
 import { canUseHls } from "./hls-capabilities";
+import {
+  DIRECT_CANDIDATE_TIMEOUT_MS,
+  clearRememberedCandidate,
+  directCandidates,
+  orderCandidates,
+  rememberCandidate,
+  rememberedCandidate,
+} from "./direct-candidates";
 import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
 import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
@@ -196,7 +204,7 @@ export function PlayerPage() {
 
   const [playing, setPlaying] = useState(false);
   const [playbackAttempt, setPlaybackAttempt] = useState(0);
-  const [directProxyFallbackRequested, setDirectProxyFallbackRequested] = useState(false);
+  const [candidateOffset, setCandidateOffset] = useState(0);
   const [failedStreamUrl, setFailedStreamUrl] = useState<string | null>(null);
   const [playbackFailure, setPlaybackFailure] = useState<PlayerFailure | null>(null);
   const [fallbackLoading, setFallbackLoading] = useState(false);
@@ -365,12 +373,16 @@ export function PlayerPage() {
   });
   const remoteHttpSource = Boolean(source && isRemoteHttpStrmSource(source));
   const remoteDirectUrl = remoteHttpSource ? source?.externalUrl ?? null : null;
-  const directProxyUrl = playbackPlan?.type === "DIRECT" ? playbackPlan.proxyUrl : undefined;
+  // The remembered kind is read once per plan so recording a success below cannot reorder a ladder
+  // that is already being walked.
+  const candidates = useMemo(
+    () => orderCandidates(directCandidates(playbackPlan, source), rememberedCandidate()),
+    [playbackPlan, source],
+  );
+  const candidate = candidates[Math.min(candidateOffset, candidates.length - 1)];
+  const hasNextCandidate = candidateOffset + 1 < candidates.length;
   const streamUrl = playbackPlan?.type === "DIRECT"
-    ? (remoteDirectUrl
-      ?? (directProxyFallbackRequested
-        ? playbackPlan.url
-        : directProxyUrl ?? playbackPlan.url))
+    ? candidate?.url ?? playbackPlan.url
     : playbackPlan?.type === "SERVER_HLS"
       ? playbackPlan.manifestUrl
       : "";
@@ -523,19 +535,16 @@ export function PlayerPage() {
   }, [queryClient]);
 
   const requestServerFallback = useCallback(async (reason?: unknown) => {
+    if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
+      if (candidate && candidate.kind === rememberedCandidate()) clearRememberedCandidate();
+      setCandidateOffset((offset) => offset + 1);
+      setFailedStreamUrl(null);
+      setPlaybackFailure(null);
+      return;
+    }
     if (remoteHttpSource) {
       setFailedStreamUrl(streamUrl || null);
       setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
-    }
-    if (
-      playbackPlan?.type === "DIRECT"
-      && directProxyUrl
-      && !directProxyFallbackRequested
-    ) {
-      setDirectProxyFallbackRequested(true);
-      setFailedStreamUrl(null);
-      setPlaybackFailure(null);
       return;
     }
     if (
@@ -559,7 +568,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [directProxyFallbackRequested, directProxyUrl, playbackAttempt, playbackPlan?.type, remoteHttpSource, stopActiveSession, streamUrl]);
+  }, [candidate, hasNextCandidate, playbackAttempt, playbackPlan?.type, remoteHttpSource, stopActiveSession, streamUrl]);
 
   useEffect(() => {
     fallbackGenerationRef.current += 1;
@@ -568,7 +577,7 @@ export function PlayerPage() {
     hasRestoredPositionRef.current = false;
     fallbackRequestedRef.current = false;
     setPlaybackAttempt(0);
-    setDirectProxyFallbackRequested(false);
+    setCandidateOffset(0);
     setFailedStreamUrl(null);
     setPlaybackFailure(null);
     setFallbackLoading(false);
@@ -815,6 +824,22 @@ export function PlayerPage() {
       if (!cancelled) syncSnapshot(activeEngine.snapshot(), true);
     };
     initialEngine.element.addEventListener("durationchange", handleDurationChange);
+    // Only the native element can stall on an unreachable entry; the client engines read the origin
+    // themselves and report their own failures.
+    const ladderKind = playbackPlan?.type === "DIRECT" ? candidate?.kind : undefined;
+    let metadataLoaded = false;
+    const handleLoadedMetadata = () => {
+      metadataLoaded = true;
+      if (!cancelled && ladderKind && activeEngine.kind === "native") rememberCandidate(ladderKind);
+    };
+    initialEngine.element.addEventListener("loadedmetadata", handleLoadedMetadata);
+    const candidateTimeout = ladderKind && hasNextCandidate
+      ? window.setTimeout(() => {
+        if (!cancelled && !metadataLoaded && activeEngine.kind === "native") {
+          void requestServerFallback("candidate timed out");
+        }
+      }, DIRECT_CANDIDATE_TIMEOUT_MS)
+      : undefined;
     const load = async () => {
       try {
         setClientEngineActive(false);
@@ -890,7 +915,9 @@ export function PlayerPage() {
     void load();
     return () => {
       cancelled = true;
-      if (remoteHttpSource && source?.id) {
+      window.clearTimeout(candidateTimeout);
+      initialEngine.element.removeEventListener("loadedmetadata", handleLoadedMetadata);
+      if ((remoteHttpSource || candidates.length > 1) && source?.id) {
         const video = activeEngine.element;
         const currentTime = Number.isFinite(video.currentTime)
           ? Math.max(0, video.currentTime)
@@ -915,7 +942,7 @@ export function PlayerPage() {
       if (runtimeRef.current === runtime) runtimeRef.current = null;
       if (engineRef.current === activeEngine) engineRef.current = null;
     };
-  }, [playbackKey, playbackPlan?.type, poster, remoteHttpSource, requestServerFallback, source, streamUrl]);
+  }, [candidate?.kind, candidates.length, hasNextCandidate, playbackKey, playbackPlan?.type, poster, remoteHttpSource, requestServerFallback, source, streamUrl]);
 
   // Fullscreen change listener
   useEffect(() => {

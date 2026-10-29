@@ -38,6 +38,7 @@ describe("PlayerPage playback synchronization", () => {
   let mediaSessionDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(() => {
+    window.localStorage.clear();
     mockPlaybackBootstrap();
     vi.spyOn(api, "progress").mockResolvedValue(undefined);
     vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (_itemId, sourceId) => ({
