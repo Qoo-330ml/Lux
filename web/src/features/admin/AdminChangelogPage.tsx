@@ -15,6 +15,26 @@ type ChangelogRelease = {
 
 export const changelogReleases: ChangelogRelease[] = [
   {
+    version: "Unreleased",
+    date: "2026-10-29",
+    sections: [
+      { kind: "added", items: [
+        "统一界面控件层：新增 web/src/components/ui（按钮、图标按钮、链接按钮、输入框、多行输入、下拉选择、单选、复选、开关、进度条、对话框、折叠区），后台各页、账户、登录/安装、详情与播放器设置改用同一套控件，焦点环、禁用态、尺寸与危险色不再逐页各写一份；下拉选择换成自研 combobox，历史页面继续写原生 option 子节点即可迁移。",
+        "应用内确认弹窗：useLuxConfirm 取代后台里的 window.confirm，禁用/启用账号、移入回收站、彻底删除、批量应用角色预设等改用同一套标题 + 说明的确认框，危险操作用危险色；未挂载 Provider 时回退浏览器确认框。",
+        "用户详情按需展开编辑：密码、资料、访问限制、设备等编辑区默认收起，只留一行说明，展开后仍是完整表单；折叠内容保持挂载并维持 aria-controls 关系。",
+      ] },
+      { kind: "changed", items: [
+        "读模型默认切到 on：新增 catalog 事件的 outbox 触发器（SQLite 行级、PostgreSQL 语句级）与增量消费者 catalog_items_incremental@1，新入库、元数据更新、海报变更、删除与合并约 1 秒内反映到首页、继续观看、库列表与详情，父级与剧集的计数随子项变更一并重算；迁移 0238/0240 在升级时把现有条目重新入队一次，LUX_READ_MODEL_MODE 仍可用 off / shadow 回退。",
+        "窄屏用户列表改卡片：宽度 ≤1023px 时用户列表从表格切换为卡片（头像、显示名与账号、权限摘要、操作按钮），桌面端仍是表格，筛选、视图切换与分页结果不变。",
+        "用户列表的头像、显示名与账号 ID 都成为进入该用户管理的链接，可键盘聚焦。",
+        "下拉选择补齐 title 与 name 透传。",
+      ] },
+      { kind: "fixed", items: [
+        "后台确认文案里的换行（用户名列表、禁用/删除的影响说明）按行保留展示，不再挤成一段。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.0",
     date: "2026-10-29",
     sections: [
