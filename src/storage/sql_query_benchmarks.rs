@@ -777,3 +777,111 @@ fn manifest_positive_file_reference_collection_benchmark() {
         snapshot,
     );
 }
+
+// A2: PostgreSQL placeholder adaptation. These five statements stand in for the shapes the
+// adapter sees in `storage`: a tiny insert, an ordinary paged select, a long join, a wide
+// `IN (...)` list, and text where `?` appears inside quotes and comments.
+
+const ADAPTATION_SHORT_SQL: &str =
+    "INSERT INTO catalog_outbox (kind, item_id, library_id) VALUES (?, ?, ?) RETURNING id";
+
+const ADAPTATION_TYPICAL_SQL: &str = "SELECT mi.id, mi.item_type, mi.title, mi.sort_title,
+        mi.production_year, fe.relative_path
+ FROM media_items mi
+ JOIN media_sources ms ON ms.item_id = mi.id
+ JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+ WHERE mi.library_root_id = ?
+   AND mi.removed_at IS NULL
+   AND mi.item_type IN ('VIDEO', 'EPISODE')
+ ORDER BY mi.sort_title, mi.id
+ LIMIT ? OFFSET ?";
+
+const ADAPTATION_LONG_JOIN_SQL: &str = "SELECT ms.id AS source_id, ms.item_id,
+        mi.item_type, mi.season_number, mi.episode_number,
+        mi.title, mi.original_title,
+        series.title AS series_title,
+        series.original_title AS series_original_title,
+        lr.canonical_path AS root_path, fe.relative_path
+ FROM media_sources ms
+ JOIN media_items mi ON mi.id = ms.item_id
+ LEFT JOIN media_items series ON series.id = mi.series_id
+ JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+ JOIN library_roots lr ON lr.id = fe.library_root_id
+ WHERE mi.id = ? AND ms.id = ?
+   AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+   AND fe.is_missing = 0
+ LIMIT 1";
+
+const ADAPTATION_QUOTES_AND_COMMENTS_SQL: &str = "-- item lookup; the ? in this comment is prose
+SELECT mi.id,
+       'it''s ?' AS note,
+       \"quoted ?\" AS identifier,
+       'what?' AS suffix
+ FROM media_items mi
+ /* the ? below this block comment is prose as well */
+ WHERE mi.library_root_id = ?
+   AND mi.identity_key = ?
+   AND mi.title <> 'Who?'
+   AND mi.item_type = ?
+   AND mi.removed_at IS NULL
+   AND EXISTS (
+       SELECT 1
+       FROM media_sources ms
+       WHERE ms.item_id = mi.id AND ms.source_kind = ?
+   )
+ ORDER BY mi.title
+ LIMIT ?";
+
+fn adaptation_wide_in_list_sql(placeholder_count: usize) -> &'static str {
+    let placeholders = std::iter::repeat_n("?", placeholder_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id FROM filesystem_entries WHERE library_root_id = ? AND relative_path IN ({placeholders})"
+    );
+    Box::leak(sql.into_boxed_str())
+}
+
+fn adaptation_benchmark_cases() -> Vec<(&'static str, &'static str, usize)> {
+    vec![
+        ("short_insert_3_placeholders", ADAPTATION_SHORT_SQL, 20_000),
+        ("typical_select_3_placeholders", ADAPTATION_TYPICAL_SQL, 20_000),
+        ("long_join_2_placeholders", ADAPTATION_LONG_JOIN_SQL, 20_000),
+        (
+            "wide_in_list_128_placeholders",
+            adaptation_wide_in_list_sql(128),
+            5_000,
+        ),
+        (
+            "quotes_and_comments_5_placeholders",
+            ADAPTATION_QUOTES_AND_COMMENTS_SQL,
+            20_000,
+        ),
+    ]
+}
+
+/// Measures the production entry point, so the number covers whatever `Database::query*` pays.
+fn report_postgres_adaptation(case: &str, sql: &'static str, iterations: usize) {
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        || adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
+        || adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
+    );
+    report_allocation_case(
+        &format!("postgres_adapt_{case}"),
+        iterations,
+        elapsed,
+        snapshot,
+    );
+    let adapted = adapt_sql_for_backend(DatabaseBackend::Postgres, sql);
+    assert_ne!(adapted.as_str(), sql, "case {case} must rewrite placeholders");
+    assert!(adapted.as_str().contains('$'), "case {case} must use $n");
+}
+
+#[test]
+#[ignore = "run explicitly to record the A2 PostgreSQL placeholder adaptation baseline"]
+fn postgres_placeholder_adaptation_benchmark() {
+    for (case, sql, iterations) in adaptation_benchmark_cases() {
+        report_postgres_adaptation(case, sql, iterations);
+    }
+}

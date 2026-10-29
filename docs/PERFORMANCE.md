@@ -3057,3 +3057,39 @@ SQL 级补充（同一夹具，5,000 次标题更新，`synchronous=NORMAL`）�
 - `strip = "symbols"` 之后，线上二进制的 panic backtrace 与采样工具（`perf` / `dtrace`）会失去符号名，
   排查现场问题时需要用同一个 tag 临时去掉 `strip` 重新构建。
 - 本节所有数字来自 arm64 开发机，NAS / x86_64 的构建耗时与体积未测，不能按比例外推。
+
+## PostgreSQL 占位符改写缓存（A2，2026-10-30，arm64）
+
+动机：`adapt_sql_for_backend`（`src/storage/repository.rs`）在 PostgreSQL 路径上**每次查询**逐字符扫描
+SQL，把 `?` 改写成 `$1,$2,…`，并分配新 `String`；`Database::query/query_as/query_scalar` 每次都调用它，
+而绝大多数 SQL 是 `&'static str` 字面量，同一条会被反复改写。本节先量化改写成本，再决定是否加缓存。
+
+前提：
+
+| 项 | 值 |
+|---|---|
+| 机器 | Apple M4，`uname -m` = `arm64`，10 核，16 GiB，macOS 26.5 |
+| 工具链 | rustc / cargo 1.97.1（`rust-toolchain.toml` 为 stable） |
+| 基线提交 | `673bfebe`（`test` 分支），独立 worktree、独立 `target/` |
+| 基准 | `storage::repository::sql_query_benchmarks::postgres_placeholder_adaptation_benchmark`（`#[ignore]`） |
+| 运行方式 | `cargo test --locked --lib --features performance-benchmarks postgres_placeholder_adaptation_benchmark -- --ignored --nocapture` |
+| 分配计数 | 复用该文件已有的 `CountingSystemAllocator`（`#[global_allocator]`，按 op 归一） |
+| 数据来源 | arm64 开发机；**不得**据此推断 NAS / x86_64 的耗时 |
+
+测得的是**生产入口**（`Database::query*` 走的那个 `adapt_sql_for_backend`），不是单独抽出来的扫描函数。
+计时段前先跑一遍分配计数段，因此同一 `&'static str` 的计时值含缓存预热后的稳态（见下节“缓存路径”）。
+
+### 五条代表性 SQL 与改写成本（原实现，无缓存）
+
+| 用例 | SQL 字节 | `?` 个数 | debug ns/次 | allocs/次 | alloc 字节/次 |
+|---|---:|---:|---:|---:|---:|
+| `short_insert`（3 个 `?` 的小 INSERT） | 90 | 3 | 1,599 | 1.00 | 90 |
+| `typical_select`（分页查询，含 `IN (...)` 字面量） | 383 | 3 | 6,526 | 1.00 | 383 |
+| `long_join`（媒体源详情多表 JOIN） | 645 | 2 | 10,904 | 1.00 | 645 |
+| `wide_in_list`（128 个 `?` 的 `IN` 列表） | 981 | 128 | 11,124 | 1.00 | 981 |
+| `quotes_and_comments`（`''` 转义、`--`、`/* */`、`"标识符"`、`'?'`） | 538 | 5 | 8,874 | 1.00 | 538 |
+
+结论（原实现）：**每条 SQL 恒定 1 次分配，字节数等于 SQL 长度**（`String::with_capacity` 预留容量足够，
+没有 realloc）；耗时随 SQL 长度增长，与 `?` 个数关系不大——瓶颈是逐字符 `match` + `push`，
+每次 `?` 再叠一次 `format_args!` 格式化。debug 数字只用于确认分配形态，**不用于采用判断**；
+release 数字与缓存对比见下一节。
