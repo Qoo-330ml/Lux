@@ -181,7 +181,12 @@ impl Database {
                  title = EXCLUDED.title,
                  sort_title = EXCLUDED.sort_title,
                  original_title = EXCLUDED.original_title,
-                 aliases = EXCLUDED.aliases"
+                 aliases = EXCLUDED.aliases
+             WHERE (media_search.title, media_search.sort_title, media_search.original_title,
+                    media_search.aliases)
+                   IS DISTINCT FROM
+                   (EXCLUDED.title, EXCLUDED.sort_title, EXCLUDED.original_title,
+                    EXCLUDED.aliases)"
         );
         let drop_missing = format!(
             "DELETE FROM media_search
