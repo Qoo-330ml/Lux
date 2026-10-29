@@ -1,5 +1,5 @@
 import "./player.css";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQuery } from "@tanstack/react-query";
 import {
   useCallback,
   useEffect,
@@ -13,10 +13,7 @@ import {
 import { useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError, api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
-import type {
-  PlaybackEventState,
-  WebPlaybackTrackSelection,
-} from "../../lib/api/types";
+import type { WebPlaybackTrackSelection } from "../../lib/api/types";
 import { imageUrl, mediaTitle } from "../home/media";
 import {
   NativeVideoEngine,
@@ -70,6 +67,7 @@ import {
 } from "./components/player-diagnostics";
 import { usePlayerPlatform } from "./components/player-platform";
 import { webPlaybackCapabilities } from "./playback-capabilities";
+import { usePlaybackReporting } from "./usePlaybackReporting";
 import {
   TICKS_PER_SECOND,
   episodeNavigationFor,
@@ -87,7 +85,6 @@ import {
   type PlayerRuntimeCaptionTrack,
 } from "./components/player-captions";
 
-const PROGRESS_REPORT_INTERVAL_MS = 10_000;
 const TIMELINE_UI_UPDATE_INTERVAL_MS = 100;
 const AUTO_HIDE_DELAY_MS = 3_000;
 const PLAYBACK_SPEEDS = [0.5, 0.75, 1.0, 1.25, 1.5, 2.0];
@@ -110,7 +107,6 @@ export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
 
   const [playing, setPlaying] = useState(false);
   const [playbackAttempt, setPlaybackAttempt] = useState(0);
@@ -322,15 +318,12 @@ export function PlayerPage() {
   const lastVideoRef = useRef<HTMLVideoElement | null>(null);
   const engineRef = useRef<PlaybackEngine | null>(null);
   const runtimeRef = useRef<LuxPlayerRuntime | null>(null);
-  const lastProgressReportRef = useRef(0);
-  const hasStartedRef = useRef(false);
   const hasRestoredPositionRef = useRef(false);
   const splashTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const screenshotStatusTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const progressBarRef = useRef<HTMLDivElement>(null);
   const isDraggingScrubberRef = useRef(false);
   const scrubberPointerIdRef = useRef<number | null>(null);
-  const playbackSequenceRef = useRef(0);
   const fallbackRequestedRef = useRef(false);
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
@@ -338,6 +331,18 @@ export function PlayerPage() {
   const remoteCaptionReaderRef = useRef<RemoteMkvCaptionReader | null>(null);
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
+  const {
+    reportPlayback,
+    stopActiveSession,
+    markStarted,
+    resetReportingClock,
+    resetSequence,
+  } = usePlaybackReporting({
+    sessionIdRef: playbackSessionIdRef,
+    videoRef,
+    lastVideoRef,
+    sessionId: playbackSession?.sessionId ?? null,
+  });
 
   useEffect(() => {
     if (!showInfo) {
@@ -377,73 +382,6 @@ export function PlayerPage() {
     engineRef.current = new NativeVideoEngine(video);
   }, []);
 
-  const reportPlayback = useCallback(
-    (
-      state: PlaybackEventState,
-      force = false,
-      keepalive = false,
-      videoOverride?: HTMLVideoElement | null,
-      sessionIdOverride?: string | null,
-    ) => {
-      const video = videoOverride ?? videoRef.current;
-      if (!video || (state === "STOPPED" && !hasStartedRef.current)) return undefined;
-      const now = Date.now();
-      if (!force && now - lastProgressReportRef.current < PROGRESS_REPORT_INTERVAL_MS) return undefined;
-      const positionTicks = Math.max(
-        0,
-        Math.round(
-          (Number.isFinite(video.currentTime) ? video.currentTime : 0) * TICKS_PER_SECOND,
-        ),
-      );
-      const durationTicks =
-        Number.isFinite(video.duration) && video.duration >= 0
-          ? Math.round(video.duration * TICKS_PER_SECOND)
-          : null;
-      lastProgressReportRef.current = now;
-      const sessionId = sessionIdOverride ?? playbackSessionIdRef.current;
-      if (!sessionId) return undefined;
-      const sequence = ++playbackSequenceRef.current;
-      const request = api.webPlaybackEvent(
-        sessionId,
-        {
-          eventId: `web-${sessionId}-${sequence}-${now}`,
-          sequence,
-          state,
-          positionTicks,
-          durationTicks,
-        },
-        keepalive,
-      );
-      if (state === "STOPPED") {
-        return request
-          .then(() => {
-            queryClient.removeQueries({
-              predicate: (query) => query.queryKey[0] === "web-playback-session"
-                && (query.state.data as { sessionId?: string } | undefined)?.sessionId === sessionId,
-            });
-            void queryClient.invalidateQueries({ queryKey: queryKeys.home });
-          })
-          .catch(() => undefined);
-      } else {
-        void request.catch(() => undefined);
-        return request;
-      }
-    },
-    [queryClient],
-  );
-
-  const stopActiveSession = useCallback((sessionId: string | null, keepalive = false) => {
-    if (!sessionId) return Promise.resolve();
-    return api.stopWebPlaybackSession(sessionId, keepalive)
-      .then(() => {
-        queryClient.removeQueries({
-          predicate: (query) => query.queryKey[0] === "web-playback-session"
-            && (query.state.data as { sessionId?: string } | undefined)?.sessionId === sessionId,
-        });
-      })
-      .catch(() => undefined);
-  }, [queryClient]);
-
   const requestServerFallback = useCallback(async (reason?: unknown) => {
     if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
       if (candidate && candidate.kind === rememberedCandidate()) clearRememberedCandidate();
@@ -473,17 +411,16 @@ export function PlayerPage() {
     if (fallbackGeneration !== fallbackGenerationRef.current) return;
     if (playbackSessionIdRef.current === sessionId) {
       playbackSessionIdRef.current = null;
-      playbackSequenceRef.current = 0;
+      resetSequence();
     }
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
-  }, [candidate, hasNextCandidate, playbackAttempt, playbackPlan?.type, remoteHttpSource, stopActiveSession, streamUrl]);
+  }, [candidate, hasNextCandidate, playbackAttempt, playbackPlan?.type, remoteHttpSource, resetSequence, stopActiveSession, streamUrl]);
 
   useEffect(() => {
     fallbackGenerationRef.current += 1;
-    lastProgressReportRef.current = 0;
-    hasStartedRef.current = false;
+    resetReportingClock();
     hasRestoredPositionRef.current = false;
     fallbackRequestedRef.current = false;
     setPlaybackAttempt(0);
@@ -534,7 +471,7 @@ export function PlayerPage() {
     if (sessionGateKey === playbackKey) return;
     const previousSessionId = playbackSessionIdRef.current;
     playbackSessionIdRef.current = null;
-    playbackSequenceRef.current = 0;
+    resetSequence();
     let active = true;
     sessionTransitionRef.current = sessionTransitionRef.current
       .catch(() => undefined)
@@ -545,38 +482,14 @@ export function PlayerPage() {
     return () => {
       active = false;
     };
-  }, [playbackKey, sessionGateKey, stopActiveSession]);
+  }, [playbackKey, resetSequence, sessionGateKey, stopActiveSession]);
 
   useEffect(() => {
     if (sessionGateKey !== playbackKey) return;
     if (playbackSession?.sessionId) sessionStartedRef.current = true;
     playbackSessionIdRef.current = playbackSession?.sessionId ?? null;
-    playbackSequenceRef.current = 0;
-  }, [playbackKey, playbackSession?.sessionId, sessionGateKey]);
-
-  useEffect(() => {
-    const sessionId = playbackSession?.sessionId;
-    if (!sessionId) return;
-    const heartbeat = window.setInterval(() => {
-      void api.webPlaybackHeartbeat(sessionId).catch(() => undefined);
-    }, 60_000);
-    return () => window.clearInterval(heartbeat);
-  }, [playbackSession?.sessionId]);
-
-  useEffect(() => {
-    const handlePageHide = () => {
-      const sessionId = playbackSessionIdRef.current;
-      void reportPlayback("STOPPED", true, true, undefined, sessionId);
-      void stopActiveSession(sessionId, true);
-    };
-    window.addEventListener("pagehide", handlePageHide);
-    return () => {
-      window.removeEventListener("pagehide", handlePageHide);
-      const sessionId = playbackSessionIdRef.current;
-      void reportPlayback("STOPPED", true, false, lastVideoRef.current, sessionId);
-      void stopActiveSession(sessionId);
-    };
-  }, [reportPlayback, stopActiveSession]);
+    resetSequence();
+  }, [playbackKey, playbackSession?.sessionId, resetSequence, sessionGateKey]);
 
   const restorePlaybackPosition = useCallback(() => {
     if (hasRestoredPositionRef.current) return;
@@ -664,7 +577,7 @@ export function PlayerPage() {
           void restoreEngineHandoff();
           break;
         case "PLAYING":
-          hasStartedRef.current = true;
+          markStarted();
           setPlaying(true);
           setControlsVisible(true);
           setControlActivity((activity) => activity + 1);
