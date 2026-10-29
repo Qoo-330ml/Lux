@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     io::{self, Write},
     sync::{
@@ -10,7 +8,7 @@ use std::{
 };
 
 use axum::{Json, Router, extract::State as AxumState, routing::any};
-use common::{TestScraper, TestScraperConfig};
+use crate::common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{

@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     sync::{
         Arc, Mutex,
@@ -16,7 +14,7 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{any, get},
 };
-use common::{TestScraper, TestScraperConfig};
+use crate::common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
