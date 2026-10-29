@@ -18594,7 +18594,48 @@ token 与 Web 播放会话绑定：有效期不超过会话 `expires_at`，会�
 只读，允许范围限定为 `Videos/{id}/stream|original`、`Items/{id}`、`Users/{id}/Items/{id}` 与 `Auth/Keys`，其他 Emby
 接口一律拒绝；不得写入日志与错误信息。需要迁移（SQLite 与 PostgreSQL，`scripts/check-migration-parity.py` 通过）。
 
-验收与验证在任务开始时按当前实现补全；开始前须先核对 `src/auth/emby.rs`、`src/storage` 的 access token 表与本条范围。
+范围细分（按当前实现核对后的结论）：
+
+- 存储与签发：`access_tokens` 增加 `scope`（`FULL`/`PLAYBACK`）与 `playback_session_id`，签发入口为
+  `EmbyAuthService::issue_playback_token`，有效期取 `min(会话 expires_at, now + 12h)`；签发沿用现有 IP 与
+  设备黑名单检查。旧行脚本回填为 `FULL`，因此既有的登录会话、设备登录校验、清理任务行为不变。
+- 令牌形状：前缀 `luxpb_`，路由无需查库即可识别并施加白名单；默认解析器（Lux API、Web 播放、管理端）
+  一律拒绝这类令牌，只有 Emby 路由的解析器接受它。
+- 路由白名单：`/emby` 与根路径的 Emby 路由挂同一条中间件，仅允许 `Videos/{id}/stream|original`（含带扩展名
+  与 `MediaSourceId` 段的变体）、`Items/{id}`、`Users/{id}/Items/{id}`、`Auth/Keys`；其余 Emby 路由对这类
+  令牌返回 401，且不匹配任何路由时也返回 401 而不是 404/405。
+- 作废：会话 `stop`/`fail` 时按 `playback_session_id` 撤销；过期行由既有清理任务删除；用户被禁用、IP 或设备
+  黑名单命中时解析失败（与普通令牌同一判定路径）。
+
+验收：
+
+- [x] 播放令牌可通过 Emby 路由解析器认证，且一律不被默认解析器、登录会话列表与设备登录校验接受。
+- [x] 播放令牌的 `api_key` 只能访问白名单入口；`/emby/Users`、`/emby/System/Info`、`/emby/Sessions`、
+      未注册的 Emby 路径对播放令牌返回 401，普通令牌行为不变。
+- [x] 过期或已撤销的播放令牌在 Emby 路由返回 401；撤销一个播放会话不影响其它会话的令牌。
+- [x] 会话 `stop` 后对应播放令牌立即失效；到期/失活会话被回收时同样撤销。
+- [x] 令牌使用不刷新过期时间，且不得出现在日志或错误响应中。
+- [x] 新增迁移在 SQLite 与 PostgreSQL 两侧配对，`scripts/check-migration-parity.py` 通过；空数据库迁移链可跑。
+
+验证：`cargo test --locked --test playback_token`、`cargo test --locked --test emby_auth`、
+`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+`python3 scripts/check-migration-parity.py`、`python3 scripts/check-backend-branches.py`。
+
+进度（2026-10-29，完成）：
+
+- 存储与签发（`71c8aa82`）：迁移 `0241`/`0243` 增加 `scope` 与 `playback_session_id`，旧行回填 `FULL`；
+  `issue_playback_token` / `revoke_playback_tokens`；`tests/playback_token.rs`（4 项）。
+- 路由白名单（`3615f409`）：Emby 路由中间件与最外层 `reject_playback_token_outside_allow_list` 双重拦截
+  （未注册路径与 Lux API 请求都到不了 Emby 路由中间件，所以需要外层）；新增 `Auth/Keys`；
+  `emby_credentials` 单测 2 项、`tests/emby_auth.rs` 2 项（限权与普通令牌对照）。
+- 会话作废（`84bbe4aa`）：`stop_with_outcome` 与到期/失活回收都撤销令牌；lib 测试
+  `stopping_a_session_revokes_its_playback_tokens`（已用回退实验确认该用例能捕获回归）。
+- 结果：`tests/emby_auth.rs` 15/15、`tests/playback_token.rs` 5/5、`tests/emby_system.rs` 2/2、
+  `--lib playback` 149/149、`cargo fmt` 与 `--lib` Clippy `-D warnings` 通过、两个校验脚本通过。
+- 未做：`cargo test --locked --all-targets` 全量门禁留到任务收尾；`Auth/Keys` 是新增 Emby 端点，
+  仅服务于 302 软件的凭据校验，返回空列表；本机 ARM（`uname -m` = `arm64`），未在 x86 上验证。
+- 注意：工作区里另有一组未提交的 `container_gateway` 改动，会让 `cargo build`（bin）失败；本轮只编译
+  lib 与测试目标，未触碰该改动。
 
 依赖：LUX-870。
 
