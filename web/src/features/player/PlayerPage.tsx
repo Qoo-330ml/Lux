@@ -21,8 +21,6 @@ import {
   type PlaybackEngine,
   type PlaybackPerformance,
 } from "./playback-engine";
-import { normalizeCaptionOffset } from "./caption-offset";
-import type { LuxCaptionCue } from "./caption-parser";
 import {
   DIRECT_CANDIDATE_TIMEOUT_MS,
   clearRememberedCandidate,
@@ -32,7 +30,6 @@ import {
   rememberedCandidate,
 } from "./direct-candidates";
 import { canUseRemoteMkvCaptionSidecar, isRemoteHttpStrmSource, shouldUseClientHevc, shouldUseClientMkv } from "./playback-selection";
-import { RemoteMkvCaptionReader } from "./remote-mkv-caption-reader";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { PlayerControls } from "./components/player-controls";
@@ -68,6 +65,8 @@ import {
 import { usePlayerPlatform } from "./components/player-platform";
 import { webPlaybackCapabilities } from "./playback-capabilities";
 import { usePlaybackReporting } from "./usePlaybackReporting";
+import { useCaptionSelection } from "./useCaptionSelection";
+import { useRuntimeCaptionReader } from "./useRuntimeCaptionReader";
 import {
   TICKS_PER_SECOND,
   episodeNavigationFor,
@@ -77,13 +76,6 @@ import {
   timelinePosition,
   useClientEngine,
 } from "./player-page-helpers";
-import {
-  defaultCaptionSelection,
-  nativeCaptionTrack,
-  overlayCaptionSource,
-  playerCaptionOptions,
-  type PlayerRuntimeCaptionTrack,
-} from "./components/player-captions";
 
 const TIMELINE_UI_UPDATE_INTERVAL_MS = 100;
 const AUTO_HIDE_DELAY_MS = 3_000;
@@ -140,12 +132,6 @@ export function PlayerPage() {
   const [hoverPercent, setHoverPercent] = useState<number | null>(null);
   const [danmuVisible, setDanmuVisible] = useState(true);
   const [screenshotStatus, setScreenshotStatus] = useState<string | null>(null);
-  const [selectedCaptionId, setSelectedCaptionId] = useState<string | null>(null);
-  const [captionSourceId, setCaptionSourceId] = useState<string | null>(null);
-  const [captionStatus, setCaptionStatus] = useState<string | null>(null);
-  const [captionOffset, setCaptionOffset] = useState(0);
-  const [runtimeCaptionCues, setRuntimeCaptionCues] = useState<LuxCaptionCue[]>([]);
-  const [nativeCaptionTracks, setNativeCaptionTracks] = useState<PlayerRuntimeCaptionTrack[]>([]);
   const [airPlayVideo, setAirPlayVideo] = useState<HTMLVideoElement | null>(null);
   const currentTimeRef = useRef(0);
   const durationRef = useRef(0);
@@ -216,21 +202,36 @@ export function PlayerPage() {
     media?.mediaSources?.find((entry) => entry.isDefault) ??
     media?.mediaSources?.[0];
   const nativeCaptionTracksSupported = typeof HTMLTrackElement !== "undefined";
-  const captionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, nativeCaptionTracks);
-  const selectedCaptionOption = captionSourceId === source?.id
-    ? captionOptions.find((caption) => (
-      (caption.id === selectedCaptionId || String(caption.streamIndex) === selectedCaptionId)
-      && caption.available
-    )) ?? null
-    : null;
-  const captionTrack = nativeCaptionTrack(itemId, source?.id ?? "", selectedCaptionOption);
-  const captionOverlaySource = overlayCaptionSource(itemId, source?.id ?? "", selectedCaptionOption);
-  const runtimeCaptionOverlayCues = selectedCaptionOption?.renderMode === "runtime-overlay"
-    ? runtimeCaptionCues.filter((cue) => cue.id.startsWith(`${selectedCaptionOption.id}:`))
-    : [];
-  const nativeCaptionTrackId = selectedCaptionOption?.renderMode === "native-inband"
-    ? selectedCaptionOption.runtimeTrackId ?? null
-    : null;
+  // The controls auto-hide timer is owned by the effect below; this callback only
+  // requests "show again", so it can be created before the caption selection hook.
+  const resetControlsTimeout = useCallback(() => {
+    setControlsVisible(true);
+    setControlActivity((activity) => activity + 1);
+  }, []);
+  const {
+    captionOptions,
+    selectedCaptionOption,
+    selectedCaptionId,
+    captionSourceId,
+    captionStatus,
+    captionOffset,
+    runtimeCaptionOverlayCues,
+    captionTrack,
+    captionOverlaySource,
+    nativeCaptionTrackId,
+    selectCaption,
+    handleRuntimeCaptionCue,
+    changeCaptionOffset,
+    clearRuntimeCaptionCues,
+    setCaptionStatus,
+    setNativeCaptionTracks,
+  } = useCaptionSelection({
+    itemId,
+    source,
+    nativeCaptionTracksSupported,
+    requestedSubtitleStreamIndex,
+    resetControlsTimeout,
+  });
   useEffect(() => {
     const controller = engineRef.current?.captionController;
     if (!controller) return;
@@ -327,8 +328,6 @@ export function PlayerPage() {
   const fallbackRequestedRef = useRef(false);
   const sessionTransitionRef = useRef(Promise.resolve());
   const fallbackGenerationRef = useRef(0);
-  const captionSelectionTouchedRef = useRef(false);
-  const remoteCaptionReaderRef = useRef<RemoteMkvCaptionReader | null>(null);
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
   const airPlay = usePlayerAirPlay(airPlayVideo, playbackKey);
   const {
@@ -437,35 +436,6 @@ export function PlayerPage() {
     setDuration(0);
     setBufferedEnd(0);
   }, [itemId, requestedAudioStreamIndex, requestedSourceId]);
-
-  useEffect(() => {
-    captionSelectionTouchedRef.current = false;
-    setNativeCaptionTracks([]);
-    const initialCaptionOptions = playerCaptionOptions(source, nativeCaptionTracksSupported, []);
-    const initialCaption = (requestedSubtitleStreamIndex
-      ? initialCaptionOptions.find((caption) => (
-        String(caption.streamIndex) === requestedSubtitleStreamIndex && caption.available
-      ))
-      : undefined) ?? defaultCaptionSelection(initialCaptionOptions);
-    setCaptionSourceId(source?.id ?? null);
-    setSelectedCaptionId(initialCaption?.id ?? null);
-    setCaptionStatus(null);
-    setRuntimeCaptionCues([]);
-  }, [nativeCaptionTracksSupported, requestedSubtitleStreamIndex, source?.id]);
-
-  const defaultCaptionId = defaultCaptionSelection(captionOptions)?.id ?? null;
-  useEffect(() => {
-    if (
-      captionSelectionTouchedRef.current
-      || !source?.id
-      || captionSourceId !== source.id
-    ) {
-      return;
-    }
-    setSelectedCaptionId((previous) => (
-      previous === defaultCaptionId ? previous : defaultCaptionId
-    ));
-  }, [captionSourceId, defaultCaptionId, source?.id]);
 
   useEffect(() => {
     if (sessionGateKey === playbackKey) return;
@@ -778,13 +748,6 @@ export function PlayerPage() {
     };
   }, []);
 
-  // Show or reset the controls. The effect below owns the actual timer so
-  // concurrent mouse, touch, and keyboard events cannot leave stale timers.
-  const resetControlsTimeout = useCallback(() => {
-    setControlsVisible(true);
-    setControlActivity((activity) => activity + 1);
-  }, []);
-
   useEffect(() => {
     if (!playing || !controlsVisible || showSettings || isPointerInteracting) return;
     const timeout = window.setTimeout(() => setControlsVisible(false), AUTO_HIDE_DELAY_MS);
@@ -907,111 +870,19 @@ export function PlayerPage() {
     setPlaybackRate(rate);
   }, []);
 
-  const selectCaption = useCallback((id: string | null) => {
-    captionSelectionTouchedRef.current = true;
-    if (id === null) {
-      setCaptionSourceId(source?.id ?? null);
-      setSelectedCaptionId(null);
-      setCaptionStatus(null);
-      resetControlsTimeout();
-      return;
-    }
-    const option = captionOptions.find((caption) => caption.id === id);
-    if (!option?.available) return;
-    setCaptionSourceId(source?.id ?? null);
-    setSelectedCaptionId(option.id);
-    setCaptionStatus(option.renderMode === "native-inband" ? null : "字幕加载中…");
-    resetControlsTimeout();
-  }, [captionOptions, remoteHttpSource, resetControlsTimeout, source]);
-
-  const handleRuntimeCaptionCue = useCallback((cue: {
-    trackId: string;
-    startMs: number;
-    endMs: number;
-    text: string;
-    layer?: number;
-    alignment?: number;
-    position?: { x: number; y: number };
-    style?: { color?: string; bold?: boolean; italic?: boolean; marginL?: number; marginR?: number; marginV?: number };
-    runs?: readonly { text: string; color?: string; bold?: boolean; italic?: boolean }[];
-  }) => {
-    setCaptionStatus(null);
-    const next: LuxCaptionCue = {
-      id: `${cue.trackId}:${cue.startMs}:${cue.endMs}:${cue.layer ?? 0}:${cue.text.slice(0, 16)}`,
-      start: cue.startMs / 1000,
-      end: cue.endMs / 1000,
-      text: cue.text,
-      layer: cue.layer,
-      alignment: cue.alignment,
-      position: cue.position,
-      style: cue.style,
-      runs: cue.runs,
-    };
-    setRuntimeCaptionCues((previous) => previous.some((entry) => entry.id === next.id) ? previous : [...previous, next]);
-  }, []);
-
-  useEffect(() => {
-    setRuntimeCaptionCues([]);
-    if (
-      !remoteCaptionSidecarRequested
-      || !clientMkvSourceUrl
-      || !selectedCaptionOption
-      || selectedCaptionOption.renderMode !== "runtime-overlay"
-    ) {
-      remoteCaptionReaderRef.current?.destroy();
-      remoteCaptionReaderRef.current = null;
-      return;
-    }
-    let active = true;
-    const reader = new RemoteMkvCaptionReader({
-      source: clientMkvSourceUrl,
-      selection: {
-        id: selectedCaptionOption.id,
-        name: selectedCaptionOption.name,
-        language: selectedCaptionOption.language,
-        format: selectedCaptionOption.format,
-        ordinal: selectedCaptionOption.embeddedOrdinal,
-      },
-      currentTime: () => videoRef.current?.currentTime ?? currentTimeRef.current,
-      onReady: () => {
-        if (active) setCaptionStatus(null);
-      },
-      onCue: (cue) => {
-        if (!active) return;
-        handleRuntimeCaptionCue({
-          trackId: selectedCaptionOption.id,
-          startMs: cue.start * 1000,
-          endMs: cue.end * 1000,
-          text: cue.text,
-          layer: cue.layer,
-          alignment: cue.alignment,
-          position: cue.position,
-          style: cue.style,
-          runs: cue.runs,
-        });
-      },
-      onError: () => {
-        if (active) setCaptionStatus("远程字幕不可用：上游不支持 CORS/Range 或媒体索引不可用");
-      },
-    });
-    remoteCaptionReaderRef.current = reader;
-    void reader.start();
-    return () => {
-      active = false;
-      reader.destroy();
-      if (remoteCaptionReaderRef.current === reader) remoteCaptionReaderRef.current = null;
-      setRuntimeCaptionCues([]);
-    };
-  }, [clientEngineActive, clientMkvSourceUrl, handleRuntimeCaptionCue, playbackKey, remoteCaptionSidecarRequested, selectedCaptionOption?.embeddedOrdinal, selectedCaptionOption?.format, selectedCaptionOption?.id, selectedCaptionOption?.language, selectedCaptionOption?.name, selectedCaptionOption?.renderMode]);
-
-  useEffect(() => {
-    remoteCaptionReaderRef.current?.setTime(currentTime);
-  }, [currentTime]);
-
-  const changeCaptionOffset = useCallback((offset: number) => {
-    setCaptionOffset(normalizeCaptionOffset(offset));
-    resetControlsTimeout();
-  }, [resetControlsTimeout]);
+  useRuntimeCaptionReader({
+    clientEngineActive,
+    clientMkvSourceUrl,
+    remoteCaptionSidecarRequested,
+    playbackKey,
+    currentTime,
+    selectedCaptionOption,
+    videoRef,
+    currentTimeRef,
+    onCue: handleRuntimeCaptionCue,
+    onStatusChange: setCaptionStatus,
+    clearCues: clearRuntimeCaptionCues,
+  });
 
   const showScreenshotStatus = useCallback((message: string) => {
     setScreenshotStatus(message);
