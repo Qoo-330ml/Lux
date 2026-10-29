@@ -25,20 +25,14 @@ impl Database {
             .bind(batch.job_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let manifest_state: Option<String> = self
             .query_scalar("SELECT state FROM scan_manifests WHERE id = ? AND job_id = ?")
             .bind(batch.manifest_id)
             .bind(batch.job_id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_job != 1 || manifest_state.as_deref() != Some("APPLYING") {
             return Err(StorageError::Conflict(
                 "manifest batch requires an active applying scan".to_owned(),
@@ -53,10 +47,7 @@ impl Database {
             .bind(batch.library_root_id)
             .fetch_optional(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let movie_files = batch
             .movie_files

@@ -40,10 +40,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_manifest_complete_roots(
@@ -69,10 +66,7 @@ impl Database {
                 .map(|row| row.get("library_root_id"))
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_manifest_complete_directories_for_root(
@@ -109,10 +103,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn scan_manifest_has_uncovered_files(
@@ -183,10 +174,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_manifest_removal_candidates_for_root(
@@ -362,10 +350,7 @@ impl Database {
                     })
                     .collect()
             })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_manifest_diff_candidates(
@@ -435,10 +420,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_manifest_filesystem_baselines(
@@ -488,14 +470,10 @@ impl Database {
             for _ in 0..padding_count {
                 statement = statement.bind(None::<String>);
             }
-            for row in
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 let baseline = StoredScanManifestFilesystemBaseline {
                     id: row.get("id"),
@@ -539,10 +517,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.is_some())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_scan_manifest_diff(
@@ -559,10 +534,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let has_remaining_changes = self
             .has_manifest_diff_remaining_changes(
                 &mut transaction,
@@ -588,10 +560,7 @@ impl Database {
             .bind(manifest_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if manifest_update.rows_affected() != 1 {
             return Ok(false);
         }
@@ -605,19 +574,13 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let processed_count = if matches!(workflow_version, 2 | 3) {
             self.query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
                 .bind(job_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
         } else {
             unchanged_count
         };
@@ -632,22 +595,13 @@ impl Database {
             .bind(job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if job_update.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "scan job stopped before manifest diff completion".to_owned(),
             ));
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -701,10 +655,7 @@ impl Database {
                 .bind(manifest_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if locked.as_deref() != Some("READY_TO_DIFF") {
                 return Err(StorageError::Conflict(
                     "manifest is not ready to accept difference rows".to_owned(),
@@ -733,18 +684,9 @@ impl Database {
                 .bind(manifest_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             inserted_count = inserted_count
                 .checked_add(batch_inserted_count)
                 .ok_or_else(|| {
