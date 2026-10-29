@@ -30,6 +30,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminLibraryDeletionJob, AdminLibraryDeletionJobsPage, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaImageVariantCacheSettings, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
 import { orderLibraries } from "../account/account-settings";
 import { DirectoryPicker } from "./DirectoryPicker";
+import { LuxButton, LuxRadio, LuxSelectField, LuxSwitch, LuxTextField } from "../../components/ui";
 
 const libraryKindOptions: Array<{ value: LibraryKind; label: string }> = [
   { value: "MOVIE", label: "电影" },
@@ -233,16 +234,16 @@ export function AdminLibrariesPage() {
         <div className="lux-library-dialog lux-library-create-dialog" role="dialog" aria-modal="true" aria-labelledby="new-library-title">
           <div className="lux-library-dialog-header"><div><h2 id="new-library-title">新增媒体库</h2></div><button className="lux-library-dialog-close" type="button" aria-label="关闭新增媒体库弹窗" onClick={() => setCreateOpen(false)}><X size={20} /></button></div>
           <form className="lux-admin-form lux-library-dialog-form" onSubmit={submit}>
-            <label htmlFor="new-library-name">名称<input id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
+            <label htmlFor="new-library-name">名称<LuxTextField id="new-library-name" value={name} onChange={(event) => setName(event.target.value)} placeholder="例如：电影" /></label>
             <label htmlFor="new-library-kind">类型<LuxSelect id="new-library-kind" value={kind} options={libraryKindOptions} onChange={(value) => setKind(value as LibraryKind)} aria-label="媒体库类型" /></label>
             {kind === "HOMEVIDEOS" ? null : <ScraperListEditor value={scrapers} plugins={pluginItems} onChange={setScrapers} />}
             <ChapterSourceSelect id="new-library-chapter-source" kind={kind} value={chapterSourceId} sources={chapterSourceItems} onChange={setChapterSourceId} />
-            <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库启用实时文件监控" checked={createRealtimeWatchEnabled} onChange={(event) => setCreateRealtimeWatchEnabled(event.target.checked)} /><span>启用实时文件监控</span></label>
-            {kind === "HOMEVIDEOS" ? null : <label className="lux-admin-toggle"><input type="checkbox" aria-label="新媒体库新增/变化资源自动刮削" checked={createRealtimeMetadataAutoMatch} onChange={(event) => setCreateRealtimeMetadataAutoMatch(event.target.checked)} /><span>新增/变化资源自动刮削</span></label>}
+            <LuxSwitch className="lux-admin-toggle" aria-label="新媒体库启用实时文件监控" checked={createRealtimeWatchEnabled} onChange={(event) => setCreateRealtimeWatchEnabled(event.target.checked)} label="启用实时文件监控" />
+            {kind === "HOMEVIDEOS" ? null : <LuxSwitch className="lux-admin-toggle" aria-label="新媒体库新增/变化资源自动刮削" checked={createRealtimeMetadataAutoMatch} onChange={(event) => setCreateRealtimeMetadataAutoMatch(event.target.checked)} label="新增/变化资源自动刮削" />}
             <section className="lux-library-dialog-section lux-library-create-root-section">
               <div className="lux-library-dialog-section-heading"><div><h3>文件夹</h3><span>创建后自动开始扫描</span></div><Folder size={18} aria-hidden="true" /></div>
               {createRootPaths.length > 0 ? <div className="lux-library-dialog-root-list">{createRootPaths.map((path) => <div className="lux-library-dialog-root-row" key={path}><span title={path}>{path}</span><button className="lux-library-dialog-icon" type="button" aria-label={`移除新媒体库路径 ${path}`} onClick={() => removeCreateRootPath(path)} disabled={create.isPending}><MinusCircle size={18} /></button></div>)}</div> : null}
-              <div className="lux-library-root-form"><input id="new-library-root-path" value={createRootPath} onChange={(event) => { setCreateRootPath(event.target.value); setFormError(""); }} placeholder="输入 Docker 内的媒体路径" aria-label="新媒体库根路径" /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setCreateDirectoryPickerOpen(true)} disabled={create.isPending}><Folder size={17} /></button></div>
+              <div className="lux-library-root-form"><LuxTextField id="new-library-root-path" value={createRootPath} onChange={(event) => { setCreateRootPath(event.target.value); setFormError(""); }} placeholder="输入 Docker 内的媒体路径" aria-label="新媒体库根路径" /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setCreateDirectoryPickerOpen(true)} disabled={create.isPending}><Folder size={17} /></button></div>
               <p className="lux-library-create-root-help">可选。选择或输入路径，创建时会一起保存；可通过文件夹按钮继续添加多个文件夹。</p>
               {createDirectoryPickerOpen ? <DirectoryPicker initialPath={createRootPath.trim()} isSubmitting={create.isPending} onClose={() => setCreateDirectoryPickerOpen(false)} onSelect={addCreateRootPath} /> : null}
             </section>
@@ -339,8 +340,8 @@ function GlobalStrategyPanel({
             onChange={(thumbnailScrapingMode) => updateImages("thumbnailScrapingMode", thumbnailScrapingMode)}
           />
           <div className="lux-library-strategy-form-grid lux-library-strategy-image-limits">
-            <label>每项最大背景图数量<select aria-label="每项最大背景图数量" value={String(strategy.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(strategy.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>0 张表示不下载背景图</small></label>
-            <label>最小下载宽度<select aria-label="最小下载宽度" value={String(strategy.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(strategy.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select><small>“不限”表示不限制</small></label>
+            <label>每项最大背景图数量<LuxSelectField aria-label="每项最大背景图数量" value={String(strategy.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(strategy.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField><small>0 张表示不下载背景图</small></label>
+            <label>最小下载宽度<LuxSelectField aria-label="最小下载宽度" value={String(strategy.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(strategy.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField><small>“不限”表示不限制</small></label>
           </div>
           <div className="lux-setting-divider" />
           <div className="lux-library-strategy-image-variants">
@@ -351,9 +352,9 @@ function GlobalStrategyPanel({
               onChange={(enabled) => updateVariantCache({ enabled })}
             />
             <div className="lux-library-strategy-form-grid lux-library-strategy-variant-limits">
-              <label>缓存文件上限<input type="number" min="100" max="1000000" step="100" value={variantCache.maxFiles} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ maxFiles: Math.min(1000000, Math.max(100, Number(event.target.value) || 100)) })} /><small>100 – 1,000,000 个文件</small></label>
-              <label>缓存容量上限 (MB)<input type="number" min="64" max="65536" step="64" value={Math.round(variantCache.maxBytes / (1024 * 1024))} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ maxBytes: Math.min(64 * 1024 * 1024 * 1024, Math.max(64, Number(event.target.value) || 64)) * 1024 * 1024 })} /><small>64 MB – 64 GB</small></label>
-              <label>生成并发<input type="number" min="1" max="4" value={variantCache.concurrency} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ concurrency: Math.min(4, Math.max(1, Number(event.target.value) || 1)) })} /><small>1 – 4，默认 2</small></label>
+              <label>缓存文件上限<LuxTextField type="number" min="100" max="1000000" step="100" value={variantCache.maxFiles} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ maxFiles: Math.min(1000000, Math.max(100, Number(event.target.value) || 100)) })} /><small>100 – 1,000,000 个文件</small></label>
+              <label>缓存容量上限 (MB)<LuxTextField type="number" min="64" max="65536" step="64" value={Math.round(variantCache.maxBytes / (1024 * 1024))} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ maxBytes: Math.min(64 * 1024 * 1024 * 1024, Math.max(64, Number(event.target.value) || 64)) * 1024 * 1024 })} /><small>64 MB – 64 GB</small></label>
+              <label>生成并发<LuxTextField type="number" min="1" max="4" value={variantCache.concurrency} disabled={!variantCache.enabled} onChange={(event) => updateVariantCache({ concurrency: Math.min(4, Math.max(1, Number(event.target.value) || 1)) })} /><small>1 – 4，默认 2</small></label>
             </div>
           </div>
         </section>
@@ -375,7 +376,7 @@ function GlobalStrategyPanel({
             <StrategyToggle label="仅下载强制字幕" checked={strategy.subtitles.forcedOnly} onChange={(checked) => updateSubtitles("forcedOnly", checked)} />
             <StrategyToggle label="包含听障字幕" checked={strategy.subtitles.hearingImpaired} onChange={(checked) => updateSubtitles("hearingImpaired", checked)} />
           </div>
-          <label className="lux-library-strategy-language-input">默认语言<input value={strategy.subtitles.languages.join(", ")} onChange={(event) => updateSubtitles("languages", event.target.value.split(",").map((value) => value.trim()).filter(Boolean).slice(0, 8))} placeholder="zh-CN, en" /><small>使用逗号分隔，最多 8 种语言。</small></label>
+          <label className="lux-library-strategy-language-input">默认语言<LuxTextField value={strategy.subtitles.languages.join(", ")} onChange={(event) => updateSubtitles("languages", event.target.value.split(",").map((value) => value.trim()).filter(Boolean).slice(0, 8))} placeholder="zh-CN, en" /><small>使用逗号分隔，最多 8 种语言。</small></label>
         </section>
 
         <section className="lux-library-strategy-card">
@@ -413,10 +414,7 @@ function ThumbnailScrapingModeControl({ value, onChange }: { value: string; onCh
   return <div className="lux-thumbnail-scraping-mode-field">
     <div><strong>缩略图刮削方式</strong><small>同时控制 POSTER 和 THUMB；本地手工图片不受影响。</small></div>
     <div className="lux-thumbnail-scraping-mode" role="radiogroup" aria-label="缩略图刮削方式">
-      {thumbnailScrapingModes.map(([mode, label, description]) => <label key={mode} className={selected === mode ? "is-selected" : ""} title={description}>
-        <input type="radio" name="thumbnail-scraping-mode" value={mode} checked={selected === mode} onChange={() => onChange(mode)} />
-        <span>{label}</span>
-      </label>)}
+      {thumbnailScrapingModes.map(([mode, label, description]) => <LuxRadio key={mode} className={selected === mode ? "is-selected" : ""} title={description} name="thumbnail-scraping-mode" value={mode} checked={selected === mode} onChange={() => onChange(mode)} label={label} />)}
     </div>
   </div>;
 }
@@ -596,21 +594,21 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy, on
           <div className="lux-library-dialog-header"><div><h2 id={`edit-library-title-${library.id}`}>{library.name}</h2></div><button ref={dialogCloseRef} className="lux-library-dialog-close" type="button" aria-label={`关闭 ${library.name} 编辑弹窗`} onClick={() => setEditOpen(false)}><X size={20} /></button></div>
           <div className="lux-library-dialog-scroll">
             <p className="lux-library-warning">如果更改了元数据或媒体图片下载的设置，只适用于之后添加到媒体库的新内容。要将更改应用于现有项目，您需要手动刷新其元数据。</p>
-            <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>文件夹</h3><button className="lux-library-toolbar-button" type="button" onClick={() => document.getElementById(`library-root-path-${library.id}`)?.focus()}><Plus size={16} /> 添加</button></div>{library.roots.length === 0 ? <p className="lux-admin-muted">尚未配置根路径。</p> : <div className="lux-library-dialog-root-list">{library.roots.map((root) => <div className="lux-library-dialog-root-row" key={root.id}><span title={root.displayPath}>{root.displayPath}</span><button className="lux-library-dialog-icon" type="button" aria-label={`编辑路径 ${root.displayPath}`} disabled><Pencil size={17} /></button><button className="lux-library-dialog-icon" type="button" aria-label={`删除路径 ${root.displayPath}`} onClick={() => removeRoot.mutate(root.id)} disabled={removeRoot.isPending}><MinusCircle size={18} /></button></div>)}</div>}<div className="lux-library-root-form"><input id={`library-root-path-${library.id}`} value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="输入 Docker 内的媒体路径" aria-label={`${library.name} 新根路径`} /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setDirectoryPickerOpen(true)}><Folder size={17} /></button></div>{directoryPickerOpen ? <DirectoryPicker initialPath={rootPath.trim()} isSubmitting={addRoot.isPending} onClose={() => setDirectoryPickerOpen(false)} onSelect={(path) => { setRootPath(path); setRootError(""); addRoot.mutate(path); }} /> : null}{rootError ? <p className="lux-error-copy">{rootError}</p> : null}</section>
+            <section className="lux-library-dialog-section"><div className="lux-library-dialog-section-heading"><h3>文件夹</h3><button className="lux-library-toolbar-button" type="button" onClick={() => document.getElementById(`library-root-path-${library.id}`)?.focus()}><Plus size={16} /> 添加</button></div>{library.roots.length === 0 ? <p className="lux-admin-muted">尚未配置根路径。</p> : <div className="lux-library-dialog-root-list">{library.roots.map((root) => <div className="lux-library-dialog-root-row" key={root.id}><span title={root.displayPath}>{root.displayPath}</span><button className="lux-library-dialog-icon" type="button" aria-label={`编辑路径 ${root.displayPath}`} disabled><Pencil size={17} /></button><button className="lux-library-dialog-icon" type="button" aria-label={`删除路径 ${root.displayPath}`} onClick={() => removeRoot.mutate(root.id)} disabled={removeRoot.isPending}><MinusCircle size={18} /></button></div>)}</div>}<div className="lux-library-root-form"><LuxTextField id={`library-root-path-${library.id}`} value={rootPath} onChange={(event) => setRootPath(event.target.value)} placeholder="输入 Docker 内的媒体路径" aria-label={`${library.name} 新根路径`} /><button className="lux-library-toolbar-button lux-library-root-browser-button" type="button" aria-label="浏览服务器目录" title="浏览服务器目录" onClick={() => setDirectoryPickerOpen(true)}><Folder size={17} /></button></div>{directoryPickerOpen ? <DirectoryPicker initialPath={rootPath.trim()} isSubmitting={addRoot.isPending} onClose={() => setDirectoryPickerOpen(false)} onSelect={(path) => { setRootPath(path); setRootError(""); addRoot.mutate(path); }} /> : null}{rootError ? <p className="lux-error-copy">{rootError}</p> : null}</section>
             <form className="lux-library-dialog-section lux-library-settings-form" onSubmit={saveDetails}>
               <h3>媒体库设置</h3>
               <label htmlFor={`library-name-${library.id}`}>
                 媒体库名称
-                <input id={`library-name-${library.id}`} aria-label={`${library.name} 媒体库名称`} value={editName} onChange={(event) => setEditName(event.target.value)} />
+                <LuxTextField id={`library-name-${library.id}`} aria-label={`${library.name} 媒体库名称`} value={editName} onChange={(event) => setEditName(event.target.value)} />
               </label>
               <label htmlFor={`library-kind-${library.id}`}>
                 媒体库类型
                 <LuxSelect id={`library-kind-${library.id}`} value={editKind} options={libraryKindOptions} onChange={(value) => setEditKind(value as LibraryKind)} aria-label={`${library.name} 媒体库类型`} />
               </label>
-              <label className="lux-admin-toggle"><input type="checkbox" checked={library.isEnabled} onChange={(event) => update.mutate({ values: { isEnabled: event.target.checked } })} /><span>启用媒体库</span></label>
-              <label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 启用实时文件监控`} checked={library.realtimeWatchEnabled} onChange={(event) => update.mutate({ values: { realtimeWatchEnabled: event.target.checked } })} /><span>启用实时文件监控</span></label>
+              <LuxSwitch className="lux-admin-toggle" checked={library.isEnabled} onChange={(event) => update.mutate({ values: { isEnabled: event.target.checked } })} label="启用媒体库" />
+              <LuxSwitch className="lux-admin-toggle" aria-label={`${library.name} 启用实时文件监控`} checked={library.realtimeWatchEnabled} onChange={(event) => update.mutate({ values: { realtimeWatchEnabled: event.target.checked } })} label="启用实时文件监控" />
               {editKind === "HOMEVIDEOS" ? null : <>
-                <label className="lux-admin-toggle"><input type="checkbox" aria-label={`${library.name} 新增/变化资源自动刮削`} checked={library.realtimeMetadataAutoMatchEnabled} onChange={(event) => update.mutate({ values: { realtimeMetadataAutoMatchEnabled: event.target.checked } })} /><span>新增/变化资源自动刮削</span></label>
+                <LuxSwitch className="lux-admin-toggle" aria-label={`${library.name} 新增/变化资源自动刮削`} checked={library.realtimeMetadataAutoMatchEnabled} onChange={(event) => update.mutate({ values: { realtimeMetadataAutoMatchEnabled: event.target.checked } })} label="新增/变化资源自动刮削" />
                 <ScraperListEditor value={scrapers} plugins={plugins} onChange={updateScrapers} />
               </>}
               <ChapterSourceSelect id={`library-chapter-source-${library.id}`} kind={editKind} value={chapterSourceId} sources={chapterSources} onChange={updateChapterSource} />
@@ -664,11 +662,11 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy, on
             <p className="lux-admin-muted">提交后会立即从可用媒体库中移除，并在后台分批清理数据库内容；原媒体文件会保留。</p>
             {removeError ? <p className="lux-error-copy" role="alert">{removeError}</p> : null}
             <div className="lux-library-delete-actions">
-              <button ref={deleteCancelRef} className="lux-button lux-button-secondary" data-action="delete-cancel" type="button" disabled={remove.isPending} onClick={closeDeleteDialog}>取消</button>
-              <button className="lux-button lux-button-danger" data-action="delete-confirm" type="button" disabled={remove.isPending} onClick={() => remove.mutate()}>
+              <LuxButton tone="secondary" ref={deleteCancelRef} data-action="delete-cancel" type="button" disabled={remove.isPending} onClick={closeDeleteDialog}>取消</LuxButton>
+              <LuxButton tone="danger" data-action="delete-confirm" type="button" disabled={remove.isPending} onClick={() => remove.mutate()}>
                 {remove.isPending ? <LoaderCircle className="lux-spin" size={16} /> : <Trash2 size={16} />}
                 {remove.isPending ? "删除中…" : "确认删除"}
-              </button>
+              </LuxButton>
             </div>
           </div>
         </section>
@@ -696,8 +694,8 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
   return <section className="lux-library-dialog-section lux-library-override-section">
     <div className="lux-library-dialog-section-heading"><div><h3>媒体库策略</h3><span>{mode === "custom" ? "此库使用自定义覆盖" : "此库继承全局策略"}</span></div><Settings2 size={18} aria-hidden="true" /></div>
     <div className="lux-library-override-modes" role="radiogroup" aria-label={`${library.name} 媒体库策略来源`}>
-      <label><input type="radio" name={`strategy-mode-${library.id}`} checked={mode === "inherit"} onChange={() => { setMode("inherit"); setSaved(false); }} /><span><strong>继承全局</strong><small>跟随全局策略的语言、图片和字幕默认值。</small></span></label>
-      <label><input type="radio" name={`strategy-mode-${library.id}`} checked={mode === "custom"} onChange={() => { setMode("custom"); setSaved(false); }} /><span><strong>自定义覆盖</strong><small>只对这个媒体库使用独立的内容策略。</small></span></label>
+      <LuxRadio name={`strategy-mode-${library.id}`} checked={mode === "inherit"} onChange={() => { setMode("inherit"); setSaved(false); }} label=<><strong>继承全局</strong><small>跟随全局策略的语言、图片和字幕默认值。</small></> />
+      <LuxRadio name={`strategy-mode-${library.id}`} checked={mode === "custom"} onChange={() => { setMode("custom"); setSaved(false); }} label=<><strong>自定义覆盖</strong><small>只对这个媒体库使用独立的内容策略。</small></> />
     </div>
     {mode === "custom" ? <>
       <div className="lux-library-override-toggles">
@@ -715,8 +713,8 @@ function LibraryStrategyOverride({ library, globalStrategy, onSave }: { library:
       />
       <div className="lux-library-override-fields">
         <StrategySelect label="元数据语言" value={draft.metadataLanguage} options={[["zh-CN", "简体中文"], ["en-US", "English"], ["ja-JP", "日本語"]]} onChange={(value) => setDraft((current) => ({ ...current, metadataLanguage: value }))} />
-        <label>最大背景图数量<select aria-label="媒体库最大背景图数量" value={String(draft.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(draft.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
-        <label>最小下载宽度<select aria-label="媒体库最小下载宽度" value={String(draft.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(draft.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</select></label>
+        <label>最大背景图数量<LuxSelectField aria-label="媒体库最大背景图数量" value={String(draft.images.maxBackdropCount)} onChange={(event) => updateImages("maxBackdropCount", Number(event.target.value))}>{flatCountOptions(draft.images.maxBackdropCount).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField></label>
+        <label>最小下载宽度<LuxSelectField aria-label="媒体库最小下载宽度" value={String(draft.images.minDownloadWidth)} onChange={(event) => updateImages("minDownloadWidth", Number(event.target.value))}>{flatWidthOptions(draft.images.minDownloadWidth).map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</LuxSelectField></label>
       </div>
       <ImageLevelPolicyEditor
         images={draft.images}

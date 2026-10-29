@@ -7,6 +7,7 @@ import type {
   AdminUserPermissionCopyPreview,
   AdminUserPermissionCopyPreviewInput,
 } from "../../lib/api/types";
+import { LuxButton, LuxCheckbox, LuxIconButton, LuxSelectField, LuxTextField } from "../../components/ui";
 
 type PermissionCopyTarget = {
   id: string;
@@ -157,7 +158,7 @@ export function AdminUserPermissionCopyDialog({ targets, onClose, onApplied }: P
             <h2>预览并复制权限</h2>
             <p>只复制所选权限组；服务器管理员角色、账号资料、凭证和偏好不会复制。</p>
           </div>
-          <button className="lux-icon-button lux-icon-button-small" type="button" data-dialog-close aria-label="关闭权限复制" onClick={onClose} disabled={apply.isPending}>×</button>
+          <LuxIconButton className="lux-icon-button-small" type="button" data-dialog-close aria-label="关闭权限复制" onClick={onClose} disabled={apply.isPending}>×</LuxIconButton>
         </header>
 
         <div className="lux-admin-user-permission-copy-targets">
@@ -168,7 +169,7 @@ export function AdminUserPermissionCopyDialog({ targets, onClose, onApplied }: P
         <div className="lux-admin-user-permission-copy-form">
           <label>
             <span>搜索来源账号</span>
-            <input type="search" value={sourceSearchInput} onChange={(event) => setSourceSearchInput(event.target.value)} placeholder="用户名、显示名称或邮箱" disabled={preview.isPending || apply.isPending} />
+            <LuxTextField type="search" value={sourceSearchInput} onChange={(event) => setSourceSearchInput(event.target.value)} placeholder="用户名、显示名称或邮箱" disabled={preview.isPending || apply.isPending} />
           </label>
           {sourceUsers.isPending ? <p role="status">正在查找来源账号…</p> : null}
           {sourceUsers.error ? <p className="lux-error-copy" role="alert">来源账号加载失败：{sourceUsers.error.message}</p> : null}
@@ -176,22 +177,22 @@ export function AdminUserPermissionCopyDialog({ targets, onClose, onApplied }: P
           {candidates.length > 0 ? (
             <label>
               <span>来源账号</span>
-              <select aria-label="权限复制来源" value={sourceUserId} onChange={(event) => changeSource(event.target.value)} disabled={preview.isPending || apply.isPending}>
+              <LuxSelectField aria-label="权限复制来源" value={sourceUserId} onChange={(event) => changeSource(event.target.value)} disabled={preview.isPending || apply.isPending}>
                 <option value="">选择来源账号</option>
                 {candidates.map((user) => <option key={user.id} value={user.id}>{adminUserName(user)}{user.isDisabled ? " · 已禁用" : ""}</option>)}
-              </select>
+              </LuxSelectField>
             </label>
           ) : null}
           <fieldset disabled={preview.isPending || apply.isPending}>
             <legend>复制权限组</legend>
-            <label><input aria-label="复制媒体库权限" type="checkbox" checked={groups.library} onChange={(event) => changeGroup("library", event.target.checked)} />媒体库访问</label>
-            <label><input aria-label="复制内容限制" type="checkbox" checked={groups.content} onChange={(event) => changeGroup("content", event.target.checked)} />内容分级与标签限制</label>
-            <label><input aria-label="复制播放权限" type="checkbox" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} />播放、下载与转码</label>
+            <LuxCheckbox aria-label="复制媒体库权限" checked={groups.library} onChange={(event) => changeGroup("library", event.target.checked)} label="媒体库访问" />
+            <LuxCheckbox aria-label="复制内容限制" checked={groups.content} onChange={(event) => changeGroup("content", event.target.checked)} label="内容分级与标签限制" />
+            <LuxCheckbox aria-label="复制播放权限" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} label="播放、下载与转码" />
           </fieldset>
           <p className="lux-admin-muted">至少选择一个权限组；每次最多复制到 100 个账号。</p>
-          <button className="lux-button lux-button-primary" type="button" aria-label="预览权限复制" onClick={previewCopy} disabled={!selectedSourceIsValid || !selectedGroups.length || preview.isPending || apply.isPending}>
+          <LuxButton tone="primary" type="button" aria-label="预览权限复制" onClick={previewCopy} disabled={!selectedSourceIsValid || !selectedGroups.length || preview.isPending || apply.isPending}>
             {preview.isPending ? "正在生成预览…" : "预览所选权限"}
-          </button>
+          </LuxButton>
         </div>
 
         {preview.error ? <p className="lux-error-copy" role="alert">预览失败：{preview.error.message}</p> : null}
@@ -209,9 +210,9 @@ export function AdminUserPermissionCopyDialog({ targets, onClose, onApplied }: P
               ))}
             </ul>
             <p className="lux-admin-muted">应用前会再次检查来源和目标版本；发生变化的来源会阻止整批写入，目标冲突会单独报告。</p>
-            <button className="lux-button lux-button-primary" type="button" aria-label="应用权限复制" onClick={() => apply.mutate()} disabled={copyDisabled}>
+            <LuxButton tone="primary" type="button" aria-label="应用权限复制" onClick={() => apply.mutate()} disabled={copyDisabled}>
               {apply.isPending ? "正在复制…" : `应用到 ${preview.data.targets.length} 个账号`}
-            </button>
+            </LuxButton>
           </section>
         ) : null}
         {copyError ? <p className="lux-error-copy" role="alert">复制失败：{copyError}。请重新预览后重试。</p> : null}
@@ -222,7 +223,7 @@ export function AdminUserPermissionCopyDialog({ targets, onClose, onApplied }: P
           </section>
         ) : null}
         <footer className="lux-admin-user-permission-copy-footer">
-          <button className="lux-button lux-button-secondary" type="button" onClick={onClose} disabled={apply.isPending}>关闭</button>
+          <LuxButton tone="secondary" type="button" onClick={onClose} disabled={apply.isPending}>关闭</LuxButton>
         </footer>
       </div>
     </div>

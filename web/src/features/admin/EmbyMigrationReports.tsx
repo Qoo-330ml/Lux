@@ -2,6 +2,7 @@ import { useQuery } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminEmbyMigrationImport, AdminEmbyMigrationMatch, AdminEmbyMigrationPage, AdminEmbyMigrationPersonFavorite, AdminEmbyMigrationUserLink } from "../../lib/api/types";
+import { LuxButton } from "../../components/ui";
 
 export type ReportTab = "users" | "matches" | "imports" | "personFavorites";
 type ReportEntry = AdminEmbyMigrationUserLink | AdminEmbyMigrationMatch | AdminEmbyMigrationImport | AdminEmbyMigrationPersonFavorite;
@@ -45,7 +46,7 @@ function ReportContent({ tab, data, page, onPageChange }: { tab: ReportTab; data
   if (!entries.length) return <EmptyState label="此报告暂无记录" detail="任务运行后，这里会显示可核对的迁移结果。" />;
   return <>
     <div className="lux-emby-report-table">{entries.map((entry, index) => <ReportRow key={`${entry.jobId}-${index}`} tab={tab} entry={entry} />)}</div>
-    <div className="lux-emby-pagination"><button className="lux-button lux-button-secondary" type="button" disabled={currentPage <= 1} onClick={() => onPageChange(currentPage - 1)}>上一页</button><span>第 {currentPage} 页</span><button className="lux-button lux-button-secondary" type="button" disabled={entries.length < responsePageSize} onClick={() => onPageChange(currentPage + 1)}>下一页</button></div>
+    <div className="lux-emby-pagination"><LuxButton tone="secondary" type="button" disabled={currentPage <= 1} onClick={() => onPageChange(currentPage - 1)}>上一页</LuxButton><span>第 {currentPage} 页</span><LuxButton tone="secondary" type="button" disabled={entries.length < responsePageSize} onClick={() => onPageChange(currentPage + 1)}>下一页</LuxButton></div>
   </>;
 }
 

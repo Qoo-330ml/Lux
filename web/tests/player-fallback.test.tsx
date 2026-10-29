@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxCombobox, luxOptions } from "./lux-select-helpers";
 import { canUseRemoteMkvCaptionSidecar, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
 
@@ -303,16 +304,15 @@ describe("PlayerPage client fallback status", () => {
     const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     expect(settings).not.toBeNull();
     await act(async () => settings?.click());
-    const captionSelect = container?.querySelector<HTMLSelectElement>("#lux-player-caption-select");
-    expect(captionSelect?.options[1]?.disabled).toBe(false);
+    const captionOptions = await luxOptions(container!, "选择字幕");
+    expect(captionOptions[1]?.disabled).toBe(false);
     expect(container?.textContent).not.toContain("浏览器未暴露远程内嵌字幕");
     expect(shouldUseClientMkv).toHaveBeenCalled();
     expect(container?.querySelector("video")?.getAttribute("src")).toBe("https://media.example.test/video.mkv");
 
+    const captionChoices = await luxOptions(container, "选择字幕");
+    await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
     await act(async () => {
-      if (!captionSelect) return;
-      captionSelect.value = captionSelect.options[1]?.value ?? "";
-      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 100));
     });
     expect(shouldUseClientMkv).toHaveBeenCalled();
@@ -375,11 +375,9 @@ describe("PlayerPage client fallback status", () => {
 
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     await act(async () => settings?.click());
-    const captionSelect = container.querySelector<HTMLSelectElement>("#lux-player-caption-select");
+    const captionChoices = await luxOptions(container, "选择字幕");
+    await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
     await act(async () => {
-      if (!captionSelect) return;
-      captionSelect.value = captionSelect.options[1]?.value ?? "";
-      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 100));
     });
 
@@ -464,11 +462,9 @@ describe("PlayerPage client fallback status", () => {
 
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     await act(async () => settings?.click());
-    const captionSelect = container.querySelector<HTMLSelectElement>("#lux-player-caption-select");
+    const captionChoices = await luxOptions(container, "选择字幕");
+    await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
     await act(async () => {
-      if (!captionSelect) return;
-      captionSelect.value = captionSelect.options[1]?.value ?? "";
-      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
 
@@ -532,13 +528,13 @@ describe("PlayerPage client fallback status", () => {
     });
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     await act(async () => settings?.click());
-    const captionSelect = container.querySelector<HTMLSelectElement>("#lux-player-caption-select");
-    await act(async () => {
-      if (!captionSelect) return;
-      captionSelect.value = captionSelect.options[1]?.value ?? "";
-      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    });
+    if (luxCombobox(container, "选择字幕")) {
+      const captionChoices = await luxOptions(container, "选择字幕");
+      await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      });
+    }
 
     expect(container.textContent).not.toContain("播放器引擎失败");
     expect(container.textContent).not.toContain("https://media.example.test/video.mkv");
@@ -597,13 +593,13 @@ describe("PlayerPage client fallback status", () => {
     });
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     await act(async () => settings?.click());
-    const captionSelect = container.querySelector<HTMLSelectElement>("#lux-player-caption-select");
-    await act(async () => {
-      if (!captionSelect) return;
-      captionSelect.value = captionSelect.options[1]?.value ?? "";
-      captionSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      await new Promise((resolve) => setTimeout(resolve, 25));
-    });
+    if (luxCombobox(container, "选择字幕")) {
+      const captionChoices = await luxOptions(container, "选择字幕");
+      await chooseLuxOptionByValue(container, "选择字幕", captionChoices[1]?.value ?? "");
+      await act(async () => {
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      });
+    }
 
     expect(container.textContent).not.toContain("播放器引擎失败");
   });

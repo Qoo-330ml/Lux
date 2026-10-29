@@ -29,6 +29,7 @@ describe("AdminUserDetailPage account lifecycle", () => {
     await waitForUser();
 
     expect(container.textContent).toContain("正常");
+    openDisclosure("账号操作");
     const button = findButton("禁用账号");
     act(() => button.click());
     expect(confirm).toHaveBeenCalledWith("禁用“观众”后会撤销登录凭证并停止播放，账号资料仍会保留。确定继续吗？");
@@ -50,6 +51,7 @@ describe("AdminUserDetailPage account lifecycle", () => {
     vi.spyOn(window, "confirm").mockReturnValue(true);
     await waitForUser();
 
+    openDisclosure("账号操作");
     await act(async () => {
       findButton("启用账号").click();
       await vi.waitFor(() => expect(enable).toHaveBeenCalledWith("user-1", { isDisabled: false }));
@@ -59,10 +61,49 @@ describe("AdminUserDetailPage account lifecycle", () => {
   it("explains how users verify an email changed by an administrator", async () => {
     renderDetail(makeUser());
     await waitForUser();
+    openDisclosure("编辑资料");
 
     const profileText = container.querySelector(".lux-admin-user-profile-form")?.textContent ?? "";
     expect(profileText).toContain("管理员修改邮箱会清除验证状态；用户可在账户设置保存当前邮箱以发送验证邮件。");
     expect(profileText).not.toContain("验证流程将在邮件功能中接入");
+  });
+
+  it("keeps the profile summary visible while the edit form stays collapsed", async () => {
+    renderDetail(makeUser());
+    await waitForUser();
+
+    const panel = container.querySelector(".lux-admin-user-profile-panel");
+    const summary = panel?.querySelector(".lux-admin-user-profile-summary");
+    expect(summary?.textContent).toContain("观众");
+    expect(summary?.textContent).toContain("viewer@example.com");
+    expect(panel?.querySelector(".lux-admin-user-profile-form")?.closest("[hidden]")).toBeTruthy();
+
+    openDisclosure("编辑资料");
+    expect(panel?.querySelector(".lux-admin-user-profile-form")?.closest("[hidden]")).toBeNull();
+  });
+
+  it("collapses the password form until the admin opens it", async () => {
+    renderDetail(makeUser());
+    await waitForUser();
+
+    const panel = container.querySelector(".lux-admin-user-password-panel");
+    expect(panel?.querySelector('input[type="password"]')?.closest("[hidden]")).toBeTruthy();
+    openDisclosure("修改密码");
+    expect(panel?.querySelector('input[type="password"]')?.closest("[hidden]")).toBeNull();
+  });
+
+  it("keeps the account status visible and hides the account actions behind a toggle", async () => {
+    renderDetail(makeUser());
+    await waitForUser();
+
+    const panel = container.querySelector(".lux-admin-user-lifecycle-panel");
+    expect(panel?.textContent).toContain("正常");
+    expect(panel?.textContent).toContain("普通用户");
+    expect(findButtonOrNull("禁用账号")?.closest("[hidden]")).toBeTruthy();
+
+    openDisclosure("账号操作");
+    expect(findButtonOrNull("禁用账号")?.closest("[hidden]")).toBeNull();
+    expect(findButtonOrNull("移入回收站")?.closest("[hidden]")).toBeNull();
   });
 
   it("uses the configured retention period when confirming account deletion", async () => {
@@ -76,23 +117,27 @@ describe("AdminUserDetailPage account lifecycle", () => {
       await vi.waitFor(() => expect(queryClient.getQueryData<AdminSettings>(["admin", "settings"])?.userDeletionGraceDays).toBe(14));
     });
 
+    openDisclosure("账号操作");
     act(() => findButton("移入回收站").click());
     expect(confirm).toHaveBeenCalledWith("将“观众”移入回收站会撤销凭证并停止播放，账号会保留 14 天，可在期限内恢复。确定继续吗？");
     expect(remove).not.toHaveBeenCalled();
   });
 
-  it("makes deleted account details read-only and restores back to the user list", async () => {
+  it("shows deleted account details as read-only and restores back to the user list", async () => {
     const deletedUser = makeUser({ isDisabled: true, deletedAt: 1_800_000_000, deletionPurgeAt: 1_800_604_800 });
     const queryClient = renderDetail(deletedUser);
     const restore = vi.spyOn(api, "restoreAdminUser").mockResolvedValue({ user: makeUser() });
     await waitForUser();
 
-    const profile = container.querySelector(".lux-admin-user-profile-form");
     expect(container.querySelector(".lux-admin-user-lifecycle-panel")?.textContent).toContain("回收站");
     expect(container.querySelector(".lux-admin-user-profile-panel .lux-user-badge")?.textContent).toBe("回收站");
-    expect(profile?.textContent).toContain("回收站中的账号资料为只读");
-    expect(profile?.querySelector<HTMLInputElement>('input[type="file"]')?.disabled).toBe(true);
-    expect([...profile!.querySelectorAll<HTMLInputElement>("input")].every((input) => input.disabled)).toBe(true);
+    expect(container.querySelector(".lux-admin-user-profile-summary")?.textContent).toContain("viewer@example.com");
+    expect(container.querySelector(".lux-admin-user-profile-panel")?.textContent).toContain("回收站中的账号资料为只读");
+    expect(container.querySelector(".lux-admin-user-profile-panel:not(.lux-admin-user-password-panel) input")).toBeNull();
+    expect(container.querySelector(".lux-admin-user-password-panel")?.textContent).toContain("回收站中的账号不可修改密码");
+    expect(findButtonOrNull("编辑资料")).toBeNull();
+
+    openDisclosure("账号操作");
     expect(findButton("恢复账号")).toBeTruthy();
     expect(findButton("彻底删除")).toBeTruthy();
 
@@ -110,6 +155,7 @@ describe("AdminUserDetailPage account lifecycle", () => {
     const confirm = vi.spyOn(window, "confirm").mockReturnValue(false);
     await waitForUser();
 
+    openDisclosure("账号操作");
     act(() => findButton("彻底删除").click());
     expect(confirm).toHaveBeenCalledWith("彻底删除“观众”将永久删除账号、头像、权限设置、偏好、播放记录和设备关联，媒体文件不受影响，且无法恢复。确定继续吗？");
     expect(purge).not.toHaveBeenCalled();
@@ -162,6 +208,14 @@ describe("AdminUserDetailPage account lifecycle", () => {
     const button = [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent?.includes(label));
     expect(button, `button containing ${label}`).toBeTruthy();
     return button!;
+  }
+
+  function findButtonOrNull(label: string) {
+    return [...container.querySelectorAll<HTMLButtonElement>("button")].find((item) => item.textContent?.includes(label)) ?? null;
+  }
+
+  function openDisclosure(label: string) {
+    act(() => findButton(label).click());
   }
 });
 

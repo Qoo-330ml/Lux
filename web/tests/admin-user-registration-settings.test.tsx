@@ -5,6 +5,7 @@ import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { chooseLuxOptionByValue } from "./lux-select-helpers";
 import { AdminUserSettingsPage } from "../src/features/admin/AdminUserManagementPage";
 import { ApiError, LuxApiClient, api } from "../src/lib/api/client";
 
@@ -37,14 +38,10 @@ describe("user registration mode settings", () => {
     await act(async () => root.render(<QueryClientProvider client={client}><MemoryRouter initialEntries={["/admin/users/settings?section=registration"]} future={{ v7_startTransition: true, v7_relativeSplatPath: true }}><AdminUserSettingsPage /></MemoryRouter></QueryClientProvider>));
   }
   async function ready() {
-    await act(async () => { await vi.waitFor(() => expect(container.querySelector("select")).not.toBeNull()); });
+    await act(async () => { await vi.waitFor(() => expect(container.querySelector('[role="combobox"]')).not.toBeNull()); });
   }
   async function choose(mode = "PUBLIC_EMAIL") {
-    await act(async () => {
-      const select = container.querySelector("select")!;
-      select.value = mode;
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await chooseLuxOptionByValue(container, "注册模式", mode);
   }
   function button(text: string) {
     const found = Array.from(container.querySelectorAll("button")).find((element) => element.textContent === text);
@@ -64,7 +61,7 @@ describe("user registration mode settings", () => {
 
   it("loads invitation-only defaults and explains validation, approval and administrator permissions", async () => {
     await render(); await ready();
-    expect(container.querySelector("select")?.value).toBe("INVITATION_ONLY");
+    expect(container.querySelector<HTMLElement>('[role="combobox"]')?.dataset.value).toBe("INVITATION_ONLY");
     expect(button("保存注册模式").disabled).toBe(true);
     expect(container.textContent).toContain("默认采用邀请制");
     expect(container.textContent).toContain("验证邮箱");
@@ -80,7 +77,7 @@ describe("user registration mode settings", () => {
     expect(api.updateAdminRegistrationSettings).toHaveBeenCalledTimes(1);
     expect(api.updateAdminRegistrationSettings).toHaveBeenCalledWith({ registrationMode: "PUBLIC_EMAIL", version: 0 });
     expect(container.querySelector("form")?.getAttribute("aria-busy")).toBe("true");
-    expect(container.querySelector("select")?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('[role="combobox"]')?.disabled).toBe(true);
     await act(async () => resolve({ registrationMode: "PUBLIC_EMAIL", version: 1 }));
     await act(async () => { await vi.waitFor(() => expect(container.querySelector('[role="status"]')?.textContent).toContain("注册模式已保存")); });
     expect(client.getQueryData(settingsKey)).toEqual({ registrationMode: "PUBLIC_EMAIL", version: 1 });
@@ -93,7 +90,7 @@ describe("user registration mode settings", () => {
     await act(async () => { await vi.waitFor(() => expect(container.querySelector('[role="alert"]')).not.toBeNull()); });
     expect(container.textContent).toContain("注册模式保存失败");
     expect(container.textContent).not.toContain("private SMTP");
-    expect(container.querySelector("select")?.value).toBe("PUBLIC_EMAIL");
+    expect(container.querySelector<HTMLElement>('[role="combobox"]')?.dataset.value).toBe("PUBLIC_EMAIL");
     expect(button("保存注册模式").disabled).toBe(false);
     await save();
     await act(async () => { await vi.waitFor(() => expect(api.updateAdminRegistrationSettings).toHaveBeenCalledTimes(2)); });
@@ -107,7 +104,7 @@ describe("user registration mode settings", () => {
     expect(container.querySelector("form")).toBeNull();
     expect(container.textContent).not.toContain("private details");
     await act(async () => button("重新加载注册设置").click()); await ready();
-    expect(container.querySelector("select")?.value).toBe("INVITATION_ONLY");
+    expect(container.querySelector<HTMLElement>('[role="combobox"]')?.dataset.value).toBe("INVITATION_ONLY");
   });
 
   it("refreshes a stale version while retaining the selected mode for retry", async () => {
@@ -115,7 +112,7 @@ describe("user registration mode settings", () => {
     vi.mocked(api.updateAdminRegistrationSettings).mockRejectedValueOnce(new ApiError("private conflict", { status: 409, code: "VERSION_CONFLICT" }));
     await render(); await ready(); await choose(); await save();
     await act(async () => { await vi.waitFor(() => expect(client.getQueryData(settingsKey)).toEqual({ registrationMode: "INVITATION_ONLY", version: 2 })); });
-    expect(container.querySelector("select")?.value).toBe("PUBLIC_EMAIL");
+    expect(container.querySelector<HTMLElement>('[role="combobox"]')?.dataset.value).toBe("PUBLIC_EMAIL");
     expect(container.textContent).toContain("已重新读取最新设置");
     await save();
     expect(api.updateAdminRegistrationSettings).toHaveBeenLastCalledWith({ registrationMode: "PUBLIC_EMAIL", version: 2 });

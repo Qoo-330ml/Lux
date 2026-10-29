@@ -19,6 +19,7 @@ import { useImageVariants } from "./image-variants";
 import { ContinueWatchingRail, imageUrl, LibraryCard, MediaRail, mediaTitle, mediaTypeLabel, playbackPositionTicks, runtimeLabel } from "./media";
 import { useSseConnectionState, type SseConnectionState } from "../activity/useUserEvents";
 import { prefetchLibraryPage } from "../library/prefetchLibrary";
+import { LuxButton , luxButtonClass } from "../../components/ui";
 
 const EMPTY_LIBRARIES: Library[] = [];
 const EMPTY_MEDIA_ITEMS: MediaItem[] = [];
@@ -94,7 +95,7 @@ export function HomePage({ user }: { user: LuxUser }) {
       <HeroCarousel items={slides} continueWatching={continueWatching} isLoading={heroIsLoading} showEmptyState={showEmptyHero} />
       {carousel.error && !carousel.data ? (
         <div className="lux-editor-error" role="status">
-          精选轮播加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void carousel.refetch()}>重试</button>
+          精选轮播加载失败。<LuxButton tone="secondary" type="button" onClick={() => void carousel.refetch()}>重试</LuxButton>
         </div>
       ) : null}
       <div className="lux-home-content">
@@ -106,7 +107,7 @@ export function HomePage({ user }: { user: LuxUser }) {
                 {librariesQuery.isPending && !librariesQuery.data ? <div className="lux-skeleton-row" /> : null}
                 {librariesQuery.error && !librariesQuery.data ? (
                   <div className="lux-editor-error" role="alert">
-                    媒体库加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void librariesQuery.refetch()}>重试</button>
+                    媒体库加载失败。<LuxButton tone="secondary" type="button" onClick={() => void librariesQuery.refetch()}>重试</LuxButton>
                   </div>
                 ) : null}
                 {librariesQuery.data && libraries.length ? libraries.map((library) => (
@@ -133,7 +134,7 @@ export function HomePage({ user }: { user: LuxUser }) {
         ) : null}
         {accountSettings.showContinueWatching && continueWatchingQuery.error && !continueWatchingQuery.data ? (
           <div className="lux-editor-error" role="alert">
-            继续观看加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={() => void continueWatchingQuery.refetch()}>重试</button>
+            继续观看加载失败。<LuxButton tone="secondary" type="button" onClick={() => void continueWatchingQuery.refetch()}>重试</LuxButton>
           </div>
         ) : null}
         {libraries.map((library) => (
@@ -183,7 +184,7 @@ function HomeLatestRail({
       <section className="lux-section" aria-label={title}>
         <div className="lux-section-heading"><h2>{title}</h2></div>
         <div className="lux-editor-error" role="alert">
-          最新资源加载失败。<button className="lux-button lux-button-secondary" type="button" onClick={onRetry}>重试</button>
+          最新资源加载失败。<LuxButton tone="secondary" type="button" onClick={onRetry}>重试</LuxButton>
         </div>
       </section>
     );
@@ -258,8 +259,8 @@ const HeroCarousel = memo(function HeroCarousel({ items, continueWatching, isLoa
             <p>{item?.overview || "在属于你的空间里，继续观看收藏的电影与剧集。"}</p>
             <div className="lux-hero-action-row">
               <div className="lux-hero-actions">
-                <Link className="lux-button lux-button-large lux-button-primary" to={playbackHref}><Play size={17} fill="currentColor" /> {item ? playbackLabel : "浏览媒体库"}</Link>
-                {item ? <Link className="lux-button lux-button-large lux-button-glass" to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
+                <Link className={luxButtonClass({ tone: "primary", size: "large" })} to={playbackHref}><Play size={17} fill="currentColor" /> {item ? playbackLabel : "浏览媒体库"}</Link>
+                {item ? <Link className={luxButtonClass({ tone: "glass", size: "large" })} to={`/items/${item.id}`}><Info size={17} /> 详情</Link> : null}
               </div>
               {items.length > 1 ? <div className="lux-hero-carousel-controls" aria-label="选择精选媒体"><div className="lux-hero-dots">{items.map((slide, index) => <button key={slide.id} className={index === safeIndex ? "lux-hero-dot is-active" : "lux-hero-dot"} type="button" aria-label={`显示第 ${index + 1} 条精选：${mediaTitle(slide)}`} aria-current={index === safeIndex ? "true" : undefined} onClick={() => goTo(index)}>{index === safeIndex ? <span className="lux-hero-dot-progress" aria-hidden="true" style={{ animationDuration: `${HERO_CAROUSEL_INTERVAL_MS}ms` }} /> : null}</button>)}</div></div> : null}
             </div>

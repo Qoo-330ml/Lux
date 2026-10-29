@@ -3,6 +3,7 @@ import { FormEvent, useEffect, useRef, useState } from "react";
 import { api } from "../../lib/api/client";
 import type { ItemMetadata, MediaItem, MetadataFieldName } from "../../lib/api/types";
 import { mediaTitle } from "../home/media-display";
+import { LuxButton, LuxTextField, LuxTextarea } from "../../components/ui";
 
 type MediaMetadataEditorProps = {
   item: MediaItem;
@@ -111,9 +112,9 @@ export function MediaMetadataEditor({ item, onClose, onSaved }: MediaMetadataEdi
                 <label htmlFor={inputId}>{label}</label>
                 <div className="lux-metadata-field-control">
                   {key === "overview" ? (
-                    <textarea id={inputId} value={draft.overview} disabled={locked} onChange={(event) => updateField(key, event.target.value)} rows={6} />
+                    <LuxTextarea id={inputId} value={draft.overview} disabled={locked} onChange={(event) => updateField(key, event.target.value)} rows={6} />
                   ) : (
-                    <input id={inputId} type={key === "productionYear" ? "number" : "text"} value={draft[key]} disabled={locked} onChange={(event) => updateField(key, event.target.value)} />
+                    <LuxTextField id={inputId} type={key === "productionYear" ? "number" : "text"} value={draft[key]} disabled={locked} onChange={(event) => updateField(key, event.target.value)} />
                   )}
                   <button className="lux-metadata-lock" type="button" aria-label={`${locked ? "解锁" : "锁定"}${label}`} aria-pressed={locked} onClick={() => toggleLock(key)}>
                     {locked ? <Lock size={16} /> : <Unlock size={16} />}
@@ -127,8 +128,8 @@ export function MediaMetadataEditor({ item, onClose, onSaved }: MediaMetadataEdi
           <footer className="lux-media-editor-footer">
             <span>{loading ? "正在读取已有元数据…" : "每个字段都可以单独锁定"}</span>
             <div>
-              <button className="lux-button lux-button-touch lux-button-secondary" type="button" onClick={onClose}>取消</button>
-              <button className="lux-button lux-button-touch lux-button-primary" type="submit" disabled={saving || loading}><Save size={16} /> {saving ? "保存中…" : "保存"}</button>
+              <LuxButton tone="secondary" size="touch" type="button" onClick={onClose}>取消</LuxButton>
+              <LuxButton tone="primary" size="touch" type="submit" disabled={saving || loading}><Save size={16} /> {saving ? "保存中…" : "保存"}</LuxButton>
             </div>
           </footer>
         </form>

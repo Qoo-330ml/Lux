@@ -8,6 +8,7 @@ import type {
   AdminTranscodingSettings,
   AdminTranscodingStatus,
 } from "../../lib/api/types";
+import { LuxButton, LuxSelectField, LuxSwitch, LuxTextField } from "../../components/ui";
 
 const HARDWARE_ENCODER_LABELS: Record<string, string> = {
   NONE: "不启用（仅软件转码）",
@@ -121,20 +122,12 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
         <ServerCog size={20} className="lux-admin-panel-icon" />
       </div>
       <div className="lux-admin-settings-form">
-        <label className="lux-admin-toggle">
-          <input
-            type="checkbox"
-            aria-label="启用服务端转码"
-            checked={draft.enabled}
-            onChange={(event) => edit({ enabled: event.target.checked })}
-          />
-          <span>启用服务端转码</span>
-        </label>
+        <LuxSwitch className="lux-admin-toggle" aria-label="启用服务端转码" checked={draft.enabled} onChange={(event) => edit({ enabled: event.target.checked })} label="启用服务端转码" />
         <small>只影响实时播放：关闭后本地媒体只做直连播放或浏览器端解码，不再启动播放转码进程。缩略图、媒体信息探测、章节检测等后台任务仍照常使用 FFmpeg/FFprobe；正在播放的会话不受影响。</small>
 
         <label>
           <span>硬件编码器</span>
-          <select
+          <LuxSelectField
             aria-label="硬件编码器"
             value={draft.hardwareEncoder}
             onChange={(event) => edit({ hardwareEncoder: event.target.value })}
@@ -144,27 +137,26 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
                 {HARDWARE_ENCODER_LABELS[encoder] ?? encoder}
               </option>
             ))}
-          </select>
+          </LuxSelectField>
           <small>保存时会自动做一次编码自检；自检不通过的编码器不会用于播放，系统会改用软件转码。部署层 LUX_HLS_HW_ENCODER 优先于此处选择。</small>
         </label>
 
         <div className="lux-admin-transcoding-status" role="status" aria-label="硬件编码器自检">
           <TranscodingStatusLine status={status} encoder={draft.hardwareEncoder} />
-          <button
+          <LuxButton tone="secondary"
             type="button"
-            className="lux-button lux-button-secondary"
             disabled={probe.isPending || draft.hardwareEncoder === "NONE"}
             onClick={() => probe.mutate()}
           >
             <RefreshCw size={14} className={probe.isPending ? "is-spinning" : undefined} />
             {probe.isPending ? "检测中…" : "重新检测"}
-          </button>
+          </LuxButton>
         </div>
         {probe.error ? <p className="lux-error-copy">{probe.error.message}</p> : null}
 
         <label>
           <span>硬件设备路径</span>
-          <input
+          <LuxTextField
             type="text"
             aria-label="硬件设备路径"
             value={draft.hardwareDevice}
@@ -174,21 +166,13 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
           <small>VAAPI/QSV 使用的 DRM 渲染节点；NVENC 与 VideoToolbox 忽略此值。留空或填写默认值时使用 /dev/dri/renderD128。</small>
         </label>
 
-        <label className="lux-admin-toggle">
-          <input
-            type="checkbox"
-            aria-label="启用硬件解码"
-            checked={draft.hardwareDecode}
-            onChange={(event) => edit({ hardwareDecode: event.target.checked })}
-          />
-          <span>启用硬件解码</span>
-        </label>
+        <LuxSwitch className="lux-admin-toggle" aria-label="启用硬件解码" checked={draft.hardwareDecode} onChange={(event) => edit({ hardwareDecode: event.target.checked })} label="启用硬件解码" />
         <small>让 FFmpeg 优先使用 GPU 解码（需要容器映射设备并支持对应源格式）；解码不可用或失败时会自动降级到软件转码。</small>
 
         <label>
           <span>封装转换 / 音频转码并发上限</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.remuxSessions, (remuxSessions) => edit({ remuxSessions }), { min: 0, max: 16 })}
               aria-label="封装转换并发上限"
             />
@@ -200,7 +184,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
         <label>
           <span>硬件转码并发上限</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.hardwareSessions, (hardwareSessions) => edit({ hardwareSessions }), { min: 0, max: 16 })}
               aria-label="硬件转码并发上限"
             />
@@ -211,7 +195,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
         <label>
           <span>软件转码并发上限</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.softwareSessions, (softwareSessions) => edit({ softwareSessions }), { min: 0, max: 16 })}
               aria-label="软件转码并发上限"
             />
@@ -222,7 +206,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
 
         <label>
           <span>软件编码 preset</span>
-          <select
+          <LuxSelectField
             aria-label="软件编码 preset"
             value={draft.softwarePreset}
             onChange={(event) => edit({ softwarePreset: event.target.value })}
@@ -230,12 +214,12 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
             {presetValues.map((preset) => (
               <option key={preset} value={preset}>{PRESET_LABELS[preset] ?? preset}</option>
             ))}
-          </select>
+          </LuxSelectField>
         </label>
 
         <label>
           <span>最大输出分辨率</span>
-          <select
+          <LuxSelectField
             aria-label="最大输出分辨率"
             value={String(draft.maxOutputHeight)}
             onChange={(event) => edit({ maxOutputHeight: Number.parseInt(event.target.value, 10) || 0 })}
@@ -243,14 +227,14 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
             {OUTPUT_HEIGHT_OPTIONS.map((option) => (
               <option key={option.value} value={option.value}>{option.label}</option>
             ))}
-          </select>
+          </LuxSelectField>
           <small>只缩小、不放大，保持宽高比；封装转换与音频转码不改变画面。</small>
         </label>
 
         <label>
           <span>视频码率上限</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.maxVideoBitrateKbps, (maxVideoBitrateKbps) => edit({ maxVideoBitrateKbps }), { min: 0, max: 100_000 })}
               aria-label="视频码率上限"
             />
@@ -262,7 +246,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
         <label>
           <span>音频码率</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.audioBitrateKbps, (audioBitrateKbps) => edit({ audioBitrateKbps }), { min: 32, max: 512 })}
               aria-label="音频码率"
             />
@@ -273,7 +257,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
         <label>
           <span>单会话磁盘配额</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.sessionQuotaMb, (sessionQuotaMb) => edit({ sessionQuotaMb }), { min: 0, max: 65_536 })}
               aria-label="单会话磁盘配额"
             />
@@ -285,7 +269,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
         <label>
           <span>全局磁盘预算</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.globalBudgetMb, (globalBudgetMb) => edit({ globalBudgetMb }), { min: 0, max: 1_048_576 })}
               aria-label="全局磁盘预算"
             />
@@ -297,7 +281,7 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
         <label>
           <span>最低剩余空间</span>
           <div className="lux-admin-input-with-suffix">
-            <input
+            <LuxTextField
               {...numberInput(draft.minFreeSpaceMb, (minFreeSpaceMb) => edit({ minFreeSpaceMb }), { min: 0, max: 1_048_576 })}
               aria-label="最低剩余空间"
             />
@@ -306,14 +290,13 @@ export function AdminTranscodingPanel({ settings }: { settings: AdminSettings })
           <small>低于该值时不再启动新的转码会话；0 表示关闭保护。</small>
         </label>
 
-        <button
-          className="lux-button lux-button-primary lux-settings-save"
+        <LuxButton tone="primary" className="lux-settings-save"
           type="button"
           disabled={save.isPending}
           onClick={() => save.mutate(draft)}
         >
           <Save size={16} /> {save.isPending ? "保存中…" : "保存转码设置"}
-        </button>
+        </LuxButton>
       </div>
       {saved ? <p className="lux-settings-saved"><Check size={15} /> 设置已保存，将在新的播放会话生效</p> : null}
       {save.error ? <p className="lux-error-copy">{save.error.message}</p> : null}

@@ -6,6 +6,7 @@ import { AdminDashboardNowPlaying } from "./AdminDashboardNowPlaying";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { AdminDashboard } from "../../lib/api/types";
+import { LuxTextField } from "../../components/ui";
 
 export function AdminDashboardPage() {
   const queryClient = useQueryClient();
@@ -215,7 +216,7 @@ export function AdminDashboardPage() {
             <button className="lux-server-name-dialog-close" type="button" aria-label="关闭服务器名称编辑" onClick={closeServerNameEditor}><X size={20} /></button>
             <form className="lux-server-name-dialog-form" onSubmit={(event) => { event.preventDefault(); if (draftServerName.trim()) saveServerName.mutate(); }}>
               <label id="server-name-dialog-title" htmlFor="server-name-dialog-input">服务器名称</label>
-              <input ref={nameEditorInputRef} id="server-name-dialog-input" name="serverName" value={draftServerName} maxLength={80} aria-describedby="server-name-dialog-help" onChange={(event) => setDraftServerName(event.target.value)} />
+              <LuxTextField ref={nameEditorInputRef} id="server-name-dialog-input" name="serverName" value={draftServerName} maxLength={80} aria-describedby="server-name-dialog-help" onChange={(event) => setDraftServerName(event.target.value)} />
               <p id="server-name-dialog-help">此名称用于标识此服务器。</p>
               {saveServerName.error ? <p className="lux-server-name-dialog-error" role="alert">{saveServerName.error.message}</p> : null}
               <button className="lux-server-name-dialog-save" type="submit" disabled={saveServerName.isPending || !draftServerName.trim()}>{saveServerName.isPending ? "保存中…" : "保存"}</button>

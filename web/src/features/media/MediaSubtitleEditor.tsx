@@ -4,6 +4,7 @@ import { api } from "../../lib/api/client";
 import type { MediaItem, MediaSource, MediaStream } from "../../lib/api/types";
 import { mediaTitle } from "../home/media-display";
 import "./MediaSubtitleEditor.css";
+import { LuxButton, LuxCheckbox, LuxTextField } from "../../components/ui";
 
 type MediaSubtitleEditorProps = {
   item: MediaItem;
@@ -111,19 +112,19 @@ export function MediaSubtitleEditor({ item, sourceId, onClose, onSaved }: MediaS
           ) : <div className="lux-image-result-state">当前版本没有可编辑的外挂字幕。</div>}
           {activeStream && draft ? (
             <form id="subtitle-editor-form" className="lux-subtitle-form" onSubmit={save}>
-              <label htmlFor="subtitle-title">字幕标题<input id="subtitle-title" value={draft.title} onChange={(event) => updateDraft("title", event.target.value)} /></label>
-              <label htmlFor="subtitle-language">语言代码<input id="subtitle-language" value={draft.language} onChange={(event) => updateDraft("language", event.target.value)} placeholder="例如 zho、eng" /></label>
+              <label htmlFor="subtitle-title">字幕标题<LuxTextField id="subtitle-title" value={draft.title} onChange={(event) => updateDraft("title", event.target.value)} /></label>
+              <label htmlFor="subtitle-language">语言代码<LuxTextField id="subtitle-language" value={draft.language} onChange={(event) => updateDraft("language", event.target.value)} placeholder="例如 zho、eng" /></label>
               <div className="lux-subtitle-checks">
-                <label><input id="subtitle-default" type="checkbox" checked={draft.isDefault} onChange={(event) => updateDraft("isDefault", event.target.checked)} /> 默认字幕</label>
-                <label><input id="subtitle-forced" type="checkbox" checked={draft.isForced} onChange={(event) => updateDraft("isForced", event.target.checked)} /> 强制字幕</label>
+                <LuxCheckbox id="subtitle-default" checked={draft.isDefault} onChange={(event) => updateDraft("isDefault", event.target.checked)} label="默认字幕" />
+                <LuxCheckbox id="subtitle-forced" checked={draft.isForced} onChange={(event) => updateDraft("isForced", event.target.checked)} label="强制字幕" />
               </div>
               <p className="lux-muted-copy">字幕文件内容保持不变，只更新播放时使用的属性。</p>
               {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
               <footer className="lux-media-editor-footer">
                 <span>{saving ? "正在保存…" : "外挂字幕来自媒体文件同目录"}</span>
                 <div>
-                  <button className="lux-button lux-button-touch lux-button-secondary" type="button" onClick={onClose}>取消</button>
-                  <button className="lux-button lux-button-touch lux-button-primary" type="submit" disabled={saving}><Save size={16} /> {saving ? "保存中…" : "保存"}</button>
+                  <LuxButton tone="secondary" size="touch" type="button" onClick={onClose}>取消</LuxButton>
+                  <LuxButton tone="primary" size="touch" type="submit" disabled={saving}><Save size={16} /> {saving ? "保存中…" : "保存"}</LuxButton>
                 </div>
               </footer>
             </form>

@@ -7,6 +7,7 @@ import type {
   AdminAccountPreferenceCopyPreviewInput,
   AdminUser,
 } from "../../lib/api/types";
+import { LuxButton, LuxCheckbox, LuxIconButton, LuxSelectField, LuxTextField } from "../../components/ui";
 
 type PreferenceCopyTarget = {
   id: string;
@@ -160,7 +161,7 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
             <h2 id="lux-admin-user-preference-copy-title">预览并复制账户偏好</h2>
             <p>来源偏好会按预览时的版本复制到所选账号；账号资料、密码、历史记录和收藏不会复制。</p>
           </div>
-          <button className="lux-icon-button lux-icon-button-small" type="button" data-dialog-close aria-label="关闭偏好复制" onClick={onClose} disabled={apply.isPending}>×</button>
+          <LuxIconButton className="lux-icon-button-small" type="button" data-dialog-close aria-label="关闭偏好复制" onClick={onClose} disabled={apply.isPending}>×</LuxIconButton>
         </header>
 
         <div className="lux-admin-user-preference-copy-targets">
@@ -171,7 +172,7 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
         <div className="lux-admin-user-preference-copy-form">
           <label>
             <span>搜索来源账号</span>
-            <input type="search" value={sourceSearchInput} onChange={(event) => setSourceSearchInput(event.target.value)} placeholder="用户名、显示名称或邮箱" disabled={preview.isPending || apply.isPending} />
+            <LuxTextField type="search" value={sourceSearchInput} onChange={(event) => setSourceSearchInput(event.target.value)} placeholder="用户名、显示名称或邮箱" disabled={preview.isPending || apply.isPending} />
           </label>
           {sourceUsers.isPending ? <p role="status">正在查找来源账号…</p> : null}
           {sourceUsers.error ? <p className="lux-error-copy" role="alert">来源账号加载失败：{sourceUsers.error.message}</p> : null}
@@ -179,23 +180,23 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
           {candidates.length > 0 ? (
             <label>
               <span>来源账号</span>
-              <select aria-label="偏好复制来源" value={sourceUserId} onChange={(event) => changeSource(event.target.value)} disabled={preview.isPending || apply.isPending}>
+              <LuxSelectField aria-label="偏好复制来源" value={sourceUserId} onChange={(event) => changeSource(event.target.value)} disabled={preview.isPending || apply.isPending}>
                 <option value="">选择来源账号</option>
                 {candidates.map((user) => <option key={user.id} value={user.id}>{adminUserName(user)}{user.isDisabled ? " · 已禁用" : ""}</option>)}
-              </select>
+              </LuxSelectField>
             </label>
           ) : null}
           <fieldset disabled={preview.isPending || apply.isPending}>
             <legend>复制项目</legend>
-            <label><input aria-label="复制外观偏好" type="checkbox" checked={groups.appearance} onChange={(event) => changeGroup("appearance", event.target.checked)} />外观与强调色</label>
-            <label><input aria-label="复制首页偏好" type="checkbox" checked={groups.home} onChange={(event) => changeGroup("home", event.target.checked)} />首页分区</label>
-            <label><input aria-label="复制播放偏好" type="checkbox" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} />音轨、字幕、自动连播与已看阈值</label>
-            <label><input aria-label="复制媒体库排序" type="checkbox" checked={groups.libraryOrder} onChange={(event) => changeGroup("libraryOrder", event.target.checked)} />媒体库排序</label>
+            <LuxCheckbox aria-label="复制外观偏好" checked={groups.appearance} onChange={(event) => changeGroup("appearance", event.target.checked)} label="外观与强调色" />
+            <LuxCheckbox aria-label="复制首页偏好" checked={groups.home} onChange={(event) => changeGroup("home", event.target.checked)} label="首页分区" />
+            <LuxCheckbox aria-label="复制播放偏好" checked={groups.playback} onChange={(event) => changeGroup("playback", event.target.checked)} label="音轨、字幕、自动连播与已看阈值" />
+            <LuxCheckbox aria-label="复制媒体库排序" checked={groups.libraryOrder} onChange={(event) => changeGroup("libraryOrder", event.target.checked)} label="媒体库排序" />
           </fieldset>
           <p className="lux-admin-muted">不选择任何项目时不能继续。每次最多复制到 100 个账号。</p>
-          <button className="lux-button lux-button-primary" type="button" aria-label="预览偏好复制" onClick={previewCopy} disabled={!sourceUserId || !selectedGroups.length || preview.isPending || apply.isPending || !selectedSourceIsValid}>
+          <LuxButton tone="primary" type="button" aria-label="预览偏好复制" onClick={previewCopy} disabled={!sourceUserId || !selectedGroups.length || preview.isPending || apply.isPending || !selectedSourceIsValid}>
             {preview.isPending ? "正在生成预览…" : "预览所选偏好"}
-          </button>
+          </LuxButton>
         </div>
 
         {preview.error ? <p className="lux-error-copy" role="alert">预览失败：{preview.error.message}</p> : null}
@@ -214,9 +215,9 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
               ))}
             </ul>
             <p className="lux-admin-muted">排序预览按目标当前可访问的媒体库过滤；应用时会按目标届时的权限重新过滤，且不会更改管理员强制排序。应用时也会再次检查偏好版本；已发生变化的目标会单独标为冲突。</p>
-            <button className="lux-button lux-button-primary" type="button" aria-label="应用偏好复制" onClick={() => apply.mutate()} disabled={copyDisabled}>
+            <LuxButton tone="primary" type="button" aria-label="应用偏好复制" onClick={() => apply.mutate()} disabled={copyDisabled}>
               {apply.isPending ? "正在复制…" : `应用到 ${preview.data.targets.length} 个账号`}
-            </button>
+            </LuxButton>
           </section>
         ) : null}
         {copyError ? <p className="lux-error-copy" role="alert">复制失败：{copyError}。请重新预览后重试。</p> : null}
@@ -227,7 +228,7 @@ export function AdminUserPreferenceCopyDialog({ targets, onClose, onApplied }: P
           </section>
         ) : null}
         <footer className="lux-admin-user-preference-copy-footer">
-          <button className="lux-button lux-button-secondary" type="button" onClick={onClose} disabled={apply.isPending}>关闭</button>
+          <LuxButton tone="secondary" type="button" onClick={onClose} disabled={apply.isPending}>关闭</LuxButton>
         </footer>
       </div>
     </div>

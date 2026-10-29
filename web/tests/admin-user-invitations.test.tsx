@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxCombobox } from "./lux-select-helpers";
 import type { AdminLibrary, AdminSettings, AdminUserInvitation, AdminUserPermissionPreset } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -71,12 +72,8 @@ describe("admin user invitations", () => {
     });
     expect(list).toHaveBeenCalledWith({ page: 1, pageSize: 20, status: "all" });
 
+    await chooseLuxOptionByValue(container, "邀请状态", "revoked");
     await act(async () => {
-      const filter = container.querySelector<HTMLSelectElement>('select[aria-label="邀请状态"]');
-      if (filter) {
-        filter.value = "revoked";
-        filter.dispatchEvent(new Event("change", { bubbles: true }));
-      }
       await vi.waitFor(() => expect(list).toHaveBeenCalledWith({ page: 1, pageSize: 20, status: "revoked" }));
       const next = container.querySelector<HTMLButtonElement>('button[aria-label="邀请下一页"]');
       await vi.waitFor(() => expect(next?.disabled).toBe(false));
@@ -98,16 +95,10 @@ describe("admin user invitations", () => {
 
     await act(async () => {
       await vi.waitFor(() => expect(container.querySelector('form[aria-label="创建邀请"]')).toBeTruthy());
-      await vi.waitFor(() => expect(container.querySelector<HTMLSelectElement>('select[aria-label="邀请角色预设"]')?.options.length).toBe(2));
+      await vi.waitFor(() => expect(luxCombobox(container, "邀请角色预设")).not.toBeNull());
     });
 
-    act(() => {
-      const presetSelect = container.querySelector<HTMLSelectElement>('select[aria-label="邀请角色预设"]');
-      if (presetSelect) {
-        presetSelect.value = preset.id;
-        presetSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    });
+    await chooseLuxOptionByValue(container, "邀请角色预设", preset.id);
     await vi.waitFor(() => expect(container.textContent).toContain("电影库"));
     act(() => {
       const email = container.querySelector<HTMLInputElement>('input[aria-label="邀请邮箱"]');

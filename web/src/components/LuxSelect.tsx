@@ -15,6 +15,9 @@ type LuxSelectCommonProps = {
   menuClassName?: string;
   placeholder?: string;
   disabled?: boolean;
+  title?: string;
+  /** 表单字段名，仅作为 data-name 暴露给测试与埋点。 */
+  name?: string;
   "aria-label"?: string;
   "aria-labelledby"?: string;
 };
@@ -40,6 +43,8 @@ export function LuxSelect(props: LuxSelectProps) {
     menuClassName,
     placeholder = "请选择",
     disabled = false,
+    title,
+    name,
     "aria-label": ariaLabel,
     "aria-labelledby": ariaLabelledBy,
   } = props;
@@ -231,6 +236,9 @@ export function LuxSelect(props: LuxSelectProps) {
         aria-activedescendant={open && activeIndex >= 0 ? `${listboxId}-option-${activeIndex}` : undefined}
         aria-label={ariaLabel}
         aria-labelledby={ariaLabelledBy}
+        title={title}
+        data-name={name}
+        data-value={multiple ? selectedValues.join(",") : props.value}
         disabled={disabled}
         onClick={() => (open ? setOpen(false) : openMenu())}
         onKeyDown={handleKeyDown}

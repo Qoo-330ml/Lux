@@ -8,6 +8,7 @@ import type {
   AdminUserRegistration,
   NewUserPermissions,
 } from "../../lib/api/types";
+import { LuxButton, LuxCheckbox, LuxSelectField, LuxTextField, useLuxConfirm } from "../../components/ui";
 
 const PAGE_SIZE = 20;
 const REGISTRATION_QUERY_PREFIX = ["admin", "user-registrations"] as const;
@@ -15,6 +16,7 @@ const REGISTRATION_QUERY_PREFIX = ["admin", "user-registrations"] as const;
 type ReviewNotice = { kind: "success" | "error"; text: string };
 
 export function AdminUserRegistrationsPanel() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [notice, setNotice] = useState<ReviewNotice | null>(null);
@@ -63,15 +65,15 @@ export function AdminUserRegistrationsPanel() {
     if (registrations.data && page > pageCount) setPage(pageCount);
   }, [page, pageCount, registrations.data]);
 
-  function approveRequest(request: AdminUserRegistration, permissions: NewUserPermissions) {
+  async function approveRequest(request: AdminUserRegistration, permissions: NewUserPermissions) {
     const summary = describePermissions(permissions, allLibraries);
-    if (!window.confirm(`确认批准 ${request.recipientEmail} 并创建普通用户吗？\n${summary}`)) return;
+    if (!(await confirm(`确认批准 ${request.recipientEmail} 并创建普通用户吗？\n${summary}`))) return;
     setNotice(null);
     approve.mutate({ requestId: request.id, permissions });
   }
 
-  function rejectRequest(request: AdminUserRegistration) {
-    if (!window.confirm(`确认拒绝 ${request.recipientEmail} 的注册申请吗？此操作无法撤销。`)) return;
+  async function rejectRequest(request: AdminUserRegistration) {
+    if (!(await confirm(`确认拒绝 ${request.recipientEmail} 的注册申请吗？此操作无法撤销。`))) return;
     setNotice(null);
     reject.mutate(request.id);
   }
@@ -93,9 +95,9 @@ export function AdminUserRegistrationsPanel() {
       {registrations.error ? (
         <div className="lux-admin-user-registration-error" role="alert">
           <p>无法读取待审批申请，请稍后重试。</p>
-          <button className="lux-button lux-button-secondary lux-button-compact" type="button" disabled={registrations.isFetching} onClick={() => void registrations.refetch()}>
+          <LuxButton tone="secondary" size="compact" type="button" disabled={registrations.isFetching} onClick={() => void registrations.refetch()}>
             {registrations.isFetching ? "正在重试…" : "重新加载申请"}
-          </button>
+          </LuxButton>
         </div>
       ) : null}
       {libraries.isPending && requests.some((request) => request.permissions.libraryAccessMode === "SELECTED") ? (
@@ -104,9 +106,9 @@ export function AdminUserRegistrationsPanel() {
       {libraries.error && requests.some((request) => request.permissions.libraryAccessMode === "SELECTED") ? (
         <div className="lux-admin-user-registration-error" role="alert">
           <p>媒体库信息暂不可用；指定媒体库权限暂不能批准。</p>
-          <button className="lux-button lux-button-secondary lux-button-compact" type="button" disabled={libraries.isFetching} onClick={() => void libraries.refetch()}>
+          <LuxButton tone="secondary" size="compact" type="button" disabled={libraries.isFetching} onClick={() => void libraries.refetch()}>
             {libraries.isFetching ? "正在重试…" : "重新加载媒体库"}
-          </button>
+          </LuxButton>
         </div>
       ) : null}
 
@@ -136,8 +138,8 @@ export function AdminUserRegistrationsPanel() {
       <nav className="lux-admin-user-session-pagination" aria-label="待审批分页">
         <span>第 {page} / {pageCount} 页</span>
         <div>
-          <button className="lux-button lux-button-secondary lux-button-compact" type="button" aria-label="待审批上一页" disabled={page <= 1 || busy} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button>
-          <button className="lux-button lux-button-secondary lux-button-compact" type="button" aria-label="待审批下一页" disabled={page >= pageCount || busy} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>下一页</button>
+          <LuxButton tone="secondary" size="compact" type="button" aria-label="待审批上一页" disabled={page <= 1 || busy} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</LuxButton>
+          <LuxButton tone="secondary" size="compact" type="button" aria-label="待审批下一页" disabled={page >= pageCount || busy} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>下一页</LuxButton>
         </div>
       </nav>
     </section>
@@ -216,47 +218,38 @@ function RegistrationReviewCard({
         <h4>批准后分配的权限</h4>
         <label className="lux-admin-user-registration-field">
           媒体库访问范围
-          <select aria-label={`媒体库访问范围 ${request.recipientEmail}`} value={permissions.libraryAccessMode} disabled={busy} onChange={(event) => changeLibraryMode(event.target.value as AdminUserLibraryAccessMode)}>
+          <LuxSelectField aria-label={`媒体库访问范围 ${request.recipientEmail}`} value={permissions.libraryAccessMode} disabled={busy} onChange={(event) => changeLibraryMode(event.target.value as AdminUserLibraryAccessMode)}>
             <option value="ALL">所有已启用媒体库</option>
             <option value="SELECTED">指定媒体库</option>
             <option value="NONE">无媒体库访问权限</option>
-          </select>
+          </LuxSelectField>
         </label>
         {permissions.libraryAccessMode === "SELECTED" ? (
           <fieldset className="lux-admin-user-registration-libraries">
             <legend>指定媒体库</legend>
             {libraryOptions.length ? libraryOptions.map((library) => (
-              <label key={library.id}>
-                <input
-                  type="checkbox"
-                  aria-label={`媒体库 ${library.name} ${request.recipientEmail}`}
-                  checked={permissions.libraryIds.includes(library.id)}
-                  disabled={busy || librariesUnavailable}
-                  onChange={(event) => changeLibrary(library.id, event.target.checked)}
-                />
-                <span>{library.name}{library.unavailable ? "（当前不可用）" : ""}</span>
-              </label>
+              <LuxCheckbox aria-label={`媒体库 ${library.name} ${request.recipientEmail}`} checked={permissions.libraryIds.includes(library.id)} disabled={busy || librariesUnavailable} onChange={(event) => changeLibrary(library.id, event.target.checked)} label=<>{library.name}{library.unavailable ? "（当前不可用）" : ""}</> />
             )) : <p className="lux-admin-muted">暂无可选媒体库。</p>}
           </fieldset>
         ) : null}
         <fieldset className="lux-admin-user-registration-options">
           <legend>播放与文件权限</legend>
-          <label><input type="checkbox" aria-label={`允许播放 ${request.recipientEmail}`} checked={permissions.canPlay} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, canPlay: event.target.checked }))} />允许播放</label>
-          <label><input type="checkbox" aria-label={`允许下载 ${request.recipientEmail}`} checked={permissions.canDownload} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, canDownload: event.target.checked }))} />允许下载</label>
-          <label><input type="checkbox" aria-label={`允许封装转换 ${request.recipientEmail}`} checked={permissions.allowRemux} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, allowRemux: event.target.checked }))} />允许封装转换</label>
-          <label><input type="checkbox" aria-label={`允许音频转码 ${request.recipientEmail}`} checked={permissions.allowAudioTranscode} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, allowAudioTranscode: event.target.checked }))} />允许音频转码</label>
-          <label><input type="checkbox" aria-label={`允许视频转码 ${request.recipientEmail}`} checked={permissions.allowVideoTranscode} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, allowVideoTranscode: event.target.checked }))} />允许视频转码</label>
-          <label className="lux-admin-user-registration-field">同时播放上限（0 表示不限）<input type="number" min={0} step={1} aria-label={`同时播放上限 ${request.recipientEmail}`} value={permissions.maxSimultaneousPlaybacks} disabled={busy} onChange={(event) => changePlaybackLimit(event.target.value)} /></label>
+          <LuxCheckbox aria-label={`允许播放 ${request.recipientEmail}`} checked={permissions.canPlay} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, canPlay: event.target.checked }))} label="允许播放" />
+          <LuxCheckbox aria-label={`允许下载 ${request.recipientEmail}`} checked={permissions.canDownload} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, canDownload: event.target.checked }))} label="允许下载" />
+          <LuxCheckbox aria-label={`允许封装转换 ${request.recipientEmail}`} checked={permissions.allowRemux} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, allowRemux: event.target.checked }))} label="允许封装转换" />
+          <LuxCheckbox aria-label={`允许音频转码 ${request.recipientEmail}`} checked={permissions.allowAudioTranscode} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, allowAudioTranscode: event.target.checked }))} label="允许音频转码" />
+          <LuxCheckbox aria-label={`允许视频转码 ${request.recipientEmail}`} checked={permissions.allowVideoTranscode} disabled={busy} onChange={(event) => setPermissions((current) => ({ ...current, allowVideoTranscode: event.target.checked }))} label="允许视频转码" />
+          <label className="lux-admin-user-registration-field">同时播放上限（0 表示不限）<LuxTextField type="number" min={0} step={1} aria-label={`同时播放上限 ${request.recipientEmail}`} value={permissions.maxSimultaneousPlaybacks} disabled={busy} onChange={(event) => changePlaybackLimit(event.target.value)} /></label>
         </fieldset>
       </div>
 
       <div className="lux-admin-user-profile-actions">
-        <button className="lux-button lux-button-primary lux-button-compact" type="button" aria-label={`批准 ${request.recipientEmail}`} disabled={approvalBlocked} onClick={() => onApprove(request, permissions)}>
+        <LuxButton tone="primary" size="compact" type="button" aria-label={`批准 ${request.recipientEmail}`} disabled={approvalBlocked} onClick={() => onApprove(request, permissions)}>
           {busy ? "处理中…" : "批准"}
-        </button>
-        <button className="lux-button lux-button-secondary lux-button-compact" type="button" aria-label={`拒绝 ${request.recipientEmail}`} disabled={busy} onClick={() => onReject(request)}>
+        </LuxButton>
+        <LuxButton tone="secondary" size="compact" type="button" aria-label={`拒绝 ${request.recipientEmail}`} disabled={busy} onClick={() => onReject(request)}>
           {busy ? "处理中…" : "拒绝"}
-        </button>
+        </LuxButton>
       </div>
     </article>
   );

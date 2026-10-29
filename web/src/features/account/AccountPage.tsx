@@ -32,6 +32,7 @@ import {
   saveAccountSettings,
   type AccountSettings,
 } from "./account-settings";
+import { LuxButton, LuxTextField } from "../../components/ui";
 
 export function AccountPage({ user }: { user: LuxUser }) {
   const navigate = useNavigate();
@@ -493,14 +494,13 @@ export function AccountPage({ user }: { user: LuxUser }) {
               <strong>{displayName}</strong>
               <span>{user.usernameNormalized}</span>
             </div>
-            <button
-              className="lux-button lux-button-compact lux-button-secondary lux-account-logout-button"
+            <LuxButton tone="secondary" size="compact" className="lux-account-logout-button"
               type="button"
               onClick={() => logout.mutate()}
               disabled={logout.isPending}
             >
               <LogOut size={15} />{logout.isPending ? "正在退出…" : "退出登录"}
-            </button>
+            </LuxButton>
           </div>
           <nav className="lux-account-settings-nav">
             <a href="#appearance"><Palette size={16} />外观</a>
@@ -659,12 +659,12 @@ export function AccountPage({ user }: { user: LuxUser }) {
               </div>
               <form className="lux-account-playback-threshold" onSubmit={(event) => { event.preventDefault(); setPlayedPercentNotice(null); savePlaybackSettings.mutate(); }}>
                 <div className="lux-admin-input-with-suffix">
-                  <input aria-label="自动标记已看百分比" type="number" min="1" max="100" value={playedPercent} disabled={accountPreferencesDisabled || savePlaybackSettings.isPending} onChange={(event) => { setPlayedPercentNotice(null); setPlayedPercent(event.target.value); }} />
+                  <LuxTextField aria-label="自动标记已看百分比" type="number" min="1" max="100" value={playedPercent} disabled={accountPreferencesDisabled || savePlaybackSettings.isPending} onChange={(event) => { setPlayedPercentNotice(null); setPlayedPercent(event.target.value); }} />
                   <em>%</em>
                 </div>
-                <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={accountPreferencesDisabled || accountPreferencesSaving || savePlaybackSettings.isPending || playbackSettings.isPending}>
+                <LuxButton tone="secondary" size="compact" type="submit" disabled={accountPreferencesDisabled || accountPreferencesSaving || savePlaybackSettings.isPending || playbackSettings.isPending}>
                   {savePlaybackSettings.isPending ? "保存中…" : "保存"}
-                </button>
+                </LuxButton>
                 {playedPercentNotice ? <span role="status">{playedPercentNotice}</span> : null}
               </form>
             </div>
@@ -690,14 +690,13 @@ export function AccountPage({ user }: { user: LuxUser }) {
                       }}
                     />
                   </label>
-                  <button
-                    className="lux-button lux-button-compact lux-button-secondary"
+                  <LuxButton tone="secondary" size="compact"
                     type="button"
                     onClick={saveAvatar}
                     disabled={!pendingAvatarFile || !pendingAvatarUrl || avatarReading || avatarPreparing || avatarUpload.isPending}
                   >
                     {avatarUpload.isPending ? "保存中…" : avatarPreparing ? "裁切中…" : avatarReading ? "读取中…" : "保存头像"}
-                  </button>
+                  </LuxButton>
                 </div>
                 {pendingAvatarUrl ? (
                   <div className="lux-account-avatar-cropper">
@@ -766,14 +765,14 @@ export function AccountPage({ user }: { user: LuxUser }) {
             </div>
             <div className="lux-setting-divider" />
             <form className="lux-setting-form-grid lux-account-form-grid" onSubmit={(event) => { event.preventDefault(); setProfileNotice(null); saveProfile.mutate(); }}>
-              <label className="lux-setting-field"><span>显示名称</span><input value={profileName} onChange={(event) => setProfileName(event.target.value)} /></label>
-              <label className="lux-setting-field"><span>账号</span><input value={user.usernameNormalized} readOnly /></label>
-              <label className="lux-setting-field"><span>邮箱</span><input type="email" value={profileEmail} onChange={(event) => setProfileEmail(event.target.value)} autoComplete="email" placeholder="可选" /></label>
+              <label className="lux-setting-field"><span>显示名称</span><LuxTextField value={profileName} onChange={(event) => setProfileName(event.target.value)} /></label>
+              <label className="lux-setting-field"><span>账号</span><LuxTextField value={user.usernameNormalized} readOnly /></label>
+              <label className="lux-setting-field"><span>邮箱</span><LuxTextField type="email" value={profileEmail} onChange={(event) => setProfileEmail(event.target.value)} autoComplete="email" placeholder="可选" /></label>
               <div className="lux-setting-field lux-account-profile-save">
                 <span>邮箱状态</span>
                 <small>{emailStatus}</small>
-                {pendingEmail ? <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="重新发送邮箱验证邮件" onClick={() => { setEmailVerificationNotice(null); resendEmailVerification.mutate(); }} disabled={resendEmailVerification.isPending}>{resendEmailVerification.isPending ? "正在发送…" : "重新发送验证邮件"}</button> : null}
-                <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={saveProfile.isPending || accountProfile.isPending}>{saveProfile.isPending ? "保存中…" : "保存资料"}</button>
+                {pendingEmail ? <LuxButton tone="secondary" size="compact" type="button" aria-label="重新发送邮箱验证邮件" onClick={() => { setEmailVerificationNotice(null); resendEmailVerification.mutate(); }} disabled={resendEmailVerification.isPending}>{resendEmailVerification.isPending ? "正在发送…" : "重新发送验证邮件"}</LuxButton> : null}
+                <LuxButton tone="secondary" size="compact" type="submit" disabled={saveProfile.isPending || accountProfile.isPending}>{saveProfile.isPending ? "保存中…" : "保存资料"}</LuxButton>
               </div>
             </form>
             {accountProfile.error ? <p className="lux-error-copy" role="alert">账户资料读取失败：{accountProfile.error.message}</p> : null}
@@ -781,14 +780,14 @@ export function AccountPage({ user }: { user: LuxUser }) {
             {emailVerificationNotice ? <p className={emailVerificationNotice.kind === "error" ? "lux-error-copy" : "lux-account-notice"} role={emailVerificationNotice.kind === "error" ? "alert" : "status"}>{emailVerificationNotice.message}</p> : null}
             {resendEmailVerification.isPending ? <p className="lux-account-notice" role="status">正在发送验证邮件…</p> : null}
             <form className="lux-password-panel" onSubmit={submitPasswordChange}>
-              <input className="lux-visually-hidden" type="text" value={user.usernameNormalized} readOnly autoComplete="username" tabIndex={-1} aria-hidden="true" />
+              <LuxTextField className="lux-visually-hidden" type="text" value={user.usernameNormalized} readOnly autoComplete="username" tabIndex={-1} aria-hidden="true" />
               <div className="lux-setting-block-heading"><div><strong>修改密码</strong><p>使用一个没有在其他服务重复使用的新密码。</p></div><ShieldCheck size={18} aria-hidden="true" /></div>
               <div className="lux-setting-form-grid lux-password-grid">
-                <label className="lux-setting-field"><span>当前密码</span><input type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" placeholder="输入当前密码" required /></label>
-                <label className="lux-setting-field"><span>新密码</span><input type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" placeholder="输入新密码" required /></label>
-                <label className="lux-setting-field"><span>确认新密码</span><input type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="再次输入新密码" required /></label>
+                <label className="lux-setting-field"><span>当前密码</span><LuxTextField type="password" value={currentPassword} onChange={(event) => setCurrentPassword(event.target.value)} autoComplete="current-password" placeholder="输入当前密码" required /></label>
+                <label className="lux-setting-field"><span>新密码</span><LuxTextField type="password" value={newPassword} onChange={(event) => setNewPassword(event.target.value)} autoComplete="new-password" placeholder="输入新密码" required /></label>
+                <label className="lux-setting-field"><span>确认新密码</span><LuxTextField type="password" value={confirmPassword} onChange={(event) => setConfirmPassword(event.target.value)} autoComplete="new-password" placeholder="再次输入新密码" required /></label>
               </div>
-              <button className="lux-button lux-button-compact lux-button-secondary" type="submit" disabled={changePassword.isPending}>{changePassword.isPending ? "保存中…" : "修改密码"}</button>
+              <LuxButton tone="secondary" size="compact" type="submit" disabled={changePassword.isPending}>{changePassword.isPending ? "保存中…" : "修改密码"}</LuxButton>
               {passwordNotice ? <p className="lux-account-notice" role="status">{passwordNotice}</p> : null}
             </form>
           </SettingsSection>

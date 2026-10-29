@@ -12,6 +12,7 @@ import { MediaEpisodePlayButton } from "./MediaEpisodesSection";
 import { streamsOfType } from "./media-source";
 import { LuxLogo } from "../../components/LuxLogo";
 import { useSseConnectionState } from "../activity/useUserEvents";
+import { LuxButton , luxButtonClass } from "../../components/ui";
 
 const LazyMetadataEditor = lazy(() => import("../media/MediaMetadataEditor").then((module) => ({ default: module.MediaMetadataEditor })));
 const LazyImageEditor = lazy(() => import("../media/MediaImageEditor").then((module) => ({ default: module.MediaImageEditor })));
@@ -252,19 +253,19 @@ export const MediaDetailActionControls = memo(function MediaDetailActionControls
   const actions = useDetailActions();
   return <>
     <div className="lux-hero-actions">
-      {actions.watchHref ? <Link className="lux-button lux-button-large lux-button-primary" to={actions.watchHref}><Play size={17} fill="currentColor" /> 播放</Link> : <MediaEpisodePlayButton item={actions.item} onNotice={actions.setNotice} />}
-      <button className="lux-button lux-button-large lux-button-glass lux-detail-action-control" type="button" data-action="toggle-favorite" aria-pressed={actions.favorite} disabled={actions.pending} onClick={() => actions.updatePlaybackFlag("favorite")}>
+      {actions.watchHref ? <Link className={luxButtonClass({ tone: "primary", size: "large" })} to={actions.watchHref}><Play size={17} fill="currentColor" /> 播放</Link> : <MediaEpisodePlayButton item={actions.item} onNotice={actions.setNotice} />}
+      <LuxButton tone="glass" size="large" className="lux-detail-action-control" type="button" data-action="toggle-favorite" aria-pressed={actions.favorite} disabled={actions.pending} onClick={() => actions.updatePlaybackFlag("favorite")}>
         <span className="lux-detail-action-icon"><Heart size={17} fill={actions.favorite ? "currentColor" : "none"} /></span>
         <span className="lux-detail-action-label">{actions.favorite ? "已收藏" : "收藏"}</span>
-      </button>
-      {actions.item.metadataPending || actions.pendingReview ? <button className="lux-button lux-button-large lux-button-glass" type="button" data-action="confirm-metadata" disabled={actions.confirmingMetadata} onClick={actions.confirmMetadata}>
+      </LuxButton>
+      {actions.item.metadataPending || actions.pendingReview ? <LuxButton tone="glass" size="large" type="button" data-action="confirm-metadata" disabled={actions.confirmingMetadata} onClick={actions.confirmMetadata}>
         <Check size={17} /> {actions.confirmingMetadata ? "确认中…" : "确认元数据"}
-      </button> : null}
+      </LuxButton> : null}
       <button className={`lux-detail-watched-status${actions.played ? " is-played" : ""}`} type="button" data-action="toggle-played" aria-pressed={actions.played} aria-label={actions.played ? "已看" : "标记为已看"} title={actions.played ? "取消已看" : "标记为已看"} disabled={actions.pending} onClick={() => actions.updatePlaybackFlag("played")}>
         <span className="lux-detail-action-icon"><Check size={20} strokeWidth={2.4} /></span>
       </button>
       <MediaDetailActionMenu className="lux-detail-inline-menu" showLabel />
-      {actions.pendingReview && actions.nextPendingItem ? <Link className="lux-button lux-button-large lux-button-glass lux-detail-next-pending" data-action="next-pending" to={`/items/${actions.nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
+      {actions.pendingReview && actions.nextPendingItem ? <Link className={luxButtonClass({ tone: "glass", size: "large", className: "lux-detail-next-pending" })} data-action="next-pending" to={`/items/${actions.nextPendingItem.id}?metadataStatus=pending`}>下一个待确认</Link> : null}
       {actions.sourceId ? <span className="lux-detail-source"><Radio size={16} /> {actions.item.mediaSources?.find((source) => source.id === actions.sourceId)?.container || "DIRECT PLAY"}</span> : null}
     </div>
     {actions.error ? <p className="lux-editor-error lux-detail-action-error" role="alert">{actions.error}</p> : null}

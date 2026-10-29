@@ -162,16 +162,48 @@ describe("AdminUsersPage user actions", () => {
     });
   });
 
+  it("shows recycle-bin entries in the mobile card list", async () => {
+    vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: true,
+      isAdmin: false, deletedAt: 1_800_000_000, deletionPurgeAt: 1_800_604_800,
+    }], totalCount: 1 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    renderPage(7, "/admin/users?view=deleted");
+
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+
+    const cards = container.querySelector(".lux-users-cards");
+    const card = cards?.querySelector(".lux-users-card-item");
+    expect(card?.textContent).toContain("观众");
+    expect(card?.textContent).toContain("回收站");
+    expect(cards?.querySelector<HTMLButtonElement>('button[aria-label="恢复观众账户"]')).toBeTruthy();
+    expect(cards?.querySelector<HTMLButtonElement>('button[aria-label="彻底删除观众账户"]')).toBeTruthy();
+  });
+
+  it("shows the active user list as cards for narrow screens", async () => {
+    vi.spyOn(api, "adminUsers").mockResolvedValue({ users: [{
+      id: "user-1", usernameNormalized: "viewer", displayName: "观众", isDisabled: false,
+      isAdmin: false, canManageServer: false, canRemoteAccess: false, canDownload: false,
+    }], totalCount: 1 });
+    vi.spyOn(api, "adminLibraries").mockResolvedValue({ libraries: [] });
+    renderPage();
+
+    await act(async () => { await vi.waitFor(() => expect(container.textContent).toContain("观众")); });
+
+    const cards = container.querySelector(".lux-users-cards");
+    expect(cards?.querySelector(".lux-users-card-item")?.textContent).toContain("观众");
+  });
+
   function openRowMenu(name = "观众") {
     act(() => container.querySelector<HTMLButtonElement>(`button[aria-label="更多操作：${name}"]`)?.click());
   }
 
-  function renderPage(userDeletionGraceDays = 7) {
+  function renderPage(userDeletionGraceDays = 7, path = "/admin/users") {
     vi.spyOn(api, "adminSettings").mockResolvedValue({ userDeletionGraceDays } as AdminSettings);
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    act(() => root.render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={["/admin/users"]}><AdminUsersPage /></MemoryRouter></QueryClientProvider>));
+    act(() => root.render(<QueryClientProvider client={queryClient}><MemoryRouter initialEntries={[path]}><AdminUsersPage /></MemoryRouter></QueryClientProvider>));
   }
 });

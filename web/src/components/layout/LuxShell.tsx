@@ -15,6 +15,7 @@ import { applyAccountAccent, applyAccountTheme, readAccountSettings } from "../.
 import { ScanActivityPopover } from "../../features/activity/ScanActivityPopover";
 import { SseConnectionContext, useUserEvents } from "../../features/activity/useUserEvents";
 import { LuxLogo } from "../LuxLogo";
+import { LuxIconButton } from "../ui";
 
 const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
 
@@ -127,15 +128,14 @@ export function LuxShell({ user, serverName }: LuxShellProps) {
                 )}
               </span>
             </button>
-            <button
-              className="lux-icon-button lux-menu-button"
+            <LuxIconButton className="lux-menu-button"
               type="button"
               aria-label={mobileOpen ? "关闭导航" : "打开导航"}
               aria-expanded={mobileOpen}
               onClick={() => setMobileOpen((open) => !open)}
             >
               {mobileOpen ? <X size={20} /> : <Menu size={20} />}
-            </button>
+            </LuxIconButton>
           </div>
         </header>
 

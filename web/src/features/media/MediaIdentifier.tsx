@@ -4,6 +4,7 @@ import "./MediaIdentifier.css";
 import { api } from "../../lib/api/client";
 import type { AdminMetadataCandidate, MediaItem } from "../../lib/api/types";
 import { mediaTitle } from "../home/media-display";
+import { LuxButton, LuxTextField } from "../../components/ui";
 
 type MediaIdentifierProps = {
   item: MediaItem;
@@ -95,9 +96,9 @@ export function MediaIdentifier({ item, onClose, onSaved }: MediaIdentifierProps
           <button ref={closeRef} className="lux-media-editor-close" type="button" aria-label="关闭元数据匹配" onClick={onClose}><X size={18} /></button>
         </header>
         <form className="lux-identifier-search" onSubmit={search}>
-          <label htmlFor="identify-query">名称<input id="identify-query" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
-          <label htmlFor="identify-year">年份<input id="identify-year" type="number" min="1800" max="2200" value={year} onChange={(event) => setYear(event.target.value)} /></label>
-          <button className="lux-button lux-button-primary" data-action="identify-search" type="submit" disabled={searching}><Search size={16} /> {searching ? "搜索中…" : "搜索候选"}</button>
+          <label htmlFor="identify-query">名称<LuxTextField id="identify-query" value={query} onChange={(event) => setQuery(event.target.value)} /></label>
+          <label htmlFor="identify-year">年份<LuxTextField id="identify-year" type="number" min="1800" max="2200" value={year} onChange={(event) => setYear(event.target.value)} /></label>
+          <LuxButton tone="primary" data-action="identify-search" type="submit" disabled={searching}><Search size={16} /> {searching ? "搜索中…" : "搜索候选"}</LuxButton>
         </form>
         {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
         <div className="lux-identifier-results" aria-busy={loading || searching}>
@@ -150,8 +151,8 @@ function CandidateCard({
           {candidate.fieldDiffs.length ? <div className="lux-identifier-diffs">{candidate.fieldDiffs.map((diff) => <div key={diff.field}><span>{diff.field}</span><small>{displayValue(diff.current)} → {displayValue(diff.candidate)}</small></div>)}</div> : <small className="lux-identifier-no-diff">没有字段差异</small>}
         </div>
         <div className="lux-identifier-actions">
-          <button className="lux-button lux-button-compact lux-button-primary" data-action="identify-fill" type="button" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "fillMissing")}><Check size={15} /> {selecting === `${candidate.id}:fillMissing` ? "应用中…" : "仅补缺"}</button>
-          <button className="lux-button lux-button-compact lux-button-secondary" data-action="identify-refresh" type="button" title="会替换当前媒体所有未锁定的元数据及图片" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "refreshUnlocked")}><Search size={15} /> {selecting === `${candidate.id}:refreshUnlocked` ? "应用中…" : "全量替换"}</button>
+          <LuxButton tone="primary" size="compact" data-action="identify-fill" type="button" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "fillMissing")}><Check size={15} /> {selecting === `${candidate.id}:fillMissing` ? "应用中…" : "仅补缺"}</LuxButton>
+          <LuxButton tone="secondary" size="compact" data-action="identify-refresh" type="button" title="会替换当前媒体所有未锁定的元数据及图片" disabled={Boolean(selecting)} onClick={() => onSelect(candidate, "refreshUnlocked")}><Search size={15} /> {selecting === `${candidate.id}:refreshUnlocked` ? "应用中…" : "全量替换"}</LuxButton>
         </div>
       </div>
     </article>

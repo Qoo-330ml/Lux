@@ -6,6 +6,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AdminTranscodingPanel } from "../src/features/admin/AdminTranscodingPanel";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOption, luxCombobox, luxOptionValues } from "./lux-select-helpers";
 import type { AdminSettings, AdminTranscodingSettings } from "../src/lib/api/types";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -107,7 +108,7 @@ describe("AdminTranscodingPanel", () => {
   }
 
   function select(label: string) {
-    return container.querySelector<HTMLSelectElement>(`select[aria-label='${label}']`);
+    return luxCombobox(container, label);
   }
 
   async function type(label: string, value: string) {
@@ -125,11 +126,11 @@ describe("AdminTranscodingPanel", () => {
     expect(container.textContent).toContain("转码设置");
     expect(container.textContent).toContain("部署层 LUX_HLS_HW_ENCODER 优先于此处选择");
     expect(input("启用服务端转码")?.checked).toBe(true);
-    expect(select("硬件编码器")?.value).toBe("NONE");
-    expect([...container.querySelectorAll<HTMLOptionElement>("select[aria-label='硬件编码器'] option")].map((option) => option.value))
+    expect(select("硬件编码器")?.dataset.value).toBe("NONE");
+    expect(await luxOptionValues(container, "硬件编码器"))
       .toEqual(["NONE", "h264_nvenc", "h264_qsv", "h264_vaapi", "h264_videotoolbox"]);
-    expect(select("软件编码 preset")?.value).toBe("veryfast");
-    expect(select("最大输出分辨率")?.value).toBe("0");
+    expect(select("软件编码 preset")?.dataset.value).toBe("veryfast");
+    expect(select("最大输出分辨率")?.dataset.value).toBe("0");
     expect(input("封装转换并发上限")?.value).toBe("4");
     expect(input("音频码率")?.value).toBe("192");
     expect(input("硬件设备路径")?.value).toBe("/dev/dri/renderD128");
@@ -156,23 +157,9 @@ describe("AdminTranscodingPanel", () => {
     await act(async () => {
       input("启用服务端转码")?.click();
     });
-    await act(async () => {
-      const encoder = select("硬件编码器");
-      if (encoder) {
-        encoder.value = "h264_videotoolbox";
-        encoder.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-      const preset = select("软件编码 preset");
-      if (preset) {
-        preset.value = "fast";
-        preset.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-      const height = select("最大输出分辨率");
-      if (height) {
-        height.value = "1080";
-        height.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    });
+    await chooseLuxOption(container, "硬件编码器", "VideoToolbox");
+    await chooseLuxOption(container, "软件编码 preset", "fast");
+    await chooseLuxOption(container, "最大输出分辨率", "1080p");
     await type("软件转码并发上限", "0");
     await type("视频码率上限", "8000");
     await type("音频码率", "256");
@@ -213,13 +200,7 @@ describe("AdminTranscodingPanel", () => {
   it("keeps the draft visible when the server rejects a value", async () => {
     vi.spyOn(api, "updateAdminSettings").mockRejectedValue(new Error("服务端转码设置无效"));
     await render(SETTINGS);
-    await act(async () => {
-      const preset = select("软件编码 preset");
-      if (preset) {
-        preset.value = "medium";
-        preset.dispatchEvent(new Event("change", { bubbles: true }));
-      }
-    });
+    await chooseLuxOption(container, "软件编码 preset", "medium");
     await act(async () => {
       [...container.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.includes("保存转码设置"))
@@ -227,7 +208,7 @@ describe("AdminTranscodingPanel", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
     expect(container.textContent).toContain("服务端转码设置无效");
-    expect(select("软件编码 preset")?.value).toBe("medium");
+    expect(select("软件编码 preset")?.dataset.value).toBe("medium");
   });
 
   it("shows the self-test result and can re-run it", async () => {

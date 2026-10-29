@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AdminSettingsPage } from "../src/features/admin/AdminSettingsPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxOptions, luxSelectValue } from "./lux-select-helpers";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -233,12 +234,10 @@ describe("AdminSettingsPage network proxy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
-    expect(select?.value).toBe("STATIC");
+    expect(luxSelectValue(container, "登录页背景来源")).toBe("STATIC");
     expect(container.textContent).not.toContain("未登录页面公开展示");
+    await chooseLuxOptionByValue(container, "登录页背景来源", "RECENTLY_ADDED");
     await act(async () => {
-      select!.value = "RECENTLY_ADDED";
-      select!.dispatchEvent(new Event("change", { bubbles: true }));
       [...container.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.includes("保存登录页背景"))
         ?.click();
@@ -277,17 +276,15 @@ describe("AdminSettingsPage network proxy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
-    const optionLabels = Array.from(select?.options ?? []).map((option) => option.textContent);
+    const optionLabels = (await luxOptions(container, "登录页背景来源")).map((option) => option.label);
     expect(optionLabels).toContain("TMDb 日榜横幅背景");
     expect(optionLabels).not.toContain("未安装");
     expect(optionLabels).not.toContain("已停用");
     expect(optionLabels).not.toContain("不可用");
     expect(optionLabels).not.toContain("非背景插件");
 
+    await chooseLuxOptionByValue(container, "登录页背景来源", "PLUGIN:org.lux.tmdb-trending-background");
     await act(async () => {
-      select!.value = "PLUGIN:org.lux.tmdb-trending-background";
-      select!.dispatchEvent(new Event("change", { bubbles: true }));
       [...container.querySelectorAll<HTMLButtonElement>("button")]
         .find((button) => button.textContent?.includes("保存登录页背景"))
         ?.click();
@@ -323,12 +320,12 @@ describe("AdminSettingsPage network proxy", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
-    const select = container.querySelector<HTMLSelectElement>("select[aria-label='登录页背景来源']");
-    const unavailableOption = Array.from(select?.options ?? []).find((option) => option.value === savedPluginSource);
-    expect(select?.value).toBe(savedPluginSource);
+    const options = await luxOptions(container, "登录页背景来源");
+    const unavailableOption = options.find((option) => option.value === savedPluginSource);
+    expect(luxSelectValue(container, "登录页背景来源")).toBe(savedPluginSource);
     expect(unavailableOption?.disabled).toBe(true);
     expect(container.textContent).toContain("所选背景插件当前不可用");
-    expect(Array.from(select?.options ?? []).some((option) => option.textContent === "可用背景")).toBe(true);
+    expect(options.some((option) => option.label === "可用背景")).toBe(true);
 
     await act(async () => {
       container.querySelector<HTMLInputElement>("input[aria-label='显示媒体库待确认标记']")?.click();

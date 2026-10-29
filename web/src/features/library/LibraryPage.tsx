@@ -8,6 +8,7 @@ import { GLOBAL_COLLECTION_LIBRARY_ID } from "../../lib/api/types";
 import type { Library } from "../../lib/api/types";
 import { MediaCard, mediaTitle } from "../home/media";
 import { LibraryGrid } from "./LibraryGrid";
+import { LuxButton } from "../../components/ui";
 
 const LIBRARY_SORT_STORAGE_KEY = "lux.library.sort";
 const DEFAULT_BROWSER_TITLE = "Lux Server - Lux";
@@ -314,14 +315,13 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
 
   return (
     <section className="lux-page lux-page-narrow">
-      {isHomeVideos && folderPath.length ? <button className="lux-button lux-button-secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</button> : null}
+      {isHomeVideos && folderPath.length ? <LuxButton tone="secondary" type="button" aria-label="返回上一级" onClick={goToParentFolder}>返回上一级</LuxButton> : null}
       <div className="lux-page-heading">
         <h1>{library?.name || "媒体库"}</h1>
         <p>{metadataStatus ? loadedCountLabel("项待确认内容") : isGlobalCollectionLibrary ? `${loadedCountLabel("个系列")} · 按默认上映顺序` : isHomeVideos ? `${folderPath.at(-1)?.title ?? "根目录"} · ${loadedCountLabel("项内容")}` : loadedCountLabel("项内容")}</p>
       </div>
       {!isGlobalCollectionLibrary ? <div className="lux-library-selection-toolbar" aria-label="媒体库批量操作">
-        <button
-          className="lux-button lux-button-secondary"
+        <LuxButton tone="secondary"
           type="button"
           aria-label={selectionMode ? "退出媒体库多选" : "开启媒体库多选"}
           aria-pressed={selectionMode}
@@ -334,10 +334,10 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
           }}
         >
           {selectionMode ? "退出多选" : "多选"}
-        </button>
+        </LuxButton>
         {selectionMode && selectedIds.size > 0 ? <span>{`已选 ${selectedIds.size} 项`}</span> : null}
-        {canMergeSelectedItems ? <button className="lux-button lux-button-primary" type="button" data-action="merge-items" disabled={mergeItems.isPending} onClick={() => { mergeItems.reset(); setMergePrimaryId(selectedItems[0]?.id); setMergeOpen(true); }}>{mergeItems.isPending ? "合并中…" : "合并为其他版本"}</button> : null}
-        {allSelectedPending ? <button className="lux-button lux-button-primary" type="button" data-action="batch-confirm-metadata" disabled={confirmMetadata.isPending} onClick={() => confirmMetadata.mutate()}>{confirmMetadata.isPending ? "确认中…" : "批量确认"}</button> : null}
+        {canMergeSelectedItems ? <LuxButton tone="primary" type="button" data-action="merge-items" disabled={mergeItems.isPending} onClick={() => { mergeItems.reset(); setMergePrimaryId(selectedItems[0]?.id); setMergeOpen(true); }}>{mergeItems.isPending ? "合并中…" : "合并为其他版本"}</LuxButton> : null}
+        {allSelectedPending ? <LuxButton tone="primary" type="button" data-action="batch-confirm-metadata" disabled={confirmMetadata.isPending} onClick={() => confirmMetadata.mutate()}>{confirmMetadata.isPending ? "确认中…" : "批量确认"}</LuxButton> : null}
         {confirmNotice ? <span className="lux-muted-copy" role="status">{confirmNotice}</span> : null}
         {confirmMetadata.error ? <span className="lux-error-copy" role="alert">{confirmMetadata.error.message}</span> : null}
       </div> : null}
@@ -403,8 +403,8 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
               </div>
               {mergeItems.error ? <p className="lux-error-copy" role="alert">合并失败：{mergeItems.error.message}</p> : null}
               <div className="lux-library-dialog-actions">
-                <button className="lux-button lux-button-secondary" type="button" onClick={() => { setMergeOpen(false); mergeItems.reset(); }}>取消</button>
-                <button className="lux-button lux-button-primary" type="button" data-action="confirm-merge-items" disabled={!mergePrimaryId || mergeItems.isPending} onClick={() => mergeItems.mutate()}>{mergeItems.isPending ? "合并中…" : "确认合并"}</button>
+                <LuxButton tone="secondary" type="button" onClick={() => { setMergeOpen(false); mergeItems.reset(); }}>取消</LuxButton>
+                <LuxButton tone="primary" type="button" data-action="confirm-merge-items" disabled={!mergePrimaryId || mergeItems.isPending} onClick={() => mergeItems.mutate()}>{mergeItems.isPending ? "合并中…" : "确认合并"}</LuxButton>
               </div>
             </div>
           </section>
@@ -416,7 +416,7 @@ export function LibraryPage({ serverName }: { serverName?: string | null } = {})
       {pages.isFetchNextPageError ? (
         <p className="lux-error-copy" role="alert">
           加载更多失败：{pages.error?.message || "请稍后重试"}
-          <button className="lux-button lux-button-secondary" type="button" onClick={() => void pages.fetchNextPage()}>重试</button>
+          <LuxButton tone="secondary" type="button" onClick={() => void pages.fetchNextPage()}>重试</LuxButton>
         </p>
       ) : null}
       {!pages.hasNextPage && loadedItems.length ? <p className="lux-muted-copy" role="status">已加载全部 {total ?? loadedItems.length} 项</p> : null}

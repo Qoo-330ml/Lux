@@ -10,6 +10,7 @@ import { HorizontalScrollRail } from "../../components/layout/HorizontalScrollRa
 import { mediaTitle, MediaPlaceholder } from "../home/media-display";
 import { MediaCardCopy, MediaCardVisual } from "../home/media-card-visual";
 import { MediaDetailArtwork } from "./MediaDetailHero";
+import { LuxButton } from "../../components/ui";
 
 const COLLECTION_PAGE_SIZE = 24;
 
@@ -101,9 +102,9 @@ export function CollectionDetailPage() {
           )}
 
           {collectionQuery.hasNextPage ? (
-            <button className="lux-button lux-button-secondary lux-collection-load-more" type="button" disabled={collectionQuery.isFetchingNextPage} onClick={() => void collectionQuery.fetchNextPage()}>
+            <LuxButton tone="secondary" className="lux-collection-load-more" type="button" disabled={collectionQuery.isFetchingNextPage} onClick={() => void collectionQuery.fetchNextPage()}>
               {collectionQuery.isFetchingNextPage ? "正在加载…" : "加载更多影片"}
-            </button>
+            </LuxButton>
           ) : null}
           {collectionQuery.isFetchNextPageError ? <p className="lux-error-copy" role="alert">加载更多影片失败，请稍后重试。</p> : null}
         </section>

@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { SetupPage } from "../src/features/auth/SetupPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxOptions } from "./lux-select-helpers";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -88,10 +89,10 @@ describe("SetupPage database restart", () => {
       await new Promise((resolve) => setTimeout(resolve, 25));
     });
 
-    const kind = container.querySelector<HTMLSelectElement>("#setup-library-kind");
+    const kind = container.querySelector<HTMLElement>("#setup-library-kind");
     expect(kind).not.toBeNull();
-    expect(kind?.value).toBe("MIXED");
-    expect([...kind!.options].map((option) => option.value)).toContain("HOMEVIDEOS");
+    expect(kind?.dataset.value).toBe("MIXED");
+    expect((await luxOptions(container, kind!)).map((option) => option.value)).toContain("HOMEVIDEOS");
 
     await act(async () => {
       const username = container.querySelector<HTMLInputElement>("#setup-username")!;
@@ -110,8 +111,7 @@ describe("SetupPage database restart", () => {
       Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(libraryRoot, "/media/home-videos");
       libraryRoot.dispatchEvent(new Event("input", { bubbles: true }));
       libraryRoot.dispatchEvent(new Event("change", { bubbles: true }));
-      Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(kind, "HOMEVIDEOS");
-      kind!.dispatchEvent(new Event("change", { bubbles: true }));
+      await chooseLuxOptionByValue(container, kind!, "HOMEVIDEOS");
     });
     await act(async () => {
       container.querySelector<HTMLButtonElement>("button[type='submit']")!.click();

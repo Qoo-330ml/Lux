@@ -7,9 +7,11 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { AccountPreferences, AdminMailSettingsResponse, AdminRegistrationSettings, RegistrationMode, AdminSettings, AdminUser, AdminUserActivityEvent, AdminUserContentRestrictionPolicy, AdminUserContentRestrictionUpdateInput, AdminUserEmbySession, AdminUserLibraryAccessMode, AdminUserPermissionPreset, AdminUserPermissionPresetInput, AdminUserPlaybackPolicy, AdminUserPlaybackSession, AdminUserWebSession, MailSettings, NewUserPermissions, SmtpTlsMode } from "../../lib/api/types";
 import { AdminUserAccessRulesPanel } from "./AdminUserAccessRulesPanel";
 import { UsersWorkspace, type PolicySectionKey } from "./users/UsersWorkspace";
+import { DetailDisclosure } from "./users/DetailDisclosure";
 import { formatRelativeTime, formatTimestamp } from "./users/format";
 import { AdminUserGlobalAccessRulesPanel } from "./AdminUserGlobalAccessRulesPanel";
 import "./user-management.css";
+import { LuxButton, LuxCheckbox, LuxProgress, LuxRadio, LuxSelectField, LuxSwitch, LuxTextField, LuxTextarea, useLuxConfirm , luxButtonClass } from "../../components/ui";
 
 const detailSections = [
   { id: "overview", label: "概览" },
@@ -156,19 +158,29 @@ function AdminUserPasswordPanel({ user }: { user: AdminUser }) {
   });
   const readOnly = user.deletedAt != null;
   return (
-    <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-password-title">
+    <section className="lux-admin-panel lux-admin-user-profile-panel lux-admin-user-password-panel" aria-labelledby="lux-admin-user-password-title">
       <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-password-title">密码</h2></div></div>
-      <p className="lux-admin-muted">修改后该用户所有已登录设备都需要重新登录；回收站中的账号不可修改。</p>
-      <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={(event) => { event.preventDefault(); if (!password || readOnly) return; setNotice(""); update.mutate(); }}>
-        <label>
-          设置新密码
-          <input type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="留空不修改" disabled={readOnly} />
-        </label>
-        <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!password || update.isPending || readOnly}>{update.isPending ? "保存中…" : "修改密码"}</button>
-          {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
-        </div>
-      </form>
+      {readOnly ? (
+        <p className="lux-admin-muted">回收站中的账号不可修改密码；恢复账号后可继续重置。</p>
+      ) : (
+        <DetailDisclosure
+          id={`user-password-${user.id}`}
+          openLabel="修改密码"
+          closeLabel="收起"
+          hint="修改后该用户所有已登录设备都需要重新登录。"
+        >
+          <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={(event) => { event.preventDefault(); if (!password) return; setNotice(""); update.mutate(); }}>
+            <label>
+              设置新密码
+              <LuxTextField type="password" value={password} onChange={(event) => setPassword(event.target.value)} autoComplete="new-password" placeholder="留空不修改" />
+            </label>
+            <div className="lux-admin-user-profile-actions">
+              <LuxButton tone="primary" type="submit" disabled={!password || update.isPending}>{update.isPending ? "保存中…" : "保存新密码"}</LuxButton>
+              {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
+            </div>
+          </form>
+        </DetailDisclosure>
+      )}
     </section>
   );
 }
@@ -206,7 +218,7 @@ function AdminUserPreferencesSection({ user }: { user: AdminUser }) {
       <section className="lux-admin-panel lux-admin-user-preferences-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-preferences-title">
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-preferences-title">账户偏好</h2></div></div>
         <p className="lux-admin-user-preferences-error" role="alert">{preferencesQuery.error instanceof Error ? preferencesQuery.error.message : "账户偏好读取失败，请重试。"}</p>
-        <button className="lux-button lux-button-secondary" type="button" onClick={() => { void preferencesQuery.refetch(); }}>重试读取偏好</button>
+        <LuxButton tone="secondary" type="button" onClick={() => { void preferencesQuery.refetch(); }}>重试读取偏好</LuxButton>
       </section>
     );
   }
@@ -335,7 +347,7 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
       <section className="lux-admin-panel lux-admin-user-content-policy" aria-labelledby="lux-admin-user-content-policy-title">
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-content-policy-title">用户内容限制</h2></div></div>
         <p className="lux-error-copy" role="alert">读取用户内容限制失败：{policyQuery.error?.message || "没有收到策略数据"}</p>
-        <button className="lux-button lux-button-secondary" type="button" onClick={() => void policyQuery.refetch()}>重试</button>
+        <LuxButton tone="secondary" type="button" onClick={() => void policyQuery.refetch()}>重试</LuxButton>
       </section>
     );
   }
@@ -384,7 +396,7 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
         <div className="lux-admin-user-content-policy-grid">
           <label>
             分级体系
-            <select
+            <LuxSelectField
               aria-label="分级体系"
               value={currentDraft.ratingSystem}
               disabled={save.isPending || versionConflict}
@@ -397,11 +409,11 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
               <option value="MPA">MPA 电影分级</option>
               <option value="TVPG">TV 家长指引</option>
               <option value="BBFC">BBFC 英国分级</option>
-            </select>
+            </LuxSelectField>
           </label>
           <label>
             最高允许等级
-            <select
+            <LuxSelectField
               aria-label="最高允许等级"
               value={currentDraft.maximumRating ?? ""}
               disabled={save.isPending || versionConflict}
@@ -409,23 +421,14 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
             >
               <option value="">不限制</option>
               {contentRatingLevels[currentDraft.ratingSystem].map((rating) => <option key={rating} value={rating}>{rating}</option>)}
-            </select>
+            </LuxSelectField>
           </label>
         </div>
-        <label className="lux-admin-user-content-policy-toggle">
-          <input
-            type="checkbox"
-            aria-label="允许未分级内容"
-            checked={currentDraft.allowUnrated}
-            disabled={save.isPending || versionConflict}
-            onChange={(event) => setDraft({ ...currentDraft, allowUnrated: event.currentTarget.checked })}
-          />
-          <span>允许未分级内容</span>
-        </label>
+        <LuxSwitch className="lux-admin-user-content-policy-toggle" aria-label="允许未分级内容" checked={currentDraft.allowUnrated} disabled={save.isPending || versionConflict} onChange={(event) => setDraft({ ...currentDraft, allowUnrated: event.currentTarget.checked })} label="允许未分级内容" />
         <div className="lux-admin-user-content-policy-grid">
           <label>
             允许标签（每行一项）
-            <textarea
+            <LuxTextarea
               aria-label="允许标签"
               rows={4}
               value={currentDraft.allowedTagsText}
@@ -436,7 +439,7 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
           </label>
           <label>
             禁止标签（每行一项）
-            <textarea
+            <LuxTextarea
               aria-label="禁止标签"
               rows={4}
               value={currentDraft.blockedTagsText}
@@ -448,10 +451,10 @@ function AdminUserContentRestrictionEditor({ user }: { user: AdminUser }) {
         </div>
         <p className="lux-admin-muted">标签按媒体分类索引匹配；每组最多 100 项。已保存的分级和标签限制由服务端用于列表筛选及详情、图片、下载、字幕和播放访问校验；缺少分类索引的条目在受限策略下按不可见处理。</p>
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || save.isPending || versionConflict}>
+          <LuxButton tone="primary" type="submit" disabled={!hasChanges || save.isPending || versionConflict}>
             {save.isPending ? "保存中…" : "保存内容限制"}
-          </button>
-          {versionConflict ? <button className="lux-button lux-button-secondary" type="button" onClick={reloadLatestPolicy}>重新读取策略</button> : null}
+          </LuxButton>
+          {versionConflict ? <LuxButton tone="secondary" type="button" onClick={reloadLatestPolicy}>重新读取策略</LuxButton> : null}
           {error ? <span role="alert">{error}</span> : null}
           {notice ? <span role="status">{notice}</span> : null}
         </div>
@@ -503,7 +506,7 @@ function AdminUserContentIndexStatus() {
       <section className="lux-admin-panel lux-admin-user-content-index" aria-labelledby="lux-admin-user-content-index-title">
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-content-index-title">内容分类索引</h2></div></div>
         <p className="lux-error-copy" role="alert">读取索引进度失败：{readiness.error.message}</p>
-        <button className="lux-button lux-button-secondary" type="button" onClick={() => void readiness.refetch()}>重试</button>
+        <LuxButton tone="secondary" type="button" onClick={() => void readiness.refetch()}>重试</LuxButton>
       </section>
     );
   }
@@ -524,7 +527,7 @@ function AdminUserContentIndexStatus() {
       ) : (
         <div className="lux-admin-user-content-index-progress" aria-live="polite">
           <div><span>已就绪</span><strong>{indexedItems.toLocaleString()} / {totalItems.toLocaleString()}</strong></div>
-          <progress aria-label="已索引条目" max={totalItems} value={Math.min(indexedItems, totalItems)} />
+          <LuxProgress label="已索引条目" max={totalItems} value={Math.min(indexedItems, totalItems)} />
           <p className="lux-admin-muted">待就绪 {pendingItems.toLocaleString()} 条。索引会在后台分批更新。</p>
         </div>
       )}
@@ -566,7 +569,7 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
           <div><h2 id="lux-admin-user-devices-title">设备清单</h2></div>
         </div>
         <p role="alert">读取设备清单失败：{devicesQuery.error.message}</p>
-        <button className="lux-button" type="button" onClick={() => void devicesQuery.refetch()}>重试</button>
+        <LuxButton type="button" onClick={() => void devicesQuery.refetch()}>重试</LuxButton>
       </section>
     );
   }
@@ -639,18 +642,16 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
       <nav className="lux-admin-user-session-pagination" aria-label="设备清单分页">
         <span>第 {devicePage.page} / {pageCount} 页</span>
         <div>
-          <button
-            className="lux-button"
+          <LuxButton
             type="button"
             disabled={devicesQuery.isFetching || devicePage.page <= 1}
             onClick={() => setPage((currentPage) => Math.max(1, currentPage - 1))}
-          >上一页</button>
-          <button
-            className="lux-button"
+          >上一页</LuxButton>
+          <LuxButton
             type="button"
             disabled={devicesQuery.isFetching || devicePage.page >= pageCount}
             onClick={() => setPage((currentPage) => currentPage + 1)}
-          >下一页</button>
+          >下一页</LuxButton>
         </div>
       </nav>
     </section>
@@ -658,6 +659,7 @@ function AdminUserDevicePanel({ user }: { user: AdminUser }) {
 }
 
 function AdminUserWebSessionsPanel({ user }: { user: AdminUser }) {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [notice, setNotice] = useState("");
@@ -697,7 +699,7 @@ function AdminUserWebSessionsPanel({ user }: { user: AdminUser }) {
       <section className="lux-admin-panel lux-admin-user-sessions lux-admin-user-web-sessions" aria-labelledby="lux-admin-user-sessions-title">
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-sessions-title">Web 登录</h2></div></div>
         <p role="alert">读取登录会话失败：{sessionsQuery.error.message}</p>
-        <button className="lux-button" type="button" onClick={() => void sessionsQuery.refetch()}>重试</button>
+        <LuxButton type="button" onClick={() => void sessionsQuery.refetch()}>重试</LuxButton>
       </section>
     );
   }
@@ -705,9 +707,9 @@ function AdminUserWebSessionsPanel({ user }: { user: AdminUser }) {
     return <AdminUserManagementState label="暂时无法读取 Web 登录会话。" error />;
   }
 
-  function requestRevoke(session: AdminUserWebSession) {
+  async function requestRevoke(session: AdminUserWebSession) {
     if (session.isCurrent || revokeSession.isPending) return;
-    if (!window.confirm("撤销此 Web 登录后，该浏览器下次访问时需要重新登录。确定撤销吗？")) return;
+    if (!(await confirm("撤销此 Web 登录后，该浏览器下次访问时需要重新登录。确定撤销吗？"))) return;
     setNotice("");
     setActionError("");
     revokeSession.mutate(session.id);
@@ -754,14 +756,13 @@ function AdminUserWebSessionsPanel({ user }: { user: AdminUser }) {
                     {session.isCurrent
                       ? <span className="lux-admin-user-session-protected">当前登录不可撤销</span>
                       : (
-                        <button
-                          className="lux-button lux-admin-user-session-revoke"
+                        <LuxButton className="lux-admin-user-session-revoke"
                           type="button"
                           disabled={revokeSession.isPending}
                           onClick={() => requestRevoke(session)}
                         >
                           {revokeSession.isPending && revokeSession.variables === session.id ? "撤销中…" : "撤销登录"}
-                        </button>
+                        </LuxButton>
                       )}
                   </td>
                 </tr>
@@ -773,18 +774,16 @@ function AdminUserWebSessionsPanel({ user }: { user: AdminUser }) {
       <nav className="lux-admin-user-session-pagination" aria-label="Web 登录分页">
         <span>第 {sessionPage.page} / {pageCount} 页</span>
         <div>
-          <button
-            className="lux-button"
+          <LuxButton
             type="button"
             disabled={sessionsQuery.isFetching || sessionPage.page <= 1}
             onClick={() => setPage((currentPage) => Math.max(1, currentPage - 1))}
-          >上一页</button>
-          <button
-            className="lux-button"
+          >上一页</LuxButton>
+          <LuxButton
             type="button"
             disabled={sessionsQuery.isFetching || sessionPage.page >= pageCount}
             onClick={() => setPage((currentPage) => currentPage + 1)}
-          >下一页</button>
+          >下一页</LuxButton>
         </div>
       </nav>
     </section>
@@ -792,6 +791,7 @@ function AdminUserWebSessionsPanel({ user }: { user: AdminUser }) {
 }
 
 function AdminUserEmbySessionsPanel({ user }: { user: AdminUser }) {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [notice, setNotice] = useState("");
@@ -848,7 +848,7 @@ function AdminUserEmbySessionsPanel({ user }: { user: AdminUser }) {
       <section className="lux-admin-panel lux-admin-user-sessions" aria-labelledby="lux-admin-user-emby-sessions-title">
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-emby-sessions-title">Emby 登录</h2></div></div>
         <p role="alert">读取 Emby 登录失败：{sessionsQuery.error.message}</p>
-        <button className="lux-button" type="button" onClick={() => void sessionsQuery.refetch()}>重试</button>
+        <LuxButton type="button" onClick={() => void sessionsQuery.refetch()}>重试</LuxButton>
       </section>
     );
   }
@@ -856,19 +856,19 @@ function AdminUserEmbySessionsPanel({ user }: { user: AdminUser }) {
     return <AdminUserManagementState label="暂时无法读取 Emby 登录凭证。" error />;
   }
 
-  function requestRevoke(session: AdminUserEmbySession) {
+  async function requestRevoke(session: AdminUserEmbySession) {
     if (isRevoking) return;
-    if (!window.confirm("撤销此 Emby 登录凭证后，对应客户端需要重新登录。确定撤销吗？")) return;
+    if (!(await confirm("撤销此 Emby 登录凭证后，对应客户端需要重新登录。确定撤销吗？"))) return;
     setNotice("");
     setActionError("");
     revokeSession.mutate(session.id);
   }
 
-  function requestRevokeAll() {
+  async function requestRevokeAll() {
     if (isRevoking || totalSessionCount === 0) return;
-    if (!window.confirm(
+    if (!(await confirm(
       "即将撤销此用户全部 " + totalSessionCount + " 个有效 Emby 登录凭证，对应客户端需要重新登录。确定继续吗？",
-    )) return;
+    ))) return;
     setNotice("");
     setActionError("");
     revokeAllSessions.mutate();
@@ -881,14 +881,13 @@ function AdminUserEmbySessionsPanel({ user }: { user: AdminUser }) {
           <h2 id="lux-admin-user-emby-sessions-title">Emby 登录</h2>
           <p className="lux-admin-user-session-summary">{sessionPage.totalCount} 个有效 Emby 登录凭证</p>
         </div>
-        <button
-          className="lux-button lux-admin-user-session-revoke-all"
+        <LuxButton className="lux-admin-user-session-revoke-all"
           type="button"
           disabled={isRevoking || sessionsQuery.isFetching || sessionPage.totalCount === 0}
           onClick={requestRevokeAll}
         >
           {revokeAllSessions.isPending ? "正在撤销…" : "撤销全部 Emby 登录"}
-        </button>
+        </LuxButton>
       </div>
       {actionError ? <p role="alert">{actionError}</p> : null}
       {notice ? <p role="status">{notice}</p> : null}
@@ -920,14 +919,13 @@ function AdminUserEmbySessionsPanel({ user }: { user: AdminUser }) {
                   <td><WebSessionDate value={session.createdAt} /></td>
                   <td>{session.lastSeenAt == null ? "最近活动未知" : <WebSessionDate value={session.lastSeenAt} />}</td>
                   <td>
-                    <button
-                      className="lux-button lux-admin-user-session-revoke"
+                    <LuxButton className="lux-admin-user-session-revoke"
                       type="button"
                       disabled={isRevoking}
                       onClick={() => requestRevoke(session)}
                     >
                       {revokeSession.isPending && revokeSession.variables === session.id ? "撤销中…" : "撤销登录"}
-                    </button>
+                    </LuxButton>
                   </td>
                 </tr>
               ))}
@@ -938,18 +936,16 @@ function AdminUserEmbySessionsPanel({ user }: { user: AdminUser }) {
       <nav className="lux-admin-user-session-pagination" aria-label="Emby 登录分页">
         <span>第 {sessionPage.page} / {pageCount} 页</span>
         <div>
-          <button
-            className="lux-button"
+          <LuxButton
             type="button"
             disabled={sessionsQuery.isFetching || sessionPage.page <= 1}
             onClick={() => setPage((currentPage) => Math.max(1, currentPage - 1))}
-          >上一页</button>
-          <button
-            className="lux-button"
+          >上一页</LuxButton>
+          <LuxButton
             type="button"
             disabled={sessionsQuery.isFetching || sessionPage.page >= pageCount}
             onClick={() => setPage((currentPage) => currentPage + 1)}
-          >下一页</button>
+          >下一页</LuxButton>
         </div>
       </nav>
     </section>
@@ -967,6 +963,7 @@ function WebSessionDate({ value }: { value: number }) {
 }
 
 function AdminUserPlaybackSessionsPanel({ user }: { user: AdminUser }) {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [notice, setNotice] = useState("");
@@ -1005,7 +1002,7 @@ function AdminUserPlaybackSessionsPanel({ user }: { user: AdminUser }) {
       <section className="lux-admin-panel lux-admin-user-playback-sessions" aria-labelledby="lux-admin-user-playback-sessions-title">
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-playback-sessions-title">当前播放</h2></div></div>
         <p role="alert">读取当前播放失败：{sessionsQuery.error.message}</p>
-        <button className="lux-button" type="button" onClick={() => void sessionsQuery.refetch()}>重试</button>
+        <LuxButton type="button" onClick={() => void sessionsQuery.refetch()}>重试</LuxButton>
       </section>
     );
   }
@@ -1013,9 +1010,9 @@ function AdminUserPlaybackSessionsPanel({ user }: { user: AdminUser }) {
     return <AdminUserManagementState label="暂时无法读取当前播放。" error />;
   }
 
-  function requestStop(session: AdminUserPlaybackSession) {
+  async function requestStop(session: AdminUserPlaybackSession) {
     if (!session.canStop || stopSession.isPending) return;
-    if (!window.confirm("将停止此用户通过 Lux 服务端 HLS 进行的播放。用户登录仍然有效。确定停止吗？")) return;
+    if (!(await confirm("将停止此用户通过 Lux 服务端 HLS 进行的播放。用户登录仍然有效。确定停止吗？"))) return;
     setNotice("");
     setActionError("");
     stopSession.mutate(session.id);
@@ -1066,10 +1063,11 @@ function AdminUserPlaybackSessionsPanel({ user }: { user: AdminUser }) {
                   <td>
                     <div className="lux-admin-user-playback-progress">
                       {session.durationTicks != null && session.durationTicks > 0 ? (
-                        <progress
-                          aria-label={`${session.title} 播放进度`}
+                        <LuxProgress
+                          label={`${session.title} 播放进度`}
                           max={session.durationTicks}
                           value={Math.min(Math.max(session.positionTicks, 0), session.durationTicks)}
+                          size="compact"
                         />
                       ) : null}
                       <span>{playbackProgressLabel(session)}</span>
@@ -1091,14 +1089,13 @@ function AdminUserPlaybackSessionsPanel({ user }: { user: AdminUser }) {
                   <td>{session.isPaused || session.state === "PAUSED" ? "已暂停" : "正在播放"}</td>
                   <td>
                     {session.canStop ? (
-                      <button
-                        className="lux-button lux-admin-user-session-revoke lux-admin-user-playback-stop"
+                      <LuxButton className="lux-admin-user-session-revoke lux-admin-user-playback-stop"
                         type="button"
                         disabled={stopSession.isPending}
                         onClick={() => requestStop(session)}
                       >
                         {stopSession.isPending && stopSession.variables === session.id ? "停止中…" : "停止播放"}
-                      </button>
+                      </LuxButton>
                     ) : <span className="lux-admin-user-session-protected">无法远程停止</span>}
                   </td>
                 </tr>
@@ -1111,18 +1108,16 @@ function AdminUserPlaybackSessionsPanel({ user }: { user: AdminUser }) {
         <nav className="lux-admin-user-session-pagination" aria-label="当前播放分页">
           <span>第 {sessionPage.page} / {pageCount} 页</span>
           <div>
-            <button
-              className="lux-button"
+            <LuxButton
               type="button"
               disabled={sessionsQuery.isFetching || sessionPage.page <= 1}
               onClick={() => setPage((currentPage) => Math.max(1, currentPage - 1))}
-            >上一页</button>
-            <button
-              className="lux-button"
+            >上一页</LuxButton>
+            <LuxButton
               type="button"
               disabled={sessionsQuery.isFetching || sessionPage.page >= pageCount}
               onClick={() => setPage((currentPage) => currentPage + 1)}
-            >下一页</button>
+            >下一页</LuxButton>
           </div>
         </nav>
       ) : null}
@@ -1232,26 +1227,26 @@ function AdminUserActivityPanel({ user }: { user: AdminUser }) {
       <form className="lux-admin-user-activity-filters" onSubmit={applyFilters}>
         <label>
           事件类型
-          <select aria-label="事件类型" value={eventTypeDraft} onChange={(event) => setEventTypeDraft(event.currentTarget.value)}>
+          <LuxSelectField aria-label="事件类型" value={eventTypeDraft} onChange={(event) => setEventTypeDraft(event.currentTarget.value)}>
             <option value="">全部事件</option>
             <option value="AUTH_LOGIN">成功登录</option>
             <option value="AUTH_LOGIN_FAILED">登录失败</option>
             <option value="PLAYBACK_STARTED">开始播放</option>
             <option value="PLAYBACK_PAUSED">暂停播放</option>
             <option value="PLAYBACK_STOPPED">停止播放</option>
-          </select>
+          </LuxSelectField>
         </label>
         <label>
           开始时间
-          <input aria-label="开始时间" type="datetime-local" value={fromDraft} onChange={(event) => setFromDraft(event.currentTarget.value)} />
+          <LuxTextField aria-label="开始时间" type="datetime-local" value={fromDraft} onChange={(event) => setFromDraft(event.currentTarget.value)} />
         </label>
         <label>
           结束时间
-          <input aria-label="结束时间" type="datetime-local" value={toDraft} onChange={(event) => setToDraft(event.currentTarget.value)} />
+          <LuxTextField aria-label="结束时间" type="datetime-local" value={toDraft} onChange={(event) => setToDraft(event.currentTarget.value)} />
         </label>
         <div className="lux-admin-user-activity-filter-actions">
-          <button className="lux-button lux-button-primary" type="submit">应用筛选</button>
-          <button className="lux-button" type="button" onClick={clearFilters}>清除</button>
+          <LuxButton tone="primary" type="submit">应用筛选</LuxButton>
+          <LuxButton type="button" onClick={clearFilters}>清除</LuxButton>
         </div>
       </form>
       {filterError ? <p className="lux-error-copy" role="alert">{filterError}</p> : null}
@@ -1260,7 +1255,7 @@ function AdminUserActivityPanel({ user }: { user: AdminUser }) {
       ) : activityQuery.error ? (
         <div className="lux-admin-user-activity-state">
           <p className="lux-error-copy" role="alert">读取活动记录失败：{activityQuery.error.message}</p>
-          <button className="lux-button" type="button" onClick={() => void activityQuery.refetch()}>重试</button>
+          <LuxButton type="button" onClick={() => void activityQuery.refetch()}>重试</LuxButton>
         </div>
       ) : !activityPage ? (
         <p className="lux-admin-muted" role="status">暂时无法读取活动记录。</p>
@@ -1288,18 +1283,16 @@ function AdminUserActivityPanel({ user }: { user: AdminUser }) {
           <span>第 {activityPage.page} / {pageCount} 页</span>
           <span>共 {activityPage.totalCount} 条</span>
           <div>
-            <button
-              className="lux-button"
+            <LuxButton
               type="button"
               disabled={activityQuery.isFetching || activityPage.page <= 1}
               onClick={() => setPage((currentPage) => Math.max(1, currentPage - 1))}
-            >上一页</button>
-            <button
-              className="lux-button"
+            >上一页</LuxButton>
+            <LuxButton
               type="button"
               disabled={activityQuery.isFetching || activityPage.page >= pageCount}
               onClick={() => setPage((currentPage) => currentPage + 1)}
-            >下一页</button>
+            >下一页</LuxButton>
           </div>
         </nav>
       ) : null}
@@ -1361,6 +1354,7 @@ function AdminUserPermissionsSection({ user }: { user: AdminUser }) {
 }
 
 function AdminUserPermissionPresetEditor({ user }: { user: AdminUser }) {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const presetsQuery = useQuery({
     queryKey: ["admin", "user-permission-presets"],
@@ -1391,11 +1385,11 @@ function AdminUserPermissionPresetEditor({ user }: { user: AdminUser }) {
   const appliedAt = presetSource ? new Date(presetSource.appliedAt * 1000) : null;
   const appliedAtIsValid = appliedAt != null && Number.isFinite(appliedAt.getTime());
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     if (!selectedPreset || apply.isPending) return;
     const displayName = user.displayName || user.usernameNormalized;
-    const accepted = window.confirm(
+    const accepted = await confirm(
       `将“${selectedPreset.name}”应用到“${displayName}”会替换该用户当前的角色、媒体库、下载、播放和转码权限。确定继续吗？`,
     );
     if (!accepted) return;
@@ -1424,7 +1418,7 @@ function AdminUserPermissionPresetEditor({ user }: { user: AdminUser }) {
       <form className="lux-admin-form lux-admin-user-preset-form" onSubmit={submit}>
         <label htmlFor={`lux-admin-user-preset-${user.id}`}>
           选择角色预设
-          <select
+          <LuxSelectField
             id={`lux-admin-user-preset-${user.id}`}
             aria-label="选择角色预设"
             value={selectedPresetId}
@@ -1439,13 +1433,13 @@ function AdminUserPermissionPresetEditor({ user }: { user: AdminUser }) {
             {presets.map((preset) => (
               <option key={preset.id} value={preset.id}>{preset.name}{preset.isBuiltin ? "（内置）" : "（自定义）"}</option>
             ))}
-          </select>
+          </LuxSelectField>
         </label>
         <p className="lux-admin-muted">应用会覆盖该用户当前的角色、媒体库、下载、播放和转码权限；观看记录、偏好及登录凭证不会改变。</p>
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!selectedPreset || apply.isPending || Boolean(presetsQuery.error)}>
+          <LuxButton tone="primary" type="submit" disabled={!selectedPreset || apply.isPending || Boolean(presetsQuery.error)}>
             {apply.isPending ? "应用中…" : "应用所选预设"}
-          </button>
+          </LuxButton>
           {error ? <span role="alert">应用失败：{error}</span> : null}
           {notice ? <span role="status">{notice}</span> : null}
         </div>
@@ -1555,39 +1549,9 @@ function AdminUserLibraryAccessEditor({ user }: { user: AdminUser }) {
       >
         <fieldset className="lux-admin-user-access-modes">
           <legend>媒体库访问范围</legend>
-          <label>
-            <input
-              type="radio"
-              name={`library-access-${user.id}`}
-              value="ALL"
-              checked={draftMode === "ALL"}
-              disabled={update.isPending}
-              onChange={() => { setModeDraft("ALL"); setNotice(""); setError(""); }}
-            />
-            <span><strong>全部媒体库</strong><small>允许访问所有已启用媒体库，包括之后新增的媒体库。</small></span>
-          </label>
-          <label>
-            <input
-              type="radio"
-              name={`library-access-${user.id}`}
-              value="SELECTED"
-              checked={draftMode === "SELECTED"}
-              disabled={update.isPending}
-              onChange={() => { setModeDraft("SELECTED"); setNotice(""); setError(""); }}
-            />
-            <span><strong>指定媒体库</strong><small>仅允许访问下方勾选的媒体库。</small></span>
-          </label>
-          <label>
-            <input
-              type="radio"
-              name={`library-access-${user.id}`}
-              value="NONE"
-              checked={draftMode === "NONE"}
-              disabled={update.isPending}
-              onChange={() => { setModeDraft("NONE"); setNotice(""); setError(""); }}
-            />
-            <span><strong>无媒体库权限</strong><small>用户不能浏览、搜索或播放任何媒体库内容。</small></span>
-          </label>
+          <LuxRadio name={`library-access-${user.id}`} value="ALL" checked={draftMode === "ALL"} disabled={update.isPending} onChange={() => { setModeDraft("ALL"); setNotice(""); setError(""); }} label=<><strong>全部媒体库</strong><small>允许访问所有已启用媒体库，包括之后新增的媒体库。</small></> />
+          <LuxRadio name={`library-access-${user.id}`} value="SELECTED" checked={draftMode === "SELECTED"} disabled={update.isPending} onChange={() => { setModeDraft("SELECTED"); setNotice(""); setError(""); }} label=<><strong>指定媒体库</strong><small>仅允许访问下方勾选的媒体库。</small></> />
+          <LuxRadio name={`library-access-${user.id}`} value="NONE" checked={draftMode === "NONE"} disabled={update.isPending} onChange={() => { setModeDraft("NONE"); setNotice(""); setError(""); }} label=<><strong>无媒体库权限</strong><small>用户不能浏览、搜索或播放任何媒体库内容。</small></> />
         </fieldset>
         {draftMode === "ALL" ? <p className="lux-admin-muted">可访问所有已启用媒体库，包括之后新增的媒体库。</p> : null}
         {draftMode === "NONE" ? <p className="lux-admin-muted">不能访问任何媒体库。</p> : null}
@@ -1606,24 +1570,16 @@ function AdminUserLibraryAccessEditor({ user }: { user: AdminUser }) {
             {enabledLibraries.length ? (
               <div className="lux-admin-library-access">
                 {enabledLibraries.map((library) => (
-                  <label key={library.id}>
-                    <input
-                      type="checkbox"
-                      checked={enabledDraftIds.includes(library.id)}
-                      disabled={update.isPending}
-                      onChange={(event) => toggleLibrary(library.id, event.currentTarget.checked)}
-                    />
-                    <span>{library.name}</span>
-                  </label>
+                  <LuxCheckbox key={library.id} checked={enabledDraftIds.includes(library.id)} disabled={update.isPending} onChange={(event) => toggleLibrary(library.id, event.currentTarget.checked)} label=<>{library.name}</> />
                 ))}
               </div>
             ) : null}
           </>
         ) : null}
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || update.isPending}>
+          <LuxButton tone="primary" type="submit" disabled={!hasChanges || update.isPending}>
             {update.isPending ? "保存中…" : "保存媒体库权限"}
-          </button>
+          </LuxButton>
           {error ? <span role="alert">保存失败：{error}</span> : null}
           {notice ? <span role="status">{notice}</span> : null}
         </div>
@@ -1701,26 +1657,14 @@ function AdminUserPlaybackPolicyEditor({ user }: { user: AdminUser }) {
       <form className="lux-admin-form lux-admin-user-playback-form" onSubmit={submit}>
         <fieldset className="lux-admin-user-playback-options">
           <legend className="lux-admin-muted">播放权限</legend>
-          <label className="lux-admin-user-playback-toggle">
-            <input type="checkbox" aria-label="允许播放" checked={currentDraft.canPlay} onChange={(event) => setDraft({ ...currentDraft, canPlay: event.currentTarget.checked })} />
-            <span>允许播放</span>
-          </label>
-          <label className="lux-admin-user-playback-toggle">
-            <input type="checkbox" aria-label="允许封装转换" checked={currentDraft.allowRemux} onChange={(event) => setDraft({ ...currentDraft, allowRemux: event.currentTarget.checked })} />
-            <span>允许封装转换</span>
-          </label>
-          <label className="lux-admin-user-playback-toggle">
-            <input type="checkbox" aria-label="允许音频转码" checked={currentDraft.allowAudioTranscode} onChange={(event) => setDraft({ ...currentDraft, allowAudioTranscode: event.currentTarget.checked })} />
-            <span>允许音频转码</span>
-          </label>
-          <label className="lux-admin-user-playback-toggle">
-            <input type="checkbox" aria-label="允许视频转码" checked={currentDraft.allowVideoTranscode} onChange={(event) => setDraft({ ...currentDraft, allowVideoTranscode: event.currentTarget.checked })} />
-            <span>允许视频转码</span>
-          </label>
+          <LuxSwitch className="lux-admin-user-playback-toggle" aria-label="允许播放" checked={currentDraft.canPlay} onChange={(event) => setDraft({ ...currentDraft, canPlay: event.currentTarget.checked })} label="允许播放" />
+          <LuxSwitch className="lux-admin-user-playback-toggle" aria-label="允许封装转换" checked={currentDraft.allowRemux} onChange={(event) => setDraft({ ...currentDraft, allowRemux: event.currentTarget.checked })} label="允许封装转换" />
+          <LuxSwitch className="lux-admin-user-playback-toggle" aria-label="允许音频转码" checked={currentDraft.allowAudioTranscode} onChange={(event) => setDraft({ ...currentDraft, allowAudioTranscode: event.currentTarget.checked })} label="允许音频转码" />
+          <LuxSwitch className="lux-admin-user-playback-toggle" aria-label="允许视频转码" checked={currentDraft.allowVideoTranscode} onChange={(event) => setDraft({ ...currentDraft, allowVideoTranscode: event.currentTarget.checked })} label="允许视频转码" />
         </fieldset>
         <label className="lux-admin-user-playback-limit">
           同时播放上限
-          <input
+          <LuxTextField
             type="number"
             aria-label="同时播放上限"
             aria-invalid={!validLimit}
@@ -1735,9 +1679,9 @@ function AdminUserPlaybackPolicyEditor({ user }: { user: AdminUser }) {
         <p className="lux-admin-muted">新建播放会话会按当前策略校验准入、并发和转码；已签发的服务端 HLS 资源会在每次请求时重新检查，STRM 只允许直放。</p>
         {limitInput.trim() === "" || !validLimit ? <p className="lux-admin-user-playback-validation" role="alert">请输入非负整数。</p> : null}
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!hasChanges || !validLimit || save.isPending}>
+          <LuxButton tone="primary" type="submit" disabled={!hasChanges || !validLimit || save.isPending}>
             {save.isPending ? "保存中…" : "保存播放策略"}
-          </button>
+          </LuxButton>
           {error ? <span role="alert">{error}</span> : null}
           {notice ? <span role="status">{notice}</span> : null}
         </div>
@@ -1784,6 +1728,8 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
     ? user.emailVerifiedAt ? "已验证" : "未验证"
     : "未填写";
   const hasChanges = displayName !== (user.displayName ?? "") || email !== (user.email ?? "");
+  const readOnly = user.deletedAt != null;
+  const statusLabel = user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常";
 
   function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -1794,59 +1740,74 @@ function AdminUserProfileEditor({ user }: { user: AdminUser }) {
   return (
     <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-user-profile-title">
       <div className="lux-admin-panel-heading">
-        <div><h2 id="lux-admin-user-profile-title">资料与状态</h2></div>
-        <span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>
-          {user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常"}
-        </span>
+        <div><h2 id="lux-admin-user-profile-title">账户资料</h2></div>
+        <span className={readOnly || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{statusLabel}</span>
       </div>
-      <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
-        <div className="lux-admin-user-avatar-row">
-          <span className="lux-admin-user-avatar is-profile">
-            {avatarFailed ? <UserRound size={27} /> : <img src={api.adminUserAvatarUrl(user.id, avatarVersion)} alt="" onError={() => setAvatarFailed(true)} />}
-          </span>
-          <div className="lux-admin-user-avatar-actions">
-            <strong>头像</strong>
-            <label className="lux-button lux-button-secondary lux-admin-user-avatar-upload">
-              <span>{updateAvatar.isPending ? "上传中…" : "更换头像"}</span>
-              <input
-                type="file"
-                accept="image/jpeg,image/png,image/webp"
-                aria-label="更换用户头像"
-                disabled={user.deletedAt != null || updateAvatar.isPending}
-                onChange={(event) => {
-                  const file = event.currentTarget.files?.[0];
-                  event.currentTarget.value = "";
-                  if (file) {
-                    setAvatarNotice("");
-                    updateAvatar.mutate(file);
-                  }
-                }}
-              />
+      <div className="lux-admin-user-profile-summary">
+        <span className="lux-admin-user-avatar is-profile">
+          {avatarFailed ? <UserRound size={27} /> : <img src={api.adminUserAvatarUrl(user.id, avatarVersion)} alt="" onError={() => setAvatarFailed(true)} />}
+        </span>
+        <dl className="lux-admin-user-profile-facts">
+          <div><dt>显示名称</dt><dd>{user.displayName?.trim() || "未设置"}</dd></div>
+          <div><dt>邮箱</dt><dd>{user.email || "未填写"}<small>{emailStatus}</small></dd></div>
+          <div><dt>用户名</dt><dd>@{user.usernameNormalized}</dd></div>
+        </dl>
+      </div>
+      {readOnly ? (
+        <p className="lux-admin-muted">回收站中的账号资料为只读。</p>
+      ) : (
+        <DetailDisclosure
+          id={`user-profile-${user.id}`}
+          openLabel="编辑资料"
+          closeLabel="收起编辑"
+          hint="需要修改头像、显示名称或邮箱时再展开。"
+        >
+          <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
+            <div className="lux-admin-user-avatar-actions">
+              <strong>头像</strong>
+              <label className={luxButtonClass({ tone: "secondary", className: "lux-admin-user-avatar-upload" })}>
+                <span>{updateAvatar.isPending ? "上传中…" : "更换头像"}</span>
+                <input
+                  type="file"
+                  accept="image/jpeg,image/png,image/webp"
+                  aria-label="更换用户头像"
+                  disabled={updateAvatar.isPending}
+                  onChange={(event) => {
+                    const file = event.currentTarget.files?.[0];
+                    event.currentTarget.value = "";
+                    if (file) {
+                      setAvatarNotice("");
+                      updateAvatar.mutate(file);
+                    }
+                  }}
+                />
+              </label>
+              {avatarNotice ? <span role={updateAvatar.isError ? "alert" : "status"}>{avatarNotice}</span> : null}
+            </div>
+            <label>
+              显示名称
+              <LuxTextField value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={128} />
             </label>
-            {avatarNotice ? <span role={updateAvatar.isError ? "alert" : "status"}>{avatarNotice}</span> : null}
-          </div>
-        </div>
-        <label>
-          显示名称
-          <input value={displayName} onChange={(event) => setDisplayName(event.target.value)} maxLength={128} disabled={user.deletedAt != null} />
-        </label>
-        <label>
-          邮箱
-          <input type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" disabled={user.deletedAt != null} />
-        </label>
-        <p className="lux-admin-muted">{user.deletedAt != null ? "回收站中的账号资料为只读。" : `邮箱状态：${emailStatus}。管理员修改邮箱会清除验证状态；用户可在账户设置保存当前邮箱以发送验证邮件。`}</p>
-        <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={user.deletedAt != null || !hasChanges || update.isPending}>
-            {update.isPending ? "保存中…" : "保存资料"}
-          </button>
-          {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
-        </div>
-      </form>
+            <label>
+              邮箱
+              <LuxTextField type="email" value={email} onChange={(event) => setEmail(event.target.value)} autoComplete="email" />
+            </label>
+            <p className="lux-admin-muted">{`邮箱状态：${emailStatus}。管理员修改邮箱会清除验证状态；用户可在账户设置保存当前邮箱以发送验证邮件。`}</p>
+            <div className="lux-admin-user-profile-actions">
+              <LuxButton tone="primary" type="submit" disabled={!hasChanges || update.isPending}>
+                {update.isPending ? "保存中…" : "保存资料"}
+              </LuxButton>
+              {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
+            </div>
+          </form>
+        </DetailDisclosure>
+      )}
     </section>
   );
 }
 
 function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
+  const confirm = useLuxConfirm();
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [error, setError] = useState("");
@@ -1865,63 +1826,74 @@ function AdminUserLifecycleActions({ user }: { user: AdminUser }) {
   const pending = disable.isPending || enable.isPending || remove.isPending || restore.isPending || purge.isPending || updateRole.isPending;
   const displayName = user.displayName || user.usernameNormalized;
 
-  function confirmDisable() {
-    if (pending || !window.confirm(`禁用“${displayName}”后会撤销登录凭证并停止播放，账号资料仍会保留。确定继续吗？`)) return;
+  async function confirmDisable() {
+    if (pending || !(await confirm(`禁用“${displayName}”后会撤销登录凭证并停止播放，账号资料仍会保留。确定继续吗？`))) return;
     setError("");
     disable.mutate();
   }
 
-  function confirmEnable() {
-    if (pending || !window.confirm(`启用“${displayName}”后，用户可以重新登录。确定继续吗？`)) return;
+  async function confirmEnable() {
+    if (pending || !(await confirm(`启用“${displayName}”后，用户可以重新登录。确定继续吗？`))) return;
     setError("");
     enable.mutate();
   }
 
-  function confirmDelete() {
+  async function confirmDelete() {
     const retention = graceDays === undefined ? "按服务器当前配置的期限保留" : `保留 ${graceDays} 天`;
-    if (pending || !window.confirm(`将“${displayName}”移入回收站会撤销凭证并停止播放，账号会${retention}，可在期限内恢复。确定继续吗？`)) return;
+    if (pending || !(await confirm(`将“${displayName}”移入回收站会撤销凭证并停止播放，账号会${retention}，可在期限内恢复。确定继续吗？`))) return;
     setError("");
     remove.mutate();
   }
 
-  function confirmPurge() {
-    if (pending || !window.confirm(`彻底删除“${displayName}”将永久删除账号、头像、权限设置、偏好、播放记录和设备关联，媒体文件不受影响，且无法恢复。确定继续吗？`)) return;
+  async function confirmPurge() {
+    if (pending || !(await confirm(`彻底删除“${displayName}”将永久删除账号、头像、权限设置、偏好、播放记录和设备关联，媒体文件不受影响，且无法恢复。确定继续吗？`))) return;
     setError("");
     purge.mutate();
   }
 
-  function confirmManageServer(next: boolean) {
+  async function confirmManageServer(next: boolean) {
     if (pending || user.deletedAt != null) return;
     const prompt = next
       ? `将“${displayName}”设为服务器管理员？该用户可以管理媒体库、插件、服务器设置与其他用户。`
       : `取消“${displayName}”的服务器管理员权限？该用户将不能再管理服务器。`;
-    if (!window.confirm(prompt)) return;
+    if (!(await confirm(prompt))) return;
     setError("");
     updateRole.mutate(next);
   }
 
+  const statusLabel = user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常";
+
   return (
     <section className="lux-admin-panel lux-admin-user-lifecycle-panel" aria-labelledby="lux-admin-user-lifecycle-title">
-      <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-lifecycle-title">账号状态</h2></div><span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{user.deletedAt != null ? "回收站" : user.isDisabled ? "已禁用" : "正常"}</span></div>
-      {user.deletedAt != null ? <p className="lux-admin-muted">删除于 {user.deletedAt ? new Date(user.deletedAt * 1000).toLocaleString() : "未知"} · 计划清理 {user.deletionPurgeAt ? new Date(user.deletionPurgeAt * 1000).toLocaleString() : "未知"}</p> : null}
-      {user.deletedAt == null ? (
-        <label className="lux-admin-toggle" style={{ marginBottom: 14 }}>
-          <input type="checkbox" checked={user.canManageServer} disabled={pending} onChange={(event) => confirmManageServer(event.target.checked)} />
-          <span>服务器管理员</span>
-        </label>
-      ) : null}
-      <div className="lux-admin-user-profile-actions">
-        {user.deletedAt != null ? <>
-          <button className="lux-button lux-button-secondary" type="button" onClick={() => restore.mutate()} disabled={pending}>{restore.isPending ? "恢复中…" : "恢复账号"}</button>
-          <button className="lux-button lux-button-secondary lux-admin-purge-user" type="button" onClick={confirmPurge} disabled={pending}>{purge.isPending ? "删除中…" : "彻底删除"}</button>
-        </> : <>
-          {user.isDisabled
-            ? <button className="lux-button lux-button-secondary" type="button" onClick={confirmEnable} disabled={pending}>{enable.isPending ? "启用中…" : "启用账号"}</button>
-            : <button className="lux-button lux-button-secondary" type="button" onClick={confirmDisable} disabled={pending}>{disable.isPending ? "禁用中…" : "禁用账号"}</button>}
-          <button className="lux-button lux-button-secondary lux-admin-purge-user" type="button" onClick={confirmDelete} disabled={pending}>{remove.isPending ? "移入回收站…" : "移入回收站"}</button>
-        </>}
-        {error ? <span role="alert">操作失败：{error}</span> : null}
-      </div>
+      <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-user-lifecycle-title">账号状态</h2></div><span className={user.deletedAt != null || user.isDisabled ? "lux-user-badge is-warn" : "lux-user-badge is-ok"}>{statusLabel}</span></div>
+      <dl className="lux-admin-user-lifecycle-facts">
+        <div><dt>登录状态</dt><dd>{statusLabel}</dd></div>
+        <div><dt>角色</dt><dd>{user.canManageServer ? "服务器管理员" : "普通用户"}</dd></div>
+        {user.deletedAt != null ? <div><dt>移入回收站</dt><dd>{formatTimestamp(user.deletedAt)}</dd></div> : null}
+        {user.deletedAt != null && user.deletionPurgeAt != null ? <div><dt>计划清理</dt><dd>{formatTimestamp(user.deletionPurgeAt)}</dd></div> : null}
+      </dl>
+      <DetailDisclosure
+        id={`user-lifecycle-${user.id}`}
+        openLabel="账号操作"
+        closeLabel="收起操作"
+        hint="禁用、移入回收站、恢复与彻底删除只在需要时展开。"
+      >
+        {user.deletedAt == null ? (
+          <LuxSwitch className="lux-admin-toggle" style={{ marginBottom: 14 }} checked={user.canManageServer} disabled={pending} onChange={(event) => confirmManageServer(event.target.checked)} label="服务器管理员" />
+        ) : null}
+        <div className="lux-admin-user-profile-actions">
+          {user.deletedAt != null ? <>
+            <LuxButton tone="secondary" type="button" onClick={() => restore.mutate()} disabled={pending}>{restore.isPending ? "恢复中…" : "恢复账号"}</LuxButton>
+            <LuxButton tone="secondary" className="lux-admin-purge-user" type="button" onClick={confirmPurge} disabled={pending}>{purge.isPending ? "删除中…" : "彻底删除"}</LuxButton>
+          </> : <>
+            {user.isDisabled
+              ? <LuxButton tone="secondary" type="button" onClick={confirmEnable} disabled={pending}>{enable.isPending ? "启用中…" : "启用账号"}</LuxButton>
+              : <LuxButton tone="secondary" type="button" onClick={confirmDisable} disabled={pending}>{disable.isPending ? "禁用中…" : "禁用账号"}</LuxButton>}
+            <LuxButton tone="secondary" className="lux-admin-purge-user" type="button" onClick={confirmDelete} disabled={pending}>{remove.isPending ? "移入回收站…" : "移入回收站"}</LuxButton>
+          </>}
+          {error ? <span role="alert">操作失败：{error}</span> : null}
+        </div>
+      </DetailDisclosure>
     </section>
   );
 }
@@ -1950,7 +1922,7 @@ export function AdminUserSettingsPage() {
           <p>下面的设置对新用户与全站生效，不针对单个用户。</p>
         </div>
         <div className="lux-users-heading-actions">
-          <Link className="lux-button lux-button-secondary" to="/admin/users"><ArrowLeft size={15} aria-hidden="true" />返回用户列表</Link>
+          <Link className={luxButtonClass({ tone: "secondary" })} to="/admin/users"><ArrowLeft size={15} aria-hidden="true" />返回用户列表</Link>
         </div>
       </header>
       <UsersWorkspace activeSection={activeSection}>
@@ -1988,7 +1960,7 @@ function TrustedProxyPlaceholder() {
       </div>
       <p className="lux-admin-muted">只有来自可信代理的连接才会采用 X-Forwarded-For 判断来源 IP；该配置尚未在当前版本开放，在此之前不会使用转发头做访问控制。</p>
       <div className="lux-admin-user-profile-actions">
-        <button className="lux-button lux-button-secondary" type="button" disabled>保存可信代理</button>
+        <LuxButton tone="secondary" type="button" disabled>保存可信代理</LuxButton>
       </div>
     </section>
   );
@@ -2024,7 +1996,7 @@ function AdminUserRegistrationSettings() {
   if (!settings.data || settings.isError) return (
     <section className="lux-admin-panel">
       <p className="lux-error-copy" role="alert">读取注册设置失败，请重新加载。</p>
-      <button className="lux-button lux-button-secondary" type="button" onClick={() => void settings.refetch()} disabled={settings.isFetching}>重新加载注册设置</button>
+      <LuxButton tone="secondary" type="button" onClick={() => void settings.refetch()} disabled={settings.isFetching}>重新加载注册设置</LuxButton>
     </section>
   );
   const mode = draft ?? settings.data.registrationMode;
@@ -2043,12 +2015,12 @@ function AdminUserRegistrationSettings() {
       <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-registration-title">注册与邀请</h2></div></div>
       <p className="lux-admin-muted">默认采用邀请制，管理员也可以直接创建账户。关闭公开注册不会撤销仍有效的已发邀请。</p>
       <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit} aria-busy={update.isPending} aria-describedby="lux-admin-registration-help">
-        <label>注册模式<select aria-label="注册模式" value={mode} disabled={update.isPending} onChange={(event) => { setDraft(event.target.value as RegistrationMode); setNotice(""); update.reset(); }}>
+        <label>注册模式<LuxSelectField aria-label="注册模式" value={mode} disabled={update.isPending} onChange={(event) => { setDraft(event.target.value as RegistrationMode); setNotice(""); update.reset(); }}>
           <option value="INVITATION_ONLY">仅邀请注册</option><option value="PUBLIC_EMAIL">公开邮箱注册</option>
-        </select></label>
+        </LuxSelectField></label>
         <p id="lux-admin-registration-help" className="lux-admin-muted">公开申请需先验证邮箱，再等待管理员审批。账户权限由管理员分配，申请者不能自行选择权限。</p>
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!changed || update.isPending}>{update.isPending ? "保存中…" : "保存注册模式"}</button>
+          <LuxButton tone="primary" type="submit" disabled={!changed || update.isPending}>{update.isPending ? "保存中…" : "保存注册模式"}</LuxButton>
           {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
         </div>
       </form>
@@ -2095,6 +2067,7 @@ function isValidMailSettingsDraft(draft: MailSettingsDraft) {
 }
 
 function AdminUserMailSettings() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const settingsQuery = useQuery({
     queryKey: adminMailSettingsQueryKey,
@@ -2148,7 +2121,7 @@ function AdminUserMailSettings() {
 
   if (settingsQuery.isPending) return <p className="lux-admin-muted" role="status">正在读取 SMTP 设置…</p>;
   if (settingsQuery.error || !settingsQuery.data) {
-    return <div role="alert" className="lux-error-copy">读取 SMTP 设置失败：{settingsQuery.error?.message || "没有收到设置数据"}<button className="lux-button lux-button-secondary" type="button" onClick={() => void settingsQuery.refetch()}>重试</button></div>;
+    return <div role="alert" className="lux-error-copy">读取 SMTP 设置失败：{settingsQuery.error?.message || "没有收到设置数据"}<LuxButton tone="secondary" type="button" onClick={() => void settingsQuery.refetch()}>重试</LuxButton></div>;
   }
 
   function saveMailSettings(event: FormEvent<HTMLFormElement>) {
@@ -2179,8 +2152,8 @@ function AdminUserMailSettings() {
     }
   }
 
-  function removeCredentials() {
-    if (!window.confirm("删除已保存的 SMTP 用户名和密码？")) return;
+  async function removeCredentials() {
+    if (!(await confirm("删除已保存的 SMTP 用户名和密码？"))) return;
     setCredentialsNotice("");
     setCredentialsError(false);
     deleteCredentials.reset();
@@ -2197,15 +2170,15 @@ function AdminUserMailSettings() {
       <section className="lux-admin-panel lux-admin-user-profile-panel" aria-labelledby="lux-admin-mail-settings-title">
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-mail-settings-title">SMTP 服务</h2></div></div>
         <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={saveMailSettings}>
-          <label>SMTP 主机<input aria-label="SMTP 主机" value={draft.host} onChange={(event) => { setDraft({ ...draft, host: event.target.value }); setSettingsNotice(""); }} autoComplete="off" maxLength={253} required disabled={saving} /></label>
-          <label>SMTP 端口<input aria-label="SMTP 端口" type="number" min={1} max={65_535} step={1} value={draft.port} onChange={(event) => { setDraft({ ...draft, port: event.target.value }); setSettingsNotice(""); }} required disabled={saving} /></label>
-          <label>传输加密<select aria-label="SMTP TLS 模式" value={draft.tlsMode} onChange={(event) => { setDraft({ ...draft, tlsMode: event.target.value as SmtpTlsMode }); setSettingsNotice(""); }} disabled={saving}><option value="SMTPS">隐式 TLS（SMTPS）</option><option value="STARTTLS">强制 STARTTLS</option></select></label>
-          <label>发件人名称<input aria-label="SMTP 发件人名称" value={draft.senderName} onChange={(event) => { setDraft({ ...draft, senderName: event.target.value }); setSettingsNotice(""); }} maxLength={128} required disabled={saving} /></label>
-          <label>发件人邮箱<input aria-label="SMTP 发件人邮箱" type="email" value={draft.senderEmail} onChange={(event) => { setDraft({ ...draft, senderEmail: event.target.value }); setSettingsNotice(""); }} maxLength={320} autoComplete="email" required disabled={saving} /></label>
-          <label>站点访问地址<input aria-label="SMTP 站点访问地址" type="url" value={draft.siteUrl} onChange={(event) => { setDraft({ ...draft, siteUrl: event.target.value }); setSettingsNotice(""); }} placeholder="https://lux.example.com" required disabled={saving} /></label>
+          <label>SMTP 主机<LuxTextField aria-label="SMTP 主机" value={draft.host} onChange={(event) => { setDraft({ ...draft, host: event.target.value }); setSettingsNotice(""); }} autoComplete="off" maxLength={253} required disabled={saving} /></label>
+          <label>SMTP 端口<LuxTextField aria-label="SMTP 端口" type="number" min={1} max={65_535} step={1} value={draft.port} onChange={(event) => { setDraft({ ...draft, port: event.target.value }); setSettingsNotice(""); }} required disabled={saving} /></label>
+          <label>传输加密<LuxSelectField aria-label="SMTP TLS 模式" value={draft.tlsMode} onChange={(event) => { setDraft({ ...draft, tlsMode: event.target.value as SmtpTlsMode }); setSettingsNotice(""); }} disabled={saving}><option value="SMTPS">隐式 TLS（SMTPS）</option><option value="STARTTLS">强制 STARTTLS</option></LuxSelectField></label>
+          <label>发件人名称<LuxTextField aria-label="SMTP 发件人名称" value={draft.senderName} onChange={(event) => { setDraft({ ...draft, senderName: event.target.value }); setSettingsNotice(""); }} maxLength={128} required disabled={saving} /></label>
+          <label>发件人邮箱<LuxTextField aria-label="SMTP 发件人邮箱" type="email" value={draft.senderEmail} onChange={(event) => { setDraft({ ...draft, senderEmail: event.target.value }); setSettingsNotice(""); }} maxLength={320} autoComplete="email" required disabled={saving} /></label>
+          <label>站点访问地址<LuxTextField aria-label="SMTP 站点访问地址" type="url" value={draft.siteUrl} onChange={(event) => { setDraft({ ...draft, siteUrl: event.target.value }); setSettingsNotice(""); }} placeholder="https://lux.example.com" required disabled={saving} /></label>
           <p className="lux-admin-muted">仅支持 SMTPS 或强制 STARTTLS。此地址用于后续邮件中的验证链接。</p>
           <div className="lux-admin-user-profile-actions">
-            <button className="lux-button lux-button-primary" type="submit" disabled={!validSettings || !settingsChanged || saving}>{saving ? "保存中…" : "保存 SMTP 设置"}</button>
+            <LuxButton tone="primary" type="submit" disabled={!validSettings || !settingsChanged || saving}>{saving ? "保存中…" : "保存 SMTP 设置"}</LuxButton>
             {settingsNotice ? <span role={saveSettings.isError ? "alert" : "status"}>{saveSettings.error?.message || settingsNotice}</span> : null}
           </div>
         </form>
@@ -2215,12 +2188,12 @@ function AdminUserMailSettings() {
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-mail-credentials-title">SMTP 身份验证</h2></div></div>
         <p className="lux-admin-muted" role="status">{credentialsConfigured ? "SMTP 凭据已配置；当前用户名和密码不会显示。" : "SMTP 凭据未配置；如邮件服务器需要认证，请输入用户名和密码。"}</p>
         <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submitCredentials}>
-          <label>SMTP 用户名<input aria-label="SMTP 用户名" value={username} onChange={(event) => { setUsername(event.target.value); setCredentialsNotice(""); setCredentialsError(false); }} autoComplete="username" maxLength={320} disabled={credentialBusy} /></label>
-          <label>SMTP 密码<input aria-label="SMTP 密码" type="password" value={password} onChange={(event) => { setPassword(event.target.value); setCredentialsNotice(""); setCredentialsError(false); }} autoComplete="new-password" maxLength={4_096} disabled={credentialBusy} /></label>
+          <label>SMTP 用户名<LuxTextField aria-label="SMTP 用户名" value={username} onChange={(event) => { setUsername(event.target.value); setCredentialsNotice(""); setCredentialsError(false); }} autoComplete="username" maxLength={320} disabled={credentialBusy} /></label>
+          <label>SMTP 密码<LuxTextField aria-label="SMTP 密码" type="password" value={password} onChange={(event) => { setPassword(event.target.value); setCredentialsNotice(""); setCredentialsError(false); }} autoComplete="new-password" maxLength={4_096} disabled={credentialBusy} /></label>
           {hasCredentialInput && !validCredentialPair ? <p className="lux-admin-playback-validation" role="alert">请同时填写 SMTP 用户名和密码。</p> : null}
           <div className="lux-admin-user-profile-actions">
-            <button className="lux-button lux-button-primary" type="submit" disabled={!validCredentialPair || credentialBusy}>{savingCredentials ? "保存中…" : "保存 SMTP 凭据"}</button>
-            {credentialsConfigured ? <button className="lux-button lux-button-secondary" type="button" onClick={removeCredentials} disabled={credentialBusy}>{deleteCredentials.isPending ? "删除中…" : "删除 SMTP 凭据"}</button> : null}
+            <LuxButton tone="primary" type="submit" disabled={!validCredentialPair || credentialBusy}>{savingCredentials ? "保存中…" : "保存 SMTP 凭据"}</LuxButton>
+            {credentialsConfigured ? <LuxButton tone="secondary" type="button" onClick={removeCredentials} disabled={credentialBusy}>{deleteCredentials.isPending ? "删除中…" : "删除 SMTP 凭据"}</LuxButton> : null}
             {credentialsNotice ? <span role={credentialsError || deleteCredentials.isError ? "alert" : "status"}>{deleteCredentials.error?.message || credentialsNotice}</span> : null}
           </div>
         </form>
@@ -2230,7 +2203,7 @@ function AdminUserMailSettings() {
         <div className="lux-admin-panel-heading"><div><h2 id="lux-admin-mail-connection-title">连接检查</h2></div></div>
         <p className="lux-admin-muted">连接检查使用最近一次保存的配置，通过 TLS 执行 SMTP NOOP，不会发送测试邮件；单次检查最多等待 8 秒。</p>
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-secondary" type="button" onClick={() => { setConnectionNotice(""); testConnection.mutate(); }} disabled={!settingsQuery.data.configured || settingsChanged || connectionBusy}>{connectionBusy ? "检查中…" : "检查 SMTP 连接"}</button>
+          <LuxButton tone="secondary" type="button" onClick={() => { setConnectionNotice(""); testConnection.mutate(); }} disabled={!settingsQuery.data.configured || settingsChanged || connectionBusy}>{connectionBusy ? "检查中…" : "检查 SMTP 连接"}</LuxButton>
           {connectionNotice ? <span role={testConnection.isError ? "alert" : "status"}>{connectionNotice}</span> : null}
         </div>
       </section>
@@ -2278,7 +2251,7 @@ function AdminUserRetentionSettings() {
         <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
           <label>
             移入回收站后保留天数
-            <input
+            <LuxTextField
               type="number"
               min={1}
               max={3_650}
@@ -2291,9 +2264,9 @@ function AdminUserRetentionSettings() {
           </label>
           <p className="lux-admin-muted">范围为 1–3650 天。新值只影响之后移入回收站的账号；已在回收站中的账号仍按原计划清理时间处理。</p>
           <div className="lux-admin-user-profile-actions">
-            <button className="lux-button lux-button-primary" type="submit" disabled={!validDays || !hasChanges || update.isPending}>
+            <LuxButton tone="primary" type="submit" disabled={!validDays || !hasChanges || update.isPending}>
               {update.isPending ? "保存中…" : "保存保留期限"}
-            </button>
+            </LuxButton>
             {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
           </div>
         </form>
@@ -2342,7 +2315,7 @@ function AdminUserActivityRetentionSettings() {
       <form className="lux-admin-form lux-admin-user-profile-form" onSubmit={submit}>
         <label>
           活动记录保留天数
-          <input
+          <LuxTextField
             type="number"
             min={1}
             max={3_650}
@@ -2355,9 +2328,9 @@ function AdminUserActivityRetentionSettings() {
         </label>
         <p className="lux-admin-muted">范围为 1–3650 天。超过期限的用户活动索引会由后台定期清理；观看进度、已看状态、收藏和文件审计不受影响。</p>
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!validDays || !hasChanges || update.isPending}>
+          <LuxButton tone="primary" type="submit" disabled={!validDays || !hasChanges || update.isPending}>
             {update.isPending ? "保存中…" : "保存活动保留期限"}
-          </button>
+          </LuxButton>
           {notice ? <span role={update.isError ? "alert" : "status"}>{notice}</span> : null}
         </div>
       </form>
@@ -2468,10 +2441,7 @@ function AdminUserDefaultPermissionsSettings() {
             ["SELECTED", "指定媒体库", "仅允许访问下方勾选的媒体库。"],
             ["NONE", "无媒体库权限", "用户不能浏览、搜索或播放任何媒体库内容。"],
           ] as const).map(([mode, title, description]) => (
-            <label key={mode}>
-              <input type="radio" name="new-user-library-access" value={mode} checked={currentDraft.libraryAccessMode === mode} disabled={update.isPending} onChange={() => updateDraft({ libraryAccessMode: mode })} />
-              <span><strong>{title}</strong><small>{description}</small></span>
-            </label>
+            <LuxRadio key={mode} name="new-user-library-access" value={mode} checked={currentDraft.libraryAccessMode === mode} disabled={update.isPending} onChange={() => updateDraft({ libraryAccessMode: mode })} label=<><strong>{title}</strong><small>{description}</small></> />
           ))}
         </fieldset>
         {currentDraft.libraryAccessMode === "ALL" ? <p className="lux-admin-muted">新用户可访问所有已启用媒体库，包括之后新增的媒体库。</p> : null}
@@ -2489,10 +2459,7 @@ function AdminUserDefaultPermissionsSettings() {
             {enabledLibraries.length ? (
               <div className="lux-admin-library-access">
                 {enabledLibraries.map((library) => (
-                  <label key={library.id}>
-                    <input type="checkbox" value={library.id} checked={selectedLibraryIds.includes(library.id)} disabled={update.isPending} onChange={(event) => toggleLibrary(library.id, event.currentTarget.checked)} />
-                    <span>{library.name}</span>
-                  </label>
+                  <LuxCheckbox key={library.id} value={library.id} checked={selectedLibraryIds.includes(library.id)} disabled={update.isPending} onChange={(event) => toggleLibrary(library.id, event.currentTarget.checked)} label=<>{library.name}</> />
                 ))}
               </div>
             ) : null}
@@ -2500,22 +2467,22 @@ function AdminUserDefaultPermissionsSettings() {
         ) : null}
         <fieldset className="lux-admin-user-defaults-policy-options">
           <legend>下载与播放/转码</legend>
-          <label><input type="checkbox" aria-label="允许下载" checked={currentDraft.canDownload} disabled={update.isPending} onChange={(event) => updateDraft({ canDownload: event.currentTarget.checked })} /><span>允许下载</span></label>
-          <label><input type="checkbox" aria-label="允许播放" checked={currentDraft.canPlay} disabled={update.isPending} onChange={(event) => updateDraft({ canPlay: event.currentTarget.checked })} /><span>允许播放</span></label>
-          <label><input type="checkbox" aria-label="允许封装转换" checked={currentDraft.allowRemux} disabled={update.isPending} onChange={(event) => updateDraft({ allowRemux: event.currentTarget.checked })} /><span>允许封装转换</span></label>
-          <label><input type="checkbox" aria-label="允许音频转码" checked={currentDraft.allowAudioTranscode} disabled={update.isPending} onChange={(event) => updateDraft({ allowAudioTranscode: event.currentTarget.checked })} /><span>允许音频转码</span></label>
-          <label><input type="checkbox" aria-label="允许视频转码" checked={currentDraft.allowVideoTranscode} disabled={update.isPending} onChange={(event) => updateDraft({ allowVideoTranscode: event.currentTarget.checked })} /><span>允许视频转码</span></label>
+          <LuxCheckbox aria-label="允许下载" checked={currentDraft.canDownload} disabled={update.isPending} onChange={(event) => updateDraft({ canDownload: event.currentTarget.checked })} label="允许下载" />
+          <LuxCheckbox aria-label="允许播放" checked={currentDraft.canPlay} disabled={update.isPending} onChange={(event) => updateDraft({ canPlay: event.currentTarget.checked })} label="允许播放" />
+          <LuxCheckbox aria-label="允许封装转换" checked={currentDraft.allowRemux} disabled={update.isPending} onChange={(event) => updateDraft({ allowRemux: event.currentTarget.checked })} label="允许封装转换" />
+          <LuxCheckbox aria-label="允许音频转码" checked={currentDraft.allowAudioTranscode} disabled={update.isPending} onChange={(event) => updateDraft({ allowAudioTranscode: event.currentTarget.checked })} label="允许音频转码" />
+          <LuxCheckbox aria-label="允许视频转码" checked={currentDraft.allowVideoTranscode} disabled={update.isPending} onChange={(event) => updateDraft({ allowVideoTranscode: event.currentTarget.checked })} label="允许视频转码" />
         </fieldset>
         <label className="lux-admin-user-playback-limit">
           同时播放上限（0 表示不限）
-          <input type="number" aria-label="新用户同时播放上限" min={0} step={1} value={limitInput} disabled={update.isPending} onChange={(event) => { setLimitDraft(event.currentTarget.value); setNotice(""); setError(""); }} />
+          <LuxTextField type="number" aria-label="新用户同时播放上限" min={0} step={1} value={limitInput} disabled={update.isPending} onChange={(event) => { setLimitDraft(event.currentTarget.value); setNotice(""); setError(""); }} />
         </label>
         {!validLimit ? <p className="lux-admin-user-playback-validation">请输入大于或等于 0 的整数。</p> : null}
         <p className="lux-admin-muted">此处配置新账号的初始权限快照；修改不会自动改变已有用户。</p>
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={!validLimit || !hasChanges || update.isPending}>
+          <LuxButton tone="primary" type="submit" disabled={!validLimit || !hasChanges || update.isPending}>
             {update.isPending ? "保存中…" : "保存默认权限"}
-          </button>
+          </LuxButton>
           {error ? <span role="alert">{error}</span> : notice ? <span role="status">{notice}</span> : null}
         </div>
       </form>
@@ -2524,6 +2491,7 @@ function AdminUserDefaultPermissionsSettings() {
 }
 
 function AdminUserPermissionPresetsSettings() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const queryKey = ["admin", "user-permission-presets"] as const;
   const presetsQuery = useQuery({ queryKey, queryFn: () => api.adminUserPermissionPresets() });
@@ -2664,9 +2632,9 @@ function AdminUserPermissionPresetsSettings() {
     }
   }
 
-  function deletePreset(preset: AdminUserPermissionPreset) {
+  async function deletePreset(preset: AdminUserPermissionPreset) {
     if (busy || preset.isBuiltin) return;
-    const accepted = window.confirm(`确定删除“${preset.name}”预设吗？已应用到用户的权限快照不会改变。`);
+    const accepted = await confirm(`确定删除“${preset.name}”预设吗？已应用到用户的权限快照不会改变。`);
     if (!accepted) return;
     setError("");
     setNotice("");
@@ -2687,7 +2655,7 @@ function AdminUserPermissionPresetsSettings() {
     <section className="lux-admin-panel lux-admin-user-permissions lux-admin-user-presets" aria-labelledby="lux-admin-user-presets-title">
       <div className="lux-admin-panel-heading">
         <div><h2 id="lux-admin-user-presets-title">角色预设</h2><p className="lux-admin-muted">预设保存权限快照；之后修改不会改变已应用到用户的权限。</p></div>
-        <button className="lux-button lux-button-primary" type="button" onClick={startCreate} disabled={busy}>新建角色预设</button>
+        <LuxButton tone="primary" type="button" onClick={startCreate} disabled={busy}>新建角色预设</LuxButton>
       </div>
       <div className="lux-admin-user-defaults-form">
         {presets.map((preset) => {
@@ -2701,8 +2669,8 @@ function AdminUserPermissionPresetsSettings() {
               <div className="lux-admin-panel-heading">
                 <div><h3>{preset.name}</h3><p className="lux-admin-muted">{preset.isBuiltin ? "内置预设" : `自定义预设 · v${preset.version}`}</p></div>
                 <div className="lux-admin-user-profile-actions">
-                  <button className="lux-button lux-button-secondary" type="button" aria-label={`编辑预设 ${preset.name}`} onClick={() => startEdit(preset)} disabled={busy || preset.isBuiltin}>编辑</button>
-                  <button className="lux-button lux-button-secondary" type="button" aria-label={`删除预设 ${preset.name}`} onClick={() => deletePreset(preset)} disabled={busy || preset.isBuiltin}>删除</button>
+                  <LuxButton tone="secondary" type="button" aria-label={`编辑预设 ${preset.name}`} onClick={() => startEdit(preset)} disabled={busy || preset.isBuiltin}>编辑</LuxButton>
+                  <LuxButton tone="secondary" type="button" aria-label={`删除预设 ${preset.name}`} onClick={() => deletePreset(preset)} disabled={busy || preset.isBuiltin}>删除</LuxButton>
                 </div>
               </div>
               <p className="lux-admin-muted">{preset.description || "未填写说明"} · {preset.isAdmin ? "管理员" : "普通用户"}{preset.canManageServer ? "，可进入管理台" : ""}</p>
@@ -2715,12 +2683,12 @@ function AdminUserPermissionPresetsSettings() {
       {draft ? (
         <form className="lux-admin-form lux-admin-user-defaults-form" onSubmit={save}>
           <div className="lux-admin-panel-heading"><div><h3>{editingPreset ? `编辑预设：${editingPreset.name}` : "新建角色预设"}</h3></div></div>
-          <label>预设名称<input aria-label="预设名称" maxLength={80} value={draft.name} disabled={busy} onChange={(event) => updateDraft({ name: event.currentTarget.value })} /></label>
-          <label>说明<input aria-label="预设说明" maxLength={500} value={draft.description ?? ""} disabled={busy} onChange={(event) => updateDraft({ description: event.currentTarget.value || null })} /></label>
+          <label>预设名称<LuxTextField aria-label="预设名称" maxLength={80} value={draft.name} disabled={busy} onChange={(event) => updateDraft({ name: event.currentTarget.value })} /></label>
+          <label>说明<LuxTextField aria-label="预设说明" maxLength={500} value={draft.description ?? ""} disabled={busy} onChange={(event) => updateDraft({ description: event.currentTarget.value || null })} /></label>
           <fieldset className="lux-admin-user-defaults-policy-options">
             <legend>账号角色</legend>
-            <label><input type="checkbox" aria-label="管理员角色" checked={draft.isAdmin} disabled={busy} onChange={(event) => updateDraft({ isAdmin: event.currentTarget.checked })} /><span>管理员角色</span></label>
-            <label><input type="checkbox" aria-label="允许进入管理台" checked={draft.canManageServer} disabled={busy || !draft.isAdmin} onChange={(event) => updateDraft({ canManageServer: event.currentTarget.checked })} /><span>允许进入管理台</span></label>
+            <LuxCheckbox aria-label="管理员角色" checked={draft.isAdmin} disabled={busy} onChange={(event) => updateDraft({ isAdmin: event.currentTarget.checked })} label="管理员角色" />
+            <LuxCheckbox aria-label="允许进入管理台" checked={draft.canManageServer} disabled={busy || !draft.isAdmin} onChange={(event) => updateDraft({ canManageServer: event.currentTarget.checked })} label="允许进入管理台" />
           </fieldset>
           <fieldset className="lux-admin-user-access-modes">
             <legend>媒体库访问范围</legend>
@@ -2729,7 +2697,7 @@ function AdminUserPermissionPresetsSettings() {
               ["SELECTED", "指定媒体库"],
               ["NONE", "无媒体库权限"],
             ] as const).map(([mode, title]) => (
-              <label key={mode}><input type="radio" name="preset-library-access" value={mode} checked={draft.permissions.libraryAccessMode === mode} disabled={busy} onChange={() => updatePermissionDraft({ libraryAccessMode: mode, libraryIds: mode === "SELECTED" ? draft.permissions.libraryIds : [] })} /><span><strong>{title}</strong></span></label>
+              <LuxRadio key={mode} name="preset-library-access" value={mode} checked={draft.permissions.libraryAccessMode === mode} disabled={busy} onChange={() => updatePermissionDraft({ libraryAccessMode: mode, libraryIds: mode === "SELECTED" ? draft.permissions.libraryIds : [] })} label=<><strong>{title}</strong></> />
             ))}
           </fieldset>
           {draft.permissions.libraryAccessMode === "SELECTED" ? (
@@ -2737,7 +2705,7 @@ function AdminUserPermissionPresetsSettings() {
               {enabledLibraries.length ? (
                 <div className="lux-admin-library-access">
                   {enabledLibraries.map((library) => (
-                    <label key={library.id}><input type="checkbox" checked={selectedLibraryIds.includes(library.id)} disabled={busy} onChange={(event) => toggleLibrary(library.id, event.currentTarget.checked)} /><span>{library.name}</span></label>
+                    <LuxCheckbox key={library.id} checked={selectedLibraryIds.includes(library.id)} disabled={busy} onChange={(event) => toggleLibrary(library.id, event.currentTarget.checked)} label=<>{library.name}</> />
                   ))}
                 </div>
               ) : <p className="lux-admin-muted">当前没有已启用的媒体库；空选择保存后会设为无媒体库权限。</p>}
@@ -2746,20 +2714,20 @@ function AdminUserPermissionPresetsSettings() {
           ) : null}
           <fieldset className="lux-admin-user-defaults-policy-options">
             <legend>下载与播放/转码</legend>
-            <label><input type="checkbox" aria-label="允许下载" checked={draft.permissions.canDownload} disabled={busy} onChange={(event) => updatePermissionDraft({ canDownload: event.currentTarget.checked })} /><span>允许下载</span></label>
-            <label><input type="checkbox" aria-label="允许播放" checked={draft.permissions.canPlay} disabled={busy} onChange={(event) => updatePermissionDraft({ canPlay: event.currentTarget.checked })} /><span>允许播放</span></label>
-            <label><input type="checkbox" aria-label="允许封装转换" checked={draft.permissions.allowRemux} disabled={busy} onChange={(event) => updatePermissionDraft({ allowRemux: event.currentTarget.checked })} /><span>允许封装转换</span></label>
-            <label><input type="checkbox" aria-label="允许音频转码" checked={draft.permissions.allowAudioTranscode} disabled={busy} onChange={(event) => updatePermissionDraft({ allowAudioTranscode: event.currentTarget.checked })} /><span>允许音频转码</span></label>
-            <label><input type="checkbox" aria-label="允许视频转码" checked={draft.permissions.allowVideoTranscode} disabled={busy} onChange={(event) => updatePermissionDraft({ allowVideoTranscode: event.currentTarget.checked })} /><span>允许视频转码</span></label>
+            <LuxCheckbox aria-label="允许下载" checked={draft.permissions.canDownload} disabled={busy} onChange={(event) => updatePermissionDraft({ canDownload: event.currentTarget.checked })} label="允许下载" />
+            <LuxCheckbox aria-label="允许播放" checked={draft.permissions.canPlay} disabled={busy} onChange={(event) => updatePermissionDraft({ canPlay: event.currentTarget.checked })} label="允许播放" />
+            <LuxCheckbox aria-label="允许封装转换" checked={draft.permissions.allowRemux} disabled={busy} onChange={(event) => updatePermissionDraft({ allowRemux: event.currentTarget.checked })} label="允许封装转换" />
+            <LuxCheckbox aria-label="允许音频转码" checked={draft.permissions.allowAudioTranscode} disabled={busy} onChange={(event) => updatePermissionDraft({ allowAudioTranscode: event.currentTarget.checked })} label="允许音频转码" />
+            <LuxCheckbox aria-label="允许视频转码" checked={draft.permissions.allowVideoTranscode} disabled={busy} onChange={(event) => updatePermissionDraft({ allowVideoTranscode: event.currentTarget.checked })} label="允许视频转码" />
           </fieldset>
-          <label className="lux-admin-user-playback-limit">同时播放上限（0 表示不限）<input type="number" aria-label="预设同时播放上限" min={0} step={1} value={limitDraft} disabled={busy} onChange={(event) => { setLimitDraft(event.currentTarget.value); setError(""); setNotice(""); }} /></label>
+          <label className="lux-admin-user-playback-limit">同时播放上限（0 表示不限）<LuxTextField type="number" aria-label="预设同时播放上限" min={0} step={1} value={limitDraft} disabled={busy} onChange={(event) => { setLimitDraft(event.currentTarget.value); setError(""); setNotice(""); }} /></label>
           {!validName ? <p className="lux-admin-user-playback-validation">请输入 1–80 个字符的预设名称。</p> : null}
           {!validDescription ? <p className="lux-admin-user-playback-validation">说明不能超过 500 个字符。</p> : null}
           {!validLimit ? <p className="lux-admin-user-playback-validation">请输入大于或等于 0 的整数。</p> : null}
           <p className="lux-admin-muted">应用预设时会复制权限快照；以后修改预设不会自动改变已有用户。</p>
           <div className="lux-admin-user-profile-actions">
-            <button className="lux-button lux-button-primary" type="submit" disabled={!canSave || busy}>{busy ? "保存中…" : "保存预设"}</button>
-            <button className="lux-button lux-button-secondary" type="button" disabled={busy} onClick={() => { setDraft(null); setEditingPreset(null); setError(""); }}>取消</button>
+            <LuxButton tone="primary" type="submit" disabled={!canSave || busy}>{busy ? "保存中…" : "保存预设"}</LuxButton>
+            <LuxButton tone="secondary" type="button" disabled={busy} onClick={() => { setDraft(null); setEditingPreset(null); setError(""); }}>取消</LuxButton>
             {error ? <span role="alert">{error}</span> : notice ? <span role="status">{notice}</span> : null}
           </div>
         </form>
@@ -2781,5 +2749,5 @@ function sameNewUserPermissions(left: NewUserPermissions, right: NewUserPermissi
 }
 
 function AdminUserManagementState({ label, error = false }: { label: string; error?: boolean }) {
-  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "无法打开用户详情" : "正在加载用户详情"}</h1><p>{label}</p><Link className="lux-button lux-button-secondary" to="/admin/users">返回用户列表</Link></section>;
+  return <section className="lux-admin-page-state" role={error ? "alert" : "status"}><h1>{error ? "无法打开用户详情" : "正在加载用户详情"}</h1><p>{label}</p><Link className={luxButtonClass({ tone: "secondary" })} to="/admin/users">返回用户列表</Link></section>;
 }

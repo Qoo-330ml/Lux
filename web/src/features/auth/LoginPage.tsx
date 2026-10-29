@@ -3,6 +3,7 @@ import { FormEvent, type CSSProperties, useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { PluginLoginBackgroundResponse } from "../../lib/api/types";
+import { LuxButton, LuxTextField } from "../../components/ui";
 
 const POSTER_WIDTH_PERCENT = 78;
 const POSTER_COLUMN_COUNT = 5;
@@ -212,7 +213,7 @@ export function LoginPage() {
           <form className="lux-auth-form" autoComplete="on" onSubmit={submit}>
             <div className="lux-auth-field">
               <label htmlFor="username">用户名</label>
-              <input
+              <LuxTextField
                 id="username"
                 name="username"
                 type="text"
@@ -227,7 +228,7 @@ export function LoginPage() {
             <div className="lux-auth-field">
               <label htmlFor="password">密码</label>
               <div className="lux-auth-password-wrapper">
-                <input
+                <LuxTextField
                   id="password"
                   name="password"
                   type={showPassword ? "text" : "password"}
@@ -268,13 +269,12 @@ export function LoginPage() {
               </div>
             </div>
 
-            <button
-              className="lux-button lux-button-large lux-auth-submit-btn"
+            <LuxButton size="large" className="lux-auth-submit-btn"
               type="submit"
               disabled={login.isPending}
             >
               {login.isPending ? "正在进入…" : "进入影院 ›"}
-            </button>
+            </LuxButton>
           </form>
 
           {login.error ? (

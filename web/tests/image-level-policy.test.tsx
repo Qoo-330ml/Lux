@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 
 import { act } from "react";
+import { chooseLuxOptionByValue, luxCombobox, luxOptions } from "./lux-select-helpers";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it } from "vitest";
 import {
@@ -125,8 +126,8 @@ describe("image level policy editor", () => {
     const groups = Array.from(container!.querySelectorAll("details"));
     const labels = groups.map((group) => group.querySelector("summary")?.textContent ?? "");
     expect(labels.some((label) => label.includes("单集"))).toBe(true);
-    expect(container!.querySelectorAll("select[aria-label='单集图片来源']")).toHaveLength(1);
-    expect(container!.querySelectorAll("select[aria-label='电影图片来源']")).toHaveLength(0);
+    expect(luxCombobox(container!, "单集图片来源")).toBeTruthy();
+    expect(luxCombobox(container!, "电影图片来源")).toBeNull();
   });
 });
 describe("image policy preset tiers", () => {
@@ -182,7 +183,7 @@ describe("image level policy editor preset controls", () => {
     act(() => root!.render(node));
   }
 
-  it("writes the selected count tier", () => {
+  it("writes the selected count tier", async () => {
     let latest: MediaImageStrategySettings = base;
     render(
       <ImageLevelPolicyEditor
@@ -193,19 +194,13 @@ describe("image level policy editor preset controls", () => {
       />,
     );
 
-    const select = container!.querySelector(
-      'select[aria-label="季度海报张数"]',
-    ) as HTMLSelectElement;
-    expect(select.tagName).toBe("SELECT");
-    select.value = "2";
-    act(() => {
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    expect(luxCombobox(container!, "季度海报张数")?.tagName).toBe("BUTTON");
+    await chooseLuxOptionByValue(container!, "季度海报张数", "2");
 
     expect(latest.levels?.season?.artworks?.poster?.maxCount).toBe(2);
   });
 
-  it("writes the selected width tier", () => {
+  it("writes the selected width tier", async () => {
     let latest: MediaImageStrategySettings = base;
     render(
       <ImageLevelPolicyEditor
@@ -216,13 +211,7 @@ describe("image level policy editor preset controls", () => {
       />,
     );
 
-    const select = container!.querySelector(
-      'select[aria-label="单集背景图最小宽度"]',
-    ) as HTMLSelectElement;
-    select.value = "1920";
-    act(() => {
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await chooseLuxOptionByValue(container!, "单集背景图最小宽度", "1920");
 
     expect(latest.levels?.episode?.artworks?.backdrop?.minWidth).toBe(1920);
   });
@@ -245,7 +234,7 @@ describe("inherit label follows the settings level", () => {
     act(() => root!.render(node));
   }
 
-  it("uses 默认 when the global strategy has no parent layer", () => {
+  it("uses 默认 when the global strategy has no parent layer", async () => {
     render(
       <ImageLevelPolicyEditor
         images={base}
@@ -263,15 +252,11 @@ describe("inherit label follows the settings level", () => {
       enabled.parentElement?.querySelector(".lux-level-policy-inherit")?.textContent,
     ).toBe("默认");
 
-    const count = container!.querySelector(
-      'select[aria-label="电影海报张数"]',
-    ) as HTMLSelectElement;
-    expect(count.querySelectorAll("option")[0]?.textContent).toBe("默认");
+    const count = await luxOptions(container!, "电影海报张数");
+    expect(count[0]?.label).toBe("默认");
 
-    const width = container!.querySelector(
-      'select[aria-label="电影海报最小宽度"]',
-    ) as HTMLSelectElement;
-    expect(width.querySelectorAll("option")[0]?.textContent).toBe("默认");
+    const width = await luxOptions(container!, "电影海报最小宽度");
+    expect(width[0]?.label).toBe("默认");
 
     expect(container!.textContent).toContain("全部默认");
     expect(container!.textContent).not.toContain("全部继承");

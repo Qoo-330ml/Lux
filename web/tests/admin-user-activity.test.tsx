@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUserDetailPage } from "../src/features/admin/AdminUserManagementPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxCombobox } from "./lux-select-helpers";
 import type { AdminUser, AdminUserActivityPage } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -80,15 +81,13 @@ describe("AdminUserDetailPage activity timeline", () => {
     expect(container.textContent).not.toContain("must-not-render");
     expect(container.textContent).toContain("共 21 条");
 
-    const eventType = container.querySelector<HTMLSelectElement>("select[aria-label='事件类型']");
+    const eventType = luxCombobox(container, "事件类型");
     const from = container.querySelector<HTMLInputElement>("input[aria-label='开始时间']");
     const to = container.querySelector<HTMLInputElement>("input[aria-label='结束时间']");
     expect(eventType).toBeTruthy();
     expect(from).toBeTruthy();
     expect(to).toBeTruthy();
-    await act(async () => {
-      changeValue(eventType!, "AUTH_LOGIN");
-    });
+    await chooseLuxOptionByValue(container, "事件类型", "AUTH_LOGIN");
     await act(async () => {
       changeValue(from!, "2026-10-10T08:00");
     });

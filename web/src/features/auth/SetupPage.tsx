@@ -5,6 +5,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import { AdminSetupForm } from "./AdminSetupForm";
 import { DatabaseSetupPanel } from "./DatabaseSetupPanel";
 import { LuxLogo } from "../../components/LuxLogo";
+import { LuxButton } from "../../components/ui";
 
 export function SetupPage() {
   const [restartRequested, setRestartRequested] = useState(false);
@@ -35,7 +36,7 @@ export function SetupPage() {
     return <main className="lux-state-screen" role="alert"><h1>无法读取数据库配置</h1><p>{database.error.message}</p></main>;
   }
   if (database.data.restartRequired) {
-    return <main className="lux-auth-screen"><section className="lux-auth-card lux-setup-card"><div className="lux-auth-brand"><LuxLogo className="lux-brand-logo" /><strong>Lux</strong></div><h1>请重启 Lux</h1><p>PostgreSQL 配置已经保存。重启 Lux 后，系统会运行迁移并继续管理员初始化。</p><button className="lux-button lux-button-primary" type="button" onClick={() => restart.mutate()} disabled={restart.isPending}>{restart.isPending ? "正在准备重启…" : "重启 Lux"}</button>{restart.error ? <p className="lux-error-copy" role="alert">{restart.error.message}</p> : <p className="lux-success-copy" role="status">重启期间页面会暂时无法访问，服务恢复后将自动继续。</p>}</section></main>;
+    return <main className="lux-auth-screen"><section className="lux-auth-card lux-setup-card"><div className="lux-auth-brand"><LuxLogo className="lux-brand-logo" /><strong>Lux</strong></div><h1>请重启 Lux</h1><p>PostgreSQL 配置已经保存。重启 Lux 后，系统会运行迁移并继续管理员初始化。</p><LuxButton tone="primary" type="button" onClick={() => restart.mutate()} disabled={restart.isPending}>{restart.isPending ? "正在准备重启…" : "重启 Lux"}</LuxButton>{restart.error ? <p className="lux-error-copy" role="alert">{restart.error.message}</p> : <p className="lux-success-copy" role="status">重启期间页面会暂时无法访问，服务恢复后将自动继续。</p>}</section></main>;
   }
   if (!database.data.configured) {
     return <main className="lux-auth-screen"><DatabaseSetupPanel onSelected={() => undefined} /></main>;

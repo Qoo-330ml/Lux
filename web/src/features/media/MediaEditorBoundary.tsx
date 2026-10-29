@@ -1,5 +1,6 @@
 import { Component, Suspense, useEffect, useRef, type ReactNode } from "react";
 import { X } from "lucide-react";
+import { LuxButton } from "../../components/ui";
 
 type EditorBoundaryProps = { children: ReactNode; onClose: () => void };
 
@@ -48,7 +49,7 @@ function EditorLoadState({ failed = false, onClose }: { failed?: boolean; onClos
         <button ref={closeRef} className="lux-media-editor-close" type="button" aria-label="关闭编辑器" onClick={onClose}><X size={18} /></button>
       </header>
       {failed ? <footer className="lux-media-editor-footer">
-        <button className="lux-button lux-button-secondary" type="button" onClick={() => window.location.reload()}>重新加载</button>
+        <LuxButton tone="secondary" type="button" onClick={() => window.location.reload()}>重新加载</LuxButton>
       </footer> : null}
     </section>
   </div>;

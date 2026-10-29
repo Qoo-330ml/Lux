@@ -6,6 +6,7 @@ import { api } from "../../lib/api/client";
 import type { MediaActor } from "../../lib/api/types";
 import { MediaCard } from "../home/media";
 import { LibraryGrid } from "../library/LibraryGrid";
+import { LuxButton, LuxTextField } from "../../components/ui";
 
 export function SearchPage() {
   const [params, setParams] = useSearchParams();
@@ -43,8 +44,8 @@ export function SearchPage() {
       <div className="lux-page-heading"><h1>搜索</h1></div>
       <form className="lux-search-panel" onSubmit={submit}>
         <Search size={20} aria-hidden="true" />
-        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、演员或别名" aria-label="搜索电影、剧集或演员" />
-        <button className="lux-button lux-button-primary" type="submit">搜索</button>
+        <LuxTextField value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索电影、剧集、演员或别名" aria-label="搜索电影、剧集或演员" />
+        <LuxButton tone="primary" type="submit">搜索</LuxButton>
       </form>
       {result.isPending || people.isPending ? <p className="lux-muted-copy">正在搜索…</p> : null}
       {result.error ? <p className="lux-error-copy">媒体搜索失败：{result.error.message}</p> : null}
@@ -63,9 +64,9 @@ export function SearchPage() {
           <LibraryGrid items={mediaItems} renderItem={(item) => <MediaCard item={item} key={item.id} />} />
           {result.hasNextPage ? (
             <div className="lux-load-more-row">
-              <button className="lux-button lux-button-secondary" type="button" disabled={result.isFetchingNextPage} onClick={() => void result.fetchNextPage()}>
+              <LuxButton tone="secondary" type="button" disabled={result.isFetchingNextPage} onClick={() => void result.fetchNextPage()}>
                 {result.isFetchingNextPage ? "正在加载…" : "加载更多"}
-              </button>
+              </LuxButton>
             </div>
           ) : null}
         </section>

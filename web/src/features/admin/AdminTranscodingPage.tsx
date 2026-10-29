@@ -15,6 +15,7 @@ import {
   tierLabel,
 } from "../player/player-stats";
 import { AdminTranscodingPanel } from "./AdminTranscodingPanel";
+import { LuxButton, useLuxConfirm } from "../../components/ui";
 
 /**
  * Dedicated transcoding settings group: policy, hardware self-test and live progress.
@@ -25,6 +26,7 @@ import { AdminTranscodingPanel } from "./AdminTranscodingPanel";
 const HISTORY_PAGE_SIZE = 10;
 
 export function AdminTranscodingPage() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [historyPage, setHistoryPage] = useState(1);
   const settings = useQuery({
@@ -109,9 +111,9 @@ export function AdminTranscodingPage() {
                 key={session.sessionId}
                 session={session}
                 stopping={stopSession.isPending && stopSession.variables === session.sessionId}
-                onStop={() => {
+                onStop={async () => {
                   const title = session.title ?? "该条目";
-                  if (!window.confirm(`停止「${title}」的转码会话？播放会立即中断。`)) return;
+                  if (!(await confirm(`停止「${title}」的转码会话？播放会立即中断。`))) return;
                   stopSession.mutate(session.sessionId);
                 }}
               />
@@ -147,22 +149,20 @@ export function AdminTranscodingPage() {
                 共 {history.data?.total ?? 0} 条 · 第 {history.data?.page ?? historyPage} 页
               </span>
               <div>
-                <button
+                <LuxButton tone="secondary"
                   type="button"
-                  className="lux-button lux-button-secondary"
                   disabled={historyPage <= 1}
                   onClick={() => setHistoryPage((page) => Math.max(1, page - 1))}
                 >
                   上一页
-                </button>
-                <button
+                </LuxButton>
+                <LuxButton tone="secondary"
                   type="button"
-                  className="lux-button lux-button-secondary"
                   disabled={(history.data?.total ?? 0) <= historyPage * HISTORY_PAGE_SIZE}
                   onClick={() => setHistoryPage((page) => page + 1)}
                 >
                   下一页
-                </button>
+                </LuxButton>
               </div>
             </div>
           </>
@@ -227,15 +227,14 @@ function TranscodingSessionRow({
           <span className={`lux-transcoding-session-state${progress?.finished ? " is-finished" : ""}`}>
             {progress ? (progress.finished ? "编码结束" : "编码中") : "等待 FFmpeg 进度"}
           </span>
-          <button
+          <LuxButton tone="secondary" className="lux-transcoding-stop"
             type="button"
-            className="lux-button lux-button-secondary lux-transcoding-stop"
             aria-label={`停止 ${session.title ?? "转码会话"}`}
             disabled={stopping}
             onClick={onStop}
           >
             <Square size={13} /> {stopping ? "停止中…" : "停止会话"}
-          </button>
+          </LuxButton>
         </div>
       </header>
       <dl className="lux-transcoding-session-metrics">

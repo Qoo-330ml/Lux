@@ -11,6 +11,7 @@ import { AdminUserInvitationsPanel } from "./AdminUserInvitationsPanel";
 import { AdminUserRegistrationsPanel } from "./AdminUserRegistrationsPanel";
 import { UsersWorkspace, type UsersViewKey } from "./users/UsersWorkspace";
 import { formatRelativeTime, formatTimestamp } from "./users/format";
+import { LuxButton, LuxIconButton, LuxSelectField, LuxSwitch, LuxTextField, useLuxConfirm , luxButtonClass } from "../../components/ui";
 
 const VIEW_LABELS: Record<UsersViewKey, string> = {
   users: "全部用户",
@@ -20,6 +21,7 @@ const VIEW_LABELS: Record<UsersViewKey, string> = {
 };
 
 export function AdminUsersPage() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const requestedView = searchParams.get("view");
@@ -234,12 +236,12 @@ export function AdminUsersPage() {
     setBatchStatusResults(null);
   }
 
-  function confirmBatchPreset() {
+  async function confirmBatchPreset() {
     const preset = permissionPresets.data?.presets.find((candidate) => candidate.id === batchPresetId);
     const targets = selectedOnCurrentPage;
     if (!preset || targets.length === 0 || applyBatchPreset.isPending || anyCopyDialogOpen) return;
     const names = targets.map((user) => user.displayName || user.usernameNormalized).join("、");
-    if (!window.confirm(`仅对当前页已选的 ${targets.length} 个用户应用角色预设“${preset.name}”吗？\n${names}`)) return;
+    if (!(await confirm(`仅对当前页已选的 ${targets.length} 个用户应用角色预设“${preset.name}”吗？\n${names}`))) return;
     setBatchResults(null);
     setBatchError("");
     setBatchStatusResults(null);
@@ -252,7 +254,7 @@ export function AdminUsersPage() {
     });
   }
 
-  function confirmBatchUserStatus(isDisabled: boolean) {
+  async function confirmBatchUserStatus(isDisabled: boolean) {
     const targets = selectedOnCurrentPage;
     if (targets.length === 0 || batchActionPending || anyCopyDialogOpen) return;
     const names = targets.map((user) => user.displayName || user.usernameNormalized).join("、");
@@ -260,7 +262,7 @@ export function AdminUsersPage() {
     const effect = isDisabled
       ? "禁用会撤销登录凭证并停止服务端控制的播放；已交给外部播放器的 STRM 链接无法强制中断。"
       : "启用后，用户需要重新登录；已撤销的旧登录不会恢复。";
-    if (!window.confirm(`仅对当前页已选的 ${targets.length} 个用户${action}账号吗？\n${names}\n${effect}`)) return;
+    if (!(await confirm(`仅对当前页已选的 ${targets.length} 个用户${action}账号吗？\n${names}\n${effect}`))) return;
     setBatchStatusResults(null);
     setBatchStatusError("");
     setBatchResults(null);
@@ -272,35 +274,35 @@ export function AdminUsersPage() {
     });
   }
 
-  function confirmDisable(user: AdminUser) {
+  async function confirmDisable(user: AdminUser) {
     const displayName = user.displayName || user.usernameNormalized;
     if (actionsDisabled || user.isDisabled) return;
-    if (!window.confirm(`确定要禁用账户“${displayName}”吗？账户数据会保留，但用户将无法登录。`)) return;
+    if (!(await confirm(`确定要禁用账户“${displayName}”吗？账户数据会保留，但用户将无法登录。`))) return;
     setActionError("");
     disableUser.mutate(user.id);
   }
 
-  function confirmEnable(user: AdminUser) {
+  async function confirmEnable(user: AdminUser) {
     const displayName = user.displayName || user.usernameNormalized;
     if (actionsDisabled || !user.isDisabled) return;
-    if (!window.confirm(`确定要启用账户“${displayName}”吗？账户将恢复登录。`)) return;
+    if (!(await confirm(`确定要启用账户“${displayName}”吗？账户将恢复登录。`))) return;
     setActionError("");
     enableUser.mutate(user.id);
   }
 
-  function confirmDelete(user: AdminUser) {
+  async function confirmDelete(user: AdminUser) {
     const displayName = user.displayName || user.usernameNormalized;
     const retention = deletionGraceDays === undefined ? "按服务器当前配置的期限保留" : `保留 ${deletionGraceDays} 天`;
     if (actionsDisabled) return;
-    if (!window.confirm(`确定将账户“${displayName}”移入回收站吗？账号会${retention}，你可以在期限内恢复。`)) return;
+    if (!(await confirm(`确定将账户“${displayName}”移入回收站吗？账号会${retention}，你可以在期限内恢复。`))) return;
     setActionError("");
     deleteUser.mutate(user.id);
   }
 
-  function confirmPurge(user: AdminUser) {
+  async function confirmPurge(user: AdminUser) {
     const displayName = user.displayName || user.usernameNormalized;
     if (actionsDisabled) return;
-    if (!window.confirm(`彻底删除“${displayName}”将永久移除账号、头像、权限设置、偏好、播放记录和设备关联，无法恢复。媒体文件不会删除。确定继续吗？`)) return;
+    if (!(await confirm(`彻底删除“${displayName}”将永久移除账号、头像、权限设置、偏好、播放记录和设备关联，无法恢复。媒体文件不会删除。确定继续吗？`))) return;
     setActionError("");
     purgeUser.mutate(user.id);
   }
@@ -341,11 +343,11 @@ export function AdminUsersPage() {
           <p>管理工作区里的账户、审批与访问策略。</p>
         </div>
         <div className="lux-users-heading-actions">
-          <button className="lux-button lux-button-secondary" type="button" onClick={() => changeView("invitations")}>邀请成员</button>
+          <LuxButton tone="secondary" type="button" onClick={() => changeView("invitations")}>邀请成员</LuxButton>
           {view === "users" ? (
-            <button ref={createButtonRef} className="lux-button lux-button-primary" type="button" onClick={() => { setFormError(""); setCreateOpen(true); }}>
+            <LuxButton tone="primary" ref={createButtonRef} type="button" onClick={() => { setFormError(""); setCreateOpen(true); }}>
               <Plus size={16} aria-hidden="true" />创建用户
-            </button>
+            </LuxButton>
           ) : null}
         </div>
       </header>
@@ -355,7 +357,7 @@ export function AdminUsersPage() {
             <section className="lux-users-toolbar" aria-label={`${VIEW_LABELS[view]}筛选`}>
               <label className="lux-users-search">
                 <Search size={15} aria-hidden="true" />
-                <input
+                <LuxTextField
                   type="search"
                   aria-label="搜索用户"
                   placeholder="搜索用户名、显示名或邮箱"
@@ -373,20 +375,19 @@ export function AdminUsersPage() {
                 <span className="lux-users-tag">按删除时间排序</span>
               )}
               <div className="lux-users-toolbar-end">
-                <select className="lux-users-select" aria-label="排序方式" value={sortBy} onChange={(event) => setSortBy(event.target.value as AdminUserSortBy)}>
+                <LuxSelectField className="lux-users-select" aria-label="排序方式" value={sortBy} onChange={(event) => setSortBy(event.target.value as AdminUserSortBy)}>
                   <option value="lastActivityAt">最近活动</option>
                   <option value="lastLoginAt">最近登录</option>
                   <option value="createdAt">创建时间</option>
-                </select>
-                <button
-                  className="lux-icon-button lux-icon-button-small"
+                </LuxSelectField>
+                <LuxIconButton className="lux-icon-button-small"
                   type="button"
                   aria-label={sortOrder === "desc" ? "当前最新优先，切换为最早优先" : "当前最早优先，切换为最新优先"}
                   title={sortOrder === "desc" ? "最新优先" : "最早优先"}
                   onClick={() => setSortOrder((order) => order === "desc" ? "asc" : "desc")}
                 >
                   {sortOrder === "desc" ? <ArrowDown size={15} aria-hidden="true" /> : <ArrowUp size={15} aria-hidden="true" />}
-                </button>
+                </LuxIconButton>
               </div>
             </section>
             <section className="lux-users-card lux-users-table-card" aria-labelledby="lux-users-list-title">
@@ -444,12 +445,12 @@ export function AdminUsersPage() {
                             <td>{formatTimestamp(user.deletedAt)}</td>
                             <td>{formatTimestamp(user.deletionPurgeAt)}</td>
                             <td className="lux-users-col-actions">
-                              <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label={`恢复${user.displayName || user.usernameNormalized}账户`} onClick={() => confirmRestore(user)} disabled={actionsDisabled}>
+                              <LuxButton tone="secondary" size="compact" type="button" aria-label={`恢复${user.displayName || user.usernameNormalized}账户`} onClick={() => confirmRestore(user)} disabled={actionsDisabled}>
                                 <RotateCcw size={15} aria-hidden="true" />{restoreUser.isPending ? "恢复中…" : "恢复"}
-                              </button>
-                              <button className="lux-button lux-button-compact lux-button-secondary lux-users-danger-text" type="button" aria-label={`彻底删除${user.displayName || user.usernameNormalized}账户`} onClick={() => confirmPurge(user)} disabled={actionsDisabled}>
+                              </LuxButton>
+                              <LuxButton tone="secondary" size="compact" className="lux-users-danger-text" type="button" aria-label={`彻底删除${user.displayName || user.usernameNormalized}账户`} onClick={() => confirmPurge(user)} disabled={actionsDisabled}>
                                 <Trash2 size={15} aria-hidden="true" />彻底删除
-                              </button>
+                              </LuxButton>
                             </td>
                           </tr>
                         ) : (
@@ -472,46 +473,67 @@ export function AdminUsersPage() {
                       </tbody>
                     </table>
                   </div>
-                  {view === "users" ? (
-                    <div className="lux-users-cards">
-                      {items.map((user) => (
-                        <article className="lux-users-card-item" key={user.id}>
-                          <div className="lux-users-card-item-head">
-                            <input
-                              type="checkbox"
-                              aria-label={`选择${user.displayName || user.usernameNormalized}`}
-                              checked={selectedUserIds.includes(user.id)}
-                              disabled={actionsDisabled}
-                              onChange={(event) => toggleUserSelection(user.id, event.target.checked)}
-                            />
-                            <span className="lux-users-avatar" aria-hidden="true">{avatarInitial(user)}</span>
-                            <div className="lux-users-account-copy">
-                              <strong className="lux-users-account-name">{user.displayName || user.usernameNormalized}</strong>
-                              <span className="lux-users-account-meta">@{user.usernameNormalized}</span>
-                            </div>
-                            <UserStatusBadge user={user} />
-                            <UserMenu
-                              user={user}
-                              graceDays={deletionGraceDays}
-                              open={openMenuId === user.id}
-                              disabled={actionsDisabled}
-                              onToggle={() => setOpenMenuId((current) => current === user.id ? null : user.id)}
-                              onDisable={() => confirmDisable(user)}
-                              onEnable={() => confirmEnable(user)}
-                              onDelete={() => confirmDelete(user)}
-                              onCopyPermission={() => openPermissionCopy(user)}
-                              onCopyPreference={() => openPreferenceCopy(user)}
-                            />
+                  <div className="lux-users-cards">
+                    {items.map((user) => view === "deleted" ? (
+                      <article className="lux-users-card-item" key={user.id}>
+                        <div className="lux-users-card-item-head">
+                          <Link className="lux-users-avatar" to={`/admin/users/${encodeURIComponent(user.id)}`} tabIndex={-1} aria-hidden="true">{avatarInitial(user)}</Link>
+                          <div className="lux-users-account-copy">
+                            <Link className="lux-users-account-name" to={`/admin/users/${encodeURIComponent(user.id)}`}>{user.displayName || user.usernameNormalized}</Link>
+                            <span className="lux-users-account-meta">@{user.usernameNormalized}</span>
                           </div>
-                          <div className="lux-users-tags">{accessTags(user)}</div>
-                          <div className="lux-users-card-item-foot">
-                            <span>{formatRelativeTime(user.lastActivityAt)}</span>
-                            <Link className="lux-button lux-button-compact lux-button-secondary" to={`/admin/users/${encodeURIComponent(user.id)}`}>管理</Link>
+                          <span className="lux-user-badge is-warn">回收站</span>
+                        </div>
+                        <dl className="lux-users-card-item-facts">
+                          <div><dt>删除于</dt><dd>{formatTimestamp(user.deletedAt)}</dd></div>
+                          <div><dt>计划清理</dt><dd>{formatTimestamp(user.deletionPurgeAt)}</dd></div>
+                        </dl>
+                        <div className="lux-users-card-item-actions">
+                          <LuxButton tone="secondary" size="compact" type="button" aria-label={`恢复${user.displayName || user.usernameNormalized}账户`} onClick={() => confirmRestore(user)} disabled={actionsDisabled}>
+                            <RotateCcw size={15} aria-hidden="true" />{restoreUser.isPending ? "恢复中…" : "恢复"}
+                          </LuxButton>
+                          <LuxButton tone="secondary" size="compact" className="lux-users-danger-text" type="button" aria-label={`彻底删除${user.displayName || user.usernameNormalized}账户`} onClick={() => confirmPurge(user)} disabled={actionsDisabled}>
+                            <Trash2 size={15} aria-hidden="true" />彻底删除
+                          </LuxButton>
+                        </div>
+                      </article>
+                    ) : (
+                      <article className="lux-users-card-item" key={user.id}>
+                        <div className="lux-users-card-item-head">
+                          <input
+                            type="checkbox"
+                            aria-label={`选择${user.displayName || user.usernameNormalized}`}
+                            checked={selectedUserIds.includes(user.id)}
+                            disabled={actionsDisabled}
+                            onChange={(event) => toggleUserSelection(user.id, event.target.checked)}
+                          />
+                          <Link className="lux-users-avatar" to={`/admin/users/${encodeURIComponent(user.id)}`} tabIndex={-1} aria-hidden="true">{avatarInitial(user)}</Link>
+                          <div className="lux-users-account-copy">
+                            <Link className="lux-users-account-name" to={`/admin/users/${encodeURIComponent(user.id)}`}>{user.displayName || user.usernameNormalized}</Link>
+                            <span className="lux-users-account-meta"><Link className="lux-users-account-username" to={`/admin/users/${encodeURIComponent(user.id)}`} tabIndex={-1} aria-hidden="true">@{user.usernameNormalized}</Link></span>
                           </div>
-                        </article>
-                      ))}
-                    </div>
-                  ) : null}
+                          <UserStatusBadge user={user} />
+                          <UserMenu
+                            user={user}
+                            graceDays={deletionGraceDays}
+                            open={openMenuId === user.id}
+                            disabled={actionsDisabled}
+                            onToggle={() => setOpenMenuId((current) => current === user.id ? null : user.id)}
+                            onDisable={() => confirmDisable(user)}
+                            onEnable={() => confirmEnable(user)}
+                            onDelete={() => confirmDelete(user)}
+                            onCopyPermission={() => openPermissionCopy(user)}
+                            onCopyPreference={() => openPreferenceCopy(user)}
+                          />
+                        </div>
+                        <div className="lux-users-tags">{accessTags(user)}</div>
+                        <div className="lux-users-card-item-foot">
+                          <span>{formatRelativeTime(user.lastActivityAt)}</span>
+                          <Link className={luxButtonClass({ tone: "secondary", size: "compact" })} to={`/admin/users/${encodeURIComponent(user.id)}`}>管理</Link>
+                        </div>
+                      </article>
+                    ))}
+                  </div>
                 </>
               ) : (
                 <p className="lux-users-empty">{view === "deleted" ? "回收站为空。" : search ? "没有找到匹配的用户。" : "当前没有用户。"}</p>
@@ -519,14 +541,14 @@ export function AdminUsersPage() {
               <footer className="lux-admin-user-pagination lux-users-pager" aria-label="用户列表分页">
                 <span>{totalCount ? `显示 ${(page - 1) * pageSize + 1}–${Math.min(page * pageSize, totalCount)} 条，共 ${totalCount} 条` : "共 0 条"}</span>
                 <div className="lux-users-pager-actions">
-                  <select aria-label="每页条数" value={pageSize} onChange={(event) => setPageSize(Number(event.target.value))}>
+                  <LuxSelectField aria-label="每页条数" value={String(pageSize)} onChange={(event) => setPageSize(Number(event.target.value))}>
                     <option value={20}>每页 20 条</option>
                     <option value={50}>每页 50 条</option>
                     <option value={100}>每页 100 条</option>
-                  </select>
+                  </LuxSelectField>
                   <span>第 {page} / {totalPages} 页</span>
-                  <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="上一页" disabled={page <= 1 || users.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button>
-                  <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="下一页" disabled={page >= totalPages || users.isFetching} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</button>
+                  <LuxButton tone="secondary" size="compact" type="button" aria-label="上一页" disabled={page <= 1 || users.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</LuxButton>
+                  <LuxButton tone="secondary" size="compact" type="button" aria-label="下一页" disabled={page >= totalPages || users.isFetching} onClick={() => setPage((current) => Math.min(totalPages, current + 1))}>下一页</LuxButton>
                 </div>
               </footer>
             </section>
@@ -534,7 +556,7 @@ export function AdminUsersPage() {
               <section className="lux-users-card" aria-label="批量结果">
                 <div className="lux-users-card-heading">
                   <div><h2>批量结果</h2><p>结果保留到下一次批量操作或离开当前筛选。</p></div>
-                  <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => { setBatchResults(null); setBatchStatusResults(null); }}>关闭结果</button>
+                  <LuxButton tone="secondary" size="compact" type="button" onClick={() => { setBatchResults(null); setBatchStatusResults(null); }}>关闭结果</LuxButton>
                 </div>
                 <div className="lux-users-card-body" style={{ display: "grid", gap: 12 }}>
                   {batchResults ? <div role="status" aria-label="批量应用结果"><strong style={{ fontSize: ".8rem" }}>角色预设“{batchResults.presetName}”的应用结果</strong><ul style={{ display: "grid", gap: 4, margin: "8px 0 0", padding: 0, listStyle: "none", fontSize: ".76rem" }}>{batchResults.results.map((result) => <li key={result.userId} className={result.success ? "is-success" : "is-failure"} style={{ color: result.success ? "#9bdcb3" : "var(--lux-danger, #ee9eaa)" }}>{result.userName}：{result.success ? "成功" : batchPermissionPresetErrorMessage(result.errorCode)}</li>)}</ul></div> : null}
@@ -547,19 +569,19 @@ export function AdminUsersPage() {
                 <strong id="lux-users-batch-title" ref={batchPanelHeadingRef} tabIndex={-1}>当前页已选 {selectedOnCurrentPage.length} 人</strong>
                 <span className="lux-users-selection-hint">仅对当前页勾选的用户操作，换页或筛选后清空</span>
                 <div className="lux-users-selection-divider" aria-hidden="true" />
-                <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="批量启用用户" onClick={() => confirmBatchUserStatus(false)} disabled={batchActionPending || anyCopyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === false ? "启用中…" : "批量启用"}</button>
-                <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="批量禁用用户" onClick={() => confirmBatchUserStatus(true)} disabled={batchActionPending || anyCopyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === true ? "禁用中…" : "批量禁用"}</button>
-                <button className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制偏好" onClick={() => setCopyDialogOpen(true)} disabled={batchActionPending || anyCopyDialogOpen}>复制偏好</button>
-                <button ref={permissionCopyButtonRef} className="lux-button lux-button-compact lux-button-secondary" type="button" aria-label="复制权限" onClick={() => setPermissionCopyDialogOpen(true)} disabled={batchActionPending || anyCopyDialogOpen}>复制权限</button>
+                <LuxButton tone="secondary" size="compact" type="button" aria-label="批量启用用户" onClick={() => confirmBatchUserStatus(false)} disabled={batchActionPending || anyCopyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === false ? "启用中…" : "批量启用"}</LuxButton>
+                <LuxButton tone="secondary" size="compact" type="button" aria-label="批量禁用用户" onClick={() => confirmBatchUserStatus(true)} disabled={batchActionPending || anyCopyDialogOpen}>{updateBatchStatus.isPending && updateBatchStatus.variables?.isDisabled === true ? "禁用中…" : "批量禁用"}</LuxButton>
+                <LuxButton tone="secondary" size="compact" type="button" aria-label="复制偏好" onClick={() => setCopyDialogOpen(true)} disabled={batchActionPending || anyCopyDialogOpen}>复制偏好</LuxButton>
+                <LuxButton tone="secondary" size="compact" ref={permissionCopyButtonRef} type="button" aria-label="复制权限" onClick={() => setPermissionCopyDialogOpen(true)} disabled={batchActionPending || anyCopyDialogOpen}>复制权限</LuxButton>
                 <label>角色预设
-                  <select aria-label="批量角色预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || batchActionPending || anyCopyDialogOpen}>
+                  <LuxSelectField aria-label="批量角色预设" value={batchPresetId} onChange={(event) => setBatchPresetId(event.target.value)} disabled={permissionPresets.isPending || batchActionPending || anyCopyDialogOpen}>
                     <option value="">选择角色预设</option>
                     {(permissionPresets.data?.presets ?? []).map((preset) => <option key={preset.id} value={preset.id}>{preset.name}</option>)}
-                  </select>
+                  </LuxSelectField>
                 </label>
-                <button className="lux-button lux-button-primary lux-button-compact" type="button" aria-label="批量应用角色预设" onClick={confirmBatchPreset} disabled={!batchPresetId || !permissionPresets.data?.presets.some((preset) => preset.id === batchPresetId) || batchActionPending || anyCopyDialogOpen}>{applyBatchPreset.isPending ? "应用中…" : "应用预设"}</button>
+                <LuxButton tone="primary" size="compact" type="button" aria-label="批量应用角色预设" onClick={confirmBatchPreset} disabled={!batchPresetId || !permissionPresets.data?.presets.some((preset) => preset.id === batchPresetId) || batchActionPending || anyCopyDialogOpen}>{applyBatchPreset.isPending ? "应用中…" : "应用预设"}</LuxButton>
                 <span className="lux-users-selection-spacer" />
-                <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => setSelectedUserIds([])}>清除选择</button>
+                <LuxButton tone="secondary" size="compact" type="button" onClick={() => setSelectedUserIds([])}>清除选择</LuxButton>
                 {permissionPresets.error ? <p className="lux-error-copy" role="alert" style={{ flexBasis: "100%" }}>角色预设加载失败：{permissionPresets.error.message}</p> : null}
                 {batchError ? <p className="lux-error-copy" role="alert" style={{ flexBasis: "100%" }}>批量应用失败：{batchError}</p> : null}
                 {batchStatusError ? <p className="lux-error-copy" role="alert" style={{ flexBasis: "100%" }}>批量状态更新失败：{batchStatusError}</p> : null}
@@ -574,20 +596,20 @@ export function AdminUsersPage() {
           <aside className="lux-users-drawer" role="dialog" aria-modal="true" aria-label="创建用户">
             <div className="lux-users-drawer-head">
               <div><h2>创建用户</h2><p>创建后可在用户详情里配置权限，或直接应用角色预设。</p></div>
-              <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="关闭创建用户" onClick={closeCreate}><X size={16} aria-hidden="true" /></button>
+              <LuxIconButton className="lux-icon-button-small" type="button" aria-label="关闭创建用户" onClick={closeCreate}><X size={16} aria-hidden="true" /></LuxIconButton>
             </div>
             <form className="lux-admin-form lux-users-drawer-form" onSubmit={submit} aria-label="创建用户">
               <div className="lux-users-drawer-body">
-                <label>用户名<input ref={createFirstFieldRef} value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} autoComplete="off" /></label>
-                <label>显示名称<input value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></label>
-                <label>初始密码<input type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} autoComplete="new-password" /></label>
-                <label className="lux-admin-toggle"><input type="checkbox" checked={form.isAdmin} onChange={(event) => setForm({ ...form, isAdmin: event.target.checked })} /><span>服务器管理员</span></label>
+                <label>用户名<LuxTextField ref={createFirstFieldRef} value={form.username} onChange={(event) => setForm({ ...form, username: event.target.value })} autoComplete="off" /></label>
+                <label>显示名称<LuxTextField value={form.displayName} onChange={(event) => setForm({ ...form, displayName: event.target.value })} /></label>
+                <label>初始密码<LuxTextField type="password" value={form.password} onChange={(event) => setForm({ ...form, password: event.target.value })} autoComplete="new-password" /></label>
+                <LuxSwitch className="lux-admin-toggle" checked={form.isAdmin} onChange={(event) => setForm({ ...form, isAdmin: event.target.checked })} label="服务器管理员" />
                 <p className="lux-admin-muted" style={{ margin: 0, fontSize: ".72rem", lineHeight: 1.55 }}>用户名创建后不可修改；初始密码需要用户首次登录后自行更换。</p>
                 {formError ? <p className="lux-error-copy" role="alert">{formError}</p> : null}
               </div>
               <div className="lux-users-drawer-foot">
-                <button className="lux-button lux-button-secondary" type="button" onClick={closeCreate}>取消</button>
-                <button className="lux-button lux-button-primary" type="submit" disabled={create.isPending}>{create.isPending ? "创建中…" : "创建用户"}</button>
+                <LuxButton tone="secondary" type="button" onClick={closeCreate}>取消</LuxButton>
+                <LuxButton tone="primary" type="submit" disabled={create.isPending}>{create.isPending ? "创建中…" : "创建用户"}</LuxButton>
               </div>
             </form>
           </aside>
@@ -628,6 +650,7 @@ function ActiveUserRow({ user, graceDays, selected, disabled, menuOpen, onSelect
   onCopyPreference: () => void;
 }) {
   const displayName = user.displayName || user.usernameNormalized;
+  const detailHref = `/admin/users/${encodeURIComponent(user.id)}`;
   return (
     <tr className={`lux-users-row${selected ? " is-selected" : ""}${user.isDisabled ? " is-disabled" : ""}`}>
       <td className="lux-users-col-check">
@@ -638,10 +661,10 @@ function ActiveUserRow({ user, graceDays, selected, disabled, menuOpen, onSelect
       </td>
       <td>
         <div className="lux-users-account">
-          <span className="lux-users-avatar" aria-hidden="true">{avatarInitial(user)}</span>
+          <Link className="lux-users-avatar" to={detailHref} tabIndex={-1} aria-hidden="true">{avatarInitial(user)}</Link>
           <div className="lux-users-account-copy">
-            <strong className="lux-users-account-name">{displayName}</strong>
-            <span className="lux-users-account-meta">@{user.usernameNormalized}{user.email ? ` · ${user.email}` : ""}</span>
+            <Link className="lux-users-account-name" to={detailHref}>{displayName}</Link>
+            <span className="lux-users-account-meta"><Link className="lux-users-account-username" to={detailHref} tabIndex={-1} aria-hidden="true">@{user.usernameNormalized}</Link>{user.email ? ` · ${user.email}` : ""}</span>
           </div>
         </div>
       </td>
@@ -651,7 +674,7 @@ function ActiveUserRow({ user, graceDays, selected, disabled, menuOpen, onSelect
       <td><RelativeTime value={user.lastActivityAt} /></td>
       <td><UserStatusBadge user={user} /></td>
       <td className="lux-users-col-actions">
-        <Link className="lux-button lux-button-compact lux-button-secondary" to={`/admin/users/${encodeURIComponent(user.id)}`}>管理</Link>
+        <Link className={luxButtonClass({ tone: "secondary", size: "compact" })} to={`/admin/users/${encodeURIComponent(user.id)}`}>管理</Link>
         <UserMenu
           user={user}
           graceDays={graceDays}
@@ -684,9 +707,9 @@ function UserMenu({ user, graceDays, open, disabled, onToggle, onDisable, onEnab
   const displayName = user.displayName || user.usernameNormalized;
   return (
     <div className="lux-users-menu-wrap" data-user-menu>
-      <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={`更多操作：${displayName}`} aria-expanded={open} aria-haspopup="menu" onClick={onToggle} disabled={disabled}>
+      <LuxIconButton className="lux-icon-button-small" type="button" aria-label={`更多操作：${displayName}`} aria-expanded={open} aria-haspopup="menu" onClick={onToggle} disabled={disabled}>
         <MenuDots />
-      </button>
+      </LuxIconButton>
       {open ? (
         <div className="lux-users-menu" role="menu">
           <Link role="menuitem" to={`/admin/users/${encodeURIComponent(user.id)}`}>查看详情</Link>

@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { useState } from "react";
 import { ApiError, api } from "../../lib/api/client";
 import type { AdminUserAccessBlacklistRule, AdminUserAccessBlacklistRuleType } from "../../lib/api/types";
+import { LuxButton, LuxSelectField, LuxSwitch, LuxTextField, useLuxConfirm } from "../../components/ui";
 
 const PAGE_SIZE = 20;
 const globalRulesQueryKey = ["admin", "global-access-blacklist"] as const;
@@ -11,6 +12,7 @@ const controlCharacterPattern = /[\u0000-\u001f\u007f-\u009f]/u;
 type RuleFormNotice = { kind: "success" | "error"; message: string };
 
 export function AdminUserGlobalAccessRulesPanel() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [ruleType, setRuleType] = useState<AdminUserAccessBlacklistRuleType>("DEVICE");
@@ -66,7 +68,7 @@ export function AdminUserGlobalAccessRulesPanel() {
     onError: () => setNotice({ kind: "error", message: "规则删除失败，请重试。" }),
   });
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const validation = validateRuleValue(ruleType, matchValue);
     if (validation) {
@@ -74,7 +76,7 @@ export function AdminUserGlobalAccessRulesPanel() {
       setNotice(null);
       return;
     }
-    if (createEnabled && !window.confirm(ruleEffectConfirmation(ruleType))) return;
+    if (createEnabled && !(await confirm(ruleEffectConfirmation(ruleType)))) return;
 
     setValidationError("");
     setNotice(null);
@@ -82,15 +84,15 @@ export function AdminUserGlobalAccessRulesPanel() {
     createRule.mutate({ ruleType, matchValue: value, isEnabled: createEnabled });
   }
 
-  function toggleRule(rule: AdminUserAccessBlacklistRule) {
+  async function toggleRule(rule: AdminUserAccessBlacklistRule) {
     const isEnabled = !rule.isEnabled;
-    if (isEnabled && !window.confirm(ruleEffectConfirmation(rule.ruleType))) return;
+    if (isEnabled && !(await confirm(ruleEffectConfirmation(rule.ruleType)))) return;
     setNotice(null);
     setRuleEnabled.mutate({ ruleId: rule.id, isEnabled });
   }
 
-  function confirmDelete(rule: AdminUserAccessBlacklistRule) {
-    if (!window.confirm(`确认删除这条${ruleTypeLabel(rule.ruleType)}规则？删除后该匹配值不再阻止登录、已有会话或播放授权。`)) return;
+  async function confirmDelete(rule: AdminUserAccessBlacklistRule) {
+    if (!(await confirm(`确认删除这条${ruleTypeLabel(rule.ruleType)}规则？删除后该匹配值不再阻止登录、已有会话或播放授权。`))) return;
     setNotice(null);
     deleteRule.mutate(rule.id);
   }
@@ -108,18 +110,18 @@ export function AdminUserGlobalAccessRulesPanel() {
 
       <form className="lux-admin-form lux-admin-user-profile-form lux-admin-global-access-form" onSubmit={submit} aria-busy={createRule.isPending}>
         <label>规则类型
-          <select aria-label="规则类型" value={ruleType} disabled={createRule.isPending} onChange={(event) => { setRuleType(event.target.value as AdminUserAccessBlacklistRuleType); setValidationError(""); setNotice(null); }}>
+          <LuxSelectField aria-label="规则类型" value={ruleType} disabled={createRule.isPending} onChange={(event) => { setRuleType(event.target.value as AdminUserAccessBlacklistRuleType); setValidationError(""); setNotice(null); }}>
             <option value="DEVICE">设备 ID</option>
             <option value="CLIENT">客户端名称</option>
             <option value="IP_CIDR">IP/CIDR</option>
-          </select>
+          </LuxSelectField>
         </label>
         <label>匹配值
-          <input aria-label="匹配值" value={matchValue} maxLength={256} disabled={createRule.isPending} onChange={(event) => { setMatchValue(event.target.value); setValidationError(""); setNotice(null); }} placeholder={ruleType === "DEVICE" ? "输入设备 ID" : ruleType === "CLIENT" ? "输入客户端名称" : "例如 192.0.2.0/24 或 2001:db8::/32"} />
+          <LuxTextField aria-label="匹配值" value={matchValue} maxLength={256} disabled={createRule.isPending} onChange={(event) => { setMatchValue(event.target.value); setValidationError(""); setNotice(null); }} placeholder={ruleType === "DEVICE" ? "输入设备 ID" : ruleType === "CLIENT" ? "输入客户端名称" : "例如 192.0.2.0/24 或 2001:db8::/32"} />
         </label>
-        <label className="lux-admin-toggle"><input type="checkbox" checked={createEnabled} disabled={createRule.isPending} onChange={(event) => setCreateEnabled(event.target.checked)} />创建后立即启用</label>
+        <LuxSwitch className="lux-admin-toggle" checked={createEnabled} disabled={createRule.isPending} onChange={(event) => setCreateEnabled(event.target.checked)} label="创建后立即启用" />
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={createRule.isPending}>{createRule.isPending ? "正在保存…" : "添加全站规则"}</button>
+          <LuxButton tone="primary" type="submit" disabled={createRule.isPending}>{createRule.isPending ? "正在保存…" : "添加全站规则"}</LuxButton>
         </div>
         <p className="lux-admin-muted">设备 ID 精确匹配；客户端名称忽略大小写并折叠连续空白；IP/CIDR 由服务器转换为规范的网络地址。</p>
         {validationError ? <p className="lux-error-copy" role="alert">{validationError}</p> : null}
@@ -131,7 +133,7 @@ export function AdminUserGlobalAccessRulesPanel() {
       {rules.isError ? (
         <div className="lux-admin-access-block" role="alert">
           <p>读取全站规则失败，请重试。</p>
-          <button className="lux-button lux-button-secondary" type="button" onClick={() => void rules.refetch()} disabled={rules.isFetching}>重新加载</button>
+          <LuxButton tone="secondary" type="button" onClick={() => void rules.refetch()} disabled={rules.isFetching}>重新加载</LuxButton>
         </div>
       ) : null}
       {rules.data && rules.data.rules.length === 0 ? <p className="lux-admin-muted" role="status">当前没有全站规则。</p> : null}
@@ -149,8 +151,8 @@ export function AdminUserGlobalAccessRulesPanel() {
                     <td><time dateTime={new Date(rule.createdAt * 1000).toISOString()}>{new Date(rule.createdAt * 1000).toLocaleString()}</time></td>
                     <td>
                       <div className="lux-admin-user-profile-actions">
-                        <button className="lux-button lux-button-secondary" type="button" aria-label={`${rule.isEnabled ? "停用" : "启用"}规则 ${rule.id}`} onClick={() => toggleRule(rule)} disabled={mutationPending}>{rule.isEnabled ? "停用" : "启用"}</button>
-                        <button className="lux-button lux-button-secondary" type="button" aria-label={`删除规则 ${rule.id}`} onClick={() => confirmDelete(rule)} disabled={mutationPending}>删除</button>
+                        <LuxButton tone="secondary" type="button" aria-label={`${rule.isEnabled ? "停用" : "启用"}规则 ${rule.id}`} onClick={() => toggleRule(rule)} disabled={mutationPending}>{rule.isEnabled ? "停用" : "启用"}</LuxButton>
+                        <LuxButton tone="secondary" type="button" aria-label={`删除规则 ${rule.id}`} onClick={() => confirmDelete(rule)} disabled={mutationPending}>删除</LuxButton>
                       </div>
                     </td>
                   </tr>
@@ -161,8 +163,8 @@ export function AdminUserGlobalAccessRulesPanel() {
           <div className="lux-admin-pagination">
             <span>第 {page} / {totalPages} 页 · {rules.data.totalCount} 条全站规则（每页最多 {PAGE_SIZE} 条）</span>
             <div>
-              <button className="lux-button lux-button-secondary" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1}>上一页</button>
-              <button className="lux-button lux-button-secondary" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page >= totalPages}>下一页</button>
+              <LuxButton tone="secondary" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1}>上一页</LuxButton>
+              <LuxButton tone="secondary" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page >= totalPages}>下一页</LuxButton>
             </div>
           </div>
         </>
