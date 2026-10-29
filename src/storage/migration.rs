@@ -432,6 +432,11 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                  id
              )
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_nfo_collection_reference_pending
+             ON media_items(id)
+             WHERE item_type = 'MOVIE'
+               AND removed_at IS NULL
+               AND nfo_collection_reference_key IS NULL",
             "CREATE INDEX idx_media_items_library_rating_sort
              ON media_items(
                  library_id,

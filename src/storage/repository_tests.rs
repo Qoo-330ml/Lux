@@ -11652,6 +11652,61 @@ async fn recommendation_query_uses_materialized_stats_and_image_indexes() {
 }
 
 #[tokio::test]
+async fn pending_nfo_collection_reconciliation_query_can_use_the_pending_index() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let plan = sqlx::query(
+        "EXPLAIN QUERY PLAN
+         SELECT item.id
+         FROM media_items item INDEXED BY idx_media_items_nfo_collection_reference_pending
+         JOIN libraries library ON library.id = item.library_id
+         JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.item_type = 'MOVIE'
+           AND item.removed_at IS NULL
+           AND item.nfo_collection_reference_key IS NULL
+         ORDER BY item.id
+         LIMIT 32",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("the pending index must be usable by the reconciliation query")
+    .into_iter()
+    .map(|row| row.get::<String, _>("detail"))
+    .collect::<Vec<_>>();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_media_items_nfo_collection_reference_pending")),
+        "pending reconciliation query did not use the pending index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
+        "pending reconciliation query must not sort: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_nfo_collection_reconciliation_query_runs_on_both_shapes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let rows = database
+        .list_pending_movie_nfo_collection_reference_reconciliations(32)
+        .await
+        .expect("fenced reconciliation query is valid SQL");
+    assert!(rows.is_empty());
+    let query = super::catalog::PENDING_NFO_COLLECTION_RECONCILIATION_QUERY;
+    assert_eq!(query.matches("AS MATERIALIZED").count(), 2);
+    assert!(query.trim_end().ends_with("LIMIT ?"));
+}
+
+#[tokio::test]
 async fn concurrent_metadata_capability_writes_are_serialized() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
     let config = Config {

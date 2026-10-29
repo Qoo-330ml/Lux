@@ -859,6 +859,11 @@
       "name": "symlink_media_origin",
       "sqlite": 239,
       "postgres": 241
+    },
+    {
+      "name": "nfo_collection_pending_index_without_stale_predicate",
+      "sqlite": 240,
+      "postgres": 242
     }
   ],
   "sqlite_only": [
@@ -1211,7 +1216,7 @@
     }
   ],
   "ordering": {
-    "shared_names": 172,
+    "shared_names": 173,
     "rank_mismatches": 84,
     "note": "Migration histories evolved with different SQLite-only/PostgreSQL-only interleaving, so the shared names are not in the same relative order. New migrations must keep a pair adjacent in both directories, which keeps this count from growing."
   }

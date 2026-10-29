@@ -8043,19 +8043,7 @@ impl Database {
             ));
         }
         let rows: Vec<StoredMovieNfoCollectionReferenceReconciliation> = self
-            .query_as(
-                "SELECT item.id AS item_id, item.provider_ids_json, item.metadata_scraper_id,
-                        library.scraper_id AS library_scraper_id,
-                        item.production_year, cache.json AS nfo_metadata_json
-                 FROM media_items item
-                 JOIN libraries library ON library.id = item.library_id
-                 JOIN media_item_nfo_cache cache ON cache.item_id = item.id
-                 WHERE item.item_type = 'MOVIE'
-                   AND item.removed_at IS NULL
-                   AND item.nfo_collection_reference_key IS NULL
-                 ORDER BY item.id
-                 LIMIT ?",
-            )
+            .query_as(PENDING_NFO_COLLECTION_RECONCILIATION_QUERY)
             .bind(i64::try_from(limit).map_err(|_| {
                 StorageError::Conflict(
                     "NFO collection reference reconciliation page size overflow".to_owned(),
@@ -8078,11 +8066,7 @@ impl Database {
     ) -> Result<bool, StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
+        let lock_clause = nfo_reconciliation_lock_clause(self.backend);
         let current_query = format!(
             "SELECT item.provider_ids_json, item.metadata_scraper_id,
                     library.scraper_id, item.production_year, cache.json,
@@ -10955,8 +10939,56 @@ fn incremental_scan_scope_sql(backend: DatabaseBackend) -> &'static str {
     }
 }
 
+/// Pending NFO collection reconciliations. The `LIMIT` must stay outside the joins: with it in
+/// the same query block PostgreSQL assumes most pending movies have an NFO cache row, walks the
+/// whole cache primary key in a merge join, and spends ~100 ms per poll to return one row. The
+/// materialized steps keep the partial pending index as the driver and probe the cache per row.
+pub(super) const PENDING_NFO_COLLECTION_RECONCILIATION_QUERY: &str =
+    "WITH pending AS MATERIALIZED (
+        SELECT id, library_id, provider_ids_json, metadata_scraper_id, production_year
+        FROM media_items
+        WHERE item_type = 'MOVIE'
+          AND removed_at IS NULL
+          AND nfo_collection_reference_key IS NULL
+    ),
+    joined AS MATERIALIZED (
+        SELECT pending.id AS item_id, pending.provider_ids_json, pending.metadata_scraper_id,
+               library.scraper_id AS library_scraper_id, pending.production_year,
+               cache.json AS nfo_metadata_json
+        FROM pending
+        JOIN libraries library ON library.id = pending.library_id
+        JOIN media_item_nfo_cache cache ON cache.item_id = pending.id
+    )
+    SELECT item_id, provider_ids_json, metadata_scraper_id, library_scraper_id,
+           production_year, nfo_metadata_json
+    FROM joined
+    ORDER BY item_id
+    LIMIT ?";
+
+/// Row lock for the reconciliation re-read. PostgreSQL rejects a bare `FOR UPDATE` when the
+/// statement has a `LEFT JOIN` (the NFO cache is the nullable side), so it must name the item.
+fn nfo_reconciliation_lock_clause(backend: DatabaseBackend) -> &'static str {
+    if backend == DatabaseBackend::Postgres {
+        " FOR UPDATE OF item"
+    } else {
+        ""
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn postgres_nfo_reconciliation_lock_targets_only_the_item_row() {
+        assert_eq!(
+            super::nfo_reconciliation_lock_clause(super::DatabaseBackend::Postgres),
+            " FOR UPDATE OF item"
+        );
+        assert_eq!(
+            super::nfo_reconciliation_lock_clause(super::DatabaseBackend::Sqlite),
+            ""
+        );
+    }
+
     use super::{
         Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
         filtered_catalog_list_query, postgres_recent_catalog_rows_by_library_query,
