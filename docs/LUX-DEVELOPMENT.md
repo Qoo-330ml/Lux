@@ -18571,14 +18571,21 @@ Lux Web 对 HTTP(S) `.strm` 却始终先连 `externalUrl`，绕过了代理。�
 
 验收：
 
-- [ ] HTTP(S) `.strm` 在存在 `proxyUrl` 时原生播放首选 `proxyUrl`；无 `proxyUrl` 时行为与改动前一致。
-- [ ] `proxy` 失败后依次回落到 `lux`、`origin`；全部失败给出现有的可诊断错误；`origin` 不早于前两者。
-- [ ] 路径型 `.strm`、本地媒体、`SERVER_HLS` 行为不回归；客户端引擎输入仍为 `externalUrl`。
-- [ ] 记忆的候选类型不含 URL、token；多次播放不会让已失效的候选永久锁定（失败后清除记忆）。
+- [x] HTTP(S) `.strm` 在存在 `proxyUrl` 时原生播放首选 `proxyUrl`；无 `proxyUrl` 时行为与改动前一致。
+- [x] `proxy` 失败后依次回落到 `lux`、`origin`；全部失败给出现有的可诊断错误；`origin` 不早于前两者。
+- [x] 路径型 `.strm`、本地媒体、`SERVER_HLS` 行为不回归；客户端引擎输入仍为 `externalUrl`。
+- [x] 记忆的候选类型不含 URL、token；多次播放不会让已失效的候选永久锁定（失败后清除记忆）。
 
 验证：`pnpm --dir web test`（`player-fallback`、新增候选链单测）、`pnpm --dir web build`、`git diff --check`。
 
 依赖：LUX-234、LUX-245。
+
+进度（2026-10-29，完成）：`direct-candidates.ts`（顺序、记忆、超时常量）与 `PlayerPage.tsx` 接入；新增 `direct-candidates.test.ts`（9 项）
+与 `player-fallback.test.tsx` 4 项集成用例（代理优先并依次回落、无代理入口保持原链接、命中记忆与按记忆起步、8 秒超时降级）；
+LUX-245 中两处“原生 `<video>` 使用原始 `externalUrl`”的断言改为代理入口，字幕读取器与客户端引擎仍断言为 `externalUrl`。
+`pnpm --dir web test` 120 文件/930 用例通过，`pnpm --dir web build` 通过。未单独测试：全部候选失败时的最终错误展示
+（沿用既有 `remoteHttpSource`/HLS 回落分支）、失败后清除记忆（仅由 `direct-candidates` 单测覆盖 `clear`，未在页面层断言）。
+未做浏览器真机 smoke test；是否能被具体 302 软件接管取决于其是否在无 `api_key` 时仍可回查（见 LUX-871）。
 
 #### LUX-871：Web 播放短期 token（Emby 兼容、仅播放范围）
 
