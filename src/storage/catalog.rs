@@ -8068,7 +8068,7 @@ impl Database {
     ) -> Result<bool, StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = nfo_reconciliation_lock_clause(self.backend);
+        let lock_clause = nfo_reconciliation_lock_clause(self.backend == DatabaseBackend::Postgres);
         let current_query = format!(
             "SELECT item.provider_ids_json, item.metadata_scraper_id,
                     library.scraper_id, item.production_year, cache.json,
@@ -10969,12 +10969,8 @@ pub(super) const PENDING_NFO_COLLECTION_RECONCILIATION_QUERY: &str =
 
 /// Row lock for the reconciliation re-read. PostgreSQL rejects a bare `FOR UPDATE` when the
 /// statement has a `LEFT JOIN` (the NFO cache is the nullable side), so it must name the item.
-fn nfo_reconciliation_lock_clause(backend: DatabaseBackend) -> &'static str {
-    if backend == DatabaseBackend::Postgres {
-        " FOR UPDATE OF item"
-    } else {
-        ""
-    }
+fn nfo_reconciliation_lock_clause(postgres: bool) -> &'static str {
+    if postgres { " FOR UPDATE OF item" } else { "" }
 }
 
 #[cfg(test)]
@@ -10982,13 +10978,10 @@ mod tests {
     #[test]
     fn postgres_nfo_reconciliation_lock_targets_only_the_item_row() {
         assert_eq!(
-            super::nfo_reconciliation_lock_clause(super::DatabaseBackend::Postgres),
+            super::nfo_reconciliation_lock_clause(true),
             " FOR UPDATE OF item"
         );
-        assert_eq!(
-            super::nfo_reconciliation_lock_clause(super::DatabaseBackend::Sqlite),
-            ""
-        );
+        assert_eq!(super::nfo_reconciliation_lock_clause(false), "");
     }
 
     use super::{
