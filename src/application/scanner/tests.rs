@@ -3274,6 +3274,46 @@ mod symlink_discovery {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn batch_walker_follows_only_file_links_inside_the_root()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("Media");
+        std::fs::create_dir_all(&root)?;
+        let root = std::fs::canonicalize(root)?;
+        let inside_target = root.join("Inside.Movie.2024.mkv");
+        std::fs::write(&inside_target, b"fixture")?;
+        let inside_link = root.join("Inside.Link.2024.mkv");
+        symlink(&inside_target, &inside_link)?;
+        std::fs::create_dir_all(temp.path().join("Outside"))?;
+        let outside_target = temp.path().join("Outside").join("Outside.Movie.2024.mkv");
+        std::fs::write(&outside_target, b"fixture")?;
+        let outside_link = root.join("Outside.Link.2024.mkv");
+        symlink(&outside_target, &outside_link)?;
+        let broken_link = root.join("Broken.Link.2024.mkv");
+        symlink(root.join("Missing.Movie.2024.mkv"), &broken_link)?;
+
+        let mut walker = super::super::library::FileBatchWalker::new(&root).await;
+        let files = walker
+            .next_batch(16)
+            .await?
+            .ok_or("the walker must yield the batch")?;
+        assert!(files.contains(&inside_target));
+        assert!(
+            files.contains(&inside_link),
+            "a file link inside the library root must be walked"
+        );
+        assert!(
+            !files.contains(&outside_link),
+            "a file link outside the library root must be skipped"
+        );
+        assert!(
+            !files.contains(&broken_link),
+            "a dangling file link must be skipped"
+        );
+        Ok(())
+    }
+
     #[test]
     fn recheck_observes_the_symlink_target_with_the_same_policy()
     -> Result<(), Box<dyn std::error::Error>> {

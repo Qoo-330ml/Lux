@@ -285,6 +285,20 @@ pub(super) struct FileBatchWalker {
     canonical_root: PathBuf,
 }
 
+/// Resolves a walked link on a blocking thread.
+///
+/// The containment check canonicalizes the link target and reads its metadata, and a link may
+/// point anywhere — including a slow or unreachable network mount — so it must never run inline in
+/// the async walk. A link whose check cannot be completed is skipped, exactly like a link whose
+/// target cannot be resolved.
+async fn link_target_is_allowed(canonical_root: PathBuf, link_path: PathBuf) -> bool {
+    tokio::task::spawn_blocking(move || {
+        followed_symlink_file_is_allowed(&canonical_root, &link_path)
+    })
+    .await
+    .unwrap_or(false)
+}
+
 impl FileBatchWalker {
     /// Canonicalizes the root before the walk so symlink containment checks compare like with
     /// like. An unresolvable root keeps its verbatim form, which then simply never matches.
@@ -350,7 +364,8 @@ impl FileBatchWalker {
                             || (self.include_sidecars
                                 && is_supported_incremental_sidecar_file(&path));
                         if candidate
-                            && followed_symlink_file_is_allowed(&self.canonical_root, &path)
+                            && link_target_is_allowed(self.canonical_root.clone(), path.clone())
+                                .await
                         {
                             files.push(path);
                         }
