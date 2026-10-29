@@ -64,7 +64,7 @@ export function usePlayerInfoPanel({
     queryFn: ({ signal }) => api.webPlaybackStats(playbackSessionId ?? "", signal),
     enabled: showInfo && Boolean(playbackSessionId),
     retry: false,
-    refetchInterval: showInfo ? 1_000 : false,
+    refetchInterval: 1_000,
     staleTime: 0,
   });
 
@@ -81,7 +81,12 @@ export function usePlayerInfoPanel({
       }));
     };
     sample();
-    const interval = window.setInterval(sample, 1_000);
+    const interval = window.setInterval(() => {
+      // Pure display data: nothing can be seen while the tab is hidden, and the
+      // next visible tick refreshes the panel within one second.
+      if (typeof document !== "undefined" && document.hidden) return;
+      sample();
+    }, 1_000);
     return () => window.clearInterval(interval);
   }, [showInfo, playbackKey]);
 

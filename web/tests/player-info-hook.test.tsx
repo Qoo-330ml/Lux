@@ -32,7 +32,7 @@ beforeEach(() => {
 
 const SOURCE: MediaSource = { id: "source-1", isDefault: true };
 
-function mountHarness(initialShowInfo: boolean) {
+function mountHarness(initialShowInfo: boolean, video: HTMLVideoElement | null = null) {
   const state: {
     info?: PlayerInfoPanel;
     setShowInfo: (value: boolean) => void;
@@ -49,7 +49,7 @@ function mountHarness(initialShowInfo: boolean) {
       tier: 0,
       source: SOURCE,
       engineRef: { current: null },
-      videoRef: { current: null },
+      videoRef: { current: video },
       lastVideoRef: { current: null },
       currentTime: 12,
       duration: 120,
@@ -102,6 +102,33 @@ describe("usePlayerInfoPanel", () => {
     });
     expect(api.webPlaybackStats).toHaveBeenCalledTimes(2);
     expect(state.info?.infoGroups.length).toBeGreaterThan(0);
+  });
+
+  it("keeps sampling paused while the tab is hidden", async () => {
+    vi.useFakeTimers();
+    let hidden = false;
+    Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+    const quality = vi.fn(() => ({ totalVideoFrames: 120, droppedVideoFrames: 0 }) as unknown as VideoPlaybackQuality);
+    const video = document.createElement("video");
+    Object.defineProperty(video, "getVideoPlaybackQuality", { configurable: true, value: quality });
+
+    mountHarness(true, video);
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(quality).toHaveBeenCalledTimes(1);
+
+    hidden = true;
+    act(() => {
+      vi.advanceTimersByTime(5_000);
+    });
+    expect(quality).toHaveBeenCalledTimes(1);
+
+    hidden = false;
+    act(() => {
+      vi.advanceTimersByTime(1_000);
+    });
+    expect(quality).toHaveBeenCalledTimes(2);
   });
 
   it("stops both timers when the panel closes", async () => {
