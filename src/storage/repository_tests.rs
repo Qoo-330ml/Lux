@@ -2479,6 +2479,170 @@ async fn postgres_metadata_batch_writes_preserve_upsert_and_retry_semantics()
     Ok(())
 }
 
+/// Runs `body` against a freshly created PostgreSQL database and drops it afterwards.
+async fn with_isolated_postgres_database<F, Fut>(body: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(Database) -> Fut,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = crate::config::DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = body(database.clone()).await;
+    database.close().await;
+    let dropped = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome?;
+    dropped?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_nfo_collection_reconciliation_commits_and_leaves_the_pending_queue()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let library = LibraryService::new(database.clone())
+            .create_library("Reconcile", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES ('reconcile-movie', ?, 'MOVIE', 'Movie', 'movie',
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                 VALUES ('reconcile-movie', '{}', 2)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let pending = database
+            .list_pending_movie_nfo_collection_reference_reconciliations(32)
+            .await?;
+        assert_eq!(pending.len(), 1);
+        // A bare FOR UPDATE over the LEFT JOIN used to fail on PostgreSQL and keep the item
+        // at the head of the queue forever.
+        let committed = database
+            .commit_movie_nfo_collection_reference_reconciliation(&pending[0], None, "")
+            .await?;
+        assert!(committed);
+        assert!(
+            database
+                .list_pending_movie_nfo_collection_reference_reconciliations(32)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_recommendation_stats_refresh_decodes_the_source_fingerprint()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        database.refresh_recommendation_stats_if_needed().await?;
+        // A stale batch key forces the fingerprint query, whose SUM() used to come back as
+        // NUMERIC and fail to decode through the Any driver.
+        database
+            .query("UPDATE recommendation_stats_state SET batch_key = batch_key - 1 WHERE id = 1")
+            .execute(database.pool())
+            .await?;
+        database.refresh_recommendation_stats_if_needed().await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_catalog_read_model_rebuild_and_stats_are_consistent()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let library = LibraryService::new(database.clone())
+            .create_library("Read model", LibraryKind::Movie, false)
+            .await?;
+        for index in 0..3 {
+            database
+                .query(
+                    "INSERT INTO media_items (
+                         id, library_id, item_type, title, sort_title, identification_status,
+                         has_available_source
+                     ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+                )
+                .bind(format!("read-model-{index}"))
+                .bind(library.id.to_string())
+                .bind(format!("Movie {index}"))
+                .bind(format!("movie {index}"))
+                .execute(database.pool())
+                .await?;
+        }
+        let (processed, _) = database.rebuild_catalog_items_batch(None, 100).await?;
+        assert_eq!(processed, 3);
+        // Run twice: the counters are replaced inside one transaction each time.
+        database.rebuild_catalog_item_stats().await?;
+        database.rebuild_catalog_item_stats().await?;
+        let global: i64 = database
+            .query_scalar(
+                "SELECT total FROM catalog_item_stats
+                 WHERE scope = 'global' AND item_type = 'MOVIE'",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(global, 3);
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_scan_write_transaction_uses_local_async_commit()
