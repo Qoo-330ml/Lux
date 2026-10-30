@@ -945,7 +945,7 @@ fn postgres_placeholder_adaptation_contention_benchmark() {
     let cases = adaptation_benchmark_cases();
     // Warm the memo so every thread measures the steady state.
     for (_, sql, _) in &cases {
-        drop(adapt_production(*sql));
+        drop(adapt_production(sql));
     }
     let started = Instant::now();
     std::thread::scope(|scope| {
@@ -953,7 +953,7 @@ fn postgres_placeholder_adaptation_contention_benchmark() {
             scope.spawn(|| {
                 for _ in 0..ITERATIONS_PER_THREAD {
                     for (_, sql, _) in &cases {
-                        drop(black_box(adapt_production(*sql)));
+                        drop(black_box(adapt_production(sql)));
                     }
                 }
             });

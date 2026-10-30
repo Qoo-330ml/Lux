@@ -34798,7 +34798,7 @@ mod adapted_sql_cache_tests {
             })
             .collect::<Vec<_>>();
         for sql in &statements {
-            let adapted = adapt_static_sql_for_backend_with_cache(&cache, *sql);
+            let adapted = adapt_static_sql_for_backend_with_cache(&cache, sql);
             assert!(adapted.as_str().contains("$1"));
         }
         assert_eq!(cache.entry_count(), statements.len());
