@@ -924,6 +924,27 @@ impl StrmProbeService {
         }
     }
 
+    /// Persists a failed probe and logs why. The error text is already free of targets: plugin
+    /// errors carry fixed messages and local errors are static strings.
+    async fn record_probe_failure(
+        &self,
+        job: &StoredStrmProbeJob,
+        source_id: &str,
+        status: &str,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        tracing::warn!(
+            job_id = %job.id,
+            source_id,
+            status,
+            error,
+            "STRM media probe failed"
+        );
+        self.database
+            .mark_media_probe_failed(source_id, status, error)
+            .await
+    }
+
     async fn finish_source(
         &self,
         job: &StoredStrmProbeJob,
@@ -936,13 +957,13 @@ impl StrmProbeService {
             return Ok(0);
         }
         let Some(result) = outcome.result else {
-            self.database
-                .mark_media_probe_failed(
-                    &outcome.source_id,
-                    &outcome.failure_status,
-                    &outcome.error,
-                )
-                .await?;
+            self.record_probe_failure(
+                job,
+                &outcome.source_id,
+                &outcome.failure_status,
+                &outcome.error,
+            )
+            .await?;
             return Ok(1);
         };
         if outcome.media_info_needed {
@@ -996,35 +1017,35 @@ impl StrmProbeService {
                 .await
                 .is_err()
             {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "media info sidecar write failed",
-                    )
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &outcome.source_id,
+                    "FAILED",
+                    "media info sidecar write failed",
+                )
+                .await?;
                 return Ok(1);
             }
         }
         if outcome.thumbnail_needed {
             let Some(thumbnail) = result.thumbnail_jpeg.as_deref() else {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "thumbnail output is missing",
-                    )
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &outcome.source_id,
+                    "FAILED",
+                    "thumbnail output is missing",
+                )
+                .await?;
                 return Ok(1);
             };
             if !is_valid_jpeg(thumbnail) {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "thumbnail output is invalid",
-                    )
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &outcome.source_id,
+                    "FAILED",
+                    "thumbnail output is invalid",
+                )
+                .await?;
                 return Ok(1);
             }
             let _image_write_lock = acquire_image_write_lock(&outcome.item_id).await;
@@ -1034,20 +1055,24 @@ impl StrmProbeService {
                     path
                 }
                 _ => {
-                    self.database
-                        .mark_media_probe_failed(
-                            &outcome.source_id,
-                            "FAILED",
-                            "STRM path has no valid thumbnail name",
-                        )
-                        .await?;
+                    self.record_probe_failure(
+                        job,
+                        &outcome.source_id,
+                        "FAILED",
+                        "STRM path has no valid thumbnail name",
+                    )
+                    .await?;
                     return Ok(1);
                 }
             };
             if write_image_atomically(&target, thumbnail).await.is_err() {
-                self.database
-                    .mark_media_probe_failed(&outcome.source_id, "FAILED", "thumbnail write failed")
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &outcome.source_id,
+                    "FAILED",
+                    "thumbnail write failed",
+                )
+                .await?;
                 return Ok(1);
             }
             let file_size =
@@ -1068,13 +1093,13 @@ impl StrmProbeService {
                 .await
                 .is_err()
             {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "thumbnail registration failed",
-                    )
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &outcome.source_id,
+                    "FAILED",
+                    "thumbnail registration failed",
+                )
+                .await?;
                 return Ok(1);
             }
         }
