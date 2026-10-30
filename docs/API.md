@@ -19,7 +19,11 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/setup/database/restart`：仅在首次初始化、数据库配置已保存且当前进程仍使用其他后端时可用。返回 202 后，Lux 优雅关闭并在同一容器进程内重新启动；页面应等待服务恢复。该接口不接受数据库凭据，也不用于已初始化实例的在线切换。
 - `POST /api/v1/setup/complete`：仅在没有用户时创建首个管理员；成功返回 201，重复或并发失败返回 `SETUP_ALREADY_COMPLETED`。201 响应体带可选布尔字段 `restarting`：`true` 表示管理员落库后已经排期重启进程（延迟约 250 ms 发出重启请求，HTTP 层先优雅排空在途请求再重新执行自身），`false` 表示当前进程没有重启句柄（嵌入式或测试构造的状态），此时 setup 本身仍然成功、需要由部署方重启；旧客户端可以忽略该字段。错误响应（含 4xx/5xx）不携带该字段。
 
-请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。首个媒体库的第一轮 `RECONCILE_LIBRARY` 扫描会被上述重启取消（`CANCELLED` + `SERVER_SHUTDOWN`），新进程启动时若该库仍未成功扫描过（`libraries.last_scan_at` 为空）会自动重新排队一次扫描，客户端不需要补触发；`201` 里的 `scanJob` 因此可能被这次重启取消，管理页能看到“取消 → 新任务”的链路。
+请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。首个媒体库的第一轮 `RECONCILE_LIBRARY` 扫描会被上述重启取消（`CANCELLED` + `SERVER_SHUTDOWN`），`201` 里的 `scanJob` 因此指向一个已被取消的任务，管理页能看到“取消 → 新任务”的链路。
+
+新进程启动时的自动补扫不是无条件的，命中全部条件才会为该库重新排队一次扫描：该库**最近一次** `RECONCILE_LIBRARY` 任务是 `CANCELLED` 且 `error = 'SERVER_SHUTDOWN'`（即确有一次被关停打断的首次扫描记录；此后若是 `FAILED` 或已 `COMPLETED`，不再重排）、媒体库仍启用、`libraries.last_scan_at` 为空（从未成功扫描过）、至少存在一个媒体根路径、并且该库当前没有 `PENDING`/`RUNNING` 的扫描任务。单次启动最多排队 512 个库（每页 32 个翻页读取）；达到上限时日志会说明排队数与剩余数量，剩余库在下一次启动继续处理。客户端不需要为此补触发扫描。
+
+**不会自动补扫的情况**：setup 时扫描根本没有启动（`201` 的 `scanJob` 为 `null`，没有任何任务行作为恢复证据），例如服务在该步骤出错；这种库重启后不会自动排队，需要管理员在管理页手动触发一次扫描。
 
 ## Web 会话
 
