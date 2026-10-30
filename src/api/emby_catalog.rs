@@ -604,7 +604,9 @@ pub(super) async fn emby_library_media_folders(
     .into_response()
 }
 
-/// Loads `root_id -> display_path` for every library the caller may see, in one query.
+/// Loads `root_id -> display_path` for every library the caller may see, in one batched query
+/// (the storage call groups library ids in chunks of 500, so very large scopes take one statement
+/// per chunk).
 ///
 /// `MediaFolders` resolves each scanned folder through the root that owns it, so the whole
 /// visible set of roots is needed at once. `list_library_roots_by_library_ids` returns them
@@ -5620,6 +5622,7 @@ mod media_folder_root_tests {
 
         database.reset_query_count();
         let batched = emby_library_root_paths(&database, &library_ids).await?;
+        // Three libraries fit in one chunk of the batched storage call (500 library ids per statement).
         assert_eq!(database.query_count(), 1);
 
         assert_eq!(per_library.len(), 3);
