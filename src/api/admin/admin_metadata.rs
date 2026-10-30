@@ -744,6 +744,12 @@ pub(crate) async fn admin_cancel_metadata_reidentify(
         )
         .into_response();
     };
+    let previous = reidentify.get_job(&job_id).await.ok();
+    let cancel_metadata = json!({
+        "libraryId": previous.as_ref().and_then(|job| job.library_id.clone()),
+        "previousStatus": previous.as_ref().map(|job| job.status.clone()),
+    })
+    .to_string();
     match reidentify.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -752,7 +758,7 @@ pub(crate) async fn admin_cancel_metadata_reidentify(
                 "METADATA_REIDENTIFY_CANCELLED",
                 Some("metadata_reidentify_job"),
                 Some(&job_id),
-                "{}",
+                &cancel_metadata,
             )
             .await;
             StatusCode::ACCEPTED.into_response()

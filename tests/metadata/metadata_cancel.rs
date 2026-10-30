@@ -321,6 +321,26 @@ async fn admin_can_request_metadata_job_cancellation() -> Result<(), Box<dyn std
     let body: Value = detail.json().await?;
     assert_eq!(body["job"]["status"], "QUEUED");
     assert_eq!(body["job"]["cancelRequested"], true);
+    let audit = client
+        .get(format!("http://{address}/api/v1/admin/audit"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let cancel_event = audit["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["eventType"] == "METADATA_REIDENTIFY_CANCELLED")
+        })
+        .ok_or("missing METADATA_REIDENTIFY_CANCELLED")?;
+    assert_eq!(
+        cancel_event["metadata"]["libraryId"],
+        json!(library.id.to_string())
+    );
+    assert_eq!(cancel_event["metadata"]["previousStatus"], "QUEUED");
     server.abort();
     Ok(())
 }
