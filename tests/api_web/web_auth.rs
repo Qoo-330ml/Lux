@@ -492,13 +492,19 @@ async fn avatar_upload_requires_csrf_and_survives_a_second_login()
     Ok(())
 }
 
+/// The `201` must reach the client before anything asks for the restart.
+///
+/// The delay is deliberately far longer than any plausible request round trip, so this assertion
+/// does not depend on a tight wall-clock window: on a loaded machine the timer simply cannot have
+/// fired yet. That the delayed task really requests the restart is proven by
+/// `setup_complete_eventually_requests_the_restart` with a zero delay.
 #[tokio::test]
-async fn setup_complete_requests_a_restart_after_the_response()
+async fn setup_complete_answers_before_it_requests_the_restart()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = test_config(&temp_dir)?;
-    let (base_url, server, mut restart, _database) =
-        test_server_with_setup_restart(config, Duration::from_millis(200)).await?;
+    let (base_url, server, restart, _database) =
+        test_server_with_setup_restart(config, Duration::from_secs(60)).await?;
     let client = test_client();
 
     let setup = client
@@ -515,12 +521,37 @@ async fn setup_complete_requests_a_restart_after_the_response()
         body["user"]["id"].is_string(),
         "the created admin must still be in the body: {body}"
     );
-    // The response is written before the delayed restart task can flip the channel.
     assert_eq!(
         *restart.borrow(),
         ShutdownReason::Running,
         "the 201 must be sent before the restart is requested"
     );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_complete_eventually_requests_the_restart()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = test_config(&temp_dir)?;
+    // The delay only moves the request off the response path; a zero delay still has to happen and
+    // the wake-up is observed by the channel rather than by sleeping in the test.
+    let (base_url, server, mut restart, _database) =
+        test_server_with_setup_restart(config, Duration::ZERO).await?;
+    let client = test_client();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(
+            &json!({ "username": "Admin", "displayName": "Admin", "password": "correct password" }),
+        )
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let body = setup.json::<serde_json::Value>().await?;
+    assert_eq!(body["restarting"], json!(true));
     timeout(Duration::from_secs(5), restart.changed())
         .await
         .expect("a restart should be requested after the response")?;
