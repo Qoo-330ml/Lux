@@ -1,3 +1,5 @@
+mod common;
+
 use std::{
     io::{self, Write},
     sync::{
@@ -7,7 +9,7 @@ use std::{
     time::Duration,
 };
 
-use crate::common::{TestScraper, TestScraperConfig};
+use common::{TestScraper, TestScraperConfig};
 use axum::{Json, Router, extract::State as AxumState, routing::any};
 use luxd::{
     api::{AppState, app_with_state},
