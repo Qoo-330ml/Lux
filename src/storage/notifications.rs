@@ -41,7 +41,9 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_notification_destination))
+        .map_err(self.sqlx_err())?
+        .map(stored_notification_destination)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -60,11 +62,10 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_notification_destination)
-                .collect()
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_notification_destination)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -80,11 +81,10 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_notification_destination)
-                .collect()
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_notification_destination)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -212,7 +212,10 @@ impl Database {
         .bind(limit.clamp(1, 100))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_notification_delivery)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -286,7 +289,10 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_notification_delivery)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 

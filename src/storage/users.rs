@@ -660,7 +660,9 @@ impl Database {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_user_permission_preset_source))
+        .map_err(self.sqlx_err())?
+        .map(stored_user_permission_preset_source)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -890,7 +892,9 @@ impl Database {
         .bind(username_normalized)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_user))
+        .map_err(self.sqlx_err())?
+        .map(stored_user)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -914,7 +918,10 @@ impl Database {
         .bind(display_name)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_user).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_user)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -954,7 +961,9 @@ impl Database {
                     .await
                     .map_err(self.sqlx_err())?
                     .into_iter()
-                    .map(stored_user),
+                    .map(stored_user)
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(self.sqlx_err())?,
             );
         }
         Ok(users)
@@ -1088,7 +1097,11 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let users = rows.into_iter().map(stored_admin_user_list_item).collect();
+        let users = rows
+            .into_iter()
+            .map(stored_admin_user_list_item)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok((users, total_count))
     }
 
@@ -1158,7 +1171,8 @@ impl Database {
             .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_user)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         if users.len() as i64 > MAX_USER_DIRECTORY_ENTRIES {
             tracing::warn!(
                 limit = MAX_USER_DIRECTORY_ENTRIES,
@@ -1225,7 +1239,11 @@ impl Database {
                 .map_err(self.sqlx_err())?,
             None => 0,
         };
-        let users = rows.into_iter().map(stored_user).collect();
+        let users = rows
+            .into_iter()
+            .map(stored_user)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok((users, total_count))
     }
 
@@ -1249,7 +1267,9 @@ impl Database {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_user))
+        .map_err(self.sqlx_err())?
+        .map(stored_user)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -2401,7 +2421,9 @@ impl Database {
         .bind(i64::from(allow_playback_scope))
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_user))
+        .map_err(self.sqlx_err())?
+        .map(stored_user)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
