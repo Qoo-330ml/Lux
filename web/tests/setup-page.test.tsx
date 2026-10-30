@@ -7,6 +7,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { SetupPage } from "../src/features/auth/SetupPage";
+import { AdminSetupForm } from "../src/features/auth/AdminSetupForm";
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 import type { SetupStatus } from "../src/lib/api/types";
@@ -362,6 +363,44 @@ describe("SetupPage setup-complete restart", () => {
     await advance(1000);
     expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
     expect(container.textContent).toContain("登录页占位");
+  });
+
+  it("keeps jumping straight to the login page when the backend reports no restart", async () => {
+    // Older backends, or a state without a restart handle, simply omit the flag.
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser });
+    const status = vi.spyOn(api, "setupStatus");
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
+    expect(container.textContent).toContain("登录页占位");
+    expect(container.textContent).not.toContain("正在重启 Lux");
+    // No restart screen means no probing at all.
+    expect(status).not.toHaveBeenCalled();
+  });
+
+  it("falls back to the direct jump when the form has no restart hand-off", async () => {
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={["/setup"]}>
+          <QueryClientProvider client={queryClient}>
+            <Routes>
+              <Route path="/setup" element={<AdminSetupForm />} />
+              <Route path="/login" element={<div>登录页占位</div>} />
+            </Routes>
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await advance(10);
+    await submitAdminForm();
+
+    expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
+    expect(container.textContent).toContain("登录页占位");
+    expect(container.textContent).not.toContain("正在重启 Lux");
   });
 });
 
