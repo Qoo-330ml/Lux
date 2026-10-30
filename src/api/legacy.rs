@@ -178,6 +178,8 @@ pub struct CoreState {
     config_dir: Option<PathBuf>,
     database_selection_required: bool,
     restart_handle: Option<RestartHandle>,
+    /// Overrides [`DEFAULT_SETUP_RESTART_DELAY`]; tests inject a shorter or longer delay.
+    setup_restart_delay: Option<std::time::Duration>,
     server_id: String,
     filmly_image_compat_mode: FilmlyImageCompatMode,
     admin_events: AdminEventHub,
@@ -191,6 +193,14 @@ pub struct CoreState {
     /// Bounds the number of concurrent server-sent-event streams.
     sse_permits: SseConnectionBudget,
 }
+
+/// Delay between the `setup/complete` response and the restart request.
+///
+/// The delay is not the correctness guarantee for the 201 reaching the client: `axum::serve` drains
+/// in-flight requests once the restart is requested. It only keeps the restart request away from the
+/// moment hyper writes the first byte of the response.
+pub(crate) const DEFAULT_SETUP_RESTART_DELAY: std::time::Duration =
+    std::time::Duration::from_millis(250);
 
 /// The business services that only exist once the application reached the ready mode.
 ///
@@ -663,6 +673,7 @@ impl AppState {
             config_dir: Some(config_dir.clone()),
             database_selection_required: false,
             restart_handle: None,
+            setup_restart_delay: None,
             server_id,
             filmly_image_compat_mode,
             admin_events,
@@ -752,6 +763,20 @@ impl AppState {
     pub fn with_restart_handle(mut self, restart_handle: RestartHandle) -> Self {
         self.core.restart_handle = Some(restart_handle);
         self
+    }
+
+    /// Overrides the delay between the `setup/complete` response and the restart request.
+    #[doc(hidden)]
+    pub fn with_setup_restart_delay(mut self, delay: std::time::Duration) -> Self {
+        self.core.setup_restart_delay = Some(delay);
+        self
+    }
+
+    /// Delay the setup handler waits (off the request path) before asking for the restart.
+    pub(crate) fn setup_restart_delay(&self) -> std::time::Duration {
+        self.core
+            .setup_restart_delay
+            .unwrap_or(DEFAULT_SETUP_RESTART_DELAY)
     }
 
     /// Replaces the STRM playback resolver; only valid for a ready state.

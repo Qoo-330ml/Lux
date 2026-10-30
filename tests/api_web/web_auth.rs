@@ -1,9 +1,12 @@
-use std::io::Cursor;
+use std::{io::Cursor, time::Duration};
 
 use image::{DynamicImage, ImageFormat};
 use luxd::{
     api::{AppState, app_with_state},
-    application::setup::SetupService,
+    application::{
+        restart::{RestartHandle, ShutdownReason},
+        setup::SetupService,
+    },
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
     storage::Database,
@@ -11,7 +14,7 @@ use luxd::{
 use reqwest::header::{CONTENT_TYPE, COOKIE, SET_COOKIE};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use tokio::net::TcpListener;
+use tokio::{net::TcpListener, sync::watch, time::timeout};
 
 async fn test_server(
     config: Config,
@@ -26,6 +29,50 @@ async fn test_server(
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
     Ok((format!("http://{address}"), server))
+}
+
+/// Starts a server with an injected restart handle, so the setup restart can be observed in-process.
+///
+/// `exec` lives in the binary target only, so `watch` is the whole restart mechanism here.
+async fn test_server_with_setup_restart(
+    config: Config,
+    setup_restart_delay: Duration,
+) -> Result<
+    (
+        String,
+        tokio::task::JoinHandle<Result<(), std::io::Error>>,
+        watch::Receiver<ShutdownReason>,
+    ),
+    Box<dyn std::error::Error>,
+> {
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let (restart_sender, restart_receiver) = watch::channel(ShutdownReason::Running);
+    let app = app_with_state(
+        AppState::ready(config, database, setup, auth, emby_auth)
+            .with_restart_handle(RestartHandle::new(restart_sender))
+            .with_setup_restart_delay(setup_restart_delay),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    Ok((format!("http://{address}"), server, restart_receiver))
+}
+
+fn test_config(temp_dir: &tempfile::TempDir) -> Result<Config, Box<dyn std::error::Error>> {
+    Ok(Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+}
+
+fn test_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client")
 }
 
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
@@ -434,6 +481,100 @@ async fn avatar_upload_requires_csrf_and_survives_a_second_login()
         .await?;
     assert_eq!(second_read.status(), reqwest::StatusCode::OK);
     assert_eq!(second_read.bytes().await?.as_ref(), avatar.as_slice());
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_complete_requests_a_restart_after_the_response()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = test_config(&temp_dir)?;
+    let (base_url, server, mut restart) =
+        test_server_with_setup_restart(config, Duration::from_millis(200)).await?;
+    let client = test_client();
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(
+            &json!({ "username": "Admin", "displayName": "Admin", "password": "correct password" }),
+        )
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let body = setup.json::<serde_json::Value>().await?;
+    assert_eq!(body["restarting"], json!(true));
+    assert!(
+        body["user"]["id"].is_string(),
+        "the created admin must still be in the body: {body}"
+    );
+    // The response is written before the delayed restart task can flip the channel.
+    assert_eq!(
+        *restart.borrow(),
+        ShutdownReason::Running,
+        "the 201 must be sent before the restart is requested"
+    );
+    timeout(Duration::from_secs(5), restart.changed())
+        .await
+        .expect("a restart should be requested after the response")?;
+    assert_eq!(*restart.borrow(), ShutdownReason::Restart);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_complete_without_a_restart_handle_keeps_the_created_body()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = test_config(&temp_dir)?;
+    let (base_url, server) = test_server(config).await?;
+    let client = test_client();
+    let root_path = temp_dir.path().join("movies");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root_path = root_path.to_str().ok_or("non-UTF-8 root path")?;
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password",
+            "firstLibrary": { "name": "Movies", "kind": "MOVIE", "rootPath": root_path },
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::CREATED);
+    let body = setup.json::<serde_json::Value>().await?;
+
+    // A state without a restart handle (embedded/tests) still reports success; the only signal is
+    // `restarting: false`, so this pins the whole 201 shape.
+    let mut keys = body
+        .as_object()
+        .ok_or("setup response must be a JSON object")?
+        .keys()
+        .map(String::as_str)
+        .collect::<Vec<_>>();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec![
+            "initialized",
+            "library",
+            "restarting",
+            "scanJob",
+            "user",
+            "warnings"
+        ]
+    );
+    assert_eq!(body["restarting"], json!(false));
+    assert_eq!(body["initialized"], json!(true));
+    assert_eq!(body["user"]["usernameNormalized"], json!("admin"));
+    assert_eq!(body["library"]["name"], json!("Movies"));
+    assert_eq!(body["warnings"], json!([]));
+    assert_eq!(body["scanJob"]["jobType"], json!("RECONCILE_LIBRARY"));
+    assert_eq!(body["scanJob"]["libraryId"], body["library"]["id"]);
 
     server.abort();
     Ok(())

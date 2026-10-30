@@ -694,51 +694,21 @@ pub(super) async fn setup_complete(
         .await
     {
         Ok(user) => {
-            let mut library_json_value = None;
-            if let (Some(first_library), Some(kind), Some(libraries)) =
-                (request.first_library, setup_kind, state.libraries())
-            {
-                let library = match libraries
-                    .create_library_with_scraper(
-                        &first_library.name,
-                        kind,
-                        first_library.realtime_watch_enabled,
-                        None,
-                        true,
-                    )
-                    .await
-                {
-                    Ok(library) => library,
-                    Err(error) => return library_error(&headers, error),
-                };
-                let mut roots = Vec::new();
-                let mut warnings = Vec::new();
-                if let Some(root_path) = first_library.root_path {
-                    match libraries.add_root(library.id, &root_path).await {
-                        Ok(result) => {
-                            roots.push(result.root);
-                            warnings = result
-                                .warnings
-                                .iter()
-                                .map(|warning| warning.as_str())
-                                .collect::<Vec<_>>();
+            let library_json_value = match (request.first_library, setup_kind) {
+                (Some(first_library), Some(kind)) => {
+                    match setup_first_library(&state, &headers, first_library, kind).await {
+                        Ok(library) => library,
+                        Err(response) => {
+                            // The administrator is stored, so setup can never run again: ask for the
+                            // restart even though this request answered 4xx. Without it the process
+                            // would stay in setup mode and the owner could not create a library.
+                            schedule_setup_restart(&state);
+                            return response;
                         }
-                        Err(error) => return library_error(&headers, error),
                     }
                 }
-                let scan_job = match spawn_library_scan(&state, library.id).await {
-                    Ok(job) => job,
-                    Err(error) => {
-                        tracing::warn!(library_id = %library.id, %error, "initial library scan could not be started");
-                        None
-                    }
-                };
-                library_json_value = Some(json!({
-                    "library": library_json(&library, &roots),
-                    "warnings": warnings,
-                    "scanJob": scan_job.as_ref().map(scan_job_json),
-                }));
-            }
+                _ => None,
+            };
             let mut response = json!({
                 "initialized": true,
                 "user": user_json(&user),
@@ -748,6 +718,7 @@ pub(super) async fn setup_complete(
                 response["warnings"] = library["warnings"].clone();
                 response["scanJob"] = library["scanJob"].clone();
             }
+            response["restarting"] = json!(schedule_setup_restart(&state));
             (StatusCode::CREATED, Json(response)).into_response()
         }
         Err(SetupError::AlreadyCompleted) => api_error(
@@ -774,6 +745,83 @@ pub(super) async fn setup_complete(
         )
         .into_response(),
     }
+}
+
+/// Creates the optional first library of a completed setup, with its root and its first scan.
+///
+/// The caller has already stored the administrator, so every error here is a partial success: the
+/// caller schedules the restart and answers the 4xx as before.
+async fn setup_first_library(
+    state: &AppState,
+    headers: &HeaderMap,
+    first_library: SetupFirstLibraryRequest,
+    kind: LibraryKind,
+) -> Result<Option<serde_json::Value>, Response> {
+    let Some(libraries) = state.libraries() else {
+        return Ok(None);
+    };
+    let library = match libraries
+        .create_library_with_scraper(
+            &first_library.name,
+            kind,
+            first_library.realtime_watch_enabled,
+            None,
+            true,
+        )
+        .await
+    {
+        Ok(library) => library,
+        Err(error) => return Err(library_error(headers, error)),
+    };
+    let mut roots = Vec::new();
+    let mut warnings = Vec::new();
+    if let Some(root_path) = first_library.root_path {
+        match libraries.add_root(library.id, &root_path).await {
+            Ok(result) => {
+                roots.push(result.root);
+                warnings = result
+                    .warnings
+                    .iter()
+                    .map(|warning| warning.as_str())
+                    .collect::<Vec<_>>();
+            }
+            Err(error) => return Err(library_error(headers, error)),
+        }
+    }
+    let scan_job = match spawn_library_scan(state, library.id).await {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::warn!(library_id = %library.id, %error, "initial library scan could not be started");
+            None
+        }
+    };
+    Ok(Some(json!({
+        "library": library_json(&library, &roots),
+        "warnings": warnings,
+        "scanJob": scan_job.as_ref().map(scan_job_json),
+    })))
+}
+
+/// Requests the process restart that leaves the setup mode once the response has been written.
+///
+/// Returns whether the restart was scheduled, which the `201` body reports as `restarting`. A
+/// missing handle is not an error: setup already succeeded, so the request only degrades to "no
+/// restart" (embedded states and older test fixtures inject no handle).
+fn schedule_setup_restart(state: &AppState) -> bool {
+    let Some(handle) = state.restart_handle.clone() else {
+        tracing::warn!("setup completed without a restart handle");
+        return false;
+    };
+    let delay = state.setup_restart_delay();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if !handle.request_restart() {
+            // The handle is one-shot, so `false` means another path (database switch) already
+            // asked for the same restart.
+            tracing::info!("restart was already requested before setup completed");
+        }
+    });
+    true
 }
 
 #[derive(Deserialize)]
