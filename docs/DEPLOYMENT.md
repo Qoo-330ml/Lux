@@ -263,7 +263,10 @@ docker compose ps
 - `POST /api/v1/setup/complete` 成功后实例会**自己重启**（`docs/SETUP-RESTART-DESIGN.md`），脚本通过
   `scripts/lib/wait-for-restart.sh` 观察一次连接失败再等到 `/health/ready` 恢复，而不是 `sleep` 猜时间。
 - 该重启会取消 setup 启动的首轮扫描并在重启后重排，所以脚本不再沿用 `201` 里的 `scanJob`（任务已取消；
-  `library.id` 不变），需要自己发起扫描的脚本先等重排的首扫结束，否则扫描端点会返回 `409`（已有任务运行）。
+  `library.id` 不变）。需要自己发起或接管扫描的 4 个脚本——`mount-loss-smoke.sh`、`probe-smoke.sh`、
+  `proxy-smoke.sh`（各自 `POST .../reconcile`）与 `restart-recovery-smoke.sh`（接管重排后的任务）——都会先等
+  重排的首扫结束或先查到它，否则扫描端点会返回 `409`（已有任务运行）；`proxy-smoke.sh` 与其他脚本一样用
+  `lux_wait_for_first_scan_settled` 完成这一步。
 - `restart-recovery-smoke.sh` 因此验证的是当前的真实契约：对重排后的首扫执行 `kill -9` → 重启把该任务标为
   `CANCELLED`/`SERVER_SHUTDOWN` → 启动恢复排入替换任务 → 替换任务完成并写入 `libraries.lastScanAt`。它不再
   断言“同一个任务 ID 续跑”，因为没有通用的扫描续跑流程，任务会被替换。

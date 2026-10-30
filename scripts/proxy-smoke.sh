@@ -166,6 +166,10 @@ wait_for_job() {
     return 1
 }
 
+# The restart canceled the first scan of setup's library and re-queued it; the reconcile below
+# would answer `409` (a scan is already running) until that recovered scan finishes.
+lux_wait_for_first_scan_settled "https://127.0.0.1:$PORT" "$library_id" -k -H "Cookie: $cookies"
+
 reconcile="$(start_reconcile)"
 job_id="$(jq -r '.job.id' <<<"$reconcile")"
 wait_for_job "$job_id"
