@@ -263,17 +263,18 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
                         FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT,
                     )
                     .await?;
+                let recovery = FirstScanRecovery {
+                    resumed,
+                    skipped_by_limit: remaining.len(),
+                };
                 tracing::warn!(
                     max = max_libraries,
-                    queued = resumed,
-                    remaining = remaining.len(),
+                    queued = recovery.resumed,
+                    remaining = recovery.skipped_by_limit,
                     "first-scan recovery reached its per-startup limit; the remaining libraries stay \
                      eligible for the next startup"
                 );
-                return Ok(FirstScanRecovery {
-                    resumed,
-                    skipped_by_limit: remaining.len(),
-                });
+                return Ok(recovery);
             }
             last_processed = Some(library_id.clone());
             let Ok(library_id) = library_id.parse::<LibraryId>() else {

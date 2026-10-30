@@ -562,7 +562,9 @@ async fn startup_keeps_first_scans_with_an_unavailable_root_eligible()
 
     assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
-        scan_job_ids(&fixture.database, fixture.library_id).await.len(),
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
         1,
         "no replacement scan may be queued while every root is unavailable"
     );
@@ -583,7 +585,9 @@ async fn startup_keeps_first_scans_with_an_unavailable_root_eligible()
         .await?;
     assert_eq!(resume_fixture_first_scans(&fixture).await?, 1);
     assert_eq!(
-        scan_job_ids(&fixture.database, fixture.library_id).await.len(),
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
         2
     );
     Ok(())
