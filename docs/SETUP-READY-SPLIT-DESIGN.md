@@ -549,3 +549,78 @@ serve(config, discovery_config, database, app, shutdown_state, control_tx, contr
   `database_selection_required` 短路，且"被关停打断的首次扫描"意味着上一次运行已完成 setup。
 **优点**：`main` 的改动面只有 6 行；setup 模式的资源/worker 行为与今天逐字相同，回滚第 ③ 步只需把
 `match` 换回 `app_with_state(app_state)`。
+
+## 6. 问题 5：后台 worker / 插件持有的服务副本
+
+结论：**拆分不改变任何 `Arc` 共享语义**，因为没有一个后台任务持有 `AppState`——它们持有的是服务句柄，
+而服务句柄本来就通过 `Arc`/数据库连接池共享（`docs/APP-STATE-NEXT.md` §6 已写明这条前提）。
+
+证据与拆分后的对应关系：
+
+| 事实 | 证据 | 拆分后 |
+| --- | --- | --- |
+| worker 启动方法只取服务克隆 | `src/api/legacy.rs` 的 `rebuild_people_index`（`self.people()`）、`start_realtime_watchers`（`self.core.database.clone()` + `self.scan_jobs().cloned()` + `self.libraries()`）、`start_webhook_worker`/`start_scheduled_tasks`/`start_database_diagnostics` 同形 | 这些方法留在 `AppState` 上（`main` 仍先构造 `AppState`，§5.5），行为不变；终局可以原样搬到 `ReadyAppState` |
+| 全仓没有任何 `AppState` 被 `tokio::spawn` 捕获后长期持有 | `grep -rn "spawn" src/api/legacy.rs | …`：`resume_interrupted_metadata_scraping` 内部捕获的是服务；`src/main.rs:227` 的 scanner 捕获 `Database` | 无变化 |
+| 服务实例的唯一所有者是 `Arc<ReadyServices>`；克隆状态只增加引用计数 | `src/api/legacy.rs:2490-2507` 的 `cloning_the_state_shares_one_ready_services_instance`（`Arc::ptr_eq` + 字段地址相同 + `strong_count == 2`） | `ReadyAppState`/`SetupState` 持有**同一个** `Arc`：`AppState::into_ready()` 与 `impl FromRef<ReadyAppState> for AppState` 都只 `Arc::clone`，不改指向 |
+| `Arc::make_mut` 只在构造期改服务（会写 `Option` 槽与 scaler 等） | `src/api/legacy.rs:317-319`（`ready_services_mut`）以及 5 个 builder：`with_strm_playback_resolver`、`with_embedded_subtitle_executable`、`with_hls_executable`、`with_scraper`、`start_content_restriction_index_worker` | 保留在 `AppState` 上（`tests/**` 需要在 `app_with_state` 之前用它们），且**规定 `into_ready()` 之后不得再调用**：它是消费型转换，类型上已经拦住（`ReadyAppState` 没有 builder 方法） |
+| 插件只拿到 `PluginService` 句柄 | `src/api/legacy.rs` 的 `ReadyServices.plugins`，被 `danmaku`/`strm_probe`/`chapter_detection`/`scheduled_tasks` 等克隆 | 同上：句柄克隆，内部状态在 `Arc` |
+
+唯一需要额外守住的纪律（写进实现注释与 review 清单）：
+
+1. `ReadyAppState`/`SetupState` 的构造必须只经由 `AppState::into_ready()`（或它派生的
+   `SetupState::from`），不得直接 `Arc::new(ReadyServices { .. })`。
+2. `into_ready()` 之后任何 `Arc::make_mut` 都会在"已被共享"的情况下复制一份句柄结构，
+   使某些 worker 看到旧句柄——与拆分前的错误用法等价，因此 `into_ready` 之后不再提供可变入口。
+3. 每请求克隆（`FromRef` 与 `State<T>` 提取）只做 `CoreState`/`Database`/`Arc` 的克隆，
+   与今天"每请求克隆整个 `AppState`"同阶或更便宜。
+
+## 7. 问题 6：删守卫（第 ④ 步）的范围
+
+### 7.1 实测分类
+
+| 类别 | 处数 | 第 ④ 步处置 | 理由 |
+| --- | --- | --- | --- |
+| `require_service!(state.<required>)` | 173 | **删** | ready 模式下 `ReadyServices.<field>` 是非 `Option` 字段，分支不可达 |
+| `state.<required>() else { … }`（结构化 503 / 裸 503 / 降级返回） | 84 | **删** | 同上；包括 `admin_people.rs`（12 处、"人物索引服务尚未就绪"）与 `admin_handlers` 里返回 `false`/`NOT_FOUND` 的降级分支 |
+| `require_service!(state.database)` | 121 | **删** | `ReadyAppState::database()` 返回 `&Database`（`into_ready()` 只在 `database` 为 `Some` 时成功） |
+| `state.database() else { … }` | 2 | **不删（搬走）** | `users.rs:153`/`:206`（`/health/ready`、`/api/v1/version`）随批 0 搬进 `core_routes`，仍是 `State<CoreState>` 上的 Option 守卫：探针必须能在数据库缺失时回答 503，它不属于 ready 树的代码 |
+| `state.setup()` / `state.database_setup()` 守卫 | 5 + 5 | **删** | `SetupState` 里两者都是非 `Option` 字段 |
+| `require_service!` on 6 个可选服务（`image_writes` 3、`downloads` 2、`strm_playback` 2） | 7 | **保留** | `ReadyServices` 里它们是 `Option`（`src/api/legacy.rs:202-256` 的注释：缺失是"就绪但降级"，不是"未就绪"） |
+| `state.<optional>() else { … }`（`webhooks` 10、`metadata_selection` 2） | 12 | **保留，响应体逐字不变** | 同上：`webhooks` 初始化失败、`metadata_selection` 未配置都是合法降级 |
+| 其余 Option 惯用法（`state.<field>()?`、`.is_some()`、`.map()`、`.as_ref()`） | ~40 | 按服务类别分别处理 | required 服务改成直接绑定；可选服务不变 |
+
+合计：**删 388 处**（173+84+121+10），**保留 19 处**（7+12）外加可选服务的 ~10 处非守卫惯用法。
+两处 `database` 守卫（`users.rs:153`/`:206`）留在 `core_routes` 里，属于"未就绪探针必须能回答 503"的语义，
+不随 ready 树删除。
+
+### 7.2 为什么"结构化 503"也能删（且不改响应体）
+
+`docs/APP-STATE-NEXT.md` §6 曾把"人物索引服务尚未就绪""Webhook 通知服务尚未就绪"这类**带自定义中文
+消息的结构化 503** 列为"不能改响应体"，因此步骤 2 没有迁移它们。第 ④ 步能删的依据是：
+
+- 这些消息来自 `ReadyServices` 的 **required** 槽（`people`、`catalog`、`access`、`library_covers`…），
+  而 `ReadyServices` 是**一次构造、全有或全无**（`src/api/legacy.rs:471` 起的
+  `ready_with_proxy_and_image_config` 单函数建出全部字段，缺一个就整体启动失败）。
+  因此"ready 模式下 `people` 缺失"这个状态**不存在**，分支不可达，删除不改变任何可达响应。
+- 真正可达的"缺失"只有 6 个 `Option` 槽，它们的响应体（例如 `admin_webhooks.rs:92` 的
+  "Webhook 通知服务尚未就绪"）**保留不动**。
+- 冻结测试里唯一触及"服务缺失"的是 `AppState::default()`（无服务），它走的是未就绪兼容树（§9.2），
+  不经过这些 handler。
+
+### 7.3 必须保留的清单（实现时逐条核对）
+
+```
+src/api/admin/admin_webhooks.rs      10 处  state.webhooks() else { …结构化 503 "Webhook 通知服务尚未就绪" }
+src/api/media.rs                      2 处  state.metadata_selection() else { …降级 503 }
+src/api/…                            7 处  require_service!(state.{image_writes,downloads,strm_playback})
+src/api/media.rs                   ~3 处  state.image_writes()/downloads()/strm_playback() 的 is_some/map 惯用法
+src/api/users.rs:153,206              2 处  core 探针的 database 守卫（随 core_routes 留下）
+```
+
+### 7.4 第 ④ 步与批 1–9 的关系
+
+删守卫**不是**一个独立提交：批 1–9 每批在改签名时顺手删掉该文件的守卫（否则 `state.catalog()` 返回
+`&CatalogService` 后旧守卫根本编译不过）。因此 `docs/APP-STATE-NEXT.md` 的"步骤 4"在本设计里被并入
+步骤 3 的批次；真正的收尾提交（批 9）只负责删除**兼容层**：46 个 Option 访问器、`Deref<Target = CoreState>`
+for `AppState`、`FromRef<ReadyAppState> for AppState`、`StateView`、`require_service!`/`require_ready!`
+两个宏及其 6 个单元测试（`src/api/legacy.rs:2416-2485` 区域）。
