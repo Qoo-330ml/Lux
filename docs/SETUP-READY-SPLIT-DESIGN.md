@@ -339,3 +339,213 @@ pub(crate) async fn require_admin(
    `core_routes()`（纯搬移，路径与 handler 不变）。
 
 批 0 之后，`main` 与 `tests/**` 一行都不用改；此后每批只碰自己的文件。
+
+## 4. 问题 3：setup 模式下挂哪些路由
+
+### 4.1 原则
+
+1. **只挂"没有管理员也能正确回答"的路由。** 判据是可执行的事实：handler 是否需要 `auth`/`emby_auth`/
+   业务服务来给出**正确**答案。
+2. setup 模式的前端契约由代码决定，不靠猜：`web/src/app/App.tsx:65-89` 在渲染任何页面之前只调
+   `/api/v1/setup/status` 与 `/api/v1/auth/me`；`SetupPage` 调 `/api/v1/setup/database`（`SetupPage.tsx:28`）；
+   `DatabaseSetupPanel` 调 `/api/v1/setup/database/{test,select}`（`DatabaseSetupPanel.tsx:47,52`）；
+   `AdminSetupForm` 调 `/api/v1/setup/complete`（`AdminSetupForm.tsx:23`）。
+3. setup 树与"未就绪兼容树"是两棵不同的树，目的不同（§4.5），不要合并。
+
+### 4.2 setup 树的路由清单
+
+| # | 方法/路径 | handler | 依赖 | 为什么必须在 setup 模式可用 | 证据 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `GET /health/live` | `users::live`（`State` 都不用） | 无 | 容器/探针存活判定 | `src/api/users.rs:33` |
+| 2 | `GET /health/ready` | `users::ready` | `CoreState.database`+`config_dir` | 就绪探针；setup 模式下数据库与配置目录正常时**今天也是 200** | `src/api/users.rs:152` |
+| 3 | `GET /api/v1/version` | `users::version` | `CoreState.database` | 版本展示/排障 | `src/api/users.rs:205` |
+| 4 | `GET /api/v1/setup/status` | `users::setup_status` | `SetupService` | SPA 启动第一个请求，决定渲染 SetupPage | `src/api/users.rs:229`、`web/src/app/App.tsx:65` |
+| 5 | `GET /api/v1/setup/database` | `users::setup_database_status` | `DatabaseSetupService` | 数据库选择面板 | `src/api/users.rs:246` |
+| 6 | `POST /api/v1/setup/database/test` | `users::setup_database_test` | `SetupService`+`DatabaseSetupService` | 数据库连通性测试 | `src/api/users.rs:332` |
+| 7 | `POST /api/v1/setup/database/select` | `users::setup_database_select` | 同上 | 选择后端并落 `database.json` | `src/api/users.rs:390` |
+| 8 | `POST /api/v1/setup/database/restart` | `users::setup_database_restart` | 同上 + `restart_handle` | 选完库后排重启 | `src/api/users.rs:452` |
+| 9 | `POST /api/v1/setup/complete` | `users::setup_complete` | `SetupService` + `libraries` + 扫描子集（见 §4.3）+ `restart_handle`/`setup_restart_delay`（第 ② 步新增） | 创建首个管理员、可选取库与首次扫描、排重启 | `src/api/users.rs:601` |
+| 10 | `GET /api/v1/auth/me` | **setup 专用**：固定 `401 AUTHENTICATION_REQUIRED "需要登录"` | 无 | SPA 并行探测会话；setup 模式不可能存在会话 | `web/src/app/App.tsx:69`，今天由 `src/api/users.rs:2935-2941` 给出同一响应 |
+| 11 | `GET /System/Ping`、`POST /System/Ping` | 复用 `emby_ping` | 无 | Emby 客户端握手 | `src/api/emby_handlers.rs:842` |
+| 12 | `GET /System/Info/Public` | 改为 `State<SetupState>`（两棵树共用一份） | `SetupService` + `CoreState.database`/`server_id` | 今天在 setup 模式返回 `{"StartupWizardCompleted": false}`，是 Emby 世界的"向导未完成"约定 | `src/api/emby_handlers.rs:397-410` |
+| 13 | `GET /Users/Public` | **setup 专用**：固定 `200 []` | 无 | 今天 setup 模式的返回就是 `[]`（`emby_auth.public_users()` 在空用户表上给出空集），保持一致 | `src/api/emby_handlers.rs:850-870` |
+| 14 | `GET /logo.svg` + 静态资源 + SPA fallback | `routes::web_logo`、`ServeDir` | 无 | setup 页面本身是 SPA | `src/api/routes.rs:134`、`:140-145` |
+
+共 **13 条业务语义路由**（1–13）+ 静态/SPA。其中只有 #12 是"签名改造后两树共用"，
+#10、#13 是两个 5~10 行的 setup 专用处理函数（无服务、无状态、响应体与今天逐字相同）。
+
+setup handler 需要的服务**只有 4 个**：`SetupService`、`DatabaseSetupService`、`LibraryService`、
+`ScanJobService`，外加 `probe`/`metadata_reidentify`/`thumbnails` 供 `spawn_library_scan` 组
+`ScanWorkerServices`（`src/api/admin/admin_jobs.rs:3-11`、`:242-253`）。`SetupState` 暴露这 7 个就够，
+其余 39 个服务在类型上不可达（§2.1）。
+
+### 4.3 setup 模式下是否构建全部服务：**构建，行为不变**
+
+`src/main.rs:187-206` 今天不管 setup 是否完成都会 `AppState::ready_with_proxy(...)` 并启动
+7 类 worker。第 ③ 步**保持这一点**：`SetupState` 由同一个 `ReadyServices` 派生（只暴露子集），
+`main` 仍调用同样的 builders 与 starters。
+
+原因：`ScanJobService` 的构造是链式接线（`src/api/legacy.rs:606-630`：`home`、`library_covers`、
+`strm_probe`、`people`、`local_nfo`、`metadata_selection`、`metadata_reidentify`、`webhooks`）。
+在 setup 模式只建一个"半接线"的 `ScanJobService` 会让 setup 的首次扫描在扫完后的封面/人物/首页
+读模型刷新上行为不同——那是**用户可见的行为变化**，违反"ready 模式行为不变"的验收口径。
+把它留给后续步骤（把 setup 模式真正瘦身）单独评估。
+
+推论：setup 模式下 worker 照旧运行（计划任务、实时监控、webhook 投递等），第 ③ 步不改变这一点；
+`docs/SETUP-RESTART-DESIGN.md` §7 的回滚边界因此仍然成立。
+
+### 4.4 setup 模式下不注册的路由，与现状对比
+
+| 路径族 | 今天（setup 未完成） | 第 ③ 步之后 | 用户可见变化 |
+| --- | --- | --- | --- |
+| `/api/v1/{libraries,items,home,search,favorites,people,continue-watching,…}` | 401 `需要登录`（无会话；服务齐全，鉴权先失败） | 不注册 → SPA fallback 命中 `reject_unmatched_api_path`（`src/api/legacy.rs:1356-1389`）→ **JSON 404 `NOT_FOUND`** | 是。但前端在 `initialized=false` 时只渲染 `SetupPage`（`web/src/app/App.tsx:89`），无业务调用；第三方脚本会看到 401→404 |
+| `/api/v1/admin/*` | 401/403 | JSON 404 | 同上；setup 向导不调 admin 接口 |
+| `/api/v1/auth/{login,logout,sessions,profile,…}` | 401/400（无管理员时登录失败） | JSON 404 | 是；setup 页面不登录（`LoginPage` 只在 `initialized=true` 后渲染） |
+| `/api/v1/auth/login-background` | 200 + 图片 | JSON 404 | 是；只被 `LoginPage` 使用（`LoginPage.tsx:16`），setup 模式不渲染 |
+| Emby `/System/Info`、`/Items/*`、`/Users/{id}/…` 等 | 401/403/200（服务齐全） | 不注册 → Emby 命名空间是**裸 404**（`reject_unmatched_api_path` 对非 `/api/` 前缀不加错误信封，`src/api/legacy.rs:1376-1379`） | 是（401→404）。Emby 客户端只会显示"服务器不可用" |
+| Emby `/System/Ping`、`/System/Info/Public`、`/Users/Public` | 200 | **200，响应逐字相同**（§4.2 #11-13） | 否 |
+| `/items/{id}`（小写，不在 `is_api_or_emby_namespace_path` 名单里，`src/api/legacy.rs:1332-1354`） | Emby handler → 401/404 | SPA fallback → **HTML 200**（`Accept: text/html` 的详情页跳转因此仍可用） | 是（仅 JSON 请求会从 401/404 变成 HTML 200） |
+
+关于"404 还是 503 带说明"的取舍：
+
+- **不选 503**：503 会与"数据库暂时不可用"的既有语义混淆（`normalize_empty_api_service_unavailable`
+  会把裸 503 改写成 `DATABASE_UNAVAILABLE`），而且 setup 模式的语义是"这些接口在这个进程里不存在"，
+  404 才是准确的。更重要的是：**`/api/v1/no-such-endpoint` 必须继续 404**（`tests/api_web/api_error_contract.rs:230-236`
+  钉住了这一条），所以"整个 `/api/v1/` 前缀一律 503"这条路本来就不通。
+- **Emby 侧保持裸 404**：与今天"未注册的 Emby 路径一律裸 404"一致（`src/api/legacy.rs:1324-1330`、
+  `tests/api_web/api_error_contract.rs:220-228`），不需要新的状态码。
+- 想给运维看"正在 setup"的提示，用 `/health/ready`（始终可用）与前端提示，不要占用 API 状态码。
+
+### 4.5 "setup 树"与"未就绪兼容树"的区别（不要混淆）
+
+| | setup 树 | 未就绪兼容树 |
+| --- | --- | --- |
+| 谁构造 | `main`：`setup_router(SetupState)` | `app_with_state(AppState::default())` / `app()`，**只有 `tests/**` 会走到**（`src/main.rs` 从不构造 `AppState::default()`） |
+| 状态 | `SetupState`（有 database、有 7 个服务） | `CoreState`（database 为 `None`，无服务） |
+| 路由 | §4.2 的 13 条 + 静态 | 6 条冻结测试钉住的兼容响应 + 静态（§9.2） |
+| 语义 | 真实的"等待初始化"模式 | 仅用于保持 `tests/**` 一行不改的历史契约 |
+
+## 5. 问题 4：`main` 如何选择模式
+
+### 5.1 判定谓词
+
+```rust
+enum AppMode { Setup, Ready }
+
+// src/main.rs，prepare_database 之后、build_app_state 之前
+async fn decide_mode(
+    database: &Database,
+    requires_database_selection: bool,
+) -> AppMode {
+    if requires_database_selection {
+        return AppMode::Setup;                       // 数据库后端都还没选，必然是 setup
+    }
+    match SetupService::new(database.clone()).and_then(|setup| Ok(setup)) {
+        Ok(setup) => match setup.status().await {
+            Ok(true) => AppMode::Ready,
+            Ok(false) => AppMode::Setup,
+            Err(error) => {
+                // fail-closed：见 §5.2
+                error!(%error, "could not decide the startup mode; assuming the ready mode");
+                AppMode::Ready
+            }
+        },
+        Err(error) => { error!(%error, "…"); AppMode::Ready }
+    }
+}
+```
+
+判定只用一条查询：`SetupService::status()` = `UserStore::has_users()`（`src/application/setup.rs:17-19`）。
+选它的理由：
+
+- 它是 **`/api/v1/setup/status` 与 `setup_complete` 的同一判据**（`src/api/users.rs:237`），
+  不存在"启动判定"与"接口判定"两套真源。
+- 它跑在**已经连接并迁移完成的同一个 `Database`** 上（`src/main.rs:28` 的 `prepare_database` 已做完
+  schema migration，`:64` 才读 schema version），所以不存在"表还没建好"的时序问题。
+- 它不依赖配置文件：`database.json` 丢失但库里已有用户的场景会正确进入 ready（而不是把 setup
+  能力重新递给 LAN 上的任何人）。
+
+### 5.2 fail-closed 选哪一边：**选 Ready**
+
+| 失败方向 | 选 Setup 的后果 | 选 Ready 的后果 |
+| --- | --- | --- |
+| 数据库瞬时不可用（迁移刚成功、`has_users()` 查询失败） | 进程把"创建首个管理员"的能力暴露给局域网（`setup_complete` → 409 之外还可能 5xx），并允许改写 `database.json`。**敏感能力被放大** | 业务路由返回 503（`normalize_empty_api_service_unavailable` 给结构化错误），管理员修复数据库后重启即可 |
+| 数据库已初始化但状态查询失败 | 同上，且此时 `setup/complete` 会 409，界面表现为"setup 永远失败" | 一切照旧 |
+| 数据库真坏 | setup 树也给不出正确答案（`setup_status` 自己会 503） | 与今天一致：`build_app_state` 失败 → 进程退出 → 由 supervisor/容器重启 |
+
+结论：**"setup 能力"是权限更敏感的一侧，fail-closed = 不把它交出去 = 选 Ready**。
+代码上表现为 `Err(_) => AppMode::Ready`，并用 `error!` 记录（不是 `warn!`：这会让一个已初始化的
+服务器在本次启动里丢掉 setup 端点，属可观测事件）。
+
+### 5.3 与 `requires_database_selection` / `prepare_database` 的关系
+
+- `requires_database_selection`（`src/main.rs:98-99`）= "既没有显式 `database.json`，也没有历史 SQLite 库"，
+  在这两种情况下 `prepare_database` 会先 `mark_database_selection_pending()`（`src/main.rs:54-56`）
+  再连默认 SQLite。这是**配置层事实**，与 setup 是否完成无关，所以它是判定里的短路条件。
+- 第 ③ 步**不动** `prepare_database`；只把 `requires_database_selection` 从 `CoreState` 移到
+  `SetupState`（它是 setup 树的属性），`CoreState.database_selection_required`
+  （`src/api/legacy.rs:179`）在第 ④ 步删除，配套 3 处 worker 短路
+  （`src/api/legacy.rs:918/935/954`）改成"只有 ready 模式才启动这些 worker"。
+  为保持 `tests/storage/database_setup_api.rs:31` 的 `.require_database_selection()` 可用，
+  `AppState` 兼容门面继续保留这个方法名，转发到内部标志。
+
+### 5.4 `AppState` / `app_with_state` 如何为 `tests/**` 保持兼容
+
+冻结构造点实测（附录 B 命令 4）：
+
+| 用法 | 处数 | 位置 | 第 ③ 步如何保持 |
+| --- | --- | --- | --- |
+| `AppState::default()` | 3 | `tests/api_web/web_static.rs:116`、`tests/plugins/danmaku_api.rs:204`、`tests/shutdown.rs:161` | `Default` 仍是"无 database、无服务"，语义不变；前两处经 `app_with_state` 落到**未就绪兼容树**（§9.2），第三处只调 `shutdown_background_workers_checked()`，与路由无关 |
+| `app()` | 8 | `tests/api_web/{health,ready_version,web_static,api_error_contract}.rs` | `app()` 定义不变（`src/api/legacy.rs:972-974`）；`app_with_state` 内部按 `into_mode()` 分派 |
+| `app_with_state(AppState::ready(..)…)` | 163 | 12 个测试文件 | `AppState::ready*` 构造器与全部 `#[doc(hidden)]`/公开 builder 方法保留；`app_with_state` 一律落到 `ready_router` |
+| builder 方法 | `with_scraper`、`with_hls_executable`、`with_strm_playback_resolver`、`with_embedded_subtitle_executable`、`with_restart_handle`、`with_request_rate_limit`、`with_sse_connection_limit`、`require_database_selection`、`start_local_metadata_{outbox_worker,refresh}`、`start_scheduled_tasks`、`rebuild_people_index`、`rebuild_person_credit_index`、`resume_interrupted_metadata_jobs`、`shutdown_background_workers{,_checked}` | 分布在 `tests/**` | 全部保留在 `AppState` 上，内部改为操作 `services: Option<Arc<ReadyServices>>`；**不移动到 `ReadyAppState`**，否则冻结测试不能编译 |
+
+`app_with_state` 的签名保持 `fn app_with_state(state: AppState) -> Router`（`src/api/legacy.rs:976`），
+内部改为分派：
+
+```rust
+impl AppState {
+    pub(crate) fn into_mode(self) -> AppMode {          // 迁移完成后直接返回 ready/setup 之一
+        match (self.database, self.services) {
+            (Some(database), Some(services)) => AppMode::Ready(ReadyAppState {
+                core: self.core, database, services,
+            }),
+            _ => AppMode::NotReady(self.core),
+        }
+    }
+}
+```
+
+因此**`tests/**` 的一行都不需要改**（本任务与后续实现均禁止修改）。唯一无法避免的是 §9.2 列出的
+"未就绪兼容树"必须自己合成 6 条响应——那是 `src` 里 ~40 行、只被测试触达的代码，不是测试改动。
+
+### 5.5 `main` 的重构草图
+
+构造部分**完全不动**（`src/main.rs:172-207` 的 `build_app_state` 保持原样，包括 7 类 worker 启动），
+只把"选路由树"插在构造与 `serve` 之间：
+
+```rust
+// src/main.rs
+let (database, requires_database_selection) = prepare_database(&config).await?;
+…
+let mode = decide_mode(&database, requires_database_selection).await;   // §5.1
+let app_state = build_app_state(&config, &database, control_tx.clone()).await?;   // 不变
+let shutdown_state = app_state.clone();
+let app = match mode {
+    // setup 模式与今天一样构建全部服务、启动全部 worker（§4.3），只是挂 setup 树
+    AppMode::Setup => setup_router(SetupState::from(app_state.into_ready()?)),
+    AppMode::Ready => ready_router(app_state.into_ready()?),
+};
+serve(config, discovery_config, database, app, shutdown_state, control_tx, control_rx).await
+```
+
+- `into_ready() -> Result<ReadyAppState, StartupError>`：`services` 缺失时返回启动错误（不 panic、不
+  `unwrap`；`main` 已经把 `AppState::ready_with_proxy` 调过，缺失就是内部不变量被破坏，按启动错误处理）。
+- `serve` 只增加一个参数：把 `app_state: AppState` 换成 `app: Router` + `shutdown_state: AppState`，
+  内部其余逻辑（`src/main.rs:253-286`：graceful shutdown、worker drain、`database.close()`、
+  `restart_process()`）一字不改。
+- 第 ② 步的 `resume_shutdown_interrupted_first_scans`（分支 `tspace/setup-restart-backend`，
+  `AppState::resume_shutdown_interrupted_first_scans`）留在 `build_app_state` 里不动：它自带
+  `database_selection_required` 短路，且"被关停打断的首次扫描"意味着上一次运行已完成 setup。
+**优点**：`main` 的改动面只有 6 行；setup 模式的资源/worker 行为与今天逐字相同，回滚第 ③ 步只需把
+`match` 换回 `app_with_state(app_state)`。
