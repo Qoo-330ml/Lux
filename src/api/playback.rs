@@ -187,7 +187,7 @@ pub(super) async fn emby_playback_info(
         .iter()
         .any(|(_, source)| emby_source_needs_strm_resolver(source))
     {
-        match state.plugins.as_ref() {
+        match state.plugins() {
             Some(plugins) => match plugins.has_available_strm_resolver().await {
                 Ok(available) => available,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -280,7 +280,7 @@ pub(super) async fn emby_playback_info(
         current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
     // When an administrator disables server transcoding, Emby clients are told direct play is the
     // only option instead of receiving a transcoding capability the server would refuse.
-    let transcoding_enabled = match state.web_playback.as_ref() {
+    let transcoding_enabled = match state.web_playback() {
         Some(service) => service.transcoding_settings().await.enabled,
         None => false,
     };
@@ -334,7 +334,7 @@ pub(super) async fn emby_playback_info(
             }
             let has_direct_stream_url = value.get("DirectStreamUrl").is_some_and(Value::is_string);
             let transcoding_url = source_transcode_session.as_ref().and_then(|session| {
-                state.web_playback.as_ref().and_then(|service| {
+                state.web_playback().and_then(|service| {
                     emby_transcoding_url(
                         service,
                         &source_item.id,
@@ -356,7 +356,7 @@ pub(super) async fn emby_playback_info(
             if let Value::Object(object) = &mut value {
                 if source_transcode_session.is_none()
                     && has_direct_stream_url
-                    && let Some(service) = state.web_playback.as_ref()
+                    && let Some(service) = state.web_playback()
                     && let Some(url) = emby_signed_direct_stream_url(
                         service,
                         &source_item.id,
@@ -1061,13 +1061,13 @@ async fn create_emby_transcoding_session(
     if source.source_kind != "LOCAL_FILE" {
         return Ok(None);
     }
-    let Some(service) = state.web_playback.as_ref() else {
+    let Some(service) = state.web_playback() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     if !service.transcoding_settings().await.enabled {
         return Ok(None);
     }
-    let Some(access) = state.access.as_ref() else {
+    let Some(access) = state.access() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
@@ -1156,7 +1156,7 @@ async fn emby_playback_authorization_context(
     let registered_device = if let Some(token) =
         emby_token_from_headers(headers).or_else(|| query_api_key.map(str::to_owned))
     {
-        let Some(auth) = state.emby_auth.as_ref() else {
+        let Some(auth) = state.emby_auth() else {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         };
         auth.device_info(&token)
@@ -1260,7 +1260,7 @@ async fn standard_emby_playback_api_key(
     // The shared management key is also accepted on Emby-compatible routes
     // for administration. Never copy it into a playback URL, even when it
     // was supplied as the query api_key.
-    if let Some(service) = state.admin_api_key.as_ref() {
+    if let Some(service) = state.admin_api_key() {
         match service.resolve_principal(&token).await {
             Ok(Some(_)) | Err(_) => return None,
             Ok(None) => {}
@@ -1511,7 +1511,7 @@ pub(super) async fn handle_emby_playback_event(
         Ok(_) => false,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(access) = state.access.as_ref() else {
+    let Some(access) = state.access() else {
         tracing::error!(
             event = "emby_playback_callback_rejected",
             stage = "access_service",
@@ -1555,7 +1555,7 @@ pub(super) async fn handle_emby_playback_event(
         || header_device.version.is_empty()
     {
         let token = emby_token_from_headers(&headers).or_else(|| query.api_key.clone());
-        if let (Some(auth), Some(token)) = (state.emby_auth.as_ref(), token) {
+        if let (Some(auth), Some(token)) = (state.emby_auth(), token) {
             match auth.device_info(&token).await {
                 Ok(Some(device)) => merge_emby_device_info(&mut header_device, device),
                 Ok(None) => {}
@@ -1679,7 +1679,7 @@ pub(super) async fn handle_emby_playback_event(
     }
     let playback_probe_source_id = if state_name == "PLAYING"
         && !request.is_paused
-        && state.strm_probe.is_some()
+        && state.strm_probe().is_some()
     {
         match access
             .authorized_playback_source(principal, &internal_item_id, media_source_id.as_deref())
@@ -1697,7 +1697,7 @@ pub(super) async fn handle_emby_playback_event(
     // by the active session matching its item, source, and device.
     if state_name == "STOPPED"
         && let Some(session_id) = emby_transcode_session_id
-        && let Some(service) = state.web_playback.as_ref()
+        && let Some(service) = state.web_playback()
     {
         if let Err(error) = service.stop(session_id, &user_id).await {
             tracing::warn!(
@@ -1778,7 +1778,7 @@ pub(super) async fn handle_emby_playback_event(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            if let Some(service) = state.web_playback.as_ref() {
+            if let Some(service) = state.web_playback() {
                 let admission_update = if state_name == "STOPPED" {
                     service
                         .release_playback_session_admission(&user_id, &play_session_id)
@@ -1797,7 +1797,7 @@ pub(super) async fn handle_emby_playback_event(
             state.user_events.publish_home_coalesced().await;
             if state_name != "STOPPED"
                 && let Some(session_id) = emby_transcode_session_id
-                && let Some(service) = state.web_playback.as_ref()
+                && let Some(service) = state.web_playback()
             {
                 if let Err(error) = service.heartbeat(session_id, &user_id).await {
                     tracing::warn!(
@@ -1856,7 +1856,7 @@ pub(super) async fn handle_emby_playback_event(
                 .await;
             }
             if let Some(source_id) = playback_probe_source_id
-                && let Some(strm_probe) = state.strm_probe.as_ref()
+                && let Some(strm_probe) = state.strm_probe()
             {
                 strm_probe.schedule_playback_probe(&internal_item_id, &source_id);
             }
@@ -1893,7 +1893,7 @@ async fn emby_playback_event_duration_ticks(
     item_id: &str,
     media_source_id: Option<&str>,
 ) -> Option<i64> {
-    let catalog = state.catalog.as_ref()?;
+    let catalog = state.catalog()?;
     let item = catalog.find_item(principal, item_id).await.ok().flatten()?;
     item.runtime_ticks
         .filter(|ticks| *ticks > 0)
@@ -1996,7 +1996,7 @@ async fn playback_notification_context(
     media_source_id: Option<&str>,
     requested_play_method: Option<&str>,
 ) -> PlaybackNotificationContext {
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return PlaybackNotificationContext {
             play_method: requested_play_method.map(normalize_play_method),
             ..PlaybackNotificationContext::default()
@@ -2099,7 +2099,7 @@ pub(super) async fn publish_playback_webhook(
     remote_ip: Option<&str>,
     resumed: bool,
 ) {
-    let Some(webhooks) = state.webhooks.as_ref() else {
+    let Some(webhooks) = state.webhooks() else {
         return;
     };
     let dedupe_key = format!(
@@ -2228,7 +2228,7 @@ pub(super) async fn emby_sessions(
             .iter()
             .map(|session| session.item_id.clone())
             .collect::<Vec<_>>();
-        let Some(catalog) = state.catalog.as_ref() else {
+        let Some(catalog) = state.catalog() else {
             return Json(
                 sessions
                     .iter()
@@ -2294,7 +2294,7 @@ pub(super) async fn emby_stop_session(
     }
     if let Some(transcode_session_id) =
         emby_transcode_session_id_from_play_session(&session.play_session_id)
-        && let Some(service) = state.web_playback.as_ref()
+        && let Some(service) = state.web_playback()
         && let Err(error) = service.stop(transcode_session_id, &session.user_id).await
     {
         tracing::warn!(
@@ -2765,8 +2765,7 @@ async fn web_playback_authorization_context(
 ) -> Result<(Option<String>, Option<String>), WebPlaybackSessionError> {
     if let Some(session_token) = super::request_cookie(headers, "lux_session") {
         let auth = state
-            .auth
-            .as_ref()
+            .auth()
             .ok_or(WebPlaybackSessionError::AccessRulesUnavailable)?;
         let client_ip = super::request_access_ip(headers, state)
             .await
@@ -2798,8 +2797,7 @@ async fn web_playback_authorization_context(
         return Err(WebPlaybackSessionError::NotFound);
     };
     let auth = state
-        .emby_auth
-        .as_ref()
+        .emby_auth()
         .ok_or(WebPlaybackSessionError::AccessRulesUnavailable)?;
     let client_ip = super::request_access_ip(headers, state)
         .await
@@ -3611,7 +3609,7 @@ pub(super) async fn admit_emby_direct_playback(
     user_id: &str,
     play_session_id: &str,
 ) -> Result<(), Response> {
-    let Some(service) = state.web_playback.as_ref() else {
+    let Some(service) = state.web_playback() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
     let result = service
@@ -3656,7 +3654,7 @@ async fn create_web_playback_session_json(
         "STRM_URL" => PlaybackSourceKind::Strm,
         _ => return Err(StatusCode::NOT_IMPLEMENTED.into_response()),
     };
-    let Some(service) = state.web_playback.as_ref() else {
+    let Some(service) = state.web_playback() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
     check_web_playback_admission(headers, service, &user.id.to_string()).await?;
@@ -3913,7 +3911,7 @@ async fn web_proxy_candidate_url(
     created: &crate::application::playback::session::CreatedWebPlaybackSession,
     device_id: Option<&str>,
 ) -> Option<String> {
-    let auth = state.emby_auth.as_ref()?;
+    let auth = state.emby_auth()?;
     let client_ip = super::request_access_ip(headers, state).await.ok()?;
     let device = crate::auth::emby::EmbyDeviceInfo {
         client: "Lux Web".to_owned(),
@@ -3963,7 +3961,7 @@ async fn validate_web_audio_stream(
     if index < 0 {
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
     let item = match catalog.find_item(principal, item_id).await {
@@ -4280,7 +4278,7 @@ pub(super) async fn lux_web_playback_range(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
-    if let Some(strm_probe) = state.strm_probe.as_ref() {
+    if let Some(strm_probe) = state.strm_probe() {
         strm_probe.schedule_playback_probe(&session.item_id, &source.source_id);
     }
     let mut response = Response::builder()

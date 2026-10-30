@@ -597,7 +597,7 @@ pub(super) async fn lux_list_libraries(
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(libraries) = state.libraries.as_ref() else {
+    let Some(libraries) = state.libraries() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -855,7 +855,7 @@ pub(super) async fn lux_list_library_items(
             .into_response();
         }
     };
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1035,7 +1035,7 @@ pub(super) async fn lux_get_item(
         Err(response) => return response,
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1111,7 +1111,7 @@ pub(super) async fn load_lux_item_detail(
                 .map_err(|_| ())
         },
         async {
-            let actors = match state.people.as_ref() {
+            let actors = match state.people() {
                 Some(people) => match people.list_item_actors(&item.id).await {
                     Ok(actors) => actors,
                     Err(error) => {
@@ -1128,7 +1128,7 @@ pub(super) async fn load_lux_item_detail(
             Ok::<_, ()>(actors)
         },
         async {
-            let nfo = match state.local_nfo.as_ref() {
+            let nfo = match state.local_nfo() {
                 Some(local_nfo) => match local_nfo.read_item(&item.id).await {
                     Ok(nfo) => nfo,
                     Err(error) => {
@@ -1612,7 +1612,7 @@ pub(super) async fn lux_image(
     let images = require_service!(state.images);
     serve_image(
         images,
-        state.image_variants.as_ref(),
+        state.image_variants(),
         principal,
         &headers,
         &method,
@@ -1648,7 +1648,7 @@ pub(super) async fn lux_image_at_index(
     let images = require_service!(state.images);
     serve_image(
         images,
-        state.image_variants.as_ref(),
+        state.image_variants(),
         principal,
         &headers,
         &method,
@@ -1667,7 +1667,7 @@ fn lux_image_variant_width(
     headers: &HeaderMap,
     requested: Option<&str>,
 ) -> Result<Option<u32>, Box<Response>> {
-    let Some(variants) = state.image_variants.as_ref() else {
+    let Some(variants) = state.image_variants() else {
         return Ok(None);
     };
     if !variants.enabled() {
@@ -1931,7 +1931,7 @@ pub(super) async fn lux_danmaku_info(
     if let Err(response) = ensure_lux_item_visible(&state, &headers, &user, &item_id).await {
         return response;
     }
-    let Some(service) = state.danmaku.as_ref() else {
+    let Some(service) = state.danmaku() else {
         return lux_danmaku_unavailable(&headers);
     };
     match service
@@ -1961,7 +1961,7 @@ pub(super) async fn lux_danmaku_raw(
     if let Err(response) = ensure_lux_item_visible(&state, &headers, &user, &item_id).await {
         return response;
     }
-    let Some(service) = state.danmaku.as_ref() else {
+    let Some(service) = state.danmaku() else {
         return lux_danmaku_unavailable(&headers);
     };
     match service
@@ -2005,7 +2005,7 @@ pub(super) async fn ensure_lux_item_visible(
     user: &UserRecord,
     item_id: &str,
 ) -> Result<(), Response> {
-    let Some(access) = state.access.as_ref() else {
+    let Some(access) = state.access() else {
         return Err(api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2401,7 +2401,7 @@ pub(super) async fn serve_emby_person_item_image(
         Some(tag) if tag != expected_tag => return None,
         _ => {}
     }
-    let people = state.people.as_ref()?;
+    let people = state.people()?;
     let image = match people.profile_image_for_emby_name_or_id(item_id).await {
         Ok(Some(image)) => image,
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => return None,
@@ -2722,7 +2722,7 @@ pub(super) async fn emby_stream_principal(
         let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>() else {
             return Err(StatusCode::UNAUTHORIZED);
         };
-        let Some(service) = state.web_playback.as_ref() else {
+        let Some(service) = state.web_playback() else {
             return Err(StatusCode::SERVICE_UNAVAILABLE);
         };
         let ticket_user_id = user_id.to_string();
@@ -3162,7 +3162,7 @@ async fn serve_media_file_internal(
                 return StatusCode::NOT_IMPLEMENTED.into_response();
             }
         }
-        let Some(plugins) = state.plugins.as_ref() else {
+        let Some(plugins) = state.plugins() else {
             return StatusCode::NOT_IMPLEMENTED.into_response();
         };
         let location = match plugins.resolve_strm_target(&external_url).await {
@@ -3238,7 +3238,7 @@ async fn admit_emby_media_response(
         }
     }
     if let Some((item_id, source_id)) = playback_probe_source
-        && let Some(strm_probe) = state.strm_probe.as_ref()
+        && let Some(strm_probe) = state.strm_probe()
     {
         strm_probe.schedule_playback_probe(item_id, source_id);
     }
@@ -3802,7 +3802,7 @@ pub(super) async fn serve_emby_library_cover(
     let library_id = emby_internal_id(library_id)
         .parse::<crate::domain::ids::LibraryId>()
         .ok()?;
-    let covers = state.library_covers.as_ref()?;
+    let covers = state.library_covers()?;
     let cover = match covers.resolve(library_id).await {
         Ok(Some(cover)) => cover,
         Ok(None) => return None,
@@ -3820,7 +3820,7 @@ pub(super) async fn serve_emby_library_cover(
         }
     } else {
         let principal = principal?;
-        let Some(access) = state.access.as_ref() else {
+        let Some(access) = state.access() else {
             return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
         };
         match access
@@ -4402,10 +4402,7 @@ mod direct_ticket_tests {
             WebAuthService::new(database.clone())?,
             EmbyAuthService::new(database.clone())?,
         );
-        let service = state
-            .web_playback
-            .as_ref()
-            .ok_or("missing Web playback service")?;
+        let service = state.web_playback().ok_or("missing Web playback service")?;
         let user_id = user.id.to_string();
         let item_id = uuid::Uuid::now_v7().to_string();
         let source_id = uuid::Uuid::now_v7().to_string();
@@ -4489,10 +4486,7 @@ mod direct_ticket_tests {
             WebAuthService::new(database.clone())?,
             EmbyAuthService::new(database.clone())?,
         );
-        let service = state
-            .web_playback
-            .as_ref()
-            .ok_or("missing Web playback service")?;
+        let service = state.web_playback().ok_or("missing Web playback service")?;
         let user_id = user.id.to_string();
         let item_id = uuid::Uuid::now_v7().to_string();
         let source_id = uuid::Uuid::now_v7().to_string();

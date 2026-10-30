@@ -14,9 +14,9 @@ pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppS
         state.config_dir.as_deref(),
         &state.resources,
         crate::application::admin_dashboard::AdminDashboardServices {
-            libraries: state.libraries.as_ref(),
-            catalog: state.catalog.as_ref(),
-            ip_location: state.ip_location.as_ref(),
+            libraries: state.libraries(),
+            catalog: state.catalog(),
+            ip_location: state.ip_location(),
             health_probe_cache: &state.admin_health_probe_cache,
         },
     )

@@ -94,7 +94,7 @@ pub(crate) async fn admin_list_people_index_rebuild(
             .into_response();
         }
     };
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -141,7 +141,7 @@ pub(crate) async fn admin_queue_people_index_rebuild(
         .into_response();
     };
     let library_id_string = library_id.to_string();
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -217,7 +217,7 @@ pub(crate) async fn admin_cancel_people_index_rebuild(
         .into_response();
     };
     let library_id_string = library_id.to_string();
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -301,7 +301,7 @@ pub(crate) async fn admin_list_pending_person_matches(
             .into_response();
         }
     };
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -334,7 +334,7 @@ pub(crate) async fn admin_confirm_person_match(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -404,7 +404,7 @@ pub(crate) async fn admin_reject_person_match(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -458,7 +458,7 @@ pub(crate) async fn admin_undo_person_match(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -513,7 +513,7 @@ pub(crate) async fn admin_split_person_identity(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -581,7 +581,7 @@ pub(crate) async fn admin_set_person_field_locks(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,

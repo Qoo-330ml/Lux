@@ -27,7 +27,7 @@ pub(crate) async fn record_audit_event(
     }
     let (actor_user_id, actor_username, metadata_json) =
         if let Some(candidate) = lux_api_key_from_headers(headers) {
-            let Some(service) = state.admin_api_key.as_ref() else {
+            let Some(service) = state.admin_api_key() else {
                 return;
             };
             let Ok(Some(_)) = service.resolve_principal(&candidate).await else {
@@ -36,7 +36,7 @@ pub(crate) async fn record_audit_event(
             (None, None, audit_metadata_for_shared_api_key(metadata_json))
         } else {
             let (Some(auth), Some(session_token)) =
-                (state.auth.as_ref(), request_cookie(headers, "lux_session"))
+                (state.auth(), request_cookie(headers, "lux_session"))
             else {
                 return;
             };

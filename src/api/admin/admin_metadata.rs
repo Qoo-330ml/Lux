@@ -247,7 +247,7 @@ pub(crate) async fn admin_start_library_reidentify(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.clone() else {
+    let Some(reidentify) = state.metadata_reidentify().cloned() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -309,7 +309,7 @@ pub(crate) async fn admin_start_library_metadata_refresh(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.clone() else {
+    let Some(reidentify) = state.metadata_reidentify().cloned() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -374,7 +374,7 @@ pub(crate) async fn admin_list_pending_metadata(
             .into_response();
         }
     };
-    let Some(candidates) = state.metadata_candidates.as_ref() else {
+    let Some(candidates) = state.metadata_candidates() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -466,7 +466,7 @@ pub(crate) async fn admin_start_metadata_reidentify(
         )
         .into_response();
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+    let Some(reidentify) = state.metadata_reidentify() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -539,7 +539,7 @@ pub(crate) async fn admin_confirm_metadata(
         )
         .into_response();
     }
-    let Some(selection) = state.metadata_selection.as_ref() else {
+    let Some(selection) = state.metadata_selection() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -624,8 +624,8 @@ pub(crate) async fn admin_merge_items(
     let service = require_service!(state.item_merge);
     let result = match crate::application::admin_media_mutations::merge_media_items(
         service,
-        state.home.as_ref(),
-        state.catalog.as_ref(),
+        state.home(),
+        state.catalog(),
         &request.primary_item_id,
         &request.item_ids,
     )
@@ -672,7 +672,7 @@ pub(crate) async fn admin_get_metadata_reidentify(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+    let Some(reidentify) = state.metadata_reidentify() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -695,7 +695,7 @@ pub(crate) async fn admin_retry_metadata_reidentify(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+    let Some(reidentify) = state.metadata_reidentify() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -735,7 +735,7 @@ pub(crate) async fn admin_cancel_metadata_reidentify(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
+    let Some(reidentify) = state.metadata_reidentify() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -791,7 +791,7 @@ pub(crate) async fn admin_list_item_candidates(
             .into_response();
         }
     };
-    let Some(candidates) = state.metadata_candidates.as_ref() else {
+    let Some(candidates) = state.metadata_candidates() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -827,7 +827,7 @@ pub(crate) async fn admin_search_item_candidates(
         )
         .into_response();
     }
-    let Some(metadata_reidentify) = state.metadata_reidentify.as_ref() else {
+    let Some(metadata_reidentify) = state.metadata_reidentify() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -875,7 +875,7 @@ pub(crate) async fn admin_list_item_images(
     }
     match crate::application::admin_media_mutations::list_admin_item_images(
         state.database.as_ref(),
-        state.image_writes.as_ref(),
+        state.image_writes(),
         &item_id,
     )
     .await
@@ -970,7 +970,7 @@ pub(crate) async fn admin_select_candidate(
         )
         .into_response();
     }
-    let Some(selection) = state.metadata_selection.as_ref() else {
+    let Some(selection) = state.metadata_selection() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -981,7 +981,7 @@ pub(crate) async fn admin_select_candidate(
     };
     match crate::application::admin_metadata::select_metadata_candidate(
         selection,
-        state.metadata_reidentify.as_ref(),
+        state.metadata_reidentify(),
         &item_id,
         &candidate_id,
         request.mode,
@@ -1497,7 +1497,7 @@ pub(crate) async fn admin_start_item_metadata_refresh(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.clone() else {
+    let Some(reidentify) = state.metadata_reidentify().cloned() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,

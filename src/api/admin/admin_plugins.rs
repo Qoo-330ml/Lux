@@ -238,7 +238,7 @@ pub(crate) async fn admin_list_plugins_with_scope(
             .into_response();
         }
     };
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -266,7 +266,7 @@ pub(crate) async fn admin_install_plugin(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -309,7 +309,7 @@ pub(crate) async fn admin_update_plugin(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -343,7 +343,7 @@ pub(crate) async fn admin_uninstall_plugin(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -353,7 +353,7 @@ pub(crate) async fn admin_uninstall_plugin(
         .into_response();
     };
     if is_strm_media_info_plugin(&plugin_id)
-        && let Some(service) = state.strm_probe.as_ref()
+        && let Some(service) = state.strm_probe()
         && let Err(error) = service.cancel_active_jobs().await
     {
         tracing::error!(%error, "STRM probe jobs could not be cancelled before plugin uninstall");
@@ -390,7 +390,7 @@ pub(crate) async fn admin_update_plugin_enabled(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -401,7 +401,7 @@ pub(crate) async fn admin_update_plugin_enabled(
     };
     if is_strm_media_info_plugin(&plugin_id)
         && !request.enabled
-        && let Some(service) = state.strm_probe.as_ref()
+        && let Some(service) = state.strm_probe()
         && let Err(error) = service.cancel_active_jobs().await
     {
         tracing::error!(%error, "STRM probe jobs could not be cancelled before plugin disable");
@@ -409,7 +409,7 @@ pub(crate) async fn admin_update_plugin_enabled(
     match plugins.set_enabled(&plugin_id, request.enabled).await {
         Ok(plugin) => {
             if is_strm_media_info_plugin(&plugin_id)
-                && let Some(service) = state.strm_probe.as_ref()
+                && let Some(service) = state.strm_probe()
             {
                 if request.enabled {
                     service.schedule_configured_jobs_when_available();
@@ -454,7 +454,7 @@ pub(crate) async fn admin_update_plugin_config(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -477,7 +477,7 @@ pub(crate) async fn admin_update_plugin_config(
             let selection_changed = is_strm_media_info
                 && previous_library_ids != configured_media_info_library_ids(plugins).await;
             if selection_changed
-                && let Some(service) = state.strm_probe.as_ref()
+                && let Some(service) = state.strm_probe()
                 && let Err(error) = service.cancel_active_jobs().await
             {
                 tracing::error!(%error, "STRM probe jobs could not be cancelled after library selection changed");
@@ -488,7 +488,7 @@ pub(crate) async fn admin_update_plugin_config(
                     .enabled_media_info_settings()
                     .await
                     .is_ok_and(|settings| settings.is_some())
-                && let Some(service) = state.strm_probe.as_ref()
+                && let Some(service) = state.strm_probe()
             {
                 service.schedule_configured_jobs_when_available();
             }
@@ -540,7 +540,7 @@ pub(crate) async fn admin_upload_plugin_config_image(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,

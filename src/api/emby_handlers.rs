@@ -28,7 +28,7 @@ pub(super) async fn emby_sync_media_info(
     if !auth_principal.is_admin() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let path = "/Items/SyncMediaInfo";
@@ -395,7 +395,7 @@ pub(super) async fn current_emby_server_name(state: &AppState) -> String {
 }
 
 pub(super) async fn emby_public_system_info(State(state): State<AppState>) -> Json<Value> {
-    let startup_wizard_completed = match state.setup.as_ref() {
+    let startup_wizard_completed = match state.setup() {
         Some(setup) => setup.status().await.unwrap_or(false),
         None => false,
     };
@@ -768,16 +768,16 @@ fn emby_matching_root<'a>(
 }
 
 fn spawn_emby_scan_job(state: &AppState, job_id: String) {
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+    let Some(scan_jobs) = state.scan_jobs() else {
         return;
     };
     crate::application::admin_scan_jobs::spawn_scan_job_worker(
         scan_jobs,
         &job_id,
         crate::application::admin_scan_jobs::ScanWorkerServices {
-            probe: state.probe.clone(),
-            metadata: state.metadata_reidentify.clone(),
-            thumbnails: state.thumbnails.clone(),
+            probe: state.probe().cloned(),
+            metadata: state.metadata_reidentify().cloned(),
+            thumbnails: state.thumbnails().cloned(),
         },
     );
 }
@@ -849,7 +849,7 @@ pub(super) async fn emby_ping(
 
 pub(super) async fn emby_public_users(State(state): State<AppState>) -> Json<Value> {
     let server_id = state.server_id.clone();
-    let Some(auth) = state.emby_auth.as_ref() else {
+    let Some(auth) = state.emby_auth() else {
         return Json(json!([]));
     };
     let server_name = current_emby_server_name(&state).await;
@@ -1008,7 +1008,7 @@ pub(super) async fn emby_query_users(
         .iter()
         .map(|user| (user.id.to_string(), user.is_admin))
         .collect::<Vec<_>>();
-    let accessible_libraries = match state.access.as_ref() {
+    let accessible_libraries = match state.access() {
         Some(access) => access
             .accessible_library_ids_for_users(&access_requests)
             .await
@@ -1036,7 +1036,7 @@ pub(super) async fn emby_query_users(
         };
         order_requests.push((user_id, user.is_admin, order_scope));
     }
-    let ordered_views = match state.libraries.as_ref() {
+    let ordered_views = match state.libraries() {
         Some(libraries) => libraries
             .saved_library_orders_for_users(&order_requests)
             .await
@@ -1434,7 +1434,7 @@ pub(super) async fn emby_delete_user(
     };
     match users.soft_delete_user(&user_id).await {
         Ok(Some(hls_session_ids)) => {
-            if let Some(web_playback) = state.web_playback.as_ref() {
+            if let Some(web_playback) = state.web_playback() {
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -1753,7 +1753,7 @@ pub(super) async fn emby_update_user(
         .await
     {
         Ok(Some((user, hls_session_ids))) => {
-            if let Some(web_playback) = state.web_playback.as_ref() {
+            if let Some(web_playback) = state.web_playback() {
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -1824,7 +1824,7 @@ pub(super) async fn emby_update_user_policy(
         .await
     {
         Ok(Some((_, hls_session_ids))) => {
-            if let Some(web_playback) = state.web_playback.as_ref() {
+            if let Some(web_playback) = state.web_playback() {
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -2136,7 +2136,7 @@ pub(super) async fn emby_delete_user_avatar(
 }
 
 pub(super) async fn emby_ordered_views(state: &AppState, user: &UserRecord) -> Vec<String> {
-    let Some(libraries) = state.libraries.as_ref() else {
+    let Some(libraries) = state.libraries() else {
         return Vec::new();
     };
     let principal = AccessPrincipal::new(user.id, user.is_admin);
@@ -2177,7 +2177,7 @@ pub(super) async fn emby_authenticate(
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
-    let Some(auth) = state.emby_auth.clone() else {
+    let Some(auth) = state.emby_auth().cloned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let login_key = login_attempt_key(&headers, &request.username);
@@ -2230,7 +2230,7 @@ pub(super) async fn emby_authenticate_user_id(
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
-    let Some(auth) = state.emby_auth.clone() else {
+    let Some(auth) = state.emby_auth().cloned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let login_key = login_attempt_key(&headers, &user_id);
@@ -2632,7 +2632,7 @@ pub(super) async fn require_emby_user_with_query(
     state: &AppState,
     query: &EmbyTokenQuery,
 ) -> Result<UserRecord, StatusCode> {
-    let Some(auth) = state.emby_auth.as_ref() else {
+    let Some(auth) = state.emby_auth() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let client_ip = super::request_access_ip(headers, state)
@@ -2699,7 +2699,7 @@ async fn require_emby_principal_scoped(
     query: &EmbyTokenQuery,
     allow_playback_token: bool,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
-    let Some(auth) = state.emby_auth.as_ref() else {
+    let Some(auth) = state.emby_auth() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let token = emby_token_from_headers(headers)
@@ -2708,7 +2708,7 @@ async fn require_emby_principal_scoped(
     if crate::auth::emby::is_playback_token(&token) && !allow_playback_token {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let principal = if let Some(service) = state.admin_api_key.as_ref() {
+    let principal = if let Some(service) = state.admin_api_key() {
         match service.resolve_principal(&token).await {
             Ok(Some(principal)) => Some(principal),
             Ok(None) => None,
@@ -2831,7 +2831,7 @@ pub(super) async fn emby_access_principal_for_target(
     if principal.user_id() == Some(target_user_id) {
         return Ok(access_principal);
     }
-    let Some(auth) = state.emby_auth.as_ref() else {
+    let Some(auth) = state.emby_auth() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     match auth.user_by_id(&target_user_id.to_string()).await {
@@ -2846,7 +2846,7 @@ pub(super) async fn emby_logout(
     Query(query): Query<EmbyTokenQuery>,
     State(state): State<AppState>,
 ) -> StatusCode {
-    let Some(auth) = state.emby_auth else {
+    let Some(auth) = state.emby_auth() else {
         return StatusCode::SERVICE_UNAVAILABLE;
     };
     let token = emby_token_from_headers(&headers).or(query.api_key);

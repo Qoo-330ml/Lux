@@ -205,8 +205,7 @@ async fn admin_invitation_creator(headers: &HeaderMap, state: &AppState) -> Opti
     }
     let session_token = request_cookie(headers, "lux_session")?;
     state
-        .auth
-        .as_ref()?
+        .auth()?
         .resolve(&session_token)
         .await
         .ok()

@@ -160,7 +160,7 @@ async fn registration_reviewer_user_id(
         )
         .into_response());
     };
-    let Some(auth) = state.auth.as_ref() else {
+    let Some(auth) = state.auth() else {
         return Err(api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,

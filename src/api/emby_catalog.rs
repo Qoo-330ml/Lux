@@ -855,7 +855,7 @@ pub(super) async fn emby_visible_library_items(
     state: &AppState,
     principal: AccessPrincipal,
 ) -> Result<Vec<Value>, StatusCode> {
-    let Some(libraries) = state.libraries.as_ref() else {
+    let Some(libraries) = state.libraries() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let (order_scope, collection_count) = emby_library_order_scope(state, principal).await?;
@@ -872,10 +872,7 @@ pub(super) async fn emby_visible_library_items(
         )
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let child_counts = catalog
         .count_library_root_items(&accessible_library_ids)
         .await
@@ -928,18 +925,12 @@ pub(super) async fn emby_library_order_scope(
     state: &AppState,
     principal: AccessPrincipal,
 ) -> Result<(Vec<String>, i64), StatusCode> {
-    let access = state
-        .access
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let access = state.access().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let library_ids = access
         .accessible_library_ids(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let content_restrictions = catalog
         .content_restrictions_for_principal(principal)
         .await
@@ -961,10 +952,7 @@ pub(super) async fn emby_library_order_scope_with_access(
     accessible_library_ids: Vec<String>,
     content_restrictions: Option<&crate::storage::UserContentRestrictions>,
 ) -> Result<(Vec<String>, i64), StatusCode> {
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     // Only the total decides whether the collection library is part of the scope; building a
     // card for it would assemble catalog rows nobody reads.
     let collection_count = catalog
@@ -1024,7 +1012,7 @@ pub(super) async fn emby_library_root_count(
     library_id: &str,
     kind: LibraryKind,
 ) -> Result<i64, StatusCode> {
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let item_types = match kind {
@@ -1225,7 +1213,7 @@ async fn emby_parent_library_kind(state: &AppState, parent_id: &str) -> Option<L
     let Ok(library_id) = internal_id.parse::<crate::domain::ids::LibraryId>() else {
         return None;
     };
-    let libraries = state.libraries.as_ref()?;
+    let libraries = state.libraries()?;
     match libraries.get_library(library_id).await {
         Ok(library) if library.is_enabled => Some(library.kind),
         _ => None,
@@ -1272,7 +1260,7 @@ pub(super) async fn emby_group_latest_page(
         *group_counts.entry(series_id.to_owned()).or_insert(0) += 1;
     }
 
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let mut series_by_id = HashMap::new();
@@ -1706,7 +1694,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
         Ok(states) => states,
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let mut catalog_items = page.items.clone();
@@ -1730,8 +1718,8 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
     let include_nfo = emby_nfo_fields_requested(fields);
     let include_people = fields.is_some_and(|fields| emby_fields_include(Some(fields), "People"));
     let extras = load_emby_item_extras(
-        state.local_nfo.clone(),
-        state.people.clone(),
+        state.local_nfo().cloned(),
+        state.people().cloned(),
         &catalog_items,
         include_nfo,
         include_people,
@@ -2175,7 +2163,7 @@ pub(super) async fn emby_single_id_lookup_response(
 ) -> Option<Response> {
     let requested_id = emby_single_id_lookup(query)?;
     let internal_item_id = emby_internal_id(requested_id);
-    let catalog = state.catalog.as_ref()?;
+    let catalog = state.catalog()?;
     let (item, preferred_source_id) = match catalog.find_item(principal, &internal_item_id).await {
         Ok(Some(item)) => (Some(item), None),
         Ok(None) => match catalog
@@ -2267,7 +2255,7 @@ pub(super) async fn emby_single_id_lookup_response(
         return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
     if emby_fields_include(query.fields.as_deref(), "People") {
-        let actors = match state.people.as_ref() {
+        let actors = match state.people() {
             Some(people) => match people.list_item_actors(&item.id).await {
                 Ok(actors) => actors,
                 Err(error) => {
@@ -2321,7 +2309,7 @@ pub(super) async fn emby_query_requests_series_children(
     let Some(parent_id) = query.parent_id.as_deref() else {
         return false;
     };
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return false;
     };
     let parent_id = emby_internal_id(parent_id);
@@ -2362,7 +2350,7 @@ pub(super) async fn emby_catalog_page_from_query(
         Ok(params) => params,
         Err(status) => return Err(status),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
+    let Some(catalog) = state.catalog() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     };
     let parent_id = query.parent_id.as_deref().map(emby_internal_id);
@@ -2481,7 +2469,7 @@ pub(super) async fn emby_catalog_page_for_item_parent(
     let child_types = if !requested_types.is_empty() {
         requested_types.join(",")
     } else if parent.item_type == "FOLDER" {
-        let is_home_videos = if let Some(libraries) = state.libraries.as_ref() {
+        let is_home_videos = if let Some(libraries) = state.libraries() {
             libraries
                 .get_library(
                     parent
@@ -2745,7 +2733,7 @@ pub(super) async fn emby_item_response(
     }
     let response_fields = emby_item_detail_response_fields(fields);
     if let Ok(library_id) = internal_item_id.parse::<crate::domain::ids::LibraryId>()
-        && let Some(libraries) = state.libraries.as_ref()
+        && let Some(libraries) = state.libraries()
     {
         match libraries.get_library(library_id).await {
             Ok(library) => {
@@ -2882,7 +2870,7 @@ pub(super) async fn emby_item_response(
                     if !work_plan.read_people {
                         return Vec::new();
                     }
-                    match state.people.as_ref() {
+                    match state.people() {
                         Some(people) => match people.list_item_actors(&item.id).await {
                             Ok(actors) => actors,
                             Err(error) => {
@@ -2956,7 +2944,7 @@ pub(super) async fn emby_item_response(
                 Ok(library_ids) => library_ids,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            let Some(people) = state.people.as_ref() else {
+            let Some(people) = state.people() else {
                 return StatusCode::NOT_FOUND.into_response();
             };
             match people.find_person(&library_ids, "Actor", item_id).await {
@@ -3058,7 +3046,7 @@ pub(super) async fn emby_person_image_response(
     if let Err(status) = require_emby_principal(headers, state, query.api_key.as_deref()).await {
         return status.into_response();
     }
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let image = match people.profile_image_for_emby_name_or_id(person_id).await {
@@ -3216,7 +3204,7 @@ pub(super) async fn read_local_nfo_details(
     state: &AppState,
     item_id: &str,
 ) -> Option<LocalNfoDetails> {
-    let store = state.local_nfo.as_ref()?;
+    let store = state.local_nfo()?;
     match store.read_item(item_id).await {
         Ok(details) => details,
         Err(error) => {
@@ -4370,7 +4358,7 @@ pub(super) async fn emby_primary_image_aspect_ratio(
         return Some(f64::from(width) / f64::from(height));
     }
 
-    let images = state.images.as_ref()?;
+    let images = state.images()?;
     let image = images
         .resolve(principal, item_id, "POSTER", 0)
         .await

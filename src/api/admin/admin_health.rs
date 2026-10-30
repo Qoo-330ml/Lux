@@ -21,7 +21,7 @@ pub(crate) async fn admin_health_payload(state: &AppState) -> Result<Value, Stat
     let report = admin_health_report(
         database,
         state.config_dir.as_deref(),
-        state.libraries.as_ref(),
+        state.libraries(),
         &state.resources,
         &state.admin_health_probe_cache,
     )

@@ -42,7 +42,7 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if let Some(plugin_id) = login_background_plugin_id(&source) {
-        let Some(plugins) = state.plugins.as_ref() else {
+        let Some(plugins) = state.plugins() else {
             return Json(json!({ "source": DEFAULT_LOGIN_BACKGROUND_SOURCE, "images": [] }))
                 .into_response();
         };
@@ -109,7 +109,7 @@ pub(super) async fn login_background_custom_image(
     headers: HeaderMap,
     State(state): State<AppState>,
 ) -> Response {
-    let Some(plugins) = state.plugins.as_ref() else {
+    let Some(plugins) = state.plugins() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let asset = match plugins.selected_custom_login_background_asset().await {
@@ -150,7 +150,7 @@ pub(super) async fn login_background_custom_image(
 }
 
 pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let Some(database) = state.database else {
+    let Some(database) = state.database() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -203,7 +203,7 @@ pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Va
 }
 
 pub(super) async fn version(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let Some(database) = state.database else {
+    let Some(database) = state.database() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -227,7 +227,7 @@ pub(super) async fn version(State(state): State<AppState>) -> (StatusCode, Json<
 }
 
 pub(super) async fn setup_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -244,7 +244,7 @@ pub(super) async fn setup_status(State(state): State<AppState>) -> (StatusCode, 
 }
 
 pub(super) async fn setup_database_status(State(state): State<AppState>) -> Response {
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -337,7 +337,7 @@ pub(super) async fn setup_database_test(
     if !setup_endpoint_allows_peer(&headers) {
         return setup_remote_peer_rejected(&headers);
     }
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -367,7 +367,7 @@ pub(super) async fn setup_database_test(
             .into_response();
         }
     }
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -395,7 +395,7 @@ pub(super) async fn setup_database_select(
     if !setup_endpoint_allows_peer(&headers) {
         return setup_remote_peer_rejected(&headers);
     }
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -425,7 +425,7 @@ pub(super) async fn setup_database_select(
             .into_response();
         }
     }
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -463,7 +463,7 @@ pub(super) async fn setup_database_restart(
         .into_response();
     }
 
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -494,7 +494,7 @@ pub(super) async fn setup_database_restart(
         }
     }
 
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -603,7 +603,7 @@ pub(super) async fn setup_complete(
     State(state): State<AppState>,
     Json(request): Json<SetupCompleteRequest>,
 ) -> Response {
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -614,7 +614,7 @@ pub(super) async fn setup_complete(
     };
 
     if state.database_selection_required {
-        let Some(database_setup) = state.database_setup.as_ref() else {
+        let Some(database_setup) = state.database_setup() else {
             return api_error(
                 &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -696,7 +696,7 @@ pub(super) async fn setup_complete(
         Ok(user) => {
             let mut library_json_value = None;
             if let (Some(first_library), Some(kind), Some(libraries)) =
-                (request.first_library, setup_kind, state.libraries.as_ref())
+                (request.first_library, setup_kind, state.libraries())
             {
                 let library = match libraries
                     .create_library_with_scraper(
@@ -851,7 +851,7 @@ pub(super) async fn auth_login(
     State(state): State<AppState>,
     Json(request): Json<AuthLoginRequest>,
 ) -> Response {
-    let Some(auth) = state.auth.clone() else {
+    let Some(auth) = state.auth().cloned() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -915,7 +915,7 @@ pub(super) async fn auth_login(
     };
     let mut migration_auth_failed = false;
     if session.is_none()
-        && let Some(migration) = state.emby_migration.clone()
+        && let Some(migration) = state.emby_migration().cloned()
     {
         match migration
             .authenticate_pending_user(&request.username, &request.password)
@@ -1419,7 +1419,7 @@ pub(super) async fn public_registration_settings(State(state): State<AppState>) 
 
 pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
     if let Some(candidate) = lux_api_key_from_headers(&headers) {
-        let Some(service) = state.admin_api_key.as_ref() else {
+        let Some(service) = state.admin_api_key() else {
             return api_error(
                 &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1475,8 +1475,7 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
     };
     let server_name = current_emby_server_name(&state).await;
     let image_variants_available = state
-        .image_variants
-        .as_ref()
+        .image_variants()
         .is_some_and(|variants| variants.enabled());
     Json(json!({
         "user": user_json(&user),
@@ -1743,7 +1742,7 @@ pub(super) async fn auth_create_device_pairing(
     {
         return rate_limited_response(&headers);
     }
-    let Some(service) = state.device_pairings.as_ref() else {
+    let Some(service) = state.device_pairings() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1791,7 +1790,7 @@ pub(super) async fn auth_cancel_device_pairing(
         )
         .into_response();
     }
-    let Some(service) = state.device_pairings.as_ref() else {
+    let Some(service) = state.device_pairings() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1861,7 +1860,7 @@ pub(super) async fn redeem_device_pairing(
         )
         .into_response();
     }
-    let Some(service) = state.device_pairings.as_ref() else {
+    let Some(service) = state.device_pairings() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1898,7 +1897,7 @@ async fn require_web_session_csrf(
     headers: &HeaderMap,
     state: &AppState,
 ) -> Result<AuthenticatedSession, Response> {
-    let Some(auth) = state.auth.as_ref() else {
+    let Some(auth) = state.auth() else {
         return Err(api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2151,7 +2150,7 @@ pub(super) async fn auth_update_account_preferences(
             preferences
                 .library_order
                 .retain(|library_id| accessible_library_ids.contains(library_id));
-            if let Some(home) = state.home.as_ref() {
+            if let Some(home) = state.home() {
                 home.invalidate();
             }
             state.user_events.publish_home_coalesced().await;
@@ -2261,7 +2260,7 @@ pub(super) async fn auth_update_settings(
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        if let Some(home) = state.home.as_ref() {
+        if let Some(home) = state.home() {
             home.invalidate();
         }
         state.user_events.publish_home_coalesced().await;
@@ -2308,7 +2307,7 @@ pub(super) async fn auth_update_password(
         )
         .into_response();
     }
-    let Some(auth) = state.auth.as_ref() else {
+    let Some(auth) = state.auth() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2370,18 +2369,12 @@ async fn library_order_access_scope(
     state: &AppState,
     principal: AccessPrincipal,
 ) -> Result<Vec<String>, StatusCode> {
-    let access = state
-        .access
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let access = state.access().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let mut library_ids = access
         .accessible_library_ids(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     let collections = catalog
         .list_global_collection_cards(principal, 0, 1)
         .await
@@ -2526,7 +2519,7 @@ pub(super) async fn auth_update_library_order(
         Ok(updated) => {
             let library_order = updated.library_order;
             let preferences_version = updated.version;
-            if let Some(home) = state.home.as_ref() {
+            if let Some(home) = state.home() {
                 home.invalidate();
             }
             state.user_events.publish_home_coalesced().await;
@@ -2711,7 +2704,7 @@ pub(super) async fn auth_revoke_session(
 }
 
 pub(super) async fn auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
+    let Some(auth) = state.auth() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -2868,7 +2861,7 @@ pub(super) async fn require_web_principal(
             )
             .into_response());
         };
-        let Some(auth) = state.emby_auth.as_ref() else {
+        let Some(auth) = state.emby_auth() else {
             return Err(api_error(
                 headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -2930,7 +2923,7 @@ pub(super) async fn require_web_principal(
             .into_response()),
         };
     }
-    let Some(auth) = state.auth.as_ref() else {
+    let Some(auth) = state.auth() else {
         return Err(api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -3036,7 +3029,7 @@ pub(super) async fn require_web_csrf(
         require_web_user(headers, state).await.map(|_| ())?;
         return Ok(());
     }
-    let Some(auth) = state.auth.as_ref() else {
+    let Some(auth) = state.auth() else {
         return Err(api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,

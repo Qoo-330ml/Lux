@@ -356,7 +356,7 @@ async fn admin_batch_update_user_status(
     .await;
     for item in result.results.iter().filter(|item| item.success) {
         if request.is_disabled
-            && let Some(web_playback) = state.web_playback.as_ref()
+            && let Some(web_playback) = state.web_playback()
         {
             web_playback
                 .stop_server_hls_sessions(&item.hls_session_ids)
@@ -797,8 +797,7 @@ async fn admin_list_user_devices(
                     .as_deref()
                     .and_then(|remote_ip| {
                         state
-                            .ip_location
-                            .as_ref()
+                            .ip_location()
                             .and_then(|service| service.cached_or_schedule(remote_ip))
                     })
                     .map(|location| json!({
@@ -1098,7 +1097,7 @@ async fn ensure_user_access_rule_does_not_block_admin(
         )
         .into_response());
     };
-    let Some(auth) = state.auth.as_ref() else {
+    let Some(auth) = state.auth() else {
         return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
     };
     let session = match auth.resolve(&session_token).await {
@@ -1253,7 +1252,7 @@ async fn admin_user_access_blacklist_creator(
         return None;
     }
     let session_token = request_cookie(headers, "lux_session")?;
-    let auth = state.auth.as_ref()?;
+    let auth = state.auth()?;
     auth.resolve(&session_token)
         .await
         .ok()
@@ -1585,7 +1584,7 @@ async fn admin_list_user_playback_sessions(
     let playback_data = match crate::application::admin_dashboard::dashboard_playback_data(
         database,
         Some(catalog),
-        state.ip_location.as_ref(),
+        state.ip_location(),
         &sessions,
         std::slice::from_ref(&user),
         page_size as usize,
@@ -2526,7 +2525,7 @@ pub(crate) async fn admin_replace_user_library_access(
     };
     match crate::application::admin_user_access::replace_library_access(
         database,
-        state.home.as_ref(),
+        state.home(),
         &user_id,
         &request.library_access_mode,
         &library_ids,
@@ -2720,7 +2719,7 @@ pub(crate) async fn admin_update_user(
         .await
     {
         Ok(Some((user, hls_session_ids))) => {
-            if let Some(web_playback) = state.web_playback.as_ref() {
+            if let Some(web_playback) = state.web_playback() {
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -2767,7 +2766,7 @@ pub(crate) async fn admin_delete_user(
     };
     match users.soft_delete_user(&user_id).await {
         Ok(Some(hls_session_ids)) => {
-            if let Some(web_playback) = state.web_playback.as_ref() {
+            if let Some(web_playback) = state.web_playback() {
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -2871,7 +2870,7 @@ pub(crate) async fn admin_purge_user(
     match users.purge_deleted_user(&user_id).await {
         Ok(true) => {
             if let (Some(avatars), Ok(user_id)) = (
-                state.user_avatars.as_ref(),
+                state.user_avatars(),
                 user_id.parse::<crate::domain::ids::UserId>(),
             ) && let Err(error) = avatars.remove(user_id).await
             {
@@ -3006,7 +3005,7 @@ pub(crate) async fn admin_set_library_access(
     };
     match crate::application::admin_user_access::set_library_access(
         database,
-        state.home.as_ref(),
+        state.home(),
         &user_id,
         &library_id,
         request.can_view,

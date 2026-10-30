@@ -84,7 +84,7 @@ pub(crate) async fn admin_list_webhook_destinations(
             .into_response();
         }
     };
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -112,7 +112,7 @@ pub(crate) async fn admin_get_webhook_destination(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -142,7 +142,7 @@ pub(crate) async fn admin_create_webhook_destination(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -192,7 +192,7 @@ pub(crate) async fn admin_update_webhook_destination(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -228,7 +228,7 @@ pub(crate) async fn admin_delete_webhook_destination(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -251,7 +251,7 @@ pub(crate) async fn admin_test_webhook_destination(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -274,7 +274,7 @@ pub(crate) async fn admin_rotate_webhook_secret(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -309,7 +309,7 @@ pub(crate) async fn admin_list_webhook_deliveries(
             .into_response();
         }
     };
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -337,7 +337,7 @@ pub(crate) async fn admin_retry_webhook_delivery(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,

@@ -322,7 +322,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
     let database = require_service!(state.database);
     let settings = match crate::application::settings::read_admin_settings(
         database,
-        state.plugins.as_ref(),
+        state.plugins(),
         state.config_dir.as_deref(),
     )
     .await
@@ -331,8 +331,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     let status = state
-        .web_playback
-        .as_ref()
+        .web_playback()
         .map(|service| service.hardware_status());
     Json(admin_settings_json(&settings, status.as_ref())).into_response()
 }
@@ -567,8 +566,8 @@ pub(crate) async fn admin_update_settings(
     };
     let settings = match crate::application::settings::update_admin_settings(
         database,
-        state.home.as_ref(),
-        state.plugins.as_ref(),
+        state.home(),
+        state.plugins(),
         state.config_dir.as_deref(),
         crate::application::settings::AdminSettingsUpdate {
             server_name: request.server_name,
@@ -688,10 +687,10 @@ pub(crate) async fn admin_update_settings(
             return plugin_error(&headers, error);
         }
     };
-    if let Some(variants) = state.image_variants.as_ref() {
+    if let Some(variants) = state.image_variants() {
         variants.apply_settings(settings.media_strategy.images.variant_cache.clone());
     }
-    let hardware_status = match state.web_playback.as_ref() {
+    let hardware_status = match state.web_playback() {
         Some(web_playback) => {
             web_playback.apply_transcoding_settings(&settings.transcoding);
             // Re-run the self-test so the response and the capability flags agree immediately.

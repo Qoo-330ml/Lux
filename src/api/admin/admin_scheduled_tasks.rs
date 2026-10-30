@@ -704,7 +704,7 @@ pub(crate) async fn admin_run_scheduled_task_plan(
     let database = require_service!(state.database);
     let result = crate::application::admin_scheduled_tasks::run_scheduled_task_plan(
         database,
-        state.scheduled_tasks.as_ref(),
+        state.scheduled_tasks(),
         &plan_id,
     )
     .await;
@@ -828,8 +828,8 @@ pub(crate) async fn admin_upsert_scheduled_task(
     };
     let task = match crate::application::admin_scheduled_tasks::update_scheduled_task_config(
         state.database.as_ref(),
-        state.libraries.as_ref(),
-        state.plugins.as_ref(),
+        state.libraries(),
+        state.plugins(),
         update,
     )
     .await

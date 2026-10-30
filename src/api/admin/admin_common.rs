@@ -42,7 +42,7 @@ pub(crate) async fn require_admin(
         .into_response());
     }
     if require_csrf && !users::has_client_token(headers) {
-        let Some(auth) = state.auth.as_ref() else {
+        let Some(auth) = state.auth() else {
             return Err(api_error(
                 headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -130,7 +130,7 @@ pub(crate) async fn resolve_shared_admin_api_key(
     let Some(candidate) = lux_api_key_from_headers(headers) else {
         return Ok(None);
     };
-    let Some(service) = state.admin_api_key.as_ref() else {
+    let Some(service) = state.admin_api_key() else {
         return Err(api_error(
             headers,
             StatusCode::SERVICE_UNAVAILABLE,

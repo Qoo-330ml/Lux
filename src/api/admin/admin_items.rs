@@ -54,9 +54,9 @@ pub(crate) async fn admin_start_item_scan(
         scan_jobs,
         &item_id,
         crate::application::admin_scan_jobs::ScanWorkerServices {
-            probe: state.probe.clone(),
-            metadata: state.metadata_reidentify.clone(),
-            thumbnails: state.thumbnails.clone(),
+            probe: state.probe().cloned(),
+            metadata: state.metadata_reidentify().cloned(),
+            thumbnails: state.thumbnails().cloned(),
         },
     )
     .await
@@ -240,7 +240,7 @@ pub(crate) async fn delete_media_item(
     let deletion = require_service!(state.deletion);
     let report = match crate::application::admin_media_mutations::delete_media_item(
         deletion,
-        state.home.as_ref(),
+        state.home(),
         item_id,
         source_id,
     )
@@ -308,7 +308,7 @@ pub(crate) async fn admin_refresh_collection(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(collections) = state.collections.as_ref() else {
+    let Some(collections) = state.collections() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -455,8 +455,8 @@ pub(crate) async fn admin_unmerge_items(
     let merge = require_service!(state.item_merge);
     let result = match crate::application::admin_media_mutations::unmerge_media_items(
         merge,
-        state.home.as_ref(),
-        state.catalog.as_ref(),
+        state.home(),
+        state.catalog(),
         &request.primary_item_id,
         &request.merged_item_id,
     )

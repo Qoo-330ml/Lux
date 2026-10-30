@@ -165,63 +165,23 @@ impl SseConnectionBudget {
     }
 }
 
+/// State that exists in every process mode, including the pre-setup mode.
+///
+/// It holds the middleware pieces (rate limiters, SSE budget, resource and request metrics), the
+/// event hubs, the connection handle, and the three non-service options (`database`,
+/// `config_dir`, `restart_handle`) that setup itself needs. Business services live in
+/// [`ReadyServices`].
 #[derive(Clone, Default)]
-pub struct AppState {
+pub struct CoreState {
     admin_health_probe_cache: AdminHealthProbeCache,
     database: Option<Database>,
     config_dir: Option<PathBuf>,
-    database_setup: Option<DatabaseSetupService>,
     database_selection_required: bool,
     restart_handle: Option<RestartHandle>,
     server_id: String,
     filmly_image_compat_mode: FilmlyImageCompatMode,
-    setup: Option<SetupService>,
-    auth: Option<WebAuthService>,
-    emby_auth: Option<EmbyAuthService>,
-    device_pairings: Option<DevicePairingService>,
-    admin_api_key: Option<AdminApiKeyService>,
-    database_diagnostics: Option<DatabaseDiagnosticsService>,
-    libraries: Option<LibraryService>,
-    catalog: Option<CatalogService>,
-    home: Option<HomeService>,
-    images: Option<ImageService>,
-    image_variants: Option<Arc<ImageVariantService>>,
-    image_writes: Option<ImageWriteService>,
-    image_candidates: Option<ImageCandidateService>,
-    library_covers: Option<LibraryCoverService>,
-    access: Option<MediaAccessService>,
-    metadata_candidates: Option<MetadataCandidateService>,
-    metadata_selection: Option<MetadataSelectionService>,
-    metadata_writes: Option<MetadataWriteService>,
-    downloads: Option<DownloadService>,
-    strm_playback: Option<StrmPlaybackResolver>,
-    metadata_reidentify: Option<MetadataReidentifyService>,
-    deletion: Option<MediaDeleteService>,
-    item_merge: Option<ItemMergeService>,
-    probe: Option<MediaProbeService>,
-    embedded_subtitle: Option<EmbeddedSubtitleService>,
-    thumbnails: Option<ThumbnailService>,
-    scan_jobs: Option<ScanJobService>,
-    strm_probe: Option<StrmProbeService>,
-    chapter_detection: Option<ChapterDetectionService>,
-    scheduled_tasks: Option<ScheduledTaskService>,
-    webhooks: Option<WebhookService>,
-    danmaku: Option<DanmakuService>,
-    plugins: Option<PluginService>,
-    emby_migration: Option<Arc<EmbyMigrationService>>,
-    scraper_resolver: Option<ScraperResolver>,
-    scraper: Option<ScraperProvider>,
-    collections: Option<CollectionService>,
-    global_collection_sync_worker: Option<GlobalCollectionSyncWorker>,
-    content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
-    identity_merge_worker: Option<IdentityMergeWorker>,
-    people: Option<PeopleService>,
-    local_nfo: Option<LocalNfoMetadataStore>,
-    user_avatars: Option<UserAvatarService>,
-    ip_location: Option<IpLocationService>,
     admin_events: AdminEventHub,
     user_events: UserEventHub,
-    web_playback: Option<WebPlaybackSessionService>,
     resources: ResourceMetrics,
     request_metrics: RequestMetrics,
     remote_access: RemoteAccessPolicy,
@@ -232,7 +192,202 @@ pub struct AppState {
     sse_permits: SseConnectionBudget,
 }
 
+/// The business services that only exist once the application reached the ready mode.
+///
+/// Every slot that the ready constructor always builds is a plain field, so a ready handler can
+/// use it directly. The feature-optional slots (`image_writes`, `metadata_selection`, `downloads`,
+/// `strm_playback`, `webhooks`, `content_restriction_index_worker`) stay `Option` because their
+/// absence is a degraded capability of a ready application, not an unready application.
+pub struct ReadyServices {
+    database_setup: DatabaseSetupService,
+    setup: SetupService,
+    auth: WebAuthService,
+    emby_auth: EmbyAuthService,
+    device_pairings: DevicePairingService,
+    admin_api_key: AdminApiKeyService,
+    database_diagnostics: DatabaseDiagnosticsService,
+    libraries: LibraryService,
+    catalog: CatalogService,
+    home: HomeService,
+    images: ImageService,
+    image_variants: Arc<ImageVariantService>,
+    image_writes: Option<ImageWriteService>,
+    image_candidates: ImageCandidateService,
+    library_covers: LibraryCoverService,
+    access: MediaAccessService,
+    metadata_candidates: MetadataCandidateService,
+    metadata_selection: Option<MetadataSelectionService>,
+    metadata_writes: MetadataWriteService,
+    downloads: Option<DownloadService>,
+    strm_playback: Option<StrmPlaybackResolver>,
+    metadata_reidentify: MetadataReidentifyService,
+    deletion: MediaDeleteService,
+    item_merge: ItemMergeService,
+    probe: MediaProbeService,
+    embedded_subtitle: EmbeddedSubtitleService,
+    thumbnails: ThumbnailService,
+    scan_jobs: ScanJobService,
+    strm_probe: StrmProbeService,
+    chapter_detection: ChapterDetectionService,
+    scheduled_tasks: ScheduledTaskService,
+    webhooks: Option<WebhookService>,
+    danmaku: DanmakuService,
+    plugins: PluginService,
+    emby_migration: Arc<EmbyMigrationService>,
+    scraper_resolver: ScraperResolver,
+    scraper: ScraperProvider,
+    collections: CollectionService,
+    global_collection_sync_worker: GlobalCollectionSyncWorker,
+    content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
+    identity_merge_worker: IdentityMergeWorker,
+    people: PeopleService,
+    local_nfo: LocalNfoMetadataStore,
+    user_avatars: UserAvatarService,
+    ip_location: IpLocationService,
+    web_playback: WebPlaybackSessionService,
+}
+
+/// Shared HTTP state: a single `Router` is mounted for both modes.
+///
+/// The router and the handler signatures stay unchanged between the setup and ready modes; the
+/// business services are only reachable through [`Self::ready`], so a handler that needs one asks
+/// for it with `require_service!`/`require_ready!` and answers the same bare `503` while the
+/// application is not ready. `core` is reachable through [`Deref`] so middleware and setup code
+/// keep reading `state.database`/`state.resources` unchanged.
+#[derive(Clone, Default)]
+pub struct AppState {
+    core: CoreState,
+    ready: Option<Arc<ReadyServices>>,
+}
+
+impl std::ops::Deref for AppState {
+    type Target = CoreState;
+
+    fn deref(&self) -> &CoreState {
+        &self.core
+    }
+}
+
+/// Read accessors for the business services.
+///
+/// They are the transitional seam of the `ReadyServices` split: the `require_service!` macro and
+/// the handler bodies that were not migrated yet keep asking `state.<field>`, but the slot lives
+/// in `ready` now. They answer `None` both for a not-ready state and for the feature-optional
+/// slots, which is exactly the pre-split `Option` semantics, so a handler keeps returning the same
+/// bare `503`. Handler-by-handler migration to `require_ready!` removes the remaining uses.
+macro_rules! required_service_accessor {
+    ($($field:ident -> $ty:ty),* $(,)?) => {
+        $(
+            #[doc = concat!("Reads `ReadyServices::", stringify!($field), "` when the state is ready.")]
+            #[allow(dead_code)]
+            pub(crate) fn $field(&self) -> Option<&$ty> {
+                self.ready.as_ref().map(|services| &services.$field)
+            }
+        )*
+    };
+}
+
+macro_rules! optional_service_accessor {
+    ($($field:ident -> $ty:ty),* $(,)?) => {
+        $(
+            #[doc = concat!("Reads the feature-optional `ReadyServices::", stringify!($field), "`.")]
+            #[allow(dead_code)]
+            pub(crate) fn $field(&self) -> Option<&$ty> {
+                self.ready
+                    .as_ref()
+                    .and_then(|services| services.$field.as_ref())
+            }
+        )*
+    };
+}
+
 impl AppState {
+    /// Borrows the ready services for the `require_ready!` guard.
+    #[allow(dead_code)]
+    pub(crate) fn ready_services(&self) -> Option<&Arc<ReadyServices>> {
+        self.ready.as_ref()
+    }
+
+    /// Mutable access for the startup-only builders.
+    ///
+    /// The builders run before the state is shared (before `app_with_state` and before the
+    /// shutdown clone), so the `Arc` has exactly one owner and no service instance is duplicated.
+    fn ready_services_mut(&mut self) -> Option<&mut ReadyServices> {
+        self.ready.as_mut().and_then(Arc::get_mut)
+    }
+
+    required_service_accessor! {
+        database_setup -> DatabaseSetupService,
+        setup -> SetupService,
+        auth -> WebAuthService,
+        emby_auth -> EmbyAuthService,
+        device_pairings -> DevicePairingService,
+        admin_api_key -> AdminApiKeyService,
+        database_diagnostics -> DatabaseDiagnosticsService,
+        libraries -> LibraryService,
+        catalog -> CatalogService,
+        home -> HomeService,
+        images -> ImageService,
+        image_variants -> Arc<ImageVariantService>,
+        image_candidates -> ImageCandidateService,
+        library_covers -> LibraryCoverService,
+        access -> MediaAccessService,
+        metadata_candidates -> MetadataCandidateService,
+        metadata_writes -> MetadataWriteService,
+        metadata_reidentify -> MetadataReidentifyService,
+        deletion -> MediaDeleteService,
+        item_merge -> ItemMergeService,
+        probe -> MediaProbeService,
+        embedded_subtitle -> EmbeddedSubtitleService,
+        thumbnails -> ThumbnailService,
+        scan_jobs -> ScanJobService,
+        strm_probe -> StrmProbeService,
+        chapter_detection -> ChapterDetectionService,
+        scheduled_tasks -> ScheduledTaskService,
+        danmaku -> DanmakuService,
+        plugins -> PluginService,
+        emby_migration -> Arc<EmbyMigrationService>,
+        scraper_resolver -> ScraperResolver,
+        scraper -> ScraperProvider,
+        collections -> CollectionService,
+        global_collection_sync_worker -> GlobalCollectionSyncWorker,
+        identity_merge_worker -> IdentityMergeWorker,
+        people -> PeopleService,
+        local_nfo -> LocalNfoMetadataStore,
+        user_avatars -> UserAvatarService,
+        ip_location -> IpLocationService,
+        web_playback -> WebPlaybackSessionService,
+    }
+
+    optional_service_accessor! {
+        image_writes -> ImageWriteService,
+        metadata_selection -> MetadataSelectionService,
+        downloads -> DownloadService,
+        strm_playback -> StrmPlaybackResolver,
+        webhooks -> WebhookService,
+        content_restriction_index_worker -> ContentRestrictionIndexWorker,
+    }
+
+    /// Core-state accessors used by the readiness macro; the remaining core fields are read
+    /// through `Deref` because they are plain state, not services.
+    /// Attaches the database to a state that was built through `Default`.
+    ///
+    /// This keeps the `AppState::default()` construction path (tests and helpers) working now that
+    /// the business services moved into `ReadyServices`: the database is core state, not a service.
+    #[doc(hidden)]
+    pub fn with_database(mut self, database: Database) -> Self {
+        self.core.database = Some(database);
+        self
+    }
+
+    pub(crate) fn database(&self) -> Option<&Database> {
+        self.core.database.as_ref()
+    }
+
+    pub(crate) fn config_dir(&self) -> Option<&PathBuf> {
+        self.core.config_dir.as_ref()
+    }
+
     pub async fn shutdown_background_workers(&self) {
         if let Err(error) = self.shutdown_background_workers_checked().await {
             tracing::error!(%error, "background workers could not drain before shutdown");
@@ -240,25 +395,25 @@ impl AppState {
     }
 
     pub async fn shutdown_background_workers_checked(&self) -> Result<(), String> {
-        if let Some(worker) = &self.content_restriction_index_worker {
+        if let Some(worker) = self.content_restriction_index_worker() {
             worker.shutdown().await;
         }
-        if let Some(worker) = &self.identity_merge_worker {
+        if let Some(worker) = self.identity_merge_worker() {
             worker.shutdown().await;
         }
         crate::application::probe::shutdown_probe_runtime()
             .await
             .map_err(|error| error.to_string())?;
-        if let Some(metadata_reidentify) = &self.metadata_reidentify {
+        if let Some(metadata_reidentify) = self.metadata_reidentify() {
             metadata_reidentify.shutdown().await;
         }
-        if let Some(worker) = &self.global_collection_sync_worker {
+        if let Some(worker) = self.global_collection_sync_worker() {
             worker.shutdown().await;
         }
-        if let Some(webhooks) = &self.webhooks {
+        if let Some(webhooks) = self.webhooks() {
             webhooks.shutdown().await;
         }
-        if let Some(scheduled_tasks) = &self.scheduled_tasks {
+        if let Some(scheduled_tasks) = self.scheduled_tasks() {
             scheduled_tasks.shutdown().await;
         }
         Ok(())
@@ -266,13 +421,13 @@ impl AppState {
 
     /// Overrides the concurrent SSE stream budget (tests use a small value).
     pub fn with_sse_connection_limit(mut self, limit: usize) -> Self {
-        self.sse_permits = SseConnectionBudget(Arc::new(tokio::sync::Semaphore::new(limit)));
+        self.core.sse_permits = SseConnectionBudget(Arc::new(tokio::sync::Semaphore::new(limit)));
         self
     }
 
     /// Overrides the per-peer request budget (tests use a small value).
     pub fn with_request_rate_limit(mut self, limit: u32) -> Self {
-        self.request_rate_limiter = crate::security::RequestRateLimiter::new(limit);
+        self.core.request_rate_limiter = crate::security::RequestRateLimiter::new(limit);
         self
     }
 
@@ -326,16 +481,14 @@ impl AppState {
         }
         let config_dir = config.config_dir.clone();
         let log_store = LogStore::new(&config_dir);
-        let user_avatars = Some(UserAvatarService::new(config_dir.clone()));
+        let user_avatars = UserAvatarService::new(config_dir.clone());
         let resources = ResourceMetrics::new();
-        let image_variants = Some(Arc::new(ImageVariantService::new(
+        let image_variants = Arc::new(ImageVariantService::new(
             &config.config_dir,
             crate::application::settings::ImageVariantCacheSettings::default(),
-        )));
-        if let Some(service) = image_variants.as_ref()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            let service = Arc::clone(service);
+        ));
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let service = Arc::clone(&image_variants);
             let settings_database = database.clone();
             handle.spawn(async move {
                 if let Ok(settings) =
@@ -347,22 +500,14 @@ impl AppState {
                 service.startup_scan();
             });
         }
-        let database_setup = Some(DatabaseSetupService::new(
-            config.clone(),
-            database.backend(),
-        ));
+        let database_setup = DatabaseSetupService::new(config.clone(), database.backend());
         let user_events = UserEventHub::new();
         let admin_events = AdminEventHub::new().with_user_events(user_events.clone());
-        let web_playback = Some(WebPlaybackSessionService::new(
-            database.clone(),
-            config_dir.clone(),
-        ));
+        let web_playback = WebPlaybackSessionService::new(database.clone(), config_dir.clone());
         // Load the administrator transcoding policy before the first playback session so hardware
         // capability reporting matches what FFmpeg will actually be asked to use.
-        if let Some(service) = web_playback.as_ref()
-            && let Ok(handle) = tokio::runtime::Handle::try_current()
-        {
-            let service = service.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let service = web_playback.clone();
             handle.spawn(async move {
                 // Load the policy and validate the hardware encoder before the first playback.
                 service.refresh_hardware_status().await;
@@ -381,10 +526,9 @@ impl AppState {
         )
         .ok()
         .map(|service| service.with_resource_metrics(resources.clone()));
-        let library_covers = Some(
+        let library_covers =
             LibraryCoverService::new(database.clone(), config.config_dir.join("library-covers"))
-                .with_metadata_directory(config.config_dir.join("metadata")),
-        );
+                .with_metadata_directory(config.config_dir.join("metadata"));
         let metadata_selection = image_writes.clone().map(|images| {
             MetadataSelectionService::with_config_dir(database.clone(), images, config_dir.clone())
                 .with_home(home.clone())
@@ -394,36 +538,32 @@ impl AppState {
             config_dir.clone(),
             network_proxy_url.clone(),
         );
-        let emby_migration = Some(Arc::new(EmbyMigrationService::new(
+        let emby_migration = Arc::new(EmbyMigrationService::new(
             database.clone(),
             plugins.clone(),
             config_dir.clone(),
-        )));
+        ));
         let scraper = ScraperProvider::unconfigured();
         let scraper_resolver = ScraperResolver::new(database.clone(), plugins.clone());
-        let collections = Some(
-            CollectionService::with_resolver(
-                database.clone(),
-                scraper.clone(),
-                scraper_resolver.clone(),
-            )
-            .with_config_dir(config.config_dir.clone()),
-        );
-        let metadata_reidentify = Some(
-            MetadataReidentifyService::with_resolver_and_selection(
-                database.clone(),
-                scraper.clone(),
-                scraper_resolver.clone(),
-                metadata_selection.clone(),
-            )
-            .with_admin_events(admin_events.clone())
-            .with_resource_metrics(resources.clone()),
-        );
-        let image_candidates = Some(ImageCandidateService::with_resolver(
+        let collections = CollectionService::with_resolver(
             database.clone(),
             scraper.clone(),
             scraper_resolver.clone(),
-        ));
+        )
+        .with_config_dir(config.config_dir.clone());
+        let metadata_reidentify = MetadataReidentifyService::with_resolver_and_selection(
+            database.clone(),
+            scraper.clone(),
+            scraper_resolver.clone(),
+            metadata_selection.clone(),
+        )
+        .with_admin_events(admin_events.clone())
+        .with_resource_metrics(resources.clone());
+        let image_candidates = ImageCandidateService::with_resolver(
+            database.clone(),
+            scraper.clone(),
+            scraper_resolver.clone(),
+        );
         let strm_probe = StrmProbeService::new(database.clone(), plugins.clone())
             .with_resource_metrics(resources.clone());
         let chapter_detection = ChapterDetectionService::new(database.clone(), plugins.clone());
@@ -436,23 +576,21 @@ impl AppState {
                 None
             }
         };
-        let metadata_reidentify = metadata_reidentify.map(|service| match webhooks.clone() {
-            Some(webhooks) => service.with_webhooks(webhooks),
-            None => service,
-        });
+        let metadata_reidentify = match webhooks.clone() {
+            Some(webhooks) => metadata_reidentify.with_webhooks(webhooks),
+            None => metadata_reidentify,
+        };
         let people = PeopleService::new_with_proxy(config_dir.clone(), network_proxy_url.clone())
             .with_database(database.clone());
         let local_nfo = LocalNfoMetadataStore::new(database.clone());
-        let probe = Some(
-            MediaProbeService::new(database.clone(), FfprobeRunner::default())
-                .with_resource_metrics(resources.clone())
-                .with_nfo_writer(NfoWriteService::new_with_config_dir(
-                    database.clone(),
-                    config_dir.clone(),
-                )),
-        );
-        let embedded_subtitle = Some(EmbeddedSubtitleService::new());
-        let thumbnails = Some(ThumbnailService::new(database.clone()));
+        let probe = MediaProbeService::new(database.clone(), FfprobeRunner::default())
+            .with_resource_metrics(resources.clone())
+            .with_nfo_writer(NfoWriteService::new_with_config_dir(
+                database.clone(),
+                config_dir.clone(),
+            ));
+        let embedded_subtitle = EmbeddedSubtitleService::new();
+        let thumbnails = ThumbnailService::new(database.clone());
         let identity_merge_notify = Arc::new(tokio::sync::Notify::new());
         let scan_jobs = {
             let service = ScanJobService::new(database.clone())
@@ -462,10 +600,7 @@ impl AppState {
                 .with_resource_metrics(resources.clone())
                 .with_home(home.clone())
                 .with_identity_merge_notify(identity_merge_notify.clone());
-            let service = match library_covers.clone() {
-                Some(covers) => service.with_library_covers(covers),
-                None => service,
-            };
+            let service = service.with_library_covers(library_covers.clone());
             let service = service
                 .with_strm_probe(strm_probe.clone())
                 .with_people(people.clone())
@@ -474,10 +609,7 @@ impl AppState {
                 Some(selection) => service.with_metadata_selection(selection),
                 None => service,
             };
-            let service = match metadata_reidentify.clone() {
-                Some(reidentify) => service.with_metadata_reidentify(reidentify),
-                None => service,
-            };
+            let service = service.with_metadata_reidentify(metadata_reidentify.clone());
             match webhooks.clone() {
                 Some(webhooks) => service.with_webhooks(webhooks),
                 None => service,
@@ -494,11 +626,11 @@ impl AppState {
         )
         .with_library_services(
             scan_jobs.clone(),
-            metadata_reidentify.clone(),
-            probe.clone(),
-            thumbnails.clone(),
+            Some(metadata_reidentify.clone()),
+            Some(probe.clone()),
+            Some(thumbnails.clone()),
         )
-        .with_library_covers(library_covers.clone())
+        .with_library_covers(Some(library_covers.clone()))
         .with_danmaku(danmaku.clone())
         .with_library_deletion(
             crate::application::library_deletion::LibraryDeletionService::new(
@@ -508,88 +640,25 @@ impl AppState {
                 Some(home.clone()),
             ),
         );
-        let global_collection_sync_worker =
-            Some(GlobalCollectionSyncWorker::start(database.clone()));
-        let identity_merge_worker = Some(IdentityMergeWorker::start(
+        let global_collection_sync_worker = GlobalCollectionSyncWorker::start(database.clone());
+        let identity_merge_worker = IdentityMergeWorker::start(
             database.clone(),
             Some(home.clone()),
             Some(catalog.clone()),
             admin_events.clone(),
             config_dir.clone(),
             identity_merge_notify,
-        ));
-        Self {
+        );
+        let core = CoreState {
             admin_health_probe_cache: AdminHealthProbeCache::default(),
             database: Some(database.clone()),
             config_dir: Some(config_dir.clone()),
-            database_setup,
             database_selection_required: false,
             restart_handle: None,
             server_id,
             filmly_image_compat_mode,
-            setup: Some(setup),
-            auth: Some(auth),
-            emby_auth: Some(emby_auth),
-            device_pairings: Some(DevicePairingService::new(database.clone())),
-            admin_api_key: Some(AdminApiKeyService::new(
-                config_dir.clone(),
-                database.clone(),
-            )),
-            database_diagnostics: Some(DatabaseDiagnosticsService::new(database.clone())),
-            libraries: Some(libraries),
-            catalog: Some(catalog),
-            home: Some(home),
-            images: Some(ImageService::new(
-                database.clone(),
-                access.clone(),
-                config.config_dir.clone(),
-            )),
-            image_variants,
-            image_writes,
-            image_candidates,
-            library_covers: library_covers.clone(),
-            access: Some(access),
-            metadata_candidates: Some(MetadataCandidateService::new(database.clone())),
-            metadata_selection,
-            metadata_writes: Some(MetadataWriteService::new_with_config_dir(
-                database.clone(),
-                config_dir.clone(),
-            )),
-            downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
-                .ok(),
-            // STRM targets can be internal NAS services. This resolver is
-            // deliberately outside the global proxy configuration.
-            strm_playback: StrmPlaybackResolver::new().ok(),
-            metadata_reidentify,
-            deletion: Some(match webhooks.clone() {
-                Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
-                None => MediaDeleteService::new(database.clone()),
-            }),
-            item_merge: Some(ItemMergeService::new(database.clone())),
-            probe,
-            embedded_subtitle,
-            thumbnails,
-            scan_jobs: Some(scan_jobs),
-            strm_probe: Some(strm_probe),
-            chapter_detection: Some(chapter_detection),
-            scheduled_tasks: Some(scheduled_tasks),
-            webhooks,
-            danmaku: Some(danmaku),
-            plugins: Some(plugins.clone()),
-            emby_migration,
-            scraper_resolver: Some(scraper_resolver),
-            scraper: Some(scraper),
-            collections,
-            global_collection_sync_worker,
-            content_restriction_index_worker: None,
-            identity_merge_worker,
-            people: Some(people),
-            local_nfo: Some(local_nfo),
-            user_avatars,
-            ip_location: Some(IpLocationService::new(plugins.clone())),
             admin_events,
             user_events,
-            web_playback,
             resources,
             request_metrics: {
                 // Background work reads the foreground p95 from these samples; the feedback is
@@ -605,32 +674,101 @@ impl AppState {
             device_pairing_rate_limiter: DevicePairingRateLimiter::default(),
             request_rate_limiter: crate::security::RequestRateLimiter::default(),
             sse_permits: SseConnectionBudget::default(),
+        };
+        let ready = ReadyServices {
+            database_setup,
+            setup,
+            auth,
+            emby_auth,
+            device_pairings: DevicePairingService::new(database.clone()),
+            admin_api_key: AdminApiKeyService::new(config_dir.clone(), database.clone()),
+            database_diagnostics: DatabaseDiagnosticsService::new(database.clone()),
+            libraries,
+            catalog,
+            home,
+            images: ImageService::new(database.clone(), access.clone(), config.config_dir.clone()),
+            image_variants,
+            image_writes,
+            image_candidates,
+            library_covers,
+            access,
+            metadata_candidates: MetadataCandidateService::new(database.clone()),
+            metadata_selection,
+            metadata_writes: MetadataWriteService::new_with_config_dir(
+                database.clone(),
+                config_dir.clone(),
+            ),
+            downloads: DownloadService::new_with_proxy(database.clone(), network_proxy_url.clone())
+                .ok(),
+            // STRM targets can be internal NAS services. This resolver is
+            // deliberately outside the global proxy configuration.
+            strm_playback: StrmPlaybackResolver::new().ok(),
+            metadata_reidentify,
+            deletion: match webhooks.clone() {
+                Some(webhooks) => MediaDeleteService::new(database.clone()).with_webhooks(webhooks),
+                None => MediaDeleteService::new(database.clone()),
+            },
+            item_merge: ItemMergeService::new(database.clone()),
+            probe,
+            embedded_subtitle,
+            thumbnails,
+            scan_jobs,
+            strm_probe,
+            chapter_detection,
+            scheduled_tasks,
+            webhooks,
+            danmaku,
+            plugins: plugins.clone(),
+            emby_migration,
+            scraper_resolver,
+            scraper,
+            collections,
+            global_collection_sync_worker,
+            content_restriction_index_worker: None,
+            identity_merge_worker,
+            people,
+            local_nfo,
+            user_avatars,
+            ip_location: IpLocationService::new(plugins.clone()),
+            web_playback,
+        };
+        // One `Arc<ReadyServices>` is shared by every clone of the state, so handlers, background
+        // workers, and plugins keep observing the same service instances.
+        Self {
+            core,
+            ready: Some(Arc::new(ready)),
         }
     }
 
     #[doc(hidden)]
     pub fn with_restart_handle(mut self, restart_handle: RestartHandle) -> Self {
-        self.restart_handle = Some(restart_handle);
+        self.core.restart_handle = Some(restart_handle);
         self
     }
 
     #[doc(hidden)]
     pub fn with_strm_playback_resolver(mut self, resolver: StrmPlaybackResolver) -> Self {
-        self.strm_playback = Some(resolver);
+        if let Some(ready) = self.ready_services_mut() {
+            ready.strm_playback = Some(resolver);
+        }
         self
     }
 
     #[doc(hidden)]
     pub fn with_embedded_subtitle_executable(mut self, executable: PathBuf) -> Self {
-        self.embedded_subtitle = Some(EmbeddedSubtitleService::with_executable(executable));
+        if let Some(ready) = self.ready_services_mut() {
+            ready.embedded_subtitle = EmbeddedSubtitleService::with_executable(executable);
+        }
         self
     }
 
     #[doc(hidden)]
     pub fn with_hls_executable(mut self, executable: PathBuf) -> Self {
-        self.web_playback = self
-            .web_playback
-            .map(|service| service.with_hls_executable(executable));
+        if let Some(ready) = self.ready_services_mut() {
+            // The service shares its HLS manager and start locks through `Arc`, so rebuilding it
+            // from a clone keeps every other holder on the same instance.
+            ready.web_playback = ready.web_playback.clone().with_hls_executable(executable);
+        }
         self
     }
 
@@ -638,74 +776,56 @@ impl AppState {
     where
         T: Into<ScraperProvider>,
     {
-        let Some(database) = self.database.clone() else {
+        let Some(database) = self.core.database.clone() else {
+            return self;
+        };
+        let config_dir = self.core.config_dir.clone();
+        let admin_events = self.core.admin_events.clone();
+        let resources = self.core.resources.clone();
+        let Some(ready) = self.ready_services_mut() else {
             return self;
         };
         let scraper = scraper.into();
-        self.scraper = Some(scraper.clone());
-        if let Some(resolver) = self.scraper_resolver.clone() {
-            let mut collections = CollectionService::with_resolver(
-                database.clone(),
-                scraper.clone(),
-                resolver.clone(),
-            );
-            if let Some(config_dir) = self.config_dir.clone() {
-                collections = collections.with_config_dir(config_dir);
-            }
-            self.collections = Some(collections);
-            self.metadata_reidentify = Some(
-                MetadataReidentifyService::with_resolver_and_selection(
-                    database.clone(),
-                    scraper.clone(),
-                    resolver.clone(),
-                    self.metadata_selection.clone(),
-                )
-                .with_admin_events(self.admin_events.clone())
-                .with_resource_metrics(self.resources.clone()),
-            );
-            self.image_candidates = Some(ImageCandidateService::with_resolver(
-                database, scraper, resolver,
-            ));
-        } else {
-            let mut collections = CollectionService::new(database.clone(), scraper.clone());
-            if let Some(config_dir) = self.config_dir.clone() {
-                collections = collections.with_config_dir(config_dir);
-            }
-            self.collections = Some(collections);
-            self.metadata_reidentify = Some(
-                MetadataReidentifyService::with_selection(
-                    database.clone(),
-                    scraper.clone(),
-                    self.metadata_selection.clone(),
-                )
-                .with_admin_events(self.admin_events.clone())
-                .with_resource_metrics(self.resources.clone()),
-            );
-            self.image_candidates = Some(ImageCandidateService::new(database, scraper));
+        ready.scraper = scraper.clone();
+        let resolver = ready.scraper_resolver.clone();
+        let mut collections =
+            CollectionService::with_resolver(database.clone(), scraper.clone(), resolver.clone());
+        if let Some(config_dir) = config_dir {
+            collections = collections.with_config_dir(config_dir);
         }
+        ready.collections = collections;
+        ready.metadata_reidentify = MetadataReidentifyService::with_resolver_and_selection(
+            database.clone(),
+            scraper.clone(),
+            resolver.clone(),
+            ready.metadata_selection.clone(),
+        )
+        .with_admin_events(admin_events)
+        .with_resource_metrics(resources);
+        ready.image_candidates = ImageCandidateService::with_resolver(database, scraper, resolver);
         self
     }
 
     pub async fn rebuild_people_index(&self) {
-        let Some(service) = self.people.clone() else {
+        let Some(service) = self.people() else {
             return;
         };
         service.schedule_person_index_rebuild();
     }
 
     pub async fn start_realtime_watchers(&self) {
-        let Some(database) = self.database.clone() else {
+        let Some(database) = self.core.database.clone() else {
             return;
         };
-        let Some(scan_jobs) = self.scan_jobs.clone() else {
+        let Some(scan_jobs) = self.scan_jobs().cloned() else {
             return;
         };
         let watch_service = LibraryWatchService::with_scan_jobs_and_metadata(
             database,
             scan_jobs,
-            self.metadata_reidentify.clone(),
+            self.metadata_reidentify().cloned(),
         );
-        let watch_service = match self.libraries.as_ref() {
+        let watch_service = match self.libraries() {
             Some(libraries) => {
                 watch_service.with_library_change_notifications(libraries.change_notifier())
             }
@@ -715,7 +835,8 @@ impl AppState {
     }
 
     pub async fn start_scheduled_tasks(&self) {
-        if let (Some(database), Some(avatars)) = (&self.database, &self.user_avatars) {
+        if let (Some(database), Some(avatars)) = (self.core.database.as_ref(), self.user_avatars())
+        {
             crate::application::catalog_read_model::spawn_startup_catalog_read_model(
                 database.clone(),
             );
@@ -729,25 +850,25 @@ impl AppState {
             crate::application::user_cleanup::spawn_user_cleanup_worker(
                 database.clone(),
                 avatars.clone(),
-                self.config_dir.clone(),
+                self.core.config_dir.clone(),
             );
         }
-        if let Some(plugins) = self.plugins.as_ref()
+        if let Some(plugins) = self.plugins()
             && let Err(error) = plugins.sync_media_info_scheduled_task().await
         {
             tracing::error!(%error, "failed to synchronize STRM scheduled task");
         }
-        if let Some(plugins) = self.plugins.as_ref()
+        if let Some(plugins) = self.plugins()
             && let Err(error) = plugins.sync_chapter_detection_scheduled_tasks().await
         {
             tracing::error!(%error, "failed to synchronize chapter detection scheduled tasks");
         }
-        if let Some(plugins) = self.plugins.as_ref()
+        if let Some(plugins) = self.plugins()
             && let Err(error) = plugins.sync_manifest_scheduled_tasks().await
         {
             tracing::error!(%error, "failed to synchronize manifest scheduled tasks");
         }
-        if let Some(scheduled_tasks) = self.scheduled_tasks.as_ref() {
+        if let Some(scheduled_tasks) = self.scheduled_tasks() {
             // Resume deletions that were queued before a restart before the loop starts,
             // so they do not depend on the first tick or on a scheduled plan running.
             scheduled_tasks.drain_queued_library_deletions().await;
@@ -756,22 +877,22 @@ impl AppState {
     }
 
     pub async fn start_webhook_worker(&self) {
-        if let Some(webhooks) = self.webhooks.as_ref() {
+        if let Some(webhooks) = self.webhooks() {
             webhooks.spawn_worker().await;
         }
     }
 
     pub async fn start_database_diagnostics(&self) {
-        if self.database_selection_required {
+        if self.core.database_selection_required {
             return;
         }
-        if let Some(service) = &self.database_diagnostics {
+        if let Some(service) = self.database_diagnostics() {
             service.start().await;
         }
     }
 
     pub async fn start_local_metadata_worker(&self) {
-        if let Some(scan_jobs) = self.scan_jobs.as_ref()
+        if let Some(scan_jobs) = self.scan_jobs()
             && let Err(error) = scan_jobs.start_local_metadata_outbox_worker().await
         {
             tracing::error!(%error, "failed to start the local metadata outbox worker");
@@ -779,22 +900,29 @@ impl AppState {
     }
 
     pub fn start_content_restriction_index_worker(&mut self) {
-        if self.database_selection_required || self.content_restriction_index_worker.is_some() {
+        if self.core.database_selection_required
+            || self.content_restriction_index_worker().is_some()
+        {
             return;
         }
-        if let Some(database) = &self.database {
-            self.content_restriction_index_worker =
-                Some(ContentRestrictionIndexWorker::start(database.clone()));
-        }
+        let Some(database) = self.core.database.clone() else {
+            return;
+        };
+        // Runs before the state is shared, so the `Arc` still has a single owner here.
+        let Some(ready) = self.ready_services_mut() else {
+            return;
+        };
+        ready.content_restriction_index_worker =
+            Some(ContentRestrictionIndexWorker::start(database));
     }
 
     /// Requeues scraping that the previous shutdown cancelled mid-way. The
     /// jobs run one library at a time, so this returns immediately.
     pub fn resume_interrupted_metadata_scraping(&self) {
-        if self.database_selection_required {
+        if self.core.database_selection_required {
             return;
         }
-        if let Some(metadata) = self.metadata_reidentify.clone() {
+        if let Some(metadata) = self.metadata_reidentify().cloned() {
             tokio::spawn(async move {
                 if let Err(error) = metadata.resume_interrupted_metadata_jobs().await {
                     tracing::error!(%error, "failed to requeue interrupted metadata scraping");
@@ -804,7 +932,7 @@ impl AppState {
     }
 
     pub fn require_database_selection(mut self) -> Self {
-        self.database_selection_required = true;
+        self.core.database_selection_required = true;
         self
     }
 }
@@ -1826,7 +1954,7 @@ async fn lux_get_person_image_inner(
     if let Err(response) = require_web_principal(&headers, &state).await {
         return response;
     }
-    let Some(people) = state.people.as_ref() else {
+    let Some(people) = state.people() else {
         return StatusCode::NOT_FOUND.into_response();
     };
     let image = match people
@@ -2138,10 +2266,7 @@ mod tests {
     async fn access_ip_ignores_forwarding_from_untrusted_peers()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp, database) = access_ip_test_database().await?;
-        let state = AppState {
-            database: Some(database),
-            ..AppState::default()
-        };
+        let state = AppState::default().with_database(database);
         let mut headers = HeaderMap::new();
         headers.insert("x-lux-peer-ip", HeaderValue::from_static("203.0.113.9"));
         headers.insert(
@@ -2163,10 +2288,7 @@ mod tests {
         database
             .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
             .await?;
-        let state = AppState {
-            database: Some(database),
-            ..AppState::default()
-        };
+        let state = AppState::default().with_database(database);
         let mut headers = HeaderMap::new();
         headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
         headers.append(
@@ -2204,10 +2326,7 @@ mod tests {
         database
             .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
             .await?;
-        let state = AppState {
-            database: Some(database.clone()),
-            ..AppState::default()
-        };
+        let state = AppState::default().with_database(database.clone());
         let mut headers = HeaderMap::new();
         headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
         headers.insert(
@@ -2270,13 +2389,112 @@ mod tests {
     async fn require_service_passes_an_initialized_service_through()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp, database) = access_ip_test_database().await?;
-        let state = AppState {
-            database: Some(database),
-            ..AppState::default()
-        };
+        let state = AppState::default().with_database(database);
         let response = require_database_probe(&state).await;
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    /// Builds a fully initialized state through the public `AppState::ready` path.
+    async fn ready_test_state() -> Result<(tempfile::TempDir, AppState), Box<dyn std::error::Error>>
+    {
+        let temp = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let auth = crate::auth::sessions::WebAuthService::new(database.clone())?;
+        let emby_auth = crate::auth::emby::EmbyAuthService::new(database.clone())?;
+        Ok((
+            temp,
+            AppState::ready(config, database, setup, auth, emby_auth),
+        ))
+    }
+
+    /// Characterization test for the ready-state business service slots.
+    ///
+    /// The services that the application always builds on the ready path must all be reachable
+    /// after construction, and the unreadiness signal must stay observable (`None`) for a state
+    /// built through `Default`, which is what keeps the bare `503` behaviour.
+    #[tokio::test]
+    async fn ready_state_exposes_every_business_service_slot()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, state) = ready_test_state().await?;
+        let required = [
+            ("database_setup", state.database_setup().is_some()),
+            ("setup", state.setup().is_some()),
+            ("auth", state.auth().is_some()),
+            ("emby_auth", state.emby_auth().is_some()),
+            ("device_pairings", state.device_pairings().is_some()),
+            ("admin_api_key", state.admin_api_key().is_some()),
+            (
+                "database_diagnostics",
+                state.database_diagnostics().is_some(),
+            ),
+            ("libraries", state.libraries().is_some()),
+            ("catalog", state.catalog().is_some()),
+            ("home", state.home().is_some()),
+            ("images", state.images().is_some()),
+            ("image_variants", state.image_variants().is_some()),
+            ("image_candidates", state.image_candidates().is_some()),
+            ("library_covers", state.library_covers().is_some()),
+            ("access", state.access().is_some()),
+            ("metadata_candidates", state.metadata_candidates().is_some()),
+            ("metadata_writes", state.metadata_writes().is_some()),
+            ("metadata_reidentify", state.metadata_reidentify().is_some()),
+            ("deletion", state.deletion().is_some()),
+            ("item_merge", state.item_merge().is_some()),
+            ("probe", state.probe().is_some()),
+            ("embedded_subtitle", state.embedded_subtitle().is_some()),
+            ("thumbnails", state.thumbnails().is_some()),
+            ("scan_jobs", state.scan_jobs().is_some()),
+            ("strm_probe", state.strm_probe().is_some()),
+            ("chapter_detection", state.chapter_detection().is_some()),
+            ("scheduled_tasks", state.scheduled_tasks().is_some()),
+            ("danmaku", state.danmaku().is_some()),
+            ("plugins", state.plugins().is_some()),
+            ("emby_migration", state.emby_migration().is_some()),
+            ("scraper_resolver", state.scraper_resolver().is_some()),
+            ("scraper", state.scraper().is_some()),
+            ("collections", state.collections().is_some()),
+            (
+                "global_collection_sync_worker",
+                state.global_collection_sync_worker().is_some(),
+            ),
+            (
+                "identity_merge_worker",
+                state.identity_merge_worker().is_some(),
+            ),
+            ("people", state.people().is_some()),
+            ("local_nfo", state.local_nfo().is_some()),
+            ("user_avatars", state.user_avatars().is_some()),
+            ("ip_location", state.ip_location().is_some()),
+            ("web_playback", state.web_playback().is_some()),
+        ];
+        for (field, present) in required {
+            assert!(present, "ready state is missing the {field} service");
+        }
+        // Feature-optional slots keep their `Option` shape on the ready path: their absence is a
+        // degraded capability, not unreadiness, so only their reachability is asserted here.
+        assert!(state.image_writes().is_some(), "image_writes");
+        assert!(state.metadata_selection().is_some(), "metadata_selection");
+        assert!(state.downloads().is_some(), "downloads");
+        assert!(state.strm_playback().is_some(), "strm_playback");
+        assert!(state.webhooks().is_some(), "webhooks");
+        // The restriction index worker is started after construction, never by the constructor.
+        assert!(
+            state.content_restriction_index_worker().is_none(),
+            "content_restriction_index_worker"
+        );
+        state.shutdown_background_workers().await;
+
+        let default_state = AppState::default();
+        assert!(default_state.catalog().is_none());
+        assert!(default_state.people().is_none());
+        assert!(default_state.webhooks().is_none());
         Ok(())
     }
 

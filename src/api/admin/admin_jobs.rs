@@ -4,9 +4,9 @@ fn scan_worker_services(
     state: &AppState,
 ) -> crate::application::admin_scan_jobs::ScanWorkerServices {
     crate::application::admin_scan_jobs::ScanWorkerServices {
-        probe: state.probe.clone(),
-        metadata: state.metadata_reidentify.clone(),
-        thumbnails: state.thumbnails.clone(),
+        probe: state.probe().cloned(),
+        metadata: state.metadata_reidentify().cloned(),
+        thumbnails: state.thumbnails().cloned(),
     }
 }
 
@@ -243,7 +243,7 @@ pub(crate) async fn spawn_library_scan(
     state: &AppState,
     library_id: crate::domain::ids::LibraryId,
 ) -> Result<Option<ScanJob>, ScanJobError> {
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
+    let Some(scan_jobs) = state.scan_jobs() else {
         return Ok(None);
     };
     crate::application::admin_scan_jobs::start_library_scan(
@@ -468,8 +468,8 @@ pub(crate) async fn admin_start_chapter_detection(
         force_refresh: request.force_refresh,
     };
     let job = match crate::application::admin_job_workers::start_admin_chapter_detection_job(
-        state.chapter_detection.as_ref(),
-        state.plugins.as_ref(),
+        state.chapter_detection(),
+        state.plugins(),
         library_id,
         request.plugin_id.as_deref(),
         overrides,

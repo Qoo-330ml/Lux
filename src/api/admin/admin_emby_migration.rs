@@ -51,7 +51,7 @@ pub(crate) async fn admin_test_emby_migration(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.emby_migration.clone() else {
+    let Some(service) = state.emby_migration().cloned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match service.test_connection().await {
@@ -108,7 +108,7 @@ pub(crate) async fn admin_create_emby_migration(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.emby_migration.clone() else {
+    let Some(service) = state.emby_migration().cloned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match service.create_job(&actor.id.to_string(), request).await {
@@ -212,7 +212,7 @@ pub(crate) async fn admin_retry_emby_migration(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.emby_migration.clone() else {
+    let Some(service) = state.emby_migration().cloned() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     match service.resume_job(&job_id).await {
