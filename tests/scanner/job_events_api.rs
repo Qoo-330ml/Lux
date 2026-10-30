@@ -96,10 +96,34 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
         .send()
         .await?;
     assert_eq!(scan.status(), reqwest::StatusCode::ACCEPTED);
-    let job_id = scan.json::<Value>().await?["job"]["id"]
+    let scan_body = scan.json::<Value>().await?;
+    let job_id = scan_body["job"]["id"]
         .as_str()
         .ok_or("missing job ID")?
         .to_owned();
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let scan_started = audit["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["eventType"] == "SCAN_STARTED")
+        })
+        .ok_or("missing SCAN_STARTED")?;
+    assert_eq!(
+        scan_started["metadata"]["libraryId"],
+        json!(library.id.to_string())
+    );
+    assert_eq!(
+        scan_started["metadata"]["jobType"],
+        scan_body["job"]["jobType"]
+    );
     log_store
         .append_scan_job_event(
             "api-redaction-event",
