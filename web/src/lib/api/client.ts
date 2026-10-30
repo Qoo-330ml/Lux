@@ -392,8 +392,11 @@ export class LuxApiClient {
     return body as T;
   }
 
-  setupStatus() {
-    return this.request<SetupStatus>("/api/v1/setup/status");
+  setupStatus(options: { signal?: AbortSignal } = {}) {
+    // The restart guide probes this endpoint while the process is down and needs
+    // a short per-probe timeout, so the signal is forwarded. Every other caller
+    // keeps calling setupStatus() with no argument.
+    return this.request<SetupStatus>("/api/v1/setup/status", { signal: options.signal });
   }
 
   setupDatabaseStatus() {

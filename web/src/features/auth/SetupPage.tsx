@@ -16,6 +16,9 @@ import { LuxButton } from "../../components/ui";
 const RESTART_POLL_INTERVAL_MS = 1000;
 const RESTART_PROBE_DEADLINE_MS = 10_000;
 const RESTART_RECOVERY_DEADLINE_MS = 60_000;
+// setup/status has no request timeout of its own; a hung proxy connection would
+// keep one probe in flight forever, so each probe aborts on its own.
+const RESTART_PROBE_TIMEOUT_MS = 3000;
 
 export function SetupPage() {
   const [restartRequested, setRestartRequested] = useState(false);
@@ -72,13 +75,21 @@ function SetupRestartGuide() {
     let cancelled = false;
     let sawDisconnect = false;
     let overdueShown = false;
-    let elapsed = 0;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    const startedAt = Date.now();
+    let pollTimer: ReturnType<typeof setTimeout> | undefined;
+    let fallbackTimer: ReturnType<typeof setTimeout> | undefined;
+    let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+
+    const clearTimers = () => {
+      if (pollTimer) clearTimeout(pollTimer);
+      if (fallbackTimer) clearTimeout(fallbackTimer);
+      if (recoveryTimer) clearTimeout(recoveryTimer);
+    };
 
     const finish = () => {
       if (cancelled) return;
       cancelled = true;
-      if (timer) clearTimeout(timer);
+      clearTimers();
       // Setup is already a committed fact on the server, so flipping the cached
       // status lets App.tsx leave the setup route; the stale session probe is
       // dropped exactly like the non-restarting path does.
@@ -97,17 +108,25 @@ function SetupRestartGuide() {
       setOverdue(true);
     };
 
+    // Every deadline is measured on the wall clock, never by counting settled
+    // probes: a hung fetch would otherwise stop the clock and pin the page.
+    const waitedMs = () => Date.now() - startedAt;
+
     const probe = async () => {
       if (cancelled) return;
-      elapsed += RESTART_POLL_INTERVAL_MS;
+      const controller = new AbortController();
+      const abortTimer = setTimeout(() => controller.abort(), RESTART_PROBE_TIMEOUT_MS);
       let up = false;
       try {
-        await api.setupStatus();
+        await api.setupStatus({ signal: controller.signal });
         up = true;
       } catch {
-        // A network error, or a 502/504 from the reverse proxy, both mean the
-        // server is unreachable right now — that is the disconnect we wait for.
+        // A network error, a 502/504 from the reverse proxy, or our own abort of
+        // a hung connection all mean the server is unreachable right now — that
+        // is the disconnect we wait for.
         up = false;
+      } finally {
+        clearTimeout(abortTimer);
       }
       if (cancelled) return;
       if (up) {
@@ -117,21 +136,22 @@ function SetupRestartGuide() {
         }
       } else {
         sawDisconnect = true;
+        if (waitedMs() >= RESTART_RECOVERY_DEADLINE_MS) markOverdue();
       }
-      if (!sawDisconnect && elapsed >= RESTART_PROBE_DEADLINE_MS) {
-        finish();
-        return;
-      }
-      if (sawDisconnect && elapsed >= RESTART_RECOVERY_DEADLINE_MS) {
-        markOverdue();
-      }
-      timer = setTimeout(() => { void probe(); }, RESTART_POLL_INTERVAL_MS);
+      pollTimer = setTimeout(() => { void probe(); }, RESTART_POLL_INTERVAL_MS);
     };
 
-    timer = setTimeout(() => { void probe(); }, RESTART_POLL_INTERVAL_MS);
+    pollTimer = setTimeout(() => { void probe(); }, RESTART_POLL_INTERVAL_MS);
+    // Independent of the probe chain so they still fire while a probe is stuck.
+    fallbackTimer = setTimeout(() => {
+      if (!sawDisconnect) finish();
+    }, RESTART_PROBE_DEADLINE_MS);
+    recoveryTimer = setTimeout(() => {
+      if (sawDisconnect) markOverdue();
+    }, RESTART_RECOVERY_DEADLINE_MS);
     return () => {
       cancelled = true;
-      if (timer) clearTimeout(timer);
+      clearTimers();
     };
   }, [navigate, queryClient]);
 

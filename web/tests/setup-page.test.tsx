@@ -292,6 +292,46 @@ describe("SetupPage setup-complete restart", () => {
     expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
     expect(container.textContent).toContain("登录页占位");
   });
+
+  it("runs the ten second fallback on the wall clock when a probe hangs", async () => {
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+    const status = vi.spyOn(api, "setupStatus").mockImplementation(() => new Promise(() => {}));
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    // The probe never settles (a hung reverse proxy), so counting finished
+    // probes would leave the deadline at zero forever.
+    await advance(5000);
+    expect(status).toHaveBeenCalled();
+    expect(status.mock.calls[0]?.[0]?.signal?.aborted).toBe(true);
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+
+    await advance(5000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
+    expect(container.textContent).toContain("登录页占位");
+  });
+
+  it("shows the reload hint on the wall clock when the probes hang after the disconnect", async () => {
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+    vi.spyOn(api, "setupStatus")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockImplementation(() => new Promise(() => {}));
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    await advance(1000);
+    expect(container.textContent).toContain("正在重启 Lux");
+
+    await advance(58_000);
+    expect(container.textContent).toContain("正在重启 Lux");
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+
+    await advance(1000);
+    expect(container.textContent).toContain("Lux 重启耗时超出预期");
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+  });
 });
 
 describe("legacy setup form", () => {
