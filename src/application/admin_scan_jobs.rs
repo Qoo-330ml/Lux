@@ -251,6 +251,8 @@ async fn first_scan_root_state(
         .await;
         match probe {
             Some(Ok(_)) => {
+                // One usable root is enough to queue the scan, and every further probe could cost
+                // another full timeout on a lost mount.
                 any_available = true;
                 if !root.is_available
                     && let Err(error) = database
@@ -264,6 +266,7 @@ async fn first_scan_root_state(
                         "could not refresh the availability of a library root"
                     );
                 }
+                break;
             }
             Some(Err(_)) => {}
             None => {
