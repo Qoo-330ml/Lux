@@ -1,0 +1,904 @@
+# 拆分 SetupState / ReadyAppState 与双 Router（方案 B 第 ③ 步设计）
+
+日期：2026-11-05。状态：**设计待确认（本阶段只写文档，未改任何 `src/**`、`tests/**`、`web/**`）**。
+范围：`src/api/**` 的路由树、状态类型与 handler 签名，以及 `src/main.rs` 的模式选择。
+前置：方案 A 的步骤 1、2 已合并（`docs/APP-STATE-NEXT.md` §6）；方案 B 的第 ② 步（setup 完成后重启）
+在 `tspace/setup-restart-backend` 分支上（设计见 `docs/SETUP-RESTART-DESIGN.md`）。
+
+本文回答 `docs/APP-STATE-NEXT.md` 方案 B 步骤 3–5 的全部落地问题：泛型扩散、330 个 handler 的分批迁移、
+setup 模式的路由集、`main` 的模式判定、后台 worker 的 `Arc` 语义、删守卫范围、回滚边界、风险与测试策略。
+**不含实现**；阶段 2 由项目所有者确认后放行。
+
+## 0. 一句话结论
+
+| 问题 | 结论 | 详见 |
+| --- | --- | --- |
+| 1 泛型扩散 | **两棵独立路由树**，handler 与路由构造函数一律不加类型参数。只有两个受控泛型边界：`core_routes<S: FromRef<CoreState>>()` 与 `setup_routes<S: FromRef<SetupState>>()`（各 ≤8 条路由，因为同一组 setup handler 要在两棵树里各挂一次），加一个迁移期专用、约 15 行的 `StateView` trait（只服务 25 个跨文件 helper，最后一批删除）。20 层中间件全部"无状态或只读 `CoreState`"，抽成 `apply_common_layers(Router)` 两棵树各调用一次，**不重复写**。 | §2 |
+| 2 handler 迁移 | 7 批，先小后大；过渡期用 **`impl FromRef<ReadyAppState> for AppState`** 让未迁移 handler 继续工作，因此每批只改自己文件里的 handler + 本地 helper，`cargo build`/集成测试在每批都绿，可独立回滚。首批一次性把 24 个 `api_routes()` 的返回类型从 `Router<AppState>` 改成 `Router<ReadyAppState>`（纯类型改动，无行为变化），此后每批都是文件内改动。 | §3 |
+| 3 setup 模式路由 | 只挂 4 组：core 探针（`/health/live`、`/health/ready`、`/api/v1/version`）、setup 路由组（`/api/v1/setup/*` 6 条）、登录前最小端点（`/api/v1/auth/me`，固定 401）、静态资源 + SPA。Emby 只保留 3 条公共发现路由（`/System/Ping`、`/System/Info/Public`、`/Users/Public`），其余 Emby 与全部 Lux 业务路由**不注册**：Lux 命名空间由现有中间件改写成 JSON 404，Emby 命名空间是裸 404，`/items/*` 这类不在命名空间表里的路径回落 SPA。与现状的差异逐条列出。 | §4 |
+| 4 `main` 选模式 | 谓词是 `requires_database_selection \|\| !SetupService::status()?`（`status()` = `users.has_users()`，一条查询）。查询失败 **fail-closed 选 Ready**：setup 模式能创建首个管理员、改写数据库配置，是敏感方向；选了 Ready 而数据库真的坏，只是业务接口 503 + 进程按今天的路径退出，不会给出提权入口。`tests/**` 的 3 处 `AppState::default()`、8 处 `app()`、163 处 `AppState::ready(..)` 全部不改，靠 `AppState` 兼容门面 + `app_with_state` 分派保持语义。 | §5 |
+| 5 后台 worker | 不变。worker 由 `AppState::start_*` 用**服务克隆**（`self.people()`、`self.scan_jobs().cloned()`）启动，从不持有 `AppState`；拆分后 `ReadyAppState`/`SetupState` 都只是同一份 `Arc<ReadyServices>` 的视图（`Arc::ptr_eq`），`Arc::make_mut` 仍只在构造期使用。 | §6 |
+| 6 删守卫 | `require_service!` 301 处调用点 + 108 处 `state.<field>() else {}`：**删 388 处**（required 服务、`database`、setup 服务，ready 模式下不可达），**保留 19 处**（6 个可选服务的降级分支，响应体逐字不变）。带自定义中文消息的结构化 503（"人物索引服务尚未就绪"等）也全删，因为 `ready` 构造器一次建出全部 required 服务，分支不可达（§7.2）。 | §7 |
+| 7 回滚边界 | 11 个提交：C0 文档、C1 骨架、C2–C9 八个批次、C10 收尾（含 `main` 选树）、C11 可选清理。C1–C9 每个都能单独 `git revert` 并保持编译；**只有 C10 必须整体回滚**（它同时删兼容访问器、`FromRef` shim 与 `StateView`）。 | §8 |
+| 8 风险 | 最大风险是"冻结测试 `tests/**` 钉住的 not-ready 契约"与"未就绪不注册业务路由"直接冲突；本节给出 6 条必须保留的兼容响应、被否决的方案与被否决原因。**有 5 个需要所有者确认的决策点（D1–D5）**。 | §9 |
+| 9 测试 | 只新增 **1 个 `src` 单元测试**（`tower::ServiceExt::oneshot` 打 `setup_router`，断言业务路径 404、探针 200），因此 `tests/**` 一行不加；"ready 模式行为不变"等价于"现有 19 个集成测试 target 不改即通过"，逐组列出命令。 | §10 |
+
+## 1. 现状基线（代码证据）
+
+测量方法见附录 B，数字都可以用同一组命令复现（基线 `test` = `c4861069`）。
+
+| 事实 | 证据 |
+| --- | --- |
+| 状态已分为 `CoreState`（16 个字段）与 `ReadyServices`（46 个字段，40 个非 `Option` + 6 个可选槽） | `src/api/legacy.rs:175`（`CoreState`）、`src/api/legacy.rs:202`（`ReadyServices`） |
+| `AppState` 仍是"一个 `Router` + 一个状态"：`core: CoreState` + `ready: Option<Arc<ReadyServices>>` | `src/api/legacy.rs:259`（结构体）、`src/api/legacy.rs:307`（`ready_services`）、`src/api/legacy.rs:317`（`ready_services_mut`，`Arc::make_mut`） |
+| 46 个同名读访问器仍是 `Option<&Service>`，`require_service!` 因此零文本改动 | `src/api/legacy.rs:321`（`required_service_accessor!`）、`src/api/legacy.rs:364`（`optional_service_accessor!`） |
+| 路由集中在一处，中间件 20 层挂在同一个 `Router` 上 | `src/api/routes.rs:123`（`app_with_state`）、`src/api/routes.rs:133-311` |
+| 路由表分 5 个入口：`users`(32)、`admin`(20 个文件)、`lux_api`(45)、`emby`(73)、`logo.svg` | `src/api/users.rs:3122`、`src/api/admin.rs:76`、`src/api/lux_api.rs:3`、`src/api/emby.rs:47`、`src/api/routes.rs:134` |
+| Emby 树挂两次（裸路径 + `/emby` 嵌套），外面再套一层大小写归一化 | `src/api/routes.rs:138-139`、`src/api/routes.rs:311`、`src/api/routes.rs:359` |
+| 带 `State<AppState>` 的 handler/extractor 共 **359 处**，分布在 **27 个文件** | 附录 B 命令 1 |
+| 跨文件共享的鉴权 helper 都取 `&AppState`：`require_admin`、`require_web_user/principal/csrf`、`require_emby_user*`、`request_client_ip` 等 | `src/api/admin/admin_common.rs:3`、`src/api/users.rs:2789`、`src/api/users.rs:2834`、`src/api/emby_handlers.rs:2616`、`src/api/legacy.rs:1420` |
+| 取 `&AppState` 的 helper 共 **111 个**：**86 个只被本文件调用**（随所在文件一起迁移），**25 个跨文件**；其中 `request_access_ip`/`request_client_ip`/`current_emby_server_name` 只读 `database`，可直接改成取 `&CoreState` 而与状态拆分解耦 | 附录 B 命令 2、`src/api/legacy.rs:1441`、`src/api/emby_handlers.rs:387` |
+| `main` 不管 setup 是否完成都构建完整 `AppState`，并无条件挂全部路由 | `src/main.rs:172`（`build_app_state`）、`src/main.rs:187`（`AppState::ready_with_proxy`）、`src/main.rs:251`（`app_with_state`） |
+| "setup 是否完成"的唯一权威信号是 `users.has_users()` | `src/application/setup.rs:17`（`status`）、`src/application/setup.rs:26`（`complete`） |
+| `requires_database_selection` 只影响 2 个端点与 3 处 worker 启动，不是路由开关 | `src/main.rs:98`、`src/api/users.rs:456`、`src/api/users.rs:616`、`src/api/legacy.rs:918/935/954` |
+| 中间件层只读 `CoreState`（限流器、`resources`、`request_metrics`），没有任何一层需要业务服务 | `src/api/routes.rs:153`（`limit_request_rate`）、`src/api/routes.rs:233`（home 延迟）、`src/api/routes.rs:290`（请求指标） |
+| 冻结测试用 `app()` / `AppState::default()` 断言"未就绪时业务路由返回 503" | `tests/api_web/api_error_contract.rs:12,19,32,43`、`tests/api_web/health.rs:11`、`tests/api_web/ready_version.rs:14`、`tests/plugins/danmaku_api.rs:204`、`tests/api_web/web_static.rs:9,116,125` |
+
+## 2. 问题 1：泛型扩散如何控制
+
+结论：**两棵独立路由树，handler 一律绑定具体状态类型**；泛型只出现在 3 个受控位置（2 个路由构造函数 +
+1 个迁移期 trait）；20 层中间件抽成一个函数，两棵树各调用一次。
+
+### 2.1 目标类型形态
+
+```rust
+// 迁移期保留，终局也保留：它是 tests/** 唯一允许的构造入口（见 §5.4）
+#[derive(Clone, Default)]
+pub struct AppState {
+    core: CoreState,
+    database: Option<Database>,
+    services: Option<Arc<ReadyServices>>,
+}
+
+/// Router<ReadyAppState> 的状态：46 个服务是非 Option 字段。
+#[derive(Clone)]
+pub struct ReadyAppState {
+    core: CoreState,
+    database: Database,
+    services: Arc<ReadyServices>,
+}
+
+impl std::ops::Deref for ReadyAppState {          // core 字段读取零改动（110 处）
+    type Target = CoreState;
+    fn deref(&self) -> &CoreState { &self.core }
+}
+
+impl ReadyAppState {
+    pub(crate) fn database(&self) -> &Database { &self.database }
+    // 40 个 required 服务：与步骤 1 的访问器**同名**，但返回 &Service 而不是 Option<&Service>
+    pub(crate) fn catalog(&self) -> &CatalogService { &self.services.catalog }
+    // 6 个可选服务：保持 Option<&Service>，降级分支的响应体因此逐字不变（§7）
+    pub(crate) fn webhooks(&self) -> Option<&WebhookService> { self.services.webhooks.as_ref() }
+}
+
+/// Router<SetupState> 的状态：只暴露 setup 需要的 4 个服务 + database + core。
+/// 内部仍持有同一份 Arc<ReadyServices>（见 §2.4 的"为什么 setup 模式照样构建全部服务"），
+/// 但**不实现 Deref 到 ReadyAppState**，也不暴露其余 42 个访问器，因此业务 handler
+/// （State<ReadyAppState>）在类型层面挂不到这棵树上。
+#[derive(Clone)]
+pub struct SetupState(ReadyAppState);
+impl std::ops::Deref for SetupState { type Target = CoreState; /* 同 ReadyAppState */ }
+impl SetupState {
+    pub(crate) fn setup(&self) -> &SetupService { &self.0.services.setup }
+    pub(crate) fn database_setup(&self) -> &DatabaseSetupService { &self.0.services.database_setup }
+    pub(crate) fn libraries(&self) -> &LibraryService { &self.0.services.libraries }
+    pub(crate) fn scan_jobs(&self) -> &ScanJobService { &self.0.services.scan_jobs }
+    // probe / metadata_reidentify / thumbnails 由 scan_worker_services() 需要，见 §4.3
+}
+```
+
+要点：
+
+- 迁移一批 handler 只需要改三样：`State<AppState>` → `State<ReadyAppState>`、删守卫、
+  文件内 helper 的 `&AppState` → `&ReadyAppState`。因为步骤 1 已经把字段读取统一成
+  `state.<field>()` 调用形态（`src/api/legacy.rs:321`、`:364`），**同名方法返回 `&Service` 让
+  handler 主体几乎不用改**：`require_service!(state.catalog)` 只需变成 `let catalog = state.catalog();`。
+- 全仓 `state.<field>()` 调用点 321 处，其中 `require_service!` 301 处、`state.X() else {` 108 处；
+  其余约 40 处是 `is_some()/as_ref()/map()` 形态（`state.database.as_ref()` 占多数，属 core），
+  在对应批次随守卫一起改写（§7 有分类清单）。
+- `database` 的歧义必须处理：`CoreState.database` 是 `Option<Database>` **字段**，而 `ReadyAppState::database()`
+  是返回 `&Database` 的**方法**。若保留字段读取，ready handler 里 `state.database` 与 `state.database()`
+  语义不同，是实打实的坑。**建议在同一提交里把 `CoreState` 的字段改名为 `database_slot` 并提供
+  `CoreState::database(&self) -> Option<&Database>`**，让"读数据库"永远是一个方法调用；
+  涉及 36 处文本（附录 B 命令 5），机械且可编译校验。
+
+### 2.2 为什么不用 trait 抽象整个状态
+
+| 候选 | 结论 | 原因 |
+| --- | --- | --- |
+| `trait HttpState { fn catalog(&self) -> Option<&CatalogService>; }` + `State<impl HttpState>` | **否决** | handler 仍然拿到 `Option`，等于退回方案 A，达不到"ready 模式字段非 Option"。 |
+| 一个 `trait` 提供 `fn catalog(&self) -> &CatalogService`，两棵树都实现 | **否决** | axum 的状态是 `Router<S>` 的类型参数，`State<T>` 提取靠 `S: FromRef<T>`；两个不同树共用一个 handler 必须让 handler 泛型化（330 个 handler + 24 个 `api_routes()` 全部变成泛型函数），扩散面正好是我们要消除的。 |
+| 双 Router + 3 个受控泛型点 | **采纳** | 见 §2.3。 |
+
+### 2.3 三个受控泛型点
+
+1. `fn core_routes<S>() -> Router<S> where S: Clone + Send + Sync + 'static, S: FromRef<CoreState>`：
+   `/health/live`、`/health/ready`、`/api/v1/version` 三条（`src/api/users.rs:3124-3126` 现有注册要搬到这里）。
+   两棵树都要挂。
+2. `fn setup_routes<S>() -> Router<S> where S: Clone + Send + Sync + 'static, S: FromRef<SetupState>`：
+   `/api/v1/setup/*` 6 条（`src/api/users.rs:3135-3149`）。**两棵树都要挂**，因为
+   (a) 前端每次启动都先调 `/api/v1/setup/status`（`web/src/app/App.tsx:65`、`web/src/lib/api/client.ts:395-399`），
+   (b) `tests/storage/database_setup_api.rs:31` 在 **ready 树**里驱动 `/setup/database/*` 与 `/setup/complete`，
+   并断言"setup 已完成后再调这些端点是 409"。
+   这要求 `impl FromRef<ReadyAppState> for SetupState`（克隆 4 个服务句柄 + core，等价于今天每请求克隆整状态）。
+3. 迁移期 `StateView`（§3.3），最后一批删除。
+
+两个 `FromRef` 实现 + 一个 `Deref`（`ReadyAppState → CoreState`、`SetupState → CoreState`）就是全部
+"状态之间"的黏合剂：
+
+```rust
+impl FromRef<SetupState> for CoreState
+impl FromRef<ReadyAppState> for CoreState
+impl FromRef<ReadyAppState> for SetupState
+impl FromRef<ReadyAppState> for AppState   // 迁移期专用，§3.1
+```
+
+### 2.4 中间件：一份 layer 栈，两棵树共用
+
+代码证据：`app_with_state` 的 20 层 `.layer()`（`src/api/routes.rs:147-310`）中，**没有任何一层需要业务服务**：
+
+| layer | 依赖 | 证据 |
+| --- | --- | --- |
+| `json_response_etag` | 无 | `src/api/routes.rs:20` |
+| `CompressionLayer` + `CompressJsonResponses` | 无 | `src/api/routes.rs:109`、`:149` |
+| `limit_request_rate` | `CoreState.request_rate_limiter` | `src/api/routes.rs:153`、`:554` |
+| catalog/home 信号量 | `app_with_state` 里新建的 `Arc<Semaphore>` | `src/api/routes.rs:129-131`、`:157` |
+| `attach_peer_address` | 无 | `src/api/legacy.rs:1064` |
+| `normalize_lux_api_key_query` | 无 | `src/api/admin/admin_common.rs:205` |
+| 3 个 Emby trace layer + `reject_playback_token_outside_allow_list` + `reject_unmatched_emby_video_path` + `reject_unmatched_api_path` | 无（纯路径判断） | `src/api/legacy.rs:1131-1184`、`:1305`、`:1324`、`:1356` |
+| `normalize_empty_api_service_unavailable` | 无 | `src/api/legacy.rs:1030` |
+| home 延迟记录 | `CoreState.resources` | `src/api/routes.rs:233` |
+| `strip_client_request_id` + `SetRequestId` + `TraceLayer` | 无 | `src/api/routes.rs:251-287` |
+| `security_response_headers`、`web_asset_cache_policy` | 无 | `src/api/routes.rs:580`、`:611` |
+| 请求指标 | `CoreState.request_metrics` | `src/api/routes.rs:290` |
+
+因此把这一整段原样抽成
+
+```rust
+fn apply_common_layers(router: Router, core: &CoreState, slots: RequestSlots) -> Router
+```
+
+两棵树各调用一次即可，**不重复写层、也不会漏层**。`Router::layer` 保持调用顺序就等于保持今天的包裹顺序
+（最后一个 `.layer()` 最外层），重构时把 20 次调用按出现顺序搬进函数体，不改顺序，语义逐字不变。
+
+### 2.5 `app_with_state` 重构草图
+
+```rust
+pub(super) fn app_with_state(state: AppState) -> Router {
+    match state.into_mode() {
+        AppMode::Ready(ready) => ready_router(ready),
+        AppMode::NotReady(core) => not_ready_compat_router(core),   // 只服务冻结测试，见 §5.4/§9.2
+    }
+}
+
+fn ready_router(state: ReadyAppState) -> Router {
+    let core = state.core().clone();
+    let slots = RequestSlots::default();
+    let (emby_routes, emby_path_templates) = emby::api_routes();   // 返回 Router<ReadyAppState>
+    let router = Router::new()
+        .route("/logo.svg", get(web_logo))
+        .merge(core_routes::<ReadyAppState>())
+        .merge(setup_routes::<ReadyAppState>())
+        .merge(users::api_routes())
+        .merge(admin::api_routes())
+        .merge(lux_api::api_routes())
+        .merge(emby_routes.clone())
+        .nest("/emby", emby_routes)
+        .fallback_service(spa_service())
+        .with_state(state);                                        // -> Router<()>
+    let router = apply_common_layers(router, &core, slots);
+    case_insensitive_emby_router(router, emby_path_templates)       // 今天的最外层，保持最后一个
+}
+
+pub(super) fn setup_router(state: SetupState) -> Router {
+    let core = state.core().clone();
+    let slots = RequestSlots::default();
+    let router = Router::new()
+        .route("/logo.svg", get(web_logo))
+        .merge(core_routes::<SetupState>())
+        .merge(setup_routes::<SetupState>())
+        .merge(setup_pre_login_routes::<SetupState>())              // /api/v1/auth/me -> 401
+        .merge(setup_emby_discovery_routes::<SetupState>())         // 3 条公共发现（§4.2 #11-13）
+        .fallback_service(spa_service())
+        .with_state(state);
+    let router = apply_common_layers(router, &core, slots);
+    case_insensitive_emby_router(
+        router,
+        vec!["/System/Ping".to_owned(), "/System/Info/Public".to_owned()],
+    )
+}
+```
+
+三个不可省的细节：
+
+1. `emby_routes` 今天被 `merge` 一次 + `nest("/emby")` 一次（`src/api/routes.rs:138-139`），且
+   `Router::nest` 会消耗 router，所以必须 `clone()` 后各用一次——与今天完全一致。
+2. `case_insensitive_emby_router`（`src/api/routes.rs:359`）用 `fallback_service` 包住整棵树，
+   必须在所有 layer 之后应用；它接受 `Router`（`Router<()>`），因此两棵树都能复用，只需换路径模板表。
+3. `SPA fallback` 必须两棵树都有：setup 页面本身是 SPA 资源（`web/src/app/App.tsx:89` 依据
+   `setup.data.initialized` 渲染 `SetupPage`），没有静态资源就没有 setup 界面。
+
+## 3. 问题 2：330 个 handler 的迁移策略
+
+可分批、可独立回滚，且每批都编译通过。实测 handler/extractor 共 **359 处**（27 个文件），
+`require_service!` 调用点 **301 处**，`state.<field>() else {}` 守卫 **108 处**（附录 B 命令 1–3）。
+
+### 3.1 过渡期"两种 State 并存"：只保留一个方向的转换
+
+```rust
+/// 迁移期专用：未迁移的 handler 仍取 State<AppState>，在 ready 树上由它降级得到。
+impl FromRef<ReadyAppState> for AppState {
+    fn from_ref(state: &ReadyAppState) -> AppState {
+        AppState {
+            core: state.core.clone(),
+            database: Some(state.database.clone()),
+            services: Some(Arc::clone(&state.services)),   // 同一份 Arc，服务实例不变
+        }
+    }
+}
+```
+
+| 方向 | 是否实现 | 理由 |
+| --- | --- | --- |
+| `FromRef<ReadyAppState> for AppState` | **实现（迁移期）** | 未迁移 handler 在 ready 树上照常工作；`Arc::ptr_eq` 保证服务实例不分裂。最后一批后删除。 |
+| `FromRef<AppState> for ReadyAppState` | **不实现** | `AppState` 可能是未就绪的（`AppState::default()`），转换只能返回 `Option`/panic。让它在运行期 panic 或发明"半就绪"状态都违背本步骤的目的。 |
+| `Deref<Target = AppState> for ReadyAppState` | **不实现** | 会把整张 Option 访问器表又暴露一遍，`state.catalog()` 的解析重新变成歧义（方法优先解析到哪一层取决于定义顺序），迁移进度变得不可见。 |
+| `Deref<Target = CoreState>`（两个新类型各一个） | **实现** | `state.remote_access`/`state.server_id`/`state.config_dir` 等 110 处 core 字段读取零文本改动。 |
+
+`AppState` 的兼容访问器（`src/api/legacy.rs:321-376`）保留到批 9，只被 `require_service!`、
+`require_ready!` 与尚未迁移的文件使用。迁移进度＝"这些访问器的调用点数"，可量化。
+
+### 3.2 一批迁移的标准动作（每批一个提交）
+
+1. 该文件内 `State(state): State<AppState>` → `State<ReadyAppState>`（函数签名一行）。
+2. `let x = require_service!(state.x);` → `let x = state.x();`（返回 `&Service`）。
+3. 删除 required 服务的 `let Some(x) = state.x() else { …503… };` → `let x = state.x();`
+   （**保留** 6 个可选服务的降级分支，§7）。
+4. 文件私有 helper 的 `state: &AppState` → `state: &ReadyAppState`（86 个里属于该文件的那部分）。
+5. 改写该文件里 `state.<field>()` 的 Option 惯用法（`?`、`is_some()`、`as_ref()`、`map()`）；
+   可选服务不在此列。
+6. `api_routes()` 的返回类型**不用动**（批 0 已统一改成 `Router<ReadyAppState>`）。
+7. `cargo build --locked` + 该组窄集成测试 + `cargo clippy --locked --all-targets --all-features -- -D warnings`。
+
+因为文件之间只剩 `StateView`（§3.3）这一条通道，**任何一批都可以单独回滚**：
+回滚后该文件回到 `State<AppState>` + 守卫，其它文件不受影响，`FromRef` shim 仍然让它编译。
+
+### 3.3 跨文件 helper：`StateView` 过渡 trait
+
+111 个取 `&AppState` 的 helper 里 25 个被别的文件调用（附录 B 命令 2），它们是最主要的耦合来源：
+`require_admin`、`require_web_user/principal/csrf`、`require_emby_user/principal*`、
+`record_audit_event`、`spawn_library_scan`、`load_lux_item_detail`、`serve_media_file`、
+`admit_emby_direct_playback` 等。为了让批次不被这些文件绑在一起，迁移期给它们一个 15 行的 trait：
+
+```rust
+pub(crate) trait StateView: std::ops::Deref<Target = CoreState> {
+    fn ready_services(&self) -> Option<&ReadyServices>;
+}
+impl StateView for AppState { fn ready_services(&self) -> Option<&ReadyServices> { self.services.as_deref() } }
+impl StateView for ReadyAppState { fn ready_services(&self) -> Option<&ReadyServices> { Some(&self.services) } }
+
+// 25 个跨文件 helper 的签名：
+pub(crate) async fn require_admin(
+    headers: &HeaderMap,
+    state: &impl StateView,     // 静态分发，无虚调用开销
+    require_csrf: bool,
+) -> Result<(), Response>
+```
+
+- `impl Trait` 在参数位置是隐式泛型，调用点文本不变（`require_admin(&headers, &state, true)`），
+  迁移前后都能编译。
+- 批 9 删除 trait，把 25 个 helper 收敛成 `&ReadyAppState`（此时已无 `AppState` 调用者）。
+- 三个只读 `database` 的 helper（`request_access_ip` `src/api/legacy.rs:1441`、`request_client_ip`
+  `:1420`、`current_emby_server_name` `src/api/emby_handlers.rs:387`）**不进 trait**，批 0 直接改成取
+  `&CoreState`：它们本来就不需要服务，改完就是终局形态，少一次迁移。
+
+### 3.4 批次划分（先小后大，每批 handler 数已核对）
+
+| 批次 | 文件 | handler | `require_service!` | 状态 `else` 守卫 | 主要验证 |
+| --- | --- | --- | --- | --- | --- |
+| **批 0** | `routes.rs` + `legacy.rs`（新类型、`FromRef`、`StateView`、`apply_common_layers`、`api_routes` 返回类型、`into_mode`/兼容树） | 0 | 0 | 0 | `cargo build` + `--test api_web` + `--test storage database_setup_api::` |
+| **批 1** | `admin_dashboard`(1) `admin_health`(1) `admin_performance`(1) `admin_database_diagnostics`(3) | 6 | 4 | 0 | `--test admin admin_health::` 等 4 组 |
+| **批 2** | `admin_scheduled_tasks`(10) `admin_logs_events`(5) `admin_items`(6) | 21 | 15 | 2 | `--test admin`、`--test library`、`--test metadata` 相关模块 |
+| **批 3** | `admin_transcoding`(3) `admin_user_invitations`(4) `admin_user_registrations`(3) `admin_webhooks`(9) | 19 | 11 | 10 | `--test api_web webhooks_api::`、`--test auth_users` |
+| **批 4** | `admin_settings`(14) `admin_plugins`(13) `admin_emby_migration`(11) `admin_people`(9) | 47 | 18 | 16 | `--test admin admin_settings::`、`--test plugins`、`--test metadata people_api::` |
+| **批 5** | `admin_jobs`(22) `admin_metadata`(17) `admin_libraries`(13) | 52 | 33 | 16 | `--test admin`、`--test library libraries_api::`、`--test scanner` |
+| **批 6** | `admin_users`(47) | 47 | 48 | 1 | `--test admin admin_users::`、`--test auth_users` |
+| **批 7** | `emby_resume_visibility`(1) `emby_catalog`(25) `emby_handlers`(35) | 61 | 53 | 16 | `--test emby`（10 个模块） |
+| **批 8** | `playback`(26) `media`(37) `legacy`(7) | 70 | 96 | 21 | `--test playback`、`--test images`、`--test api_web web_playback::` |
+| **批 9** | `users`(36，其中 6 个 setup handler 走 `State<SetupState>`)、`admin_common`(2 处守卫)、`mod.rs`（删两个宏 + 单测）、`legacy.rs`（删 46 个兼容访问器与 `FromRef`）、`StateView` | 36 | 23 | 26 | `--test auth_users`、`--test api_web web_auth::`、`--test storage database_setup_api::` |
+
+合计 359 个 handler / 301 处 `require_service!` / 108 处状态守卫，与附录 B 的实测一致。
+`users.rs` 放在最后，因为它的 6 个 setup handler 要同时切到 `State<SetupState>`（`setup_status`、
+`setup_database_*`、`setup_complete`），而这些 handler 也挂在 ready 树上（§2.3）。
+
+排序原则：单文件规模从小到大；`admin_users` 与 `users` 两个巨型文件各自独立成批；Emby 三件套
+（`emby_catalog`/`emby_handlers`/`playback`/`media` 互相调用）放在中后段，此时 `StateView` 已覆盖
+所有跨文件 helper，批次边界与文件边界一致。
+
+### 3.5 批 0 的具体内容（一次性、纯类型，无行为变化）
+
+1. 新增 `ReadyAppState`/`SetupState`/`AppMode` 与 3 个 `FromRef`（含迁移期 `AppState` 那个）。
+2. `AppState::into_mode()`：`(Some(db), Some(services))` → `Ready`，否则 `NotReady(core)`。
+3. 24 个 `api_routes()` 的返回类型 `Router<AppState>` → `Router<ReadyAppState>`（`src/api/users.rs:3122`、
+   `src/api/admin.rs:76` 起的 19 个 `*_routes`、`src/api/lux_api.rs:3`、`src/api/emby.rs:47` 的
+   `EmbyRouteBuilder` 两处）。此时所有 handler 仍是 `State<AppState>`，靠 `FromRef` 解析 → 行为不变。
+4. `routes.rs` 拆成 `ready_router` + `not_ready_compat_router` + `apply_common_layers`，
+   `app_with_state` 变成分派器。**这一步就要把冻结测试的 6 条兼容响应补齐**（§4.5、§9.2），
+   否则 `--test api_web`、`--test plugins danmaku_api::`、`--test api_web web_static::` 会红。
+5. 把 `/health/live`、`/health/ready`、`/api/v1/version` 三条注册从 `users::api_routes()` 搬进
+   `core_routes()`（纯搬移，路径与 handler 不变）。
+
+批 0 之后，`main` 与 `tests/**` 一行都不用改；此后每批只碰自己的文件。
+
+## 4. 问题 3：setup 模式下挂哪些路由
+
+### 4.1 原则
+
+1. **只挂"没有管理员也能正确回答"的路由。** 判据是可执行的事实：handler 是否需要 `auth`/`emby_auth`/
+   业务服务来给出**正确**答案。
+2. setup 模式的前端契约由代码决定，不靠猜：`web/src/app/App.tsx:65-89` 在渲染任何页面之前只调
+   `/api/v1/setup/status` 与 `/api/v1/auth/me`；`SetupPage` 调 `/api/v1/setup/database`（`SetupPage.tsx:28`）；
+   `DatabaseSetupPanel` 调 `/api/v1/setup/database/{test,select}`（`DatabaseSetupPanel.tsx:47,52`）；
+   `AdminSetupForm` 调 `/api/v1/setup/complete`（`AdminSetupForm.tsx:23`）。
+3. setup 树与"未就绪兼容树"是两棵不同的树，目的不同（§4.5），不要合并。
+
+### 4.2 setup 树的路由清单
+
+| # | 方法/路径 | handler | 依赖 | 为什么必须在 setup 模式可用 | 证据 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | `GET /health/live` | `users::live`（`State` 都不用） | 无 | 容器/探针存活判定 | `src/api/users.rs:33` |
+| 2 | `GET /health/ready` | `users::ready` | `CoreState.database`+`config_dir` | 就绪探针；setup 模式下数据库与配置目录正常时**今天也是 200** | `src/api/users.rs:152` |
+| 3 | `GET /api/v1/version` | `users::version` | `CoreState.database` | 版本展示/排障 | `src/api/users.rs:205` |
+| 4 | `GET /api/v1/setup/status` | `users::setup_status` | `SetupService` | SPA 启动第一个请求，决定渲染 SetupPage | `src/api/users.rs:229`、`web/src/app/App.tsx:65` |
+| 5 | `GET /api/v1/setup/database` | `users::setup_database_status` | `DatabaseSetupService` | 数据库选择面板 | `src/api/users.rs:246` |
+| 6 | `POST /api/v1/setup/database/test` | `users::setup_database_test` | `SetupService`+`DatabaseSetupService` | 数据库连通性测试 | `src/api/users.rs:332` |
+| 7 | `POST /api/v1/setup/database/select` | `users::setup_database_select` | 同上 | 选择后端并落 `database.json` | `src/api/users.rs:390` |
+| 8 | `POST /api/v1/setup/database/restart` | `users::setup_database_restart` | 同上 + `restart_handle` | 选完库后排重启 | `src/api/users.rs:452` |
+| 9 | `POST /api/v1/setup/complete` | `users::setup_complete` | `SetupService` + `libraries` + 扫描子集（见 §4.3）+ `restart_handle`/`setup_restart_delay`（第 ② 步新增） | 创建首个管理员、可选取库与首次扫描、排重启 | `src/api/users.rs:601` |
+| 10 | `GET /api/v1/auth/me` | **setup 专用**：固定 `401 AUTHENTICATION_REQUIRED "需要登录"` | 无 | SPA 并行探测会话；setup 模式不可能存在会话 | `web/src/app/App.tsx:69`，今天由 `src/api/users.rs:2935-2941` 给出同一响应 |
+| 11 | `GET /System/Ping`、`POST /System/Ping` | 复用 `emby_ping` | 无 | Emby 客户端握手 | `src/api/emby_handlers.rs:842` |
+| 12 | `GET /System/Info/Public` | 改为 `State<SetupState>`（两棵树共用一份） | `SetupService` + `CoreState.database`/`server_id` | 今天在 setup 模式返回 `{"StartupWizardCompleted": false}`，是 Emby 世界的"向导未完成"约定 | `src/api/emby_handlers.rs:397-410` |
+| 13 | `GET /Users/Public` | **setup 专用**：固定 `200 []` | 无 | 今天 setup 模式的返回就是 `[]`（`emby_auth.public_users()` 在空用户表上给出空集），保持一致 | `src/api/emby_handlers.rs:850-870` |
+| 14 | `GET /logo.svg` + 静态资源 + SPA fallback | `routes::web_logo`、`ServeDir` | 无 | setup 页面本身是 SPA | `src/api/routes.rs:134`、`:140-145` |
+
+共 **13 条业务语义路由**（1–13）+ 静态/SPA。其中只有 #12 是"签名改造后两树共用"，
+#10、#13 是两个 5~10 行的 setup 专用处理函数（无服务、无状态、响应体与今天逐字相同）。
+
+setup handler 需要的服务**只有 4 个**：`SetupService`、`DatabaseSetupService`、`LibraryService`、
+`ScanJobService`，外加 `probe`/`metadata_reidentify`/`thumbnails` 供 `spawn_library_scan` 组
+`ScanWorkerServices`（`src/api/admin/admin_jobs.rs:3-11`、`:242-253`）。`SetupState` 暴露这 7 个就够，
+其余 39 个服务在类型上不可达（§2.1）。
+
+### 4.3 setup 模式下是否构建全部服务：**构建，行为不变**
+
+`src/main.rs:187-206` 今天不管 setup 是否完成都会 `AppState::ready_with_proxy(...)` 并启动
+7 类 worker。第 ③ 步**保持这一点**：`SetupState` 由同一个 `ReadyServices` 派生（只暴露子集），
+`main` 仍调用同样的 builders 与 starters。
+
+原因：`ScanJobService` 的构造是链式接线（`src/api/legacy.rs:606-630`：`home`、`library_covers`、
+`strm_probe`、`people`、`local_nfo`、`metadata_selection`、`metadata_reidentify`、`webhooks`）。
+在 setup 模式只建一个"半接线"的 `ScanJobService` 会让 setup 的首次扫描在扫完后的封面/人物/首页
+读模型刷新上行为不同——那是**用户可见的行为变化**，违反"ready 模式行为不变"的验收口径。
+把它留给后续步骤（把 setup 模式真正瘦身）单独评估。
+
+推论：setup 模式下 worker 照旧运行（计划任务、实时监控、webhook 投递等），第 ③ 步不改变这一点；
+`docs/SETUP-RESTART-DESIGN.md` §7 的回滚边界因此仍然成立。
+
+### 4.4 setup 模式下不注册的路由，与现状对比
+
+| 路径族 | 今天（setup 未完成） | 第 ③ 步之后 | 用户可见变化 |
+| --- | --- | --- | --- |
+| `/api/v1/{libraries,items,home,search,favorites,people,continue-watching,…}` | 401 `需要登录`（无会话；服务齐全，鉴权先失败） | 不注册 → SPA fallback 命中 `reject_unmatched_api_path`（`src/api/legacy.rs:1356-1389`）→ **JSON 404 `NOT_FOUND`** | 是。但前端在 `initialized=false` 时只渲染 `SetupPage`（`web/src/app/App.tsx:89`），无业务调用；第三方脚本会看到 401→404 |
+| `/api/v1/admin/*` | 401/403 | JSON 404 | 同上；setup 向导不调 admin 接口 |
+| `/api/v1/auth/{login,logout,sessions,profile,…}` | 401/400（无管理员时登录失败） | JSON 404 | 是；setup 页面不登录（`LoginPage` 只在 `initialized=true` 后渲染） |
+| `/api/v1/auth/login-background` | 200 + 图片 | JSON 404 | 是；只被 `LoginPage` 使用（`LoginPage.tsx:16`），setup 模式不渲染 |
+| Emby `/System/Info`、`/Items/*`、`/Users/{id}/…` 等 | 401/403/200（服务齐全） | 不注册 → Emby 命名空间是**裸 404**（`reject_unmatched_api_path` 对非 `/api/` 前缀不加错误信封，`src/api/legacy.rs:1376-1379`） | 是（401→404）。Emby 客户端只会显示"服务器不可用" |
+| Emby `/System/Ping`、`/System/Info/Public`、`/Users/Public` | 200 | **200，响应逐字相同**（§4.2 #11-13） | 否 |
+| `/items/{id}`（小写，不在 `is_api_or_emby_namespace_path` 名单里，`src/api/legacy.rs:1332-1354`） | Emby handler → 401/404 | SPA fallback → **HTML 200**（`Accept: text/html` 的详情页跳转因此仍可用） | 是（仅 JSON 请求会从 401/404 变成 HTML 200） |
+
+关于"404 还是 503 带说明"的取舍：
+
+- **不选 503**：503 会与"数据库暂时不可用"的既有语义混淆（`normalize_empty_api_service_unavailable`
+  会把裸 503 改写成 `DATABASE_UNAVAILABLE`），而且 setup 模式的语义是"这些接口在这个进程里不存在"，
+  404 才是准确的。更重要的是：**`/api/v1/no-such-endpoint` 必须继续 404**（`tests/api_web/api_error_contract.rs:230-236`
+  钉住了这一条），所以"整个 `/api/v1/` 前缀一律 503"这条路本来就不通。
+- **Emby 侧保持裸 404**：与今天"未注册的 Emby 路径一律裸 404"一致（`src/api/legacy.rs:1324-1330`、
+  `tests/api_web/api_error_contract.rs:220-228`），不需要新的状态码。
+- 想给运维看"正在 setup"的提示，用 `/health/ready`（始终可用）与前端提示，不要占用 API 状态码。
+
+### 4.5 "setup 树"与"未就绪兼容树"的区别（不要混淆）
+
+| | setup 树 | 未就绪兼容树 |
+| --- | --- | --- |
+| 谁构造 | `main`：`setup_router(SetupState)` | `app_with_state(AppState::default())` / `app()`，**只有 `tests/**` 会走到**（`src/main.rs` 从不构造 `AppState::default()`） |
+| 状态 | `SetupState`（有 database、有 7 个服务） | `CoreState`（database 为 `None`，无服务） |
+| 路由 | §4.2 的 13 条 + 静态 | 6 条冻结测试钉住的兼容响应 + 静态（§9.2） |
+| 语义 | 真实的"等待初始化"模式 | 仅用于保持 `tests/**` 一行不改的历史契约 |
+
+## 5. 问题 4：`main` 如何选择模式
+
+### 5.1 判定谓词
+
+```rust
+enum AppMode { Setup, Ready }
+
+// src/main.rs，prepare_database 之后、build_app_state 之前
+async fn decide_mode(
+    database: &Database,
+    requires_database_selection: bool,
+) -> AppMode {
+    if requires_database_selection {
+        return AppMode::Setup;                       // 数据库后端都还没选，必然是 setup
+    }
+    match SetupService::new(database.clone()).and_then(|setup| Ok(setup)) {
+        Ok(setup) => match setup.status().await {
+            Ok(true) => AppMode::Ready,
+            Ok(false) => AppMode::Setup,
+            Err(error) => {
+                // fail-closed：见 §5.2
+                error!(%error, "could not decide the startup mode; assuming the ready mode");
+                AppMode::Ready
+            }
+        },
+        Err(error) => { error!(%error, "…"); AppMode::Ready }
+    }
+}
+```
+
+判定只用一条查询：`SetupService::status()` = `UserStore::has_users()`（`src/application/setup.rs:17-19`）。
+选它的理由：
+
+- 它是 **`/api/v1/setup/status` 与 `setup_complete` 的同一判据**（`src/api/users.rs:237`），
+  不存在"启动判定"与"接口判定"两套真源。
+- 它跑在**已经连接并迁移完成的同一个 `Database`** 上（`src/main.rs:28` 的 `prepare_database` 已做完
+  schema migration，`:64` 才读 schema version），所以不存在"表还没建好"的时序问题。
+- 它不依赖配置文件：`database.json` 丢失但库里已有用户的场景会正确进入 ready（而不是把 setup
+  能力重新递给 LAN 上的任何人）。
+
+### 5.2 fail-closed 选哪一边：**选 Ready**
+
+| 失败方向 | 选 Setup 的后果 | 选 Ready 的后果 |
+| --- | --- | --- |
+| 数据库瞬时不可用（迁移刚成功、`has_users()` 查询失败） | 进程把"创建首个管理员"的能力暴露给局域网（`setup_complete` → 409 之外还可能 5xx），并允许改写 `database.json`。**敏感能力被放大** | 业务路由返回 503（`normalize_empty_api_service_unavailable` 给结构化错误），管理员修复数据库后重启即可 |
+| 数据库已初始化但状态查询失败 | 同上，且此时 `setup/complete` 会 409，界面表现为"setup 永远失败" | 一切照旧 |
+| 数据库真坏 | setup 树也给不出正确答案（`setup_status` 自己会 503） | 与今天一致：`build_app_state` 失败 → 进程退出 → 由 supervisor/容器重启 |
+
+结论：**"setup 能力"是权限更敏感的一侧，fail-closed = 不把它交出去 = 选 Ready**。
+代码上表现为 `Err(_) => AppMode::Ready`，并用 `error!` 记录（不是 `warn!`：这会让一个已初始化的
+服务器在本次启动里丢掉 setup 端点，属可观测事件）。
+
+### 5.3 与 `requires_database_selection` / `prepare_database` 的关系
+
+- `requires_database_selection`（`src/main.rs:98-99`）= "既没有显式 `database.json`，也没有历史 SQLite 库"，
+  在这两种情况下 `prepare_database` 会先 `mark_database_selection_pending()`（`src/main.rs:54-56`）
+  再连默认 SQLite。这是**配置层事实**，与 setup 是否完成无关，所以它是判定里的短路条件。
+- 第 ③ 步**不动** `prepare_database`；只把 `requires_database_selection` 从 `CoreState` 移到
+  `SetupState`（它是 setup 树的属性），`CoreState.database_selection_required`
+  （`src/api/legacy.rs:179`）在第 ④ 步删除，配套 3 处 worker 短路
+  （`src/api/legacy.rs:918/935/954`）改成"只有 ready 模式才启动这些 worker"。
+  为保持 `tests/storage/database_setup_api.rs:31` 的 `.require_database_selection()` 可用，
+  `AppState` 兼容门面继续保留这个方法名，转发到内部标志。
+
+### 5.4 `AppState` / `app_with_state` 如何为 `tests/**` 保持兼容
+
+冻结构造点实测（附录 B 命令 4）：
+
+| 用法 | 处数 | 位置 | 第 ③ 步如何保持 |
+| --- | --- | --- | --- |
+| `AppState::default()` | 3 | `tests/api_web/web_static.rs:116`、`tests/plugins/danmaku_api.rs:204`、`tests/shutdown.rs:161` | `Default` 仍是"无 database、无服务"，语义不变；前两处经 `app_with_state` 落到**未就绪兼容树**（§9.2），第三处只调 `shutdown_background_workers_checked()`，与路由无关 |
+| `app()` | 8 | `tests/api_web/{health,ready_version,web_static,api_error_contract}.rs` | `app()` 定义不变（`src/api/legacy.rs:972-974`）；`app_with_state` 内部按 `into_mode()` 分派 |
+| `app_with_state(AppState::ready(..)…)` | 163 | 12 个测试文件 | `AppState::ready*` 构造器与全部 `#[doc(hidden)]`/公开 builder 方法保留；`app_with_state` 一律落到 `ready_router` |
+| builder 方法 | `with_scraper`、`with_hls_executable`、`with_strm_playback_resolver`、`with_embedded_subtitle_executable`、`with_restart_handle`、`with_request_rate_limit`、`with_sse_connection_limit`、`require_database_selection`、`start_local_metadata_{outbox_worker,refresh}`、`start_scheduled_tasks`、`rebuild_people_index`、`rebuild_person_credit_index`、`resume_interrupted_metadata_jobs`、`shutdown_background_workers{,_checked}` | 分布在 `tests/**` | 全部保留在 `AppState` 上，内部改为操作 `services: Option<Arc<ReadyServices>>`；**不移动到 `ReadyAppState`**，否则冻结测试不能编译 |
+
+`app_with_state` 的签名保持 `fn app_with_state(state: AppState) -> Router`（`src/api/legacy.rs:976`），
+内部改为分派：
+
+```rust
+impl AppState {
+    pub(crate) fn into_mode(self) -> AppMode {          // 迁移完成后直接返回 ready/setup 之一
+        match (self.database, self.services) {
+            (Some(database), Some(services)) => AppMode::Ready(ReadyAppState {
+                core: self.core, database, services,
+            }),
+            _ => AppMode::NotReady(self.core),
+        }
+    }
+}
+```
+
+因此**`tests/**` 的一行都不需要改**（本任务与后续实现均禁止修改）。唯一无法避免的是 §9.2 列出的
+"未就绪兼容树"必须自己合成 6 条响应——那是 `src` 里 ~40 行、只被测试触达的代码，不是测试改动。
+
+### 5.5 `main` 的重构草图
+
+构造部分**完全不动**（`src/main.rs:172-207` 的 `build_app_state` 保持原样，包括 7 类 worker 启动），
+只把"选路由树"插在构造与 `serve` 之间：
+
+```rust
+// src/main.rs
+let (database, requires_database_selection) = prepare_database(&config).await?;
+…
+let mode = decide_mode(&database, requires_database_selection).await;   // §5.1
+let app_state = build_app_state(&config, &database, control_tx.clone()).await?;   // 不变
+let shutdown_state = app_state.clone();
+let app = match mode {
+    // setup 模式与今天一样构建全部服务、启动全部 worker（§4.3），只是挂 setup 树
+    AppMode::Setup => setup_router(SetupState::from(app_state.into_ready()?)),
+    AppMode::Ready => ready_router(app_state.into_ready()?),
+};
+serve(config, discovery_config, database, app, shutdown_state, control_tx, control_rx).await
+```
+
+- `into_ready() -> Result<ReadyAppState, StartupError>`：`services` 缺失时返回启动错误（不 panic、不
+  `unwrap`；`main` 已经把 `AppState::ready_with_proxy` 调过，缺失就是内部不变量被破坏，按启动错误处理）。
+- `serve` 只增加一个参数：把 `app_state: AppState` 换成 `app: Router` + `shutdown_state: AppState`，
+  内部其余逻辑（`src/main.rs:253-286`：graceful shutdown、worker drain、`database.close()`、
+  `restart_process()`）一字不改。
+- 第 ② 步的 `resume_shutdown_interrupted_first_scans`（分支 `tspace/setup-restart-backend`，
+  `AppState::resume_shutdown_interrupted_first_scans`）留在 `build_app_state` 里不动：它自带
+  `database_selection_required` 短路，且"被关停打断的首次扫描"意味着上一次运行已完成 setup。
+**优点**：`main` 的改动面只有 6 行；setup 模式的资源/worker 行为与今天逐字相同，回滚第 ③ 步只需把
+`match` 换回 `app_with_state(app_state)`。
+
+## 6. 问题 5：后台 worker / 插件持有的服务副本
+
+结论：**拆分不改变任何 `Arc` 共享语义**，因为没有一个后台任务持有 `AppState`——它们持有的是服务句柄，
+而服务句柄本来就通过 `Arc`/数据库连接池共享（`docs/APP-STATE-NEXT.md` §6 已写明这条前提）。
+
+证据与拆分后的对应关系：
+
+| 事实 | 证据 | 拆分后 |
+| --- | --- | --- |
+| worker 启动方法只取服务克隆 | `src/api/legacy.rs` 的 `rebuild_people_index`（`self.people()`）、`start_realtime_watchers`（`self.core.database.clone()` + `self.scan_jobs().cloned()` + `self.libraries()`）、`start_webhook_worker`/`start_scheduled_tasks`/`start_database_diagnostics` 同形 | 这些方法留在 `AppState` 上（`main` 仍先构造 `AppState`，§5.5），行为不变；终局可以原样搬到 `ReadyAppState` |
+| 全仓没有任何 `AppState` 被 `tokio::spawn` 捕获后长期持有 | `grep -rn "spawn" src/api/legacy.rs | …`：`resume_interrupted_metadata_scraping` 内部捕获的是服务；`src/main.rs:227` 的 scanner 捕获 `Database` | 无变化 |
+| 服务实例的唯一所有者是 `Arc<ReadyServices>`；克隆状态只增加引用计数 | `src/api/legacy.rs:2490-2507` 的 `cloning_the_state_shares_one_ready_services_instance`（`Arc::ptr_eq` + 字段地址相同 + `strong_count == 2`） | `ReadyAppState`/`SetupState` 持有**同一个** `Arc`：`AppState::into_ready()` 与 `impl FromRef<ReadyAppState> for AppState` 都只 `Arc::clone`，不改指向 |
+| `Arc::make_mut` 只在构造期改服务（会写 `Option` 槽与 scaler 等） | `src/api/legacy.rs:317-319`（`ready_services_mut`）以及 5 个 builder：`with_strm_playback_resolver`、`with_embedded_subtitle_executable`、`with_hls_executable`、`with_scraper`、`start_content_restriction_index_worker` | 保留在 `AppState` 上（`tests/**` 需要在 `app_with_state` 之前用它们），且**规定 `into_ready()` 之后不得再调用**：它是消费型转换，类型上已经拦住（`ReadyAppState` 没有 builder 方法） |
+| 插件只拿到 `PluginService` 句柄 | `src/api/legacy.rs` 的 `ReadyServices.plugins`，被 `danmaku`/`strm_probe`/`chapter_detection`/`scheduled_tasks` 等克隆 | 同上：句柄克隆，内部状态在 `Arc` |
+
+唯一需要额外守住的纪律（写进实现注释与 review 清单）：
+
+1. `ReadyAppState`/`SetupState` 的构造必须只经由 `AppState::into_ready()`（或它派生的
+   `SetupState::from`），不得直接 `Arc::new(ReadyServices { .. })`。
+2. `into_ready()` 之后任何 `Arc::make_mut` 都会在"已被共享"的情况下复制一份句柄结构，
+   使某些 worker 看到旧句柄——与拆分前的错误用法等价，因此 `into_ready` 之后不再提供可变入口。
+3. 每请求克隆（`FromRef` 与 `State<T>` 提取）只做 `CoreState`/`Database`/`Arc` 的克隆，
+   与今天"每请求克隆整个 `AppState`"同阶或更便宜。
+
+## 7. 问题 6：删守卫（第 ④ 步）的范围
+
+### 7.1 实测分类
+
+| 类别 | 处数 | 第 ④ 步处置 | 理由 |
+| --- | --- | --- | --- |
+| `require_service!(state.<required>)` | 173 | **删** | ready 模式下 `ReadyServices.<field>` 是非 `Option` 字段，分支不可达 |
+| `state.<required>() else { … }`（结构化 503 / 裸 503 / 降级返回） | 84 | **删** | 同上；包括 `admin_people.rs`（12 处、"人物索引服务尚未就绪"）与 `admin_handlers` 里返回 `false`/`NOT_FOUND` 的降级分支 |
+| `require_service!(state.database)` | 121 | **删** | `ReadyAppState::database()` 返回 `&Database`（`into_ready()` 只在 `database` 为 `Some` 时成功） |
+| `state.database() else { … }` | 2 | **不删（搬走）** | `users.rs:153`/`:206`（`/health/ready`、`/api/v1/version`）随批 0 搬进 `core_routes`，仍是 `State<CoreState>` 上的 Option 守卫：探针必须能在数据库缺失时回答 503，它不属于 ready 树的代码 |
+| `state.setup()` / `state.database_setup()` 守卫 | 5 + 5 | **删** | `SetupState` 里两者都是非 `Option` 字段 |
+| `require_service!` on 6 个可选服务（`image_writes` 3、`downloads` 2、`strm_playback` 2） | 7 | **保留** | `ReadyServices` 里它们是 `Option`（`src/api/legacy.rs:202-256` 的注释：缺失是"就绪但降级"，不是"未就绪"） |
+| `state.<optional>() else { … }`（`webhooks` 10、`metadata_selection` 2） | 12 | **保留，响应体逐字不变** | 同上：`webhooks` 初始化失败、`metadata_selection` 未配置都是合法降级 |
+| 其余 Option 惯用法（`state.<field>()?`、`.is_some()`、`.map()`、`.as_ref()`） | ~40 | 按服务类别分别处理 | required 服务改成直接绑定；可选服务不变 |
+
+合计：**删 388 处**（173+84+121+10），**保留 19 处**（7+12）外加可选服务的 ~10 处非守卫惯用法。
+两处 `database` 守卫（`users.rs:153`/`:206`）留在 `core_routes` 里，属于"未就绪探针必须能回答 503"的语义，
+不随 ready 树删除。
+
+### 7.2 为什么"结构化 503"也能删（且不改响应体）
+
+`docs/APP-STATE-NEXT.md` §6 曾把"人物索引服务尚未就绪""Webhook 通知服务尚未就绪"这类**带自定义中文
+消息的结构化 503** 列为"不能改响应体"，因此步骤 2 没有迁移它们。第 ④ 步能删的依据是：
+
+- 这些消息来自 `ReadyServices` 的 **required** 槽（`people`、`catalog`、`access`、`library_covers`…），
+  而 `ReadyServices` 是**一次构造、全有或全无**（`src/api/legacy.rs:471` 起的
+  `ready_with_proxy_and_image_config` 单函数建出全部字段，缺一个就整体启动失败）。
+  因此"ready 模式下 `people` 缺失"这个状态**不存在**，分支不可达，删除不改变任何可达响应。
+- 真正可达的"缺失"只有 6 个 `Option` 槽，它们的响应体（例如 `admin_webhooks.rs:92` 的
+  "Webhook 通知服务尚未就绪"）**保留不动**。
+- 冻结测试里唯一触及"服务缺失"的是 `AppState::default()`（无服务），它走的是未就绪兼容树（§9.2），
+  不经过这些 handler。
+
+### 7.3 必须保留的清单（实现时逐条核对）
+
+```
+src/api/admin/admin_webhooks.rs      10 处  state.webhooks() else { …结构化 503 "Webhook 通知服务尚未就绪" }
+src/api/media.rs                      2 处  state.metadata_selection() else { …降级 503 }
+src/api/…                            7 处  require_service!(state.{image_writes,downloads,strm_playback})
+src/api/media.rs                   ~3 处  state.image_writes()/downloads()/strm_playback() 的 is_some/map 惯用法
+src/api/users.rs:153,206              2 处  core 探针的 database 守卫（随 core_routes 留下）
+```
+
+### 7.4 第 ④ 步与批 1–9 的关系
+
+删守卫**不是**一个独立提交：批 1–9 每批在改签名时顺手删掉该文件的守卫（否则 `state.catalog()` 返回
+`&CatalogService` 后旧守卫根本编译不过）。因此 `docs/APP-STATE-NEXT.md` 的"步骤 4"在本设计里被并入
+步骤 3 的批次；真正的收尾提交（批 9）只负责删除**兼容层**：46 个 Option 访问器、`Deref<Target = CoreState>`
+for `AppState`、`FromRef<ReadyAppState> for AppState`、`StateView`、`require_service!`/`require_ready!`
+两个宏及其 6 个单元测试（`src/api/legacy.rs:2416-2485` 区域）。
+
+## 8. 问题 7：回滚边界与提交序列
+
+### 8.1 提交序列
+
+| # | 提交 | 内容 | 可单独回滚 | 回滚后仍编译 |
+| --- | --- | --- | --- | --- |
+| C0 | 本设计文档 | 只加 `docs/SETUP-READY-SPLIT-DESIGN.md` | 是 | 是（不动代码） |
+| C1 | **批 0**：类型与树骨架 | `ReadyAppState`/`SetupState`/`AppMode`、3 个 `FromRef`（含迁移期 `AppState`）、`StateView`、`apply_common_layers`、24 个 `api_routes()` 返回类型、`app_with_state` 分派 + 未就绪兼容树、`core_routes` 搬移 | 是 | 是（回到今天的单树 `AppState`，§8.3 有例外说明） |
+| C2–C9 | **批 1–8**：文件组迁移 | 每批改 `State<AppState>` → `State<ReadyAppState>`、删守卫、文件私有 helper 改签名 | 是，逐批独立 | 是（`FromRef<ReadyAppState> for AppState` 让未迁移文件继续工作） |
+| C10 | **批 9**：收尾 | `users.rs` + 6 个 setup handler 切 `State<SetupState>`、`admin_common` 2 处守卫、删两个宏与 6 个宏单测、删 46 个 Option 访问器、删 `FromRef<ReadyAppState> for AppState`、删 `StateView`、`main` 插入 `decide_mode` + 选树 | **否**（见 §8.2） | — |
+| C11 | 观察期后的清理（可选） | `CoreState.database_selection_required` 移入 `SetupState`，3 处 worker 短路改写 | 是 | 是 |
+
+`main` 的 6 行改动（§5.5）放进 C10 而不是 C1：C1 之后 `app_with_state` 已经能按状态分派，
+`main` 继续用 `app_with_state(app_state)` 也完全正确（永远走 ready 树），因此**在批次迁移期间不需要
+动 `main`**；只有 setup 树真正可用（C10 完成 setup handler 的 `State<SetupState>` 切换）时，才把
+`main` 切到显式选树。
+
+### 8.2 不可单独回退的组合
+
+1. **C10 必须整体回滚。** 它同时删除 `FromRef<ReadyAppState> for AppState`、`StateView` 与 46 个
+   Option 访问器；只回退其中一半会出现"某文件仍在用兼容访问器但访问器已删"或"某 helper 仍取
+   `&impl StateView` 但 trait 已删"的编译错误。回滚方式：`git revert C10` 单个提交即可（它在历史里
+   是原子的），不要把 C10 拆成多提交。
+2. **批 i 的 handler 改动与它的守卫删除是同一个提交。** 改签名后旧守卫（`require_service!` 返回
+   `Option<&Service>` 形态）必然编译不过，中间态不可存在。
+3. **`api_routes()` 的返回类型翻转（C1）不能单独回退而保留任何批 1–8 的成果。** 回退 C1 意味
+   所有 `api_routes()` 回到 `Router<AppState>`，此时 `State<ReadyAppState>` 的 handler 无法解析
+   `FromRef<AppState> for ReadyAppState`（本设计明确不实现，§3.1）→ 编译失败。因此回退顺序必须是
+   **先回退 C2–C10（或整体回到 C0），再回退 C1**。
+
+### 8.3 C1 单独回滚的一个已知例外
+
+C1 把 `/health/live`、`/health/ready`、`/api/v1/version` 三条注册从 `users::api_routes()` 搬进
+`core_routes()`，并在 `app_with_state` 里引入未就绪兼容树。回退 C1 会同时撤掉兼容树——这在
+C1 之后、C2 之前是安全的（此时还没有 handler 迁移）。但**如果 C2–C9 已经落地**，回退 C1 会破坏
+§8.2 第 3 条的约束；所以"回退 C1"只在"刚提交 C1 就发现构建/测试红"这个窗口内成立。
+
+### 8.4 每个提交的验证口径
+
+| 提交 | 必跑 |
+| --- | --- |
+| C0 | `cargo fmt --all -- --check`（只碰 docs，可省） |
+| C1 | `cargo build --locked`；`cargo test --locked --test api_web`；`cargo test --locked --test storage database_setup_api::`；`cargo test --locked --test plugins danmaku_api::` |
+| C2–C9 | `cargo build --locked` + 批 1–8 表里该组的窄命令（`cargo test --locked --test <group> <module>::`，见 `docs/TEST-TARGETS.md`）+ `cargo clippy --locked --all-targets --all-features -- -D warnings` |
+| C10 | 全量门禁：`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`python3 scripts/check-migration-parity.py`、`python3 scripts/check-backend-branches.py` |
+| C11 | 同 C10 的全量门禁（它动 `CoreState` 字段与 worker 启动条件） |
+
+不 push、不合并到其它分支；C10 之前的每个提交都可以单独 `git revert`。
+
+## 9. 问题 8：风险、被否决的方案与决策点
+
+### 9.1 风险表
+
+| # | 风险 | 触发条件 | 影响 | 缓解 |
+| --- | --- | --- | --- | --- |
+| R1 | **冻结测试钉住的"未就绪"契约与"未就绪不注册业务路由"直接冲突** | 任何时候 | `--test api_web`、`--test plugins danmaku_api::` 变红 | 未就绪兼容树合成 6 条响应（§9.2）；C1 的验收命令就是这么定的（§8.4） |
+| R2 | 兼容树的合成响应与真实 handler 漂移 | 将来改了 `auth_me` 的 503 文案 | 测试仍绿但语义漂移 | 兼容树只在 `AppState::default()` 路径可达，命名 `not_ready_compat_*` + `#[doc(hidden)]` + 注释写明"只为冻结测试存在"；`§9.2` 表格即契约文档 |
+| R3 | **setup 完成但拿不到 `RestartHandle` → 进程停在 setup 树，无法登录** | 嵌入式/自定义启动路径（`src/main.rs:195` 之外的构造） | 用户看不到业务界面，直到手工重启 | `main` 恒注入句柄；第 ② 步的 `schedule_setup_restart` 在 `None` 时已 `tracing::warn!("setup completed without a restart handle")`（分支 `tspace/setup-restart-backend`）；本设计把它升级为 `error!` 并写进 §9.4 已知限制。**当选 `tests/**` 不改时，这是唯一无法靠类型消除的窗口** |
+| R4 | Emby 客户端在 setup 模式的响应从 401 变 404 | 有人在 setup 未完成时把 Emby 客户端指向 Lux | 客户端提示"服务器不可用" | 保留 `/System/Ping`、`/System/Info/Public`、`/Users/Public` 三条公共发现路由（§4.2 #11-13），并把差异列进 §4.4 |
+| R5 | 24 个 `api_routes()` 的返回类型翻转引发集中类型错误 | C1 | C1 一次红 24 个文件 | `FromRef<ReadyAppState> for AppState` 让 handler 完全不动（§3.1）；C1 只改函数签名，不改 handler |
+| R6 | `state.database`（字段）与 `state.database()`（方法）语义分叉 | 迁移批次 | ready handler 里误读 `Option`，行为悄悄退回 503 | 建议同 C1 把 `CoreState.database` 改名为 `database_slot` 并只留方法访问（§2.1、决策点 D4） |
+| R7 | 每请求克隆成本变化 | 两棵树 | 延迟/内存 | `FromRef` 只克隆 `CoreState`（Arc 包住的 hub/limiter）+ `Database` + `Arc<ReadyServices>`，与今天"克隆整个 `AppState`"同阶；`Arc::ptr_eq` 由 `src/api/legacy.rs:2490-2507` 的单测继续守护 |
+| R8 | setup 模式仍构建全部服务、启动全部 worker | 每次 setup 启动 | 行为与今天一致，但"setup 模式应该更轻"的直觉未被满足 | 明确列为非目标（§4.3），留给 C11 之后单独评估；不塞进第 ③ 步以免改变首次扫描的接线行为 |
+| R9 | `apply_common_layers` 重构时打乱 20 层顺序 | C1 | ETag/压缩/HSTS/请求 ID/指标行为变化 | 按 `src/api/routes.rs:147-310` 的出现顺序原样搬移；验收跑 `--test api_web response_compression::`、`acl::`、`api_error_contract::` |
+| R10 | `case_insensitive_emby_router` 包裹位置改变 | C1 | Emby 大小写归一化失效（`/items/x` vs `/Items/x`） | 它今天在最外层（`src/api/routes.rs:311`），两棵树都必须最后应用；验收跑 `--test emby` 与 `--test api_web web_static::media_detail_navigation_is_served_as_html_while_json_uses_emby` |
+| R11 | `request_metrics` 的 `route` 标签在 setup 树里只覆盖少数模板 | C1 之后 | 指标里 setup 模式多为 `unmatched` | 可接受：setup 模式的请求量极小；`src/api/routes.rs:290` 的逻辑不动 |
+
+### 9.2 冻结测试钉住的"未就绪"契约（兼容树必须合成的 6 条响应）
+
+未就绪兼容树（`not_ready_compat_router`，只在 `app_with_state(AppState::default())` 时构造）必须给出
+下面这些响应；它们今天来自真实 handler + 中间件，拆分后真实 handler 已不在树上，所以要显式合成：
+
+| # | 请求 | 断言 | 今天由谁给出 | 兼容树怎么给 |
+| --- | --- | --- | --- | --- |
+| 1 | `GET /health/live` | 200，body 逐字 `{"status":"ok"}`，有 `x-request-id` | `src/api/users.rs:33`（无状态） | 复用同一个 handler（`core_routes`，`State<CoreState>`） |
+| 2 | `GET /health/ready` | 503，body 含 `database_unavailable` | `src/api/users.rs:152-158` | 复用同一个 handler（`State<CoreState>` 的 database 守卫保留） |
+| 3 | `GET /api/v1/auth/sessions` | 503，`error.code == "DATABASE_UNAVAILABLE"`，`error.requestId` 非空且等于响应头 `x-request-id`；带 `x-forwarded-proto: https` 时还有 HSTS | handler 裸 503 + `normalize_empty_api_service_unavailable`（`src/api/legacy.rs:1030`）+ `security_response_headers`（`src/api/routes.rs:580`） | 合成 handler 返回**裸 503**（空 body）→ 两个中间件照常改写，逐字一致 |
+| 4 | `GET /api/v1/auth/me` | 503，`error.message == "服务尚未就绪"` | `require_web_principal` 的 `auth` 守卫（`src/api/users.rs:2927-2934`） | 合成 handler 用同一个 `api_error(&headers, 503, DatabaseUnavailable, "服务尚未就绪")` |
+| 5 | `GET /System/Info` | 503，body **为空** | Emby handler 的裸 503 | 合成 handler 返回裸 503（Emby 命名空间不经错误信封，`src/api/legacy.rs:1376-1379`） |
+| 6 | `GET /api/v1/items/item-1/danmaku` | 503，`error.code == "DATABASE_UNAVAILABLE"` | `lux_danmaku_unavailable`（`src/api/media.rs:1992`）或裸 503 + 归一化 | 合成 handler 返回裸 503 |
+| 旁证 | `GET /Items/unknown-item/UnknownThing`、`/api/v1/no-such-endpoint`、`/emby/not-implemented`、`/Sessions/not-implemented` | 404（Emby 侧裸 404，Lux 侧 JSON `NOT_FOUND`） | SPA fallback + `reject_unmatched_api_path`（`src/api/legacy.rs:1356`） | 不需要合成：兼容树保留 SPA fallback，行为自然一致 |
+| 旁证 | `/`、`/libraries/example`、静态资源 | 200 | `ServeDir` + SPA fallback（`src/api/routes.rs:140-145`） | 同左 |
+
+依据：`tests/api_web/health.rs:11-26`、`tests/api_web/ready_version.rs:14-24`、
+`tests/api_web/api_error_contract.rs:18-47`、`:64-81`、`:98-139`、`:220-236`、
+`tests/api_web/web_static.rs:9-49`、`:125-158`、`tests/plugins/danmaku_api.rs:213-219`。
+**兼容树合计约 40 行**（5 个合成 handler + 路由注册），全部只被测试触达。
+
+### 9.3 被否决的方案
+
+| 方案 | 否决理由 |
+| --- | --- |
+| 停在方案 A（单树 + `require_ready!`，每 handler 一次守卫） | 不满足"setup 模式下业务路由不注册"，也没到"字段非 Option"；守卫数量只是从 301 降到 handler 数 |
+| 用一个 trait 抽象状态（`trait HttpState { fn catalog(&self) -> &CatalogService; }`） | handler 变泛型或仍拿 `Option`，见 §2.2；且 axum 的 `Router<S>` 无法让同一 handler 同时服务两棵树 |
+| 进程内热切换 Router（外层 `ArcSwap<Router>` / `Mutex<Router>`） | 与第 ② 步"setup 完成后重启"的产品决策冲突；切换点要重建整棵路由树（含 20 层 layer 与 Emby 路径模板），还要处理在途请求；类型层无法保证"setup 模式没有业务路由" |
+| 让 `AppState` 变 enum、handler 继续取 `State<AppState>` | 运行期匹配 = 回到 Option 语义，守卫一个也删不掉 |
+| 单树 + 在 fallback 里对 `/api/v1/*` 统一回 503 | 与 `tests/api_web/api_error_contract.rs:230-236` 冲突（`/api/v1/no-such-endpoint` 必须 404），也与 `/api/v1/auth/me` 需要特定文案冲突（§9.2 #3/#4） |
+| setup 树专门监听第二个端口 | 违反"单进程单一监听"（`docs/LUX-DEVELOPMENT.md` 的单进程约束），前端与反向代理配置都要改 |
+| setup handler 也取 `State<ReadyAppState>`、允许 `ready` 为 `None` | 又把 `Option` 请回类型里，等于方案 A |
+| 在 setup 树挂完整 Emby 树 | 需要全部 46 个服务与鉴权链，与"setup 模式不暴露业务能力"相反 |
+| 修改 `tests/**` 的 3 处 `AppState::default()` 与 5 处断言 | 任务硬约束禁止；且兼容树已经能在不改测试的前提下把 `api_web`/`plugins` 组跑绿（§9.2） |
+
+### 9.4 需要所有者确认的决策点
+
+| # | 决策点 | 本设计建议 | 备选与代价 |
+| --- | --- | --- | --- |
+| **D1** | 是否接受"未就绪兼容树"这 ~40 行只为冻结测试存在的 `src` 代码？ | **接受**（§9.2）：它让 `tests/**` 一行不改，回滚边界也更清楚 | 备选：允许改 `tests/api_web/{web_static,api_error_contract}.rs`、`tests/plugins/danmaku_api.rs` 的 3 个构造点与若干断言，把那 6 条响应从 `src` 挪到测试里。代价：违反本任务硬约束，且 `tests/**` 是"ready 模式行为不变"的唯一证据，改它就削弱验收口径 |
+| **D2** | `main` 的模式判定失败时 fail-closed 到 **Ready** 是否同意？ | **同意 Ready**（§5.2）：setup 模式能创建首个管理员、改写数据库配置，是敏感方向 | 备选：fail 到 Setup，代价是把 setup 能力交给一个无法证明状态的服务实例 |
+| **D3** | setup 模式是否继续构建 46 个服务并启动全部后台 worker？ | **继续**（§4.3）：与今天逐字一致，首次扫描的 `ScanJobService` 接线不变 | 备选：setup 模式只建 7 个服务、只起索引 worker，代价是首次扫描后的封面/人物/首页读模型行为变化，需单独验收 |
+| **D4** | 是否接受把 `CoreState.database` 字段改名为 `database_slot` 并统一用方法读取（约 36 处文本）？ | **接受**（§2.1、R6）：消除 ready 模式下"字段 vs 方法"的歧义 | 备选：保留字段 + 只在 review 清单里禁止 ready 代码读字段，代价是没有编译器保护 |
+| **D5** | setup 树是否保留 3 条 Emby 公共发现路由？ | **保留**（§4.2 #11-13）：`StartupWizardCompleted:false` 是 Emby 的"向导未完成"约定 | 备选：全部 404，代价是 setup 期间 Emby 客户端从"服务器在、未初始化"变成"服务器不可用" |
+
+D1–D3 影响提交切分与验收口径，D4 只影响一个机械提交，D5 只影响 setup 树的 2 个 handler。
+
+## 10. 问题 9：测试策略
+
+验收要证明两件事，来源不同：
+
+| 验收主张 | 证据形式 | 是否新增代码 |
+| --- | --- | --- |
+| **A. setup 模式下业务路由确实未注册** | 新增 `src` 单元测试（`#[cfg(test)]`，在 `src/api/routes.rs` 里用 `tower::ServiceExt::oneshot` 直接打 `setup_router(...)`） | 新增 1 个 `src` 单测（允许：`src/**` 在阶段 2 可改，`tests/**` 不动） |
+| **B. ready 模式行为不变** | 现有 19 个集成测试 target **一行不改即通过** | 0（这正是"冻结测试"的价值） |
+
+### 10.1 证明 A：setup 树的路由断言（新增 `src` 单测）
+
+放在 `src/api/routes.rs` 的 `#[cfg(test)] mod tests`：
+
+```rust
+// 构造：与 src/api/legacy.rs:2509-2520 的 ready_test_state 同形（tempfile + Database::connect
+// + AppState::ready(...)），再 AppState::into_ready()? -> SetupState::from(...)
+let app = setup_router(setup_state);
+
+// 1) 未就绪模式下必须可用
+assert_eq!(oneshot(&app, get("/health/live")).status(), 200);
+// /health/ready 会检查 config_dir 是否存在（src/api/users.rs:159-172），构造前先 create_dir_all
+assert_eq!(oneshot(&app, get("/health/ready")).status(), 200);
+assert_eq!(oneshot(&app, get("/api/v1/version")).status(), 200);
+assert_eq!(oneshot(&app, get("/api/v1/setup/status")).status(), 200);
+assert_eq!(oneshot(&app, get("/api/v1/auth/me")).status(), 401);
+assert_eq!(oneshot(&app, get("/System/Ping")).status(), 200);
+assert_eq!(oneshot(&app, get("/System/Info/Public")).status(), 200);
+assert_eq!(oneshot(&app, get("/Users/Public")).status(), 200);
+
+// 2) 业务路由必须不存在（404 而非 401/403/503）
+let libraries = oneshot(&app, get("/api/v1/libraries"));
+assert_eq!(libraries.status(), 404);
+assert_eq!(json_body(&libraries)["error"]["code"], "NOT_FOUND");     // Lux 命名空间带错误信封
+assert_eq!(oneshot(&app, get("/api/v1/admin/navigation")).status(), 404);
+assert_eq!(oneshot(&app, get("/api/v1/home")).status(), 404);
+assert_eq!(oneshot(&app, post("/api/v1/auth/login")).status(), 404);
+let emby = oneshot(&app, get("/System/Info"));
+assert_eq!(emby.status(), 404);
+assert!(body_is_empty(&emby));                                       // Emby 命名空间裸 404
+```
+
+断言口径的三点说明：
+
+1. 断言的是 **404 而不是"任意非 200"**：这样任何"守卫又被写回来"（401/403/503）都会红，
+   能直接抓出批 1–9 的漏改。
+2. `GET /Users/Public` 断言 200 + `[]`：这是 setup 树与今天一致的部分（§4.2 #13）。
+3. SPA/静态（`GET /`）在 CI 里取决于 `web/dist` 是否存在（`src/api/legacy.rs:1391-1397` 的 `web_root()`，
+   可用 `LUX_WEB_DIR` 覆盖）。把它放进断言会让 `cargo test` 依赖前端产物，因此**不纳入**这个单测；
+   静态资源由现有 `tests/api_web/web_static.rs:9-49` 覆盖。
+
+同一个单测文件里再加两条不依赖 HTTP 的断言（成本近乎为零，防回归）：
+
+```rust
+// 同一份服务实例：ReadyAppState 与它派生出来的 SetupState 共享一个 Arc
+assert!(std::sync::Arc::ptr_eq(ready.services(), setup.inner_services()));
+// ready -> AppState 的迁移期 shim 也不复制服务
+let compat: AppState = FromRef::from_ref(&ready);
+assert!(std::sync::Arc::ptr_eq(ready.services(), compat.ready_services().unwrap()));
+```
+
+### 10.2 证明 B：现有集成测试不改即通过
+
+`docs/TEST-TARGETS.md` 的 12 组 + 7 个独立 binary 全跑一遍，**不改任何测试代码**：
+
+| 命令 | 覆盖与本设计相关的点 |
+| --- | --- |
+| `cargo test --locked --test api_web` | `api_error_contract`（§9.2 的 6 条契约）、`health`、`ready_version`、`web_static`、`response_compression`（ETag/压缩）、`acl`、`remote`、`web_auth`、`web_playback` |
+| `cargo test --locked --test storage database_setup_api::` | ready 树里 `/api/v1/setup/*` 仍可调、已完成时 409（§2.3 第 2 点） |
+| `cargo test --locked --test plugins danmaku_api::` | 未就绪兼容树 #6 与真实 handler 并存 |
+| `cargo test --locked --test admin` | 23 个管理端用例，覆盖 `require_admin` 迁移（批 1–6） |
+| `cargo test --locked --test auth_users` | `require_web_principal/csrf` 与 36 个 `users.rs` handler（批 9） |
+| `cargo test --locked --test emby` | Emby 树两次挂载 + 大小写归一化（批 7、R10） |
+| `cargo test --locked --test library` `--test metadata` `--test images` `--test playback` `--test scanner` `--test strm` | 批 2、4、5、8 的 handler |
+| `cargo test --locked --test shutdown` | **必须在 C1 与 C10 各跑一次**：它 spawn 真实二进制（`tests/shutdown.rs:59`），是唯一能证明 `serve` 签名改动没破坏关停/重启链路的测试 |
+| 独立 binary：`--test background_work_budget` `--test image_variants_perf` `--test performance` `--test postgres_database` `--test reidentify` `--test scanned_metadata` | `postgres_database` 需要外部 Postgres，按 `docs/TEST-TARGETS.md` §4 的环境要求执行；其余本地可跑 |
+
+C10 的全量门禁按 `AGENTS.md`：
+
+```bash
+cargo build --locked
+cargo test --locked --all-targets
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+python3 scripts/check-migration-parity.py
+python3 scripts/check-backend-branches.py
+```
+
+本机是 `arm64`/`aarch64-apple-darwin`（`uname -m`）；不要用本地 ARM 结果声明 NAS/x86 性能。
+`tests/**` 不做任何修改，也不新增集成测试文件——"setup 路由不存在"的证据放在 `src` 单测里。
+
+### 10.3 每个批次的回归节奏
+
+1. 批内：`cargo build --locked` + 该组窄命令（§8.4）。
+2. 批末：`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+3. C1、C5（`admin_users` 之后）、C10：加跑 `cargo test --locked --test api_web`，因为这三处最可能碰到
+   鉴权 helper 与 `require_admin` 的签名变化。
+4. 任何一批如果让 `api_error_contract`/`web_static`/`danmaku_api` 变红，先怀疑"是不是把未就绪兼容树
+   当成了业务树"（§9.1 R1/R2），不要改测试。
+
+### 10.4 不做的事
+
+- 不做"新旧两棵树对同一请求做差分比对"的自动化：`app_with_state` 在 C1 之后就是分派器，没有
+  "旧路径"可对照；等价证据是 §10.2 的全量集成测试（它们本身就是旧行为）。
+- 不为 setup 树引入性能基准：setup 模式请求量极小，`src/api/routes.rs:290` 的指标逻辑不动即可。
+- 不验证"setup 完成后进程真的重启"：那是第 ② 步（`docs/SETUP-RESTART-DESIGN.md` §6）的验收范围，
+  第 ③ 步只依赖"重启后进入 ready 模式"这一事实。
+
+## 附录 A：三种状态的关系与不变式
+
+| | `AppState`（兼容门面，`tests/**` 的构造入口） | `ReadyAppState`（ready 树的状态） | `SetupState`（setup 树的状态） |
+| --- | --- | --- | --- |
+| 字段 | `core: CoreState`、`database: Option<Database>`、`services: Option<Arc<ReadyServices>>` | `core`、`database: Database`、`services: Arc<ReadyServices>` | 内部包一个 `ReadyAppState`（§2.1），只暴露 4 个服务访问器 |
+| 谁构造 | `Default`、`ready*` 构造器、`main`（经 `build_app_state`） | `AppState::into_ready()` | `SetupState::from(ReadyAppState)` |
+| 谁消费 | `app_with_state`（分派）、`tests/**`、`main` 的关停路径 | `ready_router` | `setup_router` |
+| 服务可见性 | 46 个 `Option<&Service>` 访问器（迁移期） | 40 个 `&Service` + 6 个 `Option<&Service>` + `&Database` | `setup`/`database_setup`/`libraries`/`scan_jobs` + `database`（其余不可达） |
+| `Deref` | → `CoreState` | → `CoreState` | → `CoreState` |
+| 迁移期额外 impl | — | `FromRef<ReadyAppState> for AppState`、`FromRef<ReadyAppState> for SetupState` | `FromRef<SetupState> for CoreState`、`StateView` |
+
+不变式（实现时写进注释，review 时逐条核对）：
+
+1. `ReadyAppState` 一旦构造，`database` 与 `services` 永不为 `None`；`into_ready()` 是唯一的入口，
+   失败走启动错误（不 panic、不 `unwrap`）。
+2. 三种状态共享**同一个** `Arc<ReadyServices>`；任何转换只允许 `Arc::clone`（`Arc::ptr_eq` 由
+   `src/api/legacy.rs:2490-2507` 与新增单测守护）。
+3. `Arc::make_mut` 只允许在 `AppState` 的 builder 里、`into_ready()` 之前调用（§6）。
+4. 业务 handler 只出现在 `ready_router` 的注册里；`setup_router` 里出现的每个 handler 都必须在
+   §4.2 的表里有一行说明。
+5. 未就绪兼容树只允许合成 §9.2 的 6 条响应，不允许注册任何业务 handler。
+
+## 附录 B：测量命令（可复现 §1–§7 的数字）
+
+基线 `test` = `c4861069`，全部命令在仓库根目录执行。
+
+```bash
+# 命令 1：每个文件里带 State<AppState> 的 handler/extractor（合计 359）
+grep -rlc "State<AppState>" src/api | while read -r f; do
+  printf "%4d %s\n" "$(grep -c "State<AppState>" "$f")" "$f"
+done | sort -rn
+
+# 命令 2：取 &AppState 的 helper（合计 111）与其中跨文件被调用的（25）
+grep -rn "state: &AppState" src/api | wc -l            # 111（含换行参数，按函数计见正文方法）
+grep -rn "state: &AppState" src/api | cut -d: -f1 | sort | uniq -c | sort -rn
+
+# 命令 3：守卫计数（require_service! 303 = 301 调用点 + 2 处文档；else 守卫 110 = 108 + 2 处文档）
+grep -rn "require_service!" src/api | wc -l
+grep -rEn "state\.[a-z_]+\(\) else \{" src/api | wc -l
+grep -rn "require_service!(state.database)" src/api | wc -l                 # 121
+grep -rEn "require_service!\(state\.(image_writes|downloads|strm_playback)\)" src/api | wc -l   # 7
+
+# 命令 4：tests/** 的 AppState 构造点（3 / 8 / 163）
+grep -rn "AppState::default()" tests/ | wc -l
+grep -rn "\bapp()" tests/ | wc -l
+grep -rn "AppState::ready" tests/ | wc -l
+
+# 命令 5：CoreState.database 字段读取（改名 database_slot 的 36 处文本）
+grep -rn "state\.database\b" src/api |
+  grep -v "state\.database(" |
+  grep -v "require_service!(state.database)" | wc -l
+```
+
+计数口径说明：`State<AppState>` 的 359 处是"handler/extractor 出现次数"，与 §3.4 批次表的合计一致；
+`require_service!` 与 else 守卫各减去 2 处只出现在 `src/api/mod.rs` 的宏文档/宏体里的示例
+（`src/api/mod.rs:8`、`:53`），得到 301 与 108 的真实调用点。
