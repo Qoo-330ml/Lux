@@ -129,6 +129,36 @@ pub(crate) struct UpdateLibraryRequest {
     pub(crate) probe_concurrency: Option<i64>,
 }
 
+fn changed_library_fields(request: &UpdateLibraryRequest) -> Vec<&'static str> {
+    [
+        ("name", request.name.is_some()),
+        ("kind", request.kind.is_some()),
+        ("isEnabled", request.is_enabled.is_some()),
+        (
+            "realtimeWatchEnabled",
+            request.realtime_watch_enabled.is_some(),
+        ),
+        (
+            "realtimeMetadataAutoMatchEnabled",
+            request.realtime_metadata_auto_match_enabled.is_some(),
+        ),
+        (
+            "reconciliationSchedule",
+            request.reconciliation_schedule.is_some(),
+        ),
+        ("metadataSchedule", request.metadata_schedule.is_some()),
+        ("scraperId", request.scraper_id.is_some()),
+        ("scrapers", request.scrapers.is_some()),
+        ("chapterSourceId", request.chapter_source_id.is_some()),
+        ("mediaStrategy", request.media_strategy.is_some()),
+        ("scanConcurrency", request.scan_concurrency.is_some()),
+        ("probeConcurrency", request.probe_concurrency.is_some()),
+    ]
+    .into_iter()
+    .filter_map(|(field, changed)| changed.then_some(field))
+    .collect()
+}
+
 pub(crate) fn deserialize_optional_optional<'de, D, T>(
     deserializer: D,
 ) -> Result<Option<Option<T>>, D::Error>
@@ -421,7 +451,7 @@ pub(crate) async fn admin_create_library(
                 "LIBRARY_CREATED",
                 Some("library"),
                 Some(&library_id),
-                "{}",
+                &json!({"name": request.name, "kind": kind.as_str()}).to_string(),
             )
             .await;
             (
@@ -550,6 +580,7 @@ pub(crate) async fn admin_update_library(
     {
         return response;
     }
+    let changed_fields = changed_library_fields(&request);
     let settings = LibrarySettingsPatch {
         name: request.name,
         kind,
@@ -582,7 +613,7 @@ pub(crate) async fn admin_update_library(
                 "LIBRARY_UPDATED",
                 Some("library"),
                 Some(&target_id),
-                "{}",
+                &json!({"fields": changed_fields}).to_string(),
             )
             .await;
             (

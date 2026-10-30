@@ -3,6 +3,7 @@ mod admin_dashboard;
 mod admin_database_diagnostics;
 mod admin_events;
 mod admin_health;
+mod admin_library_audit;
 mod admin_mail_settings;
 mod admin_performance_metrics;
 mod admin_settings;

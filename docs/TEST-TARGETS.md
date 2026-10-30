@@ -8,7 +8,7 @@
 
 | 新 target | 领域 | 原文件数 | 测试数 |
 |---|---|---|---|
-| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 12 | 22 |
+| `--test admin` | 管理后台、日志导出、可观测性与运维事件 | 13 | 23 |
 | `--test api_web` | HTTP 契约（错误/限流/压缩/健康/远程策略）、Web 会话、Webhook | 13 | 39 |
 | `--test auth_users` | 认证、会话、登录背景、用户与用户设置、设备配对、界面偏好迁移 | 10 | 70 |
 | `--test emby` | Emby 兼容层（认证、系统信息、增量刷新、发现、多段播放、检索、下载） | 10 | 38 |
@@ -41,6 +41,7 @@ cargo test --locked --test <新 target> <旧名>::
 | `admin_database_diagnostics` | 1 | `cargo test --locked --test admin admin_database_diagnostics::` |
 | `admin_events` | 5 | `cargo test --locked --test admin admin_events::` |
 | `admin_health` | 1 | `cargo test --locked --test admin admin_health::` |
+| `admin_library_audit` | 1 | `cargo test --locked --test admin admin_library_audit::` |
 | `admin_mail_settings` | 1 | `cargo test --locked --test admin admin_mail_settings::` |
 | `admin_performance_metrics` | 1 | `cargo test --locked --test admin admin_performance_metrics::` |
 | `admin_settings` | 2 | `cargo test --locked --test admin admin_settings::` |
