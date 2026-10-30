@@ -237,6 +237,66 @@ struct MovieNfoWritebackRow {
     source: WritebackSourceRow,
 }
 
+/// Row of `find_download_source` and `find_download_source_by_id`: the kind and path of the source
+/// a download request should read.
+#[derive(Debug, sqlx::FromRow)]
+struct DownloadSourceRow {
+    source_kind: String,
+    root_path: String,
+    relative_path: String,
+}
+
+impl From<DownloadSourceRow> for StoredDownloadSource {
+    fn from(row: DownloadSourceRow) -> Self {
+        Self {
+            source_kind: row.source_kind,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
+/// Row of `find_authorized_playback_source`: the playable source of one item after the per-user
+/// library access filter.
+#[derive(Debug, sqlx::FromRow)]
+struct PlaybackSourceRow {
+    source_id: String,
+    source_kind: String,
+    container: Option<String>,
+    external_url: Option<String>,
+    root_path: String,
+    relative_path: String,
+}
+
+impl From<PlaybackSourceRow> for StoredPlaybackSource {
+    fn from(row: PlaybackSourceRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            source_kind: row.source_kind,
+            container: row.container,
+            external_url: row.external_url,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
+/// Row of `find_media_item_kind`: the item kind plus the season number only seasons carry.
+#[derive(Debug, sqlx::FromRow)]
+struct MediaItemKindRow {
+    item_type: String,
+    season_number: Option<i64>,
+}
+
+impl From<MediaItemKindRow> for StoredMediaItemKind {
+    fn from(row: MediaItemKindRow) -> Self {
+        Self {
+            item_type: row.item_type,
+            season_number: row.season_number,
+        }
+    }
+}
+
 /// Row of the three thumbnail-source pages: the preferred local file of an item plus the library
 /// strategy and scraper the thumbnail worker needs.
 #[derive(Debug, sqlx::FromRow)]
@@ -4810,7 +4870,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredDownloadSource>, StorageError> {
-        self.query(
+        self.query_as::<DownloadSourceRow>(
             "SELECT ms.source_kind,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -4824,13 +4884,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredDownloadSource {
-                source_kind: row.get("source_kind"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            })
-        })
+        .map(|row| row.map(StoredDownloadSource::from))
         .map_err(self.sqlx_err())
     }
 
@@ -5048,7 +5102,7 @@ impl Database {
              ORDER BY ms.is_default DESC, ms.id
              LIMIT 1"
         );
-        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query_as::<PlaybackSourceRow>(sqlx::AssertSqlSafe(query));
         statement = statement.bind(item_id);
         if !is_admin {
             statement = statement.bind(user_id);
@@ -5057,16 +5111,7 @@ impl Database {
         statement
             .fetch_optional(&self.pool)
             .await
-            .map(|row| {
-                row.map(|row| StoredPlaybackSource {
-                    source_id: row.get("source_id"),
-                    source_kind: row.get("source_kind"),
-                    container: row.get("container"),
-                    external_url: row.get("external_url"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-            })
+            .map(|row| row.map(StoredPlaybackSource::from))
             .map_err(self.sqlx_err())
     }
 
@@ -5075,7 +5120,7 @@ impl Database {
         item_id: &str,
         source_id: &str,
     ) -> Result<Option<StoredDownloadSource>, StorageError> {
-        self.query(
+        self.query_as::<DownloadSourceRow>(
             "SELECT ms.source_kind,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -5090,13 +5135,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredDownloadSource {
-                source_kind: row.get("source_kind"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            })
-        })
+        .map(|row| row.map(StoredDownloadSource::from))
         .map_err(self.sqlx_err())
     }
 
@@ -5156,17 +5195,14 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaItemKind>, StorageError> {
-        self.query("SELECT item_type, season_number FROM media_items WHERE id = ?")
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map(|row| {
-                row.map(|row| StoredMediaItemKind {
-                    item_type: row.get("item_type"),
-                    season_number: row.get("season_number"),
-                })
-            })
-            .map_err(self.sqlx_err())
+        self.query_as::<MediaItemKindRow>(
+            "SELECT item_type, season_number FROM media_items WHERE id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map(|row| row.map(StoredMediaItemKind::from))
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_first_episode_source_path(
@@ -11644,6 +11680,52 @@ mod tests {
             .list_strm_media_source_counts_for_libraries(&["flag-lib".to_owned()])
             .await?;
         assert_eq!(counts.get("flag-lib"), Some(&1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn download_playback_and_kind_rows_decode_the_same_source()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::test_database;
+
+        let (_temp, database) = test_database().await?;
+        seed_media_source_fixture(&database).await?;
+
+        let playback = database
+            .find_authorized_playback_source("path-movie", None, "admin", true)
+            .await?
+            .expect("playback source");
+        assert_eq!(playback.source_id, "path-source");
+        assert_eq!(playback.source_kind, "STRM_URL");
+        assert_eq!(playback.container, None);
+        assert_eq!(
+            playback.external_url.as_deref(),
+            Some("https://example.invalid/movie")
+        );
+        assert_eq!(playback.root_path, "/media");
+        assert_eq!(playback.relative_path, "Movie.strm");
+
+        let download = database
+            .find_download_source("path-movie")
+            .await?
+            .expect("download source");
+        assert_eq!(download.source_kind, "STRM_URL");
+        assert_eq!(download.root_path, "/media");
+        assert_eq!(download.relative_path, "Movie.strm");
+
+        let by_id = database
+            .find_download_source_by_id("path-movie", "path-source")
+            .await?
+            .expect("download source by id");
+        assert_eq!(by_id.source_kind, "STRM_URL");
+        assert_eq!(by_id.relative_path, "Movie.strm");
+
+        let kind = database
+            .find_media_item_kind("path-movie")
+            .await?
+            .expect("item kind");
+        assert_eq!(kind.item_type, "MOVIE");
+        assert_eq!(kind.season_number, None);
         Ok(())
     }
 
