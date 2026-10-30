@@ -49,9 +49,7 @@ pub(crate) async fn admin_start_item_scan(
         )
         .into_response();
     }
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     let job = match crate::application::admin_scan_jobs::start_item_folder_scan_job(
         scan_jobs,
         &item_id,
@@ -157,9 +155,7 @@ pub(crate) async fn admin_update_item_subtitle(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let title = request
         .title
         .as_deref()
@@ -241,9 +237,7 @@ pub(crate) async fn delete_media_item(
         )
         .into_response();
     }
-    let Some(deletion) = state.deletion.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let deletion = require_service!(state.deletion);
     let report = match crate::application::admin_media_mutations::delete_media_item(
         deletion,
         state.home.as_ref(),
@@ -403,9 +397,7 @@ pub(crate) async fn admin_list_item_merge_records(
         )
         .into_response();
     }
-    let Some(merge) = state.item_merge.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let merge = require_service!(state.item_merge);
     let offset = query.offset.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     match crate::application::admin_media_mutations::list_media_merge_records(
@@ -460,9 +452,7 @@ pub(crate) async fn admin_unmerge_items(
         )
         .into_response();
     }
-    let Some(merge) = state.item_merge.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let merge = require_service!(state.item_merge);
     let result = match crate::application::admin_media_mutations::unmerge_media_items(
         merge,
         state.home.as_ref(),

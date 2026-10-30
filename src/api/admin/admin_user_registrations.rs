@@ -47,9 +47,7 @@ async fn admin_list_user_registrations(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match list_pending_user_registrations(
         database,
         query.page.unwrap_or(1),
@@ -79,9 +77,7 @@ async fn admin_approve_user_registration(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match approve_pending_user_registration(
         database,
         &request_id,
@@ -116,9 +112,7 @@ async fn admin_reject_user_registration(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match reject_pending_user_registration(
         database,
         &request_id,

@@ -428,15 +428,9 @@ pub(super) async fn emby_library_virtual_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
+    let database = require_service!(state.database);
+    let access = require_service!(state.access);
     let media_strategy = match read_media_strategy_settings(database).await {
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -515,12 +509,8 @@ pub(super) async fn emby_library_selectable_media_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
+    let access = require_service!(state.access);
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
@@ -554,12 +544,8 @@ pub(super) async fn emby_library_media_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
+    let access = require_service!(state.access);
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
@@ -662,9 +648,7 @@ pub(super) async fn emby_persons(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -709,9 +693,7 @@ pub(super) async fn emby_persons(
             .into_response();
         }
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     let result = match parent_id.as_deref() {
         Some(parent_id) => {
             people
@@ -759,16 +741,12 @@ pub(super) async fn emby_person(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     match people
         .find_person(&library_ids, "Actor", &person_id_or_name)
         .await
@@ -1009,9 +987,7 @@ async fn emby_global_collection_library_detail(
     state: &AppState,
     principal: AccessPrincipal,
 ) -> Response {
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     match catalog.list_global_collection_cards(principal, 0, 1).await {
         Ok(page) if page.total > 0 => Json(emby_global_collection_library_json(
             &state.server_id,
@@ -1089,9 +1065,7 @@ pub(super) async fn emby_user_resume(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let page = match catalog
         .list_continue_watching(principal, &user_id, offset, limit)
         .await
@@ -1402,9 +1376,7 @@ pub(super) async fn emby_next_up_response(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let series_id = query.series_id.as_deref().map(emby_internal_id);
     match catalog
         .list_next_up(principal, user_id, series_id.as_deref(), offset, limit)
@@ -1454,9 +1426,7 @@ pub(super) async fn emby_show_seasons(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let series_id = emby_internal_id(&series_id);
     match catalog
         .list_children(principal, &series_id, "SEASON", offset, limit)
@@ -1502,9 +1472,7 @@ pub(super) async fn emby_show_episodes(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let series_id = emby_internal_id(&series_id);
     // Emby clients commonly serialize an unset season selector as `SeasonId=`.
     // Treat it the same as an omitted selector instead of looking up an empty ID.
@@ -1590,9 +1558,7 @@ pub(super) async fn emby_collection_children(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let collection_id = emby_internal_id(&collection_id);
     match catalog
         .list_collection_items(principal, &collection_id, offset, limit)
@@ -2002,9 +1968,7 @@ pub(super) async fn emby_items_counts(
             Err(status) => return status.into_response(),
         };
     let target_user_id = principal.user_id_string();
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let counts = match catalog
         .count_item_types(principal, &target_user_id, query.is_favorite)
         .await
@@ -2111,9 +2075,7 @@ async fn emby_global_collection_root_items_response(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let page = match catalog
         .list_global_collection_cards(principal, offset, limit)
         .await
@@ -2676,16 +2638,12 @@ pub(super) async fn emby_update_item(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     let update = PersonMetadataUpdate {
         name: request.name.trim().to_owned(),
         biography: request.overview,
@@ -2775,9 +2733,7 @@ pub(super) async fn emby_item_response(
                 if !library.is_enabled {
                     return StatusCode::NOT_FOUND.into_response();
                 }
-                let Some(access) = state.access.as_ref() else {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                };
+                let access = require_service!(state.access);
                 match access.can_view_library(principal, &internal_item_id).await {
                     Ok(true) => {}
                     Ok(false) => return StatusCode::NOT_FOUND.into_response(),
@@ -2805,9 +2761,7 @@ pub(super) async fn emby_item_response(
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     }
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let (catalog_item, resolved_from_media_source_id) =
         match catalog.find_item(principal, &internal_item_id).await {
             Ok(Some(item)) => (Some(item), false),
@@ -2878,9 +2832,7 @@ pub(super) async fn emby_item_response(
             Json(item_json).into_response()
         }
         Some(mut item) => {
-            let Some(database) = state.database.as_ref() else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
+            let database = require_service!(state.database);
             let work_plan = emby_item_detail_work_plan(fields);
             if work_plan.populate_image_tags
                 && catalog
@@ -2980,9 +2932,7 @@ pub(super) async fn emby_item_response(
             Json(item_json).into_response()
         }
         None => {
-            let Some(access) = state.access.as_ref() else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
+            let access = require_service!(state.access);
             let library_ids = match access.accessible_library_ids(principal).await {
                 Ok(library_ids) => library_ids,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -3015,9 +2965,7 @@ async fn emby_global_collection_item_detail(
     can_download: bool,
     can_delete: bool,
 ) -> Response {
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let card = match catalog
         .find_global_collection_card(principal, collection_item_id)
         .await

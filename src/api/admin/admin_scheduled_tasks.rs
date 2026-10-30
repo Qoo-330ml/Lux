@@ -107,9 +107,7 @@ pub(crate) async fn admin_run_scheduled_task(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(scheduled_tasks) = state.scheduled_tasks.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scheduled_tasks = require_service!(state.scheduled_tasks);
     let owner_type = request.owner_type.trim();
     let owner_id = request.owner_id.trim();
     let task_type = request.task_type.trim();
@@ -197,9 +195,7 @@ pub(crate) async fn admin_list_task_activity(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let activities =
         match crate::application::admin_task_activity::list_admin_task_activity(database).await {
             Ok(activities) => activities,
@@ -243,9 +239,7 @@ pub(crate) async fn admin_list_library_pipeline_activity(
         }
     };
     let page = offset / page_size + 1;
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::admin_task_activity::list_admin_library_pipeline_activity(
         database, page, page_size,
     )
@@ -448,9 +442,7 @@ pub(crate) async fn admin_list_scheduled_tasks(
             .into_response();
         }
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.list_scheduled_task_configs(offset, limit).await {
         Ok((tasks, total)) => Json(json!({
             "scheduledTasks": tasks.iter().map(scheduled_task_json).collect::<Vec<_>>(),
@@ -489,9 +481,7 @@ pub(crate) async fn admin_list_scheduled_task_plans(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_uppercase);
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database
         .list_scheduled_task_plans(offset, limit, task_type.as_deref(), query.search.as_deref())
         .await
@@ -553,9 +543,7 @@ pub(crate) async fn admin_create_scheduled_task_plan(
         Some(value) => Some(value.to_owned()),
         None => None,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let is_enabled = request.is_enabled.unwrap_or(schedule.is_some());
     let plan_request = crate::application::admin_scheduled_tasks::ScheduledTaskPlanCreate {
         task_type,
@@ -615,9 +603,7 @@ pub(crate) async fn admin_update_scheduled_task_plan(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let update = crate::application::admin_scheduled_tasks::ScheduledTaskPlanUpdate {
         name: request.name,
         schedule: request.schedule,
@@ -675,9 +661,7 @@ pub(crate) async fn admin_delete_scheduled_task_plan(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.delete_scheduled_task_plan(&plan_id).await {
         Ok(true) => {
             record_audit_event(
@@ -717,9 +701,7 @@ pub(crate) async fn admin_run_scheduled_task_plan(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let result = crate::application::admin_scheduled_tasks::run_scheduled_task_plan(
         database,
         state.scheduled_tasks.as_ref(),
