@@ -186,6 +186,66 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
     }
 }
 
+/// Row of `find_item_media_strategy_settings`: the library strategy plus the global fallback.
+#[derive(sqlx::FromRow)]
+struct ItemMediaStrategySettingsRow {
+    library_strategy: Option<String>,
+    global_strategy: Option<String>,
+}
+
+/// Row of `list_item_media_strategy_settings_by_ids`: the same projection keyed by item.
+#[derive(sqlx::FromRow)]
+struct ItemMediaStrategySettingsByIdRow {
+    item_id: String,
+    library_strategy: Option<String>,
+    global_strategy: Option<String>,
+}
+
+/// Row of `find_item_scan_source_path`.
+#[derive(sqlx::FromRow)]
+struct ItemScanPathRow {
+    library_id: String,
+    library_root_id: String,
+    relative_path: String,
+}
+
+impl From<ItemScanPathRow> for StoredItemScanPath {
+    fn from(row: ItemScanPathRow) -> Self {
+        Self {
+            library_id: row.library_id,
+            library_root_id: row.library_root_id,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
+/// Row of `find_folder_scan_path`: a folder item's library and folder identity key.
+#[derive(sqlx::FromRow)]
+struct FolderIdentityKeyRow {
+    library_id: String,
+    identity_key: String,
+}
+
+/// Row of `list_folder_scan_paths_page`.
+#[derive(sqlx::FromRow)]
+struct FolderScanPathRow {
+    id: String,
+    library_id: String,
+    parent_id: Option<String>,
+    title: String,
+    identity_key: String,
+}
+
+/// Row of `list_item_scraper_configurations_by_ids`.
+#[derive(sqlx::FromRow)]
+struct ItemScraperConfigurationRow {
+    item_id: String,
+    legacy_scraper_id: Option<String>,
+    selected_scraper_id: Option<String>,
+    position: Option<i64>,
+    role: Option<String>,
+}
+
 impl Database {
     pub(crate) async fn media_source_belongs_to_item(
         &self,
@@ -243,7 +303,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<(Option<String>, Option<String>)>, StorageError> {
-        self.query(
+        self.query_as::<ItemMediaStrategySettingsRow>(
             "SELECT libraries.media_strategy_json AS library_strategy,
                     server_settings.value AS global_strategy
              FROM media_items
@@ -255,7 +315,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(|row| (row.get("library_strategy"), row.get("global_strategy"))))
+        .map(|row| row.map(|row| (row.library_strategy, row.global_strategy)))
         .map_err(self.sqlx_err())
     }
 
@@ -263,7 +323,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredItemScanPath>, StorageError> {
-        self.query(
+        self.query_as::<ItemScanPathRow>(
             "SELECT source_item.library_id, fe.library_root_id, fe.relative_path
              FROM media_items source_item
              JOIN media_sources ms ON ms.item_id = source_item.id
@@ -288,13 +348,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredItemScanPath {
-                library_id: row.get("library_id"),
-                library_root_id: row.get("library_root_id"),
-                relative_path: row.get("relative_path"),
-            })
-        })
+        .map(|row| row.map(StoredItemScanPath::from))
         .map_err(self.sqlx_err())
     }
 
@@ -321,7 +375,8 @@ impl Database {
                  WHERE media_items.id IN ({placeholders})
                    AND media_items.removed_at IS NULL"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<ItemMediaStrategySettingsByIdRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -330,10 +385,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                strategies.insert(
-                    row.get("item_id"),
-                    (row.get("library_strategy"), row.get("global_strategy")),
-                );
+                strategies.insert(row.item_id, (row.library_strategy, row.global_strategy));
             }
         }
         Ok(strategies)
@@ -343,8 +395,8 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredItemScanPath>, StorageError> {
-        let Some((library_id, identity_key)) = self
-            .query(
+        let Some(row) = self
+            .query_as::<FolderIdentityKeyRow>(
                 "SELECT mi.library_id, mi.identity_key
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -357,27 +409,21 @@ impl Database {
             .fetch_optional(&self.pool)
             .await
             .map_err(self.sqlx_err())?
-            .map(|row| {
-                (
-                    row.get::<String, _>("library_id"),
-                    row.get::<String, _>("identity_key"),
-                )
-            })
         else {
             return Ok(None);
         };
-        let Some((library_root_id, relative_path)) = parse_folder_identity_key(&identity_key)
+        let Some((library_root_id, relative_path)) = parse_folder_identity_key(&row.identity_key)
         else {
             return Ok(None);
         };
         let Some(root) = self.find_library_root(&library_root_id).await? else {
             return Ok(None);
         };
-        if root.library_id != library_id {
+        if root.library_id != row.library_id {
             return Ok(None);
         }
         Ok(Some(StoredItemScanPath {
-            library_id,
+            library_id: row.library_id,
             library_root_id,
             relative_path,
         }))
@@ -421,7 +467,8 @@ impl Database {
              ORDER BY mi.identity_key, mi.id
              LIMIT ? OFFSET ?"
         );
-        let mut rows_statement = self.query(sqlx::AssertSqlSafe(rows_query));
+        let mut rows_statement =
+            self.query_as::<FolderScanPathRow>(sqlx::AssertSqlSafe(rows_query));
         for library_id in library_ids {
             rows_statement = rows_statement.bind(library_id);
         }
@@ -435,12 +482,12 @@ impl Database {
             .into_iter()
             .filter_map(|row| {
                 let (library_root_id, relative_path) =
-                    parse_folder_identity_key(row.get("identity_key"))?;
+                    parse_folder_identity_key(&row.identity_key)?;
                 Some(StoredFolderScanPath {
-                    id: row.get("id"),
-                    library_id: row.get("library_id"),
-                    parent_id: row.get("parent_id"),
-                    title: row.get("title"),
+                    id: row.id,
+                    library_id: row.library_id,
+                    parent_id: row.parent_id,
+                    title: row.title,
                     library_root_id,
                     relative_path,
                 })
@@ -588,7 +635,8 @@ impl Database {
                  WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
                  ORDER BY mi.id, ls.position"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<ItemScraperConfigurationRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -597,18 +645,22 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let item_id = row.get::<String, _>("item_id");
-                let legacy_scraper_id = row
-                    .get::<Option<String>, _>("legacy_scraper_id")
-                    .filter(|value| !value.trim().is_empty());
+                let ItemScraperConfigurationRow {
+                    item_id,
+                    legacy_scraper_id,
+                    selected_scraper_id,
+                    position,
+                    role,
+                } = row;
+                let legacy_scraper_id = legacy_scraper_id.filter(|value| !value.trim().is_empty());
                 let entry = configurations
                     .entry(item_id)
                     .or_insert_with(|| (Vec::new(), legacy_scraper_id.clone()));
-                if let Some(scraper_id) = row.get::<Option<String>, _>("selected_scraper_id") {
+                if let Some(scraper_id) = selected_scraper_id {
                     entry.0.push(StoredLibraryScraper {
                         scraper_id,
-                        position: row.get::<Option<i64>, _>("position").unwrap_or_default(),
-                        role: row.get::<Option<String>, _>("role").unwrap_or_default(),
+                        position: position.unwrap_or_default(),
+                        role: role.unwrap_or_default(),
                     });
                 }
             }
