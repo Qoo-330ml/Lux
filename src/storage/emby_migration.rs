@@ -6,6 +6,9 @@ use std::{
 #[cfg(test)]
 use super::StoredUserItemState;
 use super::{Database, StorageError};
+// Only the `EXPLAIN QUERY PLAN` assertion in the test module still reads a row by index; every
+// production query decodes through a named `FromRow` struct instead.
+#[cfg(test)]
 use sqlx::Row;
 
 const EMBY_MIGRATION_WRITE_BATCH_SIZE: usize = 100;
@@ -326,6 +329,425 @@ pub(crate) struct StoredMigrationPersonIdentity {
     pub provider_id: Option<String>,
 }
 
+/// Row of `find_emby_migration_source`.
+#[derive(sqlx::FromRow)]
+struct EmbyMigrationSourceRow {
+    source_base_url: String,
+    secret_ref: String,
+    source_label: String,
+    history_capability: String,
+}
+
+impl From<EmbyMigrationSourceRow> for StoredEmbyMigrationSource {
+    fn from(row: EmbyMigrationSourceRow) -> Self {
+        Self {
+            source_base_url: row.source_base_url,
+            secret_ref: row.secret_ref,
+            source_label: row.source_label,
+            history_capability: row.history_capability,
+        }
+    }
+}
+
+/// Row of `find_emby_migration_user_binding_by_username`.
+#[derive(sqlx::FromRow)]
+struct EmbyMigrationUserBindingRow {
+    lux_user_id: String,
+    source_base_url: String,
+    secret_ref: Option<String>,
+    emby_user_id: String,
+    emby_username: String,
+    password_pending: i64,
+}
+
+impl From<EmbyMigrationUserBindingRow> for StoredEmbyMigrationUserBinding {
+    fn from(row: EmbyMigrationUserBindingRow) -> Self {
+        Self {
+            lux_user_id: row.lux_user_id,
+            source_base_url: row.source_base_url,
+            secret_ref: row.secret_ref,
+            emby_user_id: row.emby_user_id,
+            emby_username: row.emby_username,
+            password_pending: row.password_pending != 0,
+        }
+    }
+}
+
+/// Row of `list_emby_migration_user_links`.
+#[derive(sqlx::FromRow)]
+struct EmbyMigrationUserLinkRow {
+    job_id: String,
+    emby_user_id: String,
+    emby_username: String,
+    lux_user_id: Option<String>,
+    status: String,
+    error: Option<String>,
+}
+
+impl From<EmbyMigrationUserLinkRow> for StoredEmbyMigrationUserLink {
+    fn from(row: EmbyMigrationUserLinkRow) -> Self {
+        Self {
+            job_id: row.job_id,
+            emby_user_id: row.emby_user_id,
+            emby_username: row.emby_username,
+            lux_user_id: row.lux_user_id,
+            status: row.status,
+            error: row.error,
+        }
+    }
+}
+
+/// Row of `find_emby_migration_job` and `list_emby_migration_jobs`.
+#[derive(sqlx::FromRow)]
+struct EmbyMigrationJobRow {
+    id: String,
+    plugin_id: String,
+    created_by_user_id: String,
+    source_label: String,
+    source_base_url: String,
+    secret_ref: String,
+    status: String,
+    phase: String,
+    dry_run: i64,
+    merge_policy: String,
+    scope_json: String,
+    emby_user_ids_json: String,
+    history_capability: String,
+    cursor_json: String,
+    processed_count: i64,
+    total_count: i64,
+    matched_count: i64,
+    skipped_count: i64,
+    failed_count: i64,
+    cancel_requested: i64,
+    error: Option<String>,
+}
+
+impl From<EmbyMigrationJobRow> for StoredEmbyMigrationJob {
+    fn from(row: EmbyMigrationJobRow) -> Self {
+        Self {
+            id: row.id,
+            plugin_id: row.plugin_id,
+            created_by_user_id: row.created_by_user_id,
+            source_label: row.source_label,
+            source_base_url: row.source_base_url,
+            secret_ref: row.secret_ref,
+            status: row.status,
+            phase: row.phase,
+            dry_run: row.dry_run != 0,
+            merge_policy: row.merge_policy,
+            scope_json: row.scope_json,
+            emby_user_ids_json: row.emby_user_ids_json,
+            history_capability: row.history_capability,
+            cursor_json: row.cursor_json,
+            processed_count: row.processed_count,
+            total_count: row.total_count,
+            matched_count: row.matched_count,
+            skipped_count: row.skipped_count,
+            failed_count: row.failed_count,
+            cancel_requested: row.cancel_requested != 0,
+            error: row.error,
+        }
+    }
+}
+
+/// Shared media-item identity columns of the candidate queries in
+/// `list_migration_media_identity_candidates_filtered`.
+#[derive(sqlx::FromRow)]
+struct MigrationMediaIdentityRow {
+    id: String,
+    item_type: String,
+    title: String,
+    production_year: Option<i64>,
+    provider_ids_json: Option<String>,
+    series_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    library_id: String,
+}
+
+impl From<MigrationMediaIdentityRow> for StoredMigrationMediaIdentity {
+    fn from(row: MigrationMediaIdentityRow) -> Self {
+        Self {
+            id: row.id,
+            library_id: row.library_id,
+            item_type: row.item_type,
+            title: row.title,
+            production_year: row.production_year,
+            provider_ids_json: row.provider_ids_json,
+            series_id: row.series_id,
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+        }
+    }
+}
+
+/// Row of the exact-sort-title candidate query; it also selects `sort_title`
+/// because the caller re-verifies the fuzzy title match in Rust.
+#[derive(sqlx::FromRow)]
+struct MigrationMediaIdentityTitleRow {
+    id: String,
+    item_type: String,
+    title: String,
+    sort_title: String,
+    production_year: Option<i64>,
+    provider_ids_json: Option<String>,
+    series_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    library_id: String,
+}
+
+impl From<MigrationMediaIdentityTitleRow> for StoredMigrationMediaIdentity {
+    fn from(row: MigrationMediaIdentityTitleRow) -> Self {
+        Self {
+            id: row.id,
+            library_id: row.library_id,
+            item_type: row.item_type,
+            title: row.title,
+            production_year: row.production_year,
+            provider_ids_json: row.provider_ids_json,
+            series_id: row.series_id,
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+        }
+    }
+}
+
+/// Row of the provider-ID candidate query. It carries the joined provider
+/// columns so one row can both key the provider index and build the identity.
+#[derive(sqlx::FromRow)]
+struct MigrationMediaIdentityProviderRow {
+    id: String,
+    item_type: String,
+    title: String,
+    production_year: Option<i64>,
+    provider_ids_json: Option<String>,
+    series_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    library_id: String,
+    provider: String,
+    provider_id: String,
+}
+
+impl MigrationMediaIdentityProviderRow {
+    /// Splits the joined row into the provider index key and the identity it
+    /// belongs to, keeping the column-to-field mapping in one place.
+    fn into_provider_candidate(self) -> ((String, String, String), StoredMigrationMediaIdentity) {
+        let key = (
+            self.item_type.clone(),
+            self.provider.clone(),
+            self.provider_id.clone(),
+        );
+        let identity = StoredMigrationMediaIdentity {
+            id: self.id,
+            library_id: self.library_id,
+            item_type: self.item_type,
+            title: self.title,
+            production_year: self.production_year,
+            provider_ids_json: self.provider_ids_json,
+            series_id: self.series_id,
+            season_number: self.season_number,
+            episode_number: self.episode_number,
+        };
+        (key, identity)
+    }
+}
+
+/// Row of the provider-identity candidate query in
+/// `list_migration_person_identity_candidates`.
+#[derive(sqlx::FromRow)]
+struct MigrationPersonIdentityProviderRow {
+    id: String,
+    display_name: String,
+    provider: String,
+    provider_id: String,
+}
+
+impl From<MigrationPersonIdentityProviderRow> for StoredMigrationPersonIdentity {
+    fn from(row: MigrationPersonIdentityProviderRow) -> Self {
+        Self {
+            id: row.id,
+            display_name: row.display_name,
+            provider: Some(row.provider),
+            provider_id: Some(row.provider_id),
+        }
+    }
+}
+
+/// Row of the normalized-name candidate query in
+/// `list_migration_person_identity_candidates`.
+#[derive(sqlx::FromRow)]
+struct MigrationPersonIdentityNameRow {
+    id: String,
+    display_name: String,
+}
+
+impl From<MigrationPersonIdentityNameRow> for StoredMigrationPersonIdentity {
+    fn from(row: MigrationPersonIdentityNameRow) -> Self {
+        Self {
+            id: row.id,
+            display_name: row.display_name,
+            provider: None,
+            provider_id: None,
+        }
+    }
+}
+
+/// Row of `list_emby_migration_item_matches`.
+#[derive(sqlx::FromRow)]
+struct EmbyMigrationItemMatchRow {
+    job_id: String,
+    emby_item_id: String,
+    emby_item_type: String,
+    lux_item_id: Option<String>,
+    match_method: String,
+    confidence: Option<i64>,
+    status: String,
+    detail_json: String,
+}
+
+impl From<EmbyMigrationItemMatchRow> for StoredEmbyMigrationItemMatch {
+    fn from(row: EmbyMigrationItemMatchRow) -> Self {
+        Self {
+            job_id: row.job_id,
+            emby_item_id: row.emby_item_id,
+            emby_item_type: row.emby_item_type,
+            lux_item_id: row.lux_item_id,
+            match_method: row.match_method,
+            confidence: row.confidence,
+            status: row.status,
+            detail_json: row.detail_json,
+        }
+    }
+}
+
+/// Row of `list_emby_migration_person_favorites`.
+#[derive(sqlx::FromRow)]
+struct EmbyMigrationPersonFavoriteRow {
+    job_id: String,
+    emby_user_id: String,
+    emby_person_id: String,
+    emby_person_name: String,
+    lux_user_id: Option<String>,
+    lux_person_id: Option<String>,
+    provider_ids_json: String,
+    match_method: String,
+    confidence: Option<i64>,
+    status: String,
+    state_hash: String,
+    detail_json: String,
+    error: Option<String>,
+}
+
+impl From<EmbyMigrationPersonFavoriteRow> for StoredEmbyMigrationPersonFavorite {
+    fn from(row: EmbyMigrationPersonFavoriteRow) -> Self {
+        Self {
+            job_id: row.job_id,
+            emby_user_id: row.emby_user_id,
+            emby_person_id: row.emby_person_id,
+            emby_person_name: row.emby_person_name,
+            lux_user_id: row.lux_user_id,
+            lux_person_id: row.lux_person_id,
+            provider_ids_json: row.provider_ids_json,
+            match_method: row.match_method,
+            confidence: row.confidence,
+            status: row.status,
+            state_hash: row.state_hash,
+            detail_json: row.detail_json,
+            error: row.error,
+        }
+    }
+}
+
+/// Row of `list_emby_migration_import_records`.
+#[derive(sqlx::FromRow)]
+struct EmbyMigrationImportRecordRow {
+    job_id: String,
+    emby_user_id: String,
+    emby_item_id: String,
+    lux_user_id: String,
+    lux_item_id: String,
+    state_hash: String,
+    status: String,
+    error: Option<String>,
+}
+
+impl From<EmbyMigrationImportRecordRow> for StoredEmbyMigrationImportRecord {
+    fn from(row: EmbyMigrationImportRecordRow) -> Self {
+        Self {
+            job_id: row.job_id,
+            emby_user_id: row.emby_user_id,
+            emby_item_id: row.emby_item_id,
+            lux_user_id: row.lux_user_id,
+            lux_item_id: row.lux_item_id,
+            state_hash: row.state_hash,
+            status: row.status,
+            error: row.error,
+        }
+    }
+}
+
+/// Row of `find_user_item_state_for_migration`; the three `0`/`1` columns keep
+/// their integer type so the boolean conversion stays where it was.
+#[cfg(test)]
+#[derive(sqlx::FromRow)]
+struct MigrationUserItemStateRow {
+    position_ticks: i64,
+    is_played: i64,
+    is_favorite: i64,
+    hide_from_resume: i64,
+    play_count: i64,
+    last_played_at: Option<i64>,
+    version: i64,
+}
+
+#[cfg(test)]
+impl From<MigrationUserItemStateRow> for StoredUserItemState {
+    fn from(row: MigrationUserItemStateRow) -> Self {
+        Self {
+            position_ticks: row.position_ticks,
+            is_played: row.is_played != 0,
+            is_favorite: row.is_favorite != 0,
+            hide_from_resume: row.hide_from_resume != 0,
+            play_count: row.play_count,
+            last_played_at: row.last_played_at,
+            version: row.version,
+        }
+    }
+}
+
+/// Row of `list_playback_history_events`.
+#[derive(sqlx::FromRow)]
+struct PlaybackHistoryEventRow {
+    id: String,
+    user_id: String,
+    item_id: String,
+    event_type: String,
+    position_ticks: i64,
+    duration_ticks: Option<i64>,
+    occurred_at: i64,
+    source: String,
+    source_event_key: String,
+}
+
+impl From<PlaybackHistoryEventRow> for StoredPlaybackHistoryEvent {
+    fn from(row: PlaybackHistoryEventRow) -> Self {
+        Self {
+            id: row.id,
+            user_id: row.user_id,
+            item_id: row.item_id,
+            event_type: row.event_type,
+            position_ticks: row.position_ticks,
+            duration_ticks: row.duration_ticks,
+            occurred_at: row.occurred_at,
+            source: row.source,
+            source_event_key: row.source_event_key,
+        }
+    }
+}
+
 impl Database {
     pub(crate) async fn upsert_emby_migration_source(
         &self,
@@ -355,22 +777,15 @@ impl Database {
         &self,
         source_base_url: &str,
     ) -> Result<Option<StoredEmbyMigrationSource>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationSourceRow>(
             "SELECT source_base_url, secret_ref, source_label, history_capability
              FROM emby_migration_sources WHERE source_base_url = ?",
         )
         .bind(source_base_url)
         .fetch_optional(self.pool())
         .await
-        .map(|row| {
-            row.map(|row| StoredEmbyMigrationSource {
-                source_base_url: row.get("source_base_url"),
-                secret_ref: row.get("secret_ref"),
-                source_label: row.get("source_label"),
-                history_capability: row.get("history_capability"),
-            })
-        })
-        .map_err(storage_error)
+        .map(|row| row.map(StoredEmbyMigrationSource::from))
+        .map_err(self.sqlx_err())
     }
 
     #[cfg(test)]
@@ -481,7 +896,7 @@ impl Database {
         &self,
         username: &str,
     ) -> Result<Option<StoredEmbyMigrationUserBinding>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationUserBindingRow>(
             "SELECT lux_user_id, source_base_url, secret_ref, emby_user_id,
                     emby_username, password_pending
              FROM emby_migration_user_bindings
@@ -491,17 +906,8 @@ impl Database {
         .bind(username)
         .fetch_optional(self.pool())
         .await
-        .map(|row| {
-            row.map(|row| StoredEmbyMigrationUserBinding {
-                lux_user_id: row.get("lux_user_id"),
-                source_base_url: row.get("source_base_url"),
-                secret_ref: row.get("secret_ref"),
-                emby_user_id: row.get("emby_user_id"),
-                emby_username: row.get("emby_username"),
-                password_pending: row.get::<i64, _>("password_pending") != 0,
-            })
-        })
-        .map_err(storage_error)
+        .map(|row| row.map(StoredEmbyMigrationUserBinding::from))
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_emby_migration_password_ready(
@@ -560,7 +966,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<StoredEmbyMigrationJob>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationJobRow>(
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
                     secret_ref, status, phase, dry_run, merge_policy, scope_json, cursor_json,
                     emby_user_ids_json,
@@ -571,8 +977,8 @@ impl Database {
         .bind(id)
         .fetch_optional(self.pool())
         .await
-        .map(|row| row.map(stored_migration_job))
-        .map_err(storage_error)
+        .map(|row| row.map(StoredEmbyMigrationJob::from))
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_emby_migration_jobs(
@@ -580,7 +986,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredEmbyMigrationJob>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationJobRow>(
             "SELECT id, plugin_id, created_by_user_id, source_label, source_base_url,
                     secret_ref, status, phase, dry_run, merge_policy, scope_json, cursor_json,
                     emby_user_ids_json,
@@ -593,8 +999,8 @@ impl Database {
         .bind(offset)
         .fetch_all(self.pool())
         .await
-        .map(|rows| rows.into_iter().map(stored_migration_job).collect())
-        .map_err(storage_error)
+        .map(|rows| rows.into_iter().map(StoredEmbyMigrationJob::from).collect())
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_emby_migration_job_status(
@@ -758,7 +1164,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredEmbyMigrationUserLink>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationUserLinkRow>(
             "SELECT job_id, emby_user_id, emby_username, lux_user_id, status, error
              FROM emby_migration_user_links
              WHERE job_id = ?
@@ -772,17 +1178,10 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredEmbyMigrationUserLink {
-                    job_id: row.get("job_id"),
-                    emby_user_id: row.get("emby_user_id"),
-                    emby_username: row.get("emby_username"),
-                    lux_user_id: row.get("lux_user_id"),
-                    status: row.get("status"),
-                    error: row.get("error"),
-                })
+                .map(StoredEmbyMigrationUserLink::from)
                 .collect()
         })
-        .map_err(storage_error)
+        .map_err(self.sqlx_err())
     }
 
     /// Resolve only candidates referenced by the current source page. Provider
@@ -851,7 +1250,8 @@ impl Database {
                      WHERE mi.removed_at IS NULL AND ({predicates}){}",
                     migration_library_filter_sql(library_chunk),
                 );
-                let mut query = self.query(sqlx::AssertSqlSafe(sql));
+                let mut query =
+                    self.query_as::<MigrationMediaIdentityProviderRow>(sqlx::AssertSqlSafe(sql));
                 for (item_type, provider, provider_id) in chunk {
                     query = query.bind(item_type).bind(provider).bind(provider_id);
                 }
@@ -860,29 +1260,18 @@ impl Database {
                         query = query.bind(library_id);
                     }
                 }
-                for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
-                    let id: String = row.get("id");
-                    let provider_key = (
-                        row.get("item_type"),
-                        row.get("provider"),
-                        row.get("provider_id"),
-                    );
+                for row in query
+                    .fetch_all(self.pool())
+                    .await
+                    .map_err(self.sqlx_err())?
+                {
+                    let (provider_key, identity) = row.into_provider_candidate();
                     provider_candidates_by_key
                         .entry(provider_key)
                         .or_default()
-                        .insert(id.clone());
-                    if seen_ids.insert(id.clone()) {
-                        identities.push(StoredMigrationMediaIdentity {
-                            id,
-                            library_id: row.get("library_id"),
-                            item_type: row.get("item_type"),
-                            title: row.get("title"),
-                            production_year: row.get("production_year"),
-                            provider_ids_json: row.get("provider_ids_json"),
-                            series_id: row.get("series_id"),
-                            season_number: row.get("season_number"),
-                            episode_number: row.get("episode_number"),
-                        });
+                        .insert(identity.id.clone());
+                    if seen_ids.insert(identity.id.clone()) {
+                        identities.push(identity);
                     }
                 }
             }
@@ -940,7 +1329,8 @@ impl Database {
                      WHERE mi.removed_at IS NULL AND ({predicates}){}",
                     migration_library_filter_sql(library_chunk),
                 );
-                let mut query = self.query(sqlx::AssertSqlSafe(sql));
+                let mut query =
+                    self.query_as::<MigrationMediaIdentityTitleRow>(sqlx::AssertSqlSafe(sql));
                 for (lookup, sort_title) in chunk {
                     query = query
                         .bind(&lookup.item_type)
@@ -953,16 +1343,15 @@ impl Database {
                         query = query.bind(library_id);
                     }
                 }
-                for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
-                    let row_item_type: String = row.get("item_type");
-                    let row_sort_title: String = row.get("sort_title");
-                    let row_production_year: Option<i64> = row.get("production_year");
-                    let row_season_number: Option<i64> = row.get("season_number");
-                    let row_episode_number: Option<i64> = row.get("episode_number");
+                for row in query
+                    .fetch_all(self.pool())
+                    .await
+                    .map_err(self.sqlx_err())?
+                {
                     for (lookup, sort_title) in chunk {
                         let same_year = lookup.production_year.is_none()
-                            || row_production_year.is_none()
-                            || lookup.production_year.zip(row_production_year).is_some_and(
+                            || row.production_year.is_none()
+                            || lookup.production_year.zip(row.production_year).is_some_and(
                                 |(lookup_year, row_year)| {
                                     (i128::from(lookup_year) - i128::from(row_year)).abs() <= 1
                                 },
@@ -970,31 +1359,21 @@ impl Database {
                         let same_episode = lookup.item_type != "EPISODE"
                             || (lookup
                                 .season_number
-                                .is_none_or(|number| row_season_number == Some(number))
+                                .is_none_or(|number| row.season_number == Some(number))
                                 && lookup
                                     .episode_number
-                                    .is_none_or(|number| row_episode_number == Some(number)));
-                        if lookup.item_type == row_item_type
-                            && *sort_title == row_sort_title
+                                    .is_none_or(|number| row.episode_number == Some(number)));
+                        if lookup.item_type == row.item_type
+                            && *sort_title == row.sort_title
                             && same_year
                             && same_episode
                         {
                             exact_title_lookups.insert((*lookup).clone());
                         }
                     }
-                    let id: String = row.get("id");
-                    if seen_ids.insert(id.clone()) {
-                        identities.push(StoredMigrationMediaIdentity {
-                            id,
-                            library_id: row.get("library_id"),
-                            item_type: row_item_type,
-                            title: row.get("title"),
-                            production_year: row_production_year,
-                            provider_ids_json: row.get("provider_ids_json"),
-                            series_id: row.get("series_id"),
-                            season_number: row.get("season_number"),
-                            episode_number: row.get("episode_number"),
-                        });
+                    let identity = StoredMigrationMediaIdentity::from(row);
+                    if seen_ids.insert(identity.id.clone()) {
+                        identities.push(identity);
                     }
                 }
             }
@@ -1020,7 +1399,8 @@ impl Database {
                      WHERE mi.removed_at IS NULL AND ({predicates}){}",
                     migration_library_filter_sql(library_chunk),
                 );
-                let mut query = self.query(sqlx::AssertSqlSafe(sql));
+                let mut query =
+                    self.query_as::<MigrationMediaIdentityRow>(sqlx::AssertSqlSafe(sql));
                 for lookup in chunk {
                     query = query
                         .bind(&lookup.item_type)
@@ -1033,20 +1413,14 @@ impl Database {
                         query = query.bind(library_id);
                     }
                 }
-                for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
-                    let id: String = row.get("id");
-                    if seen_ids.insert(id.clone()) {
-                        identities.push(StoredMigrationMediaIdentity {
-                            id,
-                            library_id: row.get("library_id"),
-                            item_type: row.get("item_type"),
-                            title: row.get("title"),
-                            production_year: row.get("production_year"),
-                            provider_ids_json: row.get("provider_ids_json"),
-                            series_id: row.get("series_id"),
-                            season_number: row.get("season_number"),
-                            episode_number: row.get("episode_number"),
-                        });
+                for row in query
+                    .fetch_all(self.pool())
+                    .await
+                    .map_err(self.sqlx_err())?
+                {
+                    let identity = StoredMigrationMediaIdentity::from(row);
+                    if seen_ids.insert(identity.id.clone()) {
+                        identities.push(identity);
                     }
                 }
             }
@@ -1090,20 +1464,18 @@ impl Database {
                  JOIN person_identities pi ON pi.person_id = p.id
                  WHERE p.status = 'ACTIVE' AND ({predicates})"
             );
-            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            let mut query =
+                self.query_as::<MigrationPersonIdentityProviderRow>(sqlx::AssertSqlSafe(sql));
             for (provider, provider_id) in chunk {
                 query = query.bind(provider).bind(provider_id);
             }
-            for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
-                let provider: String = row.get("provider");
-                let provider_id: String = row.get("provider_id");
-                resolved_provider_keys.insert((provider.clone(), provider_id.clone()));
-                let identity = StoredMigrationPersonIdentity {
-                    id: row.get("id"),
-                    display_name: row.get("display_name"),
-                    provider: Some(provider),
-                    provider_id: Some(provider_id),
-                };
+            for row in query
+                .fetch_all(self.pool())
+                .await
+                .map_err(self.sqlx_err())?
+            {
+                resolved_provider_keys.insert((row.provider.clone(), row.provider_id.clone()));
+                let identity = StoredMigrationPersonIdentity::from(row);
                 let key = (
                     identity.id.clone(),
                     identity.provider.clone(),
@@ -1142,17 +1514,17 @@ impl Database {
                  FROM people p
                  WHERE p.status = 'ACTIVE' AND ({predicates})"
             );
-            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            let mut query =
+                self.query_as::<MigrationPersonIdentityNameRow>(sqlx::AssertSqlSafe(sql));
             for name in chunk {
                 query = query.bind(name);
             }
-            for row in query.fetch_all(self.pool()).await.map_err(storage_error)? {
-                let identity = StoredMigrationPersonIdentity {
-                    id: row.get("id"),
-                    display_name: row.get("display_name"),
-                    provider: None,
-                    provider_id: None,
-                };
+            for row in query
+                .fetch_all(self.pool())
+                .await
+                .map_err(self.sqlx_err())?
+            {
+                let identity = StoredMigrationPersonIdentity::from(row);
                 let key = (identity.id.clone(), None, None);
                 if seen.insert(key) {
                     identities.push(identity);
@@ -1174,7 +1546,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredEmbyMigrationItemMatch>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationItemMatchRow>(
             "SELECT job_id, emby_item_id, emby_item_type, lux_item_id,
                     match_method, confidence, status, detail_json
              FROM emby_migration_item_matches
@@ -1189,19 +1561,10 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredEmbyMigrationItemMatch {
-                    job_id: row.get("job_id"),
-                    emby_item_id: row.get("emby_item_id"),
-                    emby_item_type: row.get("emby_item_type"),
-                    lux_item_id: row.get("lux_item_id"),
-                    match_method: row.get("match_method"),
-                    confidence: row.get("confidence"),
-                    status: row.get("status"),
-                    detail_json: row.get("detail_json"),
-                })
+                .map(StoredEmbyMigrationItemMatch::from)
                 .collect()
         })
-        .map_err(storage_error)
+        .map_err(self.sqlx_err())
     }
 
     #[cfg(test)]
@@ -1253,7 +1616,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredEmbyMigrationPersonFavorite>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationPersonFavoriteRow>(
             "SELECT job_id, emby_user_id, emby_person_id, emby_person_name,
                     lux_user_id, lux_person_id, provider_ids_json, match_method,
                     confidence, status, state_hash, detail_json, error
@@ -1269,24 +1632,10 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredEmbyMigrationPersonFavorite {
-                    job_id: row.get("job_id"),
-                    emby_user_id: row.get("emby_user_id"),
-                    emby_person_id: row.get("emby_person_id"),
-                    emby_person_name: row.get("emby_person_name"),
-                    lux_user_id: row.get("lux_user_id"),
-                    lux_person_id: row.get("lux_person_id"),
-                    provider_ids_json: row.get("provider_ids_json"),
-                    match_method: row.get("match_method"),
-                    confidence: row.get("confidence"),
-                    status: row.get("status"),
-                    state_hash: row.get("state_hash"),
-                    detail_json: row.get("detail_json"),
-                    error: row.get("error"),
-                })
+                .map(StoredEmbyMigrationPersonFavorite::from)
                 .collect()
         })
-        .map_err(storage_error)
+        .map_err(self.sqlx_err())
     }
 
     /// Commits all writes produced for one source page atomically.
@@ -1781,7 +2130,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredEmbyMigrationImportRecord>, StorageError> {
-        self.query(
+        self.query_as::<EmbyMigrationImportRecordRow>(
             "SELECT job_id, emby_user_id, emby_item_id, lux_user_id, lux_item_id,
                     state_hash, status, error
              FROM emby_migration_import_records
@@ -1796,19 +2145,10 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredEmbyMigrationImportRecord {
-                    job_id: row.get("job_id"),
-                    emby_user_id: row.get("emby_user_id"),
-                    emby_item_id: row.get("emby_item_id"),
-                    lux_user_id: row.get("lux_user_id"),
-                    lux_item_id: row.get("lux_item_id"),
-                    state_hash: row.get("state_hash"),
-                    status: row.get("status"),
-                    error: row.get("error"),
-                })
+                .map(StoredEmbyMigrationImportRecord::from)
                 .collect()
         })
-        .map_err(storage_error)
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_emby_migration_handled_item_ids(
@@ -1865,7 +2205,7 @@ impl Database {
         user_id: &str,
         item_id: &str,
     ) -> Result<Option<StoredUserItemState>, StorageError> {
-        self.query(
+        self.query_as::<MigrationUserItemStateRow>(
             "SELECT position_ticks, is_played, is_favorite, hide_from_resume, play_count,
                     last_played_at, version
              FROM user_item_state WHERE user_id = ? AND item_id = ?",
@@ -1874,18 +2214,8 @@ impl Database {
         .bind(item_id)
         .fetch_optional(self.pool())
         .await
-        .map(|row| {
-            row.map(|row| StoredUserItemState {
-                position_ticks: row.get("position_ticks"),
-                is_played: row.get::<i64, _>("is_played") != 0,
-                is_favorite: row.get::<i64, _>("is_favorite") != 0,
-                hide_from_resume: row.get::<i64, _>("hide_from_resume") != 0,
-                play_count: row.get("play_count"),
-                last_played_at: row.get("last_played_at"),
-                version: row.get("version"),
-            })
-        })
-        .map_err(storage_error)
+        .map(|row| row.map(StoredUserItemState::from))
+        .map_err(self.sqlx_err())
     }
 
     #[cfg(test)]
@@ -2048,7 +2378,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredPlaybackHistoryEvent>, StorageError> {
-        self.query(
+        self.query_as::<PlaybackHistoryEventRow>(
             "SELECT id, user_id, item_id, event_type, position_ticks, duration_ticks,
                     occurred_at, source, source_event_key
              FROM playback_history_events
@@ -2063,20 +2393,10 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredPlaybackHistoryEvent {
-                    id: row.get("id"),
-                    user_id: row.get("user_id"),
-                    item_id: row.get("item_id"),
-                    event_type: row.get("event_type"),
-                    position_ticks: row.get("position_ticks"),
-                    duration_ticks: row.get("duration_ticks"),
-                    occurred_at: row.get("occurred_at"),
-                    source: row.get("source"),
-                    source_event_key: row.get("source_event_key"),
-                })
+                .map(StoredPlaybackHistoryEvent::from)
                 .collect()
         })
-        .map_err(storage_error)
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_emby_migration_jobs(&self) -> Result<i64, StorageError> {
@@ -2187,32 +2507,6 @@ fn migration_library_filter_sql(library_ids: Option<&[String]>) -> String {
         .collect::<Vec<_>>()
         .join(", ");
     format!(" AND mi.library_id IN ({placeholders})")
-}
-
-fn stored_migration_job(row: sqlx::any::AnyRow) -> StoredEmbyMigrationJob {
-    StoredEmbyMigrationJob {
-        id: row.get("id"),
-        plugin_id: row.get("plugin_id"),
-        created_by_user_id: row.get("created_by_user_id"),
-        source_label: row.get("source_label"),
-        source_base_url: row.get("source_base_url"),
-        secret_ref: row.get("secret_ref"),
-        status: row.get("status"),
-        phase: row.get("phase"),
-        dry_run: row.get::<i64, _>("dry_run") != 0,
-        merge_policy: row.get("merge_policy"),
-        scope_json: row.get("scope_json"),
-        emby_user_ids_json: row.get("emby_user_ids_json"),
-        history_capability: row.get("history_capability"),
-        cursor_json: row.get("cursor_json"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        matched_count: row.get("matched_count"),
-        skipped_count: row.get("skipped_count"),
-        failed_count: row.get("failed_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-    }
 }
 
 fn storage_error(source: sqlx::Error) -> StorageError {
