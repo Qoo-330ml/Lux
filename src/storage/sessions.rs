@@ -9,6 +9,38 @@ const MAX_LISTED_PLAYBACK_SESSIONS: i64 = 500;
 /// A single item source should never accumulate more active playback sessions than this.
 const MAX_SESSIONS_PER_SOURCE: i64 = 32;
 
+/// Row of the per-user playback policy read by
+/// [`Database::reserve_playback_admission`]; `can_play` stays the raw `0`/`1` integer so the
+/// conversion to [`bool`] happens in one place.
+#[derive(Debug, sqlx::FromRow)]
+struct PlaybackPolicyRow {
+    can_play: i64,
+    max_simultaneous_playbacks: i64,
+}
+
+/// Row of the active-playback aggregation read by
+/// [`Database::reserve_playback_admission`]: `session_is_active` is `1` when the requested
+/// session already holds an admission.
+#[derive(Debug, sqlx::FromRow)]
+struct PlaybackAdmissionCountsRow {
+    active_count: i64,
+    session_is_active: i64,
+}
+
+/// Row of the `RETURNING` clause of [`Database::record_playback_event`]'s user-item-state upsert.
+#[derive(Debug, sqlx::FromRow)]
+struct PlaySessionPointerRow {
+    last_play_session_id: String,
+}
+
+/// Row of the container-wide played aggregation read by
+/// [`Database::sync_played_container_states`].
+#[derive(Debug, sqlx::FromRow)]
+struct PlayedParentStateRow {
+    parent_id: String,
+    is_played: i64,
+}
+
 impl Database {
     pub(crate) async fn list_current_user_playback_sessions(
         &self,
@@ -115,7 +147,7 @@ impl Database {
             "SELECT can_play, max_simultaneous_playbacks FROM users WHERE id = ?{row_lock}"
         );
         let policy = self
-            .query(sqlx::AssertSqlSafe(policy_query))
+            .query_as::<PlaybackPolicyRow>(sqlx::AssertSqlSafe(policy_query))
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
@@ -124,8 +156,8 @@ impl Database {
             transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(None);
         };
-        let can_play = policy.get::<i64, _>("can_play") != 0;
-        let limit = policy.get::<i64, _>("max_simultaneous_playbacks");
+        let can_play = policy.can_play != 0;
+        let limit = policy.max_simultaneous_playbacks;
         let now = now.max(0);
         let stale_before = now.saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
         self.query(
@@ -138,7 +170,7 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         let active_sessions = self
-            .query(
+            .query_as::<PlaybackAdmissionCountsRow>(
                 "SELECT COUNT(*) AS active_count,
                         COALESCE(MAX(CASE WHEN play_session_id = ? THEN 1 ELSE 0 END), 0)
                             AS session_is_active
@@ -158,8 +190,8 @@ impl Database {
             .fetch_one(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let active_count = active_sessions.get::<i64, _>("active_count");
-        let session_is_active = active_sessions.get::<i64, _>("session_is_active") != 0;
+        let active_count = active_sessions.active_count;
+        let session_is_active = active_sessions.session_is_active != 0;
         let decision = if !can_play {
             Some(PlaybackAdmissionDecision::Denied(
                 PlaybackAdmissionDenialReason::PlaybackDisabled,
@@ -449,7 +481,7 @@ impl Database {
              RETURNING last_play_session_id"
         );
         let persisted_session = self
-            .query(sqlx::AssertSqlSafe(user_item_state_query))
+            .query_as::<PlaySessionPointerRow>(sqlx::AssertSqlSafe(user_item_state_query))
             .bind(event.user_id)
             .bind(event.item_id)
             .bind(event.position_ticks)
@@ -457,9 +489,9 @@ impl Database {
             .fetch_optional(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let event_session_is_current = persisted_session.as_ref().is_some_and(|row| {
-            row.get::<String, _>("last_play_session_id") == event.play_session_id
-        });
+        let event_session_is_current = persisted_session
+            .as_ref()
+            .is_some_and(|row| row.last_play_session_id == event.play_session_id);
         if auto_played && event_session_is_current {
             self.query(
                 "UPDATE user_item_state
@@ -511,7 +543,7 @@ impl Database {
             .collect::<Vec<_>>()
             .join(", ");
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
-        let mut parent_state_query = self.query(sqlx::AssertSqlSafe(format!(
+        let parent_state_sql = format!(
             "WITH parent_scope AS (
                  SELECT id, item_type FROM media_items WHERE id IN ({parent_placeholders})
              ), eligible AS (
@@ -537,7 +569,9 @@ impl Database {
                     COALESCE(parent_states.is_played, 0) AS is_played
              FROM parent_scope
              LEFT JOIN parent_states ON parent_states.parent_id = parent_scope.id"
-        )));
+        );
+        let mut parent_state_query =
+            self.query_as::<PlayedParentStateRow>(sqlx::AssertSqlSafe(parent_state_sql));
         for parent_id in &parent_ids {
             parent_state_query = parent_state_query.bind(parent_id);
         }
@@ -547,12 +581,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
             .into_iter()
-            .map(|row| {
-                (
-                    row.get::<String, _>("parent_id"),
-                    row.get::<i64, _>("is_played"),
-                )
-            })
+            .map(|row| (row.parent_id, row.is_played))
             .collect::<Vec<_>>();
 
         let values = std::iter::repeat_n("(?, ?, ?, CASE WHEN ? = 1 THEN 1 ELSE 0 END, CASE WHEN ? = 1 THEN unixepoch() ELSE NULL END)", parent_states.len())
