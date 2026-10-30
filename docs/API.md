@@ -377,6 +377,12 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   服务端先检查条目/媒体库 ACL，再按 0→4 选择最低成本计划。响应包含 `sessionId`、`playSessionId`、`tier`、
   `expiresAt`、`sourceId` 和 `plan`。`plan.type` 为 `DIRECT`、`SERVER_HLS` 或 `UNSUPPORTED`；后者带稳定的
   `reason`，且不会创建播放会话或 FFmpeg 进程。
+- `DIRECT` 计划除 `url`、`proxyUrl`、`rangeUrl`（旧字段，保留一个版本）外还带有序的 `candidates`：
+  `[{ "kind": "proxy|lux|origin", "url": "..." }]`。`proxy` 是标准 Emby `/Videos/{id}/stream?MediaSourceId=...` 入口，
+  带 `PlaySessionId`、`DeviceId`、`UserId`、`static=true`，以及一个播放专用短期 `api_key`（`luxpb_{条目}_{随机串}`），
+  供前置的 302 软件回查 `Items/{id}`；该令牌绑定当前条目、有效期不超过会话到期时间（至多 12 小时），只能访问
+  `Items/{id}`、`Users/{id}/Items/{id}`、`Videos/{id}/stream|original` 与 `Auth/Keys`，会话停止后立即作废。`lux` 是
+  Lux 自己的签名入口；`origin` 是 HTTP(S) `.strm` 的目标地址，仅作最后手段。令牌无法签发（黑名单命中等）时省略 `proxy`。
 - 档位 0 是原始文件 Range 直放（客户端 HEVC/MKV fallback 仍属于此档）；档位 1 是视频/音频 copy 的
   fMP4/CMAF HLS；档位 2 是视频 copy、音频转码；档位 3 是管理员配置且运行时确认可用的硬件转码；档位 4 是
   Jellyfin FFmpeg 软件转码。服务端 HLS 只为当前会话生成临时 `index.m3u8`、`init.mp4` 和 `.m4s`，不生成永久副本。

@@ -26,7 +26,7 @@ struct ManifestDiscoveryObservationInput<'slice, 'data> {
 }
 
 impl Database {
-    #[allow(dead_code)] // Kept for focused storage contract tests.
+    #[cfg(test)]
     pub(crate) async fn commit_scan_manifest_discovery_chunk(
         &self,
         chunk: &NewScanManifestDiscoveryChunk<'_>,

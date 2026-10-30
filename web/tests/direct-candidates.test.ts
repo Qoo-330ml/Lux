@@ -27,6 +27,29 @@ describe("directCandidates", () => {
     expect(list[2].url).toBe("https://cdn.example.test/v.mp4");
   });
 
+  it("uses the server-ordered candidates when the plan carries them", () => {
+    const list = directCandidates(
+      direct({
+        proxyUrl: "/legacy",
+        candidates: [
+          { kind: "proxy", url: "/Videos/1/stream?api_key=luxpb_1_x" },
+          { kind: "lux", url: "/api/v1/playback/sessions/s1/direct" },
+          { kind: "origin", url: "https://cdn.example.test/v.mp4" },
+          { kind: "unknown", url: "/ignored" },
+          { kind: "lux", url: "" },
+        ],
+      }),
+      remoteHttp,
+    );
+    expect(list.map((entry) => entry.kind)).toEqual(["proxy", "lux", "origin"]);
+    expect(list[0].url).toBe("/Videos/1/stream?api_key=luxpb_1_x");
+  });
+
+  it("falls back to the legacy fields when the candidate list is empty", () => {
+    const list = directCandidates(direct({ candidates: [], proxyUrl: "/Videos/2/stream" }), pathStrm);
+    expect(list.map((entry) => entry.kind)).toEqual(["proxy", "lux"]);
+  });
+
   it("keeps the origin as the only candidate when the plan has no proxy URL", () => {
     expect(directCandidates(direct(), remoteHttp)).toEqual([
       { kind: "origin", url: "https://cdn.example.test/v.mp4" },

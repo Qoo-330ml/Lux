@@ -9,7 +9,6 @@ pub(crate) const CATALOG_OUTBOX_KIND: &str = "catalog";
 /// shape bumps `READ_MODEL_SCHEMA_VERSION` instead, which forces a full rebuild.
 pub(crate) const CATALOG_ITEMS_INCREMENTAL_CONSUMER: &str = "catalog_items_incremental@1";
 
-#[allow(dead_code)] // LUX-864 wires the consumer.
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
 pub(crate) struct CatalogOutboxEntry {
     pub(crate) id: i64,
@@ -18,7 +17,6 @@ pub(crate) struct CatalogOutboxEntry {
     pub(crate) library_id: Option<String>,
 }
 
-#[allow(dead_code)] // LUX-864 wires the consumer.
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
 pub(crate) struct CatalogConsumerState {
     pub(crate) name: String,
@@ -27,9 +25,9 @@ pub(crate) struct CatalogConsumerState {
     pub(crate) last_error: Option<String>,
 }
 
-#[allow(dead_code)] // LUX-864 wires the consumer.
 impl Database {
     /// Appends one derived-data event and returns its sequence number.
+    #[cfg(test)]
     pub(crate) async fn append_catalog_outbox(
         &self,
         kind: &str,
@@ -197,7 +195,7 @@ pub(crate) struct CatalogReadModelSummary {
 }
 
 impl Database {
-    #[allow(dead_code)] // used by rebuild tests and diagnostics
+    #[cfg(test)]
     pub(crate) async fn catalog_items_count(&self) -> Result<i64, StorageError> {
         self.query_scalar("SELECT COUNT(*) FROM catalog_items")
             .fetch_one(&self.pool)
@@ -395,7 +393,7 @@ impl Database {
         transaction.commit().await.map_err(sqlx_error)
     }
 
-    #[allow(dead_code)] // used by the read-model reset path in LUX-865
+    #[cfg(test)]
     pub(crate) async fn truncate_catalog_read_model(&self) -> Result<(), StorageError> {
         self.query("DELETE FROM catalog_item_stats")
             .execute(&self.pool)
@@ -462,7 +460,6 @@ pub(crate) struct ReadModelPageQuery<'a> {
 impl Database {
     /// Shadow query for the default library list: ids and total only, so it can be compared with
     /// the authoritative path without changing the response.
-    #[allow(dead_code)] // wired by the shadow comparison in the catalog service
     pub(crate) async fn shadow_catalog_library_page(
         &self,
         page: &ReadModelPageQuery<'_>,
@@ -561,7 +558,6 @@ pub(crate) struct RecentReadModelQuery<'a> {
 }
 
 impl Database {
-    #[allow(dead_code)] // wired by the `on` switch for the recently-added rail
     pub(crate) async fn list_recent_read_model_ids(
         &self,
         query: &RecentReadModelQuery<'_>,
@@ -728,7 +724,6 @@ pub(crate) struct RecentByLibraryReadModelQuery<'a> {
 }
 
 impl Database {
-    #[allow(dead_code)] // wired by the `on` switch for the per-library rail
     pub(crate) async fn list_recent_read_model_ids_by_library(
         &self,
         query: &RecentByLibraryReadModelQuery<'_>,
@@ -853,7 +848,6 @@ struct ReadModelSourceRow {
 
 impl Database {
     /// Builds the legacy row shape from `catalog_items` plus one batched source/stream query.
-    #[allow(dead_code)] // wired by the `on` mode switch
     pub(crate) async fn list_catalog_rows_from_read_model(
         &self,
         page: &ReadModelPageQuery<'_>,
@@ -864,7 +858,6 @@ impl Database {
     }
 
     /// Single-item variant used by the detail route.
-    #[allow(dead_code)] // wired by the `on` detail switch
     pub(crate) async fn find_catalog_rows_from_read_model(
         &self,
         item_id: &str,

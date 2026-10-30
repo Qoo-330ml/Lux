@@ -21,6 +21,13 @@ export function directCandidates(
   source: MediaSource | undefined,
 ): DirectCandidate[] {
   if (plan?.type !== "DIRECT") return [];
+  const served = (plan.candidates ?? []).filter(
+    (entry): entry is DirectCandidate =>
+      KINDS.some((kind) => kind === entry.kind) && typeof entry.url === "string" && entry.url !== "",
+  );
+  // The server orders the ladder (and decides which entries exist); the legacy fields below are
+  // only read when it did not send one.
+  if (served.length > 0) return served;
   const origin = isRemoteHttpStrmSource(source) ? source?.externalUrl ?? null : null;
   const candidates: DirectCandidate[] = [];
   if (plan.proxyUrl) candidates.push({ kind: "proxy", url: plan.proxyUrl });

@@ -605,7 +605,6 @@ impl Database {
         Ok(true)
     }
 
-    #[allow(dead_code)] // LUX-267 writes the computed manifest delta set through this boundary.
     pub(crate) async fn insert_scan_manifest_deltas(
         &self,
         manifest_id: &str,

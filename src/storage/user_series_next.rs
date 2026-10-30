@@ -7,8 +7,8 @@
 
 use super::*;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
-#[allow(dead_code)] // read back by the storage regression tests
 pub(crate) struct StoredUserSeriesNext {
     pub(crate) user_id: String,
     pub(crate) series_id: String,
@@ -51,8 +51,8 @@ fn placeholders(count: usize) -> String {
         .join(", ")
 }
 
-#[allow(dead_code)] // exercised by the storage regression tests
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn upsert_user_series_next(
         &self,
         user_id: &str,
@@ -86,6 +86,7 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_user_series_next(
         &self,
         user_id: &str,
@@ -108,6 +109,7 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    #[cfg(test)]
     pub(crate) async fn delete_user_series_next(
         &self,
         user_id: &str,

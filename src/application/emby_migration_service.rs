@@ -2027,15 +2027,6 @@ impl EmbyMigrationService {
         Ok(index)
     }
 
-    #[allow(dead_code)]
-    async fn load_person_identity_index(
-        &self,
-    ) -> Result<MigrationPersonIdentityIndex, EmbyMigrationServiceError> {
-        Ok(MigrationPersonIdentityIndex::new(
-            self.database.list_migration_person_identities().await?,
-        ))
-    }
-
     fn prefetch_migration_page(
         &self,
         source: &EmbyMigrationSource,
@@ -3710,7 +3701,6 @@ fn merge_policy_name(policy: MigrationMergePolicy) -> &'static str {
     }
 }
 
-#[allow(dead_code)]
 fn history_capability_name(capability: HistoryCapability) -> &'static str {
     match capability {
         HistoryCapability::ItemState => "ITEM_STATE",

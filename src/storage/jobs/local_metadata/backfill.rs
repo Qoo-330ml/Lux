@@ -31,7 +31,7 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // Exercised by storage tests for backfill-root idempotency.
+    #[cfg(test)]
     pub(crate) async fn ensure_scan_local_metadata_backfill_root(
         &self,
         library_root_id: &str,
@@ -164,7 +164,7 @@ impl Database {
         }
     }
 
-    #[allow(dead_code)] // Exercised by storage tests for the default completion transition.
+    #[cfg(test)]
     pub(crate) async fn complete_scan_local_metadata_backfill_page(
         &self,
         page: &StoredScanLocalMetadataBackfillPage,
@@ -210,7 +210,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    #[allow(dead_code)] // Exercised by storage tests for the default failure transition.
+    #[cfg(test)]
     pub(crate) async fn fail_scan_local_metadata_backfill_page(
         &self,
         page: &StoredScanLocalMetadataBackfillPage,

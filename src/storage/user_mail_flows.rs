@@ -5,9 +5,8 @@
 
 use super::*;
 
-// LUX-784 consumes these methods while resolving queued invitation and verification mail.
-#[allow(dead_code)]
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn create_mail_challenge(
         &self,
         challenge: NewMailChallenge<'_>,
@@ -1100,6 +1099,7 @@ impl Database {
         .transpose()
     }
 
+    #[cfg(test)]
     pub(crate) async fn consume_mail_challenge(
         &self,
         id: &str,
@@ -1128,6 +1128,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn revoke_mail_challenges(
         &self,
         kind: MailChallengeKind,
@@ -1190,7 +1191,6 @@ fn user_registration_permission_snapshot(
     Ok(snapshot)
 }
 
-#[allow(dead_code)] // LUX-808 and LUX-812 consume this request workflow.
 impl Database {
     async fn cancel_user_registration_mail(
         &self,
@@ -1411,7 +1411,6 @@ impl Database {
     }
 }
 
-#[allow(dead_code)] // LUX-808 and LUX-812 consume these registration transitions.
 impl Database {
     pub(crate) async fn queue_user_registration_resend(
         &self,
@@ -2186,7 +2185,6 @@ impl Database {
     }
 }
 
-#[allow(dead_code)] // LUX-812 and the registration expiry worker consume these transitions.
 impl Database {
     pub(crate) async fn reject_user_registration_request(
         &self,
@@ -2274,6 +2272,7 @@ impl Database {
         Ok(UserRegistrationRejectResult::Rejected)
     }
 
+    #[cfg(test)]
     pub(crate) async fn expire_user_registration_requests(
         &self,
         now: i64,
@@ -2338,8 +2337,6 @@ struct RegistrationModeRecord {
     version: i64,
 }
 
-// LUX-803 consumes these versioned settings without changing the other settings keys.
-#[allow(dead_code)]
 impl Database {
     pub(crate) async fn registration_mode(
         &self,

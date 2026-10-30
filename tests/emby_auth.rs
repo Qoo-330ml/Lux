@@ -2205,6 +2205,7 @@ async fn playback_token_is_confined_to_the_playback_allow_list()
     let token = auth
         .issue_playback_token(
             &user,
+            "00000000-0000-0000-0000-000000000001",
             "play-session-1",
             &playback_device(),
             playback_token_expiry(),
@@ -2267,6 +2268,24 @@ async fn playback_token_is_confined_to_the_playback_allow_list()
         .send()
         .await?;
     assert_ne!(stream.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    // The token is bound to one item: the same routes answer 401 for any other item.
+    for path in [
+        "/emby/Items/00000000-0000-0000-0000-000000000002",
+        "/emby/Users/00000000-0000-0000-0000-000000000001/Items/00000000-0000-0000-0000-000000000002",
+        "/emby/Videos/00000000-0000-0000-0000-000000000002/stream",
+    ] {
+        let response = client
+            .get(format!("http://{address}{path}"))
+            .query(&[("api_key", token.as_str())])
+            .send()
+            .await?;
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::UNAUTHORIZED,
+            "{path}"
+        );
+    }
 
     // Anything else, including an Emby path Lux never registered, must not accept the token.
     for path in [

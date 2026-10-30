@@ -159,8 +159,6 @@ pub(in crate::storage::repository::jobs) fn sidecar_target_query(values: &str) -
 }
 
 impl Database {
-    // These durable queue operations are wired into scanner dispatch in LUX-539.
-    #[allow(dead_code)]
     pub(crate) async fn record_scan_job_file_change(
         &self,
         job_id: &str,
@@ -208,7 +206,6 @@ impl Database {
         Ok(result.rows_affected() > 0)
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn list_pending_scan_job_file_changes(
         &self,
         job_id: &str,
@@ -258,7 +255,6 @@ impl Database {
             .collect())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn requeue_running_scan_job_file_changes(
         &self,
         job_id: &str,
@@ -275,7 +271,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn set_scan_job_file_change_state(
         &self,
         job_id: &str,

@@ -1478,8 +1478,6 @@ impl WebPlaybackSessionService {
             .await?;
         // The playback-only Emby token exists solely to carry this session's media URLs, so it
         // must not outlive it, even if the caller forgets to drop the URL.
-        // The playback-only Emby token exists solely to carry this session's media URLs, so it
-        // must not outlive it, even if the caller forgets to drop the URL.
         self.database
             .revoke_playback_access_tokens(session_id)
             .await?;
@@ -2319,6 +2317,7 @@ mod tests {
             tokens.push(
                 auth.issue_playback_token(
                     &owner,
+                    "100",
                     session_id,
                     &device,
                     unix_timestamp() + 900,

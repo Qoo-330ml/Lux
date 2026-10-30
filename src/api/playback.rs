@@ -3679,6 +3679,7 @@ async fn create_web_playback_session_json(
         })
         .await
         .map_err(|error| web_playback_error(headers, error))?;
+    let mut authorization_device_id = None;
     if !created.id.is_empty() {
         let (device_id, client_name) =
             match web_playback_authorization_context(headers, state, &user_id).await {
@@ -3704,6 +3705,7 @@ async fn create_web_playback_session_json(
                 .await;
             return Err(web_playback_error(headers, error));
         }
+        authorization_device_id = device_id;
     }
     if let WebPlaybackPlan::ServerHls { tier } = &created.plan {
         if source.source_kind != "LOCAL_FILE" {
@@ -3805,10 +3807,30 @@ async fn create_web_playback_session_json(
             } else {
                 None
             };
+            let direct_url = web_playback_resource_url(
+                service,
+                &created.id,
+                "direct",
+                web_playback_resource_expiry(),
+            );
+            let candidates = web_direct_candidates(
+                headers,
+                state,
+                service,
+                user,
+                item_id,
+                source,
+                &created,
+                authorization_device_id.as_deref(),
+                direct_url.as_deref(),
+                proxy_url.as_deref(),
+            )
+            .await;
             json!({
                 "type": "DIRECT",
-                "url": web_playback_resource_url(service, &created.id, "direct", web_playback_resource_expiry()),
+                "url": direct_url,
                 "proxyUrl": proxy_url,
+                "candidates": candidates,
                 "rangeUrl": (source.source_kind == "STRM_URL"
                     && source.external_url.as_deref().is_some_and(|target| {
                         matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
@@ -3840,6 +3862,92 @@ async fn create_web_playback_session_json(
         "plan": plan,
         "sourceId": created.media_source_id,
     }))
+}
+
+/// Ordered Direct Play candidates: `proxy` is the standard Emby stream URL a 302 proxy intercepts
+/// (carrying a short-lived playback-only token bound to this item), `lux` is Lux's own signed
+/// entry, and `origin` is the `.strm` target itself, offered last and only for HTTP(S) targets.
+/// A candidate that cannot be built (no token service, blacklisted client) is simply left out.
+#[allow(clippy::too_many_arguments)]
+async fn web_direct_candidates(
+    headers: &HeaderMap,
+    state: &AppState,
+    service: &crate::application::playback::session::WebPlaybackSessionService,
+    user: &UserRecord,
+    item_id: &str,
+    source: &crate::storage::StoredPlaybackSource,
+    created: &crate::application::playback::session::CreatedWebPlaybackSession,
+    device_id: Option<&str>,
+    lux_url: Option<&str>,
+    proxy_path: Option<&str>,
+) -> Vec<Value> {
+    let mut candidates = Vec::new();
+    if proxy_path.is_some()
+        && !created.id.is_empty()
+        && let Some(url) = web_proxy_candidate_url(
+            headers, state, service, user, item_id, source, created, device_id,
+        )
+        .await
+    {
+        candidates.push(json!({ "kind": "proxy", "url": url }));
+    }
+    if let Some(url) = lux_url {
+        candidates.push(json!({ "kind": "lux", "url": url }));
+    }
+    if let Some(target) = source.external_url.as_deref()
+        && matches!(classify_strm_target(target).kind, StrmTargetKind::Url)
+    {
+        candidates.push(json!({ "kind": "origin", "url": target }));
+    }
+    candidates
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn web_proxy_candidate_url(
+    headers: &HeaderMap,
+    state: &AppState,
+    service: &crate::application::playback::session::WebPlaybackSessionService,
+    user: &UserRecord,
+    item_id: &str,
+    source: &crate::storage::StoredPlaybackSource,
+    created: &crate::application::playback::session::CreatedWebPlaybackSession,
+    device_id: Option<&str>,
+) -> Option<String> {
+    let auth = state.emby_auth.as_ref()?;
+    let client_ip = super::request_access_ip(headers, state).await.ok()?;
+    let device = crate::auth::emby::EmbyDeviceInfo {
+        client: "Lux Web".to_owned(),
+        device: "Browser".to_owned(),
+        device_id: device_id.map_or_else(|| created.id.clone(), str::to_owned),
+        version: "1".to_owned(),
+        user_id: None,
+    };
+    let public_item_id = super::emby_catalog::emby_public_id(item_id);
+    let token = auth
+        .issue_playback_token(
+            user,
+            &public_item_id,
+            &created.id,
+            &device,
+            created.expires_at,
+            client_ip,
+        )
+        .await
+        .ok()??;
+    super::emby_catalog::emby_signed_direct_stream_url_parts(
+        service,
+        item_id,
+        super::emby_catalog::EmbyStreamSourceParts {
+            id: &source.source_id,
+            kind: &source.source_kind,
+            container: source.container.as_deref(),
+        },
+        user,
+        &created.play_session_id,
+        created.expires_at,
+        Some(&token),
+        &device.device_id,
+    )
 }
 
 async fn validate_web_audio_stream(

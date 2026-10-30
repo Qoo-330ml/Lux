@@ -151,7 +151,6 @@ impl Database {
             })
     }
 
-    #[allow(dead_code)] // LUX-266 uses this to resume and report manifest progress.
     pub(crate) async fn get_scan_manifest(
         &self,
         id: &str,
@@ -763,7 +762,6 @@ impl Database {
         transaction.commit().await.map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // Lifecycle owners use this compare-and-swap in LUX-266 onward.
     pub(crate) async fn transition_scan_manifest_state(
         &self,
         id: &str,

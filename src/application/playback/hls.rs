@@ -2210,7 +2210,8 @@ fn video_filter_chain(encoding: &FfmpegEncodingOptions, tier: ServerTier) -> Opt
     }
     let upload = match encoding.hardware_encoder.as_deref() {
         Some("h264_vaapi") => Some("format=nv12,hwupload".to_owned()),
-        Some("h264_qsv") => Some("hwupload=extra_hw_frames=64,format=qsv".to_owned()),
+        // Upload 8-bit NV12 like VAAPI: QSV rejects RGB/BGRA surfaces, and h264 output is 8-bit.
+        Some("h264_qsv") => Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv".to_owned()),
         _ => None,
     };
     match (scale, upload) {
@@ -2237,7 +2238,8 @@ fn hardware_probe_args(encoding: &FfmpegEncodingOptions) -> Vec<String> {
         "-f".to_owned(),
         "lavfi".to_owned(),
         "-i".to_owned(),
-        "testsrc=size=320x240:rate=30:duration=0.3".to_owned(),
+        // Decoded video is yuv420p; RGB frames make QSV fail on upload even when it works.
+        "testsrc=size=320x240:rate=30:duration=0.3,format=yuv420p".to_owned(),
         "-frames:v".to_owned(),
         "1".to_owned(),
     ]);
@@ -2251,15 +2253,34 @@ fn hardware_probe_args(encoding: &FfmpegEncodingOptions) -> Vec<String> {
     args
 }
 
-/// Keeps the last FFmpeg error line for the admin UI without dumping the whole log.
+/// Keeps the most useful FFmpeg error lines for the admin UI without dumping the whole log.
+///
+/// FFmpeg ends a failed run with generic "Nothing was written into output file" lines; the real
+/// cause (missing device, driver, permission) comes before them, so those lines are only used
+/// when nothing else was reported.
 fn sanitize_probe_error(stderr: &str) -> String {
-    let line = stderr
+    const GENERIC: [&str; 2] = ["Nothing was written into output file", "Conversion failed!"];
+    let lines: Vec<&str> = stderr
         .lines()
-        .rev()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("FFmpeg 未给出错误信息");
-    let cleaned: String = line
+        .filter(|line| !line.is_empty())
+        .collect();
+    let informative: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !GENERIC.iter().any(|generic| line.contains(generic)))
+        .collect();
+    let chosen = if informative.is_empty() {
+        lines
+    } else {
+        informative
+    };
+    if chosen.is_empty() {
+        return "FFmpeg 未给出错误信息".to_owned();
+    }
+    let tail = &chosen[chosen.len().saturating_sub(3)..];
+    let cleaned: String = tail
+        .join(" | ")
         .chars()
         .map(|character| {
             if character.is_control() {
@@ -2268,7 +2289,7 @@ fn sanitize_probe_error(stderr: &str) -> String {
                 character
             }
         })
-        .take(240)
+        .take(400)
         .collect();
     cleaned.trim().to_owned()
 }
@@ -2648,6 +2669,20 @@ fn available_free_bytes(_path: &Path) -> Result<u64, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_error_prefers_the_cause_over_ffmpeg_closing_lines() {
+        let stderr = "Failed to open VAAPI device /dev/dri/renderD128: Permission denied\n\
+                      [out#0/null @ 0x1] Nothing was written into output file, because at least one of its streams received no packets.\n";
+        let message = sanitize_probe_error(stderr);
+        assert!(message.contains("Permission denied"), "{message}");
+        assert!(!message.contains("Nothing was written"), "{message}");
+        assert_eq!(
+            sanitize_probe_error("Conversion failed!\n"),
+            "Conversion failed!"
+        );
+        assert_eq!(sanitize_probe_error(""), "FFmpeg 未给出错误信息");
+    }
+
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
@@ -2661,7 +2696,7 @@ mod tests {
         SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, asset_segment_number,
         emby_init_segment_number, ffmpeg_args, ffmpeg_args_for_output, ffmpeg_args_with_audio,
         ffmpeg_args_with_timeline, hls_segment_path, hls_start_number, is_valid_asset,
-        vod_manifest,
+        sanitize_probe_error, vod_manifest,
     };
 
     fn fake_process(directory: PathBuf, total_bytes: Option<u64>) -> super::HlsProcess {
@@ -3999,6 +4034,28 @@ while :; do sleep 1; done
     }
 
     #[test]
+    fn hardware_probe_source_uses_the_pixel_format_of_decoded_video() {
+        // lavfi defaults to RGB frames; QSV rejects those on upload while real yuv420p video
+        // works, so a probe on RGB reports a false negative for a usable encoder.
+        for encoder in ["h264_qsv", "h264_vaapi", "h264_nvenc"] {
+            let encoding = super::FfmpegEncodingOptions {
+                hardware_encoder: Some(encoder.to_owned()),
+                ..super::FfmpegEncodingOptions::default()
+            };
+            let args = super::hardware_probe_args(&encoding);
+            let source = args
+                .windows(2)
+                .find(|pair| pair[0] == "-i")
+                .map(|pair| pair[1].clone())
+                .unwrap_or_default();
+            assert!(
+                source.contains("format=yuv420p"),
+                "{encoder} probe source must be yuv420p: {source}"
+            );
+        }
+    }
+
+    #[test]
     fn vaapi_arguments_initialise_the_device_and_upload_frames() {
         let encoding = super::FfmpegEncodingOptions {
             hardware_encoder: Some("h264_vaapi".to_owned()),
@@ -4038,7 +4095,7 @@ while :; do sleep 1; done
         );
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["-vf", "hwupload=extra_hw_frames=64,format=qsv"]),
+                .any(|pair| pair == ["-vf", "format=nv12,hwupload=extra_hw_frames=64,format=qsv"]),
             "QSV encodes qsv surfaces only: {args:?}"
         );
     }

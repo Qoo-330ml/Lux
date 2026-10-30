@@ -1,6 +1,3 @@
-// This foundational module is consumed by the admin settings task that follows.
-#![allow(dead_code)]
-
 use std::{
     io,
     path::{Path, PathBuf},

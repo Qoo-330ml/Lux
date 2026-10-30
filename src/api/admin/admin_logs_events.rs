@@ -157,7 +157,6 @@ pub(crate) async fn record_activity_event(
     }
 }
 
-#[allow(dead_code)] // LUX-727 connects this writer to Web authentication failures.
 pub(crate) async fn record_failed_authentication_event(
     database: Option<&Database>,
     admin_events: &AdminEventHub,

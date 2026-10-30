@@ -108,9 +108,10 @@ pub(crate) struct UpdateLibraryRequest {
     pub(crate) is_enabled: Option<bool>,
     pub(crate) realtime_watch_enabled: Option<bool>,
     pub(crate) realtime_metadata_auto_match_enabled: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    /// Accepted for legacy clients; realtime incremental scanning has no schedule, so this
+    /// request field is validated by the deserializer and then ignored.
     #[allow(dead_code)]
-    /// Accepted for legacy clients; realtime incremental scanning has no schedule.
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
     pub(crate) incremental_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     pub(crate) reconciliation_schedule: Option<Option<String>>,

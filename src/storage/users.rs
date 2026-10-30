@@ -10,7 +10,6 @@ use crate::storage::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-#[allow(dead_code)] // LUX-732 wires the bounded activity-retention worker.
 const USER_ACTIVITY_RETENTION_MAX_BATCH_SIZE: i64 = 1_000;
 
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -18,9 +17,7 @@ const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
 const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
-#[allow(dead_code)] // LUX-732 exposes this default through the admin service.
 const DEFAULT_USER_ACTIVITY_RETENTION_DAYS: i64 = 90;
-#[allow(dead_code)] // LUX-732 exposes this range through the admin service.
 const MAX_USER_ACTIVITY_RETENTION_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
@@ -34,7 +31,6 @@ fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
         .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS)
 }
 
-#[allow(dead_code)] // LUX-732 wires the stored value into the admin service.
 fn normalize_user_activity_retention_days(value: Option<String>) -> i64 {
     value
         .and_then(|value| value.parse::<i64>().ok())
@@ -118,8 +114,6 @@ impl UserItemStateRow {
 }
 
 impl Database {
-    // LUX-645 wires this storage primitive into the application preset service.
-    #[allow(dead_code)]
     pub(crate) async fn apply_user_permission_preset(
         &self,
         user_id: &str,
@@ -284,8 +278,6 @@ impl Database {
         Ok(true)
     }
 
-    // LUX-648 wires these reads into administrator profile and list queries.
-    #[allow(dead_code)]
     pub(crate) async fn user_permission_preset_source(
         &self,
         user_id: &str,
@@ -301,7 +293,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn user_permission_preset_sources(
         &self,
         user_ids: &[String],
@@ -1449,8 +1440,6 @@ impl Database {
             })
     }
 
-    // LUX-721 wires this persistence method into the activity event recorder.
-    #[allow(dead_code)]
     pub(crate) async fn insert_user_activity_event(
         &self,
         event: NewUserActivityEvent<'_>,
@@ -1481,8 +1470,6 @@ impl Database {
         Ok(event_id)
     }
 
-    // LUX-741 wires this monotonic inventory upsert into authentication and activity recording.
-    #[allow(dead_code)]
     pub(crate) async fn upsert_user_device(
         &self,
         observation: NewUserDeviceObservation<'_>,
@@ -1534,8 +1521,6 @@ impl Database {
         Ok(())
     }
 
-    // LUX-745 consumes this bounded inventory page in the administrator user API.
-    #[allow(dead_code)]
     pub(crate) async fn list_user_devices_page(
         &self,
         query: UserDevicePageQuery<'_>,
@@ -1596,8 +1581,6 @@ impl Database {
         Ok((devices, total_count))
     }
 
-    // LUX-755 supplies scope-safe CRUD for future administrator blacklist APIs.
-    #[allow(dead_code)]
     pub(crate) async fn insert_user_access_blacklist_rule(
         &self,
         rule: NewUserAccessBlacklistRule<'_>,
@@ -1622,7 +1605,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn list_user_access_blacklist_rules_page(
         &self,
         query: UserAccessBlacklistRulePageQuery<'_>,
@@ -1713,8 +1695,6 @@ impl Database {
             .map_err(self.sqlx_err())
     }
 
-    // LUX-758 checks active device/client rules before auth enforcement is wired.
-    #[allow(dead_code)]
     pub(crate) async fn user_access_blacklist_matches(
         &self,
         query: UserAccessBlacklistRuleMatchQuery<'_>,
@@ -1778,9 +1758,8 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    // LUX-765 loads at most 201 active global and user IP rules so callers can
-    // fail closed if the supported per-request evaluation bound is exceeded.
-    #[allow(dead_code)]
+    // Loads at most 201 active global and user IP rules so callers can fail closed
+    // if the supported per-request evaluation bound is exceeded.
     pub(crate) async fn list_user_access_ip_blacklist_rule_values(
         &self,
         query: UserAccessBlacklistIpRuleQuery<'_>,
@@ -1804,7 +1783,6 @@ impl Database {
         Ok(rows.into_iter().map(|row| row.get("match_value")).collect())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn set_user_access_blacklist_rule_enabled(
         &self,
         scope: UserAccessBlacklistRuleScope<'_>,
@@ -1835,7 +1813,6 @@ impl Database {
             .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn delete_user_access_blacklist_rule(
         &self,
         scope: UserAccessBlacklistRuleScope<'_>,
@@ -1858,8 +1835,6 @@ impl Database {
             .map_err(self.sqlx_err())
     }
 
-    // LUX-723 wires this storage contract into the administrator activity API.
-    #[allow(dead_code)]
     pub(crate) async fn list_user_activity_events(
         &self,
         query: UserActivityEventQuery<'_>,
@@ -1941,7 +1916,6 @@ impl Database {
         Ok((events, total_count))
     }
 
-    #[allow(dead_code)] // LUX-732 wires the bounded activity-retention worker.
     pub(crate) async fn delete_user_activity_events_before(
         &self,
         occurred_before: i64,
@@ -2185,7 +2159,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn list_user_emby_login_sessions_for_admin(
         &self,
         user_id: &str,
@@ -2866,7 +2839,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)] // LUX-732 exposes the stored value through the admin service.
     pub(crate) async fn user_activity_retention_days(&self) -> Result<i64, StorageError> {
         let value: Option<String> = self
             .query_scalar(
@@ -2879,7 +2851,6 @@ impl Database {
         Ok(normalize_user_activity_retention_days(value))
     }
 
-    #[allow(dead_code)] // LUX-732 exposes the stored value through the admin service.
     pub(crate) async fn set_user_activity_retention_days(
         &self,
         days: i64,
@@ -2902,7 +2873,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)] // LUX-763 exposes and validates this setting through the admin API.
     pub(crate) async fn trusted_proxy_cidrs_json(&self) -> Result<Option<String>, StorageError> {
         self.query_scalar(
             "SELECT value FROM server_settings
@@ -2913,7 +2883,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-763 exposes and validates this setting through the admin API.
     pub(crate) async fn set_trusted_proxy_cidrs_json(
         &self,
         value: &str,
@@ -2958,7 +2927,6 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn user_permission_presets_json(
         &self,
     ) -> Result<Option<String>, StorageError> {
@@ -2971,7 +2939,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn compare_and_set_user_permission_presets_json(
         &self,
         expected: Option<&str>,
@@ -3048,8 +3015,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    // LUX-677 creates the persistent content restriction contract.
-    #[allow(dead_code)]
     pub(crate) async fn user_content_restrictions(
         &self,
         user_id: &str,
@@ -3101,8 +3066,7 @@ impl Database {
         }))
     }
 
-    // LUX-708 reads the source and all selected targets from one bounded database snapshot.
-    #[allow(dead_code)]
+    // Reads the source and all selected targets from one bounded database snapshot.
     pub(crate) async fn user_permission_copy_snapshots(
         &self,
         user_ids: &[String],
@@ -3254,8 +3218,7 @@ impl Database {
         Ok(snapshots)
     }
 
-    // LUX-709 writes one target's selected permission groups as a compare-and-swap transaction.
-    #[allow(dead_code)]
+    // Writes one target's selected permission groups as a compare-and-swap transaction.
     pub(crate) async fn copy_user_permission_groups(
         &self,
         source_user_id: &str,
@@ -3514,8 +3477,7 @@ impl Database {
         }
     }
 
-    // LUX-677 keeps the policy version and both tag groups in one CAS transaction.
-    #[allow(dead_code)]
+    // Keeps the policy version and both tag groups in one CAS transaction.
     pub(crate) async fn compare_and_swap_user_content_restrictions(
         &self,
         user_id: &str,
@@ -3646,8 +3608,6 @@ impl Database {
         Ok(UserContentRestrictionsCasResult::Updated(updated))
     }
 
-    // LUX-654 connects this storage contract to the authenticated settings API.
-    #[allow(dead_code)]
     pub(crate) async fn user_account_preferences(
         &self,
         user_id: &str,
@@ -3683,7 +3643,6 @@ impl Database {
         }))
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn compare_and_swap_user_account_preferences(
         &self,
         user_id: &str,
