@@ -40,8 +40,8 @@ impl EmbyRouteBuilder {
 
 /// Whether `path` is one of the routes a playback-only token may call. Re-exported for the
 /// outer middleware, which sees requests that never reach this router.
-pub(super) fn path_accepts_playback_token(path: &str) -> bool {
-    credentials::is_playback_allow_listed_path(path)
+pub(super) fn path_accepts_playback_token(token: &str, path: &str) -> bool {
+    credentials::playback_token_may_call(token, path)
 }
 
 pub(super) fn api_routes() -> (Router<AppState>, Vec<String>) {

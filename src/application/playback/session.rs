@@ -2317,6 +2317,7 @@ mod tests {
             tokens.push(
                 auth.issue_playback_token(
                     &owner,
+                    "100",
                     session_id,
                     &device,
                     unix_timestamp() + 900,
