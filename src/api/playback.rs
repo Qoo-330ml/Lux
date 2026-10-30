@@ -1420,81 +1420,96 @@ pub(super) async fn handle_emby_playback_event(
         } else {
             None
         };
-    let is_global_collection_work = match database.find_item_library_id(&internal_item_id).await {
-        Ok(Some(library_id)) if library_id == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID => {
-            let catalog = state.catalog();
-            let logical_item = match catalog.find_item(principal, &internal_item_id).await {
-                Ok(Some(item)) if item.item_type == "MOVIE" => item,
-                Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
-                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-                Err(CatalogError::Storage(_)) => {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                }
-                Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-            };
-            let playback_sources = match catalog
-                .global_collection_playback_sources(principal, &logical_item.id)
-                .await
-            {
-                Ok(Some(sources)) => sources,
-                Ok(None) => return StatusCode::NOT_FOUND.into_response(),
-                Err(CatalogError::Storage(_)) => {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                }
-                Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-            };
-            let matching_copy = if let Some(source_id) = requested_media_source_id.as_deref() {
-                let mut matches = playback_sources.copies.iter().filter(|copy| {
-                    copy.media_sources
-                        .iter()
-                        .any(|source| source.id == source_id)
-                });
-                let Some(copy) = matches.next() else {
-                    return StatusCode::NOT_FOUND.into_response();
-                };
-                if matches.next().is_some() {
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-                copy
-            } else if let Some(previous_session) = requested_previous_session.as_ref() {
-                let Some(copy) = playback_sources
-                    .copies
-                    .iter()
-                    .find(|copy| copy.id == previous_session.item_id)
-                else {
-                    return StatusCode::NOT_FOUND.into_response();
-                };
-                if previous_session
-                    .media_source_id
-                    .as_ref()
-                    .is_some_and(|source_id| {
-                        !copy
-                            .media_sources
-                            .iter()
-                            .any(|source| source.id == *source_id)
-                    })
-                {
-                    return StatusCode::NOT_FOUND.into_response();
-                }
-                media_source_id = previous_session.media_source_id.clone();
-                copy
-            } else if playback_sources.copies.len() == 1 {
-                &playback_sources.copies[0]
-            } else {
-                return StatusCode::BAD_REQUEST.into_response();
-            };
-            internal_item_id = matching_copy.id.clone();
-            true
-        }
-        Ok(_) => false,
+    // Resolved once here and reused by the access check below: the global collection branch
+    // replaces the item with one of its copies, so that branch keeps its own lookup.
+    let resolved_item_library_id = match database.find_item_library_id(&internal_item_id).await {
+        Ok(library_id) => library_id,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let is_global_collection_work = resolved_item_library_id
+        .as_deref()
+        .is_some_and(|library_id| library_id == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID);
+    if is_global_collection_work {
+        let catalog = state.catalog();
+        let logical_item = match catalog.find_item(principal, &internal_item_id).await {
+            Ok(Some(item)) if item.item_type == "MOVIE" => item,
+            Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(CatalogError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        };
+        let playback_sources = match catalog
+            .global_collection_playback_sources(principal, &logical_item.id)
+            .await
+        {
+            Ok(Some(sources)) => sources,
+            Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+            Err(CatalogError::Storage(_)) => {
+                return StatusCode::SERVICE_UNAVAILABLE.into_response();
+            }
+            Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+        };
+        let matching_copy = if let Some(source_id) = requested_media_source_id.as_deref() {
+            let mut matches = playback_sources.copies.iter().filter(|copy| {
+                copy.media_sources
+                    .iter()
+                    .any(|source| source.id == source_id)
+            });
+            let Some(copy) = matches.next() else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if matches.next().is_some() {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            copy
+        } else if let Some(previous_session) = requested_previous_session.as_ref() {
+            let Some(copy) = playback_sources
+                .copies
+                .iter()
+                .find(|copy| copy.id == previous_session.item_id)
+            else {
+                return StatusCode::NOT_FOUND.into_response();
+            };
+            if previous_session
+                .media_source_id
+                .as_ref()
+                .is_some_and(|source_id| {
+                    !copy
+                        .media_sources
+                        .iter()
+                        .any(|source| source.id == *source_id)
+                })
+            {
+                return StatusCode::NOT_FOUND.into_response();
+            }
+            media_source_id = previous_session.media_source_id.clone();
+            copy
+        } else if playback_sources.copies.len() == 1 {
+            &playback_sources.copies[0]
+        } else {
+            return StatusCode::BAD_REQUEST.into_response();
+        };
+        internal_item_id = matching_copy.id.clone();
+    }
     let access = state.access();
-    match access.can_view_item(principal, &internal_item_id).await {
+    let item_access = if is_global_collection_work {
+        access.can_view_item(principal, &internal_item_id).await
+    } else {
+        access
+            .can_view_item_in_library(
+                principal,
+                &internal_item_id,
+                resolved_item_library_id.as_deref(),
+            )
+            .await
+    };
+    match item_access {
         Ok(true) => {}
         Ok(false) => {
             tracing::warn!(

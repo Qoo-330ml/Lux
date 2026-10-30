@@ -72,7 +72,24 @@ impl MediaAccessService {
         principal: AccessPrincipal,
         item_id: &str,
     ) -> Result<bool, AccessError> {
-        let Some(library_id) = self.database.find_item_library_id(item_id).await? else {
+        let library_id = self.database.find_item_library_id(item_id).await?;
+        self.can_view_item_in_library(principal, item_id, library_id.as_deref())
+            .await
+    }
+
+    /// Same check as [`Self::can_view_item`] for callers that already resolved the item library.
+    ///
+    /// `library_id` is this request's `Database::find_item_library_id` result for `item_id`, so
+    /// `None` means the item is not visible and access is denied without repeating the lookup.
+    /// Playback callbacks need the library id anyway, and without this entry point they resolve
+    /// the same library twice per event.
+    pub async fn can_view_item_in_library(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+        library_id: Option<&str>,
+    ) -> Result<bool, AccessError> {
+        let Some(library_id) = library_id else {
             return Ok(false);
         };
         if library_id == GLOBAL_COLLECTION_LIBRARY_ID {
@@ -81,7 +98,7 @@ impl MediaAccessService {
         if principal.is_admin {
             return Ok(true);
         }
-        if !self.can_view_library(principal, &library_id).await? {
+        if !self.can_view_library(principal, library_id).await? {
             return Ok(false);
         }
         self.can_view_item_content(principal, item_id).await
@@ -540,6 +557,72 @@ mod tests {
                 .await?
                 .is_none(),
             "playback authorization must not bypass content restrictions"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn resolved_library_access_check_skips_the_item_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("resolved-library-viewer", "Viewer", "test password", false)
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Resolved library", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user.id.to_string(), &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES ('resolved-movie', ?, 'MOVIE', 'Resolved', 'resolved', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+
+        let access = MediaAccessService::new(database.clone());
+        let principal = AccessPrincipal::new(user.id, false);
+        database.reset_query_count();
+        assert!(
+            access
+                .can_view_item_in_library(principal, "resolved-movie", Some(&library_id))
+                .await?
+        );
+        let resolved_queries = database.query_count();
+        assert!(
+            resolved_queries > 0,
+            "the resolved-library check still enforces library access and content restrictions"
+        );
+
+        database.reset_query_count();
+        assert!(access.can_view_item(principal, "resolved-movie").await?);
+        assert_eq!(
+            database.query_count(),
+            resolved_queries + 1,
+            "can_view_item re-resolves the item library; the resolved variant must not"
+        );
+
+        database.reset_query_count();
+        assert!(
+            !access
+                .can_view_item_in_library(principal, "resolved-movie", None)
+                .await?,
+            "an unresolved library denies access exactly like a hidden item"
+        );
+        assert_eq!(
+            database.query_count(),
+            0,
+            "denying an unresolved library must not fall back to the item lookup"
         );
         Ok(())
     }
