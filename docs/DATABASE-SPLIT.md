@@ -16,7 +16,7 @@
   `list_notification_deliveries`、`claim_notification_delivery`、`mark_notification_delivered`、
   `mark_notification_retry`、`retry_notification_delivery`
 
-- 文件头从 `use super::*;` 改成显式导入列表（10 个符号 + `uuid::Uuid`）。
+- 文件头从 `use super::*;` 改成显式导入列表（11 个符号 + `uuid::Uuid`）。
 - **没有**放宽任何 helper 的可见性：`Database::query`、`Database::sqlx_err` 和私有字段 `pool` 仍保持原可见性即可用，因为 `notifications` 是 `repository` 的子模块（见 6.3）。
 - `src/storage/repository.rs` 的**生产代码零改动**；`src/storage/mod.rs` 未改（原因见 6.4）。
 - 32 个调用点改为 `database.notifications().<method>(...)`。
@@ -61,7 +61,7 @@
 
 1. `Database` 的表面少了 14 个方法。通知操作只能经 `database.notifications()` 到达，reviewer 一眼能看出"这行在写通知表"。
 2. `NotificationsRepo` 在 `storage` 之外**不可命名**（见 6.4），调用点拿到的是一个只能调方法的值，无法把它存进字段、扩展 trait 或当作 `Database` 的替身继续使用。
-3. `notifications.rs` 不再 `use super::*;`。原先该文件可以无成本引用 `repository` 里的任何私有符号（例如别的域的 helper、别的域的 `Stored*Row`），现在依赖面变成 10 个显式符号，新增依赖必须显式声明——这是本试点唯一"立刻可验证收紧"的一项，代价只是 5 行 `use`。
+3. `notifications.rs` 不再 `use super::*;`。原先该文件可以无成本引用 `repository` 里的任何私有符号（例如别的域的 helper、别的域的 `Stored*Row`），现在依赖面变成 11 个显式符号，新增依赖必须显式声明——这是本试点唯一"立刻可验证收紧"的一项，代价只是 8 行 `use`。
 
 本次**没有**收紧、但已经具备条件、建议后续处理的项（用 `grep` 确认仅本域使用）：
 
@@ -123,7 +123,7 @@
 
 计划中允许修改 `src/storage/mod.rs` 做导出，实测**不需要**：
 
-- 加 `pub(crate) use repository::NotificationsRepo;` 后，`cargo build` 直接报 `unused import`（`-D warnings` 会失败）。原因是所有调用点只是对返回值调用固有方法，从不命名该类型。
+- 若要把 `NotificationsRepo` 再导出，需要在 `repository.rs` 内写 `pub(crate) use notifications::NotificationsRepo;`（`notifications` 模块对 `repository` 私有，不能从 `mod.rs` 经 `repository::` 路径直接再导出）；再导出后 `cargo build` 会报 `unused import`（`-D warnings` 下失败），因为所有调用点只是对返回值调用固有方法，从不命名该类型。因此本试点没有再导出，也没有改 `mod.rs`。
 - 因此 `src/storage/mod.rs` 保持未改，`NotificationsRepo` 在 `storage` 外不可命名。编译期也没有触发 `private_interfaces` 告警：在 `pub(crate) fn notifications()` 返回该类型且不导出时，`cargo build` 与 `cargo clippy ... -D warnings` 均无告警通过。
 - 副作用：如果将来要把它存进 struct 字段、作为返回值、或写进 `pub(crate)` 的 trait 对象，就必须导出，届时需要重新确认可见性策略。
 
