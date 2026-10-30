@@ -1,11 +1,11 @@
 // Six bound values per row keep each insert under SQLite's conservative bind limit.
 const MAX_SCAN_LOCAL_METADATA_BATCH_INSERT_ROWS: usize = 64;
-#[allow(dead_code)] // The test-only batch listing API enforces this storage contract bound.
+#[cfg(test)]
 const MAX_SCAN_LOCAL_METADATA_BATCH_PAGE_SIZE: i64 = 100;
 use super::*;
 
 impl Database {
-    #[allow(dead_code)] // Storage contract tests cover idempotent single-batch enqueue.
+    #[cfg(test)]
     pub(crate) async fn enqueue_scan_local_metadata_batch(
         &self,
         batch: NewScanLocalMetadataBatch<'_>,
@@ -19,7 +19,7 @@ impl Database {
         Ok(inserted)
     }
 
-    #[allow(dead_code)] // Shared by the test-only single-batch enqueue contract.
+    #[cfg(test)]
     async fn enqueue_scan_local_metadata_batch_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -227,7 +227,7 @@ impl Database {
         Ok(())
     }
 
-    #[allow(dead_code)] // Storage tests inspect pagination and persisted batch state.
+    #[cfg(test)]
     pub(crate) async fn list_scan_local_metadata_batches(
         &self,
         after_created_at: Option<i64>,
@@ -349,7 +349,7 @@ impl Database {
         Ok(claimed.map(stored_scan_local_metadata_batch))
     }
 
-    #[allow(dead_code)] // Exercised by storage tests for the default completion transition.
+    #[cfg(test)]
     pub(crate) async fn complete_scan_local_metadata_batch(
         &self,
         batch_id: &str,
@@ -474,7 +474,6 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
-    #[allow(dead_code)] // Exercised by storage tests for cancellation state transitions.
     pub(crate) async fn cancel_scan_local_metadata_batches(
         &self,
         job_id: &str,
