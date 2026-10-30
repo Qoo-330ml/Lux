@@ -246,6 +246,37 @@ struct ItemScraperConfigurationRow {
     role: Option<String>,
 }
 
+/// Row shared by `find_item_source_locator`, `find_item_by_source_locator` and
+/// `find_items_by_source_fingerprint`: all three select the same source-locator projection.
+#[derive(sqlx::FromRow)]
+struct ItemSourceLocatorRow {
+    canonical_path: String,
+    relative_path: String,
+    fingerprint: Option<Vec<u8>>,
+    size: i64,
+    modified_at: i64,
+    device: Option<i64>,
+    inode: Option<i64>,
+    title: String,
+    production_year: Option<i32>,
+}
+
+impl From<ItemSourceLocatorRow> for StoredItemSourceLocator {
+    fn from(row: ItemSourceLocatorRow) -> Self {
+        Self {
+            root_path: row.canonical_path,
+            relative_path: row.relative_path,
+            fingerprint: row.fingerprint,
+            size: row.size,
+            modified_at: row.modified_at,
+            device: row.device,
+            inode: row.inode,
+            title: row.title,
+            production_year: row.production_year,
+        }
+    }
+}
+
 impl Database {
     pub(crate) async fn media_source_belongs_to_item(
         &self,
@@ -500,7 +531,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
-        self.query(
+        self.query_as::<ItemSourceLocatorRow>(
             "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
@@ -515,19 +546,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredItemSourceLocator {
-                root_path: row.get("canonical_path"),
-                relative_path: row.get("relative_path"),
-                fingerprint: row.get("fingerprint"),
-                size: row.get("size"),
-                modified_at: row.get("modified_at"),
-                device: row.get("device"),
-                inode: row.get("inode"),
-                title: row.get("title"),
-                production_year: row.get("production_year"),
-            })
-        })
+        .map(|row| row.map(StoredItemSourceLocator::from))
         .map_err(self.sqlx_err())
     }
 
@@ -536,7 +555,7 @@ impl Database {
         root_path: &str,
         relative_path: &str,
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
-        self.query(
+        self.query_as::<ItemSourceLocatorRow>(
             "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
@@ -553,19 +572,7 @@ impl Database {
         .bind(relative_path)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredItemSourceLocator {
-                root_path: row.get("canonical_path"),
-                relative_path: row.get("relative_path"),
-                fingerprint: row.get("fingerprint"),
-                size: row.get("size"),
-                modified_at: row.get("modified_at"),
-                device: row.get("device"),
-                inode: row.get("inode"),
-                title: row.get("title"),
-                production_year: row.get("production_year"),
-            })
-        })
+        .map(|row| row.map(StoredItemSourceLocator::from))
         .map_err(self.sqlx_err())
     }
 
@@ -575,7 +582,7 @@ impl Database {
         legacy_size: Option<i64>,
         legacy_modified_at: Option<i64>,
     ) -> Result<Vec<StoredItemSourceLocator>, StorageError> {
-        self.query(
+        self.query_as::<ItemSourceLocatorRow>(
             "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
@@ -598,17 +605,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredItemSourceLocator {
-                    root_path: row.get("canonical_path"),
-                    relative_path: row.get("relative_path"),
-                    fingerprint: row.get("fingerprint"),
-                    size: row.get("size"),
-                    modified_at: row.get("modified_at"),
-                    device: row.get("device"),
-                    inode: row.get("inode"),
-                    title: row.get("title"),
-                    production_year: row.get("production_year"),
-                })
+                .map(StoredItemSourceLocator::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
