@@ -163,10 +163,21 @@ fn ready_router(state: ReadyAppState) -> Router {
 fn not_ready_compat_router(state: AppState) -> Router {
     let core = state.core.clone();
     let slots = RequestSlots::default();
+    // The Emby path templates of the real tree: the case-insensitive wrapper normalises
+    // `/items/x` to `/Items/x` before routing, exactly like the single pre-split tree did. Only the
+    // templates are used here (the tree itself mounts the three public discovery routes below), so
+    // the normalised Emby business paths land on the SPA fallback and the namespace middlewares.
+    let (_emby_routes, emby_path_templates) = emby::api_routes();
     let app = Router::new()
         .route("/logo.svg", get(web_logo))
         // The three core probes are real handlers: they answer correctly without services.
         .merge(core_routes::<AppState>())
+        // Emby's public discovery routes answer correctly without any service
+        // (`emby_ping` 200, `public/System/Info` with `StartupWizardCompleted: false`,
+        // `Users/Public` an empty list), so the pre-split tree already served them unready.
+        .route("/System/Ping", get(emby_ping).post(emby_ping))
+        .route("/System/Info/Public", get(emby_public_system_info))
+        .route("/Users/Public", get(emby_public_users))
         // Synthesised for the frozen tests only (§9.2 #3, #4, #5, #6).
         .route(
             "/api/v1/auth/sessions",
@@ -184,7 +195,7 @@ fn not_ready_compat_router(state: AppState) -> Router {
         .fallback_service(spa_service())
         .with_state(state);
     let app = apply_common_layers(app, &core, slots);
-    case_insensitive_emby_router(app, vec!["/System/Info".to_owned()])
+    case_insensitive_emby_router(app, emby_path_templates)
 }
 
 /// The three routes both router trees mount: the liveness/readiness probes and the version.
@@ -1338,6 +1349,42 @@ mod tests {
                 .expect("Emby 503 body")
                 .is_empty()
         );
+
+        // Emby's public discovery routes stay available on the compatibility tree: they answer
+        // without any service, exactly like the pre-split tree did.
+        let ping = send(app.clone(), test_request(Method::GET, "/System/Ping", &[])).await;
+        assert_eq!(ping.status(), StatusCode::OK);
+        let ping_post = send(app.clone(), test_request(Method::POST, "/System/Ping", &[])).await;
+        assert_eq!(ping_post.status(), StatusCode::OK);
+        let public_info = send(
+            app.clone(),
+            test_request(Method::GET, "/System/Info/Public", &[]),
+        )
+        .await;
+        assert_eq!(public_info.status(), StatusCode::OK);
+        let public_info = json_body(public_info).await;
+        assert_eq!(public_info["StartupWizardCompleted"], false);
+        // `Id` is the core `server_id`, empty for `AppState::default()` exactly like before.
+        assert!(public_info["Id"].as_str().is_some());
+        let public_users = send(app.clone(), test_request(Method::GET, "/Users/Public", &[])).await;
+        assert_eq!(public_users.status(), StatusCode::OK);
+        assert_eq!(json_body(public_users).await, json!([]));
+
+        // The Emby templates make `/items/x` normalise to `/Items/x` like the pre-split tree, so an
+        // Emby business path never reaches the SPA as HTML. The compatibility tree mounts no Emby
+        // business route, so the namespace middleware answers its bare 404 where the pre-split tree
+        // reached the handler's bare 503; the frozen test only requires "not 200 and not HTML".
+        let emby_item = send(
+            app.clone(),
+            test_request(
+                Method::GET,
+                "/items/example-item",
+                &[("accept", "application/json")],
+            ),
+        )
+        .await;
+        assert_eq!(emby_item.status(), StatusCode::NOT_FOUND);
+        assert!(header(&emby_item, "content-type").is_none());
 
         // The case-insensitive Emby wrapper is still the outermost layer of this tree.
         let emby_info_lowercase =
