@@ -36,6 +36,14 @@ export type LuxUser = {
   canDownload?: boolean;
 };
 
+// Body of POST /api/v1/setup/complete (docs/SETUP-RESTART-DESIGN.md §4/§5).
+// `restarting` is optional on purpose: backends that cannot schedule a restart
+// (or older builds) omit it, and the page then behaves as it did before.
+export type SetupCompleteResult = {
+  user: LuxUser;
+  restarting?: boolean;
+};
+
 export type UserPlaybackSettings = {
   playedPercent: number;
   preferencesVersion?: number;

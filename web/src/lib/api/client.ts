@@ -141,6 +141,7 @@ import type {
   SetupStatus,
   SetupDatabaseBackend,
   SetupDatabaseStatus,
+  SetupCompleteResult,
   MetadataRefreshMode,
   UserPlaybackSettings,
   UserPlaybackSettingsUpdate,
@@ -431,7 +432,7 @@ export class LuxApiClient {
     libraryKind?: LibraryKind;
     libraryRoot?: string;
   }) {
-    return this.request<{ user: LuxUser }>("/api/v1/setup/complete", {
+    return this.request<SetupCompleteResult>("/api/v1/setup/complete", {
       method: "POST",
       body: JSON.stringify(input),
     });
