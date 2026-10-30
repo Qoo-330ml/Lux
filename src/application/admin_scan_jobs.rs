@@ -175,6 +175,13 @@ pub(crate) const FIRST_SCAN_RESUME_MAX_LIBRARIES: usize = 512;
 /// claiming an exact number.
 const FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT: i64 = 10_000;
 
+/// How many shutdown interruptions of the same first scan one startup tolerates automatically.
+///
+/// A first scan that keeps killing the process (OOM, `SIGKILL`) never records `FAILED`: each
+/// restart cancels it with `SERVER_SHUTDOWN` and the recovery queues it again, which would loop
+/// without any backoff. After this many interruptions the library is left to the administrator.
+pub(crate) const FIRST_SCAN_RESUME_MAX_INTERRUPTIONS: i64 = 3;
+
 /// How long the probe of a single root may take before the root counts as unavailable.
 ///
 /// A hung network mount must not hold up startup. The probe itself is `crate::library::
@@ -361,6 +368,29 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
                 );
                 continue;
             };
+            match database
+                .count_shutdown_interrupted_first_scans(&library_id)
+                .await
+            {
+                Ok(interruptions) if interruptions >= FIRST_SCAN_RESUME_MAX_INTERRUPTIONS => {
+                    tracing::warn!(
+                        %library_id,
+                        interruptions,
+                        "the first scan was interrupted by a shutdown that many times; it is not \
+                         re-queued automatically any more — start a scan by hand and check memory \
+                         usage and the logs"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %library_id,
+                        %error,
+                        "could not count the shutdown interruptions of a first scan"
+                    );
+                }
+            }
             match first_scan_root_state(database, &library_id).await {
                 // A scan against a missing mount reports success with zero items and records
                 // `last_scan_at`, which would consume the first-scan intent. Probing now keeps the

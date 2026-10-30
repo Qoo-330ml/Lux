@@ -314,6 +314,26 @@ impl Database {
     /// cancelled row may not speak for the library any more. `(created_at, id)` is the creation
     /// order: the ids are UUIDv7 and compare correctly as text, and the tuple comparison keeps the
     /// query portable between SQLite and PostgreSQL.
+    /// How many `RECONCILE_LIBRARY` scans of the library a shutdown interrupted.
+    ///
+    /// The first-scan recovery uses it as a retry budget: a scan that keeps killing the process
+    /// (OOM, `SIGKILL`) is cancelled with `SERVER_SHUTDOWN` on every startup and never becomes
+    /// `FAILED`, so without a cap the recovery would queue it again forever.
+    pub(crate) async fn count_shutdown_interrupted_first_scans(
+        &self,
+        library_id: &str,
+    ) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT COUNT(*) FROM scan_jobs
+             WHERE library_id = ? AND job_type = 'RECONCILE_LIBRARY'
+               AND status = 'CANCELLED' AND error = 'SERVER_SHUTDOWN'",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn list_shutdown_interrupted_first_scan_library_ids(
         &self,
         after_library_id: Option<&str>,

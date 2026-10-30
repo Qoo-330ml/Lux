@@ -19063,6 +19063,10 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 - C2 首次扫描恢复：采用方案 (b)，无 schema 变更。判据是 `scan_jobs` 里该库**最近一次**
   `RECONCILE_LIBRARY` 任务是 `status='CANCELLED'` + `error='SERVER_SHUTDOWN'` 且库仍启用、
   `last_scan_at IS NULL`、有 root、无活动扫描（因此恢复出的新任务若 `FAILED`，下次启动不会再排）；
+  自动补扫还有尝试上限：同一库历史上被关停打断（`CANCELLED` + `SERVER_SHUTDOWN`）的
+  `RECONCILE_LIBRARY` 记录达到 `FIRST_SCAN_RESUME_MAX_INTERRUPTIONS = 3` 且 `last_scan_at` 仍为空时停止
+  补扫并 `warn!`（库 ID、次数、请手动扫描并检查内存与日志），避免“反复 OOM/被 SIGKILL 杀死 → 启动再排队”
+  的无退避循环；不需要新表。
   排队前对候选库的根做一次**启动时实测**（`library::inspect_root_path`，单根 5 秒上限，超时按不可用），
   至少一个根可用才补扫并把过期的 `library_roots.is_available` 修正为可用（reconcile 会丢弃该列为 0 的
   根，不修正则补扫等于空扫并写入 `last_scan_at`）；全部不可用则跳过并打带库 ID 与原因的 `warn!`，
@@ -19089,11 +19093,11 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
       `Running`”（顺序断言不依赖墙钟）、“注入 0 延迟仍观察到 `Restart`”、“无句柄保持 201 与完整 body
       （键集合逐字固定，`restarting: false`）”、“重复 setup 409 且不再触发 `watch`”、“管理员已建后首库
       失败仍重启”、“`rootPath` 不可用被更早拒绝且不重启、随后修正请求正常完成”。
-- [x] `cargo test --locked --test scanner shutdown_jobs::` 11/11：恢复用例（取消记录 → 新任务 → 扫描
+- [x] `cargo test --locked --test scanner shutdown_jobs::` 14/14：恢复用例（取消记录 → 新任务 → 扫描
       完成写入 `last_scan_at` → 再次启动不再排队）、33 个库（多于一页）全部重排、标志位为 0 但路径可用
       时仍补扫并修正标志、标志位为 1 但路径确实缺失时跳过且 `last_scan_at` 仍为空（路径恢复后下一次启动
-      补扫成功），以及反向用例（已扫描 / 真实失败 / 库停用 / 无 root / 已有活动扫描 / 最近一次扫描
-      `FAILED`）。
+      补扫成功）、2 次打断仍补扫 / 3 次打断停止补扫 / 手动扫描后不再受限，以及反向用例（已扫描 /
+      真实失败 / 库停用 / 无 root / 已有活动扫描 / 最近一次扫描 `FAILED`）。
 - [x] `cargo test --locked --lib admin_scan_jobs::`：`the_limit_accounting_counts_every_library_left_for_the_next_startup`
       固定上限记账（5 个库、上限 2 → 排队 2、剩余 3）；`the_root_probe_gives_up_instead_of_hanging_the_startup`
       固定“探测超时不挂死启动”；`the_limit_log_reports_a_lower_bound_when_the_remainder_is_truncated`

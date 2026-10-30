@@ -621,3 +621,74 @@ async fn startup_skips_first_scans_whose_root_is_really_missing()
     );
     Ok(())
 }
+
+/// Adds `count` more shutdown-interrupted first scans to the fixture's library.
+async fn add_interrupted_first_scans(
+    fixture: &InterruptedFirstScan,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let jobs = ScanJobService::new(fixture.database.clone());
+    for _ in 0..count {
+        jobs.create_movie_scan_job(fixture.library_id).await?;
+        fixture
+            .database
+            .cancel_incomplete_jobs_for_shutdown()
+            .await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_still_resumes_a_first_scan_interrupted_twice()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = interrupted_first_scan(true).await?;
+    add_interrupted_first_scans(&fixture, 1).await?;
+
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 1);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
+        3
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_stops_resuming_a_first_scan_that_keeps_killing_the_process()
+-> Result<(), Box<dyn std::error::Error>> {
+    // OOM/SIGKILL leaves no `FAILED` row: every startup cancels the running scan and the recovery
+    // queues it again, which would spin forever without a retry cap.
+    let fixture = interrupted_first_scan(true).await?;
+    add_interrupted_first_scans(&fixture, 2).await?;
+
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
+        3,
+        "the library has to be left for the administrator after three interruptions"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_manual_scan_lifts_the_interruption_cap() -> Result<(), Box<dyn std::error::Error>> {
+    let fixture = interrupted_first_scan(true).await?;
+    add_interrupted_first_scans(&fixture, 2).await?;
+    // The administrator scanned the library by hand after the third interruption.
+    sqlx::query("UPDATE libraries SET last_scan_at = unixepoch() WHERE id = ?")
+        .bind(fixture.library_id.to_string())
+        .execute(fixture.database.pool())
+        .await?;
+
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
+        3
+    );
+    Ok(())
+}
