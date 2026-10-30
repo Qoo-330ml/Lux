@@ -49,9 +49,7 @@ async fn admin_list_user_invitations(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let status = match query.status.as_deref() {
         None | Some("all") => None,
         Some("pending") => Some(UserInvitationStatus::Pending),
@@ -146,9 +144,7 @@ async fn admin_revoke_user_invitation(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match revoke_user_invitation(database, &invitation_id, current_unix_time()).await {
         Ok(()) => {
             record_audit_event(
@@ -174,9 +170,7 @@ async fn admin_resend_user_invitation(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())

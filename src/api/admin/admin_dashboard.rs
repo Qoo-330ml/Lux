@@ -8,9 +8,7 @@ pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppS
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let snapshot = match crate::application::admin_dashboard::load_admin_dashboard(
         database,
         state.config_dir.as_deref(),

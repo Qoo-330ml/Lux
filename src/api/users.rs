@@ -35,9 +35,7 @@ pub(super) async fn live() -> Json<Value> {
 }
 
 pub(super) async fn login_background(State(state): State<AppState>) -> Response {
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let source = match database.login_background_source().await {
         Ok(Some(source)) if is_valid_login_background_source(&source) => source,
         Ok(_) => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
@@ -69,9 +67,7 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
         return Json(json!({ "source": source, "images": [] })).into_response();
     }
 
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
     let enabled_library_ids = match libraries.list_libraries().await {
         Ok(views) => views
             .into_iter()
@@ -80,9 +76,7 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
             .collect::<Vec<_>>(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let page = match catalog
         .list_recently_added_movies_and_series_for_library_ids(
             &enabled_library_ids,
@@ -1416,9 +1410,7 @@ pub(super) async fn auth_resend_public_user_registration_email(
 }
 
 pub(super) async fn public_registration_settings(State(state): State<AppState>) -> Response {
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::settings::read_registration_mode(database).await {
         Ok(settings) => Json(json!({ "registrationMode": settings.mode })).into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1520,9 +1512,7 @@ pub(super) async fn auth_account_profile(
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1559,9 +1549,7 @@ pub(super) async fn auth_update_account_profile(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1657,9 +1645,7 @@ pub(super) async fn auth_resend_account_email_change(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let user_id = session.user.id.to_string();
     let pending = match pending_user_email_change(
         database,
@@ -1717,9 +1703,7 @@ pub(super) async fn auth_verify_account_email_change(
         Ok(session) => session,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let Some(config_dir) = state.config_dir.as_deref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -2071,12 +2055,8 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
+    let libraries = require_service!(state.libraries);
     let preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2105,9 +2085,7 @@ pub(super) async fn auth_account_preferences(
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2139,9 +2117,7 @@ pub(super) async fn auth_update_account_preferences(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let accessible_library_ids = match library_order_access_scope(
         &state,
         AccessPrincipal::new(user.id, user.is_admin),
@@ -2152,9 +2128,7 @@ pub(super) async fn auth_update_account_preferences(
         Err(status) => return status.into_response(),
     };
     if let Some(requested_order) = request.library_order.as_deref() {
-        let Some(libraries) = state.libraries.as_ref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
+        let libraries = require_service!(state.libraries);
         match libraries
             .normalize_library_order(requested_order, &accessible_library_ids)
             .await
@@ -2245,9 +2219,7 @@ pub(super) async fn auth_update_settings(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2294,9 +2266,7 @@ pub(super) async fn auth_update_settings(
         }
         state.user_events.publish_home_coalesced().await;
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
     let (use_admin_library_order, library_order_forced) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)
         .await
@@ -2430,12 +2400,8 @@ pub(super) async fn auth_library_order(
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
+    let database = require_service!(state.database);
     let preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2486,12 +2452,8 @@ pub(super) async fn auth_update_library_order(
         )
         .into_response();
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
+    let database = require_service!(state.database);
     let preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2579,9 +2541,7 @@ pub(super) async fn auth_avatar(headers: HeaderMap, State(state): State<AppState
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = require_service!(state.user_avatars);
     match avatars.load(user.id).await {
         Ok(Some(avatar)) => match Response::builder()
             .status(StatusCode::OK)
@@ -2616,9 +2576,7 @@ pub(super) async fn auth_update_avatar(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = require_service!(state.user_avatars);
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -2633,9 +2591,7 @@ pub(super) async fn auth_update_avatar(
 }
 
 pub(super) async fn auth_sessions(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.auth);
     let Some(session_token) = request_cookie(&headers, "lux_session") else {
         return api_error(
             &headers,
@@ -2680,9 +2636,7 @@ pub(super) async fn auth_revoke_session(
     Path(session_id): Path<String>,
     State(state): State<AppState>,
 ) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.auth);
     let Some(session_token) = request_cookie(&headers, "lux_session") else {
         return api_error(
             &headers,
