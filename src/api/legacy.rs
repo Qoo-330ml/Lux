@@ -370,8 +370,6 @@ impl AppState {
         content_restriction_index_worker -> ContentRestrictionIndexWorker,
     }
 
-    /// Core-state accessors used by the readiness macro; the remaining core fields are read
-    /// through `Deref` because they are plain state, not services.
     /// Attaches the database to a state that was built through `Default`.
     ///
     /// This keeps the `AppState::default()` construction path (tests and helpers) working now that
@@ -382,6 +380,9 @@ impl AppState {
         self
     }
 
+    /// Core-state accessor used by `require_service!(state.database)`.
+    ///
+    /// Every other core field is read through `Deref` because it is plain state, not a service.
     pub(crate) fn database(&self) -> Option<&Database> {
         self.core.database.as_ref()
     }
