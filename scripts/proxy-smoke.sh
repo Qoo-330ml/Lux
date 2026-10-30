@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wait-for-restart.sh
+source "$ROOT_DIR/scripts/lib/wait-for-restart.sh"
 cd "$ROOT_DIR"
 
 IMAGE="${LUX_IMAGE:-lux:arm64-local}"
@@ -85,6 +87,9 @@ fi
 served_subject="$(printf '' | openssl s_client -connect "127.0.0.1:$PORT" -servername localhost 2>/dev/null | openssl x509 -noout -subject)"
 grep -q 'localhost' <<<"$served_subject"
 
+# A fresh config directory starts in the database-selection mode, so pick SQLite before setup.
+lux_select_sqlite_database "https://127.0.0.1:$PORT" -k
+
 setup="$(curl -ksSf -X POST "https://127.0.0.1:$PORT/api/v1/setup/complete" \
     -H 'Content-Type: application/json' \
     -d '{"username":"admin","displayName":"Proxy Smoke Admin","password":"proxy-smoke-test-password","firstLibrary":{"name":"Proxy Smoke Movies","kind":"MOVIE","rootPath":"/media/movies"}}')"
@@ -93,6 +98,10 @@ if [[ -z "$library_id" || "$library_id" == "null" ]]; then
     echo "setup did not return the first library ID" >&2
     exit 1
 fi
+
+# The setup restart closes the upstream port for a moment; nginx answers that window with 502/504,
+# which the helper also treats as "down". Wait for the recovery before the login below.
+lux_wait_for_restarted_server "https://127.0.0.1:$PORT" -k
 
 curl -ksS -D "$COOKIE_HEADERS" -o "$WORK_DIR/login.json" \
     -X POST "https://127.0.0.1:$PORT/api/v1/auth/login" \

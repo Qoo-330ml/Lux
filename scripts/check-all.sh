@@ -10,6 +10,7 @@ cargo test --locked --all-targets
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 bash -n scripts/*.sh
+bash -n scripts/lib/*.sh
 scripts/check-api-types.sh
 python3 -m unittest tools/compatibility-probe/test_probe.py
 python3 -m unittest tools/catalog-fixture/test_generator.py

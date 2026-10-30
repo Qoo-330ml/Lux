@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wait-for-restart.sh
+source "$ROOT_DIR/scripts/lib/wait-for-restart.sh"
 cd "$ROOT_DIR"
 
 IMAGE="${LUX_IMAGE:-lux:arm64-local}"
@@ -64,6 +66,9 @@ if [[ "$started" != 1 ]]; then
     exit 1
 fi
 
+# A fresh config directory starts in the database-selection mode, so pick SQLite before setup.
+lux_select_sqlite_database "http://127.0.0.1:$PORT"
+
 setup="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/setup/complete" \
     -H 'Content-Type: application/json' \
     -d "{\"username\":\"admin\",\"displayName\":\"Probe Smoke Admin\",\"password\":\"$PASSWORD\",\"firstLibrary\":{\"name\":\"Probe Smoke Movies\",\"kind\":\"MOVIE\",\"rootPath\":\"/media/movies\"}}")"
@@ -72,6 +77,10 @@ if [[ -z "$library_id" || "$library_id" == "null" ]]; then
     echo "setup did not return the first library ID" >&2
     exit 1
 fi
+
+# The restart cancels the first scan of that library and the recovered process queues it again, so
+# wait for the restart and for the recovered scan before driving a reconcile of our own.
+lux_wait_for_restarted_server "http://127.0.0.1:$PORT"
 
 curl -sS -D "$COOKIE_HEADERS" -o "$WORK_DIR/login.json" \
     -X POST "http://127.0.0.1:$PORT/api/v1/auth/login" \
@@ -87,6 +96,8 @@ if [[ -z "$session_cookie" || -z "$csrf_cookie" ]]; then
 fi
 csrf_value="${csrf_cookie#lux_csrf=}"
 cookies="$session_cookie; $csrf_cookie"
+lux_wait_for_first_scan_settled "http://127.0.0.1:$PORT" "$library_id" \
+    -H "Cookie: $cookies"
 
 reconcile="$(curl -fsS -X POST \
     "http://127.0.0.1:$PORT/api/v1/admin/libraries/$library_id/reconcile" \

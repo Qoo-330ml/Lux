@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wait-for-restart.sh
+source "$ROOT_DIR/scripts/lib/wait-for-restart.sh"
 cd "$ROOT_DIR"
 
 IMAGE="${LUX_IMAGE:-lux:arm64-local}"
@@ -44,10 +46,16 @@ if [[ "$started" != 1 ]]; then
     exit 1
 fi
 
+# A fresh config directory starts in the database-selection mode, so pick SQLite before setup.
+lux_select_sqlite_database "http://127.0.0.1:$PORT"
+
 curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/setup/complete" \
     -H 'Content-Type: application/json' \
     -d '{"username":"admin","displayName":"Disk Fault Admin","password":"disk-write-fault-test-password"}' \
     >"$WORK_DIR/setup.json"
+
+# The instance restarts itself right after that `201`; the login below must not race the shutdown.
+lux_wait_for_restarted_server "http://127.0.0.1:$PORT"
 
 curl -sS -D "$WORK_DIR/login.headers" -o "$WORK_DIR/login.json" \
     -X POST "http://127.0.0.1:$PORT/api/v1/auth/login" \
