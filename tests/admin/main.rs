@@ -10,4 +10,5 @@ mod admin_settings;
 mod admin_user_invitations;
 mod log_export;
 mod observability;
+mod user_event_scoping;
 mod user_query_events;

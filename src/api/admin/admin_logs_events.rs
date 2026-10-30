@@ -423,14 +423,17 @@ pub(crate) async fn user_events(
     headers: HeaderMap,
     State(state): State<ReadyAppState>,
 ) -> Response {
-    if let Err(response) = require_web_user(&headers, &state).await {
-        return response;
-    }
+    let user = match require_web_user(&headers, &state).await {
+        Ok(user) => user,
+        Err(response) => return response,
+    };
     let Some(connections) = state.sse_permits.try_acquire() else {
         return super::sse_capacity_response(&headers);
     };
 
-    let mut receiver = state.user_events.subscribe();
+    // The subscription only yields directory-level events and events about this
+    // user, so another user's playback ticks never reach this stream.
+    let mut receiver = state.user_events.subscribe_for(&user.id.to_string());
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         // Held until the stream ends so the budget reflects live connections.
@@ -448,16 +451,18 @@ pub(crate) async fn user_events(
         loop {
             tokio::select! {
                 event = receiver.recv() => {
-                    let scope = match event {
-                        Ok(scope) => scope,
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => crate::application::admin_events::UserEventScope::Home,
+                    let event = match event {
+                        Ok(event) => event,
+                        // A lagged subscriber may have missed invalidations of any
+                        // scope, so fall back to the full home refresh.
+                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                            crate::application::admin_events::UserEvent::broadcast(
+                                crate::application::admin_events::UserEventScope::Home,
+                            )
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     };
-                    let frame = format!(
-                        "event: invalidate\ndata: {{\"scope\":\"{}\"}}\n\n",
-                        scope.as_str(),
-                    );
-                    if writer.write_all(frame.as_bytes()).await.is_err() {
+                    if writer.write_all(user_event_frame(&event).as_bytes()).await.is_err() {
                         break;
                     }
                 }
@@ -471,6 +476,56 @@ pub(crate) async fn user_events(
     });
 
     event_stream_response(reader)
+}
+
+/// Renders one invalidation frame.
+///
+/// Scope-only payloads keep the legacy `{"scope":"..."}` shape. `progress`
+/// events additionally carry the item the user is playing so the client can
+/// refresh that item's playback state instead of every media query.
+fn user_event_frame(event: &crate::application::admin_events::UserEvent) -> String {
+    #[derive(serde::Serialize)]
+    struct Frame<'a> {
+        scope: &'a str,
+        #[serde(rename = "itemId", skip_serializing_if = "Option::is_none")]
+        item_id: Option<&'a str>,
+    }
+
+    let frame = Frame {
+        scope: event.scope().as_str(),
+        item_id: event.item_id(),
+    };
+    let data = serde_json::to_string(&frame).unwrap_or_else(|_| "{\"scope\":\"home\"}".to_owned());
+    format!("event: invalidate\ndata: {data}\n\n")
+}
+
+#[cfg(test)]
+mod user_event_frame_tests {
+    use super::*;
+
+    use crate::application::admin_events::{UserEvent, UserEventScope};
+
+    #[test]
+    fn keeps_the_legacy_scope_only_frame_for_directory_events() {
+        assert_eq!(
+            user_event_frame(&UserEvent::broadcast(UserEventScope::Home)),
+            "event: invalidate\ndata: {\"scope\":\"home\"}\n\n"
+        );
+        assert_eq!(
+            user_event_frame(&UserEvent::for_user(UserEventScope::Item, "user-a")),
+            "event: invalidate\ndata: {\"scope\":\"item\"}\n\n"
+        );
+    }
+
+    #[test]
+    fn narrows_progress_frames_to_the_playing_item() {
+        assert_eq!(
+            user_event_frame(
+                &UserEvent::for_user(UserEventScope::Progress, "user-a").with_item_id("item-1")
+            ),
+            "event: invalidate\ndata: {\"scope\":\"progress\",\"itemId\":\"item-1\"}\n\n"
+        );
+    }
 }
 
 #[cfg(test)]

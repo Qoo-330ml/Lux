@@ -55,7 +55,7 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
     let item_id = emby_internal_id(&item_id);
     match catalog.set_resume_hidden(principal, &item_id, hidden).await {
         Ok(user_state) => {
-            state.user_events.publish_home_coalesced().await;
+            state.user_events.publish_home_coalesced_for(&user_id).await;
             Json(emby_user_item_data_json(&item_id, user_state.as_ref())).into_response()
         }
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {

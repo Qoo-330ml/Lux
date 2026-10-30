@@ -1781,7 +1781,7 @@ pub(super) async fn handle_emby_playback_event(
             {
                 return web_playback_error(&headers, error);
             }
-            state.user_events.publish_home_coalesced().await;
+            state.user_events.publish_home_coalesced_for(&user_id).await;
             if state_name != "STOPPED"
                 && let Some(session_id) = emby_transcode_session_id
             {
@@ -4551,7 +4551,10 @@ pub(super) async fn lux_web_playback_event(
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        state.user_events.publish_home_coalesced().await;
+        state
+            .user_events
+            .publish_progress_coalesced(&session.user_id, &session.item_id)
+            .await;
         if let Some(event_type) = activity_event {
             record_activity_event(
                 Some(database),
@@ -4864,7 +4867,7 @@ pub(super) async fn lux_post_progress(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            state.user_events.publish_home_coalesced().await;
+            state.user_events.publish_home_coalesced_for(&user_id).await;
             if let Some(event_type) = activity_event {
                 record_activity_event(
                     Some(database),
@@ -5006,11 +5009,14 @@ pub(super) async fn handle_emby_user_flag(
                 Ok(user_state) => user_state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            state.user_events.publish(if played {
-                UserEventScope::Item
-            } else {
-                UserEventScope::Favorites
-            });
+            state.user_events.publish_for_user(
+                if played {
+                    UserEventScope::Item
+                } else {
+                    UserEventScope::Favorites
+                },
+                &target_user_id,
+            );
             Json(emby_user_item_data_json(&item_id, user_state.as_ref())).into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -5105,7 +5111,9 @@ pub(super) async fn lux_set_favorite(
         .await
     {
         Ok(()) => {
-            state.user_events.publish(UserEventScope::Favorites);
+            state
+                .user_events
+                .publish_for_user(UserEventScope::Favorites, &user.id.to_string());
             StatusCode::NO_CONTENT.into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -5147,7 +5155,9 @@ pub(super) async fn lux_set_played(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            state.user_events.publish(UserEventScope::Item);
+            state
+                .user_events
+                .publish_for_user(UserEventScope::Item, &user.id.to_string());
             StatusCode::NO_CONTENT.into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
