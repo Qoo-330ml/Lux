@@ -1501,8 +1501,10 @@ pub(super) async fn handle_emby_playback_event(
     let item_access = if is_global_collection_work {
         access.can_view_item(principal, &internal_item_id).await
     } else {
+        // A progress tick repeats this check every ~10 s for the same session, so it may reuse a
+        // recent "allowed" answer. The global collection branch above keeps its own lookup.
         access
-            .can_view_item_in_library(
+            .can_view_item_in_library_cached(
                 principal,
                 &internal_item_id,
                 resolved_item_library_id.as_deref(),
@@ -4786,8 +4788,10 @@ pub(super) async fn lux_post_progress(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let access = state.access();
+    // The web player posts progress every ~10 s for the same item, so this tick may reuse a recent
+    // "allowed" answer instead of re-reading library access and content restrictions.
     match access
-        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .can_view_item_cached(AccessPrincipal::new(user.id, user.is_admin), &item_id)
         .await
     {
         Ok(true) => {}
