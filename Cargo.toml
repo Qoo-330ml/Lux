@@ -8,6 +8,10 @@ license-file = "LICENSE"
 
 [features]
 performance-benchmarks = []
+# Opt-in TypeScript binding generation for the Lux API DTOs (docs/API-TYPES-SYNC.md).
+# The default build must never pull `ts-rs` in: this feature only exists for
+# `scripts/generate-api-types.sh` and the drift check.
+ts-bindings = ["dep:ts-rs"]
 
 [dependencies]
 argon2 = "0.5.3"
@@ -46,6 +50,13 @@ tracing = "0.1"
 tracing-appender = "0.2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 time = { version = "0.3", features = ["formatting", "parsing"] }
+# Only used to generate web/src/lib/api/generated/** behind the `ts-bindings` feature.
+# `serde-compat` is the only default feature of ts-rs and is required to carry
+# `#[serde(rename_all)]` / `Option` semantics into the generated types; the
+# `format` feature (dprint) stays off because the output is committed as-is.
+ts-rs = { version = "12.0.1", optional = true, default-features = false, features = [
+    "serde-compat",
+] }
 url = "2"
 uuid = { version = "1", features = ["serde", "v7"] }
 xxhash-rust = { version = "0.8.19", features = ["xxh3"] }

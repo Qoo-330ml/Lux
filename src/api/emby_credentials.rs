@@ -199,10 +199,7 @@ fn is_playable_media_endpoint(endpoint: &str) -> bool {
         Some((name, container)) => (name, Some(container)),
         None => (endpoint, None),
     };
-    if !matches!(
-        name.to_ascii_lowercase().as_str(),
-        "stream" | "original" | "original.strm"
-    ) {
+    if !matches!(name.to_ascii_lowercase().as_str(), "stream" | "original") {
         return false;
     }
     container.is_none_or(|container| {

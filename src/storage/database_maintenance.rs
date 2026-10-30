@@ -37,11 +37,11 @@ const SQLITE_INCREMENTAL_VACUUM_PAGES_PER_STEP: i64 = 2_048;
 const MAINTENANCE_ENV: &str = "LUX_DATABASE_MAINTENANCE";
 const MAINTENANCE_INTERVAL_ENV: &str = "LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS";
 const MAINTENANCE_INITIAL_DELAY_ENV: &str = "LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS";
+const QUERY_STATISTICS_EXTENSION_ENV: &str = "LUX_POSTGRES_QUERY_STATISTICS_EXTENSION";
+const QUERY_STATISTICS_EXTENSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// A full SQLite `VACUUM` rewrites the entire file and holds the write lock for the
 /// whole rewrite, so the default budget stays short. Operators who accept the lock
 /// for an offline compaction can raise it.
-const QUERY_STATISTICS_EXTENSION_ENV: &str = "LUX_POSTGRES_QUERY_STATISTICS_EXTENSION";
-const QUERY_STATISTICS_EXTENSION_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_VACUUM_TIMEOUT_ENV: &str = "LUX_SQLITE_VACUUM_TIMEOUT_SECONDS";
 const DEFAULT_SQLITE_VACUUM_TIMEOUT_SECONDS: u64 = 120;
 
@@ -615,8 +615,6 @@ impl Database {
     }
 }
 
-/// Quotes a table name for interpolation into DDL that cannot take bind
-/// parameters. Names come from system catalogs, never user input.
 /// `LUX_POSTGRES_QUERY_STATISTICS_EXTENSION` defaults to on; `0`, `false`, `off` and `no` opt out.
 pub(crate) fn resolve_query_statistics_extension_enabled(configured: Option<&str>) -> bool {
     !matches!(
@@ -744,6 +742,8 @@ impl Database {
     }
 }
 
+/// Quotes a table name for interpolation into DDL that cannot take bind
+/// parameters. Names come from system catalogs, never user input.
 fn quote_identifier(name: &str) -> String {
     let escaped = name.replace('"', "\"\"");
     format!("\"{escaped}\"")

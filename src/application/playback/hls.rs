@@ -2251,15 +2251,34 @@ fn hardware_probe_args(encoding: &FfmpegEncodingOptions) -> Vec<String> {
     args
 }
 
-/// Keeps the last FFmpeg error line for the admin UI without dumping the whole log.
+/// Keeps the most useful FFmpeg error lines for the admin UI without dumping the whole log.
+///
+/// FFmpeg ends a failed run with generic "Nothing was written into output file" lines; the real
+/// cause (missing device, driver, permission) comes before them, so those lines are only used
+/// when nothing else was reported.
 fn sanitize_probe_error(stderr: &str) -> String {
-    let line = stderr
+    const GENERIC: [&str; 2] = ["Nothing was written into output file", "Conversion failed!"];
+    let lines: Vec<&str> = stderr
         .lines()
-        .rev()
         .map(str::trim)
-        .find(|line| !line.is_empty())
-        .unwrap_or("FFmpeg 未给出错误信息");
-    let cleaned: String = line
+        .filter(|line| !line.is_empty())
+        .collect();
+    let informative: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !GENERIC.iter().any(|generic| line.contains(generic)))
+        .collect();
+    let chosen = if informative.is_empty() {
+        lines
+    } else {
+        informative
+    };
+    if chosen.is_empty() {
+        return "FFmpeg 未给出错误信息".to_owned();
+    }
+    let tail = &chosen[chosen.len().saturating_sub(3)..];
+    let cleaned: String = tail
+        .join(" | ")
         .chars()
         .map(|character| {
             if character.is_control() {
@@ -2268,7 +2287,7 @@ fn sanitize_probe_error(stderr: &str) -> String {
                 character
             }
         })
-        .take(240)
+        .take(400)
         .collect();
     cleaned.trim().to_owned()
 }
@@ -2648,6 +2667,20 @@ fn available_free_bytes(_path: &Path) -> Result<u64, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_error_prefers_the_cause_over_ffmpeg_closing_lines() {
+        let stderr = "Failed to open VAAPI device /dev/dri/renderD128: Permission denied\n\
+                      [out#0/null @ 0x1] Nothing was written into output file, because at least one of its streams received no packets.\n";
+        let message = sanitize_probe_error(stderr);
+        assert!(message.contains("Permission denied"), "{message}");
+        assert!(!message.contains("Nothing was written"), "{message}");
+        assert_eq!(
+            sanitize_probe_error("Conversion failed!\n"),
+            "Conversion failed!"
+        );
+        assert_eq!(sanitize_probe_error(""), "FFmpeg 未给出错误信息");
+    }
+
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
@@ -2661,7 +2694,7 @@ mod tests {
         SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, asset_segment_number,
         emby_init_segment_number, ffmpeg_args, ffmpeg_args_for_output, ffmpeg_args_with_audio,
         ffmpeg_args_with_timeline, hls_segment_path, hls_start_number, is_valid_asset,
-        vod_manifest,
+        sanitize_probe_error, vod_manifest,
     };
 
     fn fake_process(directory: PathBuf, total_bytes: Option<u64>) -> super::HlsProcess {

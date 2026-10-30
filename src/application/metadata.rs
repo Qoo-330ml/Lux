@@ -329,6 +329,11 @@ pub struct NfoMetadata {
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
 #[serde(rename_all = "camelCase")]
 pub enum MetadataField {
     Title,

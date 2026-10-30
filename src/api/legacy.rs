@@ -1113,13 +1113,6 @@ fn is_registered_emby_video_path(path: &str) -> bool {
         || is_emby_transcoding_path(path)
 }
 
-/// A playback-only token is a credential that travels inside a media URL, so it is accepted on
-/// the playback allow-list and nowhere else.
-///
-/// The Emby router's own middleware only sees paths that reach a registered route, and Lux API
-/// requests never call the Emby resolver at all. Rejecting here, before routing, keeps both cases
-/// identical: an unregistered Emby path must answer 401 rather than 404/405, and nothing outside
-/// `/emby` may accept the token.
 /// Credential exactly as the client sent it, for layers that run before normalization.
 fn emby_credential_from_request(request: &Request<Body>) -> Option<String> {
     let headers = request.headers();
@@ -1142,6 +1135,13 @@ fn emby_credential_from_request(request: &Request<Body>) -> Option<String> {
     })
 }
 
+/// A playback-only token is a credential that travels inside a media URL, so it is accepted on
+/// the playback allow-list and nowhere else.
+///
+/// The Emby router's own middleware only sees paths that reach a registered route, and Lux API
+/// requests never call the Emby resolver at all. Rejecting here, before routing, keeps both cases
+/// identical: an unregistered Emby path must answer 401 rather than 404/405, and nothing outside
+/// `/emby` may accept the token.
 async fn reject_playback_token_outside_allow_list(request: Request<Body>, next: Next) -> Response {
     // This layer runs before `normalize_credentials`, so the credential is read from wherever
     // the client put it rather than from the normalized header.
