@@ -673,3 +673,68 @@ C1 之后、C2 之前是安全的（此时还没有 handler 迁移）。但**如
 | C11 | 同 C10 的全量门禁（它动 `CoreState` 字段与 worker 启动条件） |
 
 不 push、不合并到其它分支；C10 之前的每个提交都可以单独 `git revert`。
+
+## 9. 问题 8：风险、被否决的方案与决策点
+
+### 9.1 风险表
+
+| # | 风险 | 触发条件 | 影响 | 缓解 |
+| --- | --- | --- | --- | --- |
+| R1 | **冻结测试钉住的"未就绪"契约与"未就绪不注册业务路由"直接冲突** | 任何时候 | `--test api_web`、`--test plugins danmaku_api::` 变红 | 未就绪兼容树合成 6 条响应（§9.2）；C1 的验收命令就是这么定的（§8.4） |
+| R2 | 兼容树的合成响应与真实 handler 漂移 | 将来改了 `auth_me` 的 503 文案 | 测试仍绿但语义漂移 | 兼容树只在 `AppState::default()` 路径可达，命名 `not_ready_compat_*` + `#[doc(hidden)]` + 注释写明"只为冻结测试存在"；`§9.2` 表格即契约文档 |
+| R3 | **setup 完成但拿不到 `RestartHandle` → 进程停在 setup 树，无法登录** | 嵌入式/自定义启动路径（`src/main.rs:195` 之外的构造） | 用户看不到业务界面，直到手工重启 | `main` 恒注入句柄；第 ② 步的 `schedule_setup_restart` 在 `None` 时已 `tracing::warn!("setup completed without a restart handle")`（分支 `tspace/setup-restart-backend`）；本设计把它升级为 `error!` 并写进 §9.4 已知限制。**当选 `tests/**` 不改时，这是唯一无法靠类型消除的窗口** |
+| R4 | Emby 客户端在 setup 模式的响应从 401 变 404 | 有人在 setup 未完成时把 Emby 客户端指向 Lux | 客户端提示"服务器不可用" | 保留 `/System/Ping`、`/System/Info/Public`、`/Users/Public` 三条公共发现路由（§4.2 #11-13），并把差异列进 §4.4 |
+| R5 | 24 个 `api_routes()` 的返回类型翻转引发集中类型错误 | C1 | C1 一次红 24 个文件 | `FromRef<ReadyAppState> for AppState` 让 handler 完全不动（§3.1）；C1 只改函数签名，不改 handler |
+| R6 | `state.database`（字段）与 `state.database()`（方法）语义分叉 | 迁移批次 | ready handler 里误读 `Option`，行为悄悄退回 503 | 建议同 C1 把 `CoreState.database` 改名为 `database_slot` 并只留方法访问（§2.1、决策点 D4） |
+| R7 | 每请求克隆成本变化 | 两棵树 | 延迟/内存 | `FromRef` 只克隆 `CoreState`（Arc 包住的 hub/limiter）+ `Database` + `Arc<ReadyServices>`，与今天"克隆整个 `AppState`"同阶；`Arc::ptr_eq` 由 `src/api/legacy.rs:2490-2507` 的单测继续守护 |
+| R8 | setup 模式仍构建全部服务、启动全部 worker | 每次 setup 启动 | 行为与今天一致，但"setup 模式应该更轻"的直觉未被满足 | 明确列为非目标（§4.3），留给 C11 之后单独评估；不塞进第 ③ 步以免改变首次扫描的接线行为 |
+| R9 | `apply_common_layers` 重构时打乱 20 层顺序 | C1 | ETag/压缩/HSTS/请求 ID/指标行为变化 | 按 `src/api/routes.rs:147-310` 的出现顺序原样搬移；验收跑 `--test api_web response_compression::`、`acl::`、`api_error_contract::` |
+| R10 | `case_insensitive_emby_router` 包裹位置改变 | C1 | Emby 大小写归一化失效（`/items/x` vs `/Items/x`） | 它今天在最外层（`src/api/routes.rs:311`），两棵树都必须最后应用；验收跑 `--test emby` 与 `--test api_web web_static::media_detail_navigation_is_served_as_html_while_json_uses_emby` |
+| R11 | `request_metrics` 的 `route` 标签在 setup 树里只覆盖少数模板 | C1 之后 | 指标里 setup 模式多为 `unmatched` | 可接受：setup 模式的请求量极小；`src/api/routes.rs:290` 的逻辑不动 |
+
+### 9.2 冻结测试钉住的"未就绪"契约（兼容树必须合成的 6 条响应）
+
+未就绪兼容树（`not_ready_compat_router`，只在 `app_with_state(AppState::default())` 时构造）必须给出
+下面这些响应；它们今天来自真实 handler + 中间件，拆分后真实 handler 已不在树上，所以要显式合成：
+
+| # | 请求 | 断言 | 今天由谁给出 | 兼容树怎么给 |
+| --- | --- | --- | --- | --- |
+| 1 | `GET /health/live` | 200，body 逐字 `{"status":"ok"}`，有 `x-request-id` | `src/api/users.rs:33`（无状态） | 复用同一个 handler（`core_routes`，`State<CoreState>`） |
+| 2 | `GET /health/ready` | 503，body 含 `database_unavailable` | `src/api/users.rs:152-158` | 复用同一个 handler（`State<CoreState>` 的 database 守卫保留） |
+| 3 | `GET /api/v1/auth/sessions` | 503，`error.code == "DATABASE_UNAVAILABLE"`，`error.requestId` 非空且等于响应头 `x-request-id`；带 `x-forwarded-proto: https` 时还有 HSTS | handler 裸 503 + `normalize_empty_api_service_unavailable`（`src/api/legacy.rs:1030`）+ `security_response_headers`（`src/api/routes.rs:580`） | 合成 handler 返回**裸 503**（空 body）→ 两个中间件照常改写，逐字一致 |
+| 4 | `GET /api/v1/auth/me` | 503，`error.message == "服务尚未就绪"` | `require_web_principal` 的 `auth` 守卫（`src/api/users.rs:2927-2934`） | 合成 handler 用同一个 `api_error(&headers, 503, DatabaseUnavailable, "服务尚未就绪")` |
+| 5 | `GET /System/Info` | 503，body **为空** | Emby handler 的裸 503 | 合成 handler 返回裸 503（Emby 命名空间不经错误信封，`src/api/legacy.rs:1376-1379`） |
+| 6 | `GET /api/v1/items/item-1/danmaku` | 503，`error.code == "DATABASE_UNAVAILABLE"` | `lux_danmaku_unavailable`（`src/api/media.rs:1992`）或裸 503 + 归一化 | 合成 handler 返回裸 503 |
+| 旁证 | `GET /Items/unknown-item/UnknownThing`、`/api/v1/no-such-endpoint`、`/emby/not-implemented`、`/Sessions/not-implemented` | 404（Emby 侧裸 404，Lux 侧 JSON `NOT_FOUND`） | SPA fallback + `reject_unmatched_api_path`（`src/api/legacy.rs:1356`） | 不需要合成：兼容树保留 SPA fallback，行为自然一致 |
+| 旁证 | `/`、`/libraries/example`、静态资源 | 200 | `ServeDir` + SPA fallback（`src/api/routes.rs:140-145`） | 同左 |
+
+依据：`tests/api_web/health.rs:11-26`、`tests/api_web/ready_version.rs:14-24`、
+`tests/api_web/api_error_contract.rs:18-47`、`:64-81`、`:98-139`、`:220-236`、
+`tests/api_web/web_static.rs:9-49`、`:125-158`、`tests/plugins/danmaku_api.rs:213-219`。
+**兼容树合计约 40 行**（5 个合成 handler + 路由注册），全部只被测试触达。
+
+### 9.3 被否决的方案
+
+| 方案 | 否决理由 |
+| --- | --- |
+| 停在方案 A（单树 + `require_ready!`，每 handler 一次守卫） | 不满足"setup 模式下业务路由不注册"，也没到"字段非 Option"；守卫数量只是从 301 降到 handler 数 |
+| 用一个 trait 抽象状态（`trait HttpState { fn catalog(&self) -> &CatalogService; }`） | handler 变泛型或仍拿 `Option`，见 §2.2；且 axum 的 `Router<S>` 无法让同一 handler 同时服务两棵树 |
+| 进程内热切换 Router（外层 `ArcSwap<Router>` / `Mutex<Router>`） | 与第 ② 步"setup 完成后重启"的产品决策冲突；切换点要重建整棵路由树（含 20 层 layer 与 Emby 路径模板），还要处理在途请求；类型层无法保证"setup 模式没有业务路由" |
+| 让 `AppState` 变 enum、handler 继续取 `State<AppState>` | 运行期匹配 = 回到 Option 语义，守卫一个也删不掉 |
+| 单树 + 在 fallback 里对 `/api/v1/*` 统一回 503 | 与 `tests/api_web/api_error_contract.rs:230-236` 冲突（`/api/v1/no-such-endpoint` 必须 404），也与 `/api/v1/auth/me` 需要特定文案冲突（§9.2 #3/#4） |
+| setup 树专门监听第二个端口 | 违反"单进程单一监听"（`docs/LUX-DEVELOPMENT.md` 的单进程约束），前端与反向代理配置都要改 |
+| setup handler 也取 `State<ReadyAppState>`、允许 `ready` 为 `None` | 又把 `Option` 请回类型里，等于方案 A |
+| 在 setup 树挂完整 Emby 树 | 需要全部 46 个服务与鉴权链，与"setup 模式不暴露业务能力"相反 |
+| 修改 `tests/**` 的 3 处 `AppState::default()` 与 5 处断言 | 任务硬约束禁止；且兼容树已经能在不改测试的前提下把 `api_web`/`plugins` 组跑绿（§9.2） |
+
+### 9.4 需要所有者确认的决策点
+
+| # | 决策点 | 本设计建议 | 备选与代价 |
+| --- | --- | --- | --- |
+| **D1** | 是否接受"未就绪兼容树"这 ~40 行只为冻结测试存在的 `src` 代码？ | **接受**（§9.2）：它让 `tests/**` 一行不改，回滚边界也更清楚 | 备选：允许改 `tests/api_web/{web_static,api_error_contract}.rs`、`tests/plugins/danmaku_api.rs` 的 3 个构造点与若干断言，把那 6 条响应从 `src` 挪到测试里。代价：违反本任务硬约束，且 `tests/**` 是"ready 模式行为不变"的唯一证据，改它就削弱验收口径 |
+| **D2** | `main` 的模式判定失败时 fail-closed 到 **Ready** 是否同意？ | **同意 Ready**（§5.2）：setup 模式能创建首个管理员、改写数据库配置，是敏感方向 | 备选：fail 到 Setup，代价是把 setup 能力交给一个无法证明状态的服务实例 |
+| **D3** | setup 模式是否继续构建 46 个服务并启动全部后台 worker？ | **继续**（§4.3）：与今天逐字一致，首次扫描的 `ScanJobService` 接线不变 | 备选：setup 模式只建 7 个服务、只起索引 worker，代价是首次扫描后的封面/人物/首页读模型行为变化，需单独验收 |
+| **D4** | 是否接受把 `CoreState.database` 字段改名为 `database_slot` 并统一用方法读取（约 36 处文本）？ | **接受**（§2.1、R6）：消除 ready 模式下"字段 vs 方法"的歧义 | 备选：保留字段 + 只在 review 清单里禁止 ready 代码读字段，代价是没有编译器保护 |
+| **D5** | setup 树是否保留 3 条 Emby 公共发现路由？ | **保留**（§4.2 #11-13）：`StartupWizardCompleted:false` 是 Emby 的"向导未完成"约定 | 备选：全部 404，代价是 setup 期间 Emby 客户端从"服务器在、未初始化"变成"服务器不可用" |
+
+D1–D3 影响提交切分与验收口径，D4 只影响一个机械提交，D5 只影响 setup 树的 2 个 handler。
