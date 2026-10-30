@@ -101,7 +101,98 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 
 ## 3. 设计问题 2：首次扫描会被重启取消
 
-（待填）
+### 3.1 问题与证据链
+
+1. setup 的首次扫描是一次真实的 `RECONCILE_LIBRARY` 任务：`spawn_library_scan`（`src/api/admin/admin_jobs.rs:242`）
+   → `start_library_scan`（`src/application/admin_scan_jobs.rs:143`）**先建任务行、再 `tokio::spawn`
+   worker**（`src/application/admin_scan_jobs.rs:147-157`）。
+2. 进程关停时 `cancel_incomplete_jobs_for_shutdown` 会把 `PENDING`/`RUNNING` 的 `scan_jobs` 统一改成
+   `CANCELLED`、`error='SERVER_SHUTDOWN'`（`src/storage/jobs/shutdown.rs:1`、`:46-56`），新进程启动时又取消一次
+   （`src/main.rs:161`）。
+3. 启动流程里**没有任何**“为未扫描过的库启动扫描”的步骤：`start_scheduled_tasks`（`src/api/legacy.rs:869`）
+   只同步计划任务、读模型、清理 worker；`resume_interrupted_metadata_scraping`（`src/api/legacy.rs:953`）
+   只恢复元数据刮削。全仓 `start_library_scan` 的调用点只有 setup（`src/api/users.rs:729`）与管理员手动触发
+   （`src/api/admin/admin_libraries.rs:1163`）。
+4. 结论：**若不做任何事**，setup 创建的第一个库在重启后停在“有 roots、零媒体项、`last_scan_at IS NULL`、
+   一条被取消的扫描任务”的状态，直到管理员自己去点“扫描”。
+
+补充事实：`libraries.last_scan_at` 是“扫描已成功跑完”的现成持久信号（建表
+`migrations/0005_libraries.sql`，写入 `src/storage/library_roots.rs:257`，调用点
+`src/application/scanner/jobs/manifest_index.rs:1399`、`reconciliation.rs:1192`、`incremental.rs:100`），
+且**没有历史回填**（全仓只有这 4 处出现该列名）。
+
+### 3.2 候选方案
+
+| 编号 | 机制 | 是否改动 setup 的扫描行为 | 是否新增持久化 | 主要代价 |
+| --- | --- | --- | --- | --- |
+| **(b) 推荐** | setup **继续**启动首次扫描；启动流程新增“恢复被关停打断的首次扫描” | 否 | 否（复用 `scan_jobs` 行作为意图） | 任务历史里会留下一条 `CANCELLED/SERVER_SHUTDOWN` 记录；策略上“任何被重启打断的首次扫描都会被重试” |
+| (a1) | setup **不再**启动扫描；重启后按 `lux_meta` 标记启动 | 是（201 的 `scanJob` 变 `null`） | 是（新 storage API + `lux_meta` 键） | 两处真源；`lux_meta` 目前只在 `src/storage/database_cleanup.rs:384-401` 内部使用，需要新开公共 API；标记的清理/重试语义要另写 |
+| (a2) | setup 不再启动扫描；重启后对 `last_scan_at IS NULL` 的库启动扫描 | 是 | 否 | **旧库会被批量重扫**：`last_scan_at` 属于 manifest 时代才有写入、无回填，升级后第一次启动会给所有历史库排队做全量扫描 |
+| (c) | 保留 setup 扫描，但关停时**豁免**它（新列/新状态，或“刚创建的库不取消”） | 否 | 是（迁移） | 破坏 `src/storage/jobs/shutdown.rs:9-12` 明确写下的“单事务取消、启动与关停不留混合集合”不变量；扫描续跑还要处理半成品 manifest |
+| (d) | 前端在服务就绪后调用现有 `POST /api/v1/admin/libraries/{id}/scan` | 否 | 否 | 不构成保证：关标签页、反向代理抖动、管理员还没登录都会漏；只能当兜底 UX |
+| (e) | setup 请求里等扫描跑完再返回 | 是 | 否 | 违反 `AGENTS.md`“不要在用户请求里扫描整个库”，201 会悬挂数分钟 |
+| (f) | 把重启延迟拉长到扫描完成 | 否 | 否 | 同上，等于把一次全量扫描塞进 setup 的等待窗口 |
+
+### 3.3 推荐方案 (b) 的具体形态
+
+**setup 不动扫描行为**（`src/api/users.rs:729` 保持原样），新增一个启动恢复步骤：
+
+1. **storage**：在 `src/storage/jobs/scan/lifecycle.rs`（或 `src/storage/jobs/shutdown.rs` 旁边）加
+   `list_shutdown_interrupted_first_scan_library_ids(after: Option<&str>, limit: i64)`，判据与
+   `list_shutdown_interrupted_metadata_reidentify_job_ids`（`src/storage/jobs/metadata_reidentify/lifecycle.rs:561`）
+   同构，复用项目已有的“`CANCELLED` + `SERVER_SHUTDOWN` ⇒ 可恢复”约定：
+
+   ```sql
+   SELECT jobs.library_id
+   FROM scan_jobs jobs
+   JOIN libraries lib ON lib.id = jobs.library_id
+   WHERE jobs.job_type = 'RECONCILE_LIBRARY'
+     AND jobs.status = 'CANCELLED'
+     AND jobs.error = 'SERVER_SHUTDOWN'
+     AND lib.is_enabled = 1
+     AND lib.last_scan_at IS NULL
+     AND EXISTS (SELECT 1 FROM library_roots root WHERE root.library_id = lib.id)
+     AND NOT EXISTS (
+         SELECT 1 FROM scan_jobs active
+         WHERE active.library_id = jobs.library_id AND active.status IN ('PENDING', 'RUNNING'))
+     AND (? IS NULL OR jobs.library_id > ?)
+   GROUP BY jobs.library_id
+   ORDER BY jobs.library_id
+   LIMIT ?
+   ```
+
+   `GROUP BY` 解决“连续重启留下多条取消记录”的重复；`NOT EXISTS` 用现成的活动任务判据
+   （`src/storage/jobs/scan/lifecycle.rs:235-247`）。
+
+2. **application**：在 `src/application/admin_scan_jobs.rs`（`start_library_scan` 旁，`:143`）加
+   `resume_shutdown_interrupted_first_scans(scan_jobs, workers, limit)`：逐库调用现成的
+   `start_library_scan`，把 `AlreadyActive`（`src/application/scanner/jobs/lifecycle.rs:903-909`）与
+   `LibraryNotFound`（停用/已删，`:900`）当“跳过”，其它错误 `tracing::warn!` 后继续；单次启动最多处理
+   32 个库，避免病态数据造成扫描风暴。
+
+3. **启动接线**：在 `src/api/legacy.rs` 的 `resume_interrupted_metadata_scraping`（`:953`）旁加
+   `AppState::resume_shutdown_interrupted_first_scans()`，同样以 `tokio::spawn` 后台执行、同样在
+   `database_selection_required`（`:954`）与 `scan_jobs` 缺失时直接返回；在 `src/main.rs:202`
+   之后调用一行。
+
+### 3.4 如何保证“setup 创建的第一个库在重启后仍会被扫描一次”
+
+| 环节 | 保证 | 证据 |
+| --- | --- | --- |
+| setup 请求内任务已落库 | 是（`start_library_scan` 先 `create_*_job` 后 `spawn`，201 返回时行已存在） | `src/application/admin_scan_jobs.rs:147-157` |
+| 关停把“意图”转成可恢复状态 | 是（`PENDING` 或 `RUNNING` 都改成 `CANCELLED/SERVER_SHUTDOWN`） | `src/storage/jobs/shutdown.rs:46-56` |
+| 断电/`SIGKILL` 场景 | 是（残留 `RUNNING` 会在下次启动被同样标记，谓词同样命中） | `src/main.rs:161` |
+| 重启后恢复 | 是（谓词命中 → 新任务 + 新 manifest） | §3.3 |
+| 不重复扫描 | 是（扫描若在重启前已跑完，`last_scan_at` 已写，谓词不命中） | `src/storage/library_roots.rs:257` |
+| **遗漏面**：setup 时扫描**没能启动** | 否 | `src/api/users.rs:729-735` 只 `warn`；此时无任务行、无证据，201 里 `scanJob` 为 `null`。用户可在管理页手动扫描。若必须覆盖，改用 (a1) 的 `lux_meta` 标记 |
+
+### 3.5 为什么不用“复用被取消的任务行”续跑
+
+扫描的续跑依赖 manifest 检查点（`scan_manifests` / `scan_manifest_roots`），被关停打断的任务可能处于
+“manifest 部分写入”的中间态；`cancel_incomplete_jobs_for_shutdown` 里对 `RECONCILE_LIBRARY` 还专门
+保留了一条“没有 manifest 才允许按旧版重扫”的分支（`src/storage/jobs/shutdown.rs:18-38`）。对**首次**
+扫描而言，新建任务 + 新 manifest 与“从头重扫”等价且语义简单，所以恢复流程创建**新任务**，并在任务
+历史上留下“取消 → 新任务完成”的清晰链路。
 
 ## 4. 设计问题 3：幂等与失败
 
