@@ -12,6 +12,7 @@ use crate::storage::{
     GlobalMovieCollectionReferenceUpdate, StoredMovieNfoCollectionReferenceReconciliation,
     global_collection_title_fallback, global_collection_title_is_placeholder,
 };
+use sqlx::FromRow;
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
 const RECOMMENDATION_STATS_MAX_IDLE_REFRESH_SECONDS: i64 = 7 * 86_400;
@@ -32,6 +33,122 @@ struct CatalogDetailRow {
     series_name: Option<String>,
     season_count: i64,
     episode_count: i64,
+}
+
+/// Row of every catalog list/detail query decoded by `fetch_catalog_rows_internal`.
+///
+/// The list, recommendation, resume and detail projections all select the same 44 catalog
+/// columns, so one struct decodes them and [`StoredCatalogRow::from`] keeps the previous
+/// field-for-field mapping (0/1 integers become `Option<bool>`).
+///
+/// Three columns are not part of every projection: `series_name` is only selected by the resume
+/// query, `resume_total` only by the counted resume query, and `source_relative_path` is a
+/// subquery that only some detail projections carry. They keep their historical
+/// "missing column decodes to `None`" behaviour through `#[sqlx(default)]`, so a projection
+/// without them still decodes and never turns a working request into an error. Every other
+/// column is required: a projection that stops selecting one now returns an error instead of
+/// panicking inside `row.get`.
+#[derive(Debug, sqlx::FromRow)]
+struct CatalogListRow {
+    item_id: String,
+    library_id: String,
+    item_type: String,
+    parent_id: Option<String>,
+    series_id: Option<String>,
+    #[sqlx(default)]
+    series_name: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    title: String,
+    sort_title: String,
+    original_title: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i64>,
+    rating: Option<f64>,
+    rating_source: Option<String>,
+    runtime_ticks: Option<i64>,
+    added_at: i64,
+    updated_at: i64,
+    poster_image_tag: Option<String>,
+    fanart_image_tag: Option<String>,
+    thumb_image_tag: Option<String>,
+    logo_image_tag: Option<String>,
+    source_id: Option<String>,
+    #[sqlx(default)]
+    source_relative_path: Option<String>,
+    source_kind: Option<String>,
+    container: Option<String>,
+    size: Option<i64>,
+    external_url: Option<String>,
+    edition_name: Option<String>,
+    quality_label: Option<String>,
+    bitrate: Option<i64>,
+    duration_ticks: Option<i64>,
+    is_default: Option<i64>,
+    probe_status: Option<String>,
+    stream_id: Option<String>,
+    stream_index: Option<i64>,
+    stream_type: Option<String>,
+    codec: Option<String>,
+    language: Option<String>,
+    stream_title: Option<String>,
+    stream_details_json: Option<String>,
+    stream_is_external: Option<i64>,
+    stream_is_default: Option<i64>,
+    stream_is_forced: Option<i64>,
+    #[sqlx(default)]
+    resume_total: Option<i64>,
+}
+
+impl From<CatalogListRow> for StoredCatalogRow {
+    fn from(row: CatalogListRow) -> Self {
+        Self {
+            item_id: row.item_id,
+            library_id: row.library_id,
+            item_type: row.item_type,
+            parent_id: row.parent_id,
+            series_id: row.series_id,
+            series_name: row.series_name,
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+            title: row.title,
+            sort_title: row.sort_title,
+            original_title: row.original_title,
+            overview: row.overview,
+            production_year: row.production_year,
+            rating: row.rating,
+            rating_source: row.rating_source,
+            runtime_ticks: row.runtime_ticks,
+            added_at: row.added_at,
+            updated_at: row.updated_at,
+            poster_image_tag: row.poster_image_tag,
+            fanart_image_tag: row.fanart_image_tag,
+            thumb_image_tag: row.thumb_image_tag,
+            logo_image_tag: row.logo_image_tag,
+            source_id: row.source_id,
+            source_relative_path: row.source_relative_path,
+            source_kind: row.source_kind,
+            container: row.container,
+            size: row.size,
+            external_url: row.external_url,
+            edition_name: row.edition_name,
+            quality_label: row.quality_label,
+            bitrate: row.bitrate,
+            duration_ticks: row.duration_ticks,
+            is_default: row.is_default.map(|value| value != 0),
+            probe_status: row.probe_status,
+            stream_id: row.stream_id,
+            stream_index: row.stream_index,
+            stream_type: row.stream_type,
+            codec: row.codec,
+            language: row.language,
+            stream_title: row.stream_title,
+            stream_details_json: row.stream_details_json,
+            stream_is_external: row.stream_is_external.map(|value| value != 0),
+            stream_is_default: row.stream_is_default.map(|value| value != 0),
+            stream_is_forced: row.stream_is_forced.map(|value| value != 0),
+        }
+    }
 }
 
 fn user_library_access_filter(library_id_expression: &str, include_admin: bool) -> String {
@@ -3067,77 +3184,22 @@ impl Database {
                 CatalogBind::Real(value) => statement.bind(*value),
             };
         }
-        statement
+        let raw_rows = statement
             .fetch_all(&self.pool)
             .await
-            .map(|rows| {
-                let total = if read_resume_total {
-                    rows.first()
-                        .and_then(|row| row.try_get("resume_total").ok())
-                        .unwrap_or(0)
-                } else {
-                    0
-                };
-                let rows = rows
-                    .into_iter()
-                    .map(|row| StoredCatalogRow {
-                        item_id: row.get("item_id"),
-                        library_id: row.get("library_id"),
-                        item_type: row.get("item_type"),
-                        parent_id: row.get("parent_id"),
-                        series_id: row.get("series_id"),
-                        series_name: row.try_get("series_name").ok().flatten(),
-                        season_number: row.get("season_number"),
-                        episode_number: row.get("episode_number"),
-                        title: row.get("title"),
-                        sort_title: row.get("sort_title"),
-                        original_title: row.get("original_title"),
-                        overview: row.get("overview"),
-                        production_year: row.get("production_year"),
-                        rating: row.get("rating"),
-                        rating_source: row.get("rating_source"),
-                        runtime_ticks: row.get("runtime_ticks"),
-                        added_at: row.get("added_at"),
-                        updated_at: row.get("updated_at"),
-                        poster_image_tag: row.get("poster_image_tag"),
-                        fanart_image_tag: row.get("fanart_image_tag"),
-                        thumb_image_tag: row.get("thumb_image_tag"),
-                        logo_image_tag: row.get("logo_image_tag"),
-                        source_id: row.get("source_id"),
-                        source_relative_path: row.try_get("source_relative_path").ok().flatten(),
-                        source_kind: row.get("source_kind"),
-                        container: row.get("container"),
-                        size: row.get("size"),
-                        external_url: row.get("external_url"),
-                        edition_name: row.get("edition_name"),
-                        quality_label: row.get("quality_label"),
-                        bitrate: row.get("bitrate"),
-                        duration_ticks: row.get("duration_ticks"),
-                        is_default: row
-                            .get::<Option<i64>, _>("is_default")
-                            .map(|value| value != 0),
-                        probe_status: row.get("probe_status"),
-                        stream_id: row.get("stream_id"),
-                        stream_index: row.get("stream_index"),
-                        stream_type: row.get("stream_type"),
-                        codec: row.get("codec"),
-                        language: row.get("language"),
-                        stream_title: row.get("stream_title"),
-                        stream_details_json: row.get("stream_details_json"),
-                        stream_is_external: row
-                            .get::<Option<i64>, _>("stream_is_external")
-                            .map(|value| value != 0),
-                        stream_is_default: row
-                            .get::<Option<i64>, _>("stream_is_default")
-                            .map(|value| value != 0),
-                        stream_is_forced: row
-                            .get::<Option<i64>, _>("stream_is_forced")
-                            .map(|value| value != 0),
-                    })
-                    .collect();
-                (rows, total)
-            })
-            .map_err(self.sqlx_err())
+            .map_err(self.sqlx_err())?;
+        // Decode in one pass and keep exactly one `StoredCatalogRow` per row: the struct fields
+        // are moved, never cloned, so the hot path gains no per-row allocation.
+        let mut total = 0;
+        let mut rows = Vec::with_capacity(raw_rows.len());
+        for (index, row) in raw_rows.into_iter().enumerate() {
+            let row = CatalogListRow::from_row(&row).map_err(self.sqlx_err())?;
+            if read_resume_total && index == 0 {
+                total = row.resume_total.unwrap_or(0);
+            }
+            rows.push(StoredCatalogRow::from(row));
+        }
+        Ok((rows, total))
     }
 
     pub(crate) async fn insert_media_item(
@@ -11171,6 +11233,124 @@ mod tests {
             !database
                 .is_active_web_session_token(&user_id, session_id, &token_hash)
                 .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_list_row_decodes_the_resume_projection_with_series_name()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::auth::users::UserStore;
+        use crate::storage::{ResumeItemsQuery, test_database};
+
+        let (_temp, database) = test_database().await?;
+        let user_id = UserStore::new(database.clone())?
+            .create_initial_admin("Resume", "Resume", "admin password")
+            .await?
+            .id
+            .to_string();
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('resume-lib', 'Resume', 'SERIES')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES
+                 ('resume-series', 'resume-lib', 'SERIES', 'Resume Series', 'Resume Series',
+                  NULL, 'LOCAL_CONFIRMED', 1),
+                 ('resume-episode', 'resume-lib', 'EPISODE', 'Resume Episode', 'Resume Episode',
+                  2000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE media_items SET series_id = 'resume-series' WHERE id = 'resume-episode'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (user_id, item_id, is_played, position_ticks, last_played_at)
+             VALUES (?, 'resume-episode', 0, 1000000000, 1)",
+        )
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+
+        let library_ids = vec!["resume-lib".to_owned()];
+        let (rows, total) = database
+            .list_resume_items_with_total(
+                &ResumeItemsQuery {
+                    user_id: &user_id,
+                    library_ids: &library_ids,
+                    item_types: &["EPISODE"],
+                    content_restrictions: None,
+                    played_percent: 90,
+                    minimum_ticks: 0,
+                    offset: 0,
+                    limit: 10,
+                },
+                true,
+            )
+            .await?;
+
+        // `series_name` and `resume_total` only exist in this projection; both must decode.
+        assert_eq!(total, 1);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item_id, "resume-episode");
+        assert_eq!(rows[0].series_id.as_deref(), Some("resume-series"));
+        assert_eq!(rows[0].series_name.as_deref(), Some("Resume Series"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_list_row_leaves_the_optional_columns_empty_for_the_list_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::test_database;
+
+        let (_temp, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('list-lib', 'List', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, added_at,
+                 identification_status, has_available_source
+             ) VALUES ('list-movie', 'list-lib', 'MOVIE', 'List Movie', 'list movie', 1,
+                       'LOCAL_CONFIRMED', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        // The list projection does not select `series_name` or `resume_total`, so decoding must
+        // still succeed and report them as absent instead of failing the request.
+        let rows = database.find_catalog_rows("list-movie").await?;
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].item_id, "list-movie");
+        assert_eq!(rows[0].title, "List Movie");
+        assert_eq!(rows[0].series_name, None);
+        assert_eq!(rows[0].source_id, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_list_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::test_database;
+        use sqlx::FromRow;
+
+        let (_temp, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = super::CatalogListRow::from_row(&row)
+            .expect_err("a projection without the catalog columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
         );
         Ok(())
     }
