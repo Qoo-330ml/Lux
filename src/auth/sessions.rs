@@ -1,4 +1,4 @@
-use std::net::IpAddr;
+use std::{net::IpAddr, sync::Arc, time::Instant};
 
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
 use rand_core::{OsRng, RngCore};
@@ -16,6 +16,8 @@ use crate::{
     domain::ids::UserId,
     storage::{Database, StorageError, UserAccessBlacklistIpRuleQuery},
 };
+
+use super::cache::ExpiringCache;
 
 const SESSION_LIFETIME_SECONDS: i64 = 30 * 24 * 60 * 60;
 
@@ -56,16 +58,27 @@ pub(crate) enum PrincipalResolution {
     Session(AuthenticatedSession),
 }
 
+/// A resolved web session plus the rules a request still has to evaluate itself.
+///
+/// The rules are cached as data, never as a decision: the address rules are re-evaluated on every
+/// request with the address the access-IP resolver produced.
+struct CachedWebPrincipal {
+    session: AuthenticatedSession,
+    rules: Vec<(String, String)>,
+}
+
 #[derive(Clone)]
 pub struct WebAuthService {
     database: Database,
     users: UserStore,
+    principal_cache: Arc<ExpiringCache<CachedWebPrincipal>>,
 }
 
 impl WebAuthService {
     pub fn new(database: Database) -> Result<Self, PasswordError> {
         Ok(Self {
             users: UserStore::new(database.clone())?,
+            principal_cache: Arc::new(ExpiringCache::default()),
             database,
         })
     }
@@ -244,27 +257,20 @@ impl WebAuthService {
     /// Resolves a request principal and evaluates every access rule in a single rules query.
     ///
     /// IP rules log the session out (as before); device and client rules deny the request but
-    /// keep the session, which is what the admin UI shows as a blocked client.
+    /// keep the session, which is what the admin UI shows as a blocked client. The session row and
+    /// the rule snapshot are cached for a few seconds; the rules are re-evaluated on every call
+    /// against this request's address.
     pub(crate) async fn resolve_principal(
         &self,
         session_token: &str,
         client_ip: Option<IpAddr>,
     ) -> Result<PrincipalResolution, WebAuthError> {
-        let Some(stored) = self
-            .database
-            .find_web_session(&hash_token(session_token))
-            .await?
-        else {
+        let token_hash = hash_token(session_token);
+        let Some(principal) = self.web_principal(&token_hash).await? else {
             return Ok(PrincipalResolution::Unauthenticated);
         };
-        if stored.is_disabled {
-            return Ok(PrincipalResolution::Unauthenticated);
-        }
-        let rules = self
-            .database
-            .user_access_blacklist_rules_for_user(&stored.user_id, ACCESS_RULE_SNAPSHOT_LIMIT)
-            .await?;
-        let ip_rules = rules
+        let ip_rules = principal
+            .rules
             .iter()
             .filter(|(rule_type, _)| rule_type == "IP_CIDR")
             .map(|(_, value)| value.clone())
@@ -284,8 +290,9 @@ impl WebAuthService {
                 return Ok(PrincipalResolution::Unauthenticated);
             }
         }
-        let device_id = stored.device_id.as_deref();
-        let denied = rules
+        let device_id = principal.session.device_id.as_deref();
+        let denied = principal
+            .rules
             .iter()
             .any(|(rule_type, value)| match rule_type.as_str() {
                 "DEVICE" => device_id == Some(value.as_str()),
@@ -295,9 +302,49 @@ impl WebAuthService {
         if denied {
             return Ok(PrincipalResolution::AccessDenied);
         }
-        Ok(PrincipalResolution::Session(
-            authenticated_session_from_stored(stored)?,
-        ))
+        Ok(PrincipalResolution::Session(principal.session.clone()))
+    }
+
+    /// Reads the session row and the access rules once per cache entry.
+    async fn web_principal(
+        &self,
+        token_hash: &[u8],
+    ) -> Result<Option<Arc<CachedWebPrincipal>>, WebAuthError> {
+        let epochs = self.database.auth_cache();
+        if let Some(entry) = self.principal_cache.lookup(token_hash, Instant::now())
+            && epochs.principal_is_current(entry.snapshot(), entry.user_id())
+        {
+            return Ok(Some(entry.value()));
+        }
+        let fence = epochs.write_fence();
+        let Some(stored) = self.database.find_web_session(token_hash).await? else {
+            return Ok(None);
+        };
+        if stored.is_disabled {
+            return Ok(None);
+        }
+        let user_id = stored.user_id.clone();
+        let rules = self
+            .database
+            .user_access_blacklist_rules_for_user(&user_id, ACCESS_RULE_SNAPSHOT_LIMIT)
+            .await?;
+        let session = authenticated_session_from_stored(stored)?;
+        let principal = Arc::new(CachedWebPrincipal { session, rules });
+        // Store only when no invalidation raced the read.
+        if epochs.fence_is_current(fence) {
+            let snapshot = epochs.snapshot(&user_id);
+            self.principal_cache.store(
+                token_hash.to_vec(),
+                user_id,
+                snapshot,
+                CachedWebPrincipal {
+                    session: principal.session.clone(),
+                    rules: principal.rules.clone(),
+                },
+                Instant::now(),
+            );
+        }
+        Ok(Some(principal))
     }
 
     async fn is_user_ip_blacklisted(
@@ -538,15 +585,50 @@ mod principal_tests {
         ))
     }
 
+    async fn fixture_regular_user()
+    -> Result<(Database, WebAuthService, String, String), Box<dyn std::error::Error>> {
+        let (database, service, _admin_token, _admin_id) = fixture().await?;
+        let user = crate::auth::users::UserStore::new(database.clone())?
+            .create_user("cache-member", "Cache Member", "member password", false)
+            .await?;
+        let session = service
+            .login_with_device("cache-member", "member password", Some("device-2"))
+            .await?
+            .ok_or("member login failed")?;
+        Ok((
+            database,
+            service,
+            session.session_token,
+            user.id.to_string(),
+        ))
+    }
+
     async fn add_rule(database: &Database, user_id: &str, rule_type: &str, value: &str) {
+        add_rule_for(database, Some(user_id), rule_type, value).await;
+    }
+
+    async fn add_global_rule(database: &Database, rule_type: &str, value: &str) {
+        add_rule_for(database, None, rule_type, value).await;
+    }
+
+    async fn add_rule_for(
+        database: &Database,
+        user_id: Option<&str>,
+        rule_type: &str,
+        value: &str,
+    ) {
+        let id = match user_id {
+            Some(_) => format!("rule-{rule_type}-{value}"),
+            None => format!("global-rule-{rule_type}-{value}"),
+        };
         database
             .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
-                id: Box::leak(format!("rule-{rule_type}-{value}").into_boxed_str()),
-                user_id: Some(user_id),
+                id: Box::leak(id.into_boxed_str()),
+                user_id,
                 rule_type,
                 match_value: value,
                 is_enabled: true,
-                created_by: Some(user_id),
+                created_by: user_id,
                 created_at: 1,
             })
             .await
@@ -582,6 +664,278 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::AccessDenied
         ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_cache_serves_repeat_requests_and_logout_wins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, _user_id) = fixture().await?;
+        let ip = Some("127.0.0.1".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(
+            database.query_count(),
+            0,
+            "a repeat request inside the TTL must be served from the principal cache"
+        );
+
+        service.logout(&token).await?;
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Unauthenticated
+        ));
+        assert!(
+            database.query_count() > 0,
+            "a revoked session must be re-read instead of being answered from the cache"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_cache_is_invalidated_by_device_and_global_rule_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        let ip = Some("127.0.0.1".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(database.query_count(), 0);
+
+        add_rule(&database, &user_id, "DEVICE", "device-1").await;
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::AccessDenied
+        ));
+        assert!(
+            database.query_count() > 0,
+            "a device rule must apply to the very next request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_cache_is_invalidated_by_global_rule_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, _user_id) = fixture().await?;
+        let ip = Some("127.0.0.1".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(database.query_count(), 0);
+
+        add_global_rule(&database, "CLIENT", "lux web").await;
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::AccessDenied
+        ));
+        assert!(
+            database.query_count() > 0,
+            "a global rule applies to every principal on the very next request"
+        );
+
+        database
+            .set_user_access_blacklist_rule_enabled(
+                crate::storage::UserAccessBlacklistRuleScope::Global,
+                "global-rule-CLIENT-lux web",
+                false,
+            )
+            .await?;
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert!(database.query_count() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_cache_is_invalidated_by_ip_rule_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        let ip = Some("127.0.0.1".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(database.query_count(), 0);
+
+        add_rule(&database, &user_id, "IP_CIDR", "127.0.0.0/8").await;
+        assert!(
+            matches!(
+                service.resolve_principal(&token, ip).await?,
+                PrincipalResolution::Unauthenticated
+            ),
+            "a new IP rule must block (and log out) the very next request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_cache_is_invalidated_by_account_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::UpdateUser;
+
+        let (database, service, token, user_id) = fixture_regular_user().await?;
+        let ip = Some("127.0.0.1".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(database.query_count(), 0);
+
+        database
+            .update_user(
+                &user_id,
+                UpdateUser {
+                    display_name: None,
+                    password_hash: None,
+                    has_password: None,
+                    is_disabled: Some(true),
+                    is_admin: None,
+                    can_manage_server: None,
+                    can_remote_access: None,
+                    can_download: None,
+                },
+            )
+            .await?;
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Unauthenticated
+        ));
+        assert!(
+            database.query_count() > 0,
+            "disabling a user must apply to the very next request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_cache_is_invalidated_by_password_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture_regular_user().await?;
+        let ip = Some("127.0.0.1".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(database.query_count(), 0);
+
+        assert!(
+            service
+                .change_password(
+                    &user_id.parse::<crate::domain::ids::UserId>()?,
+                    "member password",
+                    "changed password",
+                    None,
+                )
+                .await?
+        );
+        database.reset_query_count();
+        assert!(
+            matches!(
+                service.resolve_principal(&token, ip).await?,
+                PrincipalResolution::Unauthenticated
+            ),
+            "a password change revokes the sessions on the very next request"
+        );
+        assert!(database.query_count() > 0);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn principal_cache_is_invalidated_by_user_deletion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture_regular_user().await?;
+        let ip = Some("127.0.0.1".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(database.query_count(), 0);
+
+        assert!(database.delete_user(&user_id).await?);
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, ip).await?,
+            PrincipalResolution::Unauthenticated
+        ));
+        assert!(database.query_count() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_rules_still_evaluate_each_request_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        add_rule(&database, &user_id, "IP_CIDR", "10.0.0.1/32").await;
+        let allowed = Some("10.0.0.2".parse()?);
+        assert!(matches!(
+            service.resolve_principal(&token, allowed).await?,
+            PrincipalResolution::Session(_)
+        ));
+        database.reset_query_count();
+        assert!(matches!(
+            service.resolve_principal(&token, allowed).await?,
+            PrincipalResolution::Session(_)
+        ));
+        assert_eq!(database.query_count(), 0);
+
+        assert!(
+            matches!(
+                service
+                    .resolve_principal(&token, Some("10.0.0.1".parse()?))
+                    .await?,
+                PrincipalResolution::Unauthenticated
+            ),
+            "the cached rule list must be evaluated against this request's address"
+        );
         Ok(())
     }
 
