@@ -146,7 +146,7 @@ pub(crate) async fn admin_start_scan(
         "SCAN_STARTED",
         Some("scan_job"),
         Some(&target_id),
-        "{}",
+        &json!({"libraryId": job.library_id, "jobType": job.job_type}).to_string(),
     )
     .await;
     (
@@ -223,7 +223,7 @@ pub(crate) async fn admin_start_library_path_scan(
         "SCAN_PATH_STARTED",
         Some("scan_job"),
         Some(&target_id),
-        "{}",
+        &json!({"libraryId": job.library_id, "jobType": job.job_type}).to_string(),
     )
     .await;
     (
