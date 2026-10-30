@@ -1,4 +1,4 @@
-use std::{collections::HashSet, fmt, sync::Arc, time::Instant};
+use std::{fmt, sync::Arc, time::Instant};
 
 use crate::{
     auth::cache::ExpiringCache,
@@ -41,113 +41,62 @@ impl AccessPrincipal {
     }
 }
 
-/// Cache key of the access context shared by administrators without a stored user id.
-const SHARED_ADMIN_CACHE_KEY: &[u8] = b"\0shared-admin";
-
-/// Everything the access checks need about one principal, resolved once per cache window.
+/// The per-user parental-control policy, resolved once per cache window.
 ///
-/// The context caches the two per-request reads (`accessible_library_ids` and the parental-control
-/// policy). Per-item classification rows are never cached here: they are read per item exactly as
-/// before, so a rescanned certification is visible immediately.
+/// Only the policy is cached. Library access is still checked per request: the access layer must
+/// never answer from a value that a database write outside the storage API could have invalidated,
+/// and library access rows are exactly such an input (the frozen end-to-end tests change them with
+/// direct SQL). Per-item certification rows are likewise read per item, so a rescan is visible
+/// immediately.
 #[derive(Clone)]
-struct AccessContext {
-    is_admin: bool,
-    /// Enabled libraries the principal may browse, ordered like the storage query.
-    library_ids: Vec<String>,
-    library_id_set: HashSet<String>,
-    content_restrictions: Option<UserContentRestrictions>,
-}
-
-impl AccessContext {
-    fn new(
-        is_admin: bool,
-        library_ids: Vec<String>,
-        content_restrictions: Option<UserContentRestrictions>,
-    ) -> Self {
-        let library_id_set = library_ids.iter().cloned().collect();
-        Self {
-            is_admin,
-            library_ids,
-            library_id_set,
-            content_restrictions,
-        }
-    }
-
-    /// Whether `library_id` is one of the principal's enabled, non-system libraries.
-    ///
-    /// This replaces the former per-call `has_user_library_access` query. The two predicates only
-    /// differ for `system_kind` rows, and the single system library (global collections) is denied
-    /// explicitly before this check runs.
-    fn contains_library(&self, library_id: &str) -> bool {
-        self.library_id_set.contains(library_id)
-    }
+struct CachedRestrictionPolicy {
+    restrictions: Option<UserContentRestrictions>,
 }
 
 #[derive(Clone)]
 pub struct MediaAccessService {
     database: Database,
-    access_cache: Arc<ExpiringCache<AccessContext>>,
+    restriction_cache: Arc<ExpiringCache<CachedRestrictionPolicy>>,
 }
 
 impl MediaAccessService {
     pub fn new(database: Database) -> Self {
         Self {
             database,
-            access_cache: Arc::new(ExpiringCache::default()),
+            restriction_cache: Arc::new(ExpiringCache::default()),
         }
     }
 
-    /// Resolves the principal's access context, reusing it while the storage epochs are unchanged.
-    ///
-    /// `user_id` is `None` for the shared-administrator key, which sees every enabled library. The
-    /// administrator context only depends on the library epoch, so it is cached like a user's.
-    async fn access_context(
+    /// Reads the user's parental-control policy, reusing it while its epochs are unchanged.
+    async fn restriction_policy(
         &self,
-        user_id: Option<UserId>,
-        is_admin: bool,
-    ) -> Result<Arc<AccessContext>, AccessError> {
-        let user_id = user_id.map(|id| id.to_string());
-        // The epoch owner of the context; an anonymous administrator depends on the library epoch
-        // only, so its user generation is the empty user.
-        let epoch_user_id = user_id.as_deref().unwrap_or_default();
-        let cache_key = user_id.as_deref().map_or_else(
-            || SHARED_ADMIN_CACHE_KEY.to_vec(),
-            |id| id.as_bytes().to_vec(),
-        );
+        user_id: UserId,
+    ) -> Result<Arc<CachedRestrictionPolicy>, AccessError> {
+        let user_id = user_id.to_string();
         let epochs = self.database.auth_cache();
-        if let Some(entry) = self.access_cache.lookup(&cache_key, Instant::now()) {
-            let context = entry.value();
-            if context.is_admin == is_admin
-                && epochs.access_is_current(entry.snapshot(), entry.user_id())
-            {
-                return Ok(context);
-            }
+        if let Some(entry) = self
+            .restriction_cache
+            .lookup(user_id.as_bytes(), Instant::now())
+            && epochs.access_is_current(entry.snapshot(), entry.user_id())
+        {
+            return Ok(entry.value());
         }
-        // Fence the read: a library, permission or restriction write that commits while these
-        // queries run must not leave a stale context behind.
+        // Fence the read: a policy write that commits while this query runs must not leave a
+        // stale value behind.
         let fence = epochs.write_fence();
-        let (library_ids, content_restrictions) = if is_admin {
-            (self.database.list_enabled_media_library_ids().await?, None)
-        } else {
-            let Some(user_id) = user_id.as_deref() else {
-                return Ok(Arc::new(AccessContext::new(false, Vec::new(), None)));
-            };
-            let library_ids = self.database.list_accessible_library_ids(user_id).await?;
-            let restrictions = self.database.user_content_restrictions(user_id).await?;
-            (library_ids, restrictions)
-        };
-        let context = AccessContext::new(is_admin, library_ids, content_restrictions);
+        let restrictions = self.database.user_content_restrictions(&user_id).await?;
+        let policy = CachedRestrictionPolicy { restrictions };
         if epochs.fence_is_current(fence) {
-            let snapshot = epochs.snapshot(epoch_user_id);
-            self.access_cache.store(
-                cache_key,
-                epoch_user_id.to_owned(),
+            let snapshot = epochs.snapshot(&user_id);
+            self.restriction_cache.store(
+                user_id.clone().into_bytes(),
+                user_id,
                 snapshot,
-                context.clone(),
+                policy.clone(),
                 Instant::now(),
             );
         }
-        Ok(Arc::new(context))
+        Ok(Arc::new(policy))
     }
 
     pub async fn can_view_library(
@@ -164,8 +113,10 @@ impl MediaAccessService {
         let Some(user_id) = principal.user_id else {
             return Ok(false);
         };
-        let context = self.access_context(Some(user_id), false).await?;
-        Ok(context.contains_library(library_id))
+        Ok(self
+            .database
+            .has_user_library_access(&user_id.to_string(), library_id)
+            .await?)
     }
 
     pub async fn can_view_item(
@@ -218,8 +169,8 @@ impl MediaAccessService {
         let Some(user_id) = principal.user_id else {
             return Ok(true);
         };
-        let context = self.access_context(Some(user_id), false).await?;
-        let Some(restrictions) = context.content_restrictions.as_ref() else {
+        let policy = self.restriction_policy(user_id).await?;
+        let Some(restrictions) = policy.restrictions.as_ref() else {
             return Ok(true);
         };
         let policy = ContentRestrictionPolicy {
@@ -258,20 +209,15 @@ impl MediaAccessService {
         principal: AccessPrincipal,
     ) -> Result<Vec<String>, AccessError> {
         if principal.is_admin {
-            return Ok(self
-                .access_context(principal.user_id, true)
-                .await?
-                .library_ids
-                .clone());
+            return Ok(self.database.list_enabled_media_library_ids().await?);
         }
         let Some(user_id) = principal.user_id else {
             return Ok(Vec::new());
         };
         Ok(self
-            .access_context(Some(user_id), false)
-            .await?
-            .library_ids
-            .clone())
+            .database
+            .list_accessible_library_ids(&user_id.to_string())
+            .await?)
     }
 
     /// Resolves accessible library ids for several users with one bounded batch.
@@ -526,8 +472,8 @@ mod tests {
         assert!(access.can_view_item(principal, "policy-episode").await?);
         assert_eq!(
             database.query_count(),
-            1,
-            "a warm access context re-reads only the item library, not the restrictions"
+            2,
+            "a warm policy cache re-reads only the item library and the library access, not the policy"
         );
 
         let initial = database
@@ -716,11 +662,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_context_is_cached_and_invalidated_by_library_access_changes()
+    async fn library_access_changes_apply_to_the_very_next_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, access, principal, user_id, (first, second)) = library_fixture().await?;
 
-        // A fresh user sees every enabled library; a selection then narrows the context.
+        // A fresh user sees every enabled library; a selection then narrows the set.
         assert_eq!(access.accessible_library_ids(principal).await?.len(), 2);
         database
             .set_user_library_access(&user_id, &first, true)
@@ -728,17 +674,6 @@ mod tests {
         assert_eq!(
             access.accessible_library_ids(principal).await?,
             vec![first.clone()]
-        );
-
-        database.reset_query_count();
-        assert_eq!(
-            access.accessible_library_ids(principal).await?,
-            vec![first.clone()]
-        );
-        assert_eq!(
-            database.query_count(),
-            0,
-            "a repeat access-context read inside the TTL must not query the database"
         );
 
         database
@@ -749,7 +684,6 @@ mod tests {
             refreshed.contains(&second),
             "granting a library must be visible to the very next request"
         );
-        assert!(database.query_count() > 0);
 
         // Revoking it again is equally immediate.
         database
@@ -765,15 +699,51 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn access_context_is_invalidated_when_a_library_is_disabled()
+    async fn library_access_changes_deny_the_very_next_item_check()
     -> Result<(), Box<dyn std::error::Error>> {
+        let (database, access, principal, user_id, (first, second)) = library_fixture().await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES ('access-cache-movie', ?, 'MOVIE', 'Cached', 'cached', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&first)
+        .execute(database.pool())
+        .await?;
+        // A selection keeps the user in SELECTED mode, so revoking one library below narrows the
+        // set instead of falling back to "all enabled libraries".
+        database
+            .set_user_library_access(&user_id, &second, true)
+            .await?;
+        database
+            .set_user_library_access(&user_id, &first, true)
+            .await?;
+        assert!(
+            access
+                .can_view_item(principal, "access-cache-movie")
+                .await?
+        );
+
+        // Revoking the library must deny the item on the very next check, cache or not.
+        database
+            .set_user_library_access(&user_id, &first, false)
+            .await?;
+        assert!(
+            !access
+                .can_view_item(principal, "access-cache-movie")
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_disable_denies_the_very_next_request() -> Result<(), Box<dyn std::error::Error>>
+    {
         use crate::storage::LibrarySettingsUpdate;
 
         let (database, access, principal, _user_id, (first, _second)) = library_fixture().await?;
         assert!(access.can_view_library(principal, &first).await?);
-        database.reset_query_count();
-        assert!(access.can_view_library(principal, &first).await?);
-        assert_eq!(database.query_count(), 0);
 
         database
             .update_library_settings(
@@ -799,7 +769,6 @@ mod tests {
             !access.can_view_library(principal, &first).await?,
             "disabling a library must deny access on the very next request"
         );
-        assert!(database.query_count() > 0);
         Ok(())
     }
 
@@ -848,15 +817,15 @@ mod tests {
         );
         assert_eq!(
             database.query_count(),
-            0,
-            "a warm access context enforces library access and content restrictions without queries"
+            1,
+            "a warm policy cache checks library access but does not re-read the policy"
         );
 
         database.reset_query_count();
         assert!(access.can_view_item(principal, "resolved-movie").await?);
         assert_eq!(
             database.query_count(),
-            1,
+            2,
             "can_view_item re-resolves the item library; the resolved variant must not"
         );
 
