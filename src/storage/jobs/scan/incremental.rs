@@ -125,7 +125,10 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_scan_job_path).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_scan_job_path)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
