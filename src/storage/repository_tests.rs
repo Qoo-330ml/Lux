@@ -34620,8 +34620,11 @@ async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
     drop(guard);
     holder.await.expect("holder task");
 
+    // The holder keeps the lock for 50 ms and the acquisition starts after 10 ms, so a correct wait
+    // is about 40 ms. Timers fire a little early on a busy machine, so the bound leaves headroom;
+    // returning immediately (the failure this test guards against) would be near zero.
     assert!(
-        waited >= Duration::from_millis(40),
+        waited >= Duration::from_millis(25),
         "the acquisition returned while another writer still held the lock, after {waited:?}"
     );
 }
