@@ -121,15 +121,9 @@ impl tower_http::compression::predicate::Predicate for CompressJsonResponses {
 }
 
 pub(super) fn app_with_state(state: AppState) -> Router {
-    let web_root = web_root();
-    let resources = state.resources.clone();
-    let request_metrics = state.request_metrics.clone();
+    let core = state.core.clone();
+    let slots = RequestSlots::default();
     let (emby_routes, emby_path_templates) = emby::api_routes();
-    let request_rate_limiter = state.request_rate_limiter.clone();
-    let catalog_request_slots =
-        Arc::new(tokio::sync::Semaphore::new(MAX_IN_FLIGHT_CATALOG_REQUESTS));
-    let catalog_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS));
-    let home_workers = Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOME_REQUESTS));
     let app = Router::new()
         .route("/logo.svg", get(web_logo))
         .merge(users::api_routes())
@@ -137,13 +131,41 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         .merge(lux_api::api_routes())
         .merge(emby_routes.clone())
         .nest("/emby", emby_routes)
-        .fallback_service(
-            ServeDir::new(web_root.clone())
-                .append_index_html_on_directories(true)
-                .precompressed_gzip()
-                .fallback(ServeFile::new(web_root.join("index.html")).precompressed_gzip()),
-        )
-        .with_state(state)
+        .fallback_service(spa_service())
+        .with_state(state);
+    let app = apply_common_layers(app, &core, slots);
+    case_insensitive_emby_router(app, emby_path_templates)
+}
+
+/// The static assets and the `index.html` fallback the SPA needs in every mode.
+///
+/// Setup renders from the same bundle (`web/src/app/App.tsx` shows `SetupPage` when
+/// `/api/v1/setup/status` says `initialized: false`), so both trees mount it.
+fn spa_service() -> ServeDir<ServeFile> {
+    let web_root = web_root();
+    ServeDir::new(web_root.clone())
+        .append_index_html_on_directories(true)
+        .precompressed_gzip()
+        .fallback(ServeFile::new(web_root.join("index.html")).precompressed_gzip())
+}
+
+/// The middleware stack every router tree shares, in the order the single tree applied it.
+///
+/// `Router::layer` wraps in call order (the last `.layer()` ends up outermost), so the calls below
+/// are the pre-split chain copied verbatim: reordering them changes ETag, compression, request-id,
+/// security-header and empty-`503` envelope behaviour. None of the layers needs a business service;
+/// they read `CoreState` (metrics, resources, rate limiter) or nothing at all, which is what lets
+/// both trees call this once instead of duplicating the stack.
+fn apply_common_layers(router: Router, core: &CoreState, slots: RequestSlots) -> Router {
+    let resources = core.resources.clone();
+    let request_metrics = core.request_metrics.clone();
+    let request_rate_limiter = core.request_rate_limiter.clone();
+    let RequestSlots {
+        catalog_request_slots,
+        catalog_workers,
+        home_workers,
+    } = slots;
+    router
         .layer(middleware::from_fn(json_response_etag))
         .layer(
             // JSON responses only: media streams, images, the SPA fallback and server-sent events
@@ -307,8 +329,26 @@ pub(super) fn app_with_state(state: AppState) -> Router {
                     response
                 }
             },
-        ));
-    case_insensitive_emby_router(app, emby_path_templates)
+        ))
+}
+
+/// The per-tree concurrency budgets the catalog/home layer holds for the life of the process.
+struct RequestSlots {
+    catalog_request_slots: Arc<tokio::sync::Semaphore>,
+    catalog_workers: Arc<tokio::sync::Semaphore>,
+    home_workers: Arc<tokio::sync::Semaphore>,
+}
+
+impl Default for RequestSlots {
+    fn default() -> Self {
+        Self {
+            catalog_request_slots: Arc::new(tokio::sync::Semaphore::new(
+                MAX_IN_FLIGHT_CATALOG_REQUESTS,
+            )),
+            catalog_workers: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_CATALOG_REQUESTS)),
+            home_workers: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_HOME_REQUESTS)),
+        }
+    }
 }
 
 struct EmbyRoutePatterns {
@@ -1025,5 +1065,127 @@ mod tests {
             .await
             .expect("Emby busy response body");
         assert!(body.is_empty());
+    }
+
+    fn test_request(method: Method, uri: &str, headers: &[(&str, &str)]) -> Request<Body> {
+        let mut builder = Request::builder().method(method).uri(uri);
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        builder.body(Body::empty()).expect("test request")
+    }
+
+    async fn send(app: Router, request: Request<Body>) -> Response {
+        app.oneshot(request).await.expect("router response")
+    }
+
+    async fn json_body(response: Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+            .await
+            .expect("response body");
+        serde_json::from_slice(&bytes).expect("JSON response body")
+    }
+
+    fn header<'a>(response: &'a Response, name: &str) -> Option<&'a str> {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    }
+
+    /// Pins the observable order of the shared middleware stack, which `apply_common_layers` moved
+    /// out of `app_with_state` without touching a single `.layer()` call.
+    ///
+    /// `Router::layer` wraps in call order, so the assertions below only hold for the pre-split
+    /// order: the ETag layer innermost over the handler, the request-id layers outside the empty
+    /// `503` normaliser (that is how the envelope's `requestId` matches the response header), the
+    /// security headers outside both, and the rate limiter outside the routes.
+    #[tokio::test]
+    async fn common_layers_keep_their_pre_split_order() {
+        let app = app_with_state(AppState::default());
+
+        // json_response_etag sits next to the routes: it tags the handler body and answers
+        // `If-None-Match` before any outer layer rewrites the response.
+        let live = send(app.clone(), test_request(Method::GET, "/health/live", &[])).await;
+        assert_eq!(live.status(), StatusCode::OK);
+        let etag = header(&live, "etag").map(str::to_owned).expect("json etag");
+        assert_eq!(header(&live, "cache-control"), Some("private, no-cache"));
+        let not_modified = send(
+            app.clone(),
+            test_request(Method::GET, "/health/live", &[("if-none-match", &etag)]),
+        )
+        .await;
+        assert_eq!(not_modified.status(), StatusCode::NOT_MODIFIED);
+        assert_eq!(header(&not_modified, "etag"), Some(etag.as_str()));
+
+        // strip_client_request_id then SetRequestId run outside the empty-503 normaliser, so the
+        // server mints the id the envelope reports, and security_response_headers still upgrades
+        // the rewritten response to HSTS when the request arrived over HTTPS.
+        let unavailable = send(
+            app.clone(),
+            test_request(
+                Method::GET,
+                "/api/v1/auth/sessions",
+                &[
+                    ("x-request-id", "client-supplied-id"),
+                    ("x-forwarded-proto", "https"),
+                ],
+            ),
+        )
+        .await;
+        assert_eq!(unavailable.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let server_id = header(&unavailable, "x-request-id")
+            .map(str::to_owned)
+            .expect("server request id");
+        assert!(!server_id.is_empty());
+        assert_ne!(server_id, "client-supplied-id");
+        assert!(header(&unavailable, "x-client-request-id").is_none());
+        assert_eq!(
+            header(&unavailable, "strict-transport-security"),
+            Some("max-age=31536000; includeSubDomains")
+        );
+        let body = json_body(unavailable).await;
+        assert_eq!(body["error"]["code"], "DATABASE_UNAVAILABLE");
+        assert_eq!(body["error"]["requestId"], server_id.as_str());
+
+        // reject_unmatched_api_path is inside security_response_headers and keeps the two
+        // namespace behaviours: a Lux JSON envelope, a bare Emby status.
+        let missing = send(
+            app.clone(),
+            test_request(Method::GET, "/api/v1/no-such-endpoint", &[]),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        assert_eq!(header(&missing, "x-content-type-options"), Some("nosniff"));
+        assert_eq!(json_body(missing).await["error"]["code"], "NOT_FOUND");
+        let emby_missing = send(
+            app.clone(),
+            test_request(Method::GET, "/Items/unknown-item/UnknownThing", &[]),
+        )
+        .await;
+        assert_eq!(emby_missing.status(), StatusCode::NOT_FOUND);
+        assert!(
+            axum::body::to_bytes(emby_missing.into_body(), 4096)
+                .await
+                .expect("Emby 404 body")
+                .is_empty()
+        );
+
+        // limit_request_rate wraps the routes, so the second request of a one-per-window peer is
+        // answered by the layer, not by a handler.
+        let limited = app_with_state(AppState::default().with_request_rate_limit(1));
+        assert_eq!(
+            send(
+                limited.clone(),
+                test_request(Method::GET, "/health/live", &[])
+            )
+            .await
+            .status(),
+            StatusCode::OK
+        );
+        let throttled = send(limited, test_request(Method::GET, "/health/live", &[])).await;
+        assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(header(&throttled, "retry-after"), Some("60"));
+        assert_eq!(json_body(throttled).await["error"]["code"], "RATE_LIMITED");
     }
 }
