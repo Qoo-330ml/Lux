@@ -3226,6 +3226,63 @@ impl Database {
             .await
     }
 
+    /// Reads only the duration candidates a playback callback needs.
+    ///
+    /// Same rows as [`Database::find_catalog_rows`]: the item must be catalog-visible inside an
+    /// enabled library, and a media source only counts while its filesystem entry is present.
+    /// `None` therefore means "the catalog has no duration for this item", exactly like a
+    /// `find_catalog_rows` result that decodes no item or no source.
+    ///
+    /// The candidate columns keep the projection's order (media sources by id), so the caller can
+    /// apply the detail-loading precedence unchanged over one statement instead of loading the
+    /// whole item, its streams, image tags and catalog details every few seconds.
+    pub(crate) async fn find_item_playback_durations(
+        &self,
+        item_id: &str,
+        media_source_id: Option<&str>,
+    ) -> Result<Option<StoredPlaybackDurations>, StorageError> {
+        let query = format!(
+            "SELECT mi.runtime_ticks,
+                    (SELECT ms.duration_ticks
+                     FROM media_sources ms
+                     WHERE ms.item_id = mi.id
+                       AND ms.id = ?
+                       AND EXISTS (
+                           SELECT 1 FROM filesystem_entries fe
+                           WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                       )) AS requested_source_ticks,
+                    (SELECT ms.duration_ticks
+                     FROM media_sources ms
+                     WHERE ms.item_id = mi.id
+                       AND ms.is_default = 1
+                       AND EXISTS (
+                           SELECT 1 FROM filesystem_entries fe
+                           WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                       )
+                     ORDER BY ms.id
+                     LIMIT 1) AS default_source_ticks,
+                    (SELECT ms.duration_ticks
+                     FROM media_sources ms
+                     WHERE ms.item_id = mi.id
+                       AND ms.duration_ticks IS NOT NULL
+                       AND EXISTS (
+                           SELECT 1 FROM filesystem_entries fe
+                           WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+                       )
+                     ORDER BY ms.id
+                     LIMIT 1) AS first_source_ticks
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             WHERE mi.id = ? AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}",
+        );
+        self.query_as(sqlx::AssertSqlSafe(query))
+            .bind(media_source_id)
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn list_catalog_rows_by_ids(
         &self,
         item_ids: &[String],
