@@ -380,6 +380,97 @@ struct ScraperRoleRow {
     role: String,
 }
 
+/// Row of `find_media_item_image_identity`.
+#[derive(sqlx::FromRow)]
+struct ImageIdentityRow {
+    item_type: String,
+    item_original_language: Option<String>,
+    provider_ids_json: Option<String>,
+    series_original_language: Option<String>,
+    series_provider_ids_json: Option<String>,
+    series_scraper_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    scraper_id: Option<String>,
+}
+
+impl From<ImageIdentityRow> for StoredImageIdentity {
+    fn from(row: ImageIdentityRow) -> Self {
+        let provider = first_provider_id(
+            row.provider_ids_json,
+            row.series_provider_ids_json,
+            row.series_scraper_id
+                .as_deref()
+                .or(row.scraper_id.as_deref()),
+        );
+        Self {
+            item_type: row.item_type,
+            original_language: row.item_original_language.or(row.series_original_language),
+            provider_name: provider.as_ref().map(|(name, _)| name.clone()),
+            provider_id: provider.map(|(_, id)| id),
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+        }
+    }
+}
+
+/// Row of `find_movie_identity`.
+#[derive(sqlx::FromRow)]
+struct MovieIdentityRow {
+    library_id: String,
+    provider_ids_json: Option<String>,
+    scraper_id: Option<String>,
+}
+
+/// Row of the `collections` lookup in `upsert_collection`.
+#[derive(sqlx::FromRow)]
+struct CollectionIdRow {
+    id: String,
+    item_id: String,
+}
+
+/// Row of the requested-member match query in `upsert_collection`.
+#[derive(sqlx::FromRow)]
+struct CollectionMemberMatchRow {
+    ordinal: i64,
+    sort_order: i64,
+    media_item_id: String,
+}
+
+/// Row of `list_collection_member_ids_page`.
+#[derive(sqlx::FromRow)]
+struct CollectionMemberItemIdRow {
+    item_id: String,
+}
+
+/// Row of the existing-collection lookup in `create_emby_collection`.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionItemRow {
+    item_id: String,
+}
+
+/// Row of `add_emby_collection_items`.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionRow {
+    library_id: String,
+    title: String,
+}
+
+/// Row of `remove_emby_collection_items`, which also needs the collection row id.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionWithIdRow {
+    id: String,
+    library_id: String,
+    title: String,
+}
+
+/// Row of `add_emby_collection_members_in_transaction`.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionSortOrderRow {
+    id: String,
+    max_sort_order: i64,
+}
+
 /// Row of `list_hierarchy_ids_in_transaction`.
 #[derive(sqlx::FromRow)]
 struct HierarchyIdentityRow {
@@ -3420,7 +3511,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredImageIdentity>, StorageError> {
-        self.query(
+        self.query_as::<ImageIdentityRow>(
             "SELECT mi.item_type, mi.original_language AS item_original_language, mi.provider_ids_json,
                     series.original_language AS series_original_language,
                     series.provider_ids_json AS series_provider_ids_json,
@@ -3436,27 +3527,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| {
-                let series_scraper_id = row.get::<Option<String>, _>("series_scraper_id");
-                let scraper_id = row.get::<Option<String>, _>("scraper_id");
-                let provider = first_provider_id(
-                    row.get("provider_ids_json"),
-                    row.get("series_provider_ids_json"),
-                    series_scraper_id.as_deref().or(scraper_id.as_deref()),
-                );
-                StoredImageIdentity {
-                    item_type: row.get("item_type"),
-                    original_language: row
-                        .get::<Option<String>, _>("item_original_language")
-                        .or_else(|| row.get("series_original_language")),
-                    provider_name: provider.as_ref().map(|(name, _)| name.clone()),
-                    provider_id: provider.map(|(_, id)| id),
-                    season_number: row.get("season_number"),
-                    episode_number: row.get("episode_number"),
-                }
-            })
-        })
+        .map(|row| row.map(StoredImageIdentity::from))
         .map_err(self.sqlx_err())
     }
 
@@ -3464,7 +3535,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMovieIdentity>, StorageError> {
-        self.query(
+        self.query_as::<MovieIdentityRow>(
             "SELECT mi.library_id, mi.provider_ids_json,
                     COALESCE(mi.metadata_scraper_id, l.scraper_id) AS scraper_id
              FROM media_items mi
@@ -3476,11 +3547,10 @@ impl Database {
         .await
         .map(|row| {
             row.and_then(|row| {
-                let scraper_id = row.get::<Option<String>, _>("scraper_id");
                 let provider =
-                    first_provider_id(row.get("provider_ids_json"), None, scraper_id.as_deref())?;
+                    first_provider_id(row.provider_ids_json, None, row.scraper_id.as_deref())?;
                 Some(StoredMovieIdentity {
-                    library_id: row.get("library_id"),
+                    library_id: row.library_id,
                     provider_name: provider.0,
                     provider_id: provider.1,
                 })
@@ -3507,7 +3577,7 @@ impl Database {
         let provider_key = provider.to_ascii_lowercase();
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let existing = self
-            .query(
+            .query_as::<CollectionIdRow>(
                 "SELECT id, item_id
              FROM collections
              WHERE library_id = ? AND lower(provider) = lower(?) AND provider_id = ?",
@@ -3519,7 +3589,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let (collection_id, item_id) = if let Some(row) = existing {
-            (row.get::<String, _>("id"), row.get::<String, _>("item_id"))
+            (row.id, row.item_id)
         } else {
             let collection_id = Uuid::now_v7().to_string();
             let item_id = Uuid::now_v7().to_string();
@@ -3621,7 +3691,8 @@ impl Database {
                  WHERE mi.library_id = ? AND mi.removed_at IS NULL
                  ORDER BY requested.ordinal, provider.media_item_id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<CollectionMemberMatchRow>(sqlx::AssertSqlSafe(query));
             for (offset, (member_provider, member_provider_id, sort_order)) in
                 chunk.iter().enumerate()
             {
@@ -3638,14 +3709,10 @@ impl Database {
                 .map_err(self.sqlx_err())?;
             let mut seen_ordinals = HashSet::new();
             for row in rows {
-                let ordinal = row.get::<i64, _>("ordinal");
-                if !seen_ordinals.insert(ordinal) {
+                if !seen_ordinals.insert(row.ordinal) {
                     continue;
                 }
-                matched_members.push((
-                    row.get::<String, _>("media_item_id"),
-                    row.get::<i64, _>("sort_order"),
-                ));
+                matched_members.push((row.media_item_id, row.sort_order));
             }
         }
         let mut member_count = 0_usize;
@@ -3736,7 +3803,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
 
         let mut list_statement = self
-            .query(sqlx::AssertSqlSafe(format!(
+            .query_as::<CollectionMemberItemIdRow>(sqlx::AssertSqlSafe(format!(
                 "SELECT ci.item_id {from_where}
                  ORDER BY ci.sort_order, ci.item_id
                  LIMIT ? OFFSET ?"
@@ -3760,10 +3827,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok((
-            rows.into_iter().map(|row| row.get("item_id")).collect(),
-            total,
-        ))
+        Ok((rows.into_iter().map(|row| row.item_id).collect(), total))
     }
 
     pub(crate) async fn create_emby_collection(
@@ -3805,7 +3869,7 @@ impl Database {
             return Ok(None);
         };
         let existing = self
-            .query(
+            .query_as::<EmbyCollectionItemRow>(
                 "SELECT item_id, title
                  FROM collections
                  WHERE library_id = ? AND lower(provider) = 'emby' AND lower(title) = lower(?)
@@ -3817,7 +3881,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let collection_item_id = if let Some(row) = existing {
-            row.get::<String, _>("item_id")
+            row.item_id
         } else {
             let item_id = Uuid::now_v7().to_string();
             let collection_id = Uuid::now_v7().to_string();
@@ -3874,7 +3938,7 @@ impl Database {
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let Some(row) = self
-            .query(
+            .query_as::<EmbyCollectionRow>(
                 "SELECT c.library_id, c.title
                  FROM collections c
                  WHERE c.item_id = ? AND lower(c.provider) = 'emby'",
@@ -3886,8 +3950,8 @@ impl Database {
         else {
             return Ok(None);
         };
-        let library_id = row.get::<String, _>("library_id");
-        let title = row.get::<String, _>("title");
+        let library_id = row.library_id;
+        let title = row.title;
         self.add_emby_collection_members_in_transaction(
             &mut transaction,
             collection_item_id,
@@ -3910,7 +3974,7 @@ impl Database {
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let Some(row) = self
-            .query(
+            .query_as::<EmbyCollectionWithIdRow>(
                 "SELECT c.id, c.library_id, c.title
                  FROM collections c
                  WHERE c.item_id = ? AND lower(c.provider) = 'emby'",
@@ -3922,9 +3986,9 @@ impl Database {
         else {
             return Ok(None);
         };
-        let collection_id = row.get::<String, _>("id");
-        let library_id = row.get::<String, _>("library_id");
-        let title = row.get::<String, _>("title");
+        let collection_id = row.id;
+        let library_id = row.library_id;
+        let title = row.title;
         for chunk in item_ids.chunks(EMBY_COLLECTION_MEMBER_DELETE_BATCH_SIZE) {
             if chunk.is_empty() {
                 continue;
@@ -3961,7 +4025,7 @@ impl Database {
         item_ids: &[String],
     ) -> Result<(), StorageError> {
         let row = self
-            .query(
+            .query_as::<EmbyCollectionSortOrderRow>(
                 "SELECT c.id,
                         COALESCE(MAX(ci.sort_order), -1) AS max_sort_order
                  FROM collections c
@@ -3973,8 +4037,8 @@ impl Database {
             .fetch_one(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let collection_id = row.get::<String, _>("id");
-        let mut sort_order = row.get::<i64, _>("max_sort_order");
+        let collection_id = row.id;
+        let mut sort_order = row.max_sort_order;
         let mut seen = HashSet::new();
         let mut rows = Vec::with_capacity(item_ids.len());
         for item_id in item_ids {
