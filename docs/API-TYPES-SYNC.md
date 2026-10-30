@@ -259,13 +259,23 @@ export type { WebDanmakuInfo } from "./generated/WebDanmakuInfo";
 
 ## 阶段 3 小结（防漂移检查）
 
-`scripts/check-api-types.sh`：
+`scripts/check-api-types.sh` **在真实工作区原地执行**（不是临时副本），顺序是：
 
-1. 备份已提交的 `web/src/lib/api/generated/` 到临时目录；
-2. 运行 `scripts/generate-api-types.sh` 重新生成；
-3. `diff -ru` 逐字节比对，有差异就打印 diff 并以非零退出（重新生成的文件会留在工作区，方便直接提交）；
-4. 额外检查仓库根目录没有游离的 `*.ts`：`#[ts(export)]` 若漏写 `export_to`，ts-rs 会把文件写到导出根目录
-   （本次开发中就触发过一次），这类文件不会被 `tsc` 收录，属于静默漂移。
+1. 把当前的 `web/src/lib/api/generated/` 快照到临时目录；
+2. **先删掉** `web/src/lib/api/generated/` 里的全部 `*.ts`，再运行 `scripts/generate-api-types.sh` 重新生成。
+   先删后生成是关键：ts-rs 只会写文件、不会删文件，DTO 改名后残留的 `OldName.ts` 会让
+   `diff -ru` 永远报「多了一个文件」，而那条差异没有内容可以提交，检查就会永远红；
+3. 按「已消失 / 新出现 / 内容变化」三类分别报告：
+   - 已消失（ts-rs 不再生成的绑定）：列出路径，Git 跟踪的给 `git rm <路径>`，未跟踪的说明无需暂存
+     （文件在步骤 2 已从工作区删除，只需提交删除）；
+   - 新出现：列出 `git add <路径>`；
+   - 内容变化：按文件打印 `diff -u`，并提示提交重新生成的产物；
+4. 生成失败时把快照还原回 `web/src/lib/api/generated/`，不会留下半空目录；
+5. 额外检查仓库根目录没有游离的 `*.ts`：`#[ts(export)]` 若漏写 `export_to`，ts-rs 会把文件写到导出根目录
+   （本次开发中就触发过一次），这类文件不会被 `tsc` 收录，属于静默漂移；命中时直接列出待删路径。
+
+检查失败后重新生成的产物会留在工作区供评审；把删除/新增的文件提交（或按提示 `git rm`）后，
+下一次运行即通过。
 
 已加入 `scripts/check-all.sh`（在 `cargo clippy` 与 `bash -n scripts/*.sh` 之后、Python 检查之前）。
 
@@ -277,6 +287,16 @@ scripts/check-api-types.sh          # 只跑这一项
 ```
 
 注意：这项检查会以 `--features ts-bindings` 编译一次测试目标，是本仓库里唯一会引入 `ts-rs` 的路径。
+
+### 生成时的环境变量
+
+`scripts/generate-api-types.sh` 会**先 `unset` 所有 `TS_RS_*` 变量**，再显式设置 `TS_RS_EXPORT_DIR`
+与 `TS_RS_LARGE_INT=number`。原因是 ts-rs 12.0.1 的 `Config::from_env` 还会读
+`TS_RS_IMPORT_EXTENSION`（会把 `import` 改写成 `./ItemImage.js`）等变量，开发者 shell 里残留的设置
+会造成「本地生成结果与提交产物不一致」的假漂移。
+
+已验证：`TS_RS_IMPORT_EXTENSION=.js TS_RS_LARGE_INT=bigint scripts/generate-api-types.sh` 生成的产物
+与提交内容完全一致。
 
 ## 如何扩展到更多路由
 
@@ -339,9 +359,10 @@ scripts/check-api-types.sh          # 只跑这一项
    用单变体枚举（本次的 `DanmakuFormat`）或 `#[ts(type = "...")]`。
 7. **自定义 `Serialize` 实现**：ts-rs 只理解派生出来的形状；手写 `impl Serialize` 的类型必须用
    `#[ts(as = "...")]` / `#[ts(type = "...")]` 手工描述，否则生成结果与真实输出不一致。
-8. **生成受环境变量影响**：`TS_RS_EXPORT_DIR` / `TS_RS_LARGE_INT` 只在 `scripts/generate-api-types.sh` 里固定。
-   直接运行 `cargo test --features ts-bindings export_bindings` 会把文件写到 `<repo>/bindings/` 并用 `bigint`。
-   因此**只能**通过脚本生成；`scripts/check-api-types.sh` 也用脚本，所以两者一致。
+8. **生成受环境变量影响**：`ts-rs` 在导出时读 `TS_RS_*` 系列变量（`TS_RS_EXPORT_DIR`、`TS_RS_LARGE_INT`、
+   `TS_RS_IMPORT_EXTENSION` 等）。`scripts/generate-api-types.sh` 会先清空全部 `TS_RS_*`、再固定需要的两个，
+   但直接运行 `cargo test --features ts-bindings export_bindings` 会把文件写到 `<repo>/bindings/`、用 `bigint`，
+   并受调用者 shell 影响。因此**只能**通过脚本生成；`scripts/check-api-types.sh` 也用脚本，所以两者一致。
 9. **生成的 `.ts` 参与 `tsc`**：`web/src/lib/api/generated/` 位于 `web/tsconfig.json` 的 `include` 之内，
    生成物语法错误会让 `pnpm --dir web build` 失败（这是期望行为）。生成文件带文件头注释，不要手改。
 10. **Rustdoc 会进入 JS 文档注释**：`///` 会变成生成文件里的 `/** … */`，因此 DTO 上的实现细节注释用 `//` 而不是 `///`。
