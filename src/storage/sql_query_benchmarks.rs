@@ -1,6 +1,7 @@
 use super::{
-    DatabaseBackend, NewEpisodeFile, NewMovieFile, adapt_postgres_sql_uncached,
-    adapt_sql_for_backend,
+    ADAPTED_SQL_CACHE, AdaptedSqlCache, DatabaseBackend, MAX_ADAPTED_SQL_CACHE_ENTRIES,
+    MAX_ADAPTED_SQL_CACHE_TEXT_BYTES, NewEpisodeFile, NewMovieFile, adapt_postgres_sql_uncached,
+    adapt_sql_for_backend, adapt_static_sql_for_backend_with_cache,
 };
 use crate::storage::sql_templates::{
     SqlTemplateCache, filesystem_entries_by_paths_template, manifest_delta_finalize_template,
@@ -152,7 +153,7 @@ async fn execute_count_query(
 }
 
 fn filesystem_path_template(cache: &SqlTemplateCache, capacity: u16) -> Arc<str> {
-    filesystem_entries_by_paths_template(cache, DatabaseBackend::Postgres, capacity)
+    filesystem_entries_by_paths_template(cache, POSTGRES, capacity)
         .expect("valid filesystem path template")
 }
 
@@ -867,12 +868,25 @@ fn adaptation_benchmark_cases() -> Vec<(&'static str, &'static str, usize)> {
     ]
 }
 
+/// The dialect these benchmarks exercise, named once so the rest of the file stays dialect-neutral.
+const POSTGRES: DatabaseBackend = DatabaseBackend::Postgres;
+
+/// The production entry point: what `Database::query*` pays, memo included.
+fn adapt_production(sql: &'static str) -> sqlx::SqlStr {
+    adapt_sql_for_backend(POSTGRES, sql)
+}
+
+/// The pre-cache behaviour, kept as the reference point for every memo comparison.
+fn adapt_uncached(sql: &'static str) -> sqlx::SqlStr {
+    adapt_postgres_sql_uncached(sql)
+}
+
 /// Measures the production entry point, so the number covers whatever `Database::query*` pays.
 fn report_postgres_adaptation(case: &str, sql: &'static str, iterations: usize) {
     let (elapsed, snapshot) = measure_operation(
         iterations,
-        || adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
-        || adapt_sql_for_backend(DatabaseBackend::Postgres, sql),
+        || adapt_production(sql),
+        || adapt_production(sql),
     );
     report_allocation_case(
         &format!("postgres_adapt_{case}"),
@@ -880,7 +894,7 @@ fn report_postgres_adaptation(case: &str, sql: &'static str, iterations: usize) 
         elapsed,
         snapshot,
     );
-    let adapted = adapt_sql_for_backend(DatabaseBackend::Postgres, sql);
+    let adapted = adapt_production(sql);
     assert_ne!(
         adapted.as_str(),
         sql,
@@ -891,20 +905,17 @@ fn report_postgres_adaptation(case: &str, sql: &'static str, iterations: usize) 
 
 /// The pre-cache behaviour, kept as the reference point for the memo comparison.
 fn report_postgres_adaptation_uncached(case: &str, sql: &'static str, iterations: usize) {
-    let (elapsed, snapshot) = measure_operation(
-        iterations,
-        || adapt_postgres_sql_uncached(sql),
-        || adapt_postgres_sql_uncached(sql),
-    );
+    let (elapsed, snapshot) =
+        measure_operation(iterations, || adapt_uncached(sql), || adapt_uncached(sql));
     report_allocation_case(
         &format!("postgres_rewrite_uncached_{case}"),
         iterations,
         elapsed,
         snapshot,
     );
-    let expected = adapt_postgres_sql_uncached(sql);
+    let expected = adapt_uncached(sql);
     assert_eq!(
-        adapt_sql_for_backend(DatabaseBackend::Postgres, sql).as_str(),
+        adapt_production(sql).as_str(),
         expected.as_str(),
         "cached and uncached rewrites must agree for case {case}"
     );
@@ -929,7 +940,7 @@ fn postgres_placeholder_adaptation_contention_benchmark() {
     let cases = adaptation_benchmark_cases();
     // Warm the memo so every thread measures the steady state.
     for (_, sql, _) in &cases {
-        drop(adapt_sql_for_backend(DatabaseBackend::Postgres, *sql));
+        drop(adapt_production(*sql));
     }
     let started = Instant::now();
     std::thread::scope(|scope| {
@@ -937,10 +948,7 @@ fn postgres_placeholder_adaptation_contention_benchmark() {
             scope.spawn(|| {
                 for _ in 0..ITERATIONS_PER_THREAD {
                     for (_, sql, _) in &cases {
-                        drop(black_box(adapt_sql_for_backend(
-                            DatabaseBackend::Postgres,
-                            *sql,
-                        )));
+                        drop(black_box(adapt_production(*sql)));
                     }
                 }
             });
@@ -954,4 +962,187 @@ fn postgres_placeholder_adaptation_contention_benchmark() {
         "postgres_adapt_contention threads={THREADS} operations={operations} elapsed_ns_per_op={}",
         elapsed.as_nanos() / u128::try_from(operations).unwrap_or(1)
     );
+}
+
+/// Statement shapes that appear in the real tree, one variant per index so every entry is distinct.
+fn working_set_statements(statement_count: usize) -> Vec<&'static str> {
+    (0..statement_count)
+        .map(|index| {
+            let variant = format!("media_items_variant_{index:05}");
+            let sql = match index % 5 {
+                0 => format!(
+                    "INSERT INTO catalog_outbox_{index:05} (kind, item_id, library_id) VALUES (?, ?, ?) RETURNING id"
+                ),
+                1 => format!(
+                    "SELECT mi.id, mi.item_type, mi.title, mi.sort_title, mi.production_year,
+                            fe.relative_path
+                     FROM {variant} mi
+                     JOIN media_sources ms ON ms.item_id = mi.id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE mi.library_root_id = ? AND mi.removed_at IS NULL
+                       AND mi.item_type IN ('VIDEO', 'EPISODE')
+                     ORDER BY mi.sort_title, mi.id
+                     LIMIT ? OFFSET ?"
+                ),
+                2 => format!("{ADAPTATION_LONG_JOIN_SQL} -- {variant}"),
+                3 => format!(
+                    "SELECT id FROM filesystem_entries
+                     WHERE library_root_id = ? AND relative_path IN ({}) -- {variant}",
+                    std::iter::repeat_n("?", 64).collect::<Vec<_>>().join(", ")
+                ),
+                _ => format!("{ADAPTATION_QUOTES_AND_COMMENTS_SQL} -- {variant}"),
+            };
+            let leaked: &'static str = Box::leak(sql.into_boxed_str());
+            leaked
+        })
+        .collect()
+}
+
+/// One pass over the working set against a fresh memo: the cost the first query of every statement
+/// shape pays (rewrite + memo insert) instead of the steady state.
+fn report_working_set_cold_fill(statements: &[&'static str]) {
+    let cache = AdaptedSqlCache::default();
+    let started = Instant::now();
+    for sql in statements {
+        drop(black_box(adapt_static_sql_for_backend_with_cache(
+            &cache, sql,
+        )));
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "working_set case=cold_fill statements={} entries={} cached_bytes={} elapsed_ns_per_op={}",
+        statements.len(),
+        cache.entry_count(),
+        cache.cached_text_bytes(),
+        elapsed.as_nanos() / u128::try_from(statements.len()).unwrap_or(1)
+    );
+}
+
+/// Walks the whole working set on one thread, reporting ns/op and allocations per op.
+fn report_working_set_case(
+    case: &str,
+    statements: &[&'static str],
+    iterations: usize,
+    adapt: fn(&'static str) -> sqlx::SqlStr,
+) {
+    let mut allocation_index = 0_usize;
+    let mut timing_index = 0_usize;
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        move || {
+            let sql = statements[allocation_index % statements.len()];
+            allocation_index += 1;
+            drop(black_box(adapt(sql)));
+        },
+        move || {
+            let sql = statements[timing_index % statements.len()];
+            timing_index += 1;
+            drop(black_box(adapt(sql)));
+        },
+    );
+    report_allocation_case(case, iterations, elapsed, snapshot);
+}
+
+/// Same walk with `threads` threads, each one looping over the whole working set.
+fn report_working_set_threads_case(
+    case: &str,
+    statements: &[&'static str],
+    threads: usize,
+    rounds: usize,
+    adapt: fn(&'static str) -> sqlx::SqlStr,
+) {
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(move || {
+                for _ in 0..rounds {
+                    for sql in statements {
+                        drop(black_box(adapt(sql)));
+                    }
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    let operations = threads
+        .saturating_mul(rounds)
+        .saturating_mul(statements.len());
+    println!(
+        "working_set case={case} statements={} threads={threads} operations={operations} elapsed_ns_per_op={}",
+        statements.len(),
+        elapsed.as_nanos() / u128::try_from(operations).unwrap_or(1)
+    );
+}
+
+/// A working set the size of the real one (~1,000 distinct static statements, see
+/// docs/PERFORMANCE.md for the count), compared against the pre-cache rewrite on 1 and 8 threads.
+#[test]
+#[ignore = "run explicitly to record the A2 working-set cost"]
+fn postgres_placeholder_adaptation_working_set_benchmark() {
+    const STATEMENTS: usize = 1_000;
+    const THREADS: usize = 8;
+    const OPERATIONS: usize = 160_000;
+
+    let statements = working_set_statements(STATEMENTS);
+    let distinct = statements
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<&str>>();
+    let source_bytes: usize = statements.iter().map(|sql| sql.len()).sum();
+    let placeholders: usize = statements.iter().map(|sql| sql.matches('?').count()).sum();
+    println!(
+        "working_set shape statements={} distinct={} source_bytes={} placeholders={}",
+        statements.len(),
+        distinct.len(),
+        source_bytes,
+        placeholders
+    );
+    assert_eq!(distinct.len(), STATEMENTS);
+
+    report_working_set_cold_fill(&statements);
+
+    // Steady state: fill the memo once, then walk the whole working set.
+    for sql in &statements {
+        drop(adapt_production(sql));
+    }
+    report_working_set_case(
+        "memoized_single_thread",
+        &statements,
+        OPERATIONS,
+        adapt_production,
+    );
+    report_working_set_case(
+        "uncached_single_thread",
+        &statements,
+        OPERATIONS,
+        adapt_uncached,
+    );
+
+    let rounds = OPERATIONS / STATEMENTS / THREADS;
+    report_working_set_threads_case(
+        "memoized_threads",
+        &statements,
+        THREADS,
+        rounds,
+        adapt_production,
+    );
+    report_working_set_threads_case(
+        "uncached_threads",
+        &statements,
+        THREADS,
+        rounds,
+        adapt_uncached,
+    );
+
+    let entries = ADAPTED_SQL_CACHE.entry_count();
+    let cached_text_bytes = ADAPTED_SQL_CACHE.cached_text_bytes();
+    println!(
+        "working_set case=memo_coverage entries={entries} cached_bytes={cached_text_bytes} entry_limit={MAX_ADAPTED_SQL_CACHE_ENTRIES} text_limit={MAX_ADAPTED_SQL_CACHE_TEXT_BYTES}"
+    );
+    assert!(
+        entries >= STATEMENTS,
+        "the whole working set should be memoized, got {entries}"
+    );
+    assert!(entries <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
+    assert!(cached_text_bytes <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
 }
