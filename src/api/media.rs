@@ -1271,23 +1271,46 @@ pub(super) struct UpdateItemMetadataRequest {
     locked_fields: Vec<MetadataField>,
 }
 
+/// Item metadata (body of `GET`/`PATCH /api/v1/items/{item_id}/metadata`).
+// Field order matters: `serde_json` runs without `preserve_order`, so the `json!`
+// body this replaced emitted sorted keys, while `#[derive(Serialize)]` emits
+// declaration order. Declaring the fields alphabetically keeps the response bytes
+// identical - `lux_dto_tests` pins them.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ItemMetadata {
+    pub(super) locked_fields: Vec<MetadataField>,
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]
+    pub(super) original_title: Option<String>,
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]
+    pub(super) overview: Option<String>,
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]
+    pub(super) production_year: Option<i64>,
+    pub(super) title: String,
+}
+
 pub(super) fn metadata_json(
     title: &str,
     original_title: Option<&str>,
     overview: Option<&str>,
     production_year: Option<i64>,
     locked_fields_json: Option<&str>,
-) -> Value {
+) -> ItemMetadata {
     let locked_fields = locked_fields_json
         .and_then(|value| serde_json::from_str::<Vec<MetadataField>>(value).ok())
         .unwrap_or_default();
-    json!({
-        "title": title,
-        "originalTitle": original_title,
-        "overview": overview,
-        "productionYear": production_year,
-        "lockedFields": locked_fields,
-    })
+    ItemMetadata {
+        locked_fields,
+        original_title: original_title.map(str::to_owned),
+        overview: overview.map(str::to_owned),
+        production_year,
+        title: title.to_owned(),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -1676,6 +1699,56 @@ fn lux_image_variant_width(
     Ok(Some(width))
 }
 
+/// One stored image of an item (`GET /api/v1/items/{item_id}/images`).
+// Fields stay alphabetical for the same byte-level reason as `ItemMetadata`.
+// `language` is part of the wire format but Lux does not assign it yet, so it is
+// always `null`.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct ItemImage {
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]
+    pub(crate) content_tag: Option<String>,
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]
+    pub(crate) file_size: Option<i64>,
+    pub(crate) id: String,
+    pub(crate) image_index: i64,
+    pub(crate) image_type: String,
+    pub(crate) item_id: String,
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]
+    pub(crate) language: Option<String>,
+    pub(crate) source: String,
+    pub(crate) url: String,
+}
+
+/// Body of `GET /api/v1/items/{item_id}/images`.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ItemImagesResponse {
+    pub(super) images: Vec<ItemImage>,
+}
+
+/// Body of `POST /api/v1/items/{item_id}/images/select`.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct ItemImageSelectResponse {
+    pub(super) image: ItemImage,
+}
+
 pub(super) async fn lux_list_item_images(
     headers: HeaderMap,
     Path(item_id): Path<String>,
@@ -1699,9 +1772,13 @@ pub(super) async fn lux_list_item_images(
     }
     let images = require_service!(state.image_writes);
     match images.list_item_images(&item_id).await {
-        Ok(images) => Json(json!({
-            "images": images.iter().map(|image| item_image_json(&item_id, image)).collect::<Vec<_>>()
-        })).into_response(),
+        Ok(images) => Json(ItemImagesResponse {
+            images: images
+                .iter()
+                .map(|image| item_image_json(&item_id, image))
+                .collect(),
+        })
+        .into_response(),
         Err(error) => image_write_error(&headers, error),
     }
 }
@@ -1808,7 +1885,10 @@ pub(super) async fn lux_select_item_image(
         "{}",
     )
     .await;
-    Json(json!({ "image": item_image_json(&item_id, &image) })).into_response()
+    Json(ItemImageSelectResponse {
+        image: item_image_json(&item_id, &image),
+    })
+    .into_response()
 }
 
 pub(super) async fn lux_subtitle(
@@ -1966,14 +2046,44 @@ pub(super) fn lux_danmaku_raw_url(item_id: &str, source_id: Option<&str>) -> Str
     url
 }
 
+/// Sidecar format of a registered Web danmaku file.
+///
+/// A single-variant enum keeps the literal wire value (`"BILIBILI_XML"`) in the
+/// generated TypeScript instead of widening it to `string`.
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub(super) enum DanmakuFormat {
+    BilibiliXml,
+}
+
 /// Body of `GET /api/v1/items/{item_id}/danmaku`.
-fn danmaku_info_json(source_id: Option<&str>, raw_url: &str) -> Value {
-    json!({
-        "available": true,
-        "format": "BILIBILI_XML",
-        "sourceId": source_id,
-        "rawUrl": raw_url,
-    })
+#[derive(Serialize)]
+#[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "web/src/lib/api/generated/")
+)]
+#[serde(rename_all = "camelCase")]
+pub(super) struct WebDanmakuInfo {
+    pub(super) available: bool,
+    pub(super) format: DanmakuFormat,
+    pub(super) raw_url: String,
+    #[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]
+    pub(super) source_id: Option<String>,
+}
+
+fn danmaku_info_json(source_id: Option<&str>, raw_url: &str) -> WebDanmakuInfo {
+    WebDanmakuInfo {
+        available: true,
+        format: DanmakuFormat::BilibiliXml,
+        raw_url: raw_url.to_owned(),
+        source_id: source_id.map(str::to_owned),
+    }
 }
 
 #[derive(Deserialize, Default)]
@@ -4591,6 +4701,27 @@ mod lux_dto_tests {
             serde_json::to_string(&danmaku_info_json(None, "/api/v1/items/item-1/danmaku/raw"))
                 .unwrap(),
             r#"{"available":true,"format":"BILIBILI_XML","rawUrl":"/api/v1/items/item-1/danmaku/raw","sourceId":null}"#
+        );
+    }
+
+    #[test]
+    fn item_image_envelopes_are_pinned() {
+        let (item_id, image) = item_image();
+        let image = item_image_json(&item_id, &image);
+        assert_eq!(
+            serde_json::to_string(&ItemImagesResponse {
+                images: vec![image],
+            })
+            .unwrap(),
+            r#"{"images":[{"contentTag":"tag-1","fileSize":1234,"id":"img-1","imageIndex":0,"imageType":"POSTER","itemId":"item-1","language":null,"source":"TMDB","url":"/api/v1/items/item-1/images/poster"}]}"#
+        );
+        let (item_id, image) = item_image();
+        assert_eq!(
+            serde_json::to_string(&ItemImageSelectResponse {
+                image: item_image_json(&item_id, &image),
+            })
+            .unwrap(),
+            r#"{"image":{"contentTag":"tag-1","fileSize":1234,"id":"img-1","imageIndex":0,"imageType":"POSTER","itemId":"item-1","language":null,"source":"TMDB","url":"/api/v1/items/item-1/images/poster"}}"#
         );
     }
 }
