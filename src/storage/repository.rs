@@ -6201,6 +6201,192 @@ mod storage_error_mapping_tests {
     }
 }
 
+/// Drives the `stored_*` decoders through the query paths that share them.
+///
+/// Each decoder has one named row struct, so a column rename or type change breaks a test
+/// here instead of panicking inside a request.
+#[cfg(test)]
+mod stored_row_decoding_tests {
+    use super::*;
+    use crate::storage::test_database;
+
+    #[tokio::test]
+    async fn stored_user_row_decodes_the_user_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .insert_user("user-alice", "alice", "Alice", "hash", false, true)
+            .await?;
+
+        let user = database
+            .find_user_by_id("user-alice")
+            .await?
+            .expect("user should exist");
+        assert_eq!(user.id, "user-alice");
+        assert_eq!(user.username_normalized, "alice");
+        assert_eq!(user.display_name, "Alice");
+        assert_eq!(user.password_hash, "hash");
+        assert!(user.has_password);
+        assert!(!user.is_admin);
+        assert!(!user.is_disabled);
+        assert_eq!(user.email, None);
+        assert_eq!(user.last_login_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_admin_user_list_item_row_decodes_the_admin_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .insert_user("user-admin", "admin", "Admin", "hash", true, true)
+            .await?;
+        database
+            .insert_user("user-viewer", "viewer", "Viewer", "hash", false, true)
+            .await?;
+
+        let (users, total) = database
+            .query_admin_users(
+                AdminUserStatusFilter::Active,
+                None,
+                AdminUserSortField::Created,
+                false,
+                50,
+                0,
+            )
+            .await?;
+        assert_eq!(total, 2);
+        assert_eq!(users.len(), 2);
+        let admin = users
+            .iter()
+            .find(|user| user.id == "user-admin")
+            .expect("admin should be listed");
+        assert_eq!(admin.display_name, "Admin");
+        assert!(admin.is_admin);
+        assert!(admin.has_password);
+        assert_eq!(admin.email, None);
+        assert_eq!(admin.last_activity_at, None);
+        assert_eq!(admin.current_playback_count, 0);
+        let viewer = users
+            .iter()
+            .find(|user| user.id == "user-viewer")
+            .expect("viewer should be listed");
+        assert!(!viewer.is_admin);
+        assert_eq!(viewer.last_login_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_scheduled_task_rows_decode_configs_and_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO scheduled_task_plans (
+                 id, task_type, plan_name, task_name, task_description,
+                 source_type, cron_or_interval, scope_type, is_default
+             ) VALUES (
+                 'plan-a', 'INCREMENTAL_SCAN', 'Plan A', 'Scan', 'Incremental scan',
+                 'SYSTEM', '0 3 * * *', 'GLOBAL', 1
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scheduled_task_configs (
+                 owner_type, owner_id, task_type, plan_id, cron_or_interval, is_enabled
+             ) VALUES ('GLOBAL', 'global', 'INCREMENTAL_SCAN', 'plan-a', '0 3 * * *', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let config = database
+            .find_scheduled_task_config("GLOBAL", "global", "INCREMENTAL_SCAN")
+            .await?
+            .expect("config should exist");
+        assert_eq!(config.owner_type, "GLOBAL");
+        assert_eq!(config.owner_id, "global");
+        assert_eq!(config.plan_id.as_deref(), Some("plan-a"));
+        assert_eq!(config.task_name, "");
+        assert_eq!(config.source_type, "SYSTEM");
+        assert!(config.is_enabled);
+        assert_eq!(config.library_name, None);
+
+        let plan = database
+            .find_scheduled_task_plan("plan-a")
+            .await?
+            .expect("plan should exist");
+        assert_eq!(plan.task_type, "INCREMENTAL_SCAN");
+        assert_eq!(plan.plan_name, "Plan A");
+        assert_eq!(plan.cron_or_interval.as_deref(), Some("0 3 * * *"));
+        assert!(plan.is_enabled);
+        assert!(plan.is_default);
+        assert!(plan.libraries.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_notification_rows_decode_destinations_and_deliveries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .create_notification_destination(NewNotificationDestination {
+                id: "destination-a",
+                name: "Webhook",
+                url: "https://example.test/hook",
+                enabled: true,
+                allow_private_network: false,
+                event_types_json: "[\"ITEM_ADDED\"]",
+                payload_format: "LUX",
+                provider_plugin_id: "builtin.webhook",
+                provider_config_json: "{}",
+            })
+            .await?;
+
+        let destination = database
+            .find_notification_destination("destination-a")
+            .await?
+            .expect("destination should exist");
+        assert_eq!(destination.name, "Webhook");
+        assert_eq!(destination.url, "https://example.test/hook");
+        assert!(destination.enabled);
+        assert!(!destination.allow_private_network);
+        assert_eq!(destination.event_types_json, "[\"ITEM_ADDED\"]");
+        assert_eq!(destination.payload_format, "LUX");
+
+        sqlx::query(
+            "INSERT INTO notification_events (
+                 id, event_type, schema_version, occurred_at, dedupe_key, payload_json
+             ) VALUES ('event-a', 'ITEM_ADDED', 1, 1800000000, 'dedupe-a', '{}')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO notification_deliveries (
+                 id, event_id, destination_id, status, attempt_count, next_attempt_at
+             ) VALUES ('delivery-a', 'event-a', 'destination-a', 'PENDING', 0, unixepoch())",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let deliveries = database.list_ready_notification_deliveries(10).await?;
+        assert_eq!(deliveries.len(), 1);
+        let delivery = &deliveries[0];
+        assert_eq!(delivery.id, "delivery-a");
+        assert_eq!(delivery.event_id, "event-a");
+        assert_eq!(delivery.destination_id, "destination-a");
+        assert_eq!(delivery.status, "PENDING");
+        assert_eq!(delivery.attempt_count, 0);
+        assert_eq!(delivery.last_http_status, None);
+        assert_eq!(delivery.event_type, "ITEM_ADDED");
+        assert_eq!(delivery.payload_json, "{}");
+        assert_eq!(delivery.destination_name, "Webhook");
+        assert_eq!(delivery.destination_url, "https://example.test/hook");
+        assert!(!delivery.allow_private_network);
+        assert_eq!(delivery.provider_plugin_id, "builtin.webhook");
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 #[path = "repository_tests.rs"]
 mod repository_tests;
