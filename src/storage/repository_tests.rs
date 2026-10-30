@@ -4522,6 +4522,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     for index in 0..205 {
         let id = format!("notification-destination-{index:03}");
         database
+            .notifications()
             .create_notification_destination(NewNotificationDestination {
                 id: &id,
                 name: &id,
@@ -4558,6 +4559,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     .await?;
     assert!(
         database
+            .notifications()
             .insert_notification_event_with_deliveries(event(), &destination_ids)
             .await
             .is_err()
@@ -4581,6 +4583,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     database.reset_query_count();
     assert!(
         database
+            .notifications()
             .insert_notification_event_with_deliveries(event(), &destination_ids)
             .await?
     );
@@ -4609,6 +4612,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     database.reset_query_count();
     assert!(
         !database
+            .notifications()
             .insert_notification_event_with_deliveries(event(), &destination_ids)
             .await?
     );
@@ -4621,6 +4625,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     database.reset_query_count();
     assert!(
         database
+            .notifications()
             .insert_notification_event_with_deliveries(
                 NewNotificationEvent {
                     id: "notification-event-empty",
@@ -4658,6 +4663,7 @@ async fn notification_history_retention_prunes_old_delivered_rows()
     })
     .await?;
     database
+        .notifications()
         .create_notification_destination(NewNotificationDestination {
             id: "retention-destination",
             name: "Retention",
@@ -4672,6 +4678,7 @@ async fn notification_history_retention_prunes_old_delivered_rows()
         .await?;
     let destination_ids = vec!["retention-destination".to_owned()];
     database
+        .notifications()
         .insert_notification_event_with_deliveries(
             NewNotificationEvent {
                 id: "retention-old-event",
@@ -4685,6 +4692,7 @@ async fn notification_history_retention_prunes_old_delivered_rows()
         )
         .await?;
     database
+        .notifications()
         .insert_notification_event_with_deliveries(
             NewNotificationEvent {
                 id: "retention-new-event",
@@ -4711,7 +4719,10 @@ async fn notification_history_retention_prunes_old_delivered_rows()
     .execute(database.pool())
     .await?;
 
-    let (deleted_deliveries, deleted_events) = database.prune_notification_history(100, 10).await?;
+    let (deleted_deliveries, deleted_events) = database
+        .notifications()
+        .prune_notification_history(100, 10)
+        .await?;
     assert!(deleted_deliveries >= 1);
     assert!(deleted_events >= 1);
     let old_events: i64 = sqlx::query_scalar(
@@ -4777,6 +4788,7 @@ async fn postgres_notification_deliveries_are_written_in_bounded_batches()
         for index in 0..205 {
             let id = format!("postgres-notification-destination-{index:03}");
             database
+                .notifications()
                 .create_notification_destination(NewNotificationDestination {
                     id: &id,
                     name: &id,
@@ -4804,6 +4816,7 @@ async fn postgres_notification_deliveries_are_written_in_bounded_batches()
         database.reset_query_count();
         assert!(
             database
+                .notifications()
                 .insert_notification_event_with_deliveries(event(), &destination_ids)
                 .await?
         );
@@ -4818,6 +4831,7 @@ async fn postgres_notification_deliveries_are_written_in_bounded_batches()
         database.reset_query_count();
         assert!(
             !database
+                .notifications()
                 .insert_notification_event_with_deliveries(event(), &destination_ids)
                 .await?
         );
