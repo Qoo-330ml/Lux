@@ -256,3 +256,95 @@ export type { WebDanmakuInfo } from "./generated/WebDanmakuInfo";
 | `cargo clippy --locked --all-targets --all-features -- -D warnings` | 通过 |
 | `pnpm --dir web build` | 通过（生成文件参与 `tsc --noEmit`） |
 | `pnpm --dir web test` | 127 个文件 / 986 个用例通过 |
+
+## 阶段 3 小结（防漂移检查）
+
+`scripts/check-api-types.sh`：
+
+1. 备份已提交的 `web/src/lib/api/generated/` 到临时目录；
+2. 运行 `scripts/generate-api-types.sh` 重新生成；
+3. `diff -ru` 逐字节比对，有差异就打印 diff 并以非零退出（重新生成的文件会留在工作区，方便直接提交）；
+4. 额外检查仓库根目录没有游离的 `*.ts`：`#[ts(export)]` 若漏写 `export_to`，ts-rs 会把文件写到导出根目录
+   （本次开发中就触发过一次），这类文件不会被 `tsc` 收录，属于静默漂移。
+
+已加入 `scripts/check-all.sh`（在 `cargo clippy` 与 `bash -n scripts/*.sh` 之后、Python 检查之前）。
+
+运行方式：
+
+```bash
+scripts/check-api-types.sh          # 只跑这一项
+./scripts/check-all.sh              # 完整门禁
+```
+
+注意：这项检查会以 `--features ts-bindings` 编译一次测试目标，是本仓库里唯一会引入 `ts-rs` 的路径。
+
+## 如何扩展到更多路由
+
+1. **先定形状，再改代码**：在 `docs/` 或 PR 描述里写出目标 JSON（键顺序无所谓，但 `null` / 缺省 / 数字类型要写清）。
+2. **先写字节固定测试**：在 `#[cfg(test)] mod` 里对「当前实现」的响应体 `serde_json::to_string` 断言字面量，
+   跑通后再改实现。改实现后该测试必须**原样通过**；如果需要改字面量，说明响应已经变了，那是一次 API 变更而不是重构。
+3. **把 `json!` 换成结构体**：字段按序列化后的键名字母序声明（见上文「保持序列化字节一致的两个关键点」），
+   并把 `json!({ ... })` 里每个键的 `Option` 语义原样保留（不要顺手加 `skip_serializing_if`）。
+4. **加派生属性**：
+
+   ```rust
+   #[derive(Serialize)]
+   #[cfg_attr(feature = "ts-bindings", derive(ts_rs::TS))]
+   #[cfg_attr(feature = "ts-bindings", ts(export, export_to = "web/src/lib/api/generated/"))]
+   #[serde(rename_all = "camelCase")]
+   pub(super) struct FooResponse { /* … */ }
+   ```
+
+   `Option<T>` 字段若要生成 `?: T | null`，加 `#[cfg_attr(feature = "ts-bindings", ts(optional = nullable))]`。
+5. **处理嵌套**：嵌套类型也要加同样的 `cfg_attr`，否则 `--features ts-bindings` 编译失败（这是有意的：
+   宁可编译不过，也不要生成 `any`）。枚举建议用 `#[serde(rename_all = ...)]` + 派生，字面量字段用单变体枚举表达。
+6. **信封单独建模**：`{items,page,pageSize,total}` 与 `{items,page,pageSize,hasNext}` 是两种信封，各写一个结构体，
+   不要用 `Option` 合成一个（否则 TS 会把可能不存在的字段标成必填/可选，二者都不准确）。
+7. **生成并提交**：`scripts/generate-api-types.sh`，然后 `scripts/check-api-types.sh` 必须通过。
+8. **收窄 `types.ts`**：把手写类型换成 `export type { X } from "./generated/X"`，**保持导出名不变**；
+   若生成类型与手写类型有差异，逐条确认是「放宽」（读路径安全）还是「收窄」（需要同步改前端代码）。
+   最后跑 `pnpm --dir web build` 与 `pnpm --dir web test`。
+
+推荐顺序（按阶段 1 的工作量估算，风险从低到高）：
+
+1. `G-Images` 的 `image_candidate_json`（`ImageSearchResult`，8 个扁平字段）；
+2. `G-Page` 的两种分页信封（先只建模信封，元素仍是现成结构体或后续再收）；
+3. `G-Libraries`（`LibraryCard` / `LibrariesResponse` / `HomeLibraryCard`，注意 `/api/v1/home` 的卡片多 `latest`）；
+4. `G-MediaItem`（最大的一步，`MediaItem` + `userData` + `imageTags` + 详情态 `mediaSources`/`actors`/`nfo`）；
+5. `G-Playback`（`WebPlaybackSession` / `WebPlaybackBootstrap` / `WebPlaybackSessionStats` / `PlaybackHistoryEventView`），
+   它的 JSON 由 `playback.rs` 里几个长函数拼装，改造前建议先把拼装逻辑拆成纯函数。
+
+`/api/v1/continue-watching`、`/favorites`、`/search`、`/children` 等 8 条路由共用 `G-Page` + `G-MediaItem`，
+所以第 3、4 步完成后一次就能覆盖它们。
+
+## 已知限制
+
+1. **`i64` → `number` 的精度**：JSON 数字在 JS 里是 `f64`，超过 2^53 会丢精度。本项目的 `i64` 目前都是
+   时间戳（ms）、`ticks`、计数与自增 ID，量级安全。ts-rs 的默认渲染是 `bigint`，本项目用
+   `TS_RS_LARGE_INT=number` 覆盖，理由是：`serde_json` 把 `i64` 编码成 JSON 数字，`bigint` 反而需要前端做一次转换。
+   **风险**：若将来出现纳秒时间戳或 64 位雪花 ID，必须重新评估，届时更合适的做法是给该字段加 `#[ts(type = "string")]`。
+2. **`serde_json::Value` 无法直接生成类型**：ts-rs 只有在启用 `serde-json-impl` feature 时才为 `Value` 实现 `TS`
+   （生成 `JsonValue` 联合类型）。本试点**没有**启用该 feature，所以含 `Value` 字段的结构体在
+   `--features ts-bindings` 下会编译失败。这正是当前 (b) 家族的现状（`lux_catalog_item_json` 及其副本都是 `Value`），
+   扩展时必须先把 `Value` 拆成具名结构体，而不是打开 `serde-json-impl` 生成 `JsonValue`。
+3. **`Option<Option<T>>`**：serde 的 `Option<Option<T>>` 在 JSON 里表现不出三态（缺省 / `null` / 有值），
+   `json!` 与结构体都会把它压成 `null`。需要三态时用枚举（如 `#[serde(untagged)]` 的多变体）或独立的
+   「字段存在性」标志，不要依赖 `Option<Option<T>>`。
+4. **条件字段**：`lux_catalog_page_json_for_user` 只在 `total_included` 时才写 `total`。任何「有时出现」的键
+   都必须拆成两个结构体（或两个响应类型），ts-rs 无法表达「条件出现」。
+5. **`skip_serializing_if`**：ts-rs 只有在同时有 `#[serde(default)]` 时才把字段生成为可选。引入
+   `skip_serializing_if` 会让 JSON 出现「键缺省」，前端读到的是 `undefined` 而不是 `null`；
+   改造时要么保持「始终输出 `null`」，要么同步把 TS 字段改成可选并检查所有读点。
+6. **字面量字段**：`bool` 会生成为 `boolean`（本试点把 `available: true` 放宽为 `boolean`）。需要保留字面量时
+   用单变体枚举（本次的 `DanmakuFormat`）或 `#[ts(type = "...")]`。
+7. **自定义 `Serialize` 实现**：ts-rs 只理解派生出来的形状；手写 `impl Serialize` 的类型必须用
+   `#[ts(as = "...")]` / `#[ts(type = "...")]` 手工描述，否则生成结果与真实输出不一致。
+8. **生成受环境变量影响**：`TS_RS_EXPORT_DIR` / `TS_RS_LARGE_INT` 只在 `scripts/generate-api-types.sh` 里固定。
+   直接运行 `cargo test --features ts-bindings export_bindings` 会把文件写到 `<repo>/bindings/` 并用 `bigint`。
+   因此**只能**通过脚本生成；`scripts/check-api-types.sh` 也用脚本，所以两者一致。
+9. **生成的 `.ts` 参与 `tsc`**：`web/src/lib/api/generated/` 位于 `web/tsconfig.json` 的 `include` 之内，
+   生成物语法错误会让 `pnpm --dir web build` 失败（这是期望行为）。生成文件带文件头注释，不要手改。
+10. **Rustdoc 会进入 JS 文档注释**：`///` 会变成生成文件里的 `/** … */`，因此 DTO 上的实现细节注释用 `//` 而不是 `///`。
+11. **范围**：只覆盖 Lux 自有 API 的**响应**。Emby 兼容层 DTO（必须保持 Emby 形状）与请求体类型不在其中。
+12. **零运行时影响**：`ts-bindings` 是编译期功能，默认构建与 Dockerfile（`--locked`）都不会引入 `ts-rs`；
+    生成的绑定在 `web` 侧只是类型，构建产物中不新增任何运行时代码。
