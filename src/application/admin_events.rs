@@ -6,7 +6,7 @@ use std::{
 
 use tokio::sync::{Mutex, broadcast};
 
-const EVENT_CHANNEL_CAPACITY: usize = 256;
+pub(crate) const EVENT_CHANNEL_CAPACITY: usize = 256;
 const HOME_EVENT_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 const ADMIN_JOBS_EVENT_COALESCE_WINDOW: Duration = Duration::from_secs(1);
 
@@ -382,24 +382,35 @@ impl UserEventHub {
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(HOME_EVENT_COALESCE_WINDOW).await;
-                let trailing_item_id = {
+                let flush = {
                     let mut state = state.lock().await;
-                    let Some(entry) = state.keys.get_mut(&key) else {
-                        return;
-                    };
-                    if entry.epoch != epoch || !entry.scheduled {
-                        return;
-                    }
-                    if entry.dirty {
-                        entry.dirty = false;
-                        Some(entry.item_id.clone())
-                    } else {
-                        entry.scheduled = false;
-                        None
+                    match state.keys.get_mut(&key) {
+                        Some(entry) if entry.epoch == epoch && entry.scheduled => {
+                            if entry.dirty {
+                                entry.dirty = false;
+                                CoalesceFlush::Trailing(entry.item_id.clone())
+                            } else {
+                                entry.scheduled = false;
+                                CoalesceFlush::Idle
+                            }
+                        }
+                        _ => return,
                     }
                 };
-                let Some(item_id) = trailing_item_id else {
-                    return;
+                let item_id = match flush {
+                    CoalesceFlush::Trailing(item_id) => item_id,
+                    CoalesceFlush::Idle => {
+                        // The window closed with nothing pending: drop the bookkeeping
+                        // entry so the table stays bounded by users who are active now.
+                        let mut state = state.lock().await;
+                        let idle = state.keys.get(&key).is_some_and(|entry| {
+                            entry.epoch == epoch && !entry.scheduled && !entry.dirty
+                        });
+                        if idle {
+                            state.keys.remove(&key);
+                        }
+                        return;
+                    }
                 };
                 let mut event = match &key.user_id {
                     Some(user_id) => UserEvent::for_user(key.scope, user_id.clone()),
@@ -412,6 +423,17 @@ impl UserEventHub {
             }
         });
     }
+
+    /// Number of `(user, scope)` coalescing buckets currently tracked.
+    #[cfg(test)]
+    pub(crate) async fn tracked_coalesce_keys(&self) -> usize {
+        self.coalesced_events.lock().await.keys.len()
+    }
+}
+
+enum CoalesceFlush {
+    Trailing(Option<String>),
+    Idle,
 }
 
 impl Default for UserEventHub {
@@ -616,6 +638,42 @@ mod tests {
         tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(25)).await;
         assert_eq!(next_scope(&mut alice).await, Some(UserEventScope::Home));
         assert!(bob.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn drops_idle_coalescing_buckets_after_the_window() {
+        let hub = UserEventHub::new();
+        let mut alice = hub.subscribe_for("alice");
+
+        hub.publish_home_coalesced_for("alice").await;
+        assert_eq!(next_scope(&mut alice).await, Some(UserEventScope::Home));
+        assert_eq!(hub.tracked_coalesce_keys().await, 1);
+
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(25)).await;
+        assert_eq!(
+            hub.tracked_coalesce_keys().await,
+            0,
+            "an idle bucket must not stay in the coalescing table"
+        );
+
+        // A later publish starts a fresh bucket and still sends immediately.
+        hub.publish_home_coalesced_for("alice").await;
+        assert_eq!(next_scope(&mut alice).await, Some(UserEventScope::Home));
+        tokio::time::sleep(Duration::from_secs(1) + Duration::from_millis(25)).await;
+        assert_eq!(hub.tracked_coalesce_keys().await, 0);
+    }
+
+    #[tokio::test]
+    async fn lagging_subscribers_observe_a_lagged_receiver() {
+        let hub = UserEventHub::new();
+        let mut subscriber = hub.subscribe_for("alice");
+        for _ in 0..(super::EVENT_CHANNEL_CAPACITY + 8) {
+            hub.publish(UserEventScope::Item);
+        }
+        assert!(matches!(
+            subscriber.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_))
+        ));
     }
 
     #[tokio::test]

@@ -1,5 +1,7 @@
 use super::*;
 
+use crate::application::admin_events::{UserEvent, UserEventScope, UserEventSubscriber};
+
 pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route("/api/v1/admin/events", get(admin_events))
@@ -433,7 +435,7 @@ pub(crate) async fn user_events(
 
     // The subscription only yields directory-level events and events about this
     // user, so another user's playback ticks never reach this stream.
-    let mut receiver = state.user_events.subscribe_for(&user.id.to_string());
+    let receiver = state.user_events.subscribe_for(&user.id.to_string());
     let (mut writer, reader) = tokio::io::duplex(16 * 1024);
     tokio::spawn(async move {
         // Held until the stream ends so the budget reflects live connections.
@@ -445,37 +447,52 @@ pub(crate) async fn user_events(
         {
             return;
         }
-
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
-        heartbeat.tick().await;
-        loop {
-            tokio::select! {
-                event = receiver.recv() => {
-                    let event = match event {
-                        Ok(event) => event,
-                        // A lagged subscriber may have missed invalidations of any
-                        // scope, so fall back to the full home refresh.
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            crate::application::admin_events::UserEvent::broadcast(
-                                crate::application::admin_events::UserEventScope::Home,
-                            )
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                    };
-                    if writer.write_all(user_event_frame(&event).as_bytes()).await.is_err() {
-                        break;
-                    }
-                }
-                _ = heartbeat.tick() => {
-                    if writer.write_all(b": keep-alive\n\n").await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
+        pump_user_events(receiver, writer).await;
     });
 
     event_stream_response(reader)
+}
+
+/// Writes invalidations for one subscription until the client goes away.
+async fn pump_user_events<W>(mut receiver: UserEventSubscriber, mut writer: W)
+where
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    let mut heartbeat = tokio::time::interval(Duration::from_secs(15));
+    heartbeat.tick().await;
+    loop {
+        tokio::select! {
+            event = receiver.recv() => {
+                let Some(event) = user_event_from_receive(event) else {
+                    break;
+                };
+                if writer.write_all(user_event_frame(&event).as_bytes()).await.is_err() {
+                    break;
+                }
+            }
+            _ = heartbeat.tick() => {
+                if writer.write_all(b": keep-alive\n\n").await.is_err() {
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/// Decides what a broadcast receive outcome becomes on the stream.
+///
+/// A lagged subscriber may have missed invalidations of any scope, so it gets
+/// the full home refresh instead of an empty stream; a closed channel ends it.
+fn user_event_from_receive(
+    result: Result<UserEvent, tokio::sync::broadcast::error::RecvError>,
+) -> Option<UserEvent> {
+    match result {
+        Ok(event) => Some(event),
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+            Some(UserEvent::broadcast(UserEventScope::Home))
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => None,
+    }
 }
 
 /// Renders one invalidation frame.
@@ -483,7 +500,7 @@ pub(crate) async fn user_events(
 /// Scope-only payloads keep the legacy `{"scope":"..."}` shape. `progress`
 /// events additionally carry the item the user is playing so the client can
 /// refresh that item's playback state instead of every media query.
-fn user_event_frame(event: &crate::application::admin_events::UserEvent) -> String {
+fn user_event_frame(event: &UserEvent) -> String {
     #[derive(serde::Serialize)]
     struct Frame<'a> {
         scope: &'a str,
@@ -502,8 +519,6 @@ fn user_event_frame(event: &crate::application::admin_events::UserEvent) -> Stri
 #[cfg(test)]
 mod user_event_frame_tests {
     use super::*;
-
-    use crate::application::admin_events::{UserEvent, UserEventScope};
 
     #[test]
     fn keeps_the_legacy_scope_only_frame_for_directory_events() {
@@ -525,6 +540,48 @@ mod user_event_frame_tests {
             ),
             "event: invalidate\ndata: {\"scope\":\"progress\",\"itemId\":\"item-1\"}\n\n"
         );
+    }
+
+    #[test]
+    fn lagged_subscribers_fall_back_to_the_full_home_refresh() {
+        let fallback =
+            user_event_from_receive(Err(tokio::sync::broadcast::error::RecvError::Lagged(3)))
+                .expect("a lagged subscriber still receives an invalidation");
+        assert_eq!(
+            user_event_frame(&fallback),
+            "event: invalidate\ndata: {\"scope\":\"home\"}\n\n"
+        );
+        assert!(
+            user_event_from_receive(Err(tokio::sync::broadcast::error::RecvError::Closed))
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lagged_stream_writes_the_home_fallback_frame() {
+        use tokio::io::AsyncReadExt;
+
+        let hub = crate::application::admin_events::UserEventHub::new();
+        let subscriber = hub.subscribe_for("viewer");
+        // Overflow the broadcast buffer while the subscriber is not draining it,
+        // which is what a slow client looks like to the pump.
+        for _ in 0..(crate::application::admin_events::EVENT_CHANNEL_CAPACITY + 8) {
+            hub.publish(UserEventScope::Item);
+        }
+
+        let (mut client, server) = tokio::io::duplex(1024);
+        let pump = tokio::spawn(pump_user_events(subscriber, server));
+        let mut buffer = [0_u8; 1024];
+        let read = tokio::time::timeout(Duration::from_secs(2), client.read(&mut buffer))
+            .await
+            .expect("the pump should write the fallback frame")
+            .expect("stream should be readable");
+        let frame = String::from_utf8_lossy(&buffer[..read]).to_string();
+        assert!(
+            frame.starts_with("event: invalidate\ndata: {\"scope\":\"home\"}\n\n"),
+            "a lagged stream must recover with a full home refresh: {frame}"
+        );
+        pump.abort();
     }
 }
 

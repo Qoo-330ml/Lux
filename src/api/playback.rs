@@ -4555,6 +4555,14 @@ pub(super) async fn lux_web_playback_event(
             .user_events
             .publish_progress_coalesced(&session.user_id, &session.item_id)
             .await;
+        // A played flip changes the episode, season, series and library played
+        // markers, which the narrow progress refresh does not cover. Notify the
+        // user's other tabs with the full user-level item scope.
+        if effects.is_played_changed {
+            state
+                .user_events
+                .publish_for_user(UserEventScope::Item, &session.user_id);
+        }
         if let Some(event_type) = activity_event {
             record_activity_event(
                 Some(database),
