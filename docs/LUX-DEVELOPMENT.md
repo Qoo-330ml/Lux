@@ -17846,7 +17846,7 @@ POSTER/THUMB，锁定“开关只作用于实时播放 HLS”的边界。
 #### LUX-850：VAAPI / QSV / NVENC 编码参数与设备路径
 
 范围：按编码器补齐真实可用参数：VAAPI 增加 `-vaapi_device <device>` 与 `format=nv12,hwupload`；QSV 增加
-`-init_hw_device qsv=hw:<device>`、`-filter_hw_device hw` 与 `hwupload=extra_hw_frames=64,format=qsv`；
+`-init_hw_device qsv=hw:<device>`、`-filter_hw_device hw` 与 `format=nv12,hwupload=extra_hw_frames=64,format=qsv`（QSV 拒绝 RGB/BGRA 表面，需先转 NV12）；
 NVENC 增加 `-preset p4 -tune hq -rc vbr`；NVENC 与 VideoToolbox 强制 `-pix_fmt yuv420p` 以避免 10-bit 源
 不兼容；缩放与上传合并为同一个 `-vf`。设备路径可由管理员配置（默认 `/dev/dri/renderD128`，空值回落默认）。
 
