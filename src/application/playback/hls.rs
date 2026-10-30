@@ -2237,7 +2237,8 @@ fn hardware_probe_args(encoding: &FfmpegEncodingOptions) -> Vec<String> {
         "-f".to_owned(),
         "lavfi".to_owned(),
         "-i".to_owned(),
-        "testsrc=size=320x240:rate=30:duration=0.3".to_owned(),
+        // Decoded video is yuv420p; RGB frames make QSV fail on upload even when it works.
+        "testsrc=size=320x240:rate=30:duration=0.3,format=yuv420p".to_owned(),
         "-frames:v".to_owned(),
         "1".to_owned(),
     ]);
@@ -4029,6 +4030,28 @@ while :; do sleep 1; done
             hardware_output(Path::new("session/index.m3u8")),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn hardware_probe_source_uses_the_pixel_format_of_decoded_video() {
+        // lavfi defaults to RGB frames; QSV rejects those on upload while real yuv420p video
+        // works, so a probe on RGB reports a false negative for a usable encoder.
+        for encoder in ["h264_qsv", "h264_vaapi", "h264_nvenc"] {
+            let encoding = super::FfmpegEncodingOptions {
+                hardware_encoder: Some(encoder.to_owned()),
+                ..super::FfmpegEncodingOptions::default()
+            };
+            let args = super::hardware_probe_args(&encoding);
+            let source = args
+                .windows(2)
+                .find(|pair| pair[0] == "-i")
+                .map(|pair| pair[1].clone())
+                .unwrap_or_default();
+            assert!(
+                source.contains("format=yuv420p"),
+                "{encoder} probe source must be yuv420p: {source}"
+            );
+        }
     }
 
     #[test]
