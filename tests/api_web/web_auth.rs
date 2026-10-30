@@ -59,7 +59,12 @@ async fn test_server_with_setup_restart(
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    Ok((format!("http://{address}"), server, restart_receiver, database))
+    Ok((
+        format!("http://{address}"),
+        server,
+        restart_receiver,
+        database,
+    ))
 }
 
 fn test_config(temp_dir: &tempfile::TempDir) -> Result<Config, Box<dyn std::error::Error>> {
@@ -660,7 +665,9 @@ async fn setup_complete_restarts_even_when_the_first_library_cannot_be_created()
     let body = setup.json::<serde_json::Value>().await?;
     assert_eq!(body["error"]["code"], json!("DATABASE_UNAVAILABLE"));
     assert!(
-        !body.as_object().is_some_and(|body| body.contains_key("restarting")),
+        !body
+            .as_object()
+            .is_some_and(|body| body.contains_key("restarting")),
         "the 4xx/5xx body keeps the plain api_error shape: {body}"
     );
     assert!(

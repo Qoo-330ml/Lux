@@ -321,7 +321,9 @@ async fn wait_for_scan_job_status(
             return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("scan job {job_id} stayed in {status}, expected {expected}").into());
+            return Err(
+                format!("scan job {job_id} stayed in {status}, expected {expected}").into(),
+            );
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
@@ -359,10 +361,11 @@ async fn startup_resumes_first_scans_interrupted_by_shutdown()
     // The recovered scan really runs: once it completes, `last_scan_at` is written and the library
     // no longer matches the recovery predicate.
     wait_for_scan_job_status(&fixture.database, &replacement, "COMPLETED").await?;
-    let last_scan_at: Option<i64> = sqlx::query_scalar("SELECT last_scan_at FROM libraries WHERE id = ?")
-        .bind(fixture.library_id.to_string())
-        .fetch_one(fixture.database.pool())
-        .await?;
+    let last_scan_at: Option<i64> =
+        sqlx::query_scalar("SELECT last_scan_at FROM libraries WHERE id = ?")
+            .bind(fixture.library_id.to_string())
+            .fetch_one(fixture.database.pool())
+            .await?;
     assert!(last_scan_at.is_some(), "the resumed scan must be recorded");
 
     assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
@@ -393,8 +396,8 @@ async fn startup_skips_first_scans_of_libraries_that_were_scanned()
 }
 
 #[tokio::test]
-async fn startup_skips_scans_cancelled_for_a_real_failure()
--> Result<(), Box<dyn std::error::Error>> {
+async fn startup_skips_scans_cancelled_for_a_real_failure() -> Result<(), Box<dyn std::error::Error>>
+{
     let fixture = interrupted_first_scan(true).await?;
     sqlx::query("UPDATE scan_jobs SET error = 'DISK_FULL' WHERE id = ?")
         .bind(&fixture.cancelled_job_id)
@@ -410,8 +413,8 @@ async fn startup_skips_scans_cancelled_for_a_real_failure()
 }
 
 #[tokio::test]
-async fn startup_skips_first_scans_of_disabled_libraries()
--> Result<(), Box<dyn std::error::Error>> {
+async fn startup_skips_first_scans_of_disabled_libraries() -> Result<(), Box<dyn std::error::Error>>
+{
     let fixture = interrupted_first_scan(true).await?;
     sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
         .bind(fixture.library_id.to_string())
@@ -456,6 +459,9 @@ async fn startup_does_not_queue_a_second_scan_while_one_is_active()
     assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
     let jobs = scan_job_ids(&fixture.database, fixture.library_id).await;
     assert_eq!(jobs.len(), 2, "no third job: {jobs:?}");
-    assert_eq!(scan_job_status(&fixture.database, "active-scan").await, "PENDING");
+    assert_eq!(
+        scan_job_status(&fixture.database, "active-scan").await,
+        "PENDING"
+    );
     Ok(())
 }
