@@ -2460,3 +2460,112 @@ html[data-lux-theme="light"] .lux-admin-library-page .lux-library-dialog select 
 .lux-transcoding-history-pager { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-top: 12px; color: var(--lux-muted); font-size: .74rem; flex-wrap: wrap; }
 
 .lux-transcoding-history-pager > div { display: flex; gap: 8px; }
+
+/* Operations page redesign: compact status header, segmented tabs, railed run cards, console-style log. */
+.lux-admin-operations-page { display: grid; gap: 16px; align-content: start; }
+
+.lux-operations-heading { margin: 0; }
+
+.lux-operations-summary { gap: 10px; border: 0; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+
+.lux-operations-stat { align-items: center; padding: 12px 14px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: rgba(255,255,255,.03); }
+
+.lux-operations-stat + .lux-operations-stat { border-left: 1px solid var(--lux-line-soft); }
+
+.lux-operations-stat strong { margin-top: 0; font-size: 1.5rem; line-height: 1.1; }
+
+.lux-operations-stat p { margin-top: 2px; }
+
+.lux-operations-stat.is-warn { border-color: rgba(226,163,75,.34); background: rgba(226,163,75,.06); }
+
+.lux-operations-tabs { gap: 4px; width: fit-content; max-width: 100%; margin-top: 0; padding: 4px; overflow-x: auto; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: rgba(255,255,255,.03); }
+
+.lux-operations-tab { min-height: 34px; padding: 0 14px; border: 0; border-radius: 9px; white-space: nowrap; }
+
+.lux-operations-tab.is-active { color: #fff; background: rgba(255,255,255,.1); box-shadow: inset 0 0 0 1px var(--lux-line); }
+
+.lux-operations-section { padding: 0; }
+
+.lux-operations-section-heading { margin-bottom: 14px; }
+
+.lux-operations-section-heading h2 { margin: 4px 0 4px; font-size: 1.05rem; }
+
+/* Run cards: a status rail on the left replaces the boxed icon-first row. */
+.lux-admin-job-list { gap: 10px; }
+
+.lux-admin-job-row { --job-rail: var(--lux-line); position: relative; grid-template-columns: 34px minmax(0, 1fr) auto; align-items: start; gap: 14px; padding: 14px 16px 14px 18px; overflow: hidden; border-radius: 12px; }
+
+.lux-admin-job-row::before { position: absolute; inset: 0 auto 0 0; width: 3px; background: var(--job-rail); content: ""; }
+
+.lux-admin-job-row:has(.status-running, .status-pending, .status-queued, .status-postprocessing) { --job-rail: var(--lux-accent); }
+
+.lux-admin-job-row:has(.status-completed) { --job-rail: var(--lux-status-success); }
+
+.lux-admin-job-row:has(.status-failed) { --job-rail: var(--lux-status-danger); }
+
+.lux-admin-job-row:has(.status-completed-with-issues, .status-deferred) { --job-rail: var(--lux-status-warning); }
+
+.lux-admin-job-heading { flex-wrap: wrap; }
+
+.lux-admin-job-heading strong { font-size: .86rem; }
+
+.lux-admin-job-main > .lux-admin-job-meta { margin-top: 6px; }
+
+.lux-admin-job-finished-at, .lux-admin-job-duration { display: inline-block; margin: 6px 12px 0 0; }
+
+.lux-admin-job-actions { align-self: center; }
+
+/* Logs: terminal-style console with fixed columns. */
+.lux-operations-log-toolbar { padding: 8px; border: 1px solid var(--lux-line-soft); border-radius: 12px 12px 0 0; background: rgba(255,255,255,.03); margin-bottom: 0; }
+
+.lux-log-export-panel { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px 20px; margin-bottom: 14px; padding: 10px 14px; border: 1px solid var(--lux-line-soft); border-radius: 12px; background: rgba(255,255,255,.02); }
+
+.lux-log-export-controls { display: flex; flex-wrap: wrap; align-items: end; gap: 10px; }
+
+.lux-log-export-controls label { display: grid; gap: 4px; color: var(--lux-subtle); font-size: .66rem; }
+
+.lux-admin-log-list { gap: 0; overflow: hidden; border: 1px solid var(--lux-line-soft); border-top: 0; border-radius: 0 0 12px 12px; background: rgba(0,0,0,.22); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+
+.lux-operations-log-row { position: relative; display: grid; grid-template-columns: 54px minmax(0, 1fr) auto auto; align-items: start; gap: 12px; padding: 9px 14px 9px 16px; border-bottom: 1px solid var(--lux-line-soft); }
+
+.lux-operations-log-row:last-child { border-bottom: 0; }
+
+.lux-operations-log-row::before { position: absolute; inset: 0 auto 0 0; width: 2px; background: var(--lux-status-success); opacity: .55; content: ""; }
+
+.lux-operations-log-row:hover { background: rgba(255,255,255,.035); }
+
+.lux-operations-log-row.is-warn::before { background: var(--lux-status-warning); opacity: 1; }
+
+.lux-operations-log-row.is-error::before { background: var(--lux-status-danger); opacity: 1; }
+
+.lux-operations-log-row.is-error { background: rgba(220,89,115,.06); }
+
+.lux-operations-log-row .lux-operations-log-level { padding: 2px 0; text-align: center; border-radius: 5px; background: rgba(255,255,255,.06); }
+
+.lux-operations-log-row time { color: var(--lux-subtle); font-size: .65rem; font-variant-numeric: tabular-nums; white-space: nowrap; padding-top: 3px; }
+
+.lux-operations-log-copy strong { font-family: inherit; font-weight: 600; }
+
+.lux-admin-log-list > .lux-operations-empty { margin: 14px; font-family: system-ui, sans-serif; }
+
+html[data-lux-theme="light"] .lux-operations-stat,
+html[data-lux-theme="light"] .lux-operations-tabs,
+html[data-lux-theme="light"] .lux-operations-log-toolbar,
+html[data-lux-theme="light"] .lux-log-export-panel { background: rgba(255,255,255,.7); }
+
+html[data-lux-theme="light"] .lux-operations-tab.is-active { color: var(--lux-text); background: rgba(28,28,34,.08); }
+
+html[data-lux-theme="light"] .lux-admin-log-list { background: rgba(28,28,34,.04); }
+
+html[data-lux-theme="light"] .lux-operations-log-row:hover { background: rgba(28,28,34,.05); }
+
+@media (max-width: 900px) {
+  .lux-operations-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .lux-operations-tabs { width: 100%; }
+  .lux-operations-tab { flex: 1 1 0; justify-content: center; padding: 0 8px; }
+  .lux-operations-log-toolbar { flex-wrap: wrap; }
+  .lux-operations-log-row { grid-template-columns: 48px minmax(0, 1fr) auto; }
+  .lux-operations-log-row time { grid-column: 2; padding-top: 0; }
+  .lux-admin-job-row { grid-template-columns: 34px minmax(0, 1fr); }
+  .lux-admin-job-actions { grid-column: 2; align-self: start; }
+}

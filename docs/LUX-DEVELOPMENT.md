@@ -17846,7 +17846,7 @@ POSTER/THUMB，锁定“开关只作用于实时播放 HLS”的边界。
 #### LUX-850：VAAPI / QSV / NVENC 编码参数与设备路径
 
 范围：按编码器补齐真实可用参数：VAAPI 增加 `-vaapi_device <device>` 与 `format=nv12,hwupload`；QSV 增加
-`-init_hw_device qsv=hw:<device>`、`-filter_hw_device hw` 与 `hwupload=extra_hw_frames=64,format=qsv`；
+`-init_hw_device qsv=hw:<device>`、`-filter_hw_device hw` 与 `format=nv12,hwupload=extra_hw_frames=64,format=qsv`（QSV 拒绝 RGB/BGRA 表面，需先转 NV12）；
 NVENC 增加 `-preset p4 -tune hq -rc vbr`；NVENC 与 VideoToolbox 强制 `-pix_fmt yuv420p` 以避免 10-bit 源
 不兼容；缩放与上传合并为同一个 `-vf`。设备路径可由管理员配置（默认 `/dev/dri/renderD128`，空值回落默认）。
 
@@ -18644,6 +18644,23 @@ token 与 Web 播放会话绑定：有效期不超过会话 `expires_at`，会�
 范围：Direct 计划新增有序 `candidates`（`proxy`/`lux`/`origin`），`proxy` 候选为带 LUX-871 短期 token 与标准
 `DeviceId`/`PlaySessionId`/`UserId`/`static=true` 的 Emby 风格 URL。旧字段 `url`/`proxyUrl`/`rangeUrl` 保留一个版本。
 更新 `docs/API.md`、`docs/COMPATIBILITY.md`，并让 LUX-870 的候选链改读 `candidates`。
+
+条目绑定（用户追加）：LUX-871 的播放令牌不绑定条目，持有者可读取该用户任意条目。本任务把令牌形状改为
+`luxpb_{条目公共 id}_{随机串}`（哈希覆盖整串，无法篡改），Emby 路由中间件按路径中的条目 id 校验，
+`Items/{id}`、`Users/{id}/Items/{id}`、`Videos/{id}/…` 只接受绑定条目，`Auth/Keys` 不带条目。
+
+验收：
+
+- [x] Direct 计划带有序 `candidates`（`proxy`/`lux`/`origin`），路径型 `.strm` 无 `origin`，URL 型三者齐全；旧字段不变。
+- [x] `proxy` 候选的令牌可访问绑定条目、访问其他条目返回 401，会话停止后返回 401。
+- [x] 前端候选链优先读 `candidates`，缺失或为空时回落旧字段。
+
+进度（2026-10-30，完成）：`2c2d0974` 条目绑定（`playback_token_item`、`playback_token_may_call`，`issue_playback_token`
+新增条目参数）；`0d5d7987` 计划 `candidates` 与 `emby_signed_direct_stream_url_parts`；`88c32d4f` 前端读取。
+`tests/web_playback.rs`（候选、绑定、撤销端到端）、`tests/playback_token.rs`、`tests/emby_auth.rs` 与 `web` 全量
+988 项通过。未做：`cargo test --all-targets` 全量门禁、真机与真实 302 软件联调。
+`tests/web_playback.rs::broken_hardware_encoder_falls_back_to_software_transcoding` 在本机（VideoToolbox 探测）失败，
+与本任务无关；`tests/performance.rs` 存在既有的 dead_code Clippy 报错。
 
 依赖：LUX-870、LUX-871。
 

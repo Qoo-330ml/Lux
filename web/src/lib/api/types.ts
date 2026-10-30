@@ -460,7 +460,14 @@ export type WebPlaybackCapabilities = {
 };
 
 export type WebPlaybackPlan =
-  | { type: "DIRECT"; url: string; proxyUrl?: string | null; rangeUrl?: string | null }
+  | {
+      type: "DIRECT";
+      url: string;
+      proxyUrl?: string | null;
+      rangeUrl?: string | null;
+      /** Ordered Direct Play entries chosen by the server; `url`/`proxyUrl` remain for older servers. */
+      candidates?: { kind: string; url: string }[] | null;
+    }
   | { type: "SERVER_HLS"; manifestUrl: string; tier: number }
   | { type: "UNSUPPORTED"; reason: string };
 

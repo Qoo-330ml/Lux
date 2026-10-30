@@ -2210,7 +2210,8 @@ fn video_filter_chain(encoding: &FfmpegEncodingOptions, tier: ServerTier) -> Opt
     }
     let upload = match encoding.hardware_encoder.as_deref() {
         Some("h264_vaapi") => Some("format=nv12,hwupload".to_owned()),
-        Some("h264_qsv") => Some("hwupload=extra_hw_frames=64,format=qsv".to_owned()),
+        // Upload 8-bit NV12 like VAAPI: QSV rejects RGB/BGRA surfaces, and h264 output is 8-bit.
+        Some("h264_qsv") => Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv".to_owned()),
         _ => None,
     };
     match (scale, upload) {
@@ -4094,7 +4095,7 @@ while :; do sleep 1; done
         );
         assert!(
             args.windows(2)
-                .any(|pair| pair == ["-vf", "hwupload=extra_hw_frames=64,format=qsv"]),
+                .any(|pair| pair == ["-vf", "format=nv12,hwupload=extra_hw_frames=64,format=qsv"]),
             "QSV encodes qsv surfaces only: {args:?}"
         );
     }

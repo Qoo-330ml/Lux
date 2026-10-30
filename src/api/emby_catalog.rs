@@ -4654,16 +4654,51 @@ pub(super) fn emby_signed_direct_stream_url(
     api_key: Option<&str>,
     device_id: &str,
 ) -> Option<String> {
+    emby_signed_direct_stream_url_parts(
+        service,
+        item_id,
+        EmbyStreamSourceParts {
+            id: &source.id,
+            kind: &source.source_kind,
+            container: source.container.as_deref(),
+        },
+        user,
+        play_session_id,
+        expires_at,
+        api_key,
+        device_id,
+    )
+}
+
+/// The source fields an Emby stream URL is built from.
+pub(super) struct EmbyStreamSourceParts<'a> {
+    pub(super) id: &'a str,
+    pub(super) kind: &'a str,
+    pub(super) container: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emby_signed_direct_stream_url_parts(
+    service: &WebPlaybackSessionService,
+    item_id: &str,
+    source: EmbyStreamSourceParts<'_>,
+    user: &UserRecord,
+    play_session_id: &str,
+    expires_at: i64,
+    api_key: Option<&str>,
+    device_id: &str,
+) -> Option<String> {
     let user_id = user.id.to_string();
     let signature = service.sign_emby_direct_stream_v2(
         &user_id,
         user.is_admin,
         item_id,
-        &source.id,
+        source.id,
         play_session_id,
         expires_at,
     )?;
-    let mut url = emby_media_source_stream_url(item_id, source);
+    let mut url =
+        emby_media_source_stream_url_parts(item_id, source.id, source.kind, source.container);
     // Emby's standard video endpoint requires the PlaybackInfo session ID and
     // uses `static=true` to select direct streaming. External proxies use the
     // same context to associate the independent media request with playback.
