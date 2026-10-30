@@ -113,6 +113,64 @@ impl UserItemStateRow {
     }
 }
 
+/// Permission and deletion flags of one managed account; the flags are integers in both backends.
+#[derive(sqlx::FromRow)]
+struct UserPermissionStateRow {
+    is_disabled: i64,
+    can_manage_server: i64,
+    deleted_at: Option<i64>,
+}
+
+/// The manager flags needed before a hard delete; deletion state is filtered by the caller's SQL.
+#[derive(sqlx::FromRow)]
+struct UserManagerStateRow {
+    is_disabled: i64,
+    can_manage_server: i64,
+}
+
+/// Typed projection of `users` playback policy; the flags are integers in both backends.
+#[derive(sqlx::FromRow)]
+struct UserPlaybackPolicyRow {
+    can_play: i64,
+    max_simultaneous_playbacks: i64,
+    allow_remux: i64,
+    allow_audio_transcode: i64,
+    allow_video_transcode: i64,
+}
+
+impl UserPlaybackPolicyRow {
+    fn into_policy(self) -> UserPlaybackPolicy {
+        UserPlaybackPolicy {
+            can_play: self.can_play != 0,
+            max_simultaneous_playbacks: self.max_simultaneous_playbacks,
+            allow_remux: self.allow_remux != 0,
+            allow_audio_transcode: self.allow_audio_transcode != 0,
+            allow_video_transcode: self.allow_video_transcode != 0,
+        }
+    }
+}
+
+/// Typed projection of `user_permission_preset_sources`, including the owning user id.
+#[derive(sqlx::FromRow)]
+struct UserPermissionPresetSourceRow {
+    user_id: String,
+    preset_id: String,
+    preset_name: String,
+    preset_version: i64,
+    applied_at: i64,
+}
+
+impl UserPermissionPresetSourceRow {
+    fn into_source(self) -> StoredUserPermissionPresetSource {
+        StoredUserPermissionPresetSource {
+            preset_id: self.preset_id,
+            preset_name: self.preset_name,
+            preset_version: self.preset_version,
+            applied_at: self.applied_at,
+        }
+    }
+}
+
 impl Database {
     pub(crate) async fn apply_user_permission_preset(
         &self,
@@ -162,7 +220,7 @@ impl Database {
             "SELECT is_disabled, can_manage_server, deleted_at FROM users WHERE id = ?{row_lock}"
         );
         let Some(current) = self
-            .query(sqlx::AssertSqlSafe(user_query))
+            .query_as::<UserPermissionStateRow>(sqlx::AssertSqlSafe(user_query))
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
@@ -170,12 +228,12 @@ impl Database {
         else {
             return Ok(false);
         };
-        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+        if current.deleted_at.is_some() {
             return Ok(false);
         }
 
-        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let current_can_manage_server = current.get::<i64, _>("can_manage_server") != 0;
+        let current_disabled = current.is_disabled != 0;
+        let current_can_manage_server = current.can_manage_server != 0;
         if current_can_manage_server && !current_disabled && !preset.can_manage_server {
             let remaining: i64 = self
                 .query_scalar(
@@ -310,7 +368,8 @@ impl Database {
                 "SELECT user_id, preset_id, preset_name, preset_version, applied_at
                  FROM user_permission_preset_sources WHERE user_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<UserPermissionPresetSourceRow>(sqlx::AssertSqlSafe(query));
             for user_id in user_ids {
                 statement = statement.bind(user_id);
             }
@@ -319,8 +378,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id = row.get("user_id");
-                sources.insert(user_id, stored_user_permission_preset_source(row));
+                sources.insert(row.user_id.clone(), row.into_source());
             }
         }
         Ok(sources)
@@ -464,7 +522,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Option<UserPlaybackPolicy>, StorageError> {
-        self.query(
+        self.query_as::<UserPlaybackPolicyRow>(
             "SELECT can_play, max_simultaneous_playbacks, allow_remux,
                     allow_audio_transcode, allow_video_transcode
              FROM users WHERE id = ?",
@@ -472,15 +530,7 @@ impl Database {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| UserPlaybackPolicy {
-                can_play: row.get::<i64, _>("can_play") != 0,
-                max_simultaneous_playbacks: row.get("max_simultaneous_playbacks"),
-                allow_remux: row.get::<i64, _>("allow_remux") != 0,
-                allow_audio_transcode: row.get::<i64, _>("allow_audio_transcode") != 0,
-                allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
-            })
-        })
+        .map(|row| row.map(UserPlaybackPolicyRow::into_policy))
         .map_err(self.sqlx_err())
     }
 
@@ -856,10 +906,12 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let total_count = rows
-            .first()
-            .map(|row| row.get::<i64, _>("total_count"))
-            .unwrap_or(0);
+        let total_count = match rows.first() {
+            Some(row) => row
+                .try_get::<i64, _>("total_count")
+                .map_err(self.sqlx_err())?,
+            None => 0,
+        };
         let users = rows.into_iter().map(stored_user).collect();
         Ok((users, total_count))
     }
@@ -956,7 +1008,7 @@ impl Database {
     ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
-            .query(
+            .query_as::<UserPermissionStateRow>(
                 "SELECT is_disabled, can_manage_server, deleted_at
              FROM users WHERE id = ?",
             )
@@ -967,11 +1019,11 @@ impl Database {
         else {
             return Ok(None);
         };
-        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+        if current.deleted_at.is_some() {
             return Ok(None);
         }
-        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
+        let current_disabled = current.is_disabled != 0;
+        let current_can_manage = current.can_manage_server != 0;
         let next_disabled = update.is_disabled.unwrap_or(current_disabled);
         let next_can_manage = update.can_manage_server.unwrap_or(current_can_manage);
         let is_disabled = update.is_disabled.map(database_flag);
@@ -1091,7 +1143,7 @@ impl Database {
     pub(crate) async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
-            .query(
+            .query_as::<UserManagerStateRow>(
                 "SELECT is_disabled, can_manage_server
                  FROM users WHERE id = ?",
             )
@@ -1102,8 +1154,8 @@ impl Database {
         else {
             return Ok(false);
         };
-        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
+        let current_disabled = current.is_disabled != 0;
+        let current_can_manage = current.can_manage_server != 0;
         if current_can_manage && !current_disabled {
             let remaining: i64 = self
                 .query_scalar(
@@ -1133,7 +1185,7 @@ impl Database {
     ) -> Result<Option<Vec<String>>, StorageError> {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
-            .query(
+            .query_as::<UserPermissionStateRow>(
                 "SELECT is_disabled, can_manage_server, deleted_at
                  FROM users WHERE id = ?",
             )
@@ -1144,11 +1196,11 @@ impl Database {
         else {
             return Ok(None);
         };
-        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+        if current.deleted_at.is_some() {
             return Ok(None);
         }
-        let was_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let can_manage_server = current.get::<i64, _>("can_manage_server") != 0;
+        let was_disabled = current.is_disabled != 0;
+        let can_manage_server = current.can_manage_server != 0;
         if can_manage_server && !was_disabled {
             let remaining: i64 = self
                 .query_scalar(
@@ -1178,8 +1230,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let grace_days = normalize_user_deletion_grace_days(configured_grace_days);
-        let hls_session_rows = self
-            .query(
+        let hls_session_ids = self
+            .query_scalar::<String>(
                 "SELECT id FROM web_playback_sessions
                  WHERE user_id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'",
             )
@@ -1187,10 +1239,6 @@ impl Database {
             .fetch_all(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let hls_session_ids = hls_session_rows
-            .into_iter()
-            .map(|row| row.get::<String, _>("id"))
-            .collect::<Vec<_>>();
 
         self.query(
             "UPDATE users
@@ -4444,7 +4492,9 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
+    use super::{UserPermissionStateRow, UserPlaybackPolicyRow};
     use crate::storage::test_database;
+    use sqlx::FromRow;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -4720,6 +4770,52 @@ mod tests {
             .find(|user| user.id == second_user_id)
             .expect("batched lookup should include Bob");
         assert!(bob.is_disabled);
+        Ok(())
+    }
+
+    /// `query_users` reads its window count from a typed row and `delete_user` from manager flags.
+    #[tokio::test]
+    async fn query_users_reports_the_window_count_and_delete_user_removes_the_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let admin_id = Uuid::now_v7().to_string();
+        let member_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&admin_id, "row-admin", "Row Admin", "hash")
+            .await?;
+        database
+            .insert_user(&member_id, "row-member", "Row Member", "hash", false, true)
+            .await?;
+
+        let (users, total_count) = database.query_users(None, None, false, 0, 10).await?;
+        assert_eq!(total_count, 2);
+        assert_eq!(
+            users
+                .iter()
+                .map(|user| user.username_normalized.as_str())
+                .collect::<Vec<_>>(),
+            vec!["row-admin", "row-member"]
+        );
+
+        assert!(database.delete_user(&member_id).await?);
+        assert!(!database.delete_user(&member_id).await?);
+        let (users, total_count) = database.query_users(None, None, false, 0, 10).await?;
+        assert_eq!(total_count, 1);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username_normalized, "row-admin");
+        Ok(())
+    }
+
+    /// A projection whose columns are absent must report an error instead of panicking.
+    #[tokio::test]
+    async fn row_decoding_reports_missing_columns_as_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        assert!(UserPlaybackPolicyRow::from_row(&row).is_err());
+        assert!(UserPermissionStateRow::from_row(&row).is_err());
         Ok(())
     }
 }
