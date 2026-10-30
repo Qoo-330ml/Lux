@@ -325,6 +325,11 @@ pub(crate) async fn preview_account_preferences_copy(
         .map(AccountPreferences::from)
         .unwrap_or_default();
 
+    // One target at a time on purpose: the loop only reads, but `find_user_by_id` and
+    // `user_account_preferences` have no batched twin yet, so batching the accessible-library
+    // query on its own would not remove the per-target statements. The batch is admin-only and
+    // bounded by `MAX_BATCH_ACCOUNT_PREFERENCE_TARGETS`; a constant statement count needs those
+    // two reads batched first.
     let mut targets = Vec::with_capacity(input.target_user_ids.len());
     for target_user_id in &input.target_user_ids {
         let user = database
