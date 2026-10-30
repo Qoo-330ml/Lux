@@ -738,3 +738,110 @@ C1 之后、C2 之前是安全的（此时还没有 handler 迁移）。但**如
 | **D5** | setup 树是否保留 3 条 Emby 公共发现路由？ | **保留**（§4.2 #11-13）：`StartupWizardCompleted:false` 是 Emby 的"向导未完成"约定 | 备选：全部 404，代价是 setup 期间 Emby 客户端从"服务器在、未初始化"变成"服务器不可用" |
 
 D1–D3 影响提交切分与验收口径，D4 只影响一个机械提交，D5 只影响 setup 树的 2 个 handler。
+
+## 10. 问题 9：测试策略
+
+验收要证明两件事，来源不同：
+
+| 验收主张 | 证据形式 | 是否新增代码 |
+| --- | --- | --- |
+| **A. setup 模式下业务路由确实未注册** | 新增 `src` 单元测试（`#[cfg(test)]`，在 `src/api/routes.rs` 里用 `tower::ServiceExt::oneshot` 直接打 `setup_router(...)`） | 新增 1 个 `src` 单测（允许：`src/**` 在阶段 2 可改，`tests/**` 不动） |
+| **B. ready 模式行为不变** | 现有 19 个集成测试 target **一行不改即通过** | 0（这正是"冻结测试"的价值） |
+
+### 10.1 证明 A：setup 树的路由断言（新增 `src` 单测）
+
+放在 `src/api/routes.rs` 的 `#[cfg(test)] mod tests`：
+
+```rust
+// 构造：与 src/api/legacy.rs:2509-2520 的 ready_test_state 同形（tempfile + Database::connect
+// + AppState::ready(...)），再 AppState::into_ready()? -> SetupState::from(...)
+let app = setup_router(setup_state);
+
+// 1) 未就绪模式下必须可用
+assert_eq!(oneshot(&app, get("/health/live")).status(), 200);
+// /health/ready 会检查 config_dir 是否存在（src/api/users.rs:159-172），构造前先 create_dir_all
+assert_eq!(oneshot(&app, get("/health/ready")).status(), 200);
+assert_eq!(oneshot(&app, get("/api/v1/version")).status(), 200);
+assert_eq!(oneshot(&app, get("/api/v1/setup/status")).status(), 200);
+assert_eq!(oneshot(&app, get("/api/v1/auth/me")).status(), 401);
+assert_eq!(oneshot(&app, get("/System/Ping")).status(), 200);
+assert_eq!(oneshot(&app, get("/System/Info/Public")).status(), 200);
+assert_eq!(oneshot(&app, get("/Users/Public")).status(), 200);
+
+// 2) 业务路由必须不存在（404 而非 401/403/503）
+let libraries = oneshot(&app, get("/api/v1/libraries"));
+assert_eq!(libraries.status(), 404);
+assert_eq!(json_body(&libraries)["error"]["code"], "NOT_FOUND");     // Lux 命名空间带错误信封
+assert_eq!(oneshot(&app, get("/api/v1/admin/navigation")).status(), 404);
+assert_eq!(oneshot(&app, get("/api/v1/home")).status(), 404);
+assert_eq!(oneshot(&app, post("/api/v1/auth/login")).status(), 404);
+let emby = oneshot(&app, get("/System/Info"));
+assert_eq!(emby.status(), 404);
+assert!(body_is_empty(&emby));                                       // Emby 命名空间裸 404
+```
+
+断言口径的三点说明：
+
+1. 断言的是 **404 而不是"任意非 200"**：这样任何"守卫又被写回来"（401/403/503）都会红，
+   能直接抓出批 1–9 的漏改。
+2. `GET /Users/Public` 断言 200 + `[]`：这是 setup 树与今天一致的部分（§4.2 #13）。
+3. SPA/静态（`GET /`）在 CI 里取决于 `web/dist` 是否存在（`src/api/legacy.rs:1391-1397` 的 `web_root()`，
+   可用 `LUX_WEB_DIR` 覆盖）。把它放进断言会让 `cargo test` 依赖前端产物，因此**不纳入**这个单测；
+   静态资源由现有 `tests/api_web/web_static.rs:9-49` 覆盖。
+
+同一个单测文件里再加两条不依赖 HTTP 的断言（成本近乎为零，防回归）：
+
+```rust
+// 同一份服务实例：ReadyAppState 与它派生出来的 SetupState 共享一个 Arc
+assert!(std::sync::Arc::ptr_eq(ready.services(), setup.inner_services()));
+// ready -> AppState 的迁移期 shim 也不复制服务
+let compat: AppState = FromRef::from_ref(&ready);
+assert!(std::sync::Arc::ptr_eq(ready.services(), compat.ready_services().unwrap()));
+```
+
+### 10.2 证明 B：现有集成测试不改即通过
+
+`docs/TEST-TARGETS.md` 的 12 组 + 7 个独立 binary 全跑一遍，**不改任何测试代码**：
+
+| 命令 | 覆盖与本设计相关的点 |
+| --- | --- |
+| `cargo test --locked --test api_web` | `api_error_contract`（§9.2 的 6 条契约）、`health`、`ready_version`、`web_static`、`response_compression`（ETag/压缩）、`acl`、`remote`、`web_auth`、`web_playback` |
+| `cargo test --locked --test storage database_setup_api::` | ready 树里 `/api/v1/setup/*` 仍可调、已完成时 409（§2.3 第 2 点） |
+| `cargo test --locked --test plugins danmaku_api::` | 未就绪兼容树 #6 与真实 handler 并存 |
+| `cargo test --locked --test admin` | 23 个管理端用例，覆盖 `require_admin` 迁移（批 1–6） |
+| `cargo test --locked --test auth_users` | `require_web_principal/csrf` 与 36 个 `users.rs` handler（批 9） |
+| `cargo test --locked --test emby` | Emby 树两次挂载 + 大小写归一化（批 7、R10） |
+| `cargo test --locked --test library` `--test metadata` `--test images` `--test playback` `--test scanner` `--test strm` | 批 2、4、5、8 的 handler |
+| `cargo test --locked --test shutdown` | **必须在 C1 与 C10 各跑一次**：它 spawn 真实二进制（`tests/shutdown.rs:59`），是唯一能证明 `serve` 签名改动没破坏关停/重启链路的测试 |
+| 独立 binary：`--test background_work_budget` `--test image_variants_perf` `--test performance` `--test postgres_database` `--test reidentify` `--test scanned_metadata` | `postgres_database` 需要外部 Postgres，按 `docs/TEST-TARGETS.md` §4 的环境要求执行；其余本地可跑 |
+
+C10 的全量门禁按 `AGENTS.md`：
+
+```bash
+cargo build --locked
+cargo test --locked --all-targets
+cargo fmt --all -- --check
+cargo clippy --locked --all-targets --all-features -- -D warnings
+python3 scripts/check-migration-parity.py
+python3 scripts/check-backend-branches.py
+```
+
+本机是 `arm64`/`aarch64-apple-darwin`（`uname -m`）；不要用本地 ARM 结果声明 NAS/x86 性能。
+`tests/**` 不做任何修改，也不新增集成测试文件——"setup 路由不存在"的证据放在 `src` 单测里。
+
+### 10.3 每个批次的回归节奏
+
+1. 批内：`cargo build --locked` + 该组窄命令（§8.4）。
+2. 批末：`cargo clippy --locked --all-targets --all-features -- -D warnings`。
+3. C1、C5（`admin_users` 之后）、C10：加跑 `cargo test --locked --test api_web`，因为这三处最可能碰到
+   鉴权 helper 与 `require_admin` 的签名变化。
+4. 任何一批如果让 `api_error_contract`/`web_static`/`danmaku_api` 变红，先怀疑"是不是把未就绪兼容树
+   当成了业务树"（§9.1 R1/R2），不要改测试。
+
+### 10.4 不做的事
+
+- 不做"新旧两棵树对同一请求做差分比对"的自动化：`app_with_state` 在 C1 之后就是分派器，没有
+  "旧路径"可对照；等价证据是 §10.2 的全量集成测试（它们本身就是旧行为）。
+- 不为 setup 树引入性能基准：setup 模式请求量极小，`src/api/routes.rs:290` 的指标逻辑不动即可。
+- 不验证"setup 完成后进程真的重启"：那是第 ② 步（`docs/SETUP-RESTART-DESIGN.md` §6）的验收范围，
+  第 ③ 步只依赖"重启后进入 ready 模式"这一事实。
