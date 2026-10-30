@@ -92,6 +92,99 @@ struct PendingLocalMetadataItemRow {
     item_id: String,
 }
 
+/// Row shared by `list_scan_job_target_sources_page`, `list_scan_job_target_movie_items_page` and
+/// `list_scan_job_target_home_video_items_page`: all three select the same preferred-source
+/// projection.
+#[derive(sqlx::FromRow)]
+struct MediaSourcePathRow {
+    source_id: String,
+    item_id: String,
+    probe_status: String,
+    root_path: String,
+    relative_path: String,
+}
+
+impl From<MediaSourcePathRow> for StoredMediaSourcePath {
+    fn from(row: MediaSourcePathRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            item_id: row.item_id,
+            probe_status: row.probe_status,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
+/// Row of `list_scan_job_target_series_items_page`.
+#[derive(sqlx::FromRow)]
+struct SeriesMetadataSourceRow {
+    series_id: String,
+    season_id: String,
+    episode_id: String,
+    season_number: Option<i64>,
+    root_path: String,
+    relative_path: String,
+}
+
+impl From<SeriesMetadataSourceRow> for StoredSeriesMetadataSource {
+    fn from(row: SeriesMetadataSourceRow) -> Self {
+        Self {
+            series_id: row.series_id,
+            season_id: row.season_id,
+            episode_id: row.episode_id,
+            season_number: row.season_number,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
+/// Row of `load_scan_job_metadata_page`: the job lifecycle columns are optional because the job
+/// row is joined, while the source columns are `COALESCE`d to empty strings and `target_kind`
+/// selects the shape of each row.
+#[derive(Debug, sqlx::FromRow)]
+struct ScanJobMetadataPageRow {
+    job_type: Option<String>,
+    job_status: Option<String>,
+    auto_metadata_match: Option<i64>,
+    has_pending: i64,
+    target_kind: String,
+    source_id: String,
+    item_id: String,
+    probe_status: String,
+    root_path: String,
+    relative_path: String,
+    series_id: String,
+    season_id: String,
+    season_number: Option<i64>,
+}
+
+impl ScanJobMetadataPageRow {
+    /// Projects one movie or home-video row onto the preferred-source shape.
+    fn media_source_path(&self) -> StoredMediaSourcePath {
+        StoredMediaSourcePath {
+            source_id: self.source_id.clone(),
+            item_id: self.item_id.clone(),
+            probe_status: self.probe_status.clone(),
+            root_path: self.root_path.clone(),
+            relative_path: self.relative_path.clone(),
+        }
+    }
+
+    /// Projects one episode row; its `episode_id` is the target `item_id` column.
+    fn series_metadata_source(&self) -> StoredSeriesMetadataSource {
+        StoredSeriesMetadataSource {
+            series_id: self.series_id.clone(),
+            season_id: self.season_id.clone(),
+            episode_id: self.item_id.clone(),
+            season_number: self.season_number,
+            root_path: self.root_path.clone(),
+            relative_path: self.relative_path.clone(),
+        }
+    }
+}
+
 impl Database {
     pub(crate) async fn scan_job_retry_states(
         &self,
@@ -679,7 +772,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM scan_job_targets t
@@ -697,17 +790,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -717,7 +800,7 @@ impl Database {
         limit: i64,
     ) -> Result<StoredScanJobMetadataPage, StorageError> {
         let rows = self
-            .query(
+            .query_as::<ScanJobMetadataPageRow>(
                 "WITH job_lifecycle AS (
                      SELECT id, job_type, status, auto_metadata_match
                      FROM scan_jobs
@@ -845,12 +928,10 @@ impl Database {
             .first()
             .map(|row| {
                 (
-                    row.get("job_type"),
-                    row.get("job_status"),
-                    row.get::<Option<i64>, _>("auto_metadata_match")
-                        .unwrap_or_default()
-                        != 0,
-                    row.get::<i64, _>("has_pending") != 0,
+                    row.job_type.clone(),
+                    row.job_status.clone(),
+                    row.auto_metadata_match.unwrap_or_default() != 0,
+                    row.has_pending != 0,
                 )
             })
             .unwrap_or((None, None, false, false));
@@ -858,33 +939,13 @@ impl Database {
         let mut home_videos = Vec::new();
         let mut episodes = Vec::new();
         for row in rows {
-            let target_kind: String = row.get("target_kind");
-            if target_kind.is_empty() {
+            if row.target_kind.is_empty() {
                 continue;
             }
-            match target_kind.as_str() {
-                "MOVIE" => movies.push(StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                }),
-                "VIDEO" => home_videos.push(StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                }),
-                "EPISODE" => episodes.push(StoredSeriesMetadataSource {
-                    series_id: row.get("series_id"),
-                    season_id: row.get("season_id"),
-                    episode_id: row.get("item_id"),
-                    season_number: row.get("season_number"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                }),
+            match row.target_kind.as_str() {
+                "MOVIE" => movies.push(row.media_source_path()),
+                "VIDEO" => home_videos.push(row.media_source_path()),
+                "EPISODE" => episodes.push(row.series_metadata_source()),
                 _ => {
                     return Err(StorageError::Conflict(
                         "unknown local metadata target type".to_owned(),
@@ -916,7 +977,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM scan_job_targets t
@@ -944,17 +1005,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -964,7 +1015,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM scan_job_targets t
@@ -992,17 +1043,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -1012,7 +1053,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
-        self.query(
+        self.query_as::<SeriesMetadataSourceRow>(
             "SELECT series.id AS series_id, season.id AS season_id,
                     episode.id AS episode_id, season.season_number,
                     lr.canonical_path AS root_path, fe.relative_path
@@ -1047,14 +1088,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredSeriesMetadataSource {
-                    series_id: row.get("series_id"),
-                    season_id: row.get("season_id"),
-                    episode_id: row.get("episode_id"),
-                    season_number: row.get("season_number"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
+                .map(StoredSeriesMetadataSource::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -1338,6 +1372,283 @@ mod retry_diagnostic_tests {
                 "{plan}"
             );
         }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the row structs above: one seed drives every scan-target read so a column
+/// rename or reorder shows up as a decode failure here instead of a panic in production.
+#[cfg(test)]
+mod row_decode_tests {
+    use super::*;
+
+    const LIBRARY_ID: &str = "library-scan-targets";
+    const ROOT_ID: &str = "root-scan-targets";
+    const JOB_ID: &str = "job-scan-targets";
+    const MOVIE_ID: &str = "target-movie";
+    const VIDEO_ID: &str = "target-video";
+    const SERIES_ID: &str = "target-series";
+    const SEASON_ID: &str = "target-season";
+    const EPISODE_ID: &str = "target-episode";
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        })
+        .await?;
+        Ok((temp, database))
+    }
+
+    /// One library root holding a movie, a home video and an episode, each with a local source and
+    /// one scan target, so every target query decodes exactly one row per kind.
+    async fn seed_scan_targets(database: &Database) -> Result<(), sqlx::Error> {
+        database
+            .query("INSERT INTO libraries (id, name, kind) VALUES (?, 'Targets', 'MIXED')")
+            .bind(LIBRARY_ID)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES (?, ?, '/srv/targets', '/srv/targets', 1, 1)",
+            )
+            .bind(ROOT_ID)
+            .bind(LIBRARY_ID)
+            .execute(database.pool())
+            .await?;
+        for (entry_id, relative_path) in [
+            ("fe-movie", "Movies/Movie.2024.mkv"),
+            ("fe-video", "Home/Clip.mkv"),
+            ("fe-episode", "Shows/Show/S01E01.mkv"),
+        ] {
+            database
+                .query(
+                    "INSERT INTO filesystem_entries (
+                         id, library_root_id, relative_path, entry_kind, size, modified_at,
+                         last_seen_generation
+                     ) VALUES (?, ?, ?, 'FILE', 1024, 100, 'generation')",
+                )
+                .bind(entry_id)
+                .bind(ROOT_ID)
+                .bind(relative_path)
+                .execute(database.pool())
+                .await?;
+        }
+        for (item_id, item_type, parent_id, series_id, season_number, title) in [
+            (MOVIE_ID, "MOVIE", None, None, None, "Movie"),
+            (VIDEO_ID, "VIDEO", None, None, None, "Clip"),
+            (SERIES_ID, "SERIES", None, None, None, "Show"),
+            (
+                SEASON_ID,
+                "SEASON",
+                Some(SERIES_ID),
+                Some(SERIES_ID),
+                Some(1),
+                "Season 1",
+            ),
+            (
+                EPISODE_ID,
+                "EPISODE",
+                Some(SEASON_ID),
+                Some(SERIES_ID),
+                None,
+                "Pilot",
+            ),
+        ] {
+            database
+                .query(
+                    "INSERT INTO media_items (
+                         id, library_id, item_type, parent_id, series_id, season_number,
+                         title, sort_title, identification_status
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED')",
+                )
+                .bind(item_id)
+                .bind(LIBRARY_ID)
+                .bind(item_type)
+                .bind(parent_id)
+                .bind(series_id)
+                .bind(season_number)
+                .bind(title)
+                .bind(title.to_lowercase())
+                .execute(database.pool())
+                .await?;
+        }
+        for (source_id, item_id, entry_id, probe_status) in [
+            ("source-movie", MOVIE_ID, "fe-movie", "PENDING"),
+            ("source-video", VIDEO_ID, "fe-video", "DONE"),
+            ("source-episode", EPISODE_ID, "fe-episode", "DONE"),
+        ] {
+            database
+                .query(
+                    "INSERT INTO media_sources (
+                         id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+                     ) VALUES (?, ?, 'LOCAL_FILE', ?, 1, ?)",
+                )
+                .bind(source_id)
+                .bind(item_id)
+                .bind(entry_id)
+                .bind(probe_status)
+                .execute(database.pool())
+                .await?;
+        }
+        database
+            .query(
+                "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+                 VALUES (?, ?, 'RECONCILE_LIBRARY', 'PENDING', 'generation')",
+            )
+            .bind(JOB_ID)
+            .bind(LIBRARY_ID)
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO scan_job_targets (
+                     job_id, target_type, target_id, source_id, item_id, change_kind,
+                     probe_state, metadata_state, thumbnail_state
+                 ) VALUES
+                     (?, 'SOURCE', 'source-movie', 'source-movie', ?, 'NEW', 'PENDING', 'SKIPPED', 'SKIPPED'),
+                     (?, 'ITEM', ?, NULL, ?, 'NEW', 'SKIPPED', 'PENDING', 'SKIPPED'),
+                     (?, 'ITEM', ?, NULL, ?, 'NEW', 'SKIPPED', 'PENDING', 'SKIPPED'),
+                     (?, 'ITEM', ?, NULL, ?, 'NEW', 'SKIPPED', 'PENDING', 'SKIPPED')",
+            )
+            .bind(JOB_ID)
+            .bind(MOVIE_ID)
+            .bind(JOB_ID)
+            .bind(MOVIE_ID)
+            .bind(MOVIE_ID)
+            .bind(JOB_ID)
+            .bind(VIDEO_ID)
+            .bind(VIDEO_ID)
+            .bind(JOB_ID)
+            .bind(EPISODE_ID)
+            .bind(EPISODE_ID)
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_target_pages_decode_seeded_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        seed_scan_targets(&database).await?;
+
+        let sources = database
+            .list_scan_job_target_sources_page(JOB_ID, 10, 0)
+            .await?;
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].source_id, "source-movie");
+        assert_eq!(sources[0].item_id, MOVIE_ID);
+        assert_eq!(sources[0].probe_status, "PENDING");
+        assert_eq!(sources[0].root_path, "/srv/targets");
+        assert_eq!(sources[0].relative_path, "Movies/Movie.2024.mkv");
+
+        let movies = database
+            .list_scan_job_target_movie_items_page(JOB_ID, 10, 0)
+            .await?;
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].source_id, "source-movie");
+        assert_eq!(movies[0].item_id, MOVIE_ID);
+        assert_eq!(movies[0].probe_status, "PENDING");
+
+        let home_videos = database
+            .list_scan_job_target_home_video_items_page(JOB_ID, 10, 0)
+            .await?;
+        assert_eq!(home_videos.len(), 1);
+        assert_eq!(home_videos[0].source_id, "source-video");
+        assert_eq!(home_videos[0].item_id, VIDEO_ID);
+        assert_eq!(home_videos[0].relative_path, "Home/Clip.mkv");
+
+        let episodes = database
+            .list_scan_job_target_series_items_page(JOB_ID, 10, 0)
+            .await?;
+        assert_eq!(episodes.len(), 1);
+        assert_eq!(episodes[0].series_id, SERIES_ID);
+        assert_eq!(episodes[0].season_id, SEASON_ID);
+        assert_eq!(episodes[0].episode_id, EPISODE_ID);
+        assert_eq!(episodes[0].season_number, Some(1));
+        assert_eq!(episodes[0].root_path, "/srv/targets");
+        assert_eq!(episodes[0].relative_path, "Shows/Show/S01E01.mkv");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_target_metadata_page_decodes_job_and_source_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        seed_scan_targets(&database).await?;
+
+        let page = database.load_scan_job_metadata_page(JOB_ID, 8).await?;
+        assert_eq!(page.job_type.as_deref(), Some("RECONCILE_LIBRARY"));
+        assert_eq!(page.job_status.as_deref(), Some("PENDING"));
+        assert!(!page.auto_metadata_match);
+        assert!(page.has_pending);
+        let StoredScanJobMetadataSources::Movies(movies) = page.sources else {
+            return Err("expected the movie source page".into());
+        };
+        assert_eq!(movies.len(), 1);
+        assert_eq!(movies[0].source_id, "source-movie");
+        assert_eq!(movies[0].item_id, MOVIE_ID);
+        assert_eq!(movies[0].root_path, "/srv/targets");
+        assert_eq!(movies[0].relative_path, "Movies/Movie.2024.mkv");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_target_flag_rows_decode_seeded_states() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp, database) = test_database().await?;
+        seed_scan_targets(&database).await?;
+
+        let states = database.scan_job_retry_states(&[JOB_ID.to_owned()]).await?;
+        let state = states.get(JOB_ID).ok_or("missing retry state")?;
+        assert!(state.has_unfinished_targets);
+        assert!(state.has_active_job);
+        assert!(!state.has_postprocessing_issues);
+        assert!(!state.targets_need_materialization);
+        assert!(!state.has_legacy_work);
+
+        let pending = database
+            .list_pending_local_metadata_item_ids(&[
+                MOVIE_ID.to_owned(),
+                VIDEO_ID.to_owned(),
+                EPISODE_ID.to_owned(),
+                "missing-item".to_owned(),
+            ])
+            .await?;
+        assert_eq!(
+            pending,
+            [MOVIE_ID, VIDEO_ID, EPISODE_ID]
+                .into_iter()
+                .map(str::to_owned)
+                .collect::<HashSet<_>>()
+        );
+
+        assert_eq!(
+            database
+                .local_metadata_completion_wait_state(JOB_ID)
+                .await?,
+            (true, false)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_page_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = ScanJobMetadataPageRow::from_row(&row).expect_err("must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
         Ok(())
     }
 }
