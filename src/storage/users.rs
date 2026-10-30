@@ -113,6 +113,377 @@ impl UserItemStateRow {
     }
 }
 
+/// Permission and deletion flags of one managed account; the flags are integers in both backends.
+#[derive(sqlx::FromRow)]
+struct UserPermissionStateRow {
+    is_disabled: i64,
+    can_manage_server: i64,
+    deleted_at: Option<i64>,
+}
+
+/// The manager flags needed before a hard delete; deletion state is filtered by the caller's SQL.
+#[derive(sqlx::FromRow)]
+struct UserManagerStateRow {
+    is_disabled: i64,
+    can_manage_server: i64,
+}
+
+/// Typed projection of `users` playback policy; the flags are integers in both backends.
+#[derive(sqlx::FromRow)]
+struct UserPlaybackPolicyRow {
+    can_play: i64,
+    max_simultaneous_playbacks: i64,
+    allow_remux: i64,
+    allow_audio_transcode: i64,
+    allow_video_transcode: i64,
+}
+
+impl UserPlaybackPolicyRow {
+    fn into_policy(self) -> UserPlaybackPolicy {
+        UserPlaybackPolicy {
+            can_play: self.can_play != 0,
+            max_simultaneous_playbacks: self.max_simultaneous_playbacks,
+            allow_remux: self.allow_remux != 0,
+            allow_audio_transcode: self.allow_audio_transcode != 0,
+            allow_video_transcode: self.allow_video_transcode != 0,
+        }
+    }
+}
+
+/// Typed projection of `user_permission_preset_sources`, including the owning user id.
+#[derive(sqlx::FromRow)]
+struct UserPermissionPresetSourceRow {
+    user_id: String,
+    preset_id: String,
+    preset_name: String,
+    preset_version: i64,
+    applied_at: i64,
+}
+
+impl UserPermissionPresetSourceRow {
+    fn into_source(self) -> StoredUserPermissionPresetSource {
+        StoredUserPermissionPresetSource {
+            preset_id: self.preset_id,
+            preset_name: self.preset_name,
+            preset_version: self.preset_version,
+            applied_at: self.applied_at,
+        }
+    }
+}
+
+/// Minimal user projection used to resolve display names by id.
+#[derive(sqlx::FromRow)]
+struct UserDisplayNameRow {
+    id: String,
+    display_name: String,
+}
+
+/// Minimal user projection used to resolve normalized usernames by id.
+#[derive(sqlx::FromRow)]
+struct UserIdUsernameRow {
+    id: String,
+    username_normalized: String,
+}
+
+/// Typed projection of `installed_plugins`; the enabled flag is an integer in both backends.
+#[derive(sqlx::FromRow)]
+struct PluginInstallationStatusRow {
+    plugin_id: String,
+    is_enabled: i64,
+}
+
+/// Typed projection of one `user_activity_events` row.
+#[derive(sqlx::FromRow)]
+struct UserActivityEventRow {
+    id: String,
+    user_id: String,
+    actor_user_id: Option<String>,
+    event_type: String,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    metadata_json: String,
+    occurred_at: i64,
+}
+
+impl UserActivityEventRow {
+    fn into_event(self) -> StoredUserActivityEvent {
+        StoredUserActivityEvent {
+            id: self.id,
+            user_id: self.user_id,
+            actor_user_id: self.actor_user_id,
+            event_type: self.event_type,
+            target_type: self.target_type,
+            target_id: self.target_id,
+            metadata_json: self.metadata_json,
+            occurred_at: self.occurred_at,
+        }
+    }
+}
+
+/// Typed projection of `user_emby_configuration`.
+#[derive(sqlx::FromRow)]
+struct UserEmbyConfigurationRow {
+    user_id: String,
+    configuration_json: String,
+}
+
+/// Typed projection of `user_library_order`.
+#[derive(sqlx::FromRow)]
+struct UserLibraryOrderRow {
+    user_id: String,
+    library_id: String,
+}
+
+/// Typed projection of `user_library_order_preferences`; the flag is an integer in both backends.
+#[derive(sqlx::FromRow)]
+struct UserAdminLibraryOrderFlagRow {
+    user_id: String,
+    use_admin_library_order: i64,
+}
+
+/// Typed projection of the `user_library_access` join.
+#[derive(sqlx::FromRow)]
+struct UserLibraryAccessRow {
+    user_id: String,
+    library_id: String,
+}
+
+/// Typed projection of one `user_devices` page row; the login flag is an integer in both backends.
+#[derive(sqlx::FromRow)]
+struct UserDeviceRow {
+    device_id: String,
+    device_name: Option<String>,
+    device_type: Option<String>,
+    client_name: String,
+    client_version: Option<String>,
+    first_seen_at: i64,
+    last_seen_at: i64,
+    last_remote_ip: Option<String>,
+    has_active_login: i64,
+}
+
+impl UserDeviceRow {
+    fn into_device(self) -> StoredUserDevice {
+        StoredUserDevice {
+            device_id: self.device_id,
+            has_active_login: self.has_active_login != 0,
+            device_name: self.device_name,
+            device_type: self.device_type,
+            client_name: self.client_name,
+            client_version: self.client_version,
+            first_seen_at: self.first_seen_at,
+            last_seen_at: self.last_seen_at,
+            last_remote_ip: self.last_remote_ip,
+        }
+    }
+}
+
+/// Typed projection of one `user_access_blacklist_rules` row.
+///
+/// The enabled flag stays an integer in both backends and is converted by
+/// [`Self::into_rule`].
+#[derive(sqlx::FromRow)]
+struct UserAccessBlacklistRuleRow {
+    id: String,
+    user_id: Option<String>,
+    rule_type: String,
+    match_value: String,
+    is_enabled: i64,
+    created_by: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl UserAccessBlacklistRuleRow {
+    fn into_rule(self) -> StoredUserAccessBlacklistRule {
+        StoredUserAccessBlacklistRule {
+            id: self.id,
+            user_id: self.user_id,
+            rule_type: self.rule_type,
+            match_value: self.match_value,
+            is_enabled: self.is_enabled != 0,
+            created_by: self.created_by,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// Typed projection of the rule-type/value pairs evaluated per request.
+#[derive(sqlx::FromRow)]
+struct UserAccessBlacklistRuleValueRow {
+    rule_type: String,
+    match_value: String,
+}
+
+/// Typed projection of the EXISTS probes that decide which rule types to load.
+#[derive(sqlx::FromRow)]
+struct AccessBlacklistRulePresenceRow {
+    has_device_rules: i64,
+    has_client_rules: i64,
+}
+
+/// Typed projection of the device metadata stored on an access token.
+///
+/// The token hash is deliberately not part of the projection, so this type carries no secret.
+#[derive(sqlx::FromRow)]
+struct AccessTokenDeviceRow {
+    device_id: String,
+    client_name: String,
+    device_name: String,
+    client_version: String,
+}
+
+impl AccessTokenDeviceRow {
+    fn into_device(self) -> StoredAccessTokenDevice {
+        StoredAccessTokenDevice {
+            device_id: self.device_id,
+            client_name: self.client_name,
+            device_name: self.device_name,
+            client_version: self.client_version,
+        }
+    }
+}
+
+/// Typed projection of one active Emby login session (`access_tokens` row).
+#[derive(sqlx::FromRow)]
+struct EmbyLoginSessionRow {
+    id: String,
+    device_id: String,
+    device_name: String,
+    device_type: Option<String>,
+    client_name: String,
+    client_version: String,
+    created_at: i64,
+    updated_at: i64,
+    last_seen_at: Option<i64>,
+}
+
+impl EmbyLoginSessionRow {
+    fn into_summary(self) -> StoredEmbyLoginSessionSummary {
+        StoredEmbyLoginSessionSummary {
+            id: self.id,
+            device_id: self.device_id,
+            device_name: self.device_name,
+            device_type: self.device_type,
+            client_name: self.client_name,
+            client_version: self.client_version,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            last_seen_at: self.last_seen_at,
+        }
+    }
+}
+
+/// Typed projection of the permission groups copied between accounts.
+#[derive(sqlx::FromRow)]
+struct PermissionCopyUserRow {
+    id: String,
+    library_access_mode: String,
+    can_download: i64,
+    can_play: i64,
+    max_simultaneous_playbacks: i64,
+    allow_remux: i64,
+    allow_audio_transcode: i64,
+    allow_video_transcode: i64,
+}
+
+impl PermissionCopyUserRow {
+    fn into_snapshot(self) -> UserPermissionCopySnapshot {
+        UserPermissionCopySnapshot {
+            library_access_mode: self.library_access_mode,
+            library_ids: Vec::new(),
+            can_download: self.can_download != 0,
+            playback_policy: UserPlaybackPolicy {
+                can_play: self.can_play != 0,
+                max_simultaneous_playbacks: self.max_simultaneous_playbacks,
+                allow_remux: self.allow_remux != 0,
+                allow_audio_transcode: self.allow_audio_transcode != 0,
+                allow_video_transcode: self.allow_video_transcode != 0,
+            },
+            content_restrictions: None,
+        }
+    }
+}
+
+/// Typed projection of the content-restriction join, including the owning user id.
+///
+/// One row is emitted per stored tag, so callers fold the rows into one
+/// [`UserContentRestrictions`] per user.
+#[derive(sqlx::FromRow)]
+struct UserContentRestrictionTagRow {
+    user_id: String,
+    rating_system: String,
+    maximum_rating: Option<String>,
+    allow_unrated: i64,
+    version: i64,
+    updated_at: i64,
+    tag_kind: Option<String>,
+    tag: Option<String>,
+}
+
+impl UserContentRestrictionTagRow {
+    fn merge_into(
+        self,
+        restrictions_by_user: &mut HashMap<String, UserContentRestrictions>,
+    ) -> Result<(), StorageError> {
+        let Self {
+            user_id,
+            rating_system,
+            maximum_rating,
+            allow_unrated,
+            version,
+            updated_at,
+            tag_kind,
+            tag,
+        } = self;
+        let restrictions =
+            restrictions_by_user
+                .entry(user_id)
+                .or_insert_with(|| UserContentRestrictions {
+                    rating_system,
+                    maximum_rating,
+                    allow_unrated: allow_unrated != 0,
+                    allowed_tags: Vec::new(),
+                    blocked_tags: Vec::new(),
+                    version,
+                    updated_at,
+                });
+        match (tag_kind.as_deref(), tag) {
+            (None, None) => {}
+            (Some("ALLOW"), Some(tag)) => restrictions.allowed_tags.push(tag),
+            (Some("BLOCK"), Some(tag)) => restrictions.blocked_tags.push(tag),
+            _ => {
+                return Err(StorageError::Serialization(
+                    "invalid user content restriction tag row".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Typed projection of the stored account preferences; the flags are integers in both backends.
+#[derive(sqlx::FromRow)]
+struct UserAccountPreferencesRow {
+    theme: String,
+    accent_color: String,
+    show_media_libraries: i64,
+    show_continue_watching: i64,
+    audio_language: String,
+    subtitle_language: String,
+    auto_play_next_episode: i64,
+    version: i64,
+    updated_at: i64,
+}
+
+/// Typed projection of the stored library access mode of one user.
+#[derive(sqlx::FromRow)]
+struct UserLibraryAccessModeRow {
+    id: String,
+    library_access_mode: Option<String>,
+}
+
 impl Database {
     pub(crate) async fn apply_user_permission_preset(
         &self,
@@ -162,7 +533,7 @@ impl Database {
             "SELECT is_disabled, can_manage_server, deleted_at FROM users WHERE id = ?{row_lock}"
         );
         let Some(current) = self
-            .query(sqlx::AssertSqlSafe(user_query))
+            .query_as::<UserPermissionStateRow>(sqlx::AssertSqlSafe(user_query))
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
@@ -170,12 +541,12 @@ impl Database {
         else {
             return Ok(false);
         };
-        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+        if current.deleted_at.is_some() {
             return Ok(false);
         }
 
-        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let current_can_manage_server = current.get::<i64, _>("can_manage_server") != 0;
+        let current_disabled = current.is_disabled != 0;
+        let current_can_manage_server = current.can_manage_server != 0;
         if current_can_manage_server && !current_disabled && !preset.can_manage_server {
             let remaining: i64 = self
                 .query_scalar(
@@ -312,7 +683,8 @@ impl Database {
                 "SELECT user_id, preset_id, preset_name, preset_version, applied_at
                  FROM user_permission_preset_sources WHERE user_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<UserPermissionPresetSourceRow>(sqlx::AssertSqlSafe(query));
             for user_id in user_ids {
                 statement = statement.bind(user_id);
             }
@@ -321,11 +693,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id = row.get("user_id");
-                sources.insert(
-                    user_id,
-                    stored_user_permission_preset_source(row).map_err(self.sqlx_err())?,
-                );
+                sources.insert(row.user_id.clone(), row.into_source());
             }
         }
         Ok(sources)
@@ -469,7 +837,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<Option<UserPlaybackPolicy>, StorageError> {
-        self.query(
+        self.query_as::<UserPlaybackPolicyRow>(
             "SELECT can_play, max_simultaneous_playbacks, allow_remux,
                     allow_audio_transcode, allow_video_transcode
              FROM users WHERE id = ?",
@@ -477,15 +845,7 @@ impl Database {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| UserPlaybackPolicy {
-                can_play: row.get::<i64, _>("can_play") != 0,
-                max_simultaneous_playbacks: row.get("max_simultaneous_playbacks"),
-                allow_remux: row.get::<i64, _>("allow_remux") != 0,
-                allow_audio_transcode: row.get::<i64, _>("allow_audio_transcode") != 0,
-                allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
-            })
-        })
+        .map(|row| row.map(UserPlaybackPolicyRow::into_policy))
         .map_err(self.sqlx_err())
     }
 
@@ -764,7 +1124,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!("SELECT id, display_name FROM users WHERE id IN ({placeholders})");
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserDisplayNameRow>(sqlx::AssertSqlSafe(query));
             for user_id in user_ids {
                 statement = statement.bind(user_id);
             }
@@ -773,7 +1133,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                display_names.insert(row.get("id"), row.get("display_name"));
+                display_names.insert(row.id, row.display_name);
             }
         }
         Ok(display_names)
@@ -873,10 +1233,12 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let total_count = rows
-            .first()
-            .map(|row| row.get::<i64, _>("total_count"))
-            .unwrap_or(0);
+        let total_count = match rows.first() {
+            Some(row) => row
+                .try_get::<i64, _>("total_count")
+                .map_err(self.sqlx_err())?,
+            None => 0,
+        };
         let users = rows
             .into_iter()
             .map(stored_user)
@@ -979,7 +1341,7 @@ impl Database {
     ) -> Result<Option<(StoredUser, Vec<String>)>, StorageError> {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
-            .query(
+            .query_as::<UserPermissionStateRow>(
                 "SELECT is_disabled, can_manage_server, deleted_at
              FROM users WHERE id = ?",
             )
@@ -990,11 +1352,11 @@ impl Database {
         else {
             return Ok(None);
         };
-        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+        if current.deleted_at.is_some() {
             return Ok(None);
         }
-        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
+        let current_disabled = current.is_disabled != 0;
+        let current_can_manage = current.can_manage_server != 0;
         let next_disabled = update.is_disabled.unwrap_or(current_disabled);
         let next_can_manage = update.can_manage_server.unwrap_or(current_can_manage);
         let is_disabled = update.is_disabled.map(database_flag);
@@ -1114,7 +1476,7 @@ impl Database {
     pub(crate) async fn delete_user(&self, user_id: &str) -> Result<bool, StorageError> {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
-            .query(
+            .query_as::<UserManagerStateRow>(
                 "SELECT is_disabled, can_manage_server
                  FROM users WHERE id = ?",
             )
@@ -1125,8 +1487,8 @@ impl Database {
         else {
             return Ok(false);
         };
-        let current_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let current_can_manage = current.get::<i64, _>("can_manage_server") != 0;
+        let current_disabled = current.is_disabled != 0;
+        let current_can_manage = current.can_manage_server != 0;
         if current_can_manage && !current_disabled {
             let remaining: i64 = self
                 .query_scalar(
@@ -1156,7 +1518,7 @@ impl Database {
     ) -> Result<Option<Vec<String>>, StorageError> {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let Some(current) = self
-            .query(
+            .query_as::<UserPermissionStateRow>(
                 "SELECT is_disabled, can_manage_server, deleted_at
                  FROM users WHERE id = ?",
             )
@@ -1167,11 +1529,11 @@ impl Database {
         else {
             return Ok(None);
         };
-        if current.get::<Option<i64>, _>("deleted_at").is_some() {
+        if current.deleted_at.is_some() {
             return Ok(None);
         }
-        let was_disabled = current.get::<i64, _>("is_disabled") != 0;
-        let can_manage_server = current.get::<i64, _>("can_manage_server") != 0;
+        let was_disabled = current.is_disabled != 0;
+        let can_manage_server = current.can_manage_server != 0;
         if can_manage_server && !was_disabled {
             let remaining: i64 = self
                 .query_scalar(
@@ -1201,8 +1563,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let grace_days = normalize_user_deletion_grace_days(configured_grace_days);
-        let hls_session_rows = self
-            .query(
+        let hls_session_ids = self
+            .query_scalar::<String>(
                 "SELECT id FROM web_playback_sessions
                  WHERE user_id = ? AND state = 'ACTIVE' AND plan = 'SERVER_HLS'",
             )
@@ -1210,10 +1572,6 @@ impl Database {
             .fetch_all(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let hls_session_ids = hls_session_rows
-            .into_iter()
-            .map(|row| row.get::<String, _>("id"))
-            .collect::<Vec<_>>();
 
         self.query(
             "UPDATE users
@@ -1308,7 +1666,7 @@ impl Database {
         batch_limit: i64,
     ) -> Result<Vec<String>, StorageError> {
         let rows = self
-            .query(
+            .query_scalar::<String>(
                 "DELETE FROM users
                  WHERE id IN (
                      SELECT id FROM users
@@ -1325,10 +1683,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(rows
-            .into_iter()
-            .map(|row| row.get::<String, _>("id"))
-            .collect())
+        Ok(rows)
     }
 
     pub(crate) async fn find_user_emby_configuration(
@@ -1549,15 +1904,16 @@ impl Database {
         query: UserDevicePageQuery<'_>,
     ) -> Result<(Vec<StoredUserDevice>, i64), StorageError> {
         let total_count = self
-            .query("SELECT COUNT(*) AS total_count FROM user_devices WHERE user_id = ?")
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) AS total_count FROM user_devices WHERE user_id = ?",
+            )
             .bind(query.user_id)
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("total_count"))
             .map_err(self.sqlx_err())?;
 
         let rows = self
-            .query(
+            .query_as::<UserDeviceRow>(
                 "SELECT ud.device_id, ud.device_name, ud.device_type, ud.client_name,
                         ud.client_version, ud.first_seen_at, ud.last_seen_at,
                         ud.last_remote_ip,
@@ -1586,20 +1942,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let devices = rows
-            .into_iter()
-            .map(|row| StoredUserDevice {
-                device_id: row.get("device_id"),
-                has_active_login: row.get::<i64, _>("has_active_login") != 0,
-                device_name: row.get("device_name"),
-                device_type: row.get("device_type"),
-                client_name: row.get("client_name"),
-                client_version: row.get("client_version"),
-                first_seen_at: row.get("first_seen_at"),
-                last_seen_at: row.get("last_seen_at"),
-                last_remote_ip: row.get("last_remote_ip"),
-            })
-            .collect();
+        let devices = rows.into_iter().map(UserDeviceRow::into_device).collect();
 
         Ok((devices, total_count))
     }
@@ -1639,14 +1982,13 @@ impl Database {
         let count_sql = format!(
             "SELECT COUNT(*) AS total_count FROM user_access_blacklist_rules WHERE {where_clause}"
         );
-        let mut count_query = self.query(sqlx::AssertSqlSafe(count_sql));
+        let mut count_query = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql));
         if let Some(user_id) = user_id {
             count_query = count_query.bind(user_id);
         }
         let total_count = count_query
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("total_count"))
             .map_err(self.sqlx_err())?;
 
         let page_sql = format!(
@@ -1656,7 +1998,8 @@ impl Database {
              ORDER BY created_at DESC, id ASC
              LIMIT ? OFFSET ?"
         );
-        let mut page_query = self.query(sqlx::AssertSqlSafe(page_sql));
+        let mut page_query =
+            self.query_as::<UserAccessBlacklistRuleRow>(sqlx::AssertSqlSafe(page_sql));
         if let Some(user_id) = user_id {
             page_query = page_query.bind(user_id);
         }
@@ -1668,16 +2011,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let rules = rows
             .into_iter()
-            .map(|row| StoredUserAccessBlacklistRule {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                rule_type: row.get("rule_type"),
-                match_value: row.get("match_value"),
-                is_enabled: row.get::<i64, _>("is_enabled") != 0,
-                created_by: row.get("created_by"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            })
+            .map(UserAccessBlacklistRuleRow::into_rule)
             .collect();
         Ok((rules, total_count))
     }
@@ -1696,25 +2030,16 @@ impl Database {
                     created_at, updated_at
              FROM user_access_blacklist_rules WHERE id = ? AND {where_clause}"
         );
-        let mut query = self.query(sqlx::AssertSqlSafe(sql)).bind(rule_id);
+        let mut query = self
+            .query_as::<UserAccessBlacklistRuleRow>(sqlx::AssertSqlSafe(sql))
+            .bind(rule_id);
         if let Some(user_id) = user_id {
             query = query.bind(user_id);
         }
         query
             .fetch_optional(&self.pool)
             .await
-            .map(|row| {
-                row.map(|row| StoredUserAccessBlacklistRule {
-                    id: row.get("id"),
-                    user_id: row.get("user_id"),
-                    rule_type: row.get("rule_type"),
-                    match_value: row.get("match_value"),
-                    is_enabled: row.get::<i64, _>("is_enabled") != 0,
-                    created_by: row.get("created_by"),
-                    created_at: row.get("created_at"),
-                    updated_at: row.get("updated_at"),
-                })
-            })
+            .map(|row| row.map(UserAccessBlacklistRuleRow::into_rule))
             .map_err(self.sqlx_err())
     }
 
@@ -1725,7 +2050,7 @@ impl Database {
         if query.device_id.is_none() && query.client_name.is_none() {
             return Ok(false);
         }
-        self.query(
+        self.query_scalar::<i64>(
             // A bare EXISTS returns BOOLEAN on PostgreSQL, but INTEGER on SQLite.
             "SELECT CAST(CASE WHEN EXISTS (
                  SELECT 1
@@ -1745,7 +2070,7 @@ impl Database {
         .bind(query.client_name)
         .fetch_one(&self.pool)
         .await
-        .and_then(|row| row.try_get::<i64, _>("matched").map(|value| value != 0))
+        .map(|matched: i64| matched != 0)
         .map_err(self.sqlx_err())
     }
 
@@ -1753,7 +2078,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<(bool, bool), StorageError> {
-        self.query(
+        self.query_as::<AccessBlacklistRulePresenceRow>(
             "SELECT
                  CAST(CASE WHEN EXISTS (
                      SELECT 1 FROM user_access_blacklist_rules
@@ -1772,12 +2097,7 @@ impl Database {
         .bind(user_id)
         .fetch_one(&self.pool)
         .await
-        .and_then(|row| {
-            Ok((
-                row.try_get::<i64, _>("has_device_rules")? != 0,
-                row.try_get::<i64, _>("has_client_rules")? != 0,
-            ))
-        })
+        .map(|row| (row.has_device_rules != 0, row.has_client_rules != 0))
         .map_err(self.sqlx_err())
     }
 
@@ -1788,7 +2108,7 @@ impl Database {
         query: UserAccessBlacklistIpRuleQuery<'_>,
     ) -> Result<Vec<String>, StorageError> {
         let rows = self
-            .query(
+            .query_scalar::<String>(
                 "SELECT match_value
                  FROM user_access_blacklist_rules
                  WHERE is_enabled = 1
@@ -1803,7 +2123,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(rows.into_iter().map(|row| row.get("match_value")).collect())
+        Ok(rows)
     }
 
     pub(crate) async fn set_user_access_blacklist_rule_enabled(
@@ -1881,7 +2201,7 @@ impl Database {
         let count_sql =
             format!("SELECT COUNT(*) AS total_count FROM user_activity_events{where_clause}");
         let mut count_query = self
-            .query(sqlx::AssertSqlSafe(count_sql))
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql))
             .bind(query.user_id);
         if let Some(event_type) = event_type {
             count_query = count_query.bind(event_type);
@@ -1895,7 +2215,6 @@ impl Database {
         let total_count = count_query
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("total_count"))
             .map_err(self.sqlx_err())?;
 
         let page_sql = format!(
@@ -1906,7 +2225,7 @@ impl Database {
              LIMIT ? OFFSET ?"
         );
         let mut page_query = self
-            .query(sqlx::AssertSqlSafe(page_sql))
+            .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(page_sql))
             .bind(query.user_id);
         if let Some(event_type) = event_type {
             page_query = page_query.bind(event_type);
@@ -1925,16 +2244,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let events = rows
             .into_iter()
-            .map(|row| StoredUserActivityEvent {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                actor_user_id: row.get("actor_user_id"),
-                event_type: row.get("event_type"),
-                target_type: row.get("target_type"),
-                target_id: row.get("target_id"),
-                metadata_json: row.get("metadata_json"),
-                occurred_at: row.get("occurred_at"),
-            })
+            .map(UserActivityEventRow::into_event)
             .collect();
         Ok((events, total_count))
     }
@@ -2052,7 +2362,7 @@ impl Database {
                 .join(", ");
             let query =
                 format!("SELECT id, username_normalized FROM users WHERE id IN ({placeholders})");
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserIdUsernameRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id.as_str());
             }
@@ -2060,12 +2370,10 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(self.sqlx_err())?;
-            usernames.extend(rows.into_iter().map(|row| {
-                (
-                    row.get::<String, _>("id"),
-                    row.get::<String, _>("username_normalized"),
-                )
-            }));
+            usernames.extend(
+                rows.into_iter()
+                    .map(|row| (row.id, row.username_normalized)),
+            );
         }
         Ok(usernames)
     }
@@ -2164,7 +2472,7 @@ impl Database {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<StoredAccessTokenDevice>, StorageError> {
-        self.query(
+        self.query_as::<AccessTokenDeviceRow>(
             "SELECT device_id, client_name, device_name, client_version
              FROM access_tokens
              WHERE token_hash = ? AND revoked_at IS NULL
@@ -2173,14 +2481,7 @@ impl Database {
         .bind(token_hash)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredAccessTokenDevice {
-                device_id: row.get("device_id"),
-                client_name: row.get("client_name"),
-                device_name: row.get("device_name"),
-                client_version: row.get("client_version"),
-            })
-        })
+        .map(|row| row.map(AccessTokenDeviceRow::into_device))
         .map_err(self.sqlx_err())
     }
 
@@ -2202,7 +2503,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let sessions = self
-            .query(
+            .query_as::<EmbyLoginSessionRow>(
                 "SELECT id, device_id, device_name, device_type, client_name, client_version,
                         created_at, updated_at, last_seen_at
                  FROM access_tokens
@@ -2215,22 +2516,11 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| StoredEmbyLoginSessionSummary {
-                        id: row.get("id"),
-                        device_id: row.get("device_id"),
-                        device_name: row.get("device_name"),
-                        device_type: row.get("device_type"),
-                        client_name: row.get("client_name"),
-                        client_version: row.get("client_version"),
-                        created_at: row.get("created_at"),
-                        updated_at: row.get("updated_at"),
-                        last_seen_at: row.get("last_seen_at"),
-                    })
-                    .collect()
-            })
             .map_err(self.sqlx_err())?;
+        let sessions = sessions
+            .into_iter()
+            .map(EmbyLoginSessionRow::into_summary)
+            .collect();
         Ok((sessions, total_count))
     }
 
@@ -2561,7 +2851,7 @@ impl Database {
                         )))
                  ORDER BY access_user.id, media_library.name, media_library.id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserLibraryAccessRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -2570,8 +2860,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                if let Some(library_ids) = accessible.get_mut(&row.get::<String, _>("user_id")) {
-                    library_ids.push(row.get("library_id"));
+                if let Some(library_ids) = accessible.get_mut(&row.user_id) {
+                    library_ids.push(row.library_id);
                 }
             }
         }
@@ -2660,7 +2950,8 @@ impl Database {
                  FROM installed_plugins
                  WHERE plugin_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<PluginInstallationStatusRow>(sqlx::AssertSqlSafe(query));
             for plugin_id in chunk {
                 statement = statement.bind(plugin_id);
             }
@@ -2669,10 +2960,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                statuses.insert(
-                    row.get::<String, _>("plugin_id"),
-                    row.get::<i64, _>("is_enabled") != 0,
-                );
+                statuses.insert(row.plugin_id, row.is_enabled != 0);
             }
         }
         Ok(statuses)
@@ -3133,7 +3421,7 @@ impl Database {
                     allow_audio_transcode, allow_video_transcode
              FROM users WHERE deleted_at IS NULL AND id IN ({placeholders})"
         );
-        let mut user_query = self.query(sqlx::AssertSqlSafe(user_sql));
+        let mut user_query = self.query_as::<PermissionCopyUserRow>(sqlx::AssertSqlSafe(user_sql));
         for user_id in user_ids {
             user_query = user_query.bind(user_id);
         }
@@ -3143,23 +3431,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let mut snapshots = HashMap::with_capacity(user_rows.len());
         for row in user_rows {
-            let user_id: String = row.get("id");
-            snapshots.insert(
-                user_id,
-                UserPermissionCopySnapshot {
-                    library_access_mode: row.get("library_access_mode"),
-                    library_ids: Vec::new(),
-                    can_download: row.get::<i64, _>("can_download") != 0,
-                    playback_policy: UserPlaybackPolicy {
-                        can_play: row.get::<i64, _>("can_play") != 0,
-                        max_simultaneous_playbacks: row.get("max_simultaneous_playbacks"),
-                        allow_remux: row.get::<i64, _>("allow_remux") != 0,
-                        allow_audio_transcode: row.get::<i64, _>("allow_audio_transcode") != 0,
-                        allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
-                    },
-                    content_restrictions: None,
-                },
-            );
+            snapshots.insert(row.id.clone(), row.into_snapshot());
         }
 
         let library_sql = format!(
@@ -3170,7 +3442,8 @@ impl Database {
                AND access.user_id IN ({placeholders})
              ORDER BY access.user_id, access.library_id"
         );
-        let mut library_query = self.query(sqlx::AssertSqlSafe(library_sql));
+        let mut library_query =
+            self.query_as::<UserLibraryAccessRow>(sqlx::AssertSqlSafe(library_sql));
         for user_id in user_ids {
             library_query = library_query.bind(user_id);
         }
@@ -3179,10 +3452,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
         {
-            let user_id: String = row.get("user_id");
-            let library_id: String = row.get("library_id");
-            if let Some(snapshot) = snapshots.get_mut(&user_id) {
-                snapshot.library_ids.push(library_id);
+            if let Some(snapshot) = snapshots.get_mut(&row.user_id) {
+                snapshot.library_ids.push(row.library_id);
             }
         }
 
@@ -3198,7 +3469,8 @@ impl Database {
              WHERE restrictions.user_id IN ({placeholders})
              ORDER BY restrictions.user_id, tags.tag_kind, tags.tag"
         );
-        let mut restrictions_query = self.query(sqlx::AssertSqlSafe(restrictions_sql));
+        let mut restrictions_query =
+            self.query_as::<UserContentRestrictionTagRow>(sqlx::AssertSqlSafe(restrictions_sql));
         for user_id in user_ids {
             restrictions_query = restrictions_query.bind(user_id);
         }
@@ -3208,31 +3480,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
         {
-            let user_id: String = row.get("user_id");
-            let restrictions =
-                restrictions_by_user
-                    .entry(user_id)
-                    .or_insert_with(|| UserContentRestrictions {
-                        rating_system: row.get("rating_system"),
-                        maximum_rating: row.get("maximum_rating"),
-                        allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
-                        allowed_tags: Vec::new(),
-                        blocked_tags: Vec::new(),
-                        version: row.get("version"),
-                        updated_at: row.get("updated_at"),
-                    });
-            let tag_kind: Option<String> = row.get("tag_kind");
-            let tag: Option<String> = row.get("tag");
-            match (tag_kind.as_deref(), tag) {
-                (None, None) => {}
-                (Some("ALLOW"), Some(tag)) => restrictions.allowed_tags.push(tag),
-                (Some("BLOCK"), Some(tag)) => restrictions.blocked_tags.push(tag),
-                _ => {
-                    return Err(StorageError::Serialization(
-                        "invalid user content restriction tag row".to_owned(),
-                    ));
-                }
-            }
+            row.merge_into(&mut restrictions_by_user)?;
         }
         for (user_id, restrictions) in restrictions_by_user {
             if let Some(snapshot) = snapshots.get_mut(&user_id) {
@@ -3638,7 +3886,7 @@ impl Database {
         user_id: &str,
     ) -> Result<Option<UserAccountPreferences>, StorageError> {
         let row = self
-            .query(
+            .query_as::<UserAccountPreferencesRow>(
                 "SELECT theme, accent_color, show_media_libraries,
                         show_continue_watching, audio_language, subtitle_language,
                         auto_play_next_episode, version, updated_at
@@ -3654,17 +3902,17 @@ impl Database {
         let library_order = self.user_library_order(user_id).await?;
         let played_percent = self.user_played_percent(user_id).await?;
         Ok(Some(UserAccountPreferences {
-            theme: row.get("theme"),
-            accent_color: row.get("accent_color"),
-            show_media_libraries: row.get::<i64, _>("show_media_libraries") != 0,
-            show_continue_watching: row.get::<i64, _>("show_continue_watching") != 0,
-            audio_language: row.get("audio_language"),
-            subtitle_language: row.get("subtitle_language"),
-            auto_play_next_episode: row.get::<i64, _>("auto_play_next_episode") != 0,
+            theme: row.theme,
+            accent_color: row.accent_color,
+            show_media_libraries: row.show_media_libraries != 0,
+            show_continue_watching: row.show_continue_watching != 0,
+            audio_language: row.audio_language,
+            subtitle_language: row.subtitle_language,
+            auto_play_next_episode: row.auto_play_next_episode != 0,
             library_order,
             played_percent,
-            version: row.get("version"),
-            updated_at: row.get("updated_at"),
+            version: row.version,
+            updated_at: row.updated_at,
         }))
     }
 
@@ -3876,7 +4124,7 @@ impl Database {
                  WHERE user_id IN ({placeholders})
                  ORDER BY user_id, position, library_id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserLibraryOrderRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -3885,10 +4133,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                orders
-                    .entry(row.get("user_id"))
-                    .or_default()
-                    .push(row.get("library_id"));
+                orders.entry(row.user_id).or_default().push(row.library_id);
             }
         }
         Ok(orders)
@@ -3914,7 +4159,8 @@ impl Database {
                 "SELECT user_id, use_admin_library_order FROM user_library_order_preferences
                  WHERE user_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<UserAdminLibraryOrderFlagRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -3923,10 +4169,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                flags.insert(
-                    row.get("user_id"),
-                    row.get::<i64, _>("use_admin_library_order") != 0,
-                );
+                flags.insert(row.user_id, row.use_admin_library_order != 0);
             }
         }
         for user_id in user_ids {
@@ -3952,7 +4195,8 @@ impl Database {
                 "SELECT user_id, configuration_json FROM user_emby_configuration
                  WHERE user_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<UserEmbyConfigurationRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -3961,7 +4205,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                configurations.insert(row.get("user_id"), row.get("configuration_json"));
+                configurations.insert(row.user_id, row.configuration_json);
             }
         }
         Ok(configurations)
@@ -4338,7 +4582,8 @@ impl Database {
                 .join(", ");
             let mode_query =
                 format!("SELECT id, library_access_mode FROM users WHERE id IN ({placeholders})");
-            let mut mode_statement = self.query(sqlx::AssertSqlSafe(mode_query));
+            let mut mode_statement =
+                self.query_as::<UserLibraryAccessModeRow>(sqlx::AssertSqlSafe(mode_query));
             for user_id in chunk {
                 mode_statement = mode_statement.bind(user_id);
             }
@@ -4347,12 +4592,12 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id: String = row.get("id");
-                let mode: Option<String> = row.get("library_access_mode");
                 snapshots.insert(
-                    user_id,
+                    row.id,
                     UserAccessSnapshot {
-                        library_access_mode: mode.unwrap_or_else(|| "ALL".to_owned()),
+                        library_access_mode: row
+                            .library_access_mode
+                            .unwrap_or_else(|| "ALL".to_owned()),
                         library_ids: Vec::new(),
                         restrictions: None,
                     },
@@ -4364,7 +4609,8 @@ impl Database {
                  WHERE user_id IN ({placeholders}) AND can_view = 1
                  ORDER BY user_id, library_id"
             );
-            let mut access_statement = self.query(sqlx::AssertSqlSafe(access_query));
+            let mut access_statement =
+                self.query_as::<UserLibraryAccessRow>(sqlx::AssertSqlSafe(access_query));
             for user_id in chunk {
                 access_statement = access_statement.bind(user_id);
             }
@@ -4373,10 +4619,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id: String = row.get("user_id");
-                let library_id: String = row.get("library_id");
-                if let Some(snapshot) = snapshots.get_mut(&user_id) {
-                    snapshot.library_ids.push(library_id);
+                if let Some(snapshot) = snapshots.get_mut(&row.user_id) {
+                    snapshot.library_ids.push(row.library_id);
                 }
             }
 
@@ -4391,7 +4635,8 @@ impl Database {
                  WHERE restrictions.user_id IN ({placeholders})
                  ORDER BY restrictions.user_id, tags.tag_kind, tags.tag"
             );
-            let mut restriction_statement = self.query(sqlx::AssertSqlSafe(restriction_query));
+            let mut restriction_statement = self
+                .query_as::<UserContentRestrictionTagRow>(sqlx::AssertSqlSafe(restriction_query));
             for user_id in chunk {
                 restriction_statement = restriction_statement.bind(user_id);
             }
@@ -4402,30 +4647,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id: String = row.get("user_id");
-                let entry = restrictions_by_user.entry(user_id).or_insert_with(|| {
-                    UserContentRestrictions {
-                        rating_system: row.get("rating_system"),
-                        maximum_rating: row.get("maximum_rating"),
-                        allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
-                        allowed_tags: Vec::new(),
-                        blocked_tags: Vec::new(),
-                        version: row.get("version"),
-                        updated_at: row.get("updated_at"),
-                    }
-                });
-                let tag_kind: Option<String> = row.get("tag_kind");
-                let tag: Option<String> = row.get("tag");
-                match (tag_kind.as_deref(), tag) {
-                    (None, None) => {}
-                    (Some("ALLOW"), Some(tag)) => entry.allowed_tags.push(tag),
-                    (Some("BLOCK"), Some(tag)) => entry.blocked_tags.push(tag),
-                    _ => {
-                        return Err(StorageError::Serialization(
-                            "invalid user content restriction tag row".to_owned(),
-                        ));
-                    }
-                }
+                row.merge_into(&mut restrictions_by_user)?;
             }
             for (user_id, restrictions) in restrictions_by_user {
                 if let Some(snapshot) = snapshots.get_mut(&user_id) {
@@ -4448,7 +4670,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(String, String)>, StorageError> {
         let rows = self
-            .query(
+            .query_as::<UserAccessBlacklistRuleValueRow>(
                 "SELECT rule_type, match_value
                  FROM user_access_blacklist_rules
                  WHERE is_enabled = 1 AND (user_id IS NULL OR user_id = ?)
@@ -4462,14 +4684,16 @@ impl Database {
             .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
-            .map(|row| (row.get("rule_type"), row.get("match_value")))
+            .map(|row| (row.rule_type, row.match_value))
             .collect())
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::{UserPermissionStateRow, UserPlaybackPolicyRow};
     use crate::storage::test_database;
+    use sqlx::FromRow;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -4745,6 +4969,301 @@ mod tests {
             .find(|user| user.id == second_user_id)
             .expect("batched lookup should include Bob");
         assert!(bob.is_disabled);
+        Ok(())
+    }
+
+    /// `query_users` reads its window count from a typed row and `delete_user` from manager flags.
+    #[tokio::test]
+    async fn query_users_reports_the_window_count_and_delete_user_removes_the_row()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let admin_id = Uuid::now_v7().to_string();
+        let member_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&admin_id, "row-admin", "Row Admin", "hash")
+            .await?;
+        database
+            .insert_user(&member_id, "row-member", "Row Member", "hash", false, true)
+            .await?;
+
+        let (users, total_count) = database.query_users(None, None, false, 0, 10).await?;
+        assert_eq!(total_count, 2);
+        assert_eq!(
+            users
+                .iter()
+                .map(|user| user.username_normalized.as_str())
+                .collect::<Vec<_>>(),
+            vec!["row-admin", "row-member"]
+        );
+
+        assert!(database.delete_user(&member_id).await?);
+        assert!(!database.delete_user(&member_id).await?);
+        let (users, total_count) = database.query_users(None, None, false, 0, 10).await?;
+        assert_eq!(total_count, 1);
+        assert_eq!(users.len(), 1);
+        assert_eq!(users[0].username_normalized, "row-admin");
+        Ok(())
+    }
+
+    /// A projection whose columns are absent must report an error instead of panicking.
+    #[tokio::test]
+    async fn row_decoding_reports_missing_columns_as_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        assert!(UserPlaybackPolicyRow::from_row(&row).is_err());
+        assert!(UserPermissionStateRow::from_row(&row).is_err());
+        Ok(())
+    }
+
+    /// The batched user projections decode display names, configurations and library orders.
+    #[tokio::test]
+    async fn batched_user_projections_decode_display_names_configurations_and_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::HashMap;
+
+        let (_temp_dir, database) = test_database().await?;
+        let first_id = Uuid::now_v7().to_string();
+        let second_id = Uuid::now_v7().to_string();
+        let library_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&first_id, "batched-first", "Batched First", "hash")
+            .await?;
+        database
+            .insert_user(
+                &second_id,
+                "batched-second",
+                "Batched Second",
+                "hash",
+                false,
+                true,
+            )
+            .await?;
+        database
+            .set_user_emby_configuration(&first_id, "{\"server\":\"one\"}")
+            .await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(&library_id)
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .replace_user_library_order(&first_id, std::slice::from_ref(&library_id))
+            .await?;
+        database
+            .set_user_uses_admin_library_order(&first_id, false)
+            .await?;
+
+        assert_eq!(
+            database
+                .find_user_display_names(&[first_id.clone(), second_id.clone()])
+                .await?,
+            HashMap::from([
+                (first_id.clone(), "Batched First".to_owned()),
+                (second_id.clone(), "Batched Second".to_owned()),
+            ])
+        );
+        assert_eq!(
+            database
+                .list_user_emby_configurations(std::slice::from_ref(&first_id))
+                .await?,
+            HashMap::from([(first_id.clone(), "{\"server\":\"one\"}".to_owned())])
+        );
+        assert_eq!(
+            database
+                .user_library_orders(std::slice::from_ref(&first_id))
+                .await?,
+            HashMap::from([(first_id.clone(), vec![library_id.clone()])])
+        );
+        assert_eq!(
+            database
+                .user_admin_library_order_flags(&[first_id.clone(), second_id.clone()])
+                .await?,
+            HashMap::from([(first_id, false), (second_id, true)])
+        );
+        Ok(())
+    }
+
+    /// Purged accounts are returned from the `RETURNING id` projection as plain strings.
+    #[tokio::test]
+    async fn purge_expired_deleted_users_returns_the_purged_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let admin_id = Uuid::now_v7().to_string();
+        let member_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&admin_id, "purge-admin", "Purge Admin", "hash")
+            .await?;
+        database
+            .insert_user(
+                &member_id,
+                "purge-member",
+                "Purge Member",
+                "hash",
+                false,
+                true,
+            )
+            .await?;
+        assert_eq!(
+            database.soft_delete_user(&member_id).await?,
+            Some(Vec::new())
+        );
+
+        assert_eq!(
+            database
+                .purge_expired_deleted_users(i64::from(i32::MAX), 10)
+                .await?,
+            vec![member_id]
+        );
+        assert_eq!(
+            database
+                .purge_expired_deleted_users(i64::from(i32::MAX), 10)
+                .await?,
+            Vec::<String>::new()
+        );
+        Ok(())
+    }
+
+    /// Device pages, access-token metadata and access rules decode from their typed rows.
+    #[tokio::test]
+    async fn device_token_and_access_rule_projections_decode_from_typed_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::repository::{
+            NewAccessToken, NewUserAccessBlacklistRule, NewUserDeviceObservation,
+            UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+            UserAccessBlacklistRulePageQuery, UserAccessBlacklistRuleScope, UserDevicePageQuery,
+        };
+
+        let (_temp_dir, database) = test_database().await?;
+        let user_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&user_id, "decoding-admin", "Decoding Admin", "hash")
+            .await?;
+        database
+            .upsert_user_device(NewUserDeviceObservation {
+                user_id: &user_id,
+                device_id: "decoding-device",
+                device_name: Some("Decoding Device"),
+                device_type: Some("PHONE"),
+                client_name: "Decoding Client",
+                client_version: Some("9.9"),
+                last_remote_ip: Some("203.0.113.7"),
+                seen_at: 1_000,
+            })
+            .await?;
+
+        let (devices, total_count) = database
+            .list_user_devices_page(UserDevicePageQuery {
+                user_id: &user_id,
+                offset: 0,
+                limit: 10,
+            })
+            .await?;
+        assert_eq!(total_count, 1);
+        let device = devices
+            .first()
+            .ok_or("the device page must include the stored observation")?;
+        assert_eq!(device.device_id, "decoding-device");
+        assert_eq!(device.device_name.as_deref(), Some("Decoding Device"));
+        assert_eq!(device.device_type.as_deref(), Some("PHONE"));
+        assert_eq!(device.client_name, "Decoding Client");
+        assert_eq!(device.client_version.as_deref(), Some("9.9"));
+        assert_eq!(device.first_seen_at, 1_000);
+        assert_eq!(device.last_remote_ip.as_deref(), Some("203.0.113.7"));
+        assert!(!device.has_active_login);
+
+        let token_hash = [3_u8; 32];
+        database
+            .create_access_token(NewAccessToken {
+                id: "decoding-token",
+                token_hash: &token_hash,
+                user_id: &user_id,
+                device_id: "decoding-device",
+                client_name: "Decoding Client",
+                device_name: "Decoding Device",
+                client_version: "9.9",
+                device_type: Some("PHONE"),
+            })
+            .await?;
+        let token_device = database
+            .find_access_token_device(&token_hash)
+            .await?
+            .ok_or("the created token must resolve its device metadata")?;
+        assert_eq!(token_device.device_id, "decoding-device");
+        assert_eq!(token_device.device_name, "Decoding Device");
+        assert_eq!(token_device.client_version, "9.9");
+
+        for (rule_id, rule_type, match_value) in [
+            ("decoding-rule-client", "CLIENT", "Decoding Client"),
+            ("decoding-rule-ip", "IP_CIDR", "203.0.113.0/24"),
+        ] {
+            database
+                .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                    id: rule_id,
+                    user_id: Some(&user_id),
+                    rule_type,
+                    match_value,
+                    is_enabled: true,
+                    created_by: Some(&user_id),
+                    created_at: 2_000,
+                })
+                .await?;
+        }
+        assert_eq!(
+            database
+                .user_access_blacklist_rules_for_user(&user_id, 10)
+                .await?,
+            vec![
+                ("CLIENT".to_owned(), "Decoding Client".to_owned()),
+                ("IP_CIDR".to_owned(), "203.0.113.0/24".to_owned()),
+            ]
+        );
+        assert_eq!(
+            database
+                .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+                    user_id: &user_id,
+                    limit: 10,
+                })
+                .await?,
+            vec!["203.0.113.0/24".to_owned()]
+        );
+        assert_eq!(
+            database
+                .active_user_access_device_client_blacklist_rules(&user_id)
+                .await?,
+            (false, true)
+        );
+        assert!(
+            database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id: &user_id,
+                    device_id: None,
+                    client_name: Some("Decoding Client"),
+                })
+                .await?
+        );
+
+        let rule = database
+            .find_user_access_blacklist_rule(
+                UserAccessBlacklistRuleScope::User(&user_id),
+                "decoding-rule-ip",
+            )
+            .await?
+            .ok_or("the inserted rule must be readable")?;
+        assert_eq!(rule.rule_type, "IP_CIDR");
+        assert!(rule.is_enabled);
+        assert_eq!(rule.created_at, 2_000);
+        let (rules, rules_total) = database
+            .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+                scope: UserAccessBlacklistRuleScope::User(&user_id),
+                offset: 0,
+                limit: 10,
+            })
+            .await?;
+        assert_eq!(rules_total, 2);
+        assert_eq!(rules.len(), 2);
         Ok(())
     }
 }
