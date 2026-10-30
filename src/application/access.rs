@@ -1,4 +1,9 @@
-use std::fmt;
+use std::{
+    collections::HashMap,
+    fmt,
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
 
 use crate::{
     domain::{
@@ -8,8 +13,32 @@ use crate::{
         },
         ids::UserId,
     },
-    storage::{Database, GLOBAL_COLLECTION_LIBRARY_ID, StorageError, StoredPlaybackSource},
+    storage::{
+        AccessChangeEpochs, AccessEpoch, Database, GLOBAL_COLLECTION_LIBRARY_ID, StorageError,
+        StoredPlaybackSource,
+    },
 };
+
+/// How long a cached playback access answer stays usable.
+///
+/// Emby clients and the Lux web player report progress every ~10 s, so one minute removes about six
+/// repeated checks from a session. The project owner accepted this bound for revocation lag; the
+/// permission writes in `storage` still invalidate the affected user immediately, so the TTL only
+/// covers changes no storage function observes (see the notes on [`MediaAccessService`]).
+const PLAYBACK_ACCESS_CACHE_TTL: Duration = Duration::from_secs(60);
+
+/// Upper bound on cached answers.
+///
+/// The realistic working set is one entry per actively playing (user, item, library) triple, but the
+/// map is bounded so a long-running server cannot grow it without limit. Expired entries are dropped
+/// lazily; when the map is full the entry closest to expiring makes room.
+const PLAYBACK_ACCESS_CACHE_CAPACITY: usize = 1024;
+
+/// Source of `Instant`s for the playback access cache.
+///
+/// Production always uses [`Instant::now`]. Tests swap in a hand-advanced clock so the TTL can be
+/// checked without sleeping for a minute.
+type AccessCacheClock = Arc<dyn Fn() -> Instant + Send + Sync>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AccessPrincipal {
@@ -37,14 +66,31 @@ impl AccessPrincipal {
     }
 }
 
+/// Answers the access questions that every request asks.
+///
+/// The service is also the home of the one access cache in the application: the playback progress
+/// path re-asks "may this user view this item" every ~10 s for the whole session, so
+/// [`Self::can_view_item_cached`] and [`Self::can_view_item_in_library_cached`] may reuse an
+/// earlier "allowed" answer for up to [`PLAYBACK_ACCESS_CACHE_TTL`]. Those two entry points are
+/// **only** for the playback progress handlers: every other endpoint must use the uncached checks so
+/// an administrative change is visible on its very next request.
+///
+/// Denials are never cached, so a newly granted permission takes effect immediately. Denied-by-
+/// permission writes are invalidated by the change epochs stored next to the writes
+/// (`crate::storage::AccessChangeEpochs`); anything that does not go through one of those writes
+/// (an item's content-restriction index being rebuilt, for example) can lag until the TTL expires.
 #[derive(Clone)]
 pub struct MediaAccessService {
     database: Database,
+    playback_access_cache: PlaybackAccessCache,
 }
 
 impl MediaAccessService {
     pub fn new(database: Database) -> Self {
-        Self { database }
+        Self {
+            database,
+            playback_access_cache: PlaybackAccessCache::new(),
+        }
     }
 
     pub async fn can_view_library(
@@ -102,6 +148,68 @@ impl MediaAccessService {
             return Ok(false);
         }
         self.can_view_item_content(principal, item_id).await
+    }
+
+    /// The playback-progress variant of [`Self::can_view_item`].
+    ///
+    /// Only the playback progress handlers may call this: it may answer "allowed" from the short
+    /// playback cache instead of asking the database. It resolves the item library like
+    /// [`Self::can_view_item`] does, so it saves exactly the library-access and content-restriction
+    /// queries and keeps the item lookup.
+    pub async fn can_view_item_cached(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+    ) -> Result<bool, AccessError> {
+        if principal.is_admin || principal.user_id.is_none() {
+            return self.can_view_item(principal, item_id).await;
+        }
+        let library_id = self.database.find_item_library_id(item_id).await?;
+        self.can_view_item_in_library_cached(principal, item_id, library_id.as_deref())
+            .await
+    }
+
+    /// The playback-progress variant of [`Self::can_view_item_in_library`].
+    ///
+    /// Only the playback progress handlers may call this: a recent "allowed" answer for the same
+    /// (user, item, library) may be reused for up to [`PLAYBACK_ACCESS_CACHE_TTL`], while a "denied"
+    /// answer is always re-checked. Administrators, the global collection library and an unresolved
+    /// library never enter the cache, because the uncached check answers them without a query.
+    pub async fn can_view_item_in_library_cached(
+        &self,
+        principal: AccessPrincipal,
+        item_id: &str,
+        library_id: Option<&str>,
+    ) -> Result<bool, AccessError> {
+        let Some(library_id) = library_id else {
+            return Ok(false);
+        };
+        if library_id == GLOBAL_COLLECTION_LIBRARY_ID || principal.is_admin {
+            return self
+                .can_view_item_in_library(principal, item_id, Some(library_id))
+                .await;
+        }
+        let Some(user_id) = principal.user_id else {
+            return self
+                .can_view_item_in_library(principal, item_id, Some(library_id))
+                .await;
+        };
+        let key = PlaybackAccessKey {
+            user_id: user_id.to_string(),
+            item_id: item_id.to_owned(),
+            library_id: library_id.to_owned(),
+        };
+        let epochs = self.database.access_changes();
+        if self.playback_access_cache.is_fresh(epochs, &key) {
+            return Ok(true);
+        }
+        let allowed = self
+            .can_view_item_in_library(principal, item_id, Some(library_id))
+            .await?;
+        if allowed {
+            self.playback_access_cache.remember(epochs, key);
+        }
+        Ok(allowed)
     }
 
     /// Checks only the per-user content restrictions. The caller has already confirmed that the
@@ -235,6 +343,127 @@ impl MediaAccessService {
     }
 }
 
+/// Identifies one cached playback access answer.
+///
+/// The user is part of the key, so one user's answer can never be served to another; the library is
+/// part of it so an item that moved between libraries is re-checked under its new library.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PlaybackAccessKey {
+    user_id: String,
+    item_id: String,
+    library_id: String,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct PlaybackAccessEntry {
+    expires_at: Instant,
+    epoch: AccessEpoch,
+}
+
+/// A bounded, lazily cleaned map of "this user may view this item" answers.
+///
+/// Clones share one map, so every handler and worker that holds the service sees the same answers
+/// and the same invalidations. The map is guarded by a `std` mutex that is never held across an
+/// `await`, and it needs neither a background task nor a timer: entries expire by timestamp and are
+/// only removed when they are read, overwritten, or when the map needs room.
+#[derive(Clone)]
+struct PlaybackAccessCache {
+    entries: Arc<Mutex<HashMap<PlaybackAccessKey, PlaybackAccessEntry>>>,
+    clock: AccessCacheClock,
+    ttl: Duration,
+    capacity: usize,
+}
+
+impl PlaybackAccessCache {
+    fn new() -> Self {
+        Self::with_clock_and_capacity(Arc::new(Instant::now), PLAYBACK_ACCESS_CACHE_CAPACITY)
+    }
+
+    fn with_clock_and_capacity(clock: AccessCacheClock, capacity: usize) -> Self {
+        Self {
+            entries: Arc::new(Mutex::new(HashMap::new())),
+            clock,
+            ttl: PLAYBACK_ACCESS_CACHE_TTL,
+            capacity,
+        }
+    }
+
+    /// Reports whether a usable answer for `key` is present, dropping it when it is stale.
+    ///
+    /// A stale entry is removed on read, which keeps the invalidation lazy: a permission write only
+    /// has to move a counter, not walk the map.
+    fn is_fresh(&self, epochs: &AccessChangeEpochs, key: &PlaybackAccessKey) -> bool {
+        let now = (self.clock)();
+        let epoch = epochs.snapshot(&key.user_id);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        match entries.get(key) {
+            Some(entry) if entry.expires_at > now && entry.epoch == epoch => true,
+            Some(_) => {
+                entries.remove(key);
+                false
+            }
+            None => false,
+        }
+    }
+
+    /// Stores an "allowed" answer until it expires or the change epochs move.
+    fn remember(&self, epochs: &AccessChangeEpochs, key: PlaybackAccessKey) {
+        let now = (self.clock)();
+        let epoch = epochs.snapshot(&key.user_id);
+        let mut entries = self
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if entries.len() >= self.capacity {
+            // Drop everything that already expired, then the answer closest to expiring, so one
+            // insert can never push the map past its capacity.
+            entries.retain(|_, entry| entry.expires_at > now);
+            if entries.len() >= self.capacity
+                && let Some(soonest) = entries
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.expires_at)
+                    .map(|(key, _)| key.clone())
+            {
+                entries.remove(&soonest);
+            }
+        }
+        entries.insert(
+            key,
+            PlaybackAccessEntry {
+                expires_at: now + self.ttl,
+                epoch,
+            },
+        );
+    }
+
+    fn len(&self) -> usize {
+        self.entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+#[cfg(test)]
+impl MediaAccessService {
+    fn with_playback_access_clock(mut self, clock: AccessCacheClock) -> Self {
+        self.playback_access_cache.clock = clock;
+        self
+    }
+
+    fn with_playback_access_capacity(mut self, capacity: usize) -> Self {
+        self.playback_access_cache.capacity = capacity;
+        self
+    }
+
+    fn cached_playback_access_entries(&self) -> usize {
+        self.playback_access_cache.len()
+    }
+}
+
 #[derive(Debug)]
 pub enum AccessError {
     Storage(StorageError),
@@ -264,6 +493,11 @@ impl From<StorageError> for AccessError {
 
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
+
     use crate::{
         application::libraries::LibraryService,
         auth::users::UserStore,
@@ -272,7 +506,425 @@ mod tests {
         storage::{Database, NewUserContentRestrictions, UserContentRestrictionsCasResult},
     };
 
-    use super::{AccessPrincipal, MediaAccessService};
+    use super::{AccessCacheClock, AccessPrincipal, MediaAccessService, PLAYBACK_ACCESS_CACHE_TTL};
+
+    /// A database with one non-admin viewer, one library, and one classified movie.
+    struct PlaybackCacheFixture {
+        _directory: tempfile::TempDir,
+        database: Database,
+        access: MediaAccessService,
+        principal: AccessPrincipal,
+        library_id: String,
+        second_library_id: String,
+    }
+
+    async fn playback_cache_fixture() -> Result<PlaybackCacheFixture, Box<dyn std::error::Error>>
+    {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user("playback-cache-viewer", "Viewer", "test password", false)
+            .await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Playback cache", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user.id.to_string(), &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES ('cached-movie', ?, 'MOVIE', 'Cached', 'cached', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_content_restriction_index (item_id, certification_code)
+             VALUES ('cached-movie', 'R')",
+        )
+        .execute(database.pool())
+        .await?;
+        // A second granted library keeps `library_access_mode = 'SELECTED'` when one grant is
+        // revoked, which is how an administrator usually narrows access.
+        let second_library = libraries
+            .create_library("Playback cache second", LibraryKind::Movie, false)
+            .await?;
+        let second_library_id = second_library.id.to_string();
+        database
+            .set_user_library_access(&user.id.to_string(), &second_library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES ('cached-second-movie', ?, 'MOVIE', 'Second', 'second', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&second_library_id)
+        .execute(database.pool())
+        .await?;
+        let access = MediaAccessService::new(database.clone());
+        Ok(PlaybackCacheFixture {
+            _directory: directory,
+            database,
+            access,
+            principal: AccessPrincipal::new(user.id, false),
+            library_id,
+            second_library_id,
+        })
+    }
+
+    /// A hand-advanced clock, so the TTL test does not sleep for a minute.
+    #[derive(Clone)]
+    struct TestClock(Arc<Mutex<Instant>>);
+
+    impl TestClock {
+        fn new() -> Self {
+            Self(Arc::new(Mutex::new(Instant::now())))
+        }
+
+        fn reader(&self) -> AccessCacheClock {
+            let current = Arc::clone(&self.0);
+            Arc::new(move || *current.lock().expect("test clock is not poisoned"))
+        }
+
+        fn advance(&self, duration: Duration) {
+            *self.0.lock().expect("test clock is not poisoned") += duration;
+        }
+    }
+
+    #[tokio::test]
+    async fn playback_access_cache_skips_the_repeated_allowed_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        fixture.database.reset_query_count();
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+        let uncached_queries = fixture.database.query_count();
+        assert!(
+            uncached_queries > 0,
+            "the first playback check still has to read library access and content restrictions"
+        );
+
+        fixture.database.reset_query_count();
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+        assert_eq!(
+            fixture.database.query_count(),
+            0,
+            "a repeated allowed check within the TTL must not query the database"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_access_cache_never_caches_a_denial()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        fixture
+            .database
+            .replace_user_library_access_mode(&fixture.principal.user_id_string(), "NONE", &[])
+            .await?;
+
+        for attempt in 1..=2 {
+            fixture.database.reset_query_count();
+            assert!(
+                !fixture
+                    .access
+                    .can_view_item_in_library_cached(
+                        fixture.principal,
+                        "cached-movie",
+                        Some(&fixture.library_id)
+                    )
+                    .await?
+            );
+            assert!(
+                fixture.database.query_count() > 0,
+                "attempt {attempt} was denied, and a denial must never be cached"
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_access_cache_expires_after_the_ttl()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        let clock = TestClock::new();
+        let access = fixture
+            .access
+            .clone()
+            .with_playback_access_clock(clock.reader());
+        assert!(
+            access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+
+        fixture.database.reset_query_count();
+        assert!(
+            access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+        assert_eq!(fixture.database.query_count(), 0, "the cache is still warm");
+
+        clock.advance(PLAYBACK_ACCESS_CACHE_TTL + Duration::from_millis(1));
+        fixture.database.reset_query_count();
+        assert!(
+            access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+        assert!(
+            fixture.database.query_count() > 0,
+            "an expired entry must be re-checked against the database"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn revoking_library_access_invalidates_the_cached_answer_immediately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-second-movie",
+                    Some(&fixture.second_library_id)
+                )
+                .await?
+        );
+        fixture.database.reset_query_count();
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-second-movie",
+                    Some(&fixture.second_library_id)
+                )
+                .await?
+        );
+        assert_eq!(fixture.database.query_count(), 0, "the cache is warm");
+
+        fixture
+            .database
+            .set_user_library_access(
+                &fixture.principal.user_id_string(),
+                &fixture.second_library_id,
+                false,
+            )
+            .await?;
+        assert!(
+            !fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-second-movie",
+                    Some(&fixture.second_library_id)
+                )
+                .await?,
+            "a revoked library must not keep serving the cached allow"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn tightening_content_restrictions_invalidates_the_cached_answer_immediately()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+
+        let restricted = fixture
+            .database
+            .compare_and_swap_user_content_restrictions(
+                &fixture.principal.user_id_string(),
+                0,
+                NewUserContentRestrictions {
+                    rating_system: "MPA",
+                    maximum_rating: Some("PG-13"),
+                    allow_unrated: false,
+                    allowed_tags: &[],
+                    blocked_tags: &[],
+                },
+            )
+            .await?;
+        assert!(matches!(
+            restricted,
+            UserContentRestrictionsCasResult::Updated(_)
+        ));
+        assert!(
+            !fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?,
+            "a new content policy must revoke the cached allow immediately"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_access_cache_never_shares_entries_between_users()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        let other_user = UserStore::new(fixture.database.clone())?
+            .create_user("playback-cache-other", "Other", "test password", false)
+            .await?;
+        // New users default to `library_access_mode = 'ALL'`, so deny this one explicitly.
+        fixture
+            .database
+            .replace_user_library_access_mode(&other_user.id.to_string(), "NONE", &[])
+            .await?;
+        let other_principal = AccessPrincipal::new(other_user.id, false);
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+
+        fixture.database.reset_query_count();
+        assert!(
+            !fixture
+                .access
+                .can_view_item_in_library_cached(
+                    other_principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?,
+            "a second user without that library must not inherit the cached allow"
+        );
+        assert!(
+            fixture.database.query_count() > 0,
+            "the second user's answer must come from the database"
+        );
+
+        fixture.database.reset_query_count();
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(&fixture.library_id)
+                )
+                .await?
+        );
+        assert_eq!(
+            fixture.database.query_count(),
+            0,
+            "the first user's entry must survive the second user's denied check"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn playback_access_cache_is_bounded() -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        let access = fixture.access.clone().with_playback_access_capacity(2);
+        for item_id in ["bounded-a", "bounded-b", "bounded-c"] {
+            assert!(
+                access
+                    .can_view_item_in_library_cached(
+                        fixture.principal,
+                        item_id,
+                        Some(&fixture.library_id)
+                    )
+                    .await?
+            );
+        }
+        assert_eq!(
+            access.cached_playback_access_entries(),
+            2,
+            "the cache must never grow past its configured capacity"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn administrators_and_collection_items_stay_uncached()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let fixture = playback_cache_fixture().await?;
+        let admin = AccessPrincipal::new(fixture.principal.user_id.expect("viewer id"), true);
+        assert!(
+            fixture
+                .access
+                .can_view_item_in_library_cached(admin, "cached-movie", Some(&fixture.library_id))
+                .await?
+        );
+        assert!(
+            !fixture
+                .access
+                .can_view_item_in_library_cached(
+                    fixture.principal,
+                    "cached-movie",
+                    Some(crate::storage::GLOBAL_COLLECTION_LIBRARY_ID)
+                )
+                .await?
+        );
+        assert_eq!(
+            fixture.access.cached_playback_access_entries(),
+            0,
+            "administrators and the global collection library never need a cache entry"
+        );
+        Ok(())
+    }
 
     #[tokio::test]
     async fn batched_accessible_library_ids_match_single_principals()
