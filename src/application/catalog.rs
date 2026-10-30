@@ -519,6 +519,14 @@ impl CatalogService {
         self.library_page_cache.invalidate();
     }
 
+    /// The permission change counters the playback access cache already stamps its entries with.
+    ///
+    /// The home snapshot cache reads them too, so any write that changes which libraries or items a
+    /// user may see invalidates that user's cached home without a second, forgettable call site.
+    pub(crate) fn access_change_epochs(&self) -> &crate::storage::AccessChangeEpochs {
+        self.database.access_changes()
+    }
+
     pub async fn list_global_collection_cards(
         &self,
         principal: AccessPrincipal,

@@ -1400,7 +1400,7 @@ impl ScanJobService {
             return;
         }
         if let Some(home) = &self.home {
-            home.invalidate();
+            home.invalidate_directory();
         }
         self.user_events.publish_home_coalesced().await;
     }

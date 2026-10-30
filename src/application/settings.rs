@@ -1013,7 +1013,7 @@ pub(crate) async fn write_admin_settings(
         .await
         .map_err(|_| ())?;
     if let Some(home) = home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     Ok(())
 }

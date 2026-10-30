@@ -1402,7 +1402,7 @@ impl ScanJobService {
                 restart_from_beginning |= !marked;
                 if marked && changed_result {
                     if let Some(home) = &self.home {
-                        home.invalidate();
+                        home.invalidate_directory();
                     }
                     self.user_events.publish_home_coalesced().await;
                 }

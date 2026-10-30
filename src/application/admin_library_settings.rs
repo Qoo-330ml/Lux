@@ -66,7 +66,7 @@ async fn library_configuration_changed(
     plugins: Option<&PluginService>,
 ) -> Result<(), LibrarySettingsWriteError> {
     if let Some(home) = home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     if let Some(plugins) = plugins {
         plugins
@@ -85,7 +85,7 @@ pub(crate) async fn add_library_root(
 ) -> Result<AddRootResult, LibraryServiceError> {
     let result = libraries.add_root(library_id, path).await?;
     if let Some(home) = home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     Ok(result)
 }
@@ -98,7 +98,7 @@ pub(crate) async fn delete_library_root(
 ) -> Result<(), LibraryServiceError> {
     libraries.delete_root(library_id, root_id).await?;
     if let Some(home) = home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     Ok(())
 }
