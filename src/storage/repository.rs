@@ -5407,7 +5407,7 @@ fn adapt_static_sql_for_backend(sql: &'static str) -> sqlx::SqlStr {
 /// [`adapt_static_sql_for_backend`] against an explicit cache, so tests can bound and inspect one.
 ///
 /// Statements without a `?` byte never touch the memo: they are not rewritten, keep their static
-/// pointer and cost a single `memchr` pass with no lock and no allocation.
+/// pointer and cost a single linear scan for `?` with no lock and no allocation.
 fn adapt_static_sql_for_backend_with_cache(
     cache: &AdaptedSqlCache,
     sql: &'static str,
