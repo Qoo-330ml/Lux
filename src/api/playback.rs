@@ -1739,6 +1739,9 @@ pub(super) async fn handle_emby_playback_event(
             previous_state: previous_session
                 .as_ref()
                 .map(|session| session.state.as_str()),
+            previous_position_ticks: previous_session
+                .as_ref()
+                .map(|session| session.position_ticks),
             // The renewal joins the event transaction instead of committing on its own.
             renew_admission: state_name != "STOPPED",
         })
@@ -4479,6 +4482,9 @@ pub(super) async fn lux_web_playback_event(
                 previous_state: previous_session
                     .as_ref()
                     .map(|previous| previous.state.as_str()),
+                previous_position_ticks: previous_session
+                    .as_ref()
+                    .map(|previous| previous.position_ticks),
                 renew_admission: false,
             })
             .await
@@ -4791,6 +4797,9 @@ pub(super) async fn lux_post_progress(
             previous_state: previous_session
                 .as_ref()
                 .map(|previous| previous.state.as_str()),
+            previous_position_ticks: previous_session
+                .as_ref()
+                .map(|previous| previous.position_ticks),
             renew_admission: false,
         })
         .await

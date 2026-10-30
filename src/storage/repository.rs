@@ -4166,6 +4166,10 @@ pub(crate) struct NewPlaybackEvent<'a> {
     /// state means the event is a plain progress tick, which must not rewrite the derived resume
     /// pointer or the played container states.
     pub(crate) previous_state: Option<&'a str>,
+    /// Position the same session reported before this event, when it already existed. A tick that
+    /// moves the position across the configured resume threshold adds the item to, or removes it
+    /// from, continue-watching, so that tick refreshes the derived pointer like a state change.
+    pub(crate) previous_position_ticks: Option<i64>,
     /// Renew the matching playback admission in the same transaction as the session and item
     /// state writes. Callers that renew on a separate statement leave this `false` so the write
     /// pattern stays unchanged for their paths.
@@ -4184,8 +4188,9 @@ pub(crate) struct PlaybackContainerScope {
 pub(crate) struct PlaybackEventEffects {
     /// `user_item_state.is_played` flipped from `0` to `1` while recording this event.
     pub(crate) is_played_changed: bool,
-    /// Container scope, present when the event refreshed the resume pointer. The played-state
-    /// sync reuses it instead of reading the episode hierarchy a second time.
+    /// Episode scope read while refreshing the resume pointer. It is present whenever the event
+    /// ran that path for an episode, even when the episode has no series and therefore no pointer
+    /// row is written. The played-state sync reuses it instead of reading the hierarchy again.
     pub(crate) container_scope: Option<PlaybackContainerScope>,
 }
 

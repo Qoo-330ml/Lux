@@ -947,6 +947,7 @@ mod tests {
                 played_percent: 90,
                 is_paused: false,
                 previous_state: None,
+                previous_position_ticks: None,
                 renew_admission: false,
             })
             .await

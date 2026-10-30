@@ -18729,6 +18729,7 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             played_percent: 95,
             is_paused: true,
             previous_state: None,
+            previous_position_ticks: None,
             renew_admission: false,
         })
         .await?;
@@ -18768,6 +18769,7 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             played_percent: 95,
             is_paused: false,
             previous_state: Some("PAUSED"),
+            previous_position_ticks: Some(10),
             renew_admission: false,
         })
         .await?;
@@ -35068,7 +35070,7 @@ fn playback_progress_event<'a>(
     play_session_id: &'a str,
     state: &'a str,
     position_ticks: i64,
-    previous_state: Option<&'a str>,
+    previous: Option<(&'a str, i64)>,
 ) -> NewPlaybackEvent<'a> {
     NewPlaybackEvent {
         user_id,
@@ -35086,7 +35088,8 @@ fn playback_progress_event<'a>(
         duration_ticks: Some(PLAYBACK_PROGRESS_RUNTIME_TICKS),
         played_percent: 95,
         is_paused: state == "PAUSED",
-        previous_state,
+        previous_state: previous.map(|(state, _)| state),
+        previous_position_ticks: previous.map(|(_, position_ticks)| position_ticks),
         renew_admission: false,
     }
 }
@@ -35147,7 +35150,7 @@ async fn playback_progress_tick_skips_the_resume_pointer_and_container_sync()
             "progress-tick-session",
             "PLAYING",
             1_000_000_000,
-            Some("PLAYING"),
+            Some(("PLAYING", 0)),
         ))
         .await?;
     assert!(!tick.is_played_changed);
@@ -35162,8 +35165,9 @@ async fn playback_progress_tick_skips_the_resume_pointer_and_container_sync()
     );
     assert_eq!(
         database.query_count(),
-        2,
-        "a plain tick only writes the session row and the user item state"
+        3,
+        "a plain tick writes the session row and the user item state, and resolves the resume \
+         threshold without moving the pointer"
     );
     Ok(())
 }
@@ -35188,8 +35192,8 @@ async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer
             "progress-episode-1",
             "progress-flip-session",
             "PLAYING",
-            1_800_000_000,
-            Some("PLAYING"),
+            PLAYBACK_PROGRESS_RUNTIME_TICKS / 6,
+            Some(("PLAYING", 0)),
         ))
         .await?;
     assert!(!mid_episode.is_played_changed);
@@ -35203,7 +35207,7 @@ async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer
             "progress-flip-session",
             "PLAYING",
             PLAYBACK_PROGRESS_RUNTIME_TICKS,
-            Some("PLAYING"),
+            Some(("PLAYING", PLAYBACK_PROGRESS_RUNTIME_TICKS / 6)),
         ))
         .await?;
     assert!(
@@ -35219,8 +35223,8 @@ async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer
         .await?;
     assert_eq!(
         database.query_count(),
-        7,
-        "the flip event and its container sync cost two hierarchy reads and five writes"
+        8,
+        "the flip event and its container sync cost three reads and five writes"
     );
     assert_eq!(
         progress_pointer(&database, &user_id).await?,
@@ -35245,7 +35249,7 @@ async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer
             "progress-flip-session",
             "PLAYING",
             PLAYBACK_PROGRESS_RUNTIME_TICKS,
-            Some("PLAYING"),
+            Some(("PLAYING", PLAYBACK_PROGRESS_RUNTIME_TICKS)),
         ))
         .await?;
     assert!(
@@ -35256,9 +35260,9 @@ async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer
     assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
     assert_eq!(
         database.query_count(),
-        3,
+        4,
         "a tick past the played threshold writes the session row, the item state, and the \
-         last-played stamp only"
+         last-played stamp, and resolves the resume threshold only"
     );
 
     // Finish the series through the same event path: each remaining episode flips once and only
@@ -35283,7 +35287,7 @@ async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer
                 &session_id,
                 "PLAYING",
                 PLAYBACK_PROGRESS_RUNTIME_TICKS,
-                Some("PLAYING"),
+                Some(("PLAYING", 0)),
             ))
             .await?;
         assert!(flipped.is_played_changed);
@@ -35335,7 +35339,7 @@ async fn playback_progress_state_changes_refresh_the_resume_pointer()
             "progress-state-session",
             "PAUSED",
             1_800_000_000,
-            Some("PLAYING"),
+            Some(("PLAYING", 1_800_000_000)),
         ))
         .await?;
     assert!(
@@ -35357,7 +35361,7 @@ async fn playback_progress_state_changes_refresh_the_resume_pointer()
             "progress-state-session",
             "STOPPED",
             1_800_000_000,
-            Some("PAUSED"),
+            Some(("PAUSED", 1_800_000_000)),
         ))
         .await?;
     assert!(
@@ -35492,7 +35496,7 @@ async fn playback_event_renews_the_admission_in_its_own_transaction()
         "progress-admission-session",
         "PLAYING",
         1_200_000_000,
-        Some("PLAYING"),
+        Some(("PLAYING", 1_000_000_000)),
     );
     event.renew_admission = true;
     database.record_playback_event(event).await?;
@@ -35563,4 +35567,166 @@ async fn progress_container_states(
     .bind(user_id)
     .fetch_all(database.pool())
     .await?)
+}
+
+async fn progress_continue_watching_ids(
+    database: &Database,
+    user_id: &str,
+    minimum_ticks: i64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let library_ids = ["progress-lib".to_owned()];
+    let (ids, _) = database
+        .list_resume_pointer_ids(&ResumePointerQuery {
+            user_id,
+            library_ids: &library_ids,
+            item_types: &["EPISODE"],
+            content_restrictions: None,
+            played_percent: 95,
+            minimum_ticks,
+            offset: 0,
+            limit: 10,
+        })
+        .await?;
+    Ok(ids)
+}
+
+#[tokio::test]
+async fn first_watch_enters_continue_watching_when_the_position_crosses_the_resume_threshold()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    let (_, minimum_ticks) = database.home_resume_settings(&user_id).await?;
+    assert!(
+        minimum_ticks > 0 && minimum_ticks < PLAYBACK_PROGRESS_RUNTIME_TICKS,
+        "the fixture runtime must straddle the default resume threshold"
+    );
+    let below_threshold = minimum_ticks / 2;
+    let above_threshold = minimum_ticks + minimum_ticks / 4;
+
+    // First watch of a series with nothing completed yet: the start event reports position 0, so
+    // the candidate set is empty and no pointer row exists.
+    database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            0,
+            None,
+        ))
+        .await?;
+    assert!(progress_pointer(&database, &user_id).await?.is_none());
+    assert!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks)
+            .await?
+            .is_empty()
+    );
+
+    // Ticks below the threshold must not touch the pointer: the episode is not resumable yet.
+    let pointer_writes = progress_pointer_log(&database).await?;
+    database.reset_query_count();
+    let below = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            below_threshold,
+            Some(("PLAYING", 0)),
+        ))
+        .await?;
+    assert!(below.container_scope.is_none());
+    assert_eq!(
+        database.query_count(),
+        3,
+        "a tick that stays below the threshold resolves the threshold and writes no pointer"
+    );
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+
+    let still_below = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            below_threshold + 1,
+            Some(("PLAYING", below_threshold)),
+        ))
+        .await?;
+    assert!(still_below.container_scope.is_none());
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+    assert!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks)
+            .await?
+            .is_empty()
+    );
+
+    // The tick that crosses the threshold is what makes the episode resumable.
+    database.reset_query_count();
+    let crossing = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            above_threshold,
+            Some(("PLAYING", below_threshold + 1)),
+        ))
+        .await?;
+    assert!(
+        crossing.container_scope.is_some(),
+        "crossing the resume threshold refreshes the pointer"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-1".to_owned(), above_threshold)),
+        "the watched episode becomes its own resume pointer"
+    );
+    assert_eq!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks).await?,
+        vec!["progress-episode-1".to_owned()]
+    );
+
+    // Ticks that stay above the threshold are plain ticks again.
+    let pointer_writes = progress_pointer_log(&database).await?;
+    let above = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            above_threshold + 1,
+            Some(("PLAYING", above_threshold)),
+        ))
+        .await?;
+    assert!(above.container_scope.is_none());
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+
+    // A report that goes back below the threshold refreshes the pointer in the other direction
+    // too. Inside one session the stored position is monotonic (the upsert keeps the maximum), so
+    // the pointer itself keeps pointing at the episode; the refresh is what used to happen on
+    // every tick and it stays a no-op here instead of drifting.
+    let backwards = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            below_threshold,
+            Some(("PLAYING", above_threshold + 1)),
+        ))
+        .await?;
+    assert!(
+        backwards.container_scope.is_some(),
+        "crossing back below the threshold refreshes the pointer"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-1".to_owned(), above_threshold + 1)),
+        "the pointer follows the stored position, which one session never lowers"
+    );
+    assert_eq!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks).await?,
+        vec!["progress-episode-1".to_owned()]
+    );
+    Ok(())
 }

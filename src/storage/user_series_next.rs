@@ -32,7 +32,11 @@ pub(crate) struct ResumePointerQuery<'a> {
 }
 
 /// `resume_min_ticks` server setting with the default the authoritative query also applies.
-const RESUME_MINIMUM_TICKS_SQL: &str = "COALESCE(
+///
+/// Every path that needs the threshold resolves it through this one definition: the pointer
+/// candidate query, the resume list, and the per-event crossing check in
+/// [`Database::record_playback_event`].
+pub(super) const RESUME_MINIMUM_TICKS_SQL: &str = "COALESCE(
     (SELECT CAST(value AS BIGINT) FROM server_settings WHERE key = 'resume_min_ticks'),
     1200000000
 )";
@@ -408,8 +412,9 @@ impl Database {
 
     /// Refresh variant that joins the caller's transaction and reports the episode scope it read.
     ///
-    /// Non-episode items and episodes without a series have no pointer, so they return `None` and
-    /// touch nothing.
+    /// Non-episode items have no resume pointer, so they return `None`. Episodes always return
+    /// their scope; an episode without a series has nothing to point at, so only the pointer write
+    /// is skipped.
     pub(crate) async fn refresh_user_series_next_for_item_in(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -437,6 +442,28 @@ impl Database {
                 .await?;
         }
         Ok(Some(scope))
+    }
+
+    /// Resolves the resume threshold that decides whether an episode is in progress.
+    ///
+    /// `None` means the item is not an episode and has no resume pointer. The value comes from the
+    /// same SQL the pointer candidate query applies, so there is no second copy of the setting or
+    /// of its default.
+    pub(crate) async fn resume_threshold_for_item_in(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        item_id: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        let sql = format!(
+            "SELECT CASE WHEN EXISTS (
+                 SELECT 1 FROM media_items WHERE id = ? AND item_type = 'EPISODE'
+             ) THEN ({RESUME_MINIMUM_TICKS_SQL}) END"
+        );
+        self.query_scalar::<Option<i64>>(sqlx::AssertSqlSafe(sql))
+            .bind(item_id)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())
     }
 
     /// Rewrites one pointer in place.

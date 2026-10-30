@@ -674,10 +674,24 @@ impl Database {
             .map_err(self.sqlx_err())?;
         }
         // A plain progress tick leaves the derived pointer and the played container states alone;
-        // only a start, pause, stop, or played flip can change what they hold.
+        // only a start, pause, stop, played flip, or a position that crosses the resume threshold
+        // can change what they hold. The crossing matters because it is what adds an item to, or
+        // removes it from, continue-watching.
         let state_changed = event.previous_state != Some(event.state);
+        let crossed_resume_threshold = match event.previous_position_ticks {
+            Some(previous_position_ticks) if !state_changed => {
+                let threshold = self
+                    .resume_threshold_for_item_in(&mut transaction, event.item_id)
+                    .await?;
+                threshold.is_some_and(|minimum_ticks| {
+                    (previous_position_ticks < minimum_ticks)
+                        != (event.position_ticks < minimum_ticks)
+                })
+            }
+            _ => false,
+        };
         let mut container_scope = None;
-        if state_changed || is_played_changed {
+        if state_changed || is_played_changed || crossed_resume_threshold {
             container_scope = self
                 .refresh_user_series_next_for_item_in(
                     &mut transaction,
