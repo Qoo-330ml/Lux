@@ -386,6 +386,11 @@ impl AppState {
         self.core.database.as_ref()
     }
 
+    /// Reads the core `config_dir` for `require_service!(state.config_dir)`.
+    ///
+    /// `require_service!` expands to a method call, so the one handler that guards on the config
+    /// directory (`admin::admin_logs_events::admin_export_logs`) needs this accessor even though
+    /// no hand-written code calls `config_dir()` directly.
     pub(crate) fn config_dir(&self) -> Option<&PathBuf> {
         self.core.config_dir.as_ref()
     }
