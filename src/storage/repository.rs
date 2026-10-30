@@ -1092,6 +1092,19 @@ impl TryFrom<UserInvitationRecord> for StoredUserInvitation {
     }
 }
 
+/// Row of the persistent recommendation rating-median cache read.
+#[derive(Debug, sqlx::FromRow)]
+struct RecommendationRatingMedianRow {
+    median_rating: f64,
+    calculated_at: i64,
+}
+
+/// Row of the `_sqlx_migrations` schema version projection.
+#[derive(Debug, sqlx::FromRow)]
+struct SchemaVersionRow {
+    version: i64,
+}
+
 impl Database {
     pub async fn connect(config: &Config) -> Result<Self, StorageError> {
         Self::connect_with_configuration(config, &DatabaseConfiguration::Sqlite).await
@@ -1521,9 +1534,9 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
         {
-            let calculated_at: i64 = row.get("calculated_at");
-            if recommendation_rating_cache_is_fresh(now, calculated_at) {
-                let median: f64 = row.get("median_rating");
+            let row = RecommendationRatingMedianRow::from_row(&row).map_err(self.sqlx_err())?;
+            if recommendation_rating_cache_is_fresh(now, row.calculated_at) {
+                let median = row.median_rating;
                 self.recommendation_rating_median_cache
                     .lock()
                     .await
@@ -1532,7 +1545,7 @@ impl Database {
                         cache_key,
                         RecommendationRatingMedianEntry {
                             value: median,
-                            calculated_at,
+                            calculated_at: row.calculated_at,
                         },
                     );
                 return Ok(median);
@@ -1595,11 +1608,13 @@ impl Database {
     }
 
     pub async fn schema_version(&self) -> Result<i64, StorageError> {
-        self.query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
+        let row = self
+            .query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("version"))
-            .map_err(self.sqlx_err())
+            .map_err(self.sqlx_err())?;
+        let row = SchemaVersionRow::from_row(&row).map_err(self.sqlx_err())?;
+        Ok(row.version)
     }
 
     pub(crate) async fn identity_stability_repair_completed(&self) -> Result<bool, StorageError> {
@@ -3905,68 +3920,150 @@ pub(crate) struct StoredJobActivityItem {
     pub(crate) series_title: Option<String>,
 }
 
-fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReidentifyJob {
-    StoredMetadataReidentifyJob {
-        id: row.get("id"),
-        status: row.get("status"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-        mode: row.get("mode"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        library_id: row.get("library_id"),
-        job_scope: row.get("job_scope"),
-        pending_count: row.get("pending_count"),
-    }
+/// Row of every [`StoredMetadataReidentifyJob`] projection.
+///
+/// `cancel_requested` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the
+/// conversion to `bool` happens in [`stored_metadata_reidentify_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMetadataReidentifyJobRow {
+    id: String,
+    status: String,
+    processed_count: i64,
+    total_count: i64,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+    mode: String,
+    cancel_requested: i64,
+    library_id: Option<String>,
+    job_scope: String,
+    pending_count: i64,
 }
 
-fn stored_metadata_reidentify_item(row: sqlx::any::AnyRow) -> StoredMetadataReidentifyItem {
-    StoredMetadataReidentifyItem {
-        job_id: row.get("job_id"),
-        item_id: row.get("item_id"),
-        status: row.get("status"),
-        candidate_count: row.get("candidate_count"),
-        error: row.get("error"),
-        updated_at: row.get("updated_at"),
-    }
+fn stored_metadata_reidentify_job(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredMetadataReidentifyJob, sqlx::Error> {
+    let row = StoredMetadataReidentifyJobRow::from_row(&row)?;
+    Ok(StoredMetadataReidentifyJob {
+        id: row.id,
+        status: row.status,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        mode: row.mode,
+        cancel_requested: row.cancel_requested != 0,
+        library_id: row.library_id,
+        job_scope: row.job_scope,
+        pending_count: row.pending_count,
+    })
 }
 
-fn stored_metadata_candidate(row: sqlx::any::AnyRow) -> StoredMetadataCandidate {
-    StoredMetadataCandidate {
-        id: row.get("id"),
-        item_id: row.get("item_id"),
-        provider: row.get("provider"),
-        provider_id: row.get("provider_id"),
-        candidate_json: row.get("candidate_json"),
-        score: row.get("score"),
-        status: row.get("status"),
-        expires_at: row.get("expires_at"),
-        item_title: row.get("item_title"),
-    }
+/// Row of every [`StoredMetadataReidentifyItem`] projection.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMetadataReidentifyItemRow {
+    job_id: String,
+    item_id: String,
+    status: String,
+    candidate_count: i64,
+    error: Option<String>,
+    updated_at: i64,
 }
 
-fn stored_item_metadata_completeness(row: sqlx::any::AnyRow) -> StoredItemMetadataCompleteness {
-    StoredItemMetadataCompleteness {
-        item_id: row.get("item_id"),
-        capability: row.get("capability"),
-        local_state: row.get("local_state"),
-        is_missing: row
-            .get::<Option<i64>, _>("is_missing")
-            .map(|value| value != 0),
-        input_fingerprint: row.get("input_fingerprint"),
-        checked_at: row.get("checked_at"),
-        retry_after: row.get("retry_after"),
-        error: row.get("error"),
-        updated_at: row.get("updated_at"),
-    }
+fn stored_metadata_reidentify_item(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredMetadataReidentifyItem, sqlx::Error> {
+    let row = StoredMetadataReidentifyItemRow::from_row(&row)?;
+    Ok(StoredMetadataReidentifyItem {
+        job_id: row.job_id,
+        item_id: row.item_id,
+        status: row.status,
+        candidate_count: row.candidate_count,
+        error: row.error,
+        updated_at: row.updated_at,
+    })
 }
 
-fn stored_media_item(row: sqlx::any::AnyRow) -> StoredMediaItem {
-    StoredMediaItem { id: row.get("id") }
+/// Row of every [`StoredMetadataCandidate`] projection; `item_title` comes from the joined
+/// `media_items.title`.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMetadataCandidateRow {
+    id: String,
+    item_id: String,
+    provider: String,
+    provider_id: String,
+    candidate_json: String,
+    score: f64,
+    status: String,
+    expires_at: Option<i64>,
+    item_title: String,
+}
+
+fn stored_metadata_candidate(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredMetadataCandidate, sqlx::Error> {
+    let row = StoredMetadataCandidateRow::from_row(&row)?;
+    Ok(StoredMetadataCandidate {
+        id: row.id,
+        item_id: row.item_id,
+        provider: row.provider,
+        provider_id: row.provider_id,
+        candidate_json: row.candidate_json,
+        score: row.score,
+        status: row.status,
+        expires_at: row.expires_at,
+        item_title: row.item_title,
+    })
+}
+
+/// Row of every [`StoredItemMetadataCompleteness`] projection.
+///
+/// `is_missing` stays `Option<i64>` because a non-`READY` row stores `NULL` and the conversion to
+/// `Option<bool>` happens in [`stored_item_metadata_completeness`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredItemMetadataCompletenessRow {
+    item_id: String,
+    capability: String,
+    local_state: String,
+    is_missing: Option<i64>,
+    input_fingerprint: Option<Vec<u8>>,
+    checked_at: Option<i64>,
+    retry_after: Option<i64>,
+    error: Option<String>,
+    updated_at: i64,
+}
+
+fn stored_item_metadata_completeness(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredItemMetadataCompleteness, sqlx::Error> {
+    let row = StoredItemMetadataCompletenessRow::from_row(&row)?;
+    Ok(StoredItemMetadataCompleteness {
+        item_id: row.item_id,
+        capability: row.capability,
+        local_state: row.local_state,
+        is_missing: row.is_missing.map(|value| value != 0),
+        input_fingerprint: row.input_fingerprint,
+        checked_at: row.checked_at,
+        retry_after: row.retry_after,
+        error: row.error,
+        updated_at: row.updated_at,
+    })
+}
+
+/// Row of every [`StoredMediaItem`] projection.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMediaItemRow {
+    id: String,
+}
+
+fn stored_media_item(row: sqlx::any::AnyRow) -> Result<StoredMediaItem, sqlx::Error> {
+    let row = StoredMediaItemRow::from_row(&row)?;
+    Ok(StoredMediaItem { id: row.id })
 }
 
 #[derive(Debug)]
@@ -4162,29 +4259,60 @@ pub(crate) struct StoredWebPlaybackSession {
     pub(crate) updated_at: i64,
 }
 
-fn stored_web_playback_session(row: sqlx::any::AnyRow) -> StoredWebPlaybackSession {
-    StoredWebPlaybackSession {
-        id: row.get("id"),
-        user_id: row.get("user_id"),
-        item_id: row.get("item_id"),
-        media_source_id: row.get("media_source_id"),
-        play_session_id: row.get("play_session_id"),
-        tier: row.get("tier"),
-        plan: row.get("plan"),
-        state: row.get("state"),
-        temp_dir: row.get("temp_dir"),
-        is_admin: row.get::<i64, _>("is_admin") != 0,
-        expires_at: row.get("expires_at"),
-        last_heartbeat_at: row.get("last_heartbeat_at"),
-        last_sequence: row.get("last_sequence"),
-        video_codec: row.get("video_codec"),
-        audio_codec: row.get("audio_codec"),
-        video_bitrate: row.get("video_bitrate"),
-        audio_bitrate: row.get("audio_bitrate"),
-        transcoding_container: row.get("transcoding_container"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+/// Row of every [`StoredWebPlaybackSession`] projection.
+///
+/// `is_admin` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the conversion
+/// to `bool` happens in [`stored_web_playback_session`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredWebPlaybackSessionRow {
+    id: String,
+    user_id: String,
+    item_id: String,
+    media_source_id: Option<String>,
+    play_session_id: String,
+    tier: i64,
+    plan: String,
+    state: String,
+    temp_dir: Option<String>,
+    is_admin: i64,
+    expires_at: i64,
+    last_heartbeat_at: i64,
+    last_sequence: i64,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    video_bitrate: Option<i64>,
+    audio_bitrate: Option<i64>,
+    transcoding_container: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_web_playback_session(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredWebPlaybackSession, sqlx::Error> {
+    let row = StoredWebPlaybackSessionRow::from_row(&row)?;
+    Ok(StoredWebPlaybackSession {
+        id: row.id,
+        user_id: row.user_id,
+        item_id: row.item_id,
+        media_source_id: row.media_source_id,
+        play_session_id: row.play_session_id,
+        tier: row.tier,
+        plan: row.plan,
+        state: row.state,
+        temp_dir: row.temp_dir,
+        is_admin: row.is_admin != 0,
+        expires_at: row.expires_at,
+        last_heartbeat_at: row.last_heartbeat_at,
+        last_sequence: row.last_sequence,
+        video_codec: row.video_codec,
+        audio_codec: row.audio_codec,
+        video_bitrate: row.video_bitrate,
+        audio_bitrate: row.audio_bitrate,
+        transcoding_container: row.transcoding_container,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4208,26 +4336,52 @@ pub(crate) struct StoredPlaybackSession {
     pub(crate) last_event_at: i64,
 }
 
-fn stored_playback_session(row: sqlx::any::AnyRow) -> StoredPlaybackSession {
-    StoredPlaybackSession {
-        id: row.get("id"),
-        user_id: row.get("user_id"),
-        item_id: row.get("item_id"),
-        media_source_id: row.get("media_source_id"),
-        play_session_id: row.get("play_session_id"),
-        device_id: row.get("device_id"),
-        client: row.get("client"),
-        device_name: row.get("device_name"),
-        client_version: row.get("client_version"),
-        device_type: row.get("device_type"),
-        remote_ip: row.get("remote_ip"),
-        state: row.get("state"),
-        position_ticks: row.get("position_ticks"),
-        duration_ticks: row.get("duration_ticks"),
-        is_paused: row.get::<i64, _>("is_paused") != 0,
-        started_at: row.get("started_at"),
-        last_event_at: row.get("last_event_at"),
-    }
+/// Row of every [`StoredPlaybackSession`] projection.
+///
+/// `is_paused` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the conversion
+/// to `bool` happens in [`stored_playback_session`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPlaybackSessionRow {
+    id: String,
+    user_id: String,
+    item_id: String,
+    media_source_id: Option<String>,
+    play_session_id: String,
+    device_id: String,
+    client: Option<String>,
+    device_name: Option<String>,
+    client_version: Option<String>,
+    device_type: Option<String>,
+    remote_ip: Option<String>,
+    state: String,
+    position_ticks: i64,
+    duration_ticks: Option<i64>,
+    is_paused: i64,
+    started_at: i64,
+    last_event_at: i64,
+}
+
+fn stored_playback_session(row: sqlx::any::AnyRow) -> Result<StoredPlaybackSession, sqlx::Error> {
+    let row = StoredPlaybackSessionRow::from_row(&row)?;
+    Ok(StoredPlaybackSession {
+        id: row.id,
+        user_id: row.user_id,
+        item_id: row.item_id,
+        media_source_id: row.media_source_id,
+        play_session_id: row.play_session_id,
+        device_id: row.device_id,
+        client: row.client,
+        device_name: row.device_name,
+        client_version: row.client_version,
+        device_type: row.device_type,
+        remote_ip: row.remote_ip,
+        state: row.state,
+        position_ticks: row.position_ticks,
+        duration_ticks: row.duration_ticks,
+        is_paused: row.is_paused != 0,
+        started_at: row.started_at,
+        last_event_at: row.last_event_at,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -4344,18 +4498,33 @@ pub(crate) struct StoredLibraryPoster {
     pub(crate) root_path: String,
 }
 
-fn stored_item_image(row: sqlx::any::AnyRow) -> StoredItemImage {
-    StoredItemImage {
-        id: row.get("id"),
-        item_id: row.get("item_id"),
-        image_type: row.get("image_type"),
-        image_index: row.get("image_index"),
-        local_path: row.get("local_path"),
-        file_size: row.get("file_size"),
-        content_tag: row.get("content_tag"),
-        source: row.get("source"),
-        root_path: row.get("root_path"),
-    }
+/// Row of every [`StoredItemImage`] projection; `root_path` comes from the joined library root.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredItemImageRow {
+    id: String,
+    item_id: String,
+    image_type: String,
+    image_index: i64,
+    local_path: String,
+    file_size: Option<i64>,
+    content_tag: Option<String>,
+    source: String,
+    root_path: Option<String>,
+}
+
+fn stored_item_image(row: sqlx::any::AnyRow) -> Result<StoredItemImage, sqlx::Error> {
+    let row = StoredItemImageRow::from_row(&row)?;
+    Ok(StoredItemImage {
+        id: row.id,
+        item_id: row.item_id,
+        image_type: row.image_type,
+        image_index: row.image_index,
+        local_path: row.local_path,
+        file_size: row.file_size,
+        content_tag: row.content_tag,
+        source: row.source,
+        root_path: row.root_path,
+    })
 }
 
 fn catalog_filter_where_clause<'a>(
@@ -5109,24 +5278,48 @@ pub(crate) struct StoredMovieIdentity {
     pub(crate) provider_id: String,
 }
 
-fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> StoredDanmakuMatchJob {
-    StoredDanmakuMatchJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        status: row.get("status"),
-        overwrite: row.get::<i64, _>("overwrite") != 0,
-        concurrency: row.get("concurrency"),
-        total_count: row.get("total_count"),
-        processed_count: row.get("processed_count"),
-        success_count: row.get("success_count"),
-        skipped_count: row.get("skipped_count"),
-        failed_count: row.get("failed_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+/// Row of every [`StoredDanmakuMatchJob`] projection.
+///
+/// `overwrite` and `cancel_requested` stay `i64` because both backends store the flags as
+/// `BIGINT` 0/1 and the conversion to `bool` happens in [`stored_danmaku_match_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredDanmakuMatchJobRow {
+    id: String,
+    library_id: String,
+    status: String,
+    overwrite: i64,
+    concurrency: i64,
+    total_count: i64,
+    processed_count: i64,
+    success_count: i64,
+    skipped_count: i64,
+    failed_count: i64,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> Result<StoredDanmakuMatchJob, sqlx::Error> {
+    let row = StoredDanmakuMatchJobRow::from_row(&row)?;
+    Ok(StoredDanmakuMatchJob {
+        id: row.id,
+        library_id: row.library_id,
+        status: row.status,
+        overwrite: row.overwrite != 0,
+        concurrency: row.concurrency,
+        total_count: row.total_count,
+        processed_count: row.processed_count,
+        success_count: row.success_count,
+        skipped_count: row.skipped_count,
+        failed_count: row.failed_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
 }
 
 fn first_provider_id(
@@ -5309,20 +5502,40 @@ pub(crate) struct StoredLibraryCoverJob {
     pub(crate) finished_at: Option<i64>,
 }
 
-fn stored_library_cover_job(row: sqlx::any::AnyRow) -> StoredLibraryCoverJob {
-    StoredLibraryCoverJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        is_manual: row.get::<i64, _>("is_manual") != 0,
-        status: row.get("status"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+/// Row of every [`StoredLibraryCoverJob`] projection.
+///
+/// `is_manual` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the conversion
+/// to `bool` happens in [`stored_library_cover_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredLibraryCoverJobRow {
+    id: String,
+    library_id: String,
+    is_manual: i64,
+    status: String,
+    processed_count: i64,
+    total_count: i64,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn stored_library_cover_job(row: sqlx::any::AnyRow) -> Result<StoredLibraryCoverJob, sqlx::Error> {
+    let row = StoredLibraryCoverJobRow::from_row(&row)?;
+    Ok(StoredLibraryCoverJob {
+        id: row.id,
+        library_id: row.library_id,
+        is_manual: row.is_manual != 0,
+        status: row.status,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
 }
 
 pub(crate) struct NewMediaChapterMarker {
@@ -6952,8 +7165,8 @@ mod stored_row_decoding_tests {
 
     /// A projection that drifts from its row struct must surface as a storage error.
     ///
-    /// The scan/person decoders used to call `row.get`, which panicked on a missing
-    /// column; each `*Row` struct reports `ColumnNotFound` instead.
+    /// The shared decoders used to call `row.get`, which panicked on a missing column; every
+    /// `*Row` struct reports `ColumnNotFound` instead.
     #[tokio::test]
     async fn stored_row_structs_report_missing_columns_instead_of_panicking()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -6985,6 +7198,27 @@ mod stored_row_decoding_tests {
                 .expect_err("person credit columns must not decode"),
             StoredPersonIndexRebuildJobRow::from_row(&row)
                 .expect_err("person index rebuild job columns must not decode"),
+            StoredMetadataReidentifyJobRow::from_row(&row)
+                .expect_err("metadata reidentify job columns must not decode"),
+            StoredMetadataReidentifyItemRow::from_row(&row)
+                .expect_err("metadata reidentify item columns must not decode"),
+            StoredMetadataCandidateRow::from_row(&row)
+                .expect_err("metadata candidate columns must not decode"),
+            StoredItemMetadataCompletenessRow::from_row(&row)
+                .expect_err("item metadata completeness columns must not decode"),
+            StoredMediaItemRow::from_row(&row).expect_err("media item columns must not decode"),
+            StoredWebPlaybackSessionRow::from_row(&row)
+                .expect_err("web playback session columns must not decode"),
+            StoredPlaybackSessionRow::from_row(&row)
+                .expect_err("playback session columns must not decode"),
+            StoredItemImageRow::from_row(&row).expect_err("item image columns must not decode"),
+            StoredDanmakuMatchJobRow::from_row(&row)
+                .expect_err("danmaku match job columns must not decode"),
+            StoredLibraryCoverJobRow::from_row(&row)
+                .expect_err("library cover job columns must not decode"),
+            RecommendationRatingMedianRow::from_row(&row)
+                .expect_err("rating median columns must not decode"),
+            SchemaVersionRow::from_row(&row).expect_err("schema version columns must not decode"),
         ];
         for error in errors {
             assert!(
@@ -6992,6 +7226,360 @@ mod stored_row_decoding_tests {
                 "unexpected decode error: {error}"
             );
         }
+        Ok(())
+    }
+
+    /// The rating-median cache read is covered by
+    /// `recommendation_rating_median_survives_restart_until_thirty_day_ttl`; the schema version
+    /// projection has no other library test path.
+    #[tokio::test]
+    async fn schema_version_row_decodes_the_migration_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        assert!(database.schema_version().await? > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_metadata_reidentify_rows_decode_jobs_and_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('reid-lib', 'Reid', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (
+                 'reid-item', 'reid-lib', 'MOVIE', 'Reid Movie', 'reid movie', 'LOCAL_CONFIRMED'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        database
+            .create_metadata_reidentify_job("reid-job", &["reid-item".to_owned()], "REIDENTIFY")
+            .await?;
+
+        let job = database
+            .find_metadata_reidentify_job("reid-job")
+            .await?
+            .expect("reidentify job should exist");
+        assert_eq!(job.status, "QUEUED");
+        assert_eq!(job.mode, "REIDENTIFY");
+        assert_eq!(job.job_scope, "ITEMS");
+        assert_eq!(job.library_id.as_deref(), Some("reid-lib"));
+        assert_eq!(job.total_count, 1);
+        assert_eq!(job.processed_count, 0);
+        assert_eq!(job.pending_count, 0);
+        assert!(!job.cancel_requested);
+        assert_eq!(job.error, None);
+        assert_eq!(job.started_at, None);
+        assert_eq!(job.finished_at, None);
+
+        let items = database
+            .list_metadata_reidentify_items("reid-job", 0, 10)
+            .await?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].job_id, "reid-job");
+        assert_eq!(items[0].item_id, "reid-item");
+        assert_eq!(items[0].status, "PENDING");
+        assert_eq!(items[0].candidate_count, 0);
+        assert_eq!(items[0].error, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_metadata_candidate_and_completeness_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('meta-lib', 'Meta', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (
+                 'candidate-item', 'meta-lib', 'MOVIE', 'Candidate Movie',
+                 'candidate movie', 'LOCAL_CONFIRMED'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status,
+                 expires_at
+             ) VALUES (
+                 'candidate-a', 'candidate-item', 'tmdb', '42', '{\"title\":\"Candidate\"}',
+                 87.5, 'PENDING', 1900000000
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let candidate = database
+            .find_metadata_candidate("candidate-item", "candidate-a")
+            .await?
+            .expect("candidate should exist");
+        assert_eq!(candidate.id, "candidate-a");
+        assert_eq!(candidate.item_id, "candidate-item");
+        assert_eq!(candidate.provider, "tmdb");
+        assert_eq!(candidate.provider_id, "42");
+        assert_eq!(candidate.score, 87.5);
+        assert_eq!(candidate.status, "PENDING");
+        assert_eq!(candidate.expires_at, Some(1_900_000_000));
+        assert_eq!(candidate.item_title, "Candidate Movie");
+
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing, input_fingerprint,
+                 checked_at, retry_after, error
+             ) VALUES (
+                 'candidate-item', 'metadata', 'READY', 1, X'63616665', 1700000000, NULL, NULL
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing, input_fingerprint,
+                 checked_at, retry_after, error
+             ) VALUES (
+                 'candidate-item', 'images', 'PENDING', NULL, NULL, NULL, 1700000123, 'queued'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let missing = database
+            .find_item_metadata_completeness("candidate-item", "metadata")
+            .await?
+            .expect("metadata completeness should exist");
+        assert_eq!(missing.local_state, "READY");
+        assert_eq!(missing.is_missing, Some(true));
+        assert_eq!(missing.input_fingerprint.as_deref(), Some(&b"cafe"[..]));
+        assert_eq!(missing.checked_at, Some(1_700_000_000));
+        assert_eq!(missing.retry_after, None);
+        assert_eq!(missing.error, None);
+
+        let pending = database
+            .find_item_metadata_completeness("candidate-item", "images")
+            .await?
+            .expect("image completeness should exist");
+        assert_eq!(pending.local_state, "PENDING");
+        assert_eq!(pending.is_missing, None);
+        assert_eq!(pending.checked_at, None);
+        assert_eq!(pending.retry_after, Some(1_700_000_123));
+        assert_eq!(pending.error.as_deref(), Some("queued"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_media_item_and_item_image_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('image-lib', 'Image', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('image-root', 'image-lib', '/media/images', 'Images', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status, identity_key
+             ) VALUES (
+                 'image-item', 'image-lib', 'MOVIE', 'Image Movie', 'image movie',
+                 'LOCAL_CONFIRMED', 'identity-image'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let media_item = database
+            .find_media_item_by_identity("identity-image")
+            .await?
+            .expect("media item should exist");
+        assert_eq!(media_item.id, "image-item");
+
+        sqlx::query(
+            "INSERT INTO item_images (
+                 id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+             ) VALUES (
+                 'image-a', 'image-item', 'POSTER', 1, 'posters/image-a.jpg', 2048, 'tag-a', 'LOCAL'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let image = database
+            .find_item_image("image-item", "image-a")
+            .await?
+            .expect("item image should exist");
+        assert_eq!(image.id, "image-a");
+        assert_eq!(image.item_id, "image-item");
+        assert_eq!(image.image_type, "POSTER");
+        assert_eq!(image.image_index, 1);
+        assert_eq!(image.local_path, "posters/image-a.jpg");
+        assert_eq!(image.file_size, Some(2048));
+        assert_eq!(image.content_tag.as_deref(), Some("tag-a"));
+        assert_eq!(image.source, "LOCAL");
+        assert_eq!(image.root_path.as_deref(), Some("/media/images"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_danmaku_match_and_library_cover_job_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('job-lib', 'Jobs', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .create_danmaku_match_job(NewDanmakuMatchJob {
+                id: "danmaku-job",
+                library_id: "job-lib",
+                overwrite: true,
+                concurrency: 3,
+            })
+            .await?;
+
+        let danmaku = database
+            .find_danmaku_match_job("danmaku-job")
+            .await?
+            .expect("danmaku job should exist");
+        assert_eq!(danmaku.id, "danmaku-job");
+        assert_eq!(danmaku.library_id, "job-lib");
+        assert_eq!(danmaku.status, "PENDING");
+        assert!(danmaku.overwrite);
+        assert_eq!(danmaku.concurrency, 3);
+        assert_eq!(danmaku.total_count, 0);
+        assert_eq!(danmaku.processed_count, 0);
+        assert_eq!(danmaku.success_count, 0);
+        assert_eq!(danmaku.skipped_count, 0);
+        assert_eq!(danmaku.failed_count, 0);
+        assert!(!danmaku.cancel_requested);
+        assert_eq!(danmaku.error, None);
+        assert_eq!(danmaku.started_at, None);
+        assert_eq!(danmaku.finished_at, None);
+
+        assert!(
+            database
+                .create_library_cover_job("cover-job", "job-lib", true)
+                .await?
+        );
+        let cover = database
+            .find_library_cover_job("cover-job")
+            .await?
+            .expect("library cover job should exist");
+        assert_eq!(cover.id, "cover-job");
+        assert_eq!(cover.library_id, "job-lib");
+        assert!(cover.is_manual);
+        assert_eq!(cover.status, "PENDING");
+        assert_eq!(cover.processed_count, 0);
+        assert_eq!(cover.total_count, 1);
+        assert_eq!(cover.error, None);
+        assert_eq!(cover.started_at, None);
+        assert_eq!(cover.finished_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_playback_and_web_playback_session_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .insert_user("session-user", "session", "Session", "hash", false, true)
+            .await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('session-lib', 'S', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (
+                 'session-item', 'session-lib', 'MOVIE', 'Session Movie',
+                 'session movie', 'LOCAL_CONFIRMED'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                 id, user_id, item_id, play_session_id, device_id, client, device_name,
+                 client_version, device_type, remote_ip, state, position_ticks,
+                 duration_ticks, is_paused, started_at, last_event_at
+             ) VALUES (
+                 'ps-a', 'session-user', 'session-item', 'play-a', 'device-a', 'Lux',
+                 'Living Room', '1.2.3', 'TV', '10.0.0.7', 'PAUSED', 120, 240, 1,
+                 1800000000, 1800000060
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO web_playback_sessions (
+                 id, user_id, item_id, media_source_id, play_session_id, tier, plan, state,
+                 temp_dir, is_admin, expires_at, last_heartbeat_at, last_sequence,
+                 video_codec, audio_codec, video_bitrate, audio_bitrate,
+                 transcoding_container, created_at, updated_at
+             ) VALUES (
+                 'wps-a', 'session-user', 'session-item', NULL, 'web-a', 2, 'SERVER_HLS',
+                 'ACTIVE', '/tmp/transcode', 1, 1800003600, 1800000060, 7,
+                 'h264', 'aac', 4000000, 192000, 'fmp4', 1800000000, 1800000060
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let session = database
+            .find_playback_session_by_id("ps-a")
+            .await?
+            .expect("playback session should exist");
+        assert_eq!(session.user_id, "session-user");
+        assert_eq!(session.item_id, "session-item");
+        assert_eq!(session.media_source_id, None);
+        assert_eq!(session.play_session_id, "play-a");
+        assert_eq!(session.device_id, "device-a");
+        assert_eq!(session.client.as_deref(), Some("Lux"));
+        assert_eq!(session.device_name.as_deref(), Some("Living Room"));
+        assert_eq!(session.client_version.as_deref(), Some("1.2.3"));
+        assert_eq!(session.device_type.as_deref(), Some("TV"));
+        assert_eq!(session.remote_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(session.state, "PAUSED");
+        assert_eq!(session.position_ticks, 120);
+        assert_eq!(session.duration_ticks, Some(240));
+        assert!(session.is_paused);
+        assert_eq!(session.started_at, 1_800_000_000);
+        assert_eq!(session.last_event_at, 1_800_000_060);
+
+        let web = database
+            .find_web_playback_session("wps-a")
+            .await?
+            .expect("web playback session should exist");
+        assert_eq!(web.user_id, "session-user");
+        assert_eq!(web.item_id, "session-item");
+        assert_eq!(web.play_session_id, "web-a");
+        assert_eq!(web.tier, 2);
+        assert_eq!(web.plan, "SERVER_HLS");
+        assert_eq!(web.state, "ACTIVE");
+        assert_eq!(web.temp_dir.as_deref(), Some("/tmp/transcode"));
+        assert!(web.is_admin);
+        assert_eq!(web.expires_at, 1_800_003_600);
+        assert_eq!(web.last_heartbeat_at, 1_800_000_060);
+        assert_eq!(web.last_sequence, 7);
+        assert_eq!(web.video_codec.as_deref(), Some("h264"));
+        assert_eq!(web.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(web.video_bitrate, Some(4_000_000));
+        assert_eq!(web.audio_bitrate, Some(192_000));
+        assert_eq!(web.transcoding_container.as_deref(), Some("fmp4"));
+        assert_eq!(web.created_at, 1_800_000_000);
+        assert_eq!(web.updated_at, 1_800_000_060);
         Ok(())
     }
 }

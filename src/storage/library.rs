@@ -817,7 +817,9 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_library_cover_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_library_cover_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -851,7 +853,10 @@ impl Database {
         query
             .fetch_all(&self.pool)
             .await
-            .map(|rows| rows.into_iter().map(stored_library_cover_job).collect())
+            .map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_library_cover_job)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())
     }
 

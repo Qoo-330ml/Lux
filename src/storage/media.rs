@@ -3122,7 +3122,9 @@ impl Database {
                 .await
             }
         };
-        row.map(|row| row.map(stored_media_item))
+        row.map_err(self.sqlx_err())?
+            .map(stored_media_item)
+            .transpose()
             .map_err(self.sqlx_err())
     }
 
@@ -3219,7 +3221,9 @@ impl Database {
         .bind(identity_key)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_media_item))
+        .map_err(self.sqlx_err())?
+        .map(stored_media_item)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
