@@ -2156,7 +2156,7 @@ pub(super) async fn auth_update_account_preferences(
                 .retain(|library_id| accessible_library_ids.contains(library_id));
             {
                 let home = state.home();
-                home.invalidate();
+                home.invalidate_user(&user.id.to_string());
             }
             state
                 .user_events
@@ -2270,7 +2270,7 @@ pub(super) async fn auth_update_settings(
         }
         {
             let home = state.home();
-            home.invalidate();
+            home.invalidate_user(&user.id.to_string());
         }
         state
             .user_events
@@ -2525,7 +2525,7 @@ pub(super) async fn auth_update_library_order(
             let preferences_version = updated.version;
             {
                 let home = state.home();
-                home.invalidate();
+                home.invalidate_user(&user.id.to_string());
             }
             state
                 .user_events

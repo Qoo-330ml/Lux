@@ -1783,6 +1783,9 @@ pub(super) async fn handle_emby_playback_event(
             {
                 return web_playback_error(&headers, error);
             }
+            // Progress and played flags only change this user's rails, so every other user's
+            // cached home stays valid.
+            state.home().invalidate_user(&user_id);
             state.user_events.publish_home_coalesced_for(&user_id).await;
             if state_name != "STOPPED"
                 && let Some(session_id) = emby_transcode_session_id
@@ -4553,6 +4556,9 @@ pub(super) async fn lux_web_playback_event(
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
+        // Progress and played flags only change this user's rails; other users keep their cached
+        // home snapshots.
+        state.home().invalidate_user(&session.user_id);
         state
             .user_events
             .publish_progress_coalesced(&session.user_id, &session.item_id)
@@ -4879,6 +4885,7 @@ pub(super) async fn lux_post_progress(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            state.home().invalidate_user(&user_id);
             state.user_events.publish_home_coalesced_for(&user_id).await;
             if let Some(event_type) = activity_event {
                 record_activity_event(
@@ -5021,6 +5028,8 @@ pub(super) async fn handle_emby_user_flag(
                 Ok(user_state) => user_state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
+            // Played and favorite flags change only this user's rails.
+            state.home().invalidate_user(&target_user_id);
             state.user_events.publish_for_user(
                 if played {
                     UserEventScope::Item
@@ -5123,6 +5132,8 @@ pub(super) async fn lux_set_favorite(
         .await
     {
         Ok(()) => {
+            // A favorite changes only this user's rails.
+            state.home().invalidate_user(&user.id.to_string());
             state
                 .user_events
                 .publish_for_user(UserEventScope::Favorites, &user.id.to_string());
@@ -5167,6 +5178,8 @@ pub(super) async fn lux_set_played(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            // A played flip changes only this user's rails.
+            state.home().invalidate_user(&user.id.to_string());
             state
                 .user_events
                 .publish_for_user(UserEventScope::Item, &user.id.to_string());

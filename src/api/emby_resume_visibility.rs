@@ -58,6 +58,10 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
     let notification_user_id = principal.user_id.map(|user_id| user_id.to_string());
     match catalog.set_resume_hidden(principal, &item_id, hidden).await {
         Ok(user_state) => {
+            // Hiding an item from resume changes only this user's continue-watching rail.
+            if let Some(user_id) = notification_user_id.as_deref() {
+                state.home().invalidate_user(user_id);
+            }
             match notification_user_id {
                 Some(user_id) => state.user_events.publish_home_coalesced_for(&user_id).await,
                 // No user to attribute the change to; keep the old broadcast.

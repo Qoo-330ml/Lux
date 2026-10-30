@@ -452,6 +452,8 @@ async fn admin_copy_account_preferences(
     {
         Ok(result) => {
             for item in result.results.iter().filter(|item| item.success) {
+                // Copied preferences and library order change only the target user's home.
+                state.home().invalidate_user(&item.user_id);
                 record_audit_event(
                     &state,
                     &headers,
