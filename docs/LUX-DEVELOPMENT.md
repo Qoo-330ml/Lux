@@ -19096,7 +19096,8 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
       `FAILED`）。
 - [x] `cargo test --locked --lib admin_scan_jobs::`：`the_limit_accounting_counts_every_library_left_for_the_next_startup`
       固定上限记账（5 个库、上限 2 → 排队 2、剩余 3）；`the_root_probe_gives_up_instead_of_hanging_the_startup`
-      固定“探测超时不挂死启动”。
+      固定“探测超时不挂死启动”；`the_limit_log_reports_a_lower_bound_when_the_remainder_is_truncated`
+      固定“剩余数被截断时日志写 `remaining_at_least`”而不是精确值。
 - [x] `bash scripts/restart-recovery-smoke.sh` 连续实跑 3 次通过（arm64 裸进程，5000 个文件）：每次都是
       `interruptedStatus: CANCELLED`、`replacementStatus: COMPLETED`、`lastScanAtRecorded: true`。替换任务
       候选按 `(createdAt, id)` 必须晚于被中断任务，避免恢复任务尚未落库时把旧的取消记录当结果。另外用

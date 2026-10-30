@@ -189,6 +189,8 @@ pub(crate) struct FirstScanRecovery {
     pub(crate) resumed: usize,
     /// How many still-eligible libraries the per-startup bound left for the next startup.
     pub(crate) skipped_by_limit: usize,
+    /// Whether `skipped_by_limit` is only a lower bound because the count was truncated.
+    pub(crate) skipped_by_limit_truncated: bool,
 }
 
 /// Requeues the first scans that a shutdown cancelled mid-way.
@@ -211,6 +213,7 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
         scan_jobs,
         workers,
         FIRST_SCAN_RESUME_MAX_LIBRARIES,
+        FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT,
     )
     .await
 }
@@ -288,12 +291,14 @@ where
 
 /// [`resume_shutdown_interrupted_first_scans`] with an explicit per-startup bound.
 ///
-/// The bound is a parameter so the limit accounting can be tested without creating 512 libraries.
+/// The bound and the remainder-count limit are parameters so the accounting can be tested without
+/// creating 512 libraries or 10,000 rows.
 async fn resume_shutdown_interrupted_first_scans_bounded(
     database: &Database,
     scan_jobs: &ScanJobService,
     workers: ScanWorkerServices,
     max_libraries: usize,
+    remainder_limit: i64,
 ) -> Result<FirstScanRecovery, StorageError> {
     let mut cursor: Option<String> = None;
     // The last library the loop actually handled. The limit accounting counts what comes after it,
@@ -318,20 +323,33 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
                 let remaining = database
                     .list_shutdown_interrupted_first_scan_library_ids(
                         last_processed.as_deref(),
-                        FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT,
+                        remainder_limit,
                     )
                     .await?;
                 let recovery = FirstScanRecovery {
                     resumed,
                     skipped_by_limit: remaining.len(),
+                    // The remainder query is capped, so hitting the cap only proves a lower bound.
+                    skipped_by_limit_truncated: (remaining.len() as i64) >= remainder_limit,
                 };
-                tracing::warn!(
-                    max = max_libraries,
-                    queued = recovery.resumed,
-                    remaining = recovery.skipped_by_limit,
-                    "first-scan recovery examined its per-startup limit; the remaining libraries stay \
-                     eligible for the next startup"
-                );
+                if recovery.skipped_by_limit_truncated {
+                    tracing::warn!(
+                        max = max_libraries,
+                        queued = recovery.resumed,
+                        remaining_at_least = recovery.skipped_by_limit,
+                        "first-scan recovery examined its per-startup limit; at least that many more \
+                         libraries stay eligible for the next startup (the remaining count was \
+                         truncated)"
+                    );
+                } else {
+                    tracing::warn!(
+                        max = max_libraries,
+                        queued = recovery.resumed,
+                        remaining = recovery.skipped_by_limit,
+                        "first-scan recovery examined its per-startup limit; the remaining \
+                         libraries stay eligible for the next startup"
+                    );
+                }
                 return Ok(recovery);
             }
             examined += 1;
@@ -396,6 +414,7 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
     Ok(FirstScanRecovery {
         resumed,
         skipped_by_limit: 0,
+        skipped_by_limit_truncated: false,
     })
 }
 
@@ -453,6 +472,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_limit_log_reports_a_lower_bound_when_the_remainder_is_truncated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database, scan_jobs) = cancelled_first_scans(6).await?;
+        let recovery = resume_shutdown_interrupted_first_scans_bounded(
+            &database,
+            &scan_jobs,
+            ScanWorkerServices::default(),
+            2,
+            // A remainder budget that cannot cover the four libraries left behind.
+            2,
+        )
+        .await?;
+
+        assert_eq!(recovery.resumed, 2);
+        assert_eq!(recovery.skipped_by_limit, 2);
+        assert!(
+            recovery.skipped_by_limit_truncated,
+            "a truncated remainder has to be reported as \"at least\" instead of an exact number"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn the_root_probe_gives_up_instead_of_hanging_the_startup() {
         // A hung network mount is modelled by a probe that never resolves: the budget has to end the
         // wait and report "unprobed" instead of blocking the recovery.
@@ -483,6 +525,7 @@ mod tests {
             &scan_jobs,
             ScanWorkerServices::default(),
             2,
+            FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT,
         )
         .await?;
 
@@ -490,6 +533,10 @@ mod tests {
         // The three libraries that did not fit are all still eligible, including the ones that sat
         // behind the limit inside the same page. Under-counting them would hide work from the log.
         assert_eq!(recovery.skipped_by_limit, 3);
+        assert!(
+            !recovery.skipped_by_limit_truncated,
+            "a remainder below the count budget is exact"
+        );
         Ok(())
     }
 }
