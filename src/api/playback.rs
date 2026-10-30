@@ -1697,21 +1697,27 @@ pub(super) async fn handle_emby_playback_event(
         Ok(value) => value,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
+    // A plain progress tick repeats the state the stored session already has. Start, pause,
+    // resume and stop are state changes and always re-read the catalog, so a runtime the catalog
+    // only gains mid-playback still replaces the value an earlier tick stored.
+    let plain_progress_tick = is_plain_progress_tick(previous_session.as_ref(), state_name);
     // A client playing a growing HLS playlist may report the currently
-    // available playlist length here. Prefer the canonical duration: the one
-    // this play session already stored (it went through the same catalog-first
-    // resolution) and otherwise the catalog runtime/source, so that callbacks
-    // cannot replace the catalog duration with that partial value. Fall back to
-    // the client only when neither knows a usable runtime at all.
+    // available playlist length here. Prefer the canonical duration: on a
+    // plain progress tick the one this play session already stored (it went
+    // through the same catalog-first resolution), otherwise the catalog
+    // runtime/source, so that callbacks cannot replace the catalog duration
+    // with that partial value. Fall back to the client only when neither knows
+    // a usable runtime at all.
     let duration_ticks = emby_playback_event_duration_ticks(
         database,
         &internal_item_id,
         media_source_id.as_deref(),
         previous_session.as_ref(),
+        plain_progress_tick,
         request.duration_ticks,
     )
     .await;
-    let activity_event = playback_activity_event_type(previous_session.as_ref(), state_name);
     let resumed = playback_resumed(previous_session.as_ref(), state_name);
     let occurred_at = current_unix_timestamp();
     let webhook_event = webhook_event_type_for_playback(
@@ -1866,22 +1872,41 @@ pub(super) async fn handle_emby_playback_event(
     }
 }
 
+/// True when a callback repeats the state its stored play session already has.
+///
+/// This reuses the activity-event comparison instead of a second state table: "no activity event"
+/// means the callback changed nothing. A stop always counts as a state change, including a stop
+/// that arrives without a stored session.
+fn is_plain_progress_tick(
+    previous_session: Option<&StoredPlaybackSession>,
+    state_name: &str,
+) -> bool {
+    state_name != "STOPPED" && playback_activity_event_type(previous_session, state_name).is_none()
+}
+
 /// Duration recorded for one Emby playback callback.
 ///
-/// The order is the contract: the duration this play session already stored went through this
-/// same resolution, so a repeat tick reuses it and skips the catalog entirely. Next comes the
-/// catalog, and only when neither knows a usable runtime may the client decide, because a growing
-/// HLS playlist reports just the currently available length and must not replace the catalog
-/// duration with that partial value.
+/// The order is the contract: on a plain progress tick the value this play session already stored
+/// is reused and the catalog is not read, because that value went through this same resolution.
+/// Every state change (start, pause, resume, stop) reads the catalog first, so a stored value that
+/// came from a client while the catalog had no runtime yet cannot stick to the session for the rest
+/// of the playback: the next state change replaces it. Only when neither knows a usable runtime may
+/// the client decide, because a growing HLS playlist reports just the currently available length
+/// and must not replace the catalog duration with that partial value.
 async fn emby_playback_event_duration_ticks(
     database: &crate::storage::Database,
     item_id: &str,
     media_source_id: Option<&str>,
     previous_session: Option<&StoredPlaybackSession>,
+    is_plain_progress_tick: bool,
     client_reported_ticks: Option<i64>,
 ) -> Option<i64> {
-    if let Some(session) = previous_session
+    if is_plain_progress_tick
+        && let Some(session) = previous_session
         && session.item_id == item_id
+        // The stored duration belongs to the source that tick reported; a different source has a
+        // different runtime, so it must come from the catalog instead.
+        && session.media_source_id.as_deref() == media_source_id
         && let Some(ticks) = session.duration_ticks.filter(|ticks| *ticks > 0)
     {
         return Some(ticks);
@@ -1894,9 +1919,9 @@ async fn emby_playback_event_duration_ticks(
 
 /// Catalog duration for one item, read as a single narrow statement.
 ///
-/// The precedence matches what the item detail projection exposes: the item runtime first, then
-/// the requested media source, then the default source, then the first source that reports any
-/// duration. A zero or negative value never counts as a usable runtime.
+/// Same precedence as the item detail: the item runtime first, then the requested media source,
+/// then the default source, then the first source that reports any duration. A zero or negative
+/// value never counts as a usable runtime.
 async fn catalog_playback_duration_ticks(
     database: &crate::storage::Database,
     item_id: &str,
@@ -5898,7 +5923,7 @@ mod emby_playback_tests {
 
 #[cfg(test)]
 mod playback_duration_tests {
-    use super::emby_playback_event_duration_ticks;
+    use super::{emby_playback_event_duration_ticks, is_plain_progress_tick};
     use crate::storage::{Database, StoredPlaybackSession, test_database};
 
     /// Seeds one catalog-visible movie plus its media sources.
@@ -5959,12 +5984,17 @@ mod playback_duration_tests {
         Ok(())
     }
 
-    fn stored_session(item_id: &str, duration_ticks: Option<i64>) -> StoredPlaybackSession {
+    fn stored_session(
+        item_id: &str,
+        media_source_id: Option<&str>,
+        state: &str,
+        duration_ticks: Option<i64>,
+    ) -> StoredPlaybackSession {
         StoredPlaybackSession {
             id: "duration-session".to_owned(),
             user_id: "duration-user".to_owned(),
             item_id: item_id.to_owned(),
-            media_source_id: None,
+            media_source_id: media_source_id.map(str::to_owned),
             play_session_id: "duration-play-session".to_owned(),
             device_id: "duration-device".to_owned(),
             client: None,
@@ -5972,7 +6002,7 @@ mod playback_duration_tests {
             client_version: None,
             device_type: None,
             remote_ip: None,
-            state: "PLAYING".to_owned(),
+            state: state.to_owned(),
             position_ticks: 100,
             duration_ticks,
             is_paused: false,
@@ -5981,7 +6011,8 @@ mod playback_duration_tests {
         }
     }
 
-    async fn resolve(
+    /// Resolves one callback that has no stored play session yet.
+    async fn resolve_cold(
         database: &Database,
         media_source_id: Option<&str>,
         client_ticks: Option<i64>,
@@ -5991,13 +6022,33 @@ mod playback_duration_tests {
             "duration-movie",
             media_source_id,
             None,
+            true,
+            client_ticks,
+        )
+        .await
+    }
+
+    /// Resolves one callback against an existing session.
+    async fn resolve_with_session(
+        database: &Database,
+        media_source_id: Option<&str>,
+        previous: &StoredPlaybackSession,
+        plain_progress_tick: bool,
+        client_ticks: Option<i64>,
+    ) -> Option<i64> {
+        emby_playback_event_duration_ticks(
+            database,
+            "duration-movie",
+            media_source_id,
+            Some(previous),
+            plain_progress_tick,
             client_ticks,
         )
         .await
     }
 
     #[tokio::test]
-    async fn a_repeat_tick_reuses_the_stored_duration_without_reading_the_catalog()
+    async fn a_plain_progress_tick_reuses_the_stored_duration_without_reading_the_catalog()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, database) = test_database().await?;
         seed_movie(
@@ -6006,14 +6057,19 @@ mod playback_duration_tests {
             &[("duration-source", true, Some(5_000))],
         )
         .await?;
-        let previous = stored_session("duration-movie", Some(5_000));
-
-        database.reset_query_count();
-        let ticks = emby_playback_event_duration_ticks(
-            &database,
+        let previous = stored_session(
             "duration-movie",
             Some("duration-source"),
-            Some(&previous),
+            "PLAYING",
+            Some(5_000),
+        );
+
+        database.reset_query_count();
+        let ticks = resolve_with_session(
+            &database,
+            Some("duration-source"),
+            &previous,
+            true,
             Some(800),
         )
         .await;
@@ -6021,20 +6077,19 @@ mod playback_duration_tests {
         assert_eq!(
             database.query_count(),
             0,
-            "a repeat tick must not query for the duration its play session already stored"
+            "a plain progress tick must not query for the duration its play session already stored"
         );
 
         // A session for another item must not lend its duration to this callback.
-        let foreign = stored_session("other-movie", Some(1_000));
-        database.reset_query_count();
-        let ticks = emby_playback_event_duration_ticks(
-            &database,
-            "duration-movie",
+        let foreign = stored_session(
+            "other-movie",
             Some("duration-source"),
-            Some(&foreign),
-            None,
-        )
-        .await;
+            "PLAYING",
+            Some(1_000),
+        );
+        database.reset_query_count();
+        let ticks =
+            resolve_with_session(&database, Some("duration-source"), &foreign, true, None).await;
         assert_eq!(ticks, Some(5_000));
         assert_eq!(
             database.query_count(),
@@ -6043,6 +6098,124 @@ mod playback_duration_tests {
         );
         database.close().await;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_different_media_source_falls_back_to_the_catalog()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        seed_movie(
+            &database,
+            None,
+            &[
+                ("duration-source", true, Some(5_000)),
+                ("duration-alt-source", false, Some(6_000)),
+            ],
+        )
+        .await?;
+        let previous = stored_session(
+            "duration-movie",
+            Some("duration-source"),
+            "PLAYING",
+            Some(5_000),
+        );
+
+        database.reset_query_count();
+        let ticks = resolve_with_session(
+            &database,
+            Some("duration-alt-source"),
+            &previous,
+            true,
+            None,
+        )
+        .await;
+        assert_eq!(
+            ticks,
+            Some(6_000),
+            "the stored duration belongs to the source the earlier tick reported"
+        );
+        assert_eq!(
+            database.query_count(),
+            1,
+            "a source switch has to read the catalog duration of the new source"
+        );
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_state_change_reads_the_catalog_even_with_a_stored_duration()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database) = test_database().await?;
+        seed_movie(
+            &database,
+            Some(5_000),
+            &[("duration-source", true, Some(5_000))],
+        )
+        .await?;
+        // The catalog runtime arrived only after this "client" duration was stored.
+        let stored_client_duration = stored_session(
+            "duration-movie",
+            Some("duration-source"),
+            "PLAYING",
+            Some(800),
+        );
+
+        database.reset_query_count();
+        let ticks = resolve_with_session(
+            &database,
+            Some("duration-source"),
+            &stored_client_duration,
+            false,
+            Some(800),
+        )
+        .await;
+        assert_eq!(
+            ticks,
+            Some(5_000),
+            "a start, pause, resume or stop must correct a stored value from the catalog"
+        );
+        assert_eq!(
+            database.query_count(),
+            1,
+            "a state change reads the catalog with one narrow statement"
+        );
+        database.close().await;
+        Ok(())
+    }
+
+    #[test]
+    fn only_a_repeated_state_counts_as_a_plain_progress_tick() {
+        let playing = stored_session(
+            "duration-movie",
+            Some("duration-source"),
+            "PLAYING",
+            Some(1),
+        );
+        let paused = stored_session("duration-movie", Some("duration-source"), "PAUSED", Some(1));
+
+        assert!(is_plain_progress_tick(Some(&playing), "PLAYING"));
+        assert!(is_plain_progress_tick(Some(&paused), "PAUSED"));
+        assert!(
+            !is_plain_progress_tick(Some(&playing), "PAUSED"),
+            "pausing is a state change"
+        );
+        assert!(
+            !is_plain_progress_tick(Some(&paused), "PLAYING"),
+            "resuming is a state change"
+        );
+        assert!(
+            !is_plain_progress_tick(Some(&playing), "STOPPED"),
+            "stopping is a state change"
+        );
+        assert!(
+            !is_plain_progress_tick(None, "STOPPED"),
+            "a stop without a stored session is still a state change"
+        );
+        assert!(
+            !is_plain_progress_tick(None, "PLAYING"),
+            "a start without a stored session is a state change"
+        );
     }
 
     #[tokio::test]
@@ -6057,7 +6230,7 @@ mod playback_duration_tests {
         .await?;
 
         database.reset_query_count();
-        let ticks = resolve(&database, None, Some(800)).await;
+        let ticks = resolve_cold(&database, None, Some(800)).await;
         assert_eq!(
             ticks,
             Some(5_000),
@@ -6088,17 +6261,17 @@ mod playback_duration_tests {
         .await?;
 
         assert_eq!(
-            resolve(&database, Some("duration-extra-source"), None).await,
+            resolve_cold(&database, Some("duration-extra-source"), None).await,
             Some(4_000),
             "the requested media source wins while it has a usable duration"
         );
         assert_eq!(
-            resolve(&database, Some("duration-zero-source"), Some(800)).await,
+            resolve_cold(&database, Some("duration-zero-source"), Some(800)).await,
             Some(3_000),
             "a zero reported duration falls back to the default source, not the client"
         );
         assert_eq!(
-            resolve(&database, None, None).await,
+            resolve_cold(&database, None, None).await,
             Some(3_000),
             "without a requested source the default source wins"
         );
@@ -6112,12 +6285,12 @@ mod playback_duration_tests {
         seed_movie(&database, None, &[]).await?;
 
         assert_eq!(
-            resolve(&database, None, Some(800)).await,
+            resolve_cold(&database, None, Some(800)).await,
             Some(800),
             "the client duration is used only when the catalog knows none"
         );
-        assert_eq!(resolve(&database, None, Some(0)).await, None);
-        assert_eq!(resolve(&database, None, None).await, None);
+        assert_eq!(resolve_cold(&database, None, Some(0)).await, None);
+        assert_eq!(resolve_cold(&database, None, None).await, None);
         database.close().await;
         Ok(())
     }

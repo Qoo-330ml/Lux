@@ -3236,6 +3236,14 @@ impl Database {
     /// The candidate columns keep the projection's order (media sources by id), so the caller can
     /// apply the detail-loading precedence unchanged over one statement instead of loading the
     /// whole item, its streams, image tags and catalog details every few seconds.
+    ///
+    /// Known difference from the detail projection: the source candidates here read the raw
+    /// `media_sources` rows (`is_default` as stored, `ORDER BY id`), while `CatalogService` runs
+    /// `arrange_source_parts` over the assembled sources first. That normalization groups
+    /// multi-part sources by version, orders each group by part index and leaves exactly one
+    /// default (the first part of the group that held a default). For one-part items with a
+    /// single default source both picks agree; for multi-part or multiple-default data the
+    /// "default" and "first" candidates may name a different source than the detail projection.
     pub(crate) async fn find_item_playback_durations(
         &self,
         item_id: &str,
