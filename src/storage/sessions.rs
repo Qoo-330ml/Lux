@@ -10,8 +10,6 @@ const MAX_LISTED_PLAYBACK_SESSIONS: i64 = 500;
 const MAX_SESSIONS_PER_SOURCE: i64 = 32;
 
 impl Database {
-    // LUX-736 wires this bounded storage contract into the admin playback API.
-    #[allow(dead_code)]
     pub(crate) async fn list_current_user_playback_sessions(
         &self,
         user_id: &str,
@@ -31,10 +29,7 @@ impl Database {
             .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let sessions = self
             .query(
                 "SELECT id, user_id, item_id, media_source_id, play_session_id,
@@ -56,10 +51,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map(|rows| rows.into_iter().map(stored_playback_session).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((sessions, total_count))
     }
 
@@ -90,10 +82,7 @@ impl Database {
             .bind(stale_before)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let decision = if !policy.can_play {
             PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::PlaybackDisabled)
         } else if policy.max_simultaneous_playbacks > 0
@@ -110,8 +99,6 @@ impl Database {
         }))
     }
 
-    // LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
-    #[allow(dead_code)]
     pub(crate) async fn reserve_playback_admission(
         &self,
         user_id: &str,
@@ -132,18 +119,9 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(policy) = policy else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(None);
         };
         let can_play = policy.get::<i64, _>("can_play") != 0;
@@ -158,10 +136,7 @@ impl Database {
         .bind(stale_before)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let active_sessions = self
             .query(
                 "SELECT COUNT(*) AS active_count,
@@ -182,10 +157,7 @@ impl Database {
             .bind(stale_before)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let active_count = active_sessions.get::<i64, _>("active_count");
         let session_is_active = active_sessions.get::<i64, _>("session_is_active") != 0;
         let decision = if !can_play {
@@ -200,13 +172,7 @@ impl Database {
             None
         };
         if let Some(decision) = decision {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(Some(PlaybackAdmissionResult {
                 decision,
                 active_playback_count: active_count,
@@ -235,10 +201,7 @@ impl Database {
         .bind(stale_before)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let active_playback_count: i64 = self
             .query_scalar(
                 "SELECT COUNT(*) FROM (
@@ -255,17 +218,8 @@ impl Database {
             .bind(stale_before)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(PlaybackAdmissionResult {
             decision: PlaybackAdmissionDecision::Admitted,
             active_playback_count,
@@ -297,14 +251,10 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() == 1)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
-    // LUX-620 calls this after playback stop, failure, or expiry.
-    #[allow(dead_code)]
+    // Called after playback stop, failure, or expiry.
     pub(crate) async fn release_playback_admission(
         &self,
         user_id: &str,
@@ -324,10 +274,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() == 1)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_user_item_played(
@@ -358,10 +305,7 @@ impl Database {
         .bind(database_flag(played))
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.refresh_user_series_next_for_item(user_id, item_id)
             .await
     }
@@ -386,10 +330,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_user_item_favorite(
@@ -412,24 +353,14 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn record_playback_event(
         &self,
         event: NewPlaybackEvent<'_>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let max_function = self.scalar_max_function();
         let auto_played = event.duration_ticks.is_some_and(|duration_ticks| {
             playback_reached_played_threshold(
@@ -480,10 +411,7 @@ impl Database {
             .bind(database_flag(event.is_paused))
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let same_session = "user_item_state.last_play_session_id = excluded.last_play_session_id";
         let newer_session = "(user_item_state.last_play_session_id IS NULL OR EXISTS (
             SELECT 1
@@ -528,10 +456,7 @@ impl Database {
             .bind(event.play_session_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let event_session_is_current = persisted_session.as_ref().is_some_and(|row| {
             row.get::<String, _>("last_play_session_id") == event.play_session_id
         });
@@ -548,18 +473,9 @@ impl Database {
             .bind(event.item_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         self.refresh_user_series_next_for_item(event.user_id, event.item_id)
             .await
     }
@@ -577,10 +493,7 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((parent_id, series_id)) = episode_scope else {
             return Ok(());
         };
@@ -597,14 +510,7 @@ impl Database {
         let parent_placeholders = std::iter::repeat_n("?", parent_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let mut parent_state_query = self.query(sqlx::AssertSqlSafe(format!(
             "WITH parent_scope AS (
                  SELECT id, item_type FROM media_items WHERE id IN ({parent_placeholders})
@@ -639,10 +545,7 @@ impl Database {
         let parent_states = parent_state_query
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(|row| {
                 (
@@ -680,17 +583,8 @@ impl Database {
         state_write
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         // The pointer only reads episode-level progress, so refreshing the played item's series is
         // enough and stays bounded; a table-wide rebuild here would rewrite every series of every
         // user on each play event.
@@ -753,10 +647,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map(|rows| rows.into_iter().map(stored_playback_session).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_playback_session(
@@ -778,10 +669,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_playback_session))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_playback_session_by_id(
@@ -801,10 +689,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_playback_session))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn stop_playback_session(
@@ -822,10 +707,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_active_playback_session_for_stop(
@@ -873,10 +755,7 @@ impl Database {
         let sessions = statement
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_playback_session)
             .collect::<Vec<_>>();
@@ -912,10 +791,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_playback_session))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn insert_web_playback_session(
@@ -945,13 +821,9 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
     pub(crate) async fn set_web_playback_access_context(
         &self,
         session_id: &str,
@@ -973,13 +845,9 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
     pub(crate) async fn find_web_playback_access_context(
         &self,
         session_id: &str,
@@ -999,10 +867,7 @@ impl Database {
                 client_name: row.get("authorization_client_name"),
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn insert_emby_direct_playback_ticket(
@@ -1024,10 +889,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn ensure_legacy_emby_direct_playback_ticket(
@@ -1051,10 +913,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_emby_direct_playback_ticket(
@@ -1083,10 +942,7 @@ impl Database {
                 created_at: row.get("created_at"),
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn revoke_emby_direct_playback_ticket(
@@ -1109,13 +965,9 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-776 periodically drops expired direct-ticket contexts.
     pub(crate) async fn delete_expired_emby_direct_playback_tickets(
         &self,
         now: i64,
@@ -1137,10 +989,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Inserts one finished-transcode row; a session id is recorded at most once.
@@ -1178,10 +1027,7 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let _ = self
             .query(
                 "DELETE FROM transcoding_history
@@ -1203,10 +1049,7 @@ impl Database {
             .query_scalar("SELECT COUNT(*) FROM transcoding_history")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let rows = self
             .query(
                 "SELECT h.id, h.session_id, h.user_id, u.display_name AS user_name,
@@ -1224,10 +1067,7 @@ impl Database {
             .bind(offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((
             rows.into_iter()
                 .map(|row| StoredTranscodingHistory {
@@ -1296,10 +1136,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Records the tier actually running, after a hardware start fell back to software.
@@ -1324,10 +1161,7 @@ impl Database {
             .bind(user_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected()
             == 1)
     }
@@ -1356,10 +1190,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_web_playback_session(
@@ -1378,10 +1209,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_web_playback_session))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_web_playback_sessions_for_playbacks(
@@ -1410,10 +1238,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_active_web_playback_sessions_for_source(
@@ -1443,10 +1268,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn take_expired_web_playback_sessions(
@@ -1467,10 +1289,7 @@ impl Database {
             .bind(now)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let sessions = rows.into_iter().map(stored_web_playback_session).collect();
         self.stop_selected_web_playback_sessions(sessions, now, "expires_at < ?", now)
             .await
@@ -1496,10 +1315,7 @@ impl Database {
             .bind(cutoff)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let sessions = rows.into_iter().map(stored_web_playback_session).collect();
         self.stop_selected_web_playback_sessions(
             sessions,
@@ -1538,10 +1354,7 @@ impl Database {
             .bind(eligibility_value)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .collect::<HashSet<_>>();
         Ok(sessions
@@ -1567,10 +1380,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn touch_web_playback_session(
@@ -1594,10 +1404,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn stop_web_playback_session(
@@ -1619,24 +1426,14 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn accept_web_playback_event(
         &self,
         event: NewWebPlaybackEvent<'_>,
     ) -> Result<WebPlaybackEventClaim, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let inserted = self
             .query(
                 "INSERT INTO web_playback_events (
@@ -1654,18 +1451,9 @@ impl Database {
             .bind(event.now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if inserted.rows_affected() == 0 {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(WebPlaybackEventClaim::Duplicate);
         }
         let updated = self
@@ -1689,17 +1477,8 @@ impl Database {
             .bind(event.sequence)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(if updated.rows_affected() == 1 {
             WebPlaybackEventClaim::Accepted
         } else {

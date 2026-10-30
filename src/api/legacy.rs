@@ -1113,13 +1113,6 @@ fn is_registered_emby_video_path(path: &str) -> bool {
         || is_emby_transcoding_path(path)
 }
 
-/// A playback-only token is a credential that travels inside a media URL, so it is accepted on
-/// the playback allow-list and nowhere else.
-///
-/// The Emby router's own middleware only sees paths that reach a registered route, and Lux API
-/// requests never call the Emby resolver at all. Rejecting here, before routing, keeps both cases
-/// identical: an unregistered Emby path must answer 401 rather than 404/405, and nothing outside
-/// `/emby` may accept the token.
 /// Credential exactly as the client sent it, for layers that run before normalization.
 fn emby_credential_from_request(request: &Request<Body>) -> Option<String> {
     let headers = request.headers();
@@ -1142,6 +1135,13 @@ fn emby_credential_from_request(request: &Request<Body>) -> Option<String> {
     })
 }
 
+/// A playback-only token is a credential that travels inside a media URL, so it is accepted on
+/// the playback allow-list and nowhere else.
+///
+/// The Emby router's own middleware only sees paths that reach a registered route, and Lux API
+/// requests never call the Emby resolver at all. Rejecting here, before routing, keeps both cases
+/// identical: an unregistered Emby path must answer 401 rather than 404/405, and nothing outside
+/// `/emby` may accept the token.
 async fn reject_playback_token_outside_allow_list(request: Request<Body>, next: Next) -> Response {
     // This layer runs before `normalize_credentials`, so the credential is read from wherever
     // the client put it rather than from the normalized header.
@@ -1152,8 +1152,8 @@ async fn reject_playback_token_outside_allow_list(request: Request<Body>, next: 
         return next.run(request).await;
     }
     let is_allowed = match request.extensions().get::<axum::extract::OriginalUri>() {
-        Some(original) => emby::path_accepts_playback_token(original.0.path()),
-        None => emby::path_accepts_playback_token(request.uri().path()),
+        Some(original) => emby::path_accepts_playback_token(&token, original.0.path()),
+        None => emby::path_accepts_playback_token(&token, request.uri().path()),
     };
     if is_allowed {
         return next.run(request).await;
@@ -1428,16 +1428,12 @@ async fn lux_search_people(
             .into_response();
         }
     };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     match people
         .search_actors(&library_ids, raw_query, offset, limit)
         .await
@@ -1487,16 +1483,12 @@ async fn lux_get_person_items(
             .into_response();
         }
     };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     let person = match people.find_person(&library_ids, "Actor", &person_id).await {
         Ok(Some(person)) => person,
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
@@ -1511,12 +1503,8 @@ async fn lux_get_person_items(
         Err(PeopleError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
+    let database = require_service!(state.database);
     let filter = CatalogFilter {
         item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
         person_id: Some(person.lookup_id),
@@ -1563,19 +1551,13 @@ async fn lux_get_person(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
+    let database = require_service!(state.database);
     match people.find_person(&library_ids, "Actor", &person_id).await {
         Ok(Some(mut person)) => {
             person.is_favorite = match auth_principal.user_id() {
@@ -1621,9 +1603,7 @@ async fn lux_set_person_favorite(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access
         .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
         .await
@@ -1631,9 +1611,7 @@ async fn lux_set_person_favorite(
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     let person = match people.find_person(&library_ids, "Actor", &person_id).await {
         Ok(Some(person)) => person,
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
@@ -1641,9 +1619,7 @@ async fn lux_set_person_favorite(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database
         .set_user_person_favorite(&user.id.to_string(), &person.id, request.favorite)
         .await
@@ -1712,16 +1688,12 @@ async fn lux_update_person(
         )
         .into_response();
     }
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     let update = PersonMetadataUpdate {
         name: request.name.trim().to_owned(),
         biography: clean_person_text(request.biography),
@@ -1908,7 +1880,9 @@ mod tests {
     use crate::library::LibraryKind;
     use crate::network::RemoteAccessPolicy;
     use crate::storage::{Database, StorageError};
+    use axum::body::to_bytes;
     use axum::http::{HeaderMap, HeaderValue, StatusCode, Uri};
+    use axum::response::{IntoResponse, Response};
     use serde_json::json;
 
     #[test]
@@ -2266,6 +2240,43 @@ mod tests {
         let headers = HeaderMap::new();
 
         assert_eq!(request_access_ip(&headers, &state).await, Ok(None));
+        Ok(())
+    }
+
+    /// Minimal handler body that does nothing but the shared readiness check.
+    ///
+    /// The macro has to expand to an early `return` of the handler's own response type, so it is
+    /// exercised through a real `async fn` signature like the ones in the route modules.
+    async fn require_database_probe(state: &AppState) -> Response {
+        let database = require_service!(state.database);
+        // Use the binding so the pass-through case proves the reference survived the expansion.
+        (StatusCode::NO_CONTENT, database.server_id().to_owned()).into_response()
+    }
+
+    #[tokio::test]
+    async fn require_service_answers_service_unavailable_without_the_service() {
+        let state = AppState::default();
+        let response = require_database_probe(&state).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The macro must keep returning the bare status, without a body.
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("service unavailable body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn require_service_passes_an_initialized_service_through()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        let state = AppState {
+            database: Some(database),
+            ..AppState::default()
+        };
+        let response = require_database_probe(&state).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
         Ok(())
     }
 

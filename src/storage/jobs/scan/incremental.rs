@@ -26,10 +26,7 @@ impl Database {
         .bind(change_kind)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.refresh_incremental_scan_path_count(job_id).await
     }
 
@@ -89,13 +86,7 @@ impl Database {
                     .bind(relative_path)
                     .bind(change_kind);
             }
-            query
-                .execute(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            query.execute(&self.pool).await.map_err(self.sqlx_err())?;
             self.refresh_incremental_scan_path_count(job_id).await?;
         }
         Ok(())
@@ -115,10 +106,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_pending_scan_job_paths(
@@ -138,10 +126,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_scan_job_path).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_scan_job_path_processed(
@@ -161,10 +146,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_media_item_ids_for_incremental_scan(
@@ -216,10 +198,7 @@ impl Database {
         .bind(job_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn clear_scan_job_paths(&self, job_id: &str) -> Result<(), StorageError> {
@@ -228,9 +207,6 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 }

@@ -5,9 +5,8 @@
 
 use super::*;
 
-// LUX-783 wires the worker and LUX-784 wires the admin queue API to this storage contract.
-#[allow(dead_code)]
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn enqueue_mail_outbox(
         &self,
         message: NewMailOutboxMessage<'_>,
@@ -48,10 +47,7 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let record = self
             .query_as::<MailOutboxRecord>(
@@ -63,10 +59,7 @@ impl Database {
             .bind(message.idempotency_key)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if record.recipient_email != message.recipient_email
             || record.template_kind != message.template_kind.as_str()
             || record.reference_id != message.reference_id
@@ -138,10 +131,7 @@ impl Database {
         query
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .map(TryInto::try_into)
             .transpose()
     }
@@ -170,10 +160,7 @@ impl Database {
             .bind(attempt_count)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -202,10 +189,7 @@ impl Database {
             .bind(attempt_count)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -234,13 +218,11 @@ impl Database {
             .bind(attempt_count)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn retry_failed_mail_outbox(
         &self,
         id: &str,
@@ -263,13 +245,11 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_mail_outbox_page(
         &self,
         status: Option<MailOutboxStatus>,
@@ -288,10 +268,7 @@ impl Database {
                 .fetch_one(&self.pool)
                 .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let records = if let Some(status) = status {
             self.query_as::<MailOutboxRecord>(
@@ -318,10 +295,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let messages = records
             .into_iter()
             .map(TryInto::try_into)

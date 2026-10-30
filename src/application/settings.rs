@@ -23,8 +23,6 @@ use crate::{
 };
 use tokio::fs;
 
-// The following versioned contract is exposed by LUX-803.
-#[allow(dead_code)]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RegistrationModeError {
     InvalidMode,
@@ -32,7 +30,6 @@ pub(crate) enum RegistrationModeError {
     Unavailable,
 }
 
-#[allow(dead_code)]
 pub(crate) async fn read_registration_mode(
     database: &Database,
 ) -> Result<crate::storage::StoredRegistrationMode, RegistrationModeError> {
@@ -42,7 +39,6 @@ pub(crate) async fn read_registration_mode(
         .map_err(|_| RegistrationModeError::Unavailable)
 }
 
-#[allow(dead_code)]
 pub(crate) async fn update_registration_mode(
     database: &Database,
     mode: &str,

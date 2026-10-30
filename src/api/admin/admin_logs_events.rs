@@ -157,7 +157,6 @@ pub(crate) async fn record_activity_event(
     }
 }
 
-#[allow(dead_code)] // LUX-727 connects this writer to Web authentication failures.
 pub(crate) async fn record_failed_authentication_event(
     database: Option<&Database>,
     admin_events: &AdminEventHub,
@@ -296,9 +295,7 @@ pub(crate) async fn admin_export_logs(
         Ok(range) => range,
         Err(error) => return log_export_error_response(&headers, error),
     };
-    let Some(config_dir) = state.config_dir.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let config_dir = require_service!(state.config_dir);
     match export_logs(config_dir, range).await {
         Ok(export) => {
             let (content_type, filename, contents) = match export {

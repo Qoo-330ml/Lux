@@ -107,9 +107,7 @@ pub(super) async fn emby_sync_media_info(
                     return StatusCode::BAD_REQUEST.into_response();
                 };
                 let id = emby_internal_id(&id);
-                let Some(database) = state.database.as_ref() else {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                };
+                let database = require_service!(state.database);
                 let Some(source) = database
                     .find_strm_source_by_emby_id(&id)
                     .await
@@ -132,9 +130,7 @@ pub(super) async fn emby_sync_media_info(
         } else {
             return StatusCode::OK.into_response();
         };
-        let Some(service) = state.probe.as_ref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
+        let service = require_service!(state.probe);
         if service
             .import_media_info_for_absolute_path(&path, &probe, &chapters)
             .await
@@ -326,9 +322,7 @@ pub(super) async fn emby_danmaku_info(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let public_item_id = item_id.clone();
     let item_id = emby_internal_id(&item_id);
     let principal = match emby_access_principal(&auth_principal, None) {
@@ -340,9 +334,7 @@ pub(super) async fn emby_danmaku_info(
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let Some(service) = state.danmaku.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.danmaku);
     match service.read_sidecar(&item_id).await {
         Ok(Some(_)) => Json(json!({
             "hasDanmaku": true,
@@ -368,9 +360,7 @@ pub(super) async fn emby_danmaku_raw(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let item_id = emby_internal_id(&item_id);
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
@@ -381,9 +371,7 @@ pub(super) async fn emby_danmaku_raw(
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let Some(service) = state.danmaku.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.danmaku);
     match service.read_sidecar(&item_id).await {
         Ok(Some(bytes)) => Response::builder()
             .status(StatusCode::OK)
@@ -479,9 +467,7 @@ pub(super) async fn emby_refresh_item(
     if query.recursive == Some(false) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     let item_id = emby_internal_id(&item_id);
     let (job, scope) = match scan_jobs.create_folder_scan_job(&item_id).await {
         Ok(job) => (job, "FOLDER"),
@@ -533,12 +519,8 @@ pub(super) async fn emby_refresh_library(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
+    let scan_jobs = require_service!(state.scan_jobs);
     let library_ids = match database.list_enabled_library_ids().await {
         Ok(library_ids) => library_ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -589,12 +571,8 @@ pub(super) async fn emby_media_updated(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
+    let scan_jobs = require_service!(state.scan_jobs);
     if request.updates.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -718,9 +696,7 @@ pub(super) async fn emby_scheduled_tasks(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let mut active_full_scan = None;
     for status in ["PENDING", "RUNNING"] {
         let jobs = match database.list_scan_jobs(Some(status), 0, 10_000).await {
@@ -908,9 +884,7 @@ pub(super) async fn emby_users(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.emby_auth);
     let users = match auth.public_users().await {
         Ok(users) => users,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -1008,9 +982,7 @@ pub(super) async fn emby_query_users(
         }))
         .into_response();
     }
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.emby_auth);
     let (users, total_count) = match auth
         .query_users(
             query.is_disabled,
@@ -1140,9 +1112,7 @@ pub(super) async fn emby_user(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.emby_auth);
     let user = match auth.user_by_id(&user_id).await {
         Ok(Some(user)) if !user.is_disabled => user,
         Ok(Some(_) | None) => return StatusCode::NOT_FOUND.into_response(),
@@ -1214,9 +1184,7 @@ pub(super) async fn emby_create_collection(
         Ok(ids) => ids,
         Err(status) => return status.into_response(),
     };
-    let Some(collections) = state.collections.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let collections = require_service!(state.collections);
     match collections.create_emby_collection(name, &ids).await {
         Ok(Some(collection)) => Json(json!({
             "Id": emby_public_id(&collection.collection_item_id),
@@ -1268,9 +1236,7 @@ async fn emby_mutate_collection_items(
         Ok(ids) => ids,
         Err(status) => return status.into_response(),
     };
-    let Some(collections) = state.collections.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let collections = require_service!(state.collections);
     let collection_id = emby_internal_id(collection_id);
     let result = if add {
         collections
@@ -1330,9 +1296,7 @@ pub(super) async fn emby_create_user(
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1341,9 +1305,7 @@ pub(super) async fn emby_create_user(
         if source_id.parse::<UserId>().is_err() {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        let Some(auth) = state.emby_auth.as_ref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
+        let auth = require_service!(state.emby_auth);
         match auth.user_by_id(source_id).await {
             Ok(Some(source)) => Some(source),
             Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -1465,9 +1427,7 @@ pub(super) async fn emby_delete_user(
     if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1757,9 +1717,7 @@ pub(super) async fn emby_update_user(
     if request.policy.is_some() && !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1846,9 +1804,7 @@ pub(super) async fn emby_update_user_policy(
     if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1913,9 +1869,7 @@ pub(super) async fn emby_update_user_password(
     if new_password.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1964,9 +1918,7 @@ async fn emby_user_avatar_response(
     {
         return status.into_response();
     }
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = require_service!(state.user_avatars);
     let Some(target_user_id) = user_id.parse::<UserId>().ok() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -2047,9 +1999,7 @@ async fn update_emby_user_avatar(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = require_service!(state.user_avatars);
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -2165,9 +2115,7 @@ async fn delete_emby_user_avatar(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = require_service!(state.user_avatars);
     let Some(target_user_id) = user_id.parse::<UserId>().ok() else {
         return StatusCode::BAD_REQUEST.into_response();
     };

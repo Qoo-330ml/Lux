@@ -5,14 +5,7 @@ impl Database {
         &self,
         job: NewStrmProbeJob<'_>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO strm_probe_jobs (
                 id, operation_id, library_id, status, concurrency,
@@ -35,10 +28,7 @@ impl Database {
         .bind(job.total_count)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if job.total_count > 0 {
             self.mark_strm_probe_sources_pending_in_transaction(
                 &mut transaction,
@@ -48,13 +38,7 @@ impl Database {
             )
             .await?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn has_active_strm_probe_jobs(&self) -> Result<bool, StorageError> {
@@ -66,10 +50,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn has_active_strm_probe_jobs_for_operation(
@@ -86,10 +67,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_strm_probe_job(
@@ -109,10 +87,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_strm_probe_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_strm_probe_jobs(
@@ -154,10 +129,7 @@ impl Database {
             .await
         };
         rows.map(|rows| rows.into_iter().map(stored_strm_probe_job).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_active_strm_probe_job_ids(&self) -> Result<Vec<String>, StorageError> {
@@ -168,10 +140,7 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_strm_probe_job(&self, id: &str) -> Result<bool, StorageError> {
@@ -185,10 +154,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_strm_probe_job_progress(
@@ -208,10 +174,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn strm_probe_job_cancel_requested(
@@ -223,10 +186,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map(|value: i64| value != 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn request_strm_probe_job_cancel(&self, id: &str) -> Result<(), StorageError> {
@@ -238,10 +198,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_strm_probe_job(
@@ -250,14 +207,7 @@ impl Database {
         status: &str,
         error: Option<&str>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let cancelled_scope: Option<(String, Option<String>)> = self
             .query_as(
                 "SELECT library_id, target_source_id FROM strm_probe_jobs
@@ -267,10 +217,7 @@ impl Database {
             .bind(id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if let Some((library_id, target_source_id)) = cancelled_scope {
             let reset = if let Some(source_id) = target_source_id {
                 self.query(
@@ -300,10 +247,7 @@ impl Database {
                 .execute(&mut *transaction)
                 .await
             };
-            reset.map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            reset.map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE strm_probe_jobs
@@ -317,17 +261,8 @@ impl Database {
         .bind(id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 }
 

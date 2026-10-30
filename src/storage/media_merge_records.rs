@@ -119,10 +119,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         // Seasons and episodes carry the merged series in `series_id`; the root carries itself.
@@ -150,10 +147,7 @@ impl Database {
             for row in query
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
             {
                 let owner_id: String = row.get("owner_id");
                 let Some(record_id) = owners.get(&owner_id).cloned() else {
@@ -191,10 +185,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let mut sources = Vec::<(String, String, String, i64)>::new();
@@ -216,10 +207,7 @@ impl Database {
             for row in query
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
             {
                 let item_id: String = row.get("item_id");
                 let Some(record_id) = record_by_item.get(&item_id).cloned() else {
@@ -247,10 +235,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -296,10 +281,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn unmerge_media_items(
@@ -325,10 +307,7 @@ impl Database {
             .bind(merged_item_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(record) = record else {
             return Err(StorageError::Conflict("没有可撤销的合并记录".to_owned()));
         };
@@ -345,10 +324,7 @@ impl Database {
             .bind(primary_item_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if still_merged == 0 {
             return Err(StorageError::Conflict("条目已不处于合并状态".to_owned()));
         }
@@ -368,10 +344,7 @@ impl Database {
             .bind(merged_item_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if shared_provider_keys.is_empty() {
             let title_key = self
                 .query(
@@ -381,10 +354,7 @@ impl Database {
                 .bind(primary_item_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if let Some(title_key) = title_key {
                 let sort_title: String = title_key.get("sort_title");
                 let production_year: i64 = title_key.get("production_year");
@@ -399,10 +369,7 @@ impl Database {
                 .bind(production_year)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         } else {
             for row in shared_provider_keys {
@@ -419,10 +386,7 @@ impl Database {
                 .bind(provider_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
 
@@ -434,10 +398,7 @@ impl Database {
             .bind(&record_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut restored_item_ids = Vec::with_capacity(item_rows.len());
         for chunk in item_rows.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
             let values = std::iter::repeat_n("(?, ?, ?, ?)", chunk.len())
@@ -473,10 +434,7 @@ impl Database {
             query
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let source_rows = self
@@ -487,10 +445,7 @@ impl Database {
             .bind(&record_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let restored_source_count = source_rows.len();
         let mut normalize_ids = Vec::<String>::new();
         for row in &source_rows {
@@ -528,10 +483,7 @@ impl Database {
             query
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         normalize_ids.push(primary_item_id.to_owned());
@@ -541,18 +493,9 @@ impl Database {
             .bind(&record_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(StoredMediaMergeUndo {
             library_id,
             item_type,
@@ -624,10 +567,7 @@ impl Database {
                     })
                     .collect()
             })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_title_identity_merge_keys(
@@ -690,10 +630,7 @@ impl Database {
                     })
                     .collect()
             })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_provider_identity_group_items(
@@ -731,10 +668,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(stored_identity_group_items)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Media-source paths for the given candidate items, keyed by item ID.
@@ -776,10 +710,7 @@ impl Database {
                     .map(|row| (row.get("item_id"), row.get("relative_path")))
                     .collect()
             })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_title_identity_group_items(
@@ -820,10 +751,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(stored_identity_group_items)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }
 

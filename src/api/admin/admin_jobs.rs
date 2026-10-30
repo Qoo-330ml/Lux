@@ -110,9 +110,7 @@ pub(crate) async fn admin_start_scan(
         )
         .into_response();
     };
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     let job = match crate::application::admin_scan_jobs::start_movie_scan_job(
         scan_jobs,
         library_id,
@@ -185,9 +183,7 @@ pub(crate) async fn admin_start_library_path_scan(
         )
         .into_response();
     };
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     let job = match crate::application::admin_scan_jobs::start_path_scan_job(
         scan_jobs,
         library_id,
@@ -266,9 +262,7 @@ pub(crate) async fn admin_cancel_scan(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     match scan_jobs.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -294,9 +288,7 @@ pub(crate) async fn admin_start_strm_probe(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.strm_probe.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.strm_probe);
     let jobs =
         match crate::application::admin_job_workers::start_admin_strm_probe_jobs(service).await {
             Ok(jobs) => jobs,
@@ -360,9 +352,7 @@ pub(crate) async fn admin_list_strm_probe_jobs(
         )
         .into_response();
     }
-    let Some(service) = state.strm_probe.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.strm_probe);
     match service.list(status.as_deref(), offset, limit).await {
         Ok(jobs) => Json(json!({
             "jobs": jobs,
@@ -382,9 +372,7 @@ pub(crate) async fn admin_get_strm_probe_job(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.strm_probe.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.strm_probe);
     match service.get(&job_id).await {
         Ok(job) => Json(json!({ "job": job })).into_response(),
         Err(error) => strm_probe_error(&headers, error),
@@ -399,9 +387,7 @@ pub(crate) async fn admin_cancel_strm_probe(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.strm_probe.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.strm_probe);
     match service.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -427,9 +413,7 @@ pub(crate) async fn admin_retry_strm_probe(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.strm_probe.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.strm_probe);
     let job =
         match crate::application::admin_job_workers::retry_strm_probe_job(service, &job_id).await {
             Ok(job) => job,
@@ -554,9 +538,7 @@ pub(crate) async fn admin_list_chapter_detection_jobs(
         )
         .into_response();
     }
-    let Some(service) = state.chapter_detection.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.chapter_detection);
     match service.list(status.as_deref(), offset, limit).await {
         Ok(jobs) => Json(json!({
             "jobs": jobs,
@@ -576,9 +558,7 @@ pub(crate) async fn admin_get_chapter_detection_job(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.chapter_detection.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.chapter_detection);
     match service.get(&job_id).await {
         Ok(job) => Json(json!({ "job": job })).into_response(),
         Err(error) => chapter_detection_error(&headers, error),
@@ -593,9 +573,7 @@ pub(crate) async fn admin_cancel_chapter_detection(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.chapter_detection.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.chapter_detection);
     match service.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -621,9 +599,7 @@ pub(crate) async fn admin_retry_chapter_detection(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.chapter_detection.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.chapter_detection);
     let job =
         match crate::application::admin_job_workers::retry_chapter_detection_job(service, &job_id)
             .await
@@ -726,9 +702,7 @@ pub(crate) async fn admin_start_danmaku_match(
             .into_response();
         }
     };
-    let Some(service) = state.danmaku.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.danmaku);
     let job = match crate::application::admin_job_workers::start_danmaku_match_job(
         service,
         library_id,
@@ -787,9 +761,7 @@ pub(crate) async fn admin_list_danmaku_match_jobs(
         )
         .into_response();
     }
-    let Some(service) = state.danmaku.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.danmaku);
     match service.list(status.as_deref(), offset, limit).await {
         Ok(jobs) => Json(json!({
             "jobs": jobs,
@@ -809,9 +781,7 @@ pub(crate) async fn admin_get_danmaku_match_job(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.danmaku.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.danmaku);
     match service.get(&job_id).await {
         Ok(job) => Json(json!({ "job": job })).into_response(),
         Err(error) => danmaku_service_error(&headers, error),
@@ -826,9 +796,7 @@ pub(crate) async fn admin_cancel_danmaku_match(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.danmaku.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.danmaku);
     match service.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -854,9 +822,7 @@ pub(crate) async fn admin_retry_danmaku_match(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.danmaku.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.danmaku);
     let job = match crate::application::admin_job_workers::retry_danmaku_match_job(service, &job_id)
         .await
     {
@@ -929,9 +895,7 @@ pub(crate) async fn admin_list_jobs(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::admin_scan_jobs::list_admin_scan_jobs(
         database,
         status.as_deref(),
@@ -959,9 +923,7 @@ pub(crate) async fn admin_get_job(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::admin_scan_jobs::find_admin_scan_job(database, &job_id).await {
         Ok(Some(job)) => Json(json!({ "job": admin_scan_job_json(&job) })).into_response(),
         Ok(None) => api_error(
@@ -1071,9 +1033,7 @@ pub(crate) async fn admin_retry_scan(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     let job = match crate::application::admin_scan_jobs::retry_scan_job(
         scan_jobs,
         &job_id,

@@ -12,15 +12,13 @@ pub(crate) struct CatalogSearchQuery<'a> {
     pub(crate) include_total: bool,
 }
 
-// LUX-564 lands the cache foundation before S3a adds its first production caller.
+// The cache is used in production, but a few template builders are only exercised by the
+// crate's SQL contract tests.
 #[cfg_attr(not(test), allow(dead_code))]
 pub(crate) mod sql_templates;
 
-// LUX-684 consumes this bound and candidate contract in the background index worker.
-#[allow(dead_code)]
 pub(crate) const CONTENT_RESTRICTION_INDEX_BATCH_LIMIT: usize = 100;
 
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct MediaContentRestrictionIndexCandidate {
     pub(crate) item_id: String,
@@ -57,8 +55,6 @@ pub(crate) enum MetadataAutoMatchPolicy {
     Disabled,
 }
 
-// Registration settings are consumed by LUX-803's administrator API.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum RegistrationMode {
@@ -66,7 +62,6 @@ pub(crate) enum RegistrationMode {
     PublicEmail,
 }
 
-#[allow(dead_code)]
 pub(crate) struct StoredRegistrationMode {
     pub(crate) mode: RegistrationMode,
     pub(crate) version: i64,
@@ -164,7 +159,9 @@ pub(crate) enum UserRegistrationRejectResult {
     NotReviewable,
 }
 
-#[allow(dead_code)] // LUX-812 maps this redacted summary to the administrator API.
+// Mirrors `repository::UserRegistrationRequestSummaryRecord`, which selects the whole stored
+// row; the administrator review page reads a subset of these columns today.
+#[allow(dead_code)]
 pub(crate) struct StoredUserRegistrationRequest {
     pub(crate) id: String,
     pub(crate) recipient_email: String,
@@ -182,14 +179,12 @@ pub(crate) struct StoredUserRegistrationRequest {
     pub(crate) updated_at: i64,
 }
 
-#[allow(dead_code)] // LUX-812 maps this bounded storage result to the administrator API.
 pub(crate) struct UserRegistrationRequestPage {
     pub(crate) requests: Vec<StoredUserRegistrationRequest>,
     pub(crate) page_size: i64,
     pub(crate) total_count: i64,
 }
 
-#[allow(dead_code)] // LUX-808 resolves a submitted verification token to its challenge.
 pub(crate) struct StoredUserRegistrationChallenge {
     pub(crate) id: String,
     pub(crate) expires_at: i64,
@@ -270,8 +265,6 @@ pub(crate) enum UserInvitationAcceptResult {
     EmailAlreadyRegistered,
 }
 
-// LUX-645 consumes this contract in the preset application service.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct ApplyUserPermissionPreset<'a> {
     pub(crate) preset_id: &'a str,
@@ -282,22 +275,18 @@ pub(crate) struct ApplyUserPermissionPreset<'a> {
     pub(crate) permissions: NewStoredUserPermissions<'a>,
 }
 
-// LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlaybackAdmissionDenialReason {
     PlaybackDisabled,
     ConcurrentLimit,
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum PlaybackAdmissionDecision {
     Admitted,
     Denied(PlaybackAdmissionDenialReason),
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct PlaybackAdmissionResult {
     pub(crate) decision: PlaybackAdmissionDecision,

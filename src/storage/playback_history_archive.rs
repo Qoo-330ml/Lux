@@ -116,7 +116,7 @@ impl Database {
             .execute(&mut **transaction)
             .await
             .map(|result| result.rows_affected())
-            .map_err(|source| self.storage_error(source))
+            .map_err(self.sqlx_err())
     }
 
     /// Reattaches archived playback history to the items that carry the same identity again.
@@ -135,7 +135,7 @@ impl Database {
             .bind(batch_size)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| self.storage_error(source))?;
+            .map_err(self.sqlx_err())?;
         if event_ids.is_empty() {
             return Ok(0);
         }
@@ -180,7 +180,7 @@ impl Database {
             let inserted = statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| self.storage_error(source))?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             let delete =
                 format!("DELETE FROM playback_history_event_archive WHERE id IN ({placeholders})");
@@ -191,11 +191,8 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| self.storage_error(source))?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| self.storage_error(source))?;
+                .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             restored = restored.saturating_add(inserted);
         }
         Ok(restored)
@@ -233,10 +230,7 @@ impl Database {
         .bind(limit.clamp(1, 5_000))
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Deletes exactly the archived event ids. Callers must only pass ids whose lines reached disk.
@@ -260,10 +254,7 @@ impl Database {
             deleted += statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
         }
         Ok(deleted)

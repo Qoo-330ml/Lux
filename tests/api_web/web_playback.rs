@@ -787,6 +787,13 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         format!("/Videos/{emby_strm_item_id}/stream?MediaSourceId={strm_source_id}")
     );
     assert!(strm_direct_body["sessionId"].is_string());
+    let strm_kinds: Vec<&str> = strm_direct_body["plan"]["candidates"]
+        .as_array()
+        .ok_or("missing STRM candidates")?
+        .iter()
+        .filter_map(|candidate| candidate["kind"].as_str())
+        .collect();
+    assert_eq!(strm_kinds, ["proxy", "lux", "origin"]);
     let strm_direct_session_id = strm_direct_body["sessionId"]
         .as_str()
         .ok_or("missing direct STRM session id")?;
@@ -980,6 +987,69 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         proxy_body["plan"]["proxyUrl"],
         format!("/Videos/{emby_proxy_item_id}/stream?MediaSourceId={proxy_source_id}")
     );
+
+    // Direct plans also carry the ordered candidate ladder. A path-type STRM has no origin URL.
+    let candidates = proxy_body["plan"]["candidates"]
+        .as_array()
+        .ok_or("missing candidates")?;
+    let kinds: Vec<&str> = candidates
+        .iter()
+        .filter_map(|candidate| candidate["kind"].as_str())
+        .collect();
+    assert_eq!(kinds, ["proxy", "lux"]);
+    assert_eq!(candidates[1]["url"], proxy_body["plan"]["url"]);
+    let proxy_candidate = candidates[0]["url"]
+        .as_str()
+        .ok_or("missing proxy candidate url")?;
+    assert!(
+        proxy_candidate.starts_with(&format!(
+            "/Videos/{emby_proxy_item_id}/stream?MediaSourceId={proxy_source_id}&"
+        )),
+        "{proxy_candidate}"
+    );
+    let play_session_id = proxy_body["playSessionId"]
+        .as_str()
+        .ok_or("missing play session id")?;
+    assert!(proxy_candidate.contains(&format!(
+        "PlaySessionId={}",
+        play_session_id.replace(':', "%3A")
+    )));
+    let proxy_token = proxy_candidate
+        .split('&')
+        .find_map(|part| part.strip_prefix("api_key="))
+        .ok_or("proxy candidate has no api_key")?;
+    assert!(proxy_token.starts_with(&format!("luxpb_{emby_proxy_item_id}_")));
+    // The token is what a 302 proxy sends back to resolve the item: it works for this item only.
+    let own_item = client
+        .get(format!("{base_url}/emby/Items/{emby_proxy_item_id}"))
+        .query(&[("api_key", proxy_token)])
+        .send()
+        .await?;
+    assert_eq!(own_item.status(), reqwest::StatusCode::OK);
+    let other_item = client
+        .get(format!("{base_url}/emby/Items/{emby_strm_item_id}"))
+        .query(&[("api_key", proxy_token)])
+        .send()
+        .await?;
+    assert_eq!(other_item.status(), reqwest::StatusCode::UNAUTHORIZED);
+    let proxy_session_id = proxy_body["sessionId"]
+        .as_str()
+        .ok_or("missing proxy session id")?;
+    let stop_proxy = client
+        .delete(format!(
+            "{base_url}/api/v1/playback/sessions/{proxy_session_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf_cookie)
+        .send()
+        .await?;
+    assert_eq!(stop_proxy.status(), reqwest::StatusCode::NO_CONTENT);
+    let after_stop = client
+        .get(format!("{base_url}/emby/Items/{emby_proxy_item_id}"))
+        .query(&[("api_key", proxy_token)])
+        .send()
+        .await?;
+    assert_eq!(after_stop.status(), reqwest::StatusCode::UNAUTHORIZED);
 
     let stopped = client
         .delete(format!("{base_url}/api/v1/playback/sessions/{session_id}"))

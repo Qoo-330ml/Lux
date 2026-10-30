@@ -7,8 +7,8 @@
 
 use super::*;
 
+#[cfg(test)]
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
-#[allow(dead_code)] // read back by the storage regression tests
 pub(crate) struct StoredUserSeriesNext {
     pub(crate) user_id: String,
     pub(crate) series_id: String,
@@ -51,8 +51,8 @@ fn placeholders(count: usize) -> String {
         .join(", ")
 }
 
-#[allow(dead_code)] // exercised by the storage regression tests
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn upsert_user_series_next(
         &self,
         user_id: &str,
@@ -83,12 +83,10 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_user_series_next(
         &self,
         user_id: &str,
@@ -108,12 +106,10 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
+    #[cfg(test)]
     pub(crate) async fn delete_user_series_next(
         &self,
         user_id: &str,
@@ -125,10 +121,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() > 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Pages the continue-watching list from the derived pointers.
@@ -256,10 +249,7 @@ impl Database {
             .bind(query.offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(|(item_id,)| item_id)
             .collect::<Vec<_>>();
@@ -275,10 +265,7 @@ impl Database {
         let total = statement
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((ids, total))
     }
 }
@@ -294,10 +281,7 @@ impl Database {
         self.query("DELETE FROM user_series_next")
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let statement_sql = format!(
             "WITH in_progress AS (
                      SELECT us.user_id, mi.series_id, mi.id, mi.season_number,
@@ -401,10 +385,7 @@ impl Database {
             .query(sqlx::AssertSqlSafe(statement_sql))
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 }
@@ -423,10 +404,7 @@ impl Database {
             .bind(item_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(Some(series_id)) = series_id else {
             return Ok(());
         };
@@ -444,10 +422,7 @@ impl Database {
             .bind(series_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let statement_sql = format!(
             "WITH in_progress AS (
                  SELECT mi.id, mi.season_number, mi.episode_number, us.position_ticks,
@@ -551,9 +526,6 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 }

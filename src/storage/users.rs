@@ -10,7 +10,6 @@ use crate::storage::{
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
-#[allow(dead_code)] // LUX-732 wires the bounded activity-retention worker.
 const USER_ACTIVITY_RETENTION_MAX_BATCH_SIZE: i64 = 1_000;
 
 const SQLITE_USER_UPDATE_RETRY_DELAY: Duration = Duration::from_millis(50);
@@ -18,9 +17,7 @@ const SQLITE_USER_UPDATE_RETRY_WINDOW: Duration = Duration::from_secs(5);
 const MAX_LOGIN_BACKGROUND_CACHE_BYTES: usize = 256 * 1024;
 const DEFAULT_USER_DELETION_GRACE_DAYS: i64 = 7;
 const MAX_USER_DELETION_GRACE_DAYS: i64 = 3_650;
-#[allow(dead_code)] // LUX-732 exposes this default through the admin service.
 const DEFAULT_USER_ACTIVITY_RETENTION_DAYS: i64 = 90;
-#[allow(dead_code)] // LUX-732 exposes this range through the admin service.
 const MAX_USER_ACTIVITY_RETENTION_DAYS: i64 = 3_650;
 const SECONDS_PER_DAY: i64 = 86_400;
 const MAX_USER_CONTENT_RESTRICTION_TAGS: usize = 100;
@@ -34,7 +31,6 @@ fn normalize_user_deletion_grace_days(value: Option<String>) -> i64 {
         .unwrap_or(DEFAULT_USER_DELETION_GRACE_DAYS)
 }
 
-#[allow(dead_code)] // LUX-732 wires the stored value into the admin service.
 fn normalize_user_activity_retention_days(value: Option<String>) -> i64 {
     value
         .and_then(|value| value.parse::<i64>().ok())
@@ -118,8 +114,6 @@ impl UserItemStateRow {
 }
 
 impl Database {
-    // LUX-645 wires this storage primitive into the application preset service.
-    #[allow(dead_code)]
     pub(crate) async fn apply_user_permission_preset(
         &self,
         user_id: &str,
@@ -157,10 +151,7 @@ impl Database {
                 )
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let row_lock = if self.backend() == crate::config::DatabaseBackend::Postgres {
             " FOR UPDATE"
@@ -175,10 +166,7 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         else {
             return Ok(false);
         };
@@ -198,10 +186,7 @@ impl Database {
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if remaining == 0 {
                 return Err(StorageError::LastManager);
             }
@@ -218,10 +203,7 @@ impl Database {
                     .bind(library_id)
                     .fetch_one(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 if enabled_regular_library != 1 {
                     return Err(StorageError::Conflict(
                         "user permission preset references an unavailable library".to_owned(),
@@ -250,10 +232,7 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if updated.rows_affected() != 1 {
             return Ok(false);
         }
@@ -262,10 +241,7 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if permissions.library_access_mode == "SELECTED" {
             for library_id in permissions.library_ids {
                 self.query(
@@ -276,10 +252,7 @@ impl Database {
                 .bind(library_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
 
@@ -299,23 +272,12 @@ impl Database {
         .bind(preset.preset_version)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
-    // LUX-648 wires these reads into administrator profile and list queries.
-    #[allow(dead_code)]
     pub(crate) async fn user_permission_preset_source(
         &self,
         user_id: &str,
@@ -328,13 +290,9 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_user_permission_preset_source))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn user_permission_preset_sources(
         &self,
         user_ids: &[String],
@@ -356,14 +314,10 @@ impl Database {
             for user_id in user_ids {
                 statement = statement.bind(user_id);
             }
-            for row in
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 let user_id = row.get("user_id");
                 sources.insert(user_id, stored_user_permission_preset_source(row));
@@ -377,10 +331,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map(|value: i64| value != 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn insert_initial_user(
@@ -390,14 +341,7 @@ impl Database {
         display_name: &str,
         password_hash: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let inserted = self
             .query(
                 "INSERT INTO users (
@@ -414,17 +358,8 @@ impl Database {
             .execute(&mut *transaction)
             .await
             .map(|result| result.rows_affected() == 1)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(inserted)
     }
 
@@ -471,10 +406,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn insert_user_with_email_and_permissions(
@@ -482,14 +414,7 @@ impl Database {
         user: NewStoredUser<'_>,
         permissions: NewStoredUserPermissions<'_>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO users (
                 id, username_normalized, display_name, password_hash,
@@ -516,10 +441,7 @@ impl Database {
         .bind(permissions.library_access_mode)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         if permissions.library_access_mode == "SELECTED" {
             for library_id in permissions.library_ids {
@@ -531,20 +453,11 @@ impl Database {
                 .bind(library_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn get_user_playback_policy(
@@ -568,10 +481,7 @@ impl Database {
                 allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_user_playback_policy(
@@ -594,10 +504,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_user_by_username(
@@ -621,10 +528,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_user))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_users_by_display_name_exact(
@@ -648,10 +552,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_user).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_users_by_normalized_usernames(
@@ -688,10 +589,7 @@ impl Database {
                 query
                     .fetch_all(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .into_iter()
                     .map(stored_user),
             );
@@ -707,10 +605,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_users(&self) -> Result<Vec<StoredUser>, StorageError> {
@@ -766,10 +661,7 @@ impl Database {
         let total_count = count_statement
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let max_function = match self.backend() {
             crate::config::DatabaseBackend::Sqlite => "MAX",
@@ -832,10 +724,7 @@ impl Database {
             .bind(offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let users = rows.into_iter().map(stored_admin_user_list_item).collect();
         Ok((users, total_count))
     }
@@ -863,14 +752,10 @@ impl Database {
             for user_id in user_ids {
                 statement = statement.bind(user_id);
             }
-            for row in
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 display_names.insert(row.get("id"), row.get("display_name"));
             }
@@ -907,10 +792,7 @@ impl Database {
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_user)
             .collect();
@@ -921,10 +803,7 @@ impl Database {
             );
             users.truncate(MAX_USER_DIRECTORY_ENTRIES as usize);
         }
-        Ok(users).map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        Ok(users).map_err(self.sqlx_err())
     }
 
     pub(crate) async fn query_users(
@@ -976,10 +855,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let total_count = rows
             .first()
             .map(|row| row.get::<i64, _>("total_count"))
@@ -1009,10 +885,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_user))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_user_profile(
@@ -1041,10 +914,7 @@ impl Database {
         .bind(user_id)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.find_user_by_id(user_id).await
     }
 
@@ -1093,10 +963,7 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         else {
             return Ok(None);
         };
@@ -1122,10 +989,7 @@ impl Database {
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if remaining == 0 {
                 return Err(StorageError::LastManager);
             }
@@ -1139,10 +1003,7 @@ impl Database {
             .bind(user_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         } else {
             Vec::new()
         };
@@ -1170,19 +1031,13 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if !current_disabled && next_disabled {
             let now: i64 = self
                 .query_scalar("SELECT unixepoch()")
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE web_sessions
                  SET revoked_at = ?, updated_at = ?
@@ -1193,10 +1048,7 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE access_tokens
                  SET revoked_at = ?, updated_at = ?
@@ -1207,10 +1059,7 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE playback_sessions
                  SET state = 'STOPPED', is_paused = 0, last_event_at = ?
@@ -1220,10 +1069,7 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE web_playback_sessions
                  SET state = 'STOPPED', updated_at = ?
@@ -1233,18 +1079,9 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(self
             .find_user_by_id(user_id)
             .await?
@@ -1261,10 +1098,7 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         else {
             return Ok(false);
         };
@@ -1279,10 +1113,7 @@ impl Database {
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if remaining == 0 {
                 return Err(StorageError::LastManager);
             }
@@ -1291,17 +1122,8 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -1318,10 +1140,7 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         else {
             return Ok(None);
         };
@@ -1340,10 +1159,7 @@ impl Database {
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if remaining == 0 {
                 return Err(StorageError::LastManager);
             }
@@ -1352,10 +1168,7 @@ impl Database {
             .query_scalar("SELECT unixepoch()")
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let configured_grace_days: Option<String> = self
             .query_scalar(
                 "SELECT value FROM server_settings
@@ -1363,10 +1176,7 @@ impl Database {
             )
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let grace_days = normalize_user_deletion_grace_days(configured_grace_days);
         let hls_session_rows = self
             .query(
@@ -1376,10 +1186,7 @@ impl Database {
             .bind(user_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let hls_session_ids = hls_session_rows
             .into_iter()
             .map(|row| row.get::<String, _>("id"))
@@ -1398,10 +1205,7 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE web_sessions
              SET revoked_at = ?, updated_at = ?
@@ -1412,10 +1216,7 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE access_tokens
              SET revoked_at = ?, updated_at = ?
@@ -1426,10 +1227,7 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE playback_sessions
              SET state = 'STOPPED', is_paused = 0, last_event_at = ?
@@ -1439,10 +1237,7 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE web_playback_sessions
              SET state = 'STOPPED', updated_at = ?
@@ -1452,17 +1247,8 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(hls_session_ids))
     }
 
@@ -1479,10 +1265,7 @@ impl Database {
             .bind(user_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1492,10 +1275,7 @@ impl Database {
             .bind(user_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1521,10 +1301,7 @@ impl Database {
             .bind(now)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
             .map(|row| row.get::<String, _>("id"))
@@ -1542,10 +1319,7 @@ impl Database {
         .bind(user_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_user_emby_configuration(
@@ -1565,10 +1339,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn copy_user_library_settings(
@@ -1576,14 +1347,7 @@ impl Database {
         source_user_id: &str,
         target_user_id: &str,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO user_library_access (user_id, library_id, can_view)
              SELECT ?, library_id, can_view
@@ -1593,10 +1357,7 @@ impl Database {
         .bind(source_user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO user_library_order (user_id, library_id, position)
              SELECT ?, library_id, position
@@ -1606,10 +1367,7 @@ impl Database {
         .bind(source_user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO user_library_order_preferences (user_id, use_admin_library_order)
              SELECT ?, use_admin_library_order
@@ -1622,17 +1380,8 @@ impl Database {
         .bind(source_user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_user_logged_in(&self, user_id: &str) -> Result<(), StorageError> {
@@ -1641,10 +1390,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn touch_access_token(&self, token_hash: &[u8]) -> Result<(), StorageError> {
@@ -1660,10 +1406,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn insert_audit_event(
@@ -1675,10 +1418,7 @@ impl Database {
                 .bind(actor_user_id)
                 .fetch_optional(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
         } else {
             None
         };
@@ -1700,8 +1440,6 @@ impl Database {
             })
     }
 
-    // LUX-721 wires this persistence method into the activity event recorder.
-    #[allow(dead_code)]
     pub(crate) async fn insert_user_activity_event(
         &self,
         event: NewUserActivityEvent<'_>,
@@ -1727,16 +1465,11 @@ impl Database {
         .bind(metadata_json)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         Ok(event_id)
     }
 
-    // LUX-741 wires this monotonic inventory upsert into authentication and activity recording.
-    #[allow(dead_code)]
     pub(crate) async fn upsert_user_device(
         &self,
         observation: NewUserDeviceObservation<'_>,
@@ -1784,15 +1517,10 @@ impl Database {
         .bind(observation.last_remote_ip)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
-    // LUX-745 consumes this bounded inventory page in the administrator user API.
-    #[allow(dead_code)]
     pub(crate) async fn list_user_devices_page(
         &self,
         query: UserDevicePageQuery<'_>,
@@ -1803,10 +1531,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map(|row| row.get::<i64, _>("total_count"))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let rows = self
             .query(
@@ -1837,10 +1562,7 @@ impl Database {
             .bind(query.offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let devices = rows
             .into_iter()
             .map(|row| StoredUserDevice {
@@ -1859,8 +1581,6 @@ impl Database {
         Ok((devices, total_count))
     }
 
-    // LUX-755 supplies scope-safe CRUD for future administrator blacklist APIs.
-    #[allow(dead_code)]
     pub(crate) async fn insert_user_access_blacklist_rule(
         &self,
         rule: NewUserAccessBlacklistRule<'_>,
@@ -1881,14 +1601,10 @@ impl Database {
         .bind(rule.created_at)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn list_user_access_blacklist_rules_page(
         &self,
         query: UserAccessBlacklistRulePageQuery<'_>,
@@ -1908,10 +1624,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map(|row| row.get::<i64, _>("total_count"))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let page_sql = format!(
             "SELECT id, user_id, rule_type, match_value, is_enabled, created_by,
@@ -1929,10 +1642,7 @@ impl Database {
             .bind(query.offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let rules = rows
             .into_iter()
             .map(|row| StoredUserAccessBlacklistRule {
@@ -1982,14 +1692,9 @@ impl Database {
                     updated_at: row.get("updated_at"),
                 })
             })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
-    // LUX-758 checks active device/client rules before auth enforcement is wired.
-    #[allow(dead_code)]
     pub(crate) async fn user_access_blacklist_matches(
         &self,
         query: UserAccessBlacklistRuleMatchQuery<'_>,
@@ -2018,10 +1723,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .and_then(|row| row.try_get::<i64, _>("matched").map(|value| value != 0))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn active_user_access_device_client_blacklist_rules(
@@ -2053,15 +1755,11 @@ impl Database {
                 row.try_get::<i64, _>("has_client_rules")? != 0,
             ))
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    // LUX-765 loads at most 201 active global and user IP rules so callers can
-    // fail closed if the supported per-request evaluation bound is exceeded.
-    #[allow(dead_code)]
+    // Loads at most 201 active global and user IP rules so callers can fail closed
+    // if the supported per-request evaluation bound is exceeded.
     pub(crate) async fn list_user_access_ip_blacklist_rule_values(
         &self,
         query: UserAccessBlacklistIpRuleQuery<'_>,
@@ -2081,14 +1779,10 @@ impl Database {
             .bind(query.limit.clamp(1, 201))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(rows.into_iter().map(|row| row.get("match_value")).collect())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn set_user_access_blacklist_rule_enabled(
         &self,
         scope: UserAccessBlacklistRuleScope<'_>,
@@ -2116,13 +1810,9 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() > 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn delete_user_access_blacklist_rule(
         &self,
         scope: UserAccessBlacklistRuleScope<'_>,
@@ -2142,14 +1832,9 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() > 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
-    // LUX-723 wires this storage contract into the administrator activity API.
-    #[allow(dead_code)]
     pub(crate) async fn list_user_activity_events(
         &self,
         query: UserActivityEventQuery<'_>,
@@ -2188,10 +1873,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map(|row| row.get::<i64, _>("total_count"))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let page_sql = format!(
             "SELECT id, user_id, actor_user_id, event_type, target_type, target_id,
@@ -2217,10 +1899,7 @@ impl Database {
             .bind(query.offset.max(0))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let events = rows
             .into_iter()
             .map(|row| StoredUserActivityEvent {
@@ -2237,7 +1916,6 @@ impl Database {
         Ok((events, total_count))
     }
 
-    #[allow(dead_code)] // LUX-732 wires the bounded activity-retention worker.
     pub(crate) async fn delete_user_activity_events_before(
         &self,
         occurred_before: i64,
@@ -2261,10 +1939,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_activity_events(
@@ -2358,14 +2033,10 @@ impl Database {
             for user_id in chunk {
                 statement = statement.bind(user_id.as_str());
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             usernames.extend(rows.into_iter().map(|row| {
                 (
                     row.get::<String, _>("id"),
@@ -2420,10 +2091,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_user))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn create_playback_access_token(
@@ -2448,10 +2116,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn revoke_playback_access_tokens(
@@ -2467,10 +2132,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_access_token_device(
@@ -2494,13 +2156,9 @@ impl Database {
                 client_version: row.get("client_version"),
             })
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn list_user_emby_login_sessions_for_admin(
         &self,
         user_id: &str,
@@ -2517,10 +2175,7 @@ impl Database {
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let sessions = self
             .query(
                 "SELECT id, device_id, device_name, device_type, client_name, client_version,
@@ -2550,10 +2205,7 @@ impl Database {
                     })
                     .collect()
             })
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((sessions, total_count))
     }
 
@@ -2572,10 +2224,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() > 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn revoke_all_user_emby_login_sessions_for_admin(
@@ -2599,10 +2248,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_user_library_access(
@@ -2623,10 +2269,7 @@ impl Database {
         .bind(database_flag(can_view))
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE users
              SET library_access_mode = CASE WHEN EXISTS (
@@ -2638,17 +2281,8 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_user_library_access_batch(
@@ -2684,10 +2318,7 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE users
@@ -2700,17 +2331,8 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn user_library_access_mode(
@@ -2721,10 +2343,7 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn replace_user_library_access_mode(
@@ -2743,28 +2362,16 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if updated.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         self.query("DELETE FROM user_library_access WHERE user_id = ?")
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if mode == "SELECTED" {
             for library_id in library_ids {
                 self.query(
@@ -2775,19 +2382,10 @@ impl Database {
                 .bind(library_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -2820,10 +2418,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_accessible_library_ids(
@@ -2855,10 +2450,7 @@ impl Database {
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_selected_library_ids(
@@ -2876,10 +2468,7 @@ impl Database {
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_enabled_library_ids(&self) -> Result<Vec<String>, StorageError> {
@@ -2891,10 +2480,7 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_user_item_state(
@@ -2912,10 +2498,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(UserItemStateRow::into_state))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Resolves the accessible media libraries of several users in one bounded batch.
@@ -2957,14 +2540,10 @@ impl Database {
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
-            for row in
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 if let Some(library_ids) = accessible.get_mut(&row.get::<String, _>("user_id")) {
                     library_ids.push(row.get("library_id"));
@@ -2982,10 +2561,7 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_user_person_favorite(
@@ -3005,10 +2581,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_user_person_favorite(
@@ -3030,10 +2603,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn plugin_installation_status(
@@ -3045,10 +2615,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await
             .map(|value: Option<i64>| value.map(|value| value != 0))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_plugin_installation_statuses_by_ids(
@@ -3072,14 +2639,10 @@ impl Database {
             for plugin_id in chunk {
                 statement = statement.bind(plugin_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 statuses.insert(
                     row.get::<String, _>("plugin_id"),
@@ -3117,10 +2680,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_plugin_enabled(
@@ -3138,10 +2698,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_user_item_states(
@@ -3168,14 +2725,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let item_id = row.item_id.clone();
                 states.insert(item_id, row.into_state());
@@ -3192,10 +2745,7 @@ impl Database {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let percent = values
             .iter()
             .find(|(key, _)| key == "resume_played_percent")
@@ -3220,10 +2770,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|value: Option<i64>| value.unwrap_or(DEFAULT_PLAYED_PERCENT).clamp(1, 100))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn home_resume_settings(
@@ -3239,10 +2786,7 @@ impl Database {
             .bind(user_id)
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let played_percent = played_percent
             .unwrap_or(DEFAULT_PLAYED_PERCENT)
             .clamp(1, 100);
@@ -3261,10 +2805,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|value: Option<String>| value.as_deref() == Some("1"))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn user_deletion_grace_days(&self) -> Result<i64, StorageError> {
@@ -3275,10 +2816,7 @@ impl Database {
             )
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(normalize_user_deletion_grace_days(value))
     }
 
@@ -3297,14 +2835,10 @@ impl Database {
         .bind(days.to_string())
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
-    #[allow(dead_code)] // LUX-732 exposes the stored value through the admin service.
     pub(crate) async fn user_activity_retention_days(&self) -> Result<i64, StorageError> {
         let value: Option<String> = self
             .query_scalar(
@@ -3313,14 +2847,10 @@ impl Database {
             )
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(normalize_user_activity_retention_days(value))
     }
 
-    #[allow(dead_code)] // LUX-732 exposes the stored value through the admin service.
     pub(crate) async fn set_user_activity_retention_days(
         &self,
         days: i64,
@@ -3339,14 +2869,10 @@ impl Database {
         .bind(days.to_string())
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
-    #[allow(dead_code)] // LUX-763 exposes and validates this setting through the admin API.
     pub(crate) async fn trusted_proxy_cidrs_json(&self) -> Result<Option<String>, StorageError> {
         self.query_scalar(
             "SELECT value FROM server_settings
@@ -3354,13 +2880,9 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-763 exposes and validates this setting through the admin API.
     pub(crate) async fn set_trusted_proxy_cidrs_json(
         &self,
         value: &str,
@@ -3374,10 +2896,7 @@ impl Database {
         .bind(value)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -3388,10 +2907,7 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_new_user_permissions_json(
@@ -3407,14 +2923,10 @@ impl Database {
         .bind(value)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn user_permission_presets_json(
         &self,
     ) -> Result<Option<String>, StorageError> {
@@ -3424,13 +2936,9 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn compare_and_set_user_permission_presets_json(
         &self,
         expected: Option<&str>,
@@ -3456,10 +2964,7 @@ impl Database {
             .execute(&self.pool)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         Ok(result.rows_affected() == 1)
     }
@@ -3487,10 +2992,7 @@ impl Database {
                 .bind(library_id)
                 .fetch_one(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if enabled == 0 {
                 return Ok(false);
             }
@@ -3510,14 +3012,9 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|value: Option<i64>| value.unwrap_or(1) != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    // LUX-677 creates the persistent content restriction contract.
-    #[allow(dead_code)]
     pub(crate) async fn user_content_restrictions(
         &self,
         user_id: &str,
@@ -3536,10 +3033,7 @@ impl Database {
             .bind(user_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(row) = rows.first() else {
             return Ok(None);
         };
@@ -3572,8 +3066,7 @@ impl Database {
         }))
     }
 
-    // LUX-708 reads the source and all selected targets from one bounded database snapshot.
-    #[allow(dead_code)]
+    // Reads the source and all selected targets from one bounded database snapshot.
     pub(crate) async fn user_permission_copy_snapshots(
         &self,
         user_ids: &[String],
@@ -3589,33 +3082,17 @@ impl Database {
             ));
         }
 
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == crate::config::DatabaseBackend::Postgres {
             sqlx::query("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let snapshots = self
             .user_permission_copy_snapshots_in_transaction(user_ids, &mut transaction)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(snapshots)
     }
 
@@ -3638,10 +3115,7 @@ impl Database {
         let user_rows = user_query
             .fetch_all(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut snapshots = HashMap::with_capacity(user_rows.len());
         for row in user_rows {
             let user_id: String = row.get("id");
@@ -3678,10 +3152,7 @@ impl Database {
         for row in library_query
             .fetch_all(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         {
             let user_id: String = row.get("user_id");
             let library_id: String = row.get("library_id");
@@ -3710,10 +3181,7 @@ impl Database {
         for row in restrictions_query
             .fetch_all(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         {
             let user_id: String = row.get("user_id");
             let restrictions =
@@ -3750,8 +3218,7 @@ impl Database {
         Ok(snapshots)
     }
 
-    // LUX-709 writes one target's selected permission groups as a compare-and-swap transaction.
-    #[allow(dead_code)]
+    // Writes one target's selected permission groups as a compare-and-swap transaction.
     pub(crate) async fn copy_user_permission_groups(
         &self,
         source_user_id: &str,
@@ -3777,10 +3244,7 @@ impl Database {
             lock_query
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let user_ids = vec![source_user_id.to_owned(), target_user_id.to_owned()];
@@ -3830,14 +3294,10 @@ impl Database {
                     for library_id in library_chunk {
                         library_query = library_query.bind(library_id);
                     }
-                    available +=
-                        library_query
-                            .fetch_one(&mut *transaction)
-                            .await
-                            .map_err(|source| StorageError::Sqlx {
-                                path: self.path.clone(),
-                                source,
-                            })?;
+                    available += library_query
+                        .fetch_one(&mut *transaction)
+                        .await
+                        .map_err(self.sqlx_err())?;
                 }
                 if available != source.library_ids.len() as i64 {
                     return Ok(UserPermissionCopyResult::InvalidSnapshot);
@@ -3853,10 +3313,7 @@ impl Database {
                 .bind(target_user_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if updated.rows_affected() != 1 {
                 return Ok(UserPermissionCopyResult::UserUnavailable);
             }
@@ -3864,10 +3321,7 @@ impl Database {
                 .bind(target_user_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if source.library_access_mode == "SELECTED" {
                 for library_id in &source.library_ids {
                     self.query(
@@ -3878,10 +3332,7 @@ impl Database {
                     .bind(library_id)
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 }
             }
         }
@@ -3904,10 +3355,7 @@ impl Database {
                 .bind(target_user_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if updated.rows_affected() != 1 {
                 return Ok(UserPermissionCopyResult::UserUnavailable);
             }
@@ -3926,13 +3374,7 @@ impl Database {
             return Ok(UserPermissionCopyResult::Conflict);
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserPermissionCopyResult::Updated)
     }
 
@@ -3987,10 +3429,7 @@ impl Database {
                     .execute(&mut **transaction)
                     .await
                 }
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
                 if result.rows_affected() != 1 {
                     return Ok(false);
                 }
@@ -3999,10 +3438,7 @@ impl Database {
                     .bind(target_user_id)
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 for (tag_kind, tags) in [
                     ("ALLOW", source.allowed_tags.as_slice()),
                     ("BLOCK", source.blocked_tags.as_slice()),
@@ -4017,10 +3453,7 @@ impl Database {
                         .bind(tag)
                         .execute(&mut **transaction)
                         .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                        .map_err(self.sqlx_err())?;
                     }
                 }
                 Ok(true)
@@ -4038,17 +3471,13 @@ impl Database {
                     .bind(target.version)
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 Ok(deleted.rows_affected() == 1)
             }
         }
     }
 
-    // LUX-677 keeps the policy version and both tag groups in one CAS transaction.
-    #[allow(dead_code)]
+    // Keeps the policy version and both tag groups in one CAS transaction.
     pub(crate) async fn compare_and_swap_user_content_restrictions(
         &self,
         user_id: &str,
@@ -4073,32 +3502,16 @@ impl Database {
         let allowed_tags = normalize_user_content_restriction_tags(restrictions.allowed_tags)?;
         let blocked_tags = normalize_user_content_restriction_tags(restrictions.blocked_tags)?;
 
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == crate::config::DatabaseBackend::Postgres {
             let active_user: Option<String> = self
                 .query_scalar("SELECT id FROM users WHERE id = ? AND deleted_at IS NULL FOR UPDATE")
                 .bind(user_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if active_user.is_none() {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                transaction.rollback().await.map_err(self.sqlx_err())?;
                 return Ok(UserContentRestrictionsCasResult::UserUnavailable);
             }
         }
@@ -4139,10 +3552,7 @@ impl Database {
             .execute(&mut *transaction)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if result.rows_affected() == 0 {
             let user_available: i64 = self
                 .query_scalar(
@@ -4153,17 +3563,8 @@ impl Database {
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(if user_available != 0 {
                 UserContentRestrictionsCasResult::Conflict
             } else {
@@ -4175,10 +3576,7 @@ impl Database {
             .bind(user_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         for (tag_kind, tags) in [
             ("ALLOW", allowed_tags.as_slice()),
             ("BLOCK", blocked_tags.as_slice()),
@@ -4203,21 +3601,13 @@ impl Database {
                 }
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         let Some(updated) = self.user_content_restrictions(user_id).await? else {
             return Ok(UserContentRestrictionsCasResult::UserUnavailable);
         };
         Ok(UserContentRestrictionsCasResult::Updated(updated))
     }
 
-    // LUX-654 connects this storage contract to the authenticated settings API.
-    #[allow(dead_code)]
     pub(crate) async fn user_account_preferences(
         &self,
         user_id: &str,
@@ -4232,10 +3622,7 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(row) = row else {
             return Ok(None);
         };
@@ -4256,7 +3643,6 @@ impl Database {
         }))
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn compare_and_swap_user_account_preferences(
         &self,
         user_id: &str,
@@ -4266,14 +3652,7 @@ impl Database {
         if expected_version < 0 {
             return Ok(UserAccountPreferencesCasResult::Conflict);
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let result = if expected_version == 0 {
             self.query(
                 "INSERT INTO user_account_preferences (
@@ -4323,10 +3702,7 @@ impl Database {
             .execute(&mut *transaction)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if result.rows_affected() == 0 {
             let user_available: i64 = self
                 .query_scalar(
@@ -4337,17 +3713,8 @@ impl Database {
                 .bind(user_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(if user_available != 0 {
                 UserAccountPreferencesCasResult::Conflict
             } else {
@@ -4385,13 +3752,7 @@ impl Database {
                 return Err(error);
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         let Some(updated) = self.user_account_preferences(user_id).await? else {
             return Ok(UserAccountPreferencesCasResult::UserUnavailable);
         };
@@ -4415,10 +3776,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn admin_user_id(&self) -> Result<Option<String>, StorageError> {
@@ -4430,10 +3788,7 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     #[cfg(test)]
@@ -4472,10 +3827,7 @@ impl Database {
         .bind(user_id)
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Loads the saved library order of several users in one query per bounded chunk.
@@ -4503,14 +3855,10 @@ impl Database {
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
-            for row in
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 orders
                     .entry(row.get("user_id"))
@@ -4545,14 +3893,10 @@ impl Database {
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
-            for row in
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 flags.insert(
                     row.get("user_id"),
@@ -4587,14 +3931,10 @@ impl Database {
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
-            for row in
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 configurations.insert(row.get("user_id"), row.get("configuration_json"));
             }
@@ -4607,23 +3947,10 @@ impl Database {
         user_id: &str,
         library_ids: &[String],
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.replace_user_library_order_in_transaction(user_id, library_ids, &mut transaction)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     async fn replace_user_library_order_in_transaction(
@@ -4636,10 +3963,7 @@ impl Database {
             .bind(user_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         const MAX_ROWS_PER_BATCH: usize = 100;
         for (batch_index, batch) in library_ids.chunks(MAX_ROWS_PER_BATCH).enumerate() {
             let values = std::iter::repeat_n("(?, ?, ?)", batch.len())
@@ -4661,10 +3985,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -4677,14 +3998,7 @@ impl Database {
         force_admin_library_order: bool,
         login_background_source: &str,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let settings = [
             ("resume_played_percent", percent.to_string()),
             ("resume_min_ticks", min_ticks.to_string()),
@@ -4712,28 +4026,12 @@ impl Database {
         statement
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn uninstall_plugin(&self, plugin_id: &str) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let rows: Vec<(String, String, i64, String)> = self
             .query_as(
                 "SELECT library_id, scraper_id, position, role
@@ -4746,10 +4044,7 @@ impl Database {
             .bind(plugin_id)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut scrapers_by_library = BTreeMap::<String, Vec<(String, String)>>::new();
         for (library_id, scraper_id, _position, role) in rows {
             if scraper_id != plugin_id {
@@ -4777,10 +4072,7 @@ impl Database {
             query
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let mut rebuilt_rows = Vec::new();
@@ -4821,10 +4113,7 @@ impl Database {
             query
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         const LIBRARY_UPDATE_CHUNK_SIZE: usize = 100;
@@ -4849,10 +4138,7 @@ impl Database {
             query
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE libraries
@@ -4867,25 +4153,13 @@ impl Database {
         .bind(plugin_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query("DELETE FROM installed_plugins WHERE plugin_id = ?")
             .bind(plugin_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn server_name(&self) -> Result<Option<String>, StorageError> {
@@ -4895,10 +4169,7 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_server_name(&self, name: &str) -> Result<(), StorageError> {
@@ -4911,10 +4182,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn media_strategy_settings(&self) -> Result<Option<String>, StorageError> {
@@ -4924,10 +4192,7 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn transcoding_settings(&self) -> Result<Option<String>, StorageError> {
@@ -4937,10 +4202,7 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn set_transcoding_settings(&self, value: &str) -> Result<(), StorageError> {
@@ -4953,10 +4215,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn login_background_source(&self) -> Result<Option<String>, StorageError> {
@@ -4966,10 +4225,7 @@ impl Database {
         )
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn upsert_login_background_plugin_cache(
@@ -4996,10 +4252,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn login_background_plugin_cache(
@@ -5014,10 +4267,7 @@ impl Database {
         .bind(plugin_id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 }
 
@@ -5070,10 +4320,7 @@ impl Database {
             for row in mode_statement
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
             {
                 let user_id: String = row.get("id");
                 let mode: Option<String> = row.get("library_access_mode");
@@ -5099,10 +4346,7 @@ impl Database {
             for row in access_statement
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
             {
                 let user_id: String = row.get("user_id");
                 let library_id: String = row.get("library_id");
@@ -5131,10 +4375,7 @@ impl Database {
             for row in restriction_statement
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
             {
                 let user_id: String = row.get("user_id");
                 let entry = restrictions_by_user.entry(user_id).or_insert_with(|| {
@@ -5193,10 +4434,7 @@ impl Database {
             .bind(limit.clamp(1, 1000))
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
             .map(|row| (row.get("rule_type"), row.get("match_value")))

@@ -26,7 +26,7 @@ struct ManifestDiscoveryObservationInput<'slice, 'data> {
 }
 
 impl Database {
-    #[allow(dead_code)] // Kept for focused storage contract tests.
+    #[cfg(test)]
     pub(crate) async fn commit_scan_manifest_discovery_chunk(
         &self,
         chunk: &NewScanManifestDiscoveryChunk<'_>,
@@ -102,13 +102,7 @@ impl Database {
         );
         let result = result?;
         let transaction_commit_started = Instant::now();
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         record_manifest_storage_stage(
             "transaction_commit",
             transaction_commit_started,

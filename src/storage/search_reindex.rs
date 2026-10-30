@@ -69,10 +69,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() as i64)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Rewrites the search rows for `item_ids` from the authoritative tables in one transaction.
@@ -83,14 +80,7 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", item_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         // Claim rowids first: FTS5 cannot delete by item_id, and inserts need the mapped rowid.
         let statements = [
             format!(
@@ -141,18 +131,9 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// PostgreSQL variant: `media_search` is a plain table with a unique item_id, so the consumer
@@ -161,14 +142,7 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", item_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let upsert = format!(
             "INSERT INTO media_search (item_id, title, sort_title, original_title, aliases)
              SELECT item.id, item.title, item.sort_title, COALESCE(item.original_title, ''),
@@ -203,17 +177,8 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 }

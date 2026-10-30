@@ -179,9 +179,7 @@ pub(crate) async fn admin_refresh_library_local_metadata(
         )
         .into_response();
     };
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     let accepted = match scan_jobs
         .start_local_metadata_refresh(library_id, request.root_id.as_deref(), &request.paths)
         .await
@@ -432,9 +430,7 @@ pub(crate) async fn admin_list_metadata_reidentify(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database
         .list_metadata_reidentify_jobs(status.as_deref(), offset, limit)
         .await
@@ -625,9 +621,7 @@ pub(crate) async fn admin_merge_items(
         )
         .into_response();
     }
-    let Some(service) = state.item_merge.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.item_merge);
     let result = match crate::application::admin_media_mutations::merge_media_items(
         service,
         state.home.as_ref(),
@@ -935,9 +929,7 @@ pub(crate) async fn admin_delete_item_image(
         )
         .into_response();
     }
-    let Some(images) = state.image_writes.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let images = require_service!(state.image_writes);
     match images.delete_item_image(&item_id, &image_id).await {
         Ok(()) => {
             record_audit_event(
@@ -1107,24 +1099,32 @@ pub(crate) fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> 
     }
 }
 
-pub(crate) fn item_image_json(item_id: &str, image: &crate::storage::StoredItemImage) -> Value {
+pub(crate) fn item_image_json(
+    item_id: &str,
+    image: &crate::storage::StoredItemImage,
+) -> super::super::media::ItemImage {
     let image_type = image.image_type.to_ascii_lowercase();
     let index = if image.image_index > 0 {
         format!("/{}", image.image_index)
     } else {
         String::new()
     };
-    json!({
-        "id": image.id,
-        "itemId": item_id,
-        "imageType": image.image_type,
-        "imageIndex": image.image_index,
-        "fileSize": image.file_size,
-        "contentTag": image.content_tag,
-        "source": image.source,
-        "language": Value::Null,
-        "url": format!("/api/v1/items/{}/images/{}{}", encode_path_segment(item_id), image_type, index),
-    })
+    super::super::media::ItemImage {
+        content_tag: image.content_tag.clone(),
+        file_size: image.file_size,
+        id: image.id.clone(),
+        image_index: image.image_index,
+        image_type: image.image_type.clone(),
+        item_id: item_id.to_owned(),
+        language: None,
+        source: image.source.clone(),
+        url: format!(
+            "/api/v1/items/{}/images/{}{}",
+            encode_path_segment(item_id),
+            image_type,
+            index
+        ),
+    }
 }
 
 pub(crate) fn image_candidate_json(image: &crate::application::images::ImageCandidate) -> Value {

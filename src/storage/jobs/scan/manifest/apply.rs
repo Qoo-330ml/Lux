@@ -56,10 +56,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_applied_scan_manifest_removals(
@@ -73,10 +70,7 @@ impl Database {
         .bind(manifest_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn commit_scan_manifest_delta_batch(
@@ -120,13 +114,7 @@ impl Database {
         let result = self
             .finalize_manifest_delta_batch(&mut transaction, batch, outcome)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result)
     }
 }

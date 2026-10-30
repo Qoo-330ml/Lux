@@ -38,10 +38,7 @@ impl Database {
         .bind(database_flag(auto_metadata_match))
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let created_manifest = self
             .query(
                 "INSERT INTO scan_manifests (
@@ -60,10 +57,7 @@ impl Database {
             .bind(manifest.library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if created_manifest.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "manifest must reference its new full-scan job".to_owned(),
@@ -73,13 +67,7 @@ impl Database {
             .await?;
         self.copy_legacy_scan_manifest_targets(&mut transaction, id, legacy_retry_job_id)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     async fn initialize_full_scan_manifest_roots(
@@ -111,10 +99,7 @@ impl Database {
                 .bind(manifest.library_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if usize::try_from(inserted.rows_affected()).unwrap_or(usize::MAX) != chunk.len() {
                 let placeholders = std::iter::repeat_n("?", chunk.len())
                     .collect::<Vec<_>>()
@@ -130,10 +115,7 @@ impl Database {
                 let valid = valid_query
                     .fetch_all(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .into_iter()
                     .map(|row| row.get::<String, _>("id"))
                     .collect::<HashSet<_>>();
@@ -162,10 +144,7 @@ impl Database {
             insert
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         self.query(
             "UPDATE scan_manifests
@@ -176,10 +155,7 @@ impl Database {
         .bind(manifest.id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -213,10 +189,7 @@ impl Database {
             .bind(legacy_job_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO scan_job_targets (
                      job_id, target_type, target_id, source_id, item_id, change_kind,
@@ -237,10 +210,7 @@ impl Database {
             .bind(legacy_job_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "INSERT INTO scan_job_targets (
                      job_id, target_type, target_id, item_id, change_kind,
@@ -262,26 +232,17 @@ impl Database {
             .bind(legacy_job_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query("DELETE FROM scan_job_targets WHERE job_id = ?")
                 .bind(legacy_job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             self.query("DELETE FROM reconciliation_scan_entries WHERE job_id = ?")
                 .bind(legacy_job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -299,20 +260,11 @@ impl Database {
             .bind(job_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((state, resume_state, workflow_version, discovery_format_version, discovery_mode)) =
             manifest
         else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(None);
         };
 
@@ -338,10 +290,7 @@ impl Database {
                         .bind(stage)
                         .execute(&mut *transaction)
                         .await
-                        .map_err(|source| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source,
-                        })?;
+                        .map_err(self.sqlx_err())?;
                     if restored.rows_affected() != 1 {
                         return Err(StorageError::Conflict(
                             "scan manifest checkpoint changed while preparing retry".to_owned(),
@@ -368,13 +317,7 @@ impl Database {
             &discovery_mode,
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(stage))
     }
 
@@ -402,10 +345,7 @@ impl Database {
                 .bind(job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
                 self.query(
                     "UPDATE scan_manifest_roots
                      SET state = 'PENDING', error = NULL, finished_at = NULL,
@@ -416,10 +356,7 @@ impl Database {
                 .bind(job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             } else {
                 self.query(
                     "UPDATE scan_manifest_directories
@@ -430,10 +367,7 @@ impl Database {
                 .bind(job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
                 self.query(
                     "UPDATE scan_manifest_roots
                  SET state = CASE WHEN EXISTS (
@@ -449,10 +383,7 @@ impl Database {
                 .bind(job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
 

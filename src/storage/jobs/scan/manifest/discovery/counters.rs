@@ -45,10 +45,7 @@ impl Database {
         .bind(input.chunk.manifest_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let accepting_discovery = self
             .query(
@@ -66,10 +63,7 @@ impl Database {
             .bind(input.chunk.job_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if accepting_discovery.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "scan job is no longer accepting manifest discovery chunks".to_owned(),

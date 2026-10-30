@@ -37,11 +37,11 @@ const SQLITE_INCREMENTAL_VACUUM_PAGES_PER_STEP: i64 = 2_048;
 const MAINTENANCE_ENV: &str = "LUX_DATABASE_MAINTENANCE";
 const MAINTENANCE_INTERVAL_ENV: &str = "LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS";
 const MAINTENANCE_INITIAL_DELAY_ENV: &str = "LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS";
+const QUERY_STATISTICS_EXTENSION_ENV: &str = "LUX_POSTGRES_QUERY_STATISTICS_EXTENSION";
+const QUERY_STATISTICS_EXTENSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// A full SQLite `VACUUM` rewrites the entire file and holds the write lock for the
 /// whole rewrite, so the default budget stays short. Operators who accept the lock
 /// for an offline compaction can raise it.
-const QUERY_STATISTICS_EXTENSION_ENV: &str = "LUX_POSTGRES_QUERY_STATISTICS_EXTENSION";
-const QUERY_STATISTICS_EXTENSION_TIMEOUT: Duration = Duration::from_secs(10);
 const SQLITE_VACUUM_TIMEOUT_ENV: &str = "LUX_SQLITE_VACUUM_TIMEOUT_SECONDS";
 const DEFAULT_SQLITE_VACUUM_TIMEOUT_SECONDS: u64 = 120;
 
@@ -173,10 +173,7 @@ impl Database {
             )
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(active != 0)
     }
 
@@ -202,10 +199,7 @@ impl Database {
             .query_scalar(sqlx::AssertSqlSafe(query))
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(active != 0)
     }
 
@@ -233,10 +227,7 @@ impl Database {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut candidates = Vec::with_capacity(rows.len());
         for row in rows {
             let table: String = row.try_get("table_name").unwrap_or_default();
@@ -266,18 +257,12 @@ impl Database {
             .query_scalar("PRAGMA freelist_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let page_count: i64 = self
             .query_scalar("PRAGMA page_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         // SQLite tracks no per-table dead tuples. Model the database-wide
         // freelist as one synthetic candidate so the round can run `VACUUM` when
         // enough pages are reclaimable, and skip it otherwise.
@@ -298,10 +283,7 @@ impl Database {
         self.query_scalar("PRAGMA auto_vacuum")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Returns free pages to the filesystem in bounded steps. Incremental vacuum only
@@ -360,10 +342,7 @@ impl Database {
         self.query_scalar("PRAGMA freelist_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     async fn run_maintenance_vacuum(&self, table: &str, report: &mut MaintenanceReport) -> bool {
@@ -444,10 +423,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 }
 
@@ -502,10 +478,7 @@ impl Database {
             .query_scalar("SELECT EXISTS(SELECT 1 FROM media_items)")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if has_items == 0 {
             return Ok(SqliteStatisticsRefresh::SkippedEmpty);
         }
@@ -516,10 +489,7 @@ impl Database {
             )
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if analyzed == 0 {
             self.analyze_catalog().await?;
             return Ok(SqliteStatisticsRefresh::Analyzed);
@@ -527,10 +497,7 @@ impl Database {
         self.query("PRAGMA optimize")
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(SqliteStatisticsRefresh::Optimized)
     }
 
@@ -556,10 +523,7 @@ impl Database {
             .query_scalar("SELECT EXISTS(SELECT 1 FROM media_items)")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if has_items == 0 {
             return Ok(SqliteStatisticsRefresh::SkippedEmpty);
         }
@@ -590,17 +554,11 @@ impl Database {
             .query_scalar("PRAGMA analysis_limit")
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query("PRAGMA analysis_limit = 0")
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let analyzed = tokio::time::timeout(
             SQLITE_ANALYZE_TIMEOUT,
             self.query("ANALYZE").execute(&self.pool),
@@ -657,8 +615,6 @@ impl Database {
     }
 }
 
-/// Quotes a table name for interpolation into DDL that cannot take bind
-/// parameters. Names come from system catalogs, never user input.
 /// `LUX_POSTGRES_QUERY_STATISTICS_EXTENSION` defaults to on; `0`, `false`, `off` and `no` opt out.
 pub(crate) fn resolve_query_statistics_extension_enabled(configured: Option<&str>) -> bool {
     !matches!(
@@ -786,6 +742,8 @@ impl Database {
     }
 }
 
+/// Quotes a table name for interpolation into DDL that cannot take bind
+/// parameters. Names come from system catalogs, never user input.
 fn quote_identifier(name: &str) -> String {
     let escaped = name.replace('"', "\"\"");
     format!("\"{escaped}\"")

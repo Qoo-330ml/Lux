@@ -428,15 +428,9 @@ pub(super) async fn emby_library_virtual_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
+    let database = require_service!(state.database);
+    let access = require_service!(state.access);
     let media_strategy = match read_media_strategy_settings(database).await {
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -515,12 +509,8 @@ pub(super) async fn emby_library_selectable_media_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
+    let access = require_service!(state.access);
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
@@ -554,12 +544,8 @@ pub(super) async fn emby_library_media_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
+    let access = require_service!(state.access);
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
@@ -582,14 +568,10 @@ pub(super) async fn emby_library_media_folders(
         }
         None => accessible_library_ids,
     };
-    let mut root_paths = HashMap::new();
-    for library_id in &library_ids {
-        let roots = match database.list_library_roots(library_id).await {
-            Ok(roots) => roots,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        root_paths.extend(roots.into_iter().map(|root| (root.id, root.display_path)));
-    }
+    let root_paths = match emby_library_root_paths(database, &library_ids).await {
+        Ok(root_paths) => root_paths,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let (folders, total) = match database
         .list_folder_scan_paths_page(&library_ids, offset, limit)
         .await
@@ -620,6 +602,29 @@ pub(super) async fn emby_library_media_folders(
         "StartIndex": offset,
     }))
     .into_response()
+}
+
+/// Loads `root_id -> display_path` for every library the caller may see, in one batched query
+/// (the storage call groups library ids in chunks of 500, so very large scopes take one statement
+/// per chunk).
+///
+/// `MediaFolders` resolves each scanned folder through the root that owns it, so the whole
+/// visible set of roots is needed at once. `list_library_roots_by_library_ids` returns them
+/// grouped per library; flattening that grouping reproduces the map the per-library loop built,
+/// because a root belongs to exactly one library and only its display path is kept. Libraries
+/// without roots contribute no row, and asking for no library at all skips the query.
+async fn emby_library_root_paths(
+    database: &Database,
+    library_ids: &[String],
+) -> Result<HashMap<String, String>, StorageError> {
+    let roots = database
+        .list_library_roots_by_library_ids(library_ids)
+        .await?;
+    Ok(roots
+        .into_values()
+        .flatten()
+        .map(|root| (root.id, root.display_path))
+        .collect())
 }
 
 #[derive(Deserialize, Default)]
@@ -662,9 +667,7 @@ pub(super) async fn emby_persons(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -709,9 +712,7 @@ pub(super) async fn emby_persons(
             .into_response();
         }
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     let result = match parent_id.as_deref() {
         Some(parent_id) => {
             people
@@ -759,16 +760,12 @@ pub(super) async fn emby_person(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     match people
         .find_person(&library_ids, "Actor", &person_id_or_name)
         .await
@@ -1009,9 +1006,7 @@ async fn emby_global_collection_library_detail(
     state: &AppState,
     principal: AccessPrincipal,
 ) -> Response {
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     match catalog.list_global_collection_cards(principal, 0, 1).await {
         Ok(page) if page.total > 0 => Json(emby_global_collection_library_json(
             &state.server_id,
@@ -1089,9 +1084,7 @@ pub(super) async fn emby_user_resume(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let page = match catalog
         .list_continue_watching(principal, &user_id, offset, limit)
         .await
@@ -1402,9 +1395,7 @@ pub(super) async fn emby_next_up_response(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let series_id = query.series_id.as_deref().map(emby_internal_id);
     match catalog
         .list_next_up(principal, user_id, series_id.as_deref(), offset, limit)
@@ -1454,9 +1445,7 @@ pub(super) async fn emby_show_seasons(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let series_id = emby_internal_id(&series_id);
     match catalog
         .list_children(principal, &series_id, "SEASON", offset, limit)
@@ -1502,9 +1491,7 @@ pub(super) async fn emby_show_episodes(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let series_id = emby_internal_id(&series_id);
     // Emby clients commonly serialize an unset season selector as `SeasonId=`.
     // Treat it the same as an omitted selector instead of looking up an empty ID.
@@ -1590,9 +1577,7 @@ pub(super) async fn emby_collection_children(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let collection_id = emby_internal_id(&collection_id);
     match catalog
         .list_collection_items(principal, &collection_id, offset, limit)
@@ -2002,9 +1987,7 @@ pub(super) async fn emby_items_counts(
             Err(status) => return status.into_response(),
         };
     let target_user_id = principal.user_id_string();
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let counts = match catalog
         .count_item_types(principal, &target_user_id, query.is_favorite)
         .await
@@ -2111,9 +2094,7 @@ async fn emby_global_collection_root_items_response(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let page = match catalog
         .list_global_collection_cards(principal, offset, limit)
         .await
@@ -2676,16 +2657,12 @@ pub(super) async fn emby_update_item(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(people) = state.people.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let people = require_service!(state.people);
     let update = PersonMetadataUpdate {
         name: request.name.trim().to_owned(),
         biography: request.overview,
@@ -2775,9 +2752,7 @@ pub(super) async fn emby_item_response(
                 if !library.is_enabled {
                     return StatusCode::NOT_FOUND.into_response();
                 }
-                let Some(access) = state.access.as_ref() else {
-                    return StatusCode::SERVICE_UNAVAILABLE.into_response();
-                };
+                let access = require_service!(state.access);
                 match access.can_view_library(principal, &internal_item_id).await {
                     Ok(true) => {}
                     Ok(false) => return StatusCode::NOT_FOUND.into_response(),
@@ -2805,9 +2780,7 @@ pub(super) async fn emby_item_response(
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     }
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let (catalog_item, resolved_from_media_source_id) =
         match catalog.find_item(principal, &internal_item_id).await {
             Ok(Some(item)) => (Some(item), false),
@@ -2878,9 +2851,7 @@ pub(super) async fn emby_item_response(
             Json(item_json).into_response()
         }
         Some(mut item) => {
-            let Some(database) = state.database.as_ref() else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
+            let database = require_service!(state.database);
             let work_plan = emby_item_detail_work_plan(fields);
             if work_plan.populate_image_tags
                 && catalog
@@ -2980,9 +2951,7 @@ pub(super) async fn emby_item_response(
             Json(item_json).into_response()
         }
         None => {
-            let Some(access) = state.access.as_ref() else {
-                return StatusCode::SERVICE_UNAVAILABLE.into_response();
-            };
+            let access = require_service!(state.access);
             let library_ids = match access.accessible_library_ids(principal).await {
                 Ok(library_ids) => library_ids,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -3015,9 +2984,7 @@ async fn emby_global_collection_item_detail(
     can_download: bool,
     can_delete: bool,
 ) -> Response {
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let card = match catalog
         .find_global_collection_card(principal, collection_item_id)
         .await
@@ -4687,16 +4654,51 @@ pub(super) fn emby_signed_direct_stream_url(
     api_key: Option<&str>,
     device_id: &str,
 ) -> Option<String> {
+    emby_signed_direct_stream_url_parts(
+        service,
+        item_id,
+        EmbyStreamSourceParts {
+            id: &source.id,
+            kind: &source.source_kind,
+            container: source.container.as_deref(),
+        },
+        user,
+        play_session_id,
+        expires_at,
+        api_key,
+        device_id,
+    )
+}
+
+/// The source fields an Emby stream URL is built from.
+pub(super) struct EmbyStreamSourceParts<'a> {
+    pub(super) id: &'a str,
+    pub(super) kind: &'a str,
+    pub(super) container: Option<&'a str>,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emby_signed_direct_stream_url_parts(
+    service: &WebPlaybackSessionService,
+    item_id: &str,
+    source: EmbyStreamSourceParts<'_>,
+    user: &UserRecord,
+    play_session_id: &str,
+    expires_at: i64,
+    api_key: Option<&str>,
+    device_id: &str,
+) -> Option<String> {
     let user_id = user.id.to_string();
     let signature = service.sign_emby_direct_stream_v2(
         &user_id,
         user.is_admin,
         item_id,
-        &source.id,
+        source.id,
         play_session_id,
         expires_at,
     )?;
-    let mut url = emby_media_source_stream_url(item_id, source);
+    let mut url =
+        emby_media_source_stream_url_parts(item_id, source.id, source.kind, source.container);
     // Emby's standard video endpoint requires the PlaybackInfo session ID and
     // uses `static=true` to select direct streaming. External proxies use the
     // same context to associate the independent media request with playback.
@@ -5584,5 +5586,98 @@ mod tests {
         let filter = catalog_filter_from_emby(&query);
         assert_eq!(filter.is_played, Some(false));
         assert_eq!(filter.min_date_last_saved, Some(1_700_000_000));
+    }
+}
+
+/// Media folder root lookups, checked with the test-only statement counter.
+#[cfg(test)]
+mod media_folder_root_tests {
+    use std::collections::HashMap;
+
+    use super::emby_library_root_paths;
+    use crate::storage::{Database, NewLibraryRoot, test_database};
+
+    async fn insert_library(database: &Database, id: &str) {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(id)
+            .bind(id)
+            .execute(database.pool())
+            .await
+            .expect("library row");
+    }
+
+    async fn insert_root(
+        database: &Database,
+        root_id: &str,
+        library_id: &str,
+        canonical_path: &str,
+        display_path: &str,
+    ) {
+        database
+            .insert_library_root(NewLibraryRoot {
+                id: root_id,
+                library_id,
+                canonical_path,
+                display_path,
+                is_available: true,
+                is_writable: true,
+            })
+            .await
+            .expect("library root row");
+    }
+
+    #[tokio::test]
+    async fn media_folder_roots_keep_per_library_results_in_one_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        for library_id in ["library-a", "library-b", "library-c"] {
+            insert_library(&database, library_id).await;
+        }
+        insert_root(&database, "root-a1", "library-a", "/mnt/a1", "/srv/a1").await;
+        insert_root(&database, "root-a2", "library-a", "/mnt/a2", "/srv/a2").await;
+        insert_root(&database, "root-b1", "library-b", "/mnt/b1", "/srv/b1").await;
+        let library_ids = [
+            "library-a",
+            "library-b",
+            "library-c",
+            "library-missing-from-the-table",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+
+        // What the request path used to do: one query per library, merged into one map.
+        database.reset_query_count();
+        let mut per_library = HashMap::new();
+        for library_id in &library_ids {
+            for root in database.list_library_roots(library_id).await? {
+                per_library.insert(root.id, root.display_path);
+            }
+        }
+        assert_eq!(database.query_count(), library_ids.len());
+
+        database.reset_query_count();
+        let batched = emby_library_root_paths(&database, &library_ids).await?;
+        // Three libraries fit in one chunk of the batched storage call (500 library ids per statement).
+        assert_eq!(database.query_count(), 1);
+
+        assert_eq!(per_library.len(), 3);
+        assert_eq!(batched, per_library);
+        assert_eq!(batched.get("root-a1").map(String::as_str), Some("/srv/a1"));
+        assert_eq!(batched.get("root-a2").map(String::as_str), Some("/srv/a2"));
+        assert_eq!(batched.get("root-b1").map(String::as_str), Some("/srv/b1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_folder_roots_skip_the_query_when_no_library_is_in_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+
+        database.reset_query_count();
+        let batched = emby_library_root_paths(&database, &[]).await?;
+
+        assert!(batched.is_empty());
+        assert_eq!(database.query_count(), 0);
+        Ok(())
     }
 }

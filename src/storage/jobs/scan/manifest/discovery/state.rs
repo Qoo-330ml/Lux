@@ -39,10 +39,7 @@ impl Database {
             .bind(chunk.job_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
         let lite_mode =
             is_lite_manifest_discovery(workflow_version, discovery_format_version, &discovery_mode);

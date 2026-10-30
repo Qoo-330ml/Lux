@@ -373,7 +373,7 @@ impl Database {
         .map_err(storage_error)
     }
 
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn upsert_emby_migration_user_binding(
         &self,
         binding: &StoredEmbyMigrationUserBinding,
@@ -693,34 +693,6 @@ impl Database {
             .await
             .map(|value: Option<i64>| value.unwrap_or_default() != 0)
             .map_err(storage_error)
-    }
-
-    #[allow(dead_code)]
-    pub(crate) async fn upsert_emby_migration_user_link(
-        &self,
-        link: &StoredEmbyMigrationUserLink,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO emby_migration_user_links (
-                 job_id, emby_user_id, emby_username, lux_user_id, status, error
-             ) VALUES (?, ?, ?, ?, ?, ?)
-             ON CONFLICT(job_id, emby_user_id) DO UPDATE SET
-                 emby_username = excluded.emby_username,
-                 lux_user_id = excluded.lux_user_id,
-                 status = excluded.status,
-                 error = excluded.error,
-                 updated_at = unixepoch()",
-        )
-        .bind(&link.job_id)
-        .bind(&link.emby_user_id)
-        .bind(&link.emby_username)
-        .bind(&link.lux_user_id)
-        .bind(&link.status)
-        .bind(&link.error)
-        .execute(self.pool())
-        .await
-        .map(|_| ())
-        .map_err(storage_error)
     }
 
     /// Upsert a bounded batch of user-link reports in one transaction per
@@ -1082,34 +1054,6 @@ impl Database {
 
         identities.sort_unstable_by(|left, right| left.id.cmp(&right.id));
         Ok(identities)
-    }
-
-    pub(crate) async fn list_migration_person_identities(
-        &self,
-    ) -> Result<Vec<StoredMigrationPersonIdentity>, StorageError> {
-        self.query(
-            "SELECT p.id, p.display_name, pi.provider, pi.provider_id
-             FROM people p
-             LEFT JOIN person_identities pi ON pi.person_id = p.id
-             WHERE p.status = 'ACTIVE'
-             ORDER BY p.id, pi.provider, pi.provider_id",
-        )
-        .fetch_all(self.pool())
-        .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMigrationPersonIdentity {
-                    id: row.get("id"),
-                    display_name: row.get("display_name"),
-                    provider: row.try_get::<Option<String>, _>("provider").ok().flatten(),
-                    provider_id: row
-                        .try_get::<Option<String>, _>("provider_id")
-                        .ok()
-                        .flatten(),
-                })
-                .collect()
-        })
-        .map_err(storage_error)
     }
 
     /// Resolve only the people referenced by the current source favorites
@@ -2071,9 +2015,7 @@ impl Database {
             .map_err(storage_error)
     }
 
-    // Reserved for a future EVENT_HISTORY-capable source plugin. ITEM_STATE imports
-    // intentionally never synthesize rows in this table.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn insert_playback_history_event(
         &self,
         event: &StoredPlaybackHistoryEvent,

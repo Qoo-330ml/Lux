@@ -33,10 +33,7 @@ impl Database {
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_reconciliation_scan_entries(
@@ -62,10 +59,7 @@ impl Database {
                 .map(stored_reconciliation_scan_entry)
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn commit_reconciliation_discovery_chunk(
@@ -106,18 +100,9 @@ impl Database {
             .bind(completed_directory)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         i64::try_from(inserted_file_count)
             .map_err(|_| StorageError::Conflict("reconciliation file count overflow".to_owned()))
     }
@@ -156,10 +141,7 @@ impl Database {
                 let result = statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 if entry_type == "FILE" {
                     inserted_file_count = inserted_file_count
                         .checked_add(result.rows_affected())
@@ -199,10 +181,7 @@ impl Database {
         .execute(&mut **transaction)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_reconciliation_discovery(
@@ -218,19 +197,13 @@ impl Database {
             .bind(job_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let processed_count: i64 = self
             .query_scalar("SELECT processed_count FROM scan_jobs WHERE id = ?")
             .bind(job_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let total_count = discovered_file_count.max(processed_count);
         self.query(
             "UPDATE scan_jobs
@@ -241,17 +214,8 @@ impl Database {
         .bind(job_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(total_count)
     }
 
@@ -260,14 +224,7 @@ impl Database {
         job_id: &str,
         library_root_id: &str,
     ) -> Result<i64, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let file_count: i64 = self
             .query_scalar(
                 "SELECT COUNT(*) FROM reconciliation_scan_entries
@@ -278,10 +235,7 @@ impl Database {
             .bind(library_root_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query(
             "DELETE FROM reconciliation_scan_entries
              WHERE job_id = ? AND library_root_id = ?",
@@ -290,17 +244,8 @@ impl Database {
         .bind(library_root_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(file_count)
     }
 
@@ -313,10 +258,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Commits one reconciliation batch atomically.
@@ -368,10 +310,7 @@ impl Database {
             .bind(batch.job_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if job_status.as_deref() != Some("RUNNING") {
             return Err(StorageError::Conflict(
                 "reconciliation batch requires a running scan job".to_owned(),
@@ -440,23 +379,14 @@ impl Database {
             .bind(batch.job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if result.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "reconciliation scan job stopped during batch commit".to_owned(),
             ));
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(ReconciliationBatchCommitResult {
             confirmed_entries: usize::try_from(confirmed_count).map_err(|_| {
                 StorageError::Conflict(
@@ -498,10 +428,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .rows_affected(),
             );
         }
@@ -544,10 +471,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .rows_affected(),
             );
         }
@@ -591,17 +515,11 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let path = row
                     .try_get::<String, _>("relative_path")
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.sqlx_err())?;
                 pending.insert(path);
             }
         }
@@ -665,10 +583,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -745,13 +660,7 @@ impl Database {
             &removed_file_changes,
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(missing_entries)
     }
 
@@ -787,17 +696,9 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             for row in rows {
-                confirmed.push(row.try_get("relative_path").map_err(|source| {
-                    StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    }
-                })?);
+                confirmed.push(row.try_get("relative_path").map_err(self.sqlx_err())?);
             }
         }
         Ok(confirmed)

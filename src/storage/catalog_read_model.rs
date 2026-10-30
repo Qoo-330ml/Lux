@@ -9,7 +9,6 @@ pub(crate) const CATALOG_OUTBOX_KIND: &str = "catalog";
 /// shape bumps `READ_MODEL_SCHEMA_VERSION` instead, which forces a full rebuild.
 pub(crate) const CATALOG_ITEMS_INCREMENTAL_CONSUMER: &str = "catalog_items_incremental@1";
 
-#[allow(dead_code)] // LUX-864 wires the consumer.
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
 pub(crate) struct CatalogOutboxEntry {
     pub(crate) id: i64,
@@ -18,7 +17,6 @@ pub(crate) struct CatalogOutboxEntry {
     pub(crate) library_id: Option<String>,
 }
 
-#[allow(dead_code)] // LUX-864 wires the consumer.
 #[derive(Debug, Clone, Eq, PartialEq, sqlx::FromRow)]
 pub(crate) struct CatalogConsumerState {
     pub(crate) name: String,
@@ -27,9 +25,9 @@ pub(crate) struct CatalogConsumerState {
     pub(crate) last_error: Option<String>,
 }
 
-#[allow(dead_code)] // LUX-864 wires the consumer.
 impl Database {
     /// Appends one derived-data event and returns its sequence number.
+    #[cfg(test)]
     pub(crate) async fn append_catalog_outbox(
         &self,
         kind: &str,
@@ -46,10 +44,7 @@ impl Database {
         .bind(library_id)
         .fetch_one(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Reads at most `limit` events after `after_seq`, oldest first.
@@ -69,10 +64,7 @@ impl Database {
         .bind(limit.clamp(1, 5_000))
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn catalog_consumer(
@@ -86,10 +78,7 @@ impl Database {
         .bind(name)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Advances a consumer watermark. The watermark never moves backwards, so a retried batch is
@@ -113,10 +102,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn record_catalog_consumer_error(
@@ -136,10 +122,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Drops the already-applied events of one `kind`, oldest first and bounded so a long backlog
@@ -175,10 +158,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() as i64)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Detects that the queue was trimmed past a consumer's watermark.
@@ -200,10 +180,7 @@ impl Database {
             .bind(kind)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .flatten();
         Ok(oldest.and_then(|oldest| {
             (oldest > applied_seq.saturating_add(1)).then_some((applied_seq, oldest))
@@ -218,15 +195,12 @@ pub(crate) struct CatalogReadModelSummary {
 }
 
 impl Database {
-    #[allow(dead_code)] // used by rebuild tests and diagnostics
+    #[cfg(test)]
     pub(crate) async fn catalog_items_count(&self) -> Result<i64, StorageError> {
         self.query_scalar("SELECT COUNT(*) FROM catalog_items")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Highest item id already materialized, used to resume an interrupted rebuild.
@@ -235,10 +209,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await
             .map(|row| row.flatten())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Rebuilds one keyset page of `catalog_items` from the authoritative tables.
@@ -262,10 +233,7 @@ impl Database {
             .bind(limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if rows.is_empty() {
             return Ok((0, None));
         }
@@ -279,10 +247,7 @@ impl Database {
             .bind(last.as_deref())
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok((upsert.rows_affected(), last))
     }
 
@@ -309,10 +274,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Removes derived rows whose authoritative item is gone, so a deletion disappears from the
@@ -340,10 +302,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Queues every authoritative item once; used after a detected queue gap so the derived table
@@ -356,10 +315,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() as i64)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Applies at most `batch` queued `kind = 'catalog'` events, oldest first, and returns how many
@@ -437,23 +393,17 @@ impl Database {
         transaction.commit().await.map_err(sqlx_error)
     }
 
-    #[allow(dead_code)] // used by the read-model reset path in LUX-865
+    #[cfg(test)]
     pub(crate) async fn truncate_catalog_read_model(&self) -> Result<(), StorageError> {
         self.query("DELETE FROM catalog_item_stats")
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.query("DELETE FROM catalog_items")
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Stable hash of the read model's user-visible columns, used by rebuild validation.
@@ -469,10 +419,7 @@ impl Database {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut hasher = Sha256::new();
         for (item_id, sort_title, added, available) in &rows {
             hasher.update(item_id.as_bytes());
@@ -513,7 +460,6 @@ pub(crate) struct ReadModelPageQuery<'a> {
 impl Database {
     /// Shadow query for the default library list: ids and total only, so it can be compared with
     /// the authoritative path without changing the response.
-    #[allow(dead_code)] // wired by the shadow comparison in the catalog service
     pub(crate) async fn shadow_catalog_library_page(
         &self,
         page: &ReadModelPageQuery<'_>,
@@ -574,10 +520,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .into_iter()
             .map(|(id,)| id)
             .collect::<Vec<_>>();
@@ -595,10 +538,7 @@ impl Database {
             count_statement
                 .fetch_one(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
         } else {
             0
         };
@@ -618,7 +558,6 @@ pub(crate) struct RecentReadModelQuery<'a> {
 }
 
 impl Database {
-    #[allow(dead_code)] // wired by the `on` switch for the recently-added rail
     pub(crate) async fn list_recent_read_model_ids(
         &self,
         query: &RecentReadModelQuery<'_>,
@@ -707,10 +646,7 @@ impl Database {
                         .map(|(item_id,)| item_id)
                         .collect::<Vec<_>>()
                 })
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })
+                .map_err(self.sqlx_err())
         };
         if !query.include_total {
             return Ok((list_future.await?, 0));
@@ -767,19 +703,13 @@ impl Database {
                 count_scope(&available_count_sql)
                     .fetch_one(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })
+                    .map_err(self.sqlx_err())
             },
             async {
                 count_scope(&container_count_sql)
                     .fetch_one(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })
+                    .map_err(self.sqlx_err())
             },
         )?;
         Ok((ids, available_total.saturating_add(container_total)))
@@ -794,7 +724,6 @@ pub(crate) struct RecentByLibraryReadModelQuery<'a> {
 }
 
 impl Database {
-    #[allow(dead_code)] // wired by the `on` switch for the per-library rail
     pub(crate) async fn list_recent_read_model_ids_by_library(
         &self,
         query: &RecentByLibraryReadModelQuery<'_>,
@@ -852,10 +781,7 @@ impl Database {
         let rows = statement
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut grouped: Vec<(String, Vec<String>)> = Vec::new();
         for (id, library_id) in rows {
             match grouped.last_mut() {
@@ -922,7 +848,6 @@ struct ReadModelSourceRow {
 
 impl Database {
     /// Builds the legacy row shape from `catalog_items` plus one batched source/stream query.
-    #[allow(dead_code)] // wired by the `on` mode switch
     pub(crate) async fn list_catalog_rows_from_read_model(
         &self,
         page: &ReadModelPageQuery<'_>,
@@ -933,7 +858,6 @@ impl Database {
     }
 
     /// Single-item variant used by the detail route.
-    #[allow(dead_code)] // wired by the `on` detail switch
     pub(crate) async fn find_catalog_rows_from_read_model(
         &self,
         item_id: &str,
@@ -991,10 +915,7 @@ impl Database {
         let cores = statement
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let source_query = format!(
             "SELECT ms.item_id,
                     (SELECT fe.relative_path FROM filesystem_entries fe
@@ -1019,14 +940,10 @@ impl Database {
         for id in ids {
             statement = statement.bind(id);
         }
-        let sources =
-            statement
-                .fetch_all(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let sources = statement
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
         let mut by_item: std::collections::HashMap<String, Vec<ReadModelSourceRow>> =
             std::collections::HashMap::new();
         for source in sources {

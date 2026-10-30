@@ -10,7 +10,6 @@ const MAX_ITEM_METADATA_COMPLETENESS_CAPABILITY_LENGTH: usize = 64;
 const MAX_ITEM_METADATA_COMPLETENESS_FINGERPRINT_BYTES: usize = 256;
 #[cfg(test)]
 const MAX_ITEM_METADATA_COMPLETENESS_ERROR_BYTES: usize = 4096;
-#[allow(dead_code)] // The test-only confirmed-missing listing API enforces this bound.
 const MAX_ITEM_METADATA_COMPLETENESS_PAGE_SIZE: i64 = 100;
 const MAX_ITEM_METADATA_COMPLETENESS_CHECK_BATCH_SIZE: usize = 512;
 const ITEM_METADATA_COMPLETENESS_WRITE_BATCH_SIZE: usize = 100;
@@ -34,7 +33,7 @@ fn validate_item_metadata_completeness_key(
 }
 
 impl Database {
-    #[allow(dead_code)] // Storage tests retain the legacy batch-claim contract.
+    #[cfg(test)]
     pub(crate) async fn prepare_and_claim_item_metadata_completeness_checks(
         &self,
         checks: &[NewItemMetadataCompletenessCheck<'_>],
@@ -48,6 +47,7 @@ impl Database {
         .map(|(claimed_indices, _)| claimed_indices)
     }
 
+    #[cfg(test)]
     pub(crate) async fn prepare_and_claim_item_metadata_completeness_checks_with_due_fill_missing_retries(
         &self,
         checks: &[NewItemMetadataCompletenessCheck<'_>],
@@ -119,13 +119,7 @@ impl Database {
                 &candidate_ids,
             )
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok((claimed_indices, due_fill_missing_retry_item_ids))
     }
 
@@ -168,10 +162,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
 
             let claim_values = std::iter::repeat_n("(?, ?, ?)", batch.len())
                 .collect::<Vec<_>>()
@@ -200,10 +191,7 @@ impl Database {
             let claimed_keys = claim_statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .into_iter()
                 .map(|row| {
                     (
@@ -274,10 +262,7 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             due_item_ids.extend(rows.into_iter().map(|row| row.get::<String, _>("item_id")));
         }
         due_item_ids.sort_unstable();
@@ -342,10 +327,7 @@ impl Database {
                 .bind(library_id)
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             commit.updated_count = commit.updated_count.saturating_add(rows.len());
         }
 
@@ -363,10 +345,8 @@ impl Database {
                     .bind(library_id)
                     .fetch_one(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })? != 0
+                    .map_err(self.sqlx_err())?
+                        != 0
                 }
             };
             if auto_match_enabled {
@@ -455,10 +435,7 @@ impl Database {
                 .fetch_optional(&mut *transaction)
                 .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if library_exists.is_none() {
             return Err(StorageError::Conflict(
                 "metadata completeness library was not found".into(),
@@ -515,17 +492,11 @@ impl Database {
                 auto_match_policy,
             )
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(commit)
     }
 
-    #[allow(dead_code)] // Storage tests cover atomic completion and enqueue semantics.
+    #[cfg(test)]
     pub(crate) async fn complete_local_metadata_and_enqueue_fill_missing(
         &self,
         library_id: &str,
@@ -541,6 +512,7 @@ impl Database {
         .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn complete_local_metadata_and_enqueue_fill_missing_with_policy(
         &self,
         library_id: &str,
@@ -583,10 +555,7 @@ impl Database {
                 .bind(library_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if library_exists.is_none() {
                 return Err(StorageError::Conflict(
                     "metadata completeness library was not found".into(),
@@ -598,10 +567,7 @@ impl Database {
                 .bind(library_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if library_exists.is_none() {
                 return Err(StorageError::Conflict(
                     "metadata completeness library was not found".into(),
@@ -627,13 +593,7 @@ impl Database {
             )
             .await?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(commit)
     }
 
@@ -689,10 +649,7 @@ impl Database {
             for row in statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
             {
                 missing_by_item
                     .entry(row.get("item_id"))
@@ -739,7 +696,7 @@ impl Database {
         Ok(requests)
     }
 
-    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
+    #[cfg(test)]
     pub(crate) async fn prepare_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -775,21 +732,12 @@ impl Database {
             .bind(input_fingerprint.to_vec())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(changed.is_some())
     }
 
-    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
+    #[cfg(test)]
     pub(crate) async fn claim_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -813,21 +761,12 @@ impl Database {
             .bind(input_fingerprint.to_vec())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(changed.is_some())
     }
 
-    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
+    #[cfg(test)]
     pub(crate) async fn finish_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -855,17 +794,8 @@ impl Database {
             .bind(input_fingerprint.to_vec())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(changed.is_some())
     }
 
@@ -916,7 +846,7 @@ impl Database {
         Ok(changed.is_some())
     }
 
-    #[allow(dead_code)] // Storage tests cover the legacy single-item claim state machine.
+    #[cfg(test)]
     pub(crate) async fn cancel_item_metadata_completeness_check(
         &self,
         item_id: &str,
@@ -940,22 +870,12 @@ impl Database {
             .bind(input_fingerprint.to_vec())
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(changed.is_some())
     }
 
-    /// Call once during startup, before local metadata workers begin claiming checks.
-    #[allow(dead_code)] // Storage tests cover recovery of legacy single-item claims.
+    #[cfg(test)]
     pub(crate) async fn requeue_interrupted_item_metadata_completeness_checks(
         &self,
     ) -> Result<u64, StorageError> {
@@ -970,21 +890,14 @@ impl Database {
             )
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 
-    #[allow(dead_code)] // Storage tests assert persisted legacy claim state through this projection.
+    // Read only by the storage regression tests. The row projection it maps lives in the
+    // production build (`storage::repository`), so the caller cannot be test-gated yet.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn find_item_metadata_completeness(
         &self,
         item_id: &str,
@@ -1008,13 +921,12 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_item_metadata_completeness))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // Storage tests cover pagination of confirmed missing items.
+    // Read only by the storage regression tests; see `find_item_metadata_completeness` for why
+    // this stays in the production build.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn list_confirmed_missing_metadata(
         &self,
         capability: &str,
@@ -1070,10 +982,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
             .map(stored_item_metadata_completeness)
@@ -1086,10 +995,7 @@ impl Database {
         self.query_scalar("SELECT COUNT(*) FROM metadata_candidates WHERE status = 'PENDING'")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_pending_metadata_item_ids(
@@ -1112,14 +1018,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             pending.extend(rows.into_iter().map(|row| row.get("item_id")));
         }
         Ok(pending)
@@ -1196,18 +1098,9 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_pending_metadata_candidate_json(
@@ -1229,17 +1122,8 @@ impl Database {
             .bind(item_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1270,10 +1154,7 @@ impl Database {
             .bind(item_id)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut capability_attempts = Vec::new();
         let mut image_attempts = Vec::new();
         for row in rows {
@@ -1337,14 +1218,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let item_id = row.get::<String, _>("item_id");
                 let entry = attempts_by_item
@@ -1431,18 +1308,9 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn record_metadata_capability_failures(
@@ -1484,10 +1352,7 @@ impl Database {
             let rows = statement
                 .fetch_all(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             attempts.extend(rows);
         }
         let retry_rows = unique_capabilities
@@ -1535,18 +1400,9 @@ impl Database {
             statement
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_pending_metadata_candidates(
@@ -1569,10 +1425,7 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_pending_metadata_candidates_for_item(
@@ -1601,10 +1454,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
         };
-        count.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        count.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_pending_metadata_candidates_for_item(
@@ -1650,10 +1500,7 @@ impl Database {
             .await
         };
         rows.map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_pending_metadata_candidates_for_item_with_count(
@@ -1678,10 +1525,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let total = rows.first().map(|row| row.get("total_count")).unwrap_or(0);
         let candidates = rows.into_iter().map(stored_metadata_candidate).collect();
         Ok((candidates, total))
@@ -1727,10 +1571,7 @@ impl Database {
             .bind(result_limit)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let total = rows.first().map(|row| row.get("total_count")).unwrap_or(0);
         let candidates = rows.into_iter().map(stored_metadata_candidate).collect();
         Ok((candidates, total))
@@ -1756,10 +1597,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_metadata_candidate))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_best_pending_metadata_candidate(
@@ -1781,10 +1619,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_metadata_candidate))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_unexpired_pending_metadata_candidates_for_item(
@@ -1826,13 +1661,10 @@ impl Database {
         .fetch_all(&self.pool)
         .await
         .map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // Storage regression tests retain the compatibility wrapper.
+    #[cfg(test)]
     pub(crate) async fn select_metadata_candidate(
         &self,
         update: SelectedMetadataUpdate<'_>,
@@ -1927,10 +1759,7 @@ impl Database {
         .bind(update.item_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         if let Some(json) = nfo_metadata_json {
             let changed = self
                 .upsert_media_item_nfo_cache_in_transaction(
@@ -1947,10 +1776,7 @@ impl Database {
                 .bind(update.item_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
                 self.invalidate_content_restriction_index_in_transaction(
                     &mut transaction,
                     update.item_id,
@@ -1970,18 +1796,9 @@ impl Database {
             .bind(update.item_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if selected.rows_affected() != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         self.replace_global_movie_collection_reference_in_transaction(
@@ -2003,17 +1820,8 @@ impl Database {
         .bind(update.candidate_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 }

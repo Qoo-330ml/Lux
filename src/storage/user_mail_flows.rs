@@ -5,9 +5,8 @@
 
 use super::*;
 
-// LUX-784 consumes these methods while resolving queued invitation and verification mail.
-#[allow(dead_code)]
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn create_mail_challenge(
         &self,
         challenge: NewMailChallenge<'_>,
@@ -46,10 +45,7 @@ impl Database {
         .bind(now)
         .fetch_one(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
+        .map_err(self.sqlx_err())?
         .try_into()
     }
 
@@ -109,18 +105,9 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_user_id.is_none() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserEmailChangeCreateResult::NotAcceptable);
         }
 
@@ -138,18 +125,9 @@ impl Database {
                 .bind(now)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if current_pending_challenge_id.as_deref() != Some(expected_challenge_id) {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                transaction.commit().await.map_err(self.sqlx_err())?;
                 return Ok(UserEmailChangeCreateResult::NotAcceptable);
             }
         }
@@ -168,10 +146,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let outbox_id = Uuid::now_v7().to_string();
         self.query(
@@ -189,10 +164,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         self.query(
             "UPDATE mail_challenges SET revoked_at = ?
@@ -206,10 +178,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE mail_outbox
              SET status = 'FAILED', lease_expires_at = NULL,
@@ -226,18 +195,9 @@ impl Database {
         .bind(challenge.id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserEmailChangeCreateResult::Created)
     }
 
@@ -271,18 +231,9 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_user_id.is_none() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
 
@@ -294,10 +245,7 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE mail_challenges SET revoked_at = ?
              WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
@@ -308,10 +256,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE mail_outbox
              SET status = 'FAILED', lease_expires_at = NULL,
@@ -326,18 +271,9 @@ impl Database {
         .bind(user_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(true)
     }
 
@@ -404,10 +340,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let inserted = self
             .query(
@@ -430,10 +363,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if inserted.rows_affected() != 1 {
             let pending_invitation_exists: Option<String> = self
                 .query_scalar(
@@ -445,17 +375,8 @@ impl Database {
                 .bind(now)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return if pending_invitation_exists.is_some() {
                 Ok(UserInvitationCreateResult::AlreadyPending)
             } else {
@@ -475,18 +396,9 @@ impl Database {
             .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationCreateResult::RateLimited);
         }
 
@@ -505,10 +417,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let outbox_id = Uuid::now_v7().to_string();
         self.query(
@@ -527,18 +436,9 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserInvitationCreateResult::Created)
     }
 
@@ -577,18 +477,9 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((recipient_email, invitation_expires_at)) = invitation else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationResendResult::NotResendable);
         };
 
@@ -608,18 +499,9 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(challenge_id) = challenge_id else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationResendResult::NotResendable);
         };
 
@@ -633,10 +515,7 @@ impl Database {
             .bind(idempotency_key)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if let Some(existing_message) = existing_message {
             if existing_message.recipient_email != recipient_email
                 || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
@@ -646,13 +525,7 @@ impl Database {
                     "mail outbox idempotency key already used".to_owned(),
                 ));
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationResendResult::Queued);
         }
 
@@ -666,18 +539,9 @@ impl Database {
             .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationResendResult::RateLimited);
         }
 
@@ -698,10 +562,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let existing_message = self
             .query_as::<MailOutboxRecord>(
@@ -713,10 +574,7 @@ impl Database {
             .bind(idempotency_key)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if existing_message.recipient_email != recipient_email
             || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
             || existing_message.reference_id != challenge_id
@@ -726,13 +584,7 @@ impl Database {
             ));
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserInvitationResendResult::Queued)
     }
 
@@ -758,10 +610,7 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
+        .map_err(self.sqlx_err())?
         .map(TryInto::try_into)
         .transpose()
     }
@@ -795,10 +644,7 @@ impl Database {
             .bind(now)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(row.map(
             |(invitation_id, challenge_id, recipient_email, expires_at)| {
                 StoredUserInvitationAcceptance {
@@ -865,18 +711,9 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((invitation_id, recipient_email, permission_snapshot_json)) = invitation else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationAcceptResult::NotAcceptable);
         };
 
@@ -900,19 +737,10 @@ impl Database {
             .bind(account.username_normalized)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if username_taken {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationAcceptResult::UsernameTaken);
         }
 
@@ -948,13 +776,7 @@ impl Database {
                 .as_database_error()
                 .is_some_and(|error| error.is_unique_violation());
             if unique_violation {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|rollback_error| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source: rollback_error,
-                    })?;
+                transaction.rollback().await.map_err(self.sqlx_err())?;
 
                 let username_taken = self
                     .query_scalar::<String>(
@@ -963,10 +785,7 @@ impl Database {
                     .bind(account.username_normalized)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .is_some();
                 if username_taken {
                     return Ok(UserInvitationAcceptResult::UsernameTaken);
@@ -982,10 +801,7 @@ impl Database {
                     .bind(&recipient_email)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .is_some();
                 if email_already_registered {
                     return Ok(UserInvitationAcceptResult::EmailAlreadyRegistered);
@@ -1007,10 +823,7 @@ impl Database {
                 .bind(library_id)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             }
         }
 
@@ -1027,10 +840,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         let challenge_consumed = self
             .query(
@@ -1046,29 +856,14 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         if invitation_updated != 1 || challenge_consumed != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(UserInvitationAcceptResult::NotAcceptable);
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserInvitationAcceptResult::Accepted)
     }
 
@@ -1103,14 +898,10 @@ impl Database {
         if let Some(status) = status {
             count_query = count_query.bind(status.as_str());
         }
-        let total_count =
-            count_query
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let total_count = count_query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
 
         let page_statement = format!(
             "SELECT id, recipient_email, created_by_user_id, accepted_user_id, status,
@@ -1137,10 +928,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let entries = records
             .into_iter()
             .map(TryInto::try_into)
@@ -1173,10 +961,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let revoked = self
             .query(
                 "UPDATE user_invitations
@@ -1189,10 +974,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected()
             == 1;
         if revoked {
@@ -1206,10 +988,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.query(
                 "UPDATE mail_outbox
                  SET status = 'FAILED', lease_expires_at = NULL,
@@ -1224,18 +1003,9 @@ impl Database {
             .bind(id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(revoked)
     }
 
@@ -1251,10 +1021,7 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
+        .map_err(self.sqlx_err())?
         .map(TryInto::try_into)
         .transpose()
     }
@@ -1292,10 +1059,7 @@ impl Database {
         .bind(now)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
+        .map_err(self.sqlx_err())?
         .map(TryInto::try_into)
         .transpose()
     }
@@ -1330,14 +1094,12 @@ impl Database {
         .bind(now)
         .fetch_optional(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
+        .map_err(self.sqlx_err())?
         .map(TryInto::try_into)
         .transpose()
     }
 
+    #[cfg(test)]
     pub(crate) async fn consume_mail_challenge(
         &self,
         id: &str,
@@ -1362,13 +1124,11 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn revoke_mail_challenges(
         &self,
         kind: MailChallengeKind,
@@ -1396,10 +1156,7 @@ impl Database {
             .bind(now)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 }
@@ -1434,7 +1191,6 @@ fn user_registration_permission_snapshot(
     Ok(snapshot)
 }
 
-#[allow(dead_code)] // LUX-808 and LUX-812 consume this request workflow.
 impl Database {
     async fn cancel_user_registration_mail(
         &self,
@@ -1452,10 +1208,7 @@ impl Database {
         .bind(now)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE mail_outbox
              SET status = 'FAILED', lease_expires_at = NULL,
@@ -1469,10 +1222,7 @@ impl Database {
         .bind(request_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -1535,10 +1285,7 @@ impl Database {
             .bind(now)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         for expired_id in expired_ids {
             self.query(
                 "UPDATE user_registration_requests
@@ -1550,10 +1297,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             self.cancel_user_registration_mail(&mut transaction, &expired_id, now)
                 .await?;
         }
@@ -1565,18 +1309,9 @@ impl Database {
             .bind(request.recipient_email)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if existing_user.is_some() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationCreateResult::AlreadyExists);
         }
 
@@ -1590,18 +1325,9 @@ impl Database {
             .bind(now.saturating_sub(USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS))
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if recent_email_count >= USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationCreateResult::RateLimited);
         }
 
@@ -1624,10 +1350,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if inserted.rows_affected() != 1 {
             let existing_request: Option<String> = self
                 .query_scalar(
@@ -1639,17 +1362,8 @@ impl Database {
                 .bind(now)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return if existing_request.is_some() {
                 Ok(UserRegistrationCreateResult::AlreadyExists)
             } else {
@@ -1674,10 +1388,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO mail_outbox (
                  id, idempotency_key, recipient_email, template_kind, reference_id,
@@ -1694,22 +1405,12 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserRegistrationCreateResult::Created)
     }
 }
 
-#[allow(dead_code)] // LUX-808 and LUX-812 consume these registration transitions.
 impl Database {
     pub(crate) async fn queue_user_registration_resend(
         &self,
@@ -1753,18 +1454,9 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((request_id, request_expires_at)) = request else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationResendResult::NotResendable);
         };
 
@@ -1784,18 +1476,9 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(challenge_id) = challenge_id else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationResendResult::NotResendable);
         };
 
@@ -1807,10 +1490,7 @@ impl Database {
             .bind(idempotency_key)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if let Some((existing_email, existing_template, existing_reference)) = existing_message {
             if existing_email != recipient_email
                 || existing_template != MailOutboxTemplateKind::EmailVerification.as_str()
@@ -1820,13 +1500,7 @@ impl Database {
                     "mail outbox idempotency key already used".to_owned(),
                 ));
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationResendResult::Queued);
         }
 
@@ -1840,18 +1514,9 @@ impl Database {
             .bind(now.saturating_sub(USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS))
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if recent_email_count >= USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationResendResult::RateLimited);
         }
 
@@ -1871,10 +1536,7 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
 
         let stored_message: (String, String, String) = self
             .query_as(
@@ -1884,10 +1546,7 @@ impl Database {
             .bind(idempotency_key)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if stored_message.0 != recipient_email
             || stored_message.1 != MailOutboxTemplateKind::EmailVerification.as_str()
             || stored_message.2 != challenge_id
@@ -1897,13 +1556,7 @@ impl Database {
             ));
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserRegistrationResendResult::Queued)
     }
 
@@ -1935,10 +1588,7 @@ impl Database {
             .bind(now)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(record.map(|(id, expires_at)| StoredUserRegistrationChallenge { id, expires_at }))
     }
 
@@ -1983,18 +1633,9 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(request_id) = request_id else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationVerifyResult::NotAcceptable);
         };
 
@@ -2012,10 +1653,7 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         let transitioned = self
             .query(
@@ -2031,30 +1669,15 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         if consumed != 1 || transitioned != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationVerifyResult::NotAcceptable);
         }
         self.cancel_user_registration_mail(&mut transaction, &request_id, now)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserRegistrationVerifyResult::Verified)
     }
 
@@ -2094,18 +1717,9 @@ impl Database {
             .bind(user_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if active_user_id.is_none() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(crate::storage::UserEmailChangeVerifyResult::NotAcceptable);
         }
 
@@ -2125,18 +1739,9 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(recipient_email) = recipient_email else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(crate::storage::UserEmailChangeVerifyResult::NotAcceptable);
         };
 
@@ -2150,18 +1755,9 @@ impl Database {
             .bind(&recipient_email)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if email_in_use != 0 {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(crate::storage::UserEmailChangeVerifyResult::EmailConflict);
         }
 
@@ -2183,13 +1779,7 @@ impl Database {
                     .as_database_error()
                     .is_some_and(|error| error.is_unique_violation()) =>
             {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|rollback| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source: rollback,
-                    })?;
+                transaction.rollback().await.map_err(self.sqlx_err())?;
                 return Ok(crate::storage::UserEmailChangeVerifyResult::EmailConflict);
             }
             Err(source) => {
@@ -2215,19 +1805,10 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         if updated_user != 1 || consumed_challenge != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(crate::storage::UserEmailChangeVerifyResult::NotAcceptable);
         }
 
@@ -2243,17 +1824,8 @@ impl Database {
         .bind(now)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(crate::storage::UserEmailChangeVerifyResult::Verified)
     }
 
@@ -2289,14 +1861,10 @@ impl Database {
         if let Some(status) = status {
             count_query = count_query.bind(status.as_str());
         }
-        let total_count =
-            count_query
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let total_count = count_query
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
 
         let page_statement = format!(
             "SELECT id, recipient_email, username_normalized, display_name,
@@ -2325,10 +1893,7 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let requests = records
             .into_iter()
             .map(|record| {
@@ -2375,10 +1940,7 @@ impl Database {
         .bind(now)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(())
     }
 
@@ -2422,10 +1984,7 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some(request) = request else {
             let expired = self
                 .query(
@@ -2439,32 +1998,17 @@ impl Database {
                 .bind(now)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if expired == 1 {
                 self.cancel_user_registration_mail(&mut transaction, request_id, now)
                     .await?;
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationApproveResult::NotReviewable);
         };
         let Some(email_verified_at) = request.email_verified_at else {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationApproveResult::NotReviewable);
         };
         if now < email_verified_at {
@@ -2483,10 +2027,7 @@ impl Database {
             .bind(&request.username_normalized)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if username_taken {
             self.query(
@@ -2497,17 +2038,8 @@ impl Database {
             .bind(request_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationApproveResult::UsernameConflict);
         }
         let email_taken = self
@@ -2517,10 +2049,7 @@ impl Database {
             .bind(&request.recipient_email)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .is_some();
         if email_taken {
             self.query(
@@ -2531,17 +2060,8 @@ impl Database {
             .bind(request_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationApproveResult::EmailConflict);
         }
 
@@ -2578,13 +2098,7 @@ impl Database {
             let unique_violation = source
                 .as_database_error()
                 .is_some_and(|error| error.is_unique_violation());
-            transaction
-                .rollback()
-                .await
-                .map_err(|rollback_error| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source: rollback_error,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             if unique_violation {
                 let username_taken = self
                     .query_scalar::<String>(
@@ -2593,10 +2107,7 @@ impl Database {
                     .bind(&request.username_normalized)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .is_some();
                 if username_taken {
                     self.mark_user_registration_error(request_id, "USERNAME_CONFLICT", now)
@@ -2610,10 +2121,7 @@ impl Database {
                     .bind(&request.recipient_email)
                     .fetch_optional(&self.pool)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .is_some();
                 if email_taken {
                     self.mark_user_registration_error(request_id, "EMAIL_CONFLICT", now)
@@ -2639,13 +2147,7 @@ impl Database {
                     .execute(&mut *transaction)
                     .await
                 {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(|rollback_error| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source: rollback_error,
-                        })?;
+                    transaction.rollback().await.map_err(self.sqlx_err())?;
                     return Err(StorageError::Sqlx {
                         path: self.path.clone(),
                         source,
@@ -2670,35 +2172,19 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         if updated != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationApproveResult::NotReviewable);
         }
         self.cancel_user_registration_mail(&mut transaction, request_id, now)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserRegistrationApproveResult::Approved(user_id))
     }
 }
 
-#[allow(dead_code)] // LUX-812 and the registration expiry worker consume these transitions.
 impl Database {
     pub(crate) async fn reject_user_registration_request(
         &self,
@@ -2736,10 +2222,7 @@ impl Database {
             .bind(now)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if reviewable.is_none() {
             let expired = self
                 .query(
@@ -2753,22 +2236,13 @@ impl Database {
                 .bind(now)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if expired == 1 {
                 self.cancel_user_registration_mail(&mut transaction, request_id, now)
                     .await?;
             }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationRejectResult::NotReviewable);
         }
 
@@ -2786,33 +2260,19 @@ impl Database {
             .bind(now)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         if updated != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(UserRegistrationRejectResult::NotReviewable);
         }
         self.cancel_user_registration_mail(&mut transaction, request_id, now)
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(UserRegistrationRejectResult::Rejected)
     }
 
+    #[cfg(test)]
     pub(crate) async fn expire_user_registration_requests(
         &self,
         now: i64,
@@ -2841,10 +2301,7 @@ impl Database {
             .bind(limit)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut expired_count = 0_u64;
         for request_id in expired_ids {
             let updated = self
@@ -2860,10 +2317,7 @@ impl Database {
                 .bind(now)
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if updated == 1 {
                 self.cancel_user_registration_mail(&mut transaction, &request_id, now)
@@ -2871,13 +2325,7 @@ impl Database {
                 expired_count += 1;
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(expired_count)
     }
 }
@@ -2889,8 +2337,6 @@ struct RegistrationModeRecord {
     version: i64,
 }
 
-// LUX-803 consumes these versioned settings without changing the other settings keys.
-#[allow(dead_code)]
 impl Database {
     pub(crate) async fn registration_mode(
         &self,
@@ -2899,10 +2345,7 @@ impl Database {
             .query_scalar("SELECT value FROM server_settings WHERE key = 'registration_mode'")
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let parsed = raw_value
             .as_deref()
             .and_then(|value| serde_json::from_str::<RegistrationModeRecord>(value).ok())
@@ -2948,10 +2391,7 @@ impl Database {
             .execute(&self.pool)
             .await
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 }

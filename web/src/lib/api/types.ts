@@ -351,27 +351,19 @@ export type CollectionDetailResponse = {
   total: number;
 };
 
-export type MetadataFieldName = "title" | "originalTitle" | "overview" | "productionYear";
+// The item metadata and image types are generated from the Rust DTOs so a renamed or
+// removed field fails `tsc` instead of a request at runtime. Regenerate with
+// `scripts/generate-api-types.sh`; `scripts/check-api-types.sh` fails on stale output.
+// The exported names below are unchanged for the rest of the Web app.
+export type { MetadataField as MetadataFieldName } from "./generated/MetadataField";
 
-export type ItemMetadata = {
-  title: string;
-  originalTitle?: string | null;
-  overview?: string | null;
-  productionYear?: number | null;
-  lockedFields: MetadataFieldName[];
-};
+export type { ItemMetadata } from "./generated/ItemMetadata";
 
-export type ItemImage = {
-  id: string;
-  itemId: string;
-  imageType: string;
-  imageIndex: number;
-  fileSize?: number | null;
-  contentTag?: string | null;
-  source?: string | null;
-  language?: string | null;
-  url: string;
-};
+export type { ItemImage } from "./generated/ItemImage";
+
+export type { ItemImagesResponse } from "./generated/ItemImagesResponse";
+
+export type { ItemImageSelectResponse } from "./generated/ItemImageSelectResponse";
 
 export type ImageSearchResult = {
   id: string;
@@ -468,7 +460,14 @@ export type WebPlaybackCapabilities = {
 };
 
 export type WebPlaybackPlan =
-  | { type: "DIRECT"; url: string; proxyUrl?: string | null; rangeUrl?: string | null }
+  | {
+      type: "DIRECT";
+      url: string;
+      proxyUrl?: string | null;
+      rangeUrl?: string | null;
+      /** Ordered Direct Play entries chosen by the server; `url`/`proxyUrl` remain for older servers. */
+      candidates?: { kind: string; url: string }[] | null;
+    }
   | { type: "SERVER_HLS"; manifestUrl: string; tier: number }
   | { type: "UNSUPPORTED"; reason: string };
 
@@ -531,12 +530,7 @@ export type WebPlaybackBootstrap = {
 };
 
 /** Metadata for a registered, same-origin Lux Web danmaku sidecar. */
-export type WebDanmakuInfo = {
-  available: true;
-  format: "BILIBILI_XML";
-  sourceId: string | null;
-  rawUrl: string;
-};
+export type { WebDanmakuInfo } from "./generated/WebDanmakuInfo";
 
 export type AdminRoot = {
   id: string;

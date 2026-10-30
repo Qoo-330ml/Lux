@@ -70,14 +70,10 @@ impl Database {
             for entry_id in entry_ids {
                 statement = statement.bind(entry_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let library_root_id: String = row.get("library_root_id");
                 let relative_path: String = row.get("relative_path");
@@ -167,14 +163,10 @@ impl Database {
                         .bind(format!("{escaped}/%/%"));
                 }
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let queued_relative_path: String = row.get("queued_relative_path");
                 let queued_library_root_id: String = row.get("queued_library_root_id");
@@ -280,14 +272,10 @@ impl Database {
                     .bind(directory_path)
                     .bind(format!("{escaped}/%"));
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 sources.push(StoredScanLocalMetadataSource {
                     source_id: row.get("source_id"),
@@ -361,14 +349,10 @@ impl Database {
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
                 let source_item_id: String = row.get("source_item_id");
                 let item_id: String = row.get("item_id");

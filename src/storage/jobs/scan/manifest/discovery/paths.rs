@@ -81,10 +81,7 @@ impl Database {
                 statement
                     .fetch_all(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .into_iter()
                     .map(|row| row.get::<String, _>("relative_path")),
             );

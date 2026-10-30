@@ -108,9 +108,10 @@ pub(crate) struct UpdateLibraryRequest {
     pub(crate) is_enabled: Option<bool>,
     pub(crate) realtime_watch_enabled: Option<bool>,
     pub(crate) realtime_metadata_auto_match_enabled: Option<bool>,
-    #[serde(default, deserialize_with = "deserialize_optional_optional")]
+    /// Accepted for legacy clients; realtime incremental scanning has no schedule, so this
+    /// request field is validated by the deserializer and then ignored.
     #[allow(dead_code)]
-    /// Accepted for legacy clients; realtime incremental scanning has no schedule.
+    #[serde(default, deserialize_with = "deserialize_optional_optional")]
     pub(crate) incremental_schedule: Option<Option<String>>,
     #[serde(default, deserialize_with = "deserialize_optional_optional")]
     pub(crate) reconciliation_schedule: Option<Option<String>>,
@@ -621,9 +622,7 @@ pub(crate) async fn admin_update_library_cover(
             );
         }
     };
-    let Some(covers) = state.library_covers.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let covers = require_service!(state.library_covers);
     let content_type = headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
@@ -694,9 +693,7 @@ pub(crate) async fn admin_list_library_cover_jobs(
         )
         .into_response();
     }
-    let Some(service) = state.library_covers.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.library_covers);
     match service.list(status.as_deref(), offset, limit).await {
         Ok(jobs) => Json(json!({
             "jobs": jobs,
@@ -716,9 +713,7 @@ pub(crate) async fn admin_get_library_cover_job(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.library_covers.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.library_covers);
     match service.get(&job_id).await {
         Ok(job) => Json(json!({ "job": job })).into_response(),
         Err(error) => library_cover_error(&headers, error),
@@ -743,9 +738,7 @@ pub(crate) async fn admin_run_auto_library_cover(
         }
     };
     let library_id_text = library_id.to_string();
-    let Some(covers) = state.library_covers.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let covers = require_service!(state.library_covers);
     let job = match covers.dispatch_manual_job(library_id).await {
         Ok(job) => job,
         Err(
@@ -812,9 +805,7 @@ pub(crate) async fn admin_delete_library_root(
             );
         }
     };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = require_service!(state.libraries);
     match crate::application::admin_library_settings::delete_library_root(
         libraries,
         state.home.as_ref(),
@@ -857,12 +848,8 @@ pub(crate) async fn admin_delete_library(
             );
         }
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
+    let libraries = require_service!(state.libraries);
     let service = crate::application::library_deletion::LibraryDeletionService::new(
         database.clone(),
         state.scan_jobs.clone(),
@@ -974,9 +961,7 @@ pub(crate) async fn admin_list_library_deletion_jobs(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let service = crate::application::library_deletion::LibraryDeletionService::new(
         database.clone(),
         state.scan_jobs.clone(),
@@ -1027,9 +1012,7 @@ pub(crate) async fn admin_retry_library_deletion(
             .into_response();
         }
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let service = crate::application::library_deletion::LibraryDeletionService::new(
         database.clone(),
         state.scan_jobs.clone(),
