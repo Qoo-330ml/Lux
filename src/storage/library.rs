@@ -25,7 +25,7 @@ type LegacyScheduledTaskConfigRow = (
 
 /// Row of `person_index_item_state_matches_snapshot`: the snapshot marker recorded for one
 /// person index item.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct PersonIndexItemStateRow {
     source_fingerprint: Option<String>,
     relation_schema_version: i64,
@@ -33,7 +33,7 @@ struct PersonIndexItemStateRow {
 }
 
 /// Row shared by `list_library_scrapers`: one configured scraper of a library.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct LibraryScraperRow {
     scraper_id: String,
     position: i64,
@@ -51,12 +51,71 @@ impl From<LibraryScraperRow> for StoredLibraryScraper {
 }
 
 /// Row of `list_library_scrapers_by_library_ids`: the same projection keyed by library.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct LibraryScraperByLibraryRow {
     library_id: String,
     scraper_id: String,
     position: i64,
     role: String,
+}
+
+/// Row of `list_libraries` and `find_library`: one library and its stored settings.
+#[derive(Debug, sqlx::FromRow)]
+struct LibraryRow {
+    id: String,
+    name: String,
+    kind: String,
+    is_enabled: i64,
+    realtime_watch_enabled: i64,
+    realtime_metadata_auto_match_enabled: i64,
+    incremental_schedule: Option<String>,
+    reconciliation_schedule: Option<String>,
+    metadata_schedule: Option<String>,
+    scan_concurrency: i64,
+    probe_concurrency: i64,
+    last_scan_at: Option<i64>,
+    scraper_id: Option<String>,
+    chapter_source_id: Option<String>,
+    cover_image_path: Option<String>,
+    cover_image_content_type: Option<String>,
+    cover_image_size: Option<i64>,
+    cover_image_tag: Option<String>,
+    media_strategy_json: Option<String>,
+}
+
+impl From<LibraryRow> for StoredLibrary {
+    fn from(row: LibraryRow) -> Self {
+        Self {
+            id: row.id,
+            name: row.name,
+            kind: row.kind,
+            is_enabled: row.is_enabled != 0,
+            realtime_watch_enabled: row.realtime_watch_enabled != 0,
+            realtime_metadata_auto_match_enabled: row.realtime_metadata_auto_match_enabled != 0,
+            incremental_schedule: row.incremental_schedule,
+            reconciliation_schedule: row.reconciliation_schedule,
+            metadata_schedule: row.metadata_schedule,
+            scan_concurrency: row.scan_concurrency,
+            probe_concurrency: row.probe_concurrency,
+            last_scan_at: row.last_scan_at,
+            scraper_id: row.scraper_id,
+            scrapers: Vec::new(),
+            chapter_source_id: row.chapter_source_id,
+            cover_image_path: row.cover_image_path,
+            cover_image_content_type: row.cover_image_content_type,
+            cover_image_size: row.cover_image_size,
+            cover_image_tag: row.cover_image_tag,
+            media_strategy_json: row.media_strategy_json,
+        }
+    }
+}
+
+/// Row of `list_enabled_library_identities`: one library root of an enabled library.
+#[derive(Debug, sqlx::FromRow)]
+struct LibraryIdentityRow {
+    id: String,
+    name: String,
+    canonical_path: Option<String>,
 }
 
 impl Database {
@@ -536,7 +595,7 @@ impl Database {
 
     pub(crate) async fn list_libraries(&self) -> Result<Vec<StoredLibrary>, StorageError> {
         let rows = self
-            .query(
+            .query_as::<LibraryRow>(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     realtime_metadata_auto_match_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
@@ -550,40 +609,15 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(self.sqlx_err())?;
-        let library_ids = rows
-            .iter()
-            .map(|row| row.get::<String, _>("id"))
-            .collect::<Vec<_>>();
+        let library_ids = rows.iter().map(|row| row.id.clone()).collect::<Vec<_>>();
         let mut scrapers = self
             .list_library_scrapers_by_library_ids(&library_ids)
             .await?;
         let mut libraries = Vec::with_capacity(rows.len());
         for row in rows {
-            let id: String = row.get("id");
-            libraries.push(StoredLibrary {
-                id: id.clone(),
-                name: row.get("name"),
-                kind: row.get("kind"),
-                is_enabled: row.get::<i64, _>("is_enabled") != 0,
-                realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
-                realtime_metadata_auto_match_enabled: row
-                    .get::<i64, _>("realtime_metadata_auto_match_enabled")
-                    != 0,
-                incremental_schedule: row.get("incremental_schedule"),
-                reconciliation_schedule: row.get("reconciliation_schedule"),
-                metadata_schedule: row.get("metadata_schedule"),
-                scan_concurrency: row.get("scan_concurrency"),
-                probe_concurrency: row.get("probe_concurrency"),
-                last_scan_at: row.get("last_scan_at"),
-                scraper_id: row.get("scraper_id"),
-                scrapers: scrapers.remove(&id).unwrap_or_default(),
-                chapter_source_id: row.get("chapter_source_id"),
-                cover_image_path: row.get("cover_image_path"),
-                cover_image_content_type: row.get("cover_image_content_type"),
-                cover_image_size: row.get("cover_image_size"),
-                cover_image_tag: row.get("cover_image_tag"),
-                media_strategy_json: row.get("media_strategy_json"),
-            });
+            let mut library = StoredLibrary::from(row);
+            library.scrapers = scrapers.remove(&library.id).unwrap_or_default();
+            libraries.push(library);
         }
         Ok(libraries)
     }
@@ -595,7 +629,7 @@ impl Database {
         &self,
     ) -> Result<Vec<StoredLibraryIdentity>, StorageError> {
         let rows = self
-            .query(
+            .query_as::<LibraryIdentityRow>(
                 "SELECT l.id, l.name, r.canonical_path
                  FROM libraries l
                  LEFT JOIN library_roots r ON r.library_id = l.id
@@ -608,20 +642,19 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let mut identities = Vec::<StoredLibraryIdentity>::new();
         for row in rows {
-            let id: String = row.get("id");
-            if let Some(identity) = identities.last_mut().filter(|identity| identity.id == id) {
-                if let Some(root_path) = row.get::<Option<String>, _>("canonical_path") {
+            if let Some(identity) = identities
+                .last_mut()
+                .filter(|identity| identity.id == row.id)
+            {
+                if let Some(root_path) = row.canonical_path {
                     identity.root_paths.push(root_path);
                 }
                 continue;
             }
             identities.push(StoredLibraryIdentity {
-                id,
-                name: row.get("name"),
-                root_paths: row
-                    .get::<Option<String>, _>("canonical_path")
-                    .into_iter()
-                    .collect(),
+                id: row.id,
+                name: row.name,
+                root_paths: row.canonical_path.into_iter().collect(),
             });
         }
         Ok(identities)
@@ -632,7 +665,7 @@ impl Database {
         id: &str,
     ) -> Result<Option<StoredLibrary>, StorageError> {
         let row = self
-            .query(
+            .query_as::<LibraryRow>(
             "SELECT id, name, kind, is_enabled, realtime_watch_enabled,
                     realtime_metadata_auto_match_enabled,
                     incremental_schedule, reconciliation_schedule, metadata_schedule,
@@ -648,31 +681,9 @@ impl Database {
         let Some(row) = row else {
             return Ok(None);
         };
-        let stored_id: String = row.get("id");
-        Ok(Some(StoredLibrary {
-            id: stored_id.clone(),
-            name: row.get("name"),
-            kind: row.get("kind"),
-            is_enabled: row.get::<i64, _>("is_enabled") != 0,
-            realtime_watch_enabled: row.get::<i64, _>("realtime_watch_enabled") != 0,
-            realtime_metadata_auto_match_enabled: row
-                .get::<i64, _>("realtime_metadata_auto_match_enabled")
-                != 0,
-            incremental_schedule: row.get("incremental_schedule"),
-            reconciliation_schedule: row.get("reconciliation_schedule"),
-            metadata_schedule: row.get("metadata_schedule"),
-            scan_concurrency: row.get("scan_concurrency"),
-            probe_concurrency: row.get("probe_concurrency"),
-            last_scan_at: row.get("last_scan_at"),
-            scraper_id: row.get("scraper_id"),
-            scrapers: self.list_library_scrapers(&stored_id).await?,
-            chapter_source_id: row.get("chapter_source_id"),
-            cover_image_path: row.get("cover_image_path"),
-            cover_image_content_type: row.get("cover_image_content_type"),
-            cover_image_size: row.get("cover_image_size"),
-            cover_image_tag: row.get("cover_image_tag"),
-            media_strategy_json: row.get("media_strategy_json"),
-        }))
+        let mut library = StoredLibrary::from(row);
+        library.scrapers = self.list_library_scrapers(&library.id).await?;
+        Ok(Some(library))
     }
 
     pub(crate) async fn assign_chapter_source_to_unassigned_libraries(
@@ -3688,6 +3699,119 @@ mod library_row_decoding_tests {
         assert_eq!(roles("library-b"), vec!["BACKUP"]);
         assert_eq!(batched["library-b"][0].position, 1);
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_queries_decode_named_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO libraries (
+                 id, name, kind, is_enabled, realtime_watch_enabled,
+                 realtime_metadata_auto_match_enabled, incremental_schedule,
+                 reconciliation_schedule, metadata_schedule, scan_concurrency,
+                 probe_concurrency, last_scan_at, scraper_id, chapter_source_id,
+                 cover_image_path, cover_image_content_type, cover_image_size,
+                 cover_image_tag, media_strategy_json
+             ) VALUES (
+                 'library-full', 'Movies', 'SERIES', 1, 0, 1, '0 * * * *',
+                 '0 3 * * 0', '0 4 * * *', 4, 2, 1700000000, 'scraper-x',
+                 'chapter-plugin', '/covers/movies.png', 'image/png', 2048,
+                 'tag-1', '{\"preferLocal\":true}'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('root-full', 'library-full', '/srv/movies', '/srv/movies', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        insert_scraper(&database, "library-full", "scraper-full", 1, "BOTH").await?;
+        insert_library(&database, "library-plain").await?;
+
+        let full = database
+            .find_library("library-full")
+            .await?
+            .expect("library should exist");
+        assert_eq!(full.id, "library-full");
+        assert_eq!(full.name, "Movies");
+        assert_eq!(full.kind, "SERIES");
+        assert!(full.is_enabled);
+        assert!(!full.realtime_watch_enabled);
+        assert!(full.realtime_metadata_auto_match_enabled);
+        assert_eq!(full.incremental_schedule.as_deref(), Some("0 * * * *"));
+        assert_eq!(full.reconciliation_schedule.as_deref(), Some("0 3 * * 0"));
+        assert_eq!(full.metadata_schedule.as_deref(), Some("0 4 * * *"));
+        assert_eq!(full.scan_concurrency, 4);
+        assert_eq!(full.probe_concurrency, 2);
+        assert_eq!(full.last_scan_at, Some(1_700_000_000));
+        assert_eq!(full.scraper_id.as_deref(), Some("scraper-x"));
+        assert_eq!(full.chapter_source_id.as_deref(), Some("chapter-plugin"));
+        assert_eq!(full.cover_image_path.as_deref(), Some("/covers/movies.png"));
+        assert_eq!(full.cover_image_content_type.as_deref(), Some("image/png"));
+        assert_eq!(full.cover_image_size, Some(2048));
+        assert_eq!(full.cover_image_tag.as_deref(), Some("tag-1"));
+        assert_eq!(
+            full.media_strategy_json.as_deref(),
+            Some(r#"{"preferLocal":true}"#)
+        );
+        assert_eq!(full.scrapers.len(), 1);
+        assert_eq!(full.scrapers[0].scraper_id, "scraper-full");
+        assert_eq!(full.scrapers[0].role, "BOTH");
+
+        let libraries = database.list_libraries().await?;
+        let names = libraries
+            .iter()
+            .map(|library| library.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["Movies", "library-plain"]);
+        assert_eq!(libraries[0].scrapers.len(), 1);
+        assert!(libraries[1].scrapers.is_empty());
+        assert_eq!(libraries[1].scan_concurrency, 2);
+        assert!(!libraries[1].realtime_metadata_auto_match_enabled);
+        assert!(libraries[1].last_scan_at.is_none());
+
+        let identities = database.list_enabled_library_identities().await?;
+        let identities = identities
+            .into_iter()
+            .map(|identity| (identity.id, identity.name, identity.root_paths))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            identities,
+            vec![
+                (
+                    "library-full".to_owned(),
+                    "Movies".to_owned(),
+                    vec!["/srv/movies".to_owned()],
+                ),
+                (
+                    "library-plain".to_owned(),
+                    "library-plain".to_owned(),
+                    vec![]
+                ),
+            ]
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = LibraryRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
         Ok(())
     }
 }
