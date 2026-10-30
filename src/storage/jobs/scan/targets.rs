@@ -21,6 +21,77 @@ fn postprocessing_issues_predicate() -> String {
         AND (COALESCE(sj.error, '') = 'POSTPROCESSING_FAILED' OR {UNFINISHED_TARGETS} OR {UNREADY_TARGETS})")
 }
 
+/// Row of `scan_job_retry_states`: one flag column per retry reason, projected as 0/1 integers
+/// because `sqlx::Any` binds booleans to the backend's integer representation.
+#[derive(sqlx::FromRow)]
+struct ScanJobRetryStateRow {
+    id: String,
+    issues: i64,
+    unfinished: i64,
+    unready: i64,
+    legacy_work: i64,
+    active_job: i64,
+}
+
+impl ScanJobRetryStateRow {
+    /// Splits the decoded row into the map key and the flag struct callers consume.
+    fn into_keyed_state(self) -> (String, StoredScanJobRetryState) {
+        (
+            self.id,
+            StoredScanJobRetryState {
+                has_postprocessing_issues: self.issues != 0,
+                has_unfinished_targets: self.unfinished != 0,
+                targets_need_materialization: self.unready != 0,
+                has_legacy_work: self.legacy_work != 0,
+                has_active_job: self.active_job != 0,
+            },
+        )
+    }
+}
+
+/// Row of `list_pending_scan_job_file_changes`.
+#[derive(sqlx::FromRow)]
+struct ScanJobFileChangeRow {
+    library_root_id: String,
+    relative_path: String,
+    change_kind: String,
+    revision: i64,
+}
+
+impl From<ScanJobFileChangeRow> for StoredScanJobPath {
+    fn from(row: ScanJobFileChangeRow) -> Self {
+        Self {
+            library_root_id: row.library_root_id,
+            relative_path: row.relative_path,
+            change_kind: row.change_kind,
+            file_change_revision: Some(row.revision),
+        }
+    }
+}
+
+/// Row of `local_metadata_completion_wait_state`: both flags arrive as 0/1 integers.
+#[derive(sqlx::FromRow)]
+struct LocalMetadataCompletionWaitRow {
+    has_pending_targets: i64,
+    job_missing_or_cancelled: i64,
+}
+
+impl LocalMetadataCompletionWaitRow {
+    /// Returns `(has_pending_targets, job_missing_or_cancelled)` exactly as the flags were read.
+    fn into_wait_state(self) -> (bool, bool) {
+        (
+            self.has_pending_targets != 0,
+            self.job_missing_or_cancelled != 0,
+        )
+    }
+}
+
+/// Row of `list_pending_local_metadata_item_ids`.
+#[derive(sqlx::FromRow)]
+struct PendingLocalMetadataItemRow {
+    item_id: String,
+}
+
 impl Database {
     pub(crate) async fn scan_job_retry_states(
         &self,
@@ -47,22 +118,14 @@ impl Database {
                 postprocessing_issues_predicate()
             );
             // Only fixed predicates and generated placeholders enter SQL; IDs are bound below.
-            let mut query = self.query(sqlx::AssertSqlSafe(sql));
+            let mut query = self.query_as::<ScanJobRetryStateRow>(sqlx::AssertSqlSafe(sql));
             for id in chunk {
                 query = query.bind(id);
             }
             let rows = query.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
-            for row in rows {
-                states.insert(
-                    row.get("id"),
-                    StoredScanJobRetryState {
-                        has_postprocessing_issues: row.get::<i64, _>("issues") != 0,
-                        has_unfinished_targets: row.get::<i64, _>("unfinished") != 0,
-                        targets_need_materialization: row.get::<i64, _>("unready") != 0,
-                        has_legacy_work: row.get::<i64, _>("legacy_work") != 0,
-                        has_active_job: row.get::<i64, _>("active_job") != 0,
-                    },
-                );
+            for state in rows {
+                let (id, state) = state.into_keyed_state();
+                states.insert(id, state);
             }
         }
         Ok(states)
@@ -214,7 +277,7 @@ impl Database {
     ) -> Result<Vec<StoredScanJobPath>, StorageError> {
         let limit = limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE);
         let rows = if let Some(after) = after {
-            self.query(
+            self.query_as::<ScanJobFileChangeRow>(
                 "SELECT library_root_id, relative_path, change_kind, revision
                  FROM scan_job_file_changes
                  WHERE job_id = ? AND processing_state = 'PENDING'
@@ -231,7 +294,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            self.query(
+            self.query_as::<ScanJobFileChangeRow>(
                 "SELECT library_root_id, relative_path, change_kind, revision
                  FROM scan_job_file_changes
                  WHERE job_id = ? AND processing_state = 'PENDING'
@@ -244,15 +307,7 @@ impl Database {
             .await
         }
         .map_err(self.sqlx_err())?;
-        Ok(rows
-            .into_iter()
-            .map(|row| StoredScanJobPath {
-                library_root_id: row.get("library_root_id"),
-                relative_path: row.get("relative_path"),
-                change_kind: row.get("change_kind"),
-                file_change_revision: Some(row.get("revision")),
-            })
-            .collect())
+        Ok(rows.into_iter().map(StoredScanJobPath::from).collect())
     }
 
     pub(crate) async fn requeue_running_scan_job_file_changes(
@@ -1011,7 +1066,7 @@ impl Database {
     ) -> Result<(bool, bool), StorageError> {
         // Return (has_pending_targets, job_missing_or_cancelled) from one read.
         let row = self
-            .query(
+            .query_as::<LocalMetadataCompletionWaitRow>(
                 "WITH completion_state AS (
                     SELECT CASE WHEN EXISTS (
                         SELECT 1 FROM scan_job_targets
@@ -1031,10 +1086,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok((
-            row.get::<i64, _>("has_pending_targets") != 0,
-            row.get::<i64, _>("job_missing_or_cancelled") != 0,
-        ))
+        Ok(row.into_wait_state())
     }
 
     pub(crate) async fn mark_pending_scan_job_metadata_targets_failed(
@@ -1080,7 +1132,8 @@ impl Database {
                    )
                    AND t.item_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<PendingLocalMetadataItemRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -1088,7 +1141,7 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(self.sqlx_err())?;
-            pending.extend(rows.into_iter().map(|row| row.get("item_id")));
+            pending.extend(rows.into_iter().map(|row| row.item_id));
         }
         Ok(pending)
     }
