@@ -177,6 +177,79 @@ struct MergeSuppressionTitleKeyRow {
     production_year: i64,
 }
 
+/// Row of `list_provider_identity_merge_keys`: the provider half of a candidate key.
+#[derive(sqlx::FromRow)]
+struct ProviderIdentityMergeKeyRow {
+    library_id: String,
+    item_type: String,
+    provider: String,
+    provider_id: String,
+}
+
+impl From<ProviderIdentityMergeKeyRow> for StoredIdentityMergeCandidateKey {
+    fn from(row: ProviderIdentityMergeKeyRow) -> Self {
+        Self {
+            library_id: row.library_id,
+            item_type: row.item_type,
+            provider: Some(row.provider),
+            provider_id: Some(row.provider_id),
+            sort_title: None,
+            production_year: None,
+        }
+    }
+}
+
+/// Row of `list_title_identity_merge_keys`: the title+year half of a candidate key.
+#[derive(sqlx::FromRow)]
+struct TitleIdentityMergeKeyRow {
+    library_id: String,
+    item_type: String,
+    sort_title: Option<String>,
+    production_year: Option<i64>,
+}
+
+impl From<TitleIdentityMergeKeyRow> for StoredIdentityMergeCandidateKey {
+    fn from(row: TitleIdentityMergeKeyRow) -> Self {
+        Self {
+            library_id: row.library_id,
+            item_type: row.item_type,
+            provider: None,
+            provider_id: None,
+            sort_title: row.sort_title,
+            production_year: row.production_year,
+        }
+    }
+}
+
+/// Row of the candidate-group readers, which share one projection.
+#[derive(sqlx::FromRow)]
+struct IdentityGroupItemRow {
+    id: String,
+    added_at: i64,
+    source_count: i64,
+    default_source_count: i64,
+    edition_source_count: i64,
+}
+
+impl From<IdentityGroupItemRow> for StoredIdentityMergeCandidateItem {
+    fn from(row: IdentityGroupItemRow) -> Self {
+        Self {
+            id: row.id,
+            added_at: row.added_at,
+            source_count: row.source_count,
+            default_source_count: row.default_source_count,
+            edition_source_count: row.edition_source_count,
+        }
+    }
+}
+
+/// Row of `list_identity_group_source_paths`.
+#[derive(sqlx::FromRow)]
+struct IdentityGroupSourcePathRow {
+    item_id: String,
+    relative_path: String,
+}
+
 impl Database {
     /// Records one merge record per merged root in a single pass: records, the hierarchy fields a
     /// merge is about to change, and the media sources it is about to move.
@@ -230,13 +303,12 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut query =
-                self.query_as::<MergeItemStateSelectRow>(sqlx::AssertSqlSafe(format!(
-                    "SELECT id, item_type, parent_id, series_id, merged_into_item_id,
+            let mut query = self.query_as::<MergeItemStateSelectRow>(sqlx::AssertSqlSafe(format!(
+                "SELECT id, item_type, parent_id, series_id, merged_into_item_id,
                         CASE WHEN series_id IS NULL THEN id ELSE series_id END AS owner_id
                  FROM media_items
                  WHERE id IN ({placeholders}) OR series_id IN ({placeholders})"
-                )));
+            )));
             for merged_item_id in chunk {
                 query = query.bind(merged_item_id);
             }
@@ -363,11 +435,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(StoredMediaMergeRecord::from)
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaMergeRecord::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -599,7 +667,7 @@ impl Database {
         } else {
             ""
         };
-        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+        let mut query = self.query_as::<ProviderIdentityMergeKeyRow>(sqlx::AssertSqlSafe(format!(
             "SELECT mi.library_id AS library_id, mi.item_type AS item_type,
                     provider.provider AS provider, provider.provider_id AS provider_id
              FROM media_item_provider_ids provider
@@ -638,14 +706,7 @@ impl Database {
             .await
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| StoredIdentityMergeCandidateKey {
-                        library_id: row.get("library_id"),
-                        item_type: row.get("item_type"),
-                        provider: row.get("provider"),
-                        provider_id: row.get("provider_id"),
-                        sort_title: None,
-                        production_year: None,
-                    })
+                    .map(StoredIdentityMergeCandidateKey::from)
                     .collect()
             })
             .map_err(self.sqlx_err())
@@ -662,7 +723,7 @@ impl Database {
         } else {
             ""
         };
-        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+        let mut query = self.query_as::<TitleIdentityMergeKeyRow>(sqlx::AssertSqlSafe(format!(
             "SELECT mi.library_id AS library_id, mi.item_type AS item_type,
                     mi.sort_title AS sort_title, mi.production_year AS production_year
              FROM media_items mi
@@ -701,14 +762,7 @@ impl Database {
             .await
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| StoredIdentityMergeCandidateKey {
-                        library_id: row.get("library_id"),
-                        item_type: row.get("item_type"),
-                        provider: None,
-                        provider_id: None,
-                        sort_title: row.get("sort_title"),
-                        production_year: row.get("production_year"),
-                    })
+                    .map(StoredIdentityMergeCandidateKey::from)
                     .collect()
             })
             .map_err(self.sqlx_err())
@@ -723,7 +777,7 @@ impl Database {
         else {
             return Ok(Vec::new());
         };
-        self.query(sqlx::AssertSqlSafe(format!(
+        self.query_as::<IdentityGroupItemRow>(sqlx::AssertSqlSafe(format!(
             "SELECT mi.id AS id, mi.added_at AS added_at,
                     (SELECT COUNT(*) FROM media_sources source
                      WHERE source.item_id = mi.id) AS source_count,
@@ -772,7 +826,7 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", item_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+        let mut query = self.query_as::<IdentityGroupSourcePathRow>(sqlx::AssertSqlSafe(format!(
             "SELECT source.item_id AS item_id, entry.relative_path AS relative_path
              FROM media_sources source
              JOIN filesystem_entries entry ON entry.id = source.filesystem_entry_id
@@ -788,7 +842,7 @@ impl Database {
             .await
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| (row.get("item_id"), row.get("relative_path")))
+                    .map(|row| (row.item_id, row.relative_path))
                     .collect()
             })
             .map_err(self.sqlx_err())
@@ -803,7 +857,7 @@ impl Database {
         else {
             return Ok(Vec::new());
         };
-        self.query(sqlx::AssertSqlSafe(format!(
+        self.query_as::<IdentityGroupItemRow>(sqlx::AssertSqlSafe(format!(
             "SELECT mi.id AS id, mi.added_at AS added_at,
                     (SELECT COUNT(*) FROM media_sources source
                      WHERE source.item_id = mi.id) AS source_count,
@@ -850,16 +904,10 @@ const EDITION_SOURCE_COUNT_SQL: &str = "CASE WHEN mi.item_type = 'SERIES' THEN (
     ) END";
 
 fn stored_identity_group_items(
-    rows: Vec<sqlx::any::AnyRow>,
+    rows: Vec<IdentityGroupItemRow>,
 ) -> Vec<StoredIdentityMergeCandidateItem> {
     rows.into_iter()
-        .map(|row| StoredIdentityMergeCandidateItem {
-            id: row.get("id"),
-            added_at: row.get("added_at"),
-            source_count: row.get("source_count"),
-            default_source_count: row.get("default_source_count"),
-            edition_source_count: row.get("edition_source_count"),
-        })
+        .map(StoredIdentityMergeCandidateItem::from)
         .collect()
 }
 
