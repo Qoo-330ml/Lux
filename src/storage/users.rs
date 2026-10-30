@@ -375,6 +375,115 @@ impl EmbyLoginSessionRow {
     }
 }
 
+/// Typed projection of the permission groups copied between accounts.
+#[derive(sqlx::FromRow)]
+struct PermissionCopyUserRow {
+    id: String,
+    library_access_mode: String,
+    can_download: i64,
+    can_play: i64,
+    max_simultaneous_playbacks: i64,
+    allow_remux: i64,
+    allow_audio_transcode: i64,
+    allow_video_transcode: i64,
+}
+
+impl PermissionCopyUserRow {
+    fn into_snapshot(self) -> UserPermissionCopySnapshot {
+        UserPermissionCopySnapshot {
+            library_access_mode: self.library_access_mode,
+            library_ids: Vec::new(),
+            can_download: self.can_download != 0,
+            playback_policy: UserPlaybackPolicy {
+                can_play: self.can_play != 0,
+                max_simultaneous_playbacks: self.max_simultaneous_playbacks,
+                allow_remux: self.allow_remux != 0,
+                allow_audio_transcode: self.allow_audio_transcode != 0,
+                allow_video_transcode: self.allow_video_transcode != 0,
+            },
+            content_restrictions: None,
+        }
+    }
+}
+
+/// Typed projection of the content-restriction join, including the owning user id.
+///
+/// One row is emitted per stored tag, so callers fold the rows into one
+/// [`UserContentRestrictions`] per user.
+#[derive(sqlx::FromRow)]
+struct UserContentRestrictionTagRow {
+    user_id: String,
+    rating_system: String,
+    maximum_rating: Option<String>,
+    allow_unrated: i64,
+    version: i64,
+    updated_at: i64,
+    tag_kind: Option<String>,
+    tag: Option<String>,
+}
+
+impl UserContentRestrictionTagRow {
+    fn merge_into(
+        self,
+        restrictions_by_user: &mut HashMap<String, UserContentRestrictions>,
+    ) -> Result<(), StorageError> {
+        let Self {
+            user_id,
+            rating_system,
+            maximum_rating,
+            allow_unrated,
+            version,
+            updated_at,
+            tag_kind,
+            tag,
+        } = self;
+        let restrictions =
+            restrictions_by_user
+                .entry(user_id)
+                .or_insert_with(|| UserContentRestrictions {
+                    rating_system,
+                    maximum_rating,
+                    allow_unrated: allow_unrated != 0,
+                    allowed_tags: Vec::new(),
+                    blocked_tags: Vec::new(),
+                    version,
+                    updated_at,
+                });
+        match (tag_kind.as_deref(), tag) {
+            (None, None) => {}
+            (Some("ALLOW"), Some(tag)) => restrictions.allowed_tags.push(tag),
+            (Some("BLOCK"), Some(tag)) => restrictions.blocked_tags.push(tag),
+            _ => {
+                return Err(StorageError::Serialization(
+                    "invalid user content restriction tag row".to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Typed projection of the stored account preferences; the flags are integers in both backends.
+#[derive(sqlx::FromRow)]
+struct UserAccountPreferencesRow {
+    theme: String,
+    accent_color: String,
+    show_media_libraries: i64,
+    show_continue_watching: i64,
+    audio_language: String,
+    subtitle_language: String,
+    auto_play_next_episode: i64,
+    version: i64,
+    updated_at: i64,
+}
+
+/// Typed projection of the stored library access mode of one user.
+#[derive(sqlx::FromRow)]
+struct UserLibraryAccessModeRow {
+    id: String,
+    library_access_mode: Option<String>,
+}
+
 impl Database {
     pub(crate) async fn apply_user_permission_preset(
         &self,
@@ -3290,7 +3399,7 @@ impl Database {
                     allow_audio_transcode, allow_video_transcode
              FROM users WHERE deleted_at IS NULL AND id IN ({placeholders})"
         );
-        let mut user_query = self.query(sqlx::AssertSqlSafe(user_sql));
+        let mut user_query = self.query_as::<PermissionCopyUserRow>(sqlx::AssertSqlSafe(user_sql));
         for user_id in user_ids {
             user_query = user_query.bind(user_id);
         }
@@ -3300,23 +3409,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let mut snapshots = HashMap::with_capacity(user_rows.len());
         for row in user_rows {
-            let user_id: String = row.get("id");
-            snapshots.insert(
-                user_id,
-                UserPermissionCopySnapshot {
-                    library_access_mode: row.get("library_access_mode"),
-                    library_ids: Vec::new(),
-                    can_download: row.get::<i64, _>("can_download") != 0,
-                    playback_policy: UserPlaybackPolicy {
-                        can_play: row.get::<i64, _>("can_play") != 0,
-                        max_simultaneous_playbacks: row.get("max_simultaneous_playbacks"),
-                        allow_remux: row.get::<i64, _>("allow_remux") != 0,
-                        allow_audio_transcode: row.get::<i64, _>("allow_audio_transcode") != 0,
-                        allow_video_transcode: row.get::<i64, _>("allow_video_transcode") != 0,
-                    },
-                    content_restrictions: None,
-                },
-            );
+            snapshots.insert(row.id.clone(), row.into_snapshot());
         }
 
         let library_sql = format!(
@@ -3327,7 +3420,8 @@ impl Database {
                AND access.user_id IN ({placeholders})
              ORDER BY access.user_id, access.library_id"
         );
-        let mut library_query = self.query(sqlx::AssertSqlSafe(library_sql));
+        let mut library_query =
+            self.query_as::<UserLibraryAccessRow>(sqlx::AssertSqlSafe(library_sql));
         for user_id in user_ids {
             library_query = library_query.bind(user_id);
         }
@@ -3336,10 +3430,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
         {
-            let user_id: String = row.get("user_id");
-            let library_id: String = row.get("library_id");
-            if let Some(snapshot) = snapshots.get_mut(&user_id) {
-                snapshot.library_ids.push(library_id);
+            if let Some(snapshot) = snapshots.get_mut(&row.user_id) {
+                snapshot.library_ids.push(row.library_id);
             }
         }
 
@@ -3355,7 +3447,8 @@ impl Database {
              WHERE restrictions.user_id IN ({placeholders})
              ORDER BY restrictions.user_id, tags.tag_kind, tags.tag"
         );
-        let mut restrictions_query = self.query(sqlx::AssertSqlSafe(restrictions_sql));
+        let mut restrictions_query =
+            self.query_as::<UserContentRestrictionTagRow>(sqlx::AssertSqlSafe(restrictions_sql));
         for user_id in user_ids {
             restrictions_query = restrictions_query.bind(user_id);
         }
@@ -3365,31 +3458,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
         {
-            let user_id: String = row.get("user_id");
-            let restrictions =
-                restrictions_by_user
-                    .entry(user_id)
-                    .or_insert_with(|| UserContentRestrictions {
-                        rating_system: row.get("rating_system"),
-                        maximum_rating: row.get("maximum_rating"),
-                        allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
-                        allowed_tags: Vec::new(),
-                        blocked_tags: Vec::new(),
-                        version: row.get("version"),
-                        updated_at: row.get("updated_at"),
-                    });
-            let tag_kind: Option<String> = row.get("tag_kind");
-            let tag: Option<String> = row.get("tag");
-            match (tag_kind.as_deref(), tag) {
-                (None, None) => {}
-                (Some("ALLOW"), Some(tag)) => restrictions.allowed_tags.push(tag),
-                (Some("BLOCK"), Some(tag)) => restrictions.blocked_tags.push(tag),
-                _ => {
-                    return Err(StorageError::Serialization(
-                        "invalid user content restriction tag row".to_owned(),
-                    ));
-                }
-            }
+            row.merge_into(&mut restrictions_by_user)?;
         }
         for (user_id, restrictions) in restrictions_by_user {
             if let Some(snapshot) = snapshots.get_mut(&user_id) {
@@ -3795,7 +3864,7 @@ impl Database {
         user_id: &str,
     ) -> Result<Option<UserAccountPreferences>, StorageError> {
         let row = self
-            .query(
+            .query_as::<UserAccountPreferencesRow>(
                 "SELECT theme, accent_color, show_media_libraries,
                         show_continue_watching, audio_language, subtitle_language,
                         auto_play_next_episode, version, updated_at
@@ -3811,17 +3880,17 @@ impl Database {
         let library_order = self.user_library_order(user_id).await?;
         let played_percent = self.user_played_percent(user_id).await?;
         Ok(Some(UserAccountPreferences {
-            theme: row.get("theme"),
-            accent_color: row.get("accent_color"),
-            show_media_libraries: row.get::<i64, _>("show_media_libraries") != 0,
-            show_continue_watching: row.get::<i64, _>("show_continue_watching") != 0,
-            audio_language: row.get("audio_language"),
-            subtitle_language: row.get("subtitle_language"),
-            auto_play_next_episode: row.get::<i64, _>("auto_play_next_episode") != 0,
+            theme: row.theme,
+            accent_color: row.accent_color,
+            show_media_libraries: row.show_media_libraries != 0,
+            show_continue_watching: row.show_continue_watching != 0,
+            audio_language: row.audio_language,
+            subtitle_language: row.subtitle_language,
+            auto_play_next_episode: row.auto_play_next_episode != 0,
             library_order,
             played_percent,
-            version: row.get("version"),
-            updated_at: row.get("updated_at"),
+            version: row.version,
+            updated_at: row.updated_at,
         }))
     }
 
@@ -4491,7 +4560,8 @@ impl Database {
                 .join(", ");
             let mode_query =
                 format!("SELECT id, library_access_mode FROM users WHERE id IN ({placeholders})");
-            let mut mode_statement = self.query(sqlx::AssertSqlSafe(mode_query));
+            let mut mode_statement =
+                self.query_as::<UserLibraryAccessModeRow>(sqlx::AssertSqlSafe(mode_query));
             for user_id in chunk {
                 mode_statement = mode_statement.bind(user_id);
             }
@@ -4500,12 +4570,12 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id: String = row.get("id");
-                let mode: Option<String> = row.get("library_access_mode");
                 snapshots.insert(
-                    user_id,
+                    row.id,
                     UserAccessSnapshot {
-                        library_access_mode: mode.unwrap_or_else(|| "ALL".to_owned()),
+                        library_access_mode: row
+                            .library_access_mode
+                            .unwrap_or_else(|| "ALL".to_owned()),
                         library_ids: Vec::new(),
                         restrictions: None,
                     },
@@ -4517,7 +4587,8 @@ impl Database {
                  WHERE user_id IN ({placeholders}) AND can_view = 1
                  ORDER BY user_id, library_id"
             );
-            let mut access_statement = self.query(sqlx::AssertSqlSafe(access_query));
+            let mut access_statement =
+                self.query_as::<UserLibraryAccessRow>(sqlx::AssertSqlSafe(access_query));
             for user_id in chunk {
                 access_statement = access_statement.bind(user_id);
             }
@@ -4526,10 +4597,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id: String = row.get("user_id");
-                let library_id: String = row.get("library_id");
-                if let Some(snapshot) = snapshots.get_mut(&user_id) {
-                    snapshot.library_ids.push(library_id);
+                if let Some(snapshot) = snapshots.get_mut(&row.user_id) {
+                    snapshot.library_ids.push(row.library_id);
                 }
             }
 
@@ -4544,7 +4613,8 @@ impl Database {
                  WHERE restrictions.user_id IN ({placeholders})
                  ORDER BY restrictions.user_id, tags.tag_kind, tags.tag"
             );
-            let mut restriction_statement = self.query(sqlx::AssertSqlSafe(restriction_query));
+            let mut restriction_statement = self
+                .query_as::<UserContentRestrictionTagRow>(sqlx::AssertSqlSafe(restriction_query));
             for user_id in chunk {
                 restriction_statement = restriction_statement.bind(user_id);
             }
@@ -4555,30 +4625,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let user_id: String = row.get("user_id");
-                let entry = restrictions_by_user.entry(user_id).or_insert_with(|| {
-                    UserContentRestrictions {
-                        rating_system: row.get("rating_system"),
-                        maximum_rating: row.get("maximum_rating"),
-                        allow_unrated: row.get::<i64, _>("allow_unrated") != 0,
-                        allowed_tags: Vec::new(),
-                        blocked_tags: Vec::new(),
-                        version: row.get("version"),
-                        updated_at: row.get("updated_at"),
-                    }
-                });
-                let tag_kind: Option<String> = row.get("tag_kind");
-                let tag: Option<String> = row.get("tag");
-                match (tag_kind.as_deref(), tag) {
-                    (None, None) => {}
-                    (Some("ALLOW"), Some(tag)) => entry.allowed_tags.push(tag),
-                    (Some("BLOCK"), Some(tag)) => entry.blocked_tags.push(tag),
-                    _ => {
-                        return Err(StorageError::Serialization(
-                            "invalid user content restriction tag row".to_owned(),
-                        ));
-                    }
-                }
+                row.merge_into(&mut restrictions_by_user)?;
             }
             for (user_id, restrictions) in restrictions_by_user {
                 if let Some(snapshot) = snapshots.get_mut(&user_id) {
