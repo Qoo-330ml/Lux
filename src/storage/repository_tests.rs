@@ -2956,9 +2956,9 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
         .sync_played_container_states(&user_id, "played-episode-1")
         .await
         .expect("played parent states");
-    // One episode-scope read, one parent-state read, one batched state write, plus the two
-    // statements that refresh this series' resume pointer after the commit.
-    assert_eq!(database.query_count(), 5);
+    // One episode-scope read, one parent-state read, and one batched state write. The resume
+    // pointer belongs to whoever changed the episode state, so this sync does not touch it.
+    assert_eq!(database.query_count(), 3);
 
     let played_states: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT item_id, is_played, play_count FROM user_item_state
@@ -2989,7 +2989,7 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
         .sync_played_container_states(&user_id, "played-episode-2")
         .await
         .expect("unplayed parent states");
-    assert_eq!(database.query_count(), 5);
+    assert_eq!(database.query_count(), 3);
 
     let unplayed_states: Vec<(String, i64, i64)> = sqlx::query_as(
         "SELECT item_id, is_played, version FROM user_item_state
@@ -3008,8 +3008,12 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
         ]
     );
 
-    // The container sync also keeps the resume pointer in step: with episode 1 played and episode 2
+    // The episode-state write keeps the resume pointer in step: with episode 1 played and episode 2
     // unplayed again, the next-up pointer is episode 2.
+    database
+        .refresh_user_series_next_for_item(&user_id, "played-episode-2")
+        .await
+        .expect("resume pointer refresh");
     let pointer: Vec<(String, i64)> = sqlx::query_as(
         "SELECT next_item_id, position_ticks FROM user_series_next
          WHERE user_id = ? AND series_id = 'played-parent-series'",
@@ -34998,4 +35002,156 @@ mod adapted_sql_cache_tests {
         assert!(ADAPTED_SQL_CACHE.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
         assert!(ADAPTED_SQL_CACHE.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
     }
+}
+
+/// Episode runtime used by the playback-progress fixtures below: long enough that a mid-episode
+/// position stays under the default resume thresholds.
+const PLAYBACK_PROGRESS_RUNTIME_TICKS: i64 = 3_600_000_000;
+
+/// One series, one season, three episodes, and log triggers that record every write to
+/// `user_series_next` so a test can assert the resume pointer was left alone.
+async fn playback_progress_fixture()
+-> Result<(tempfile::TempDir, Database, String), Box<dyn std::error::Error>> {
+    use crate::application::setup::SetupService;
+    use crate::storage::test_database;
+
+    let (temp, database) = test_database().await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("Progress", "Progress", "correct password")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('progress-lib', 'P', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+             title, sort_title, identification_status, has_available_source, runtime_ticks
+         ) VALUES
+             ('progress-series', 'progress-lib', 'SERIES', NULL, NULL, NULL, NULL,
+              'Series', 'series', 'LOCAL_CONFIRMED', 1, NULL),
+             ('progress-season', 'progress-lib', 'SEASON', 'progress-series', 'progress-series',
+              1, NULL, 'Season', 'season', 'LOCAL_CONFIRMED', 1, NULL),
+             ('progress-episode-1', 'progress-lib', 'EPISODE', 'progress-season',
+              'progress-series', 1, 1, 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1, ?),
+             ('progress-episode-2', 'progress-lib', 'EPISODE', 'progress-season',
+              'progress-series', 1, 2, 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1, ?),
+             ('progress-episode-3', 'progress-lib', 'EPISODE', 'progress-season',
+              'progress-series', 1, 3, 'Episode 3', 'episode 3', 'LOCAL_CONFIRMED', 1, ?)",
+    )
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("CREATE TABLE progress_pointer_log (event TEXT NOT NULL)")
+        .execute(database.pool())
+        .await?;
+    for operation in ["INSERT", "UPDATE", "DELETE"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER progress_pointer_{operation} AFTER {operation} ON user_series_next
+             BEGIN INSERT INTO progress_pointer_log (event) VALUES ('{operation}'); END"
+        )))
+        .execute(database.pool())
+        .await?;
+    }
+    Ok((temp, database, user_id))
+}
+
+async fn progress_pointer_log(
+    database: &Database,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(
+        sqlx::query_scalar("SELECT event FROM progress_pointer_log ORDER BY rowid")
+            .fetch_all(database.pool())
+            .await?,
+    )
+}
+
+async fn progress_pointer(
+    database: &Database,
+    user_id: &str,
+) -> Result<Option<(String, i64)>, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_as(
+        "SELECT next_item_id, position_ticks FROM user_series_next
+         WHERE user_id = ? AND series_id = 'progress-series'",
+    )
+    .bind(user_id)
+    .fetch_optional(database.pool())
+    .await?)
+}
+
+#[tokio::test]
+async fn resume_pointer_refresh_upserts_instead_of_deleting_the_row()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+         VALUES (?, 'progress-episode-1', 1, 1, 10)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played, last_played_at)
+         VALUES (?, 'progress-episode-2', 1800000000, 0, 20)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        2,
+        "one hierarchy read and one pointer upsert"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_800_000_000))
+    );
+
+    // A second refresh must update the row in place: a delete would open the empty-pointer window
+    // the UPSERT exists to avoid.
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "UPDATE".to_owned()],
+        "the refresh must never delete a pointer row while a next episode exists"
+    );
+
+    sqlx::query(
+        "UPDATE user_item_state SET is_played = 1, position_ticks = 0
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES (?, 'progress-episode-3', 0, 1, 1, 30)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-3")
+        .await?;
+    assert!(progress_pointer(&database, &user_id).await?.is_none());
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec![
+            "INSERT".to_owned(),
+            "UPDATE".to_owned(),
+            "DELETE".to_owned()
+        ],
+        "the pointer is deleted only once the series has no next episode"
+    );
+    Ok(())
 }

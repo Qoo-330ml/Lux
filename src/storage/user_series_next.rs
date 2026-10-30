@@ -392,37 +392,64 @@ impl Database {
 
 impl Database {
     /// Refreshes one user/series pointer after a playback state change.
+    ///
+    /// The write is one UPSERT inside one transaction, so a concurrent reader sees either the
+    /// previous pointer or the refreshed one and never a series without a pointer.
     pub(crate) async fn refresh_user_series_next_for_item(
         &self,
         user_id: &str,
         item_id: &str,
     ) -> Result<(), StorageError> {
-        let series_id: Option<Option<String>> = self
-            .query_scalar(
-                "SELECT series_id FROM media_items WHERE id = ? AND item_type = 'EPISODE'",
-            )
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(self.sqlx_err())?;
-        let Some(Some(series_id)) = series_id else {
-            return Ok(());
-        };
-        self.refresh_user_series_next_for_series(user_id, &series_id)
-            .await
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        self.refresh_user_series_next_for_item_in(&mut transaction, user_id, item_id)
+            .await?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
-    pub(crate) async fn refresh_user_series_next_for_series(
+    /// Refresh variant that joins the caller's transaction and reports the episode scope it read.
+    ///
+    /// Non-episode items and episodes without a series have no pointer, so they return `None` and
+    /// touch nothing.
+    pub(crate) async fn refresh_user_series_next_for_item_in(
         &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        user_id: &str,
+        item_id: &str,
+    ) -> Result<Option<PlaybackContainerScope>, StorageError> {
+        let line: Option<(Option<String>, Option<String>)> = self
+            .query_as(
+                "SELECT parent_id, series_id FROM media_items
+                 WHERE id = ? AND item_type = 'EPISODE'",
+            )
+            .bind(item_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        let Some((parent_id, series_id)) = line else {
+            return Ok(None);
+        };
+        let scope = PlaybackContainerScope {
+            parent_id,
+            series_id,
+        };
+        if let Some(series_id) = scope.series_id.as_deref() {
+            self.write_user_series_next_pointer(transaction, user_id, series_id)
+                .await?;
+        }
+        Ok(Some(scope))
+    }
+
+    /// Rewrites one pointer in place.
+    ///
+    /// The candidate query upserts the resume row in a single statement; only when it matches no
+    /// episode at all is the row deleted, so a refresh never leaves the series without a pointer
+    /// while a next episode still exists.
+    async fn write_user_series_next_pointer(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
         user_id: &str,
         series_id: &str,
     ) -> Result<(), StorageError> {
-        self.query("DELETE FROM user_series_next WHERE user_id = ? AND series_id = ?")
-            .bind(user_id)
-            .bind(series_id)
-            .execute(&self.pool)
-            .await
-            .map_err(self.sqlx_err())?;
         let statement_sql = format!(
             "WITH in_progress AS (
                  SELECT mi.id, mi.season_number, mi.episode_number, us.position_ticks,
@@ -514,7 +541,8 @@ impl Database {
             minimum_ticks = RESUME_MINIMUM_TICKS_SQL,
             played_percent = RESUME_PLAYED_PERCENT_SQL,
         );
-        self.query(sqlx::AssertSqlSafe(statement_sql))
+        let updated = self
+            .query(sqlx::AssertSqlSafe(statement_sql))
             .bind(user_id)
             .bind(series_id)
             .bind(user_id)
@@ -523,7 +551,18 @@ impl Database {
             .bind(user_id)
             .bind(user_id)
             .bind(series_id)
-            .execute(&self.pool)
+            .execute(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        if updated > 0 {
+            return Ok(());
+        }
+        // No in-progress or next episode is left for this series, so the pointer must go away.
+        self.query("DELETE FROM user_series_next WHERE user_id = ? AND series_id = ?")
+            .bind(user_id)
+            .bind(series_id)
+            .execute(&mut **transaction)
             .await
             .map(|_| ())
             .map_err(self.sqlx_err())

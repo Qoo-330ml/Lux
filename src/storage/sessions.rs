@@ -651,6 +651,10 @@ impl Database {
             .await
     }
 
+    /// Recomputes the played state of the episode's season and series.
+    ///
+    /// Callers pass the scope when they already read it (the playback event path reads it while
+    /// refreshing the resume pointer); otherwise this reads the episode row once.
     pub(crate) async fn sync_played_container_states(
         &self,
         user_id: &str,
@@ -668,8 +672,25 @@ impl Database {
         let Some((parent_id, series_id)) = episode_scope else {
             return Ok(());
         };
+        let scope = PlaybackContainerScope {
+            parent_id,
+            series_id,
+        };
+        self.sync_played_container_states_for_scope(user_id, &scope)
+            .await
+    }
+
+    /// Played-state sync for an episode whose container scope is already known.
+    pub(crate) async fn sync_played_container_states_for_scope(
+        &self,
+        user_id: &str,
+        scope: &PlaybackContainerScope,
+    ) -> Result<(), StorageError> {
         let mut parent_ids = Vec::new();
-        for candidate in [parent_id, series_id.clone()].into_iter().flatten() {
+        for candidate in [scope.parent_id.clone(), scope.series_id.clone()]
+            .into_iter()
+            .flatten()
+        {
             if !parent_ids.contains(&candidate) {
                 parent_ids.push(candidate);
             }
@@ -752,17 +773,9 @@ impl Database {
             .execute(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())?;
-        // The pointer only reads episode-level progress, so refreshing the played item's series is
-        // enough and stays bounded; a table-wide rebuild here would rewrite every series of every
-        // user on each play event.
-        match series_id.as_deref() {
-            Some(series_id) => {
-                self.refresh_user_series_next_for_series(user_id, series_id)
-                    .await
-            }
-            None => Ok(()),
-        }
+        transaction.commit().await.map_err(self.sqlx_err())
+        // The resume pointer only reads episode-level progress, so this sync does not touch it.
+        // Whoever changed the episode state refreshes the pointer in its own transaction.
     }
 
     pub(crate) async fn list_playback_sessions(

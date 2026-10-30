@@ -4164,6 +4164,13 @@ pub(crate) struct NewPlaybackEvent<'a> {
     pub(crate) is_paused: bool,
 }
 
+/// Episode container identifiers, read once while a playback event refreshes the resume pointer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackContainerScope {
+    pub(crate) parent_id: Option<String>,
+    pub(crate) series_id: Option<String>,
+}
+
 pub(crate) struct NewWebPlaybackSession<'a> {
     pub(crate) id: &'a str,
     pub(crate) user_id: &'a str,
