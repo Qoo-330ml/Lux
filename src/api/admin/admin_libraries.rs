@@ -669,7 +669,8 @@ pub(crate) async fn admin_update_library_cover(
                 "LIBRARY_COVER_UPDATED",
                 Some("library"),
                 Some(&target_id),
-                "{}",
+                &json!({"contentType": content_type.split(';').next().unwrap_or_default().trim()})
+                    .to_string(),
             )
             .await;
             (
@@ -853,7 +854,7 @@ pub(crate) async fn admin_delete_library_root(
                 "LIBRARY_ROOT_DELETED",
                 Some("library_root"),
                 Some(&target_id),
-                "{}",
+                &json!({"libraryId": library_id.to_string(), "rootId": target_id}).to_string(),
             )
             .await;
             StatusCode::NO_CONTENT.into_response()
@@ -1156,7 +1157,7 @@ pub(crate) async fn admin_add_library_root(
                 "LIBRARY_ROOT_ADDED",
                 Some("library"),
                 Some(&target_id),
-                "{}",
+                &json!({"rootId": result.root.id.to_string(), "warningCount": result.warnings.len()}).to_string(),
             )
             .await;
             let scan_job = match spawn_library_scan(&state, library_id).await {

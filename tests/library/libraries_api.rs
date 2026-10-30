@@ -288,6 +288,33 @@ async fn admin_can_create_list_and_add_library_root_with_csrf()
         .await?;
     assert_eq!(deleted_root.status(), reqwest::StatusCode::NO_CONTENT);
 
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let audit_events = audit["events"].as_array().ok_or("missing audit events")?;
+    let audit_metadata = |event_type: &str| {
+        audit_events
+            .iter()
+            .find(|event| event["eventType"] == event_type)
+            .map(|event| event["metadata"].clone())
+    };
+    assert_eq!(
+        audit_metadata("LIBRARY_ROOT_ADDED").ok_or("missing LIBRARY_ROOT_ADDED")?,
+        json!({ "rootId": root_id, "warningCount": 0 })
+    );
+    assert_eq!(
+        audit_metadata("LIBRARY_ROOT_DELETED").ok_or("missing LIBRARY_ROOT_DELETED")?,
+        json!({ "libraryId": library_id, "rootId": root_id })
+    );
+    assert_eq!(
+        audit_metadata("LIBRARY_COVER_UPDATED").ok_or("missing LIBRARY_COVER_UPDATED")?,
+        json!({ "contentType": "image/png" })
+    );
+
     let listed = client
         .get(format!("{base_url}/api/v1/admin/libraries"))
         .header(COOKIE, &cookies)
