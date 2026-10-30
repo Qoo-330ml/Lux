@@ -198,6 +198,7 @@ pub struct CoreState {
 /// use it directly. The feature-optional slots (`image_writes`, `metadata_selection`, `downloads`,
 /// `strm_playback`, `webhooks`, `content_restriction_index_worker`) stay `Option` because their
 /// absence is a degraded capability of a ready application, not an unready application.
+#[derive(Clone)]
 pub struct ReadyServices {
     database_setup: DatabaseSetupService,
     setup: SetupService,
@@ -303,17 +304,18 @@ macro_rules! optional_service_accessor {
 
 impl AppState {
     /// Borrows the ready services for the `require_ready!` guard.
-    #[allow(dead_code)]
     pub(crate) fn ready_services(&self) -> Option<&Arc<ReadyServices>> {
         self.ready.as_ref()
     }
 
     /// Mutable access for the startup-only builders.
     ///
-    /// The builders run before the state is shared (before `app_with_state` and before the
-    /// shutdown clone), so the `Arc` has exactly one owner and no service instance is duplicated.
+    /// `Arc::make_mut` only copies the *handles* when the `Arc` is already shared (every service is
+    /// cheap to clone and shares its internals through `Arc`/database pools, exactly like the
+    /// per-request `AppState` clones do), so a builder rewrites its own copy without splitting any
+    /// service state or dropping the other holders' view of it.
     fn ready_services_mut(&mut self) -> Option<&mut ReadyServices> {
-        self.ready.as_mut().and_then(Arc::get_mut)
+        self.ready.as_mut().map(Arc::make_mut)
     }
 
     required_service_accessor! {
@@ -1556,13 +1558,13 @@ async fn lux_search_people(
             .into_response();
         }
     };
-    let access = require_service!(state.access);
-    let library_ids = match access.accessible_library_ids(principal).await {
+    let services = require_ready!(state);
+    let library_ids = match services.access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let people = require_service!(state.people);
-    match people
+    match services
+        .people
         .search_actors(&library_ids, raw_query, offset, limit)
         .await
     {
@@ -1611,13 +1613,16 @@ async fn lux_get_person_items(
             .into_response();
         }
     };
-    let access = require_service!(state.access);
-    let library_ids = match access.accessible_library_ids(principal).await {
+    let services = require_ready!(state);
+    let library_ids = match services.access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let people = require_service!(state.people);
-    let person = match people.find_person(&library_ids, "Actor", &person_id).await {
+    let person = match services
+        .people
+        .find_person(&library_ids, "Actor", &person_id)
+        .await
+    {
         Ok(Some(person)) => person,
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
             return api_error(
@@ -1631,7 +1636,6 @@ async fn lux_get_person_items(
         Err(PeopleError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let catalog = require_service!(state.catalog);
     let database = require_service!(state.database);
     let filter = CatalogFilter {
         item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
@@ -1640,7 +1644,8 @@ async fn lux_get_person_items(
         descending: true,
         ..CatalogFilter::default()
     };
-    match catalog
+    match services
+        .catalog
         .list_all_items_filtered(principal, &filter, offset, limit)
         .await
     {
@@ -1679,14 +1684,17 @@ async fn lux_get_person(
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    let access = require_service!(state.access);
-    let library_ids = match access.accessible_library_ids(principal).await {
+    let services = require_ready!(state);
+    let library_ids = match services.access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let people = require_service!(state.people);
     let database = require_service!(state.database);
-    match people.find_person(&library_ids, "Actor", &person_id).await {
+    match services
+        .people
+        .find_person(&library_ids, "Actor", &person_id)
+        .await
+    {
         Ok(Some(mut person)) => {
             person.is_favorite = match auth_principal.user_id() {
                 Some(user_id) => match database
@@ -1731,16 +1739,20 @@ async fn lux_set_person_favorite(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let access = require_service!(state.access);
-    let library_ids = match access
+    let services = require_ready!(state);
+    let library_ids = match services
+        .access
         .accessible_library_ids(AccessPrincipal::new(user.id, user.is_admin))
         .await
     {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let people = require_service!(state.people);
-    let person = match people.find_person(&library_ids, "Actor", &person_id).await {
+    let person = match services
+        .people
+        .find_person(&library_ids, "Actor", &person_id)
+        .await
+    {
         Ok(Some(person)) => person,
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => {
             return StatusCode::NOT_FOUND.into_response();
@@ -1816,12 +1828,11 @@ async fn lux_update_person(
         )
         .into_response();
     }
-    let access = require_service!(state.access);
-    let library_ids = match access.accessible_library_ids(principal).await {
+    let services = require_ready!(state);
+    let library_ids = match services.access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let people = require_service!(state.people);
     let update = PersonMetadataUpdate {
         name: request.name.trim().to_owned(),
         biography: clean_person_text(request.biography),
@@ -1837,7 +1848,8 @@ async fn lux_update_person(
         production_year: request.production_year,
         taglines: clean_person_values(request.taglines),
     };
-    match people
+    match services
+        .people
         .replace_person_metadata(&library_ids, &person_id, update)
         .await
     {
@@ -1871,7 +1883,11 @@ async fn lux_update_person(
         "{}",
     )
     .await;
-    match people.find_person(&library_ids, "Actor", &person_id).await {
+    match services
+        .people
+        .find_person(&library_ids, "Actor", &person_id)
+        .await
+    {
         Ok(Some(person)) => Json(person).into_response(),
         Ok(None) | Err(PeopleError::InvalidComponent(_)) => StatusCode::NOT_FOUND.into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2393,6 +2409,59 @@ mod tests {
         let response = require_database_probe(&state).await;
 
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        Ok(())
+    }
+
+    /// Minimal handler body that only takes the shared ready-services guard.
+    async fn require_ready_probe(state: &AppState) -> Response {
+        let services = require_ready!(state);
+        // Use the binding so the pass-through case proves the shared handle survived the expansion.
+        let _ = &services.catalog;
+        StatusCode::NO_CONTENT.into_response()
+    }
+
+    #[tokio::test]
+    async fn require_ready_answers_service_unavailable_without_the_services() {
+        let state = AppState::default();
+        let response = require_ready_probe(&state).await;
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        // The guard must keep returning the bare status, without a body.
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("service unavailable body");
+        assert!(body.is_empty());
+    }
+
+    #[tokio::test]
+    async fn require_ready_passes_the_ready_services_through()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, state) = ready_test_state().await?;
+        let response = require_ready_probe(&state).await;
+
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        state.shutdown_background_workers().await;
+        Ok(())
+    }
+
+    /// A clone of the state must share one `ReadyServices`, not copy the services.
+    #[tokio::test]
+    async fn cloning_the_state_shares_one_ready_services_instance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, state) = ready_test_state().await?;
+        let cloned = state.clone();
+        let shared = state.ready_services().ok_or("missing ready services")?;
+        let same = cloned.ready_services().ok_or("missing ready services")?;
+
+        assert!(std::sync::Arc::ptr_eq(shared, same));
+        assert!(std::ptr::eq(&shared.catalog, &same.catalog));
+        assert!(std::ptr::eq(&shared.scan_jobs, &same.scan_jobs));
+        assert!(std::ptr::eq(
+            shared.emby_migration.as_ref(),
+            same.emby_migration.as_ref()
+        ));
+        assert_eq!(std::sync::Arc::strong_count(shared), 2);
+        state.shutdown_background_workers().await;
         Ok(())
     }
 

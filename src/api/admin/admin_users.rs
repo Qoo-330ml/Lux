@@ -2141,13 +2141,16 @@ pub(crate) async fn admin_get_user_account_preferences(
     };
     let principal =
         crate::application::access::AccessPrincipal::new(profile.user.id, profile.user.is_admin);
-    let access = require_service!(state.access);
-    let mut accessible_library_ids = match access.accessible_library_ids(principal).await {
+    let services = require_ready!(state);
+    let mut accessible_library_ids = match services.access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let catalog = require_service!(state.catalog);
-    let collections = match catalog.list_global_collection_cards(principal, 0, 1).await {
+    let collections = match services
+        .catalog
+        .list_global_collection_cards(principal, 0, 1)
+        .await
+    {
         Ok(collections) => collections,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };

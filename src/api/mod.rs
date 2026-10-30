@@ -32,6 +32,31 @@ macro_rules! require_service {
     }};
 }
 
+/// Answers `503` unless the state carries the ready services, then yields the shared handle.
+///
+/// ```ignore
+/// let services = require_ready!(state);
+/// services.catalog.list(..).await
+/// ```
+///
+/// It replaces the per-service guards of a handler that needs more than one service with a single
+/// guard, and it answers exactly the same bare `503` (no body, no message) as `require_service!`.
+/// It returns the shared `Arc<ReadyServices>` clone, so a handler keeps observing the same service
+/// instances as the workers and plugins; only the reference count changes.
+///
+/// Call it where the first per-service guard of the handler used to be, not necessarily on the
+/// first line: the readiness flag never changes while a request is in flight, so every guard in
+/// one handler returns the same response, and hoisting them to the earliest guard position keeps
+/// the status-code ordering (authentication and validation errors stay first).
+macro_rules! require_ready {
+    ($state:ident) => {{
+        let Some(services) = $state.ready_services() else {
+            return StatusCode::SERVICE_UNAVAILABLE.into_response();
+        };
+        ::std::sync::Arc::clone(services)
+    }};
+}
+
 pub mod lux;
 
 mod legacy;
