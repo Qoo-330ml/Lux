@@ -299,6 +299,45 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Lists the libraries whose first scan a shutdown cancelled before it could finish.
+    ///
+    /// The predicate reuses the project-wide "`CANCELLED` + `SERVER_SHUTDOWN` means resumable"
+    /// convention and adds the first-scan specifics: the library is still enabled, it was never
+    /// scanned (`last_scan_at IS NULL`), it still has a root, and no scan is active for it. The
+    /// `GROUP BY` collapses the repeated cancellations that consecutive restarts leave behind.
+    pub(crate) async fn list_shutdown_interrupted_first_scan_library_ids(
+        &self,
+        after_library_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT jobs.library_id
+             FROM scan_jobs jobs
+             JOIN libraries lib ON lib.id = jobs.library_id
+             WHERE jobs.job_type = 'RECONCILE_LIBRARY'
+               AND jobs.status = 'CANCELLED'
+               AND jobs.error = 'SERVER_SHUTDOWN'
+               AND lib.is_enabled = 1
+               AND lib.last_scan_at IS NULL
+               AND EXISTS (SELECT 1 FROM library_roots root WHERE root.library_id = lib.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_jobs active
+                   WHERE active.library_id = jobs.library_id
+                     AND active.status IN ('PENDING', 'RUNNING')
+               )
+               AND (? IS NULL OR jobs.library_id > ?)
+             GROUP BY jobs.library_id
+             ORDER BY jobs.library_id
+             LIMIT ?",
+        )
+        .bind(after_library_id)
+        .bind(after_library_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn has_running_scan_job_type(
         &self,
         job_type: &str,

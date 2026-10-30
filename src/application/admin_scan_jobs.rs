@@ -157,6 +157,63 @@ pub(crate) async fn start_library_scan(
     Ok(Some(job))
 }
 
+/// How many interrupted first scans a single startup requeues.
+///
+/// Bounded on purpose: pathological data must not turn one startup into a scan storm, and the scan
+/// queue serializes the work anyway.
+pub(crate) const FIRST_SCAN_RESUME_LIMIT: i64 = 32;
+
+/// Requeues the first scans that a shutdown cancelled mid-way.
+///
+/// The intent of a first scan is already persisted (the `scan_jobs` row setup created before it
+/// returned `201`), so the recovery needs no new marker: a `CANCELLED` `RECONCILE_LIBRARY` job with
+/// `error = 'SERVER_SHUTDOWN'` for a library that was never scanned is the evidence. Every library
+/// gets a *new* job, which keeps the history readable (cancelled job, then the replacement) and
+/// avoids resuming a manifest that was only half written.
+pub(crate) async fn resume_shutdown_interrupted_first_scans(
+    database: &Database,
+    scan_jobs: &ScanJobService,
+    workers: ScanWorkerServices,
+    limit: i64,
+) -> Result<usize, StorageError> {
+    let library_ids = database
+        .list_shutdown_interrupted_first_scan_library_ids(None, limit)
+        .await?;
+    let mut resumed = 0_usize;
+    for library_id in library_ids {
+        let Ok(library_id) = library_id.parse::<LibraryId>() else {
+            tracing::warn!(
+                %library_id,
+                "ignoring an unparsable library id from the first-scan recovery query"
+            );
+            continue;
+        };
+        match start_library_scan(scan_jobs, library_id, workers.clone()).await {
+            Ok(Some(job)) => {
+                tracing::info!(
+                    %library_id,
+                    job_id = %job.id,
+                    "restarted a first scan that a shutdown interrupted"
+                );
+                resumed += 1;
+            }
+            // `None` means a scan appeared between the query and now (a manual trigger won the
+            // race), which is exactly the work the recovery would have queued.
+            Ok(None) => {}
+            // The library was disabled or deleted in between: nothing to recover.
+            Err(ScanJobError::LibraryNotFound) => {}
+            Err(error) => {
+                tracing::warn!(
+                    %library_id,
+                    %error,
+                    "an interrupted first scan could not be restarted"
+                );
+            }
+        }
+    }
+    Ok(resumed)
+}
+
 pub(crate) fn spawn_scan_job_worker(
     scan_jobs: &ScanJobService,
     job_id: &str,

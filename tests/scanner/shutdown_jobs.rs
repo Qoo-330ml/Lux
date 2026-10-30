@@ -1,6 +1,11 @@
+use std::time::Duration;
+
 use luxd::{
+    api::AppState,
     application::{libraries::LibraryService, scanner::ScanJobService, setup::SetupService},
+    auth::{emby::EmbyAuthService, sessions::WebAuthService},
     config::Config,
+    domain::ids::LibraryId,
     library::LibraryKind,
     observability::logs::LogStore,
     storage::Database,
@@ -224,5 +229,233 @@ async fn shutdown_cancels_every_incomplete_persistent_job() -> Result<(), Box<dy
     .fetch_one(database.pool())
     .await?;
     assert_eq!(active_count, 0);
+    Ok(())
+}
+
+/// A database that looks like the state a shutdown leaves behind: one library whose first
+/// `RECONCILE_LIBRARY` scan was cancelled with `SERVER_SHUTDOWN`.
+struct InterruptedFirstScan {
+    _temp_dir: tempfile::TempDir,
+    config: Config,
+    database: Database,
+    library_id: LibraryId,
+    cancelled_job_id: String,
+}
+
+async fn interrupted_first_scan(
+    with_root: bool,
+) -> Result<InterruptedFirstScan, Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    SetupService::new(database.clone())?
+        .complete("Admin", "Admin", "correct password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    if with_root {
+        let root_path = temp_dir.path().join("movies");
+        tokio::fs::create_dir_all(&root_path).await?;
+        libraries
+            .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+            .await?;
+    }
+    let job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    database.cancel_incomplete_jobs_for_shutdown().await?;
+    Ok(InterruptedFirstScan {
+        _temp_dir: temp_dir,
+        config,
+        database,
+        library_id: library.id,
+        cancelled_job_id: job.id,
+    })
+}
+
+/// Runs the startup recovery through the same state `main` builds.
+async fn resume_interrupted_first_scans(
+    fixture: &InterruptedFirstScan,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    let database = fixture.database.clone();
+    let state = AppState::ready(
+        fixture.config.clone(),
+        database.clone(),
+        SetupService::new(database.clone())?,
+        WebAuthService::new(database.clone())?,
+        EmbyAuthService::new(database)?,
+    );
+    Ok(state.resume_shutdown_interrupted_first_scans().await?)
+}
+
+async fn scan_job_ids(database: &Database, library_id: LibraryId) -> Vec<String> {
+    sqlx::query_scalar("SELECT id FROM scan_jobs WHERE library_id = ? ORDER BY id")
+        .bind(library_id.to_string())
+        .fetch_all(database.pool())
+        .await
+        .expect("scan job ids")
+}
+
+async fn scan_job_status(database: &Database, job_id: &str) -> String {
+    sqlx::query_scalar("SELECT status FROM scan_jobs WHERE id = ?")
+        .bind(job_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("scan job status")
+}
+
+async fn wait_for_scan_job_status(
+    database: &Database,
+    job_id: &str,
+    expected: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let status = scan_job_status(database, job_id).await;
+        if status == expected {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("scan job {job_id} stayed in {status}, expected {expected}").into());
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+#[tokio::test]
+async fn startup_resumes_first_scans_interrupted_by_shutdown()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = interrupted_first_scan(true).await?;
+    let cancelled: (String, Option<String>) =
+        sqlx::query_as("SELECT status, error FROM scan_jobs WHERE id = ?")
+            .bind(&fixture.cancelled_job_id)
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(
+        cancelled,
+        ("CANCELLED".to_owned(), Some("SERVER_SHUTDOWN".to_owned()))
+    );
+
+    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 1);
+
+    let jobs = scan_job_ids(&fixture.database, fixture.library_id).await;
+    assert_eq!(jobs.len(), 2, "exactly one replacement scan job: {jobs:?}");
+    let replacement = jobs
+        .iter()
+        .find(|id| **id != fixture.cancelled_job_id)
+        .ok_or("the recovery must queue a replacement scan job")?
+        .clone();
+    let job_type: String = sqlx::query_scalar("SELECT job_type FROM scan_jobs WHERE id = ?")
+        .bind(&replacement)
+        .fetch_one(fixture.database.pool())
+        .await?;
+    assert_eq!(job_type, "RECONCILE_LIBRARY");
+
+    // The recovered scan really runs: once it completes, `last_scan_at` is written and the library
+    // no longer matches the recovery predicate.
+    wait_for_scan_job_status(&fixture.database, &replacement, "COMPLETED").await?;
+    let last_scan_at: Option<i64> = sqlx::query_scalar("SELECT last_scan_at FROM libraries WHERE id = ?")
+        .bind(fixture.library_id.to_string())
+        .fetch_one(fixture.database.pool())
+        .await?;
+    assert!(last_scan_at.is_some(), "the resumed scan must be recorded");
+
+    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
+        2
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_skips_first_scans_of_libraries_that_were_scanned()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = interrupted_first_scan(true).await?;
+    sqlx::query("UPDATE libraries SET last_scan_at = unixepoch() WHERE id = ?")
+        .bind(fixture.library_id.to_string())
+        .execute(fixture.database.pool())
+        .await?;
+
+    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id).await,
+        vec![fixture.cancelled_job_id.clone()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_skips_scans_cancelled_for_a_real_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = interrupted_first_scan(true).await?;
+    sqlx::query("UPDATE scan_jobs SET error = 'DISK_FULL' WHERE id = ?")
+        .bind(&fixture.cancelled_job_id)
+        .execute(fixture.database.pool())
+        .await?;
+
+    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id).await,
+        vec![fixture.cancelled_job_id.clone()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_skips_first_scans_of_disabled_libraries()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = interrupted_first_scan(true).await?;
+    sqlx::query("UPDATE libraries SET is_enabled = 0 WHERE id = ?")
+        .bind(fixture.library_id.to_string())
+        .execute(fixture.database.pool())
+        .await?;
+
+    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id).await,
+        vec![fixture.cancelled_job_id.clone()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_skips_first_scans_of_libraries_without_a_root()
+-> Result<(), Box<dyn std::error::Error>> {
+    // `start_library_scan` itself accepts a rootless library, so the recovery predicate has to
+    // reject it: scanning nothing would only write `last_scan_at` for an unusable library.
+    let fixture = interrupted_first_scan(false).await?;
+    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id).await,
+        vec![fixture.cancelled_job_id.clone()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_does_not_queue_a_second_scan_while_one_is_active()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = interrupted_first_scan(true).await?;
+    // A manual scan is already queued: the recovery must leave it alone instead of racing it.
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+         VALUES ('active-scan', ?, 'RECONCILE_LIBRARY', 'PENDING', 'generation-active')",
+    )
+    .bind(fixture.library_id.to_string())
+    .execute(fixture.database.pool())
+    .await?;
+
+    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    let jobs = scan_job_ids(&fixture.database, fixture.library_id).await;
+    assert_eq!(jobs.len(), 2, "no third job: {jobs:?}");
+    assert_eq!(scan_job_status(&fixture.database, "active-scan").await, "PENDING");
     Ok(())
 }

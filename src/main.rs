@@ -200,6 +200,20 @@ async fn build_app_state(
     app_state.rebuild_people_index().await;
     app_state.start_local_metadata_worker().await;
     app_state.resume_interrupted_metadata_scraping();
+    {
+        // Runs in the background like the metadata recovery: the scans are queued one library at a
+        // time and the listener should not wait for the first filesystem walk.
+        let scan_state = app_state.clone();
+        tokio::spawn(async move {
+            match scan_state.resume_shutdown_interrupted_first_scans().await {
+                Ok(0) => {}
+                Ok(queued) => info!(queued, "requeued first scans interrupted by a shutdown"),
+                Err(error) => {
+                    error!(%error, "failed to requeue interrupted first scans");
+                }
+            }
+        });
+    }
     app_state.start_realtime_watchers().await;
     app_state.start_scheduled_tasks().await;
     app_state.start_webhook_worker().await;

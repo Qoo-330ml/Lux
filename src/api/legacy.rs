@@ -988,6 +988,36 @@ impl AppState {
         }
     }
 
+    /// Requeues the first scans that the previous shutdown cancelled mid-way.
+    ///
+    /// Setup starts the first scan of the library it creates, and the restart request that follows
+    /// the `201` cancels that scan with `SERVER_SHUTDOWN`. Without this step the new process would
+    /// leave the library empty until the administrator triggers a scan by hand. Returns how many
+    /// libraries were queued, so the caller can log it and tests can await the work directly.
+    pub async fn resume_shutdown_interrupted_first_scans(&self) -> Result<usize, String> {
+        if self.core.database_selection_required {
+            return Ok(0);
+        }
+        let (Some(scan_jobs), Some(database)) =
+            (self.scan_jobs().cloned(), self.core.database.as_ref())
+        else {
+            return Ok(0);
+        };
+        let workers = crate::application::admin_scan_jobs::ScanWorkerServices {
+            probe: self.probe().cloned(),
+            metadata: self.metadata_reidentify().cloned(),
+            thumbnails: self.thumbnails().cloned(),
+        };
+        crate::application::admin_scan_jobs::resume_shutdown_interrupted_first_scans(
+            database,
+            &scan_jobs,
+            workers,
+            crate::application::admin_scan_jobs::FIRST_SCAN_RESUME_LIMIT,
+        )
+        .await
+        .map_err(|error| error.to_string())
+    }
+
     pub fn require_database_selection(mut self) -> Self {
         self.core.database_selection_required = true;
         self
