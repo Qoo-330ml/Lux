@@ -7,8 +7,10 @@ const HOME_LATEST_ITEMS_PER_LIBRARY: i64 = 12;
 
 #[derive(Deserialize, Default)]
 pub(super) struct LuxImageQuery {
-    #[serde(default)]
+    // Accepted and ignored: the Web client appends the stored image tag as a
+    // cache-busting query parameter, and the route always serves the current image.
     #[allow(dead_code)]
+    #[serde(default)]
     tag: Option<String>,
     #[serde(default)]
     w: Option<String>,
