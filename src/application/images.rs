@@ -3745,6 +3745,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_changed_library_root_is_validated_again() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Rerooted Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+
+        let other_root = temp.path().join("Other Movies");
+        tokio::fs::create_dir_all(&other_root).await?;
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1",
+                &poster,
+                &other_root,
+                "tag-1",
+            )])
+            .await;
+
+        assert!(
+            matches!(resolved, Err(ImageError::Forbidden)),
+            "the image is no longer inside the library root the row points at"
+        );
+        assert_eq!(
+            service.path_validation_count(),
+            2,
+            "a changed library root must not be served from the cache"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn a_new_content_tag_is_resolved_again() -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
         let service = image_service_for_tests(&temp.path().join("config")).await?;
