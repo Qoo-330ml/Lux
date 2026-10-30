@@ -135,3 +135,35 @@ it("limits a targeted item event to that item and related list caches", () => {
   expect(client.getQueryState(["item", "item-1"])?.isInvalidated).toBe(true);
   expect(client.getQueryState(["item", "item-2"])?.isInvalidated).toBe(false);
 });
+
+const progressUntouchedKeys = [
+  ["home"], ["home", "carousel"], ["home", "latest-libraries", ["library-1"]], ["libraries"],
+  ["library", "library-1"], ["item", "item-1"], ["item-images", "item-1"],
+  ["children", "series-1", "EPISODE"], ["favorites"], ["collection", "collection-1"],
+  ["person", "person-1"], ["playback", "item-2"],
+];
+
+it("narrows a progress event to continue-watching and the playing item's playback state", () => {
+  client.setQueryData(["home", "continue-watching"], { value: "old" });
+  client.setQueryData(["playback", "item-1"], { value: "old" });
+  for (const key of progressUntouchedKeys) client.setQueryData(key, { value: "old" });
+  renderShell();
+  act(() => FakeEventSource.instances[0].emit("invalidate", { scope: "progress", itemId: "item-1" }));
+  expect(client.getQueryState(["home", "continue-watching"])?.isInvalidated).toBe(true);
+  expect(client.getQueryState(["playback", "item-1"])?.isInvalidated).toBe(true);
+  for (const key of progressUntouchedKeys) expect(client.getQueryState(key)?.isInvalidated).toBe(false);
+});
+
+it("keeps progress without an item id on the playback prefix instead of the media surface", () => {
+  client.setQueryData(["home", "continue-watching"], { value: "old" });
+  client.setQueryData(["playback", "item-1"], { value: "old" });
+  for (const key of progressUntouchedKeys) client.setQueryData(key, { value: "old" });
+  renderShell();
+  act(() => FakeEventSource.instances[0].emit("invalidate", { scope: "progress" }));
+  expect(client.getQueryState(["home", "continue-watching"])?.isInvalidated).toBe(true);
+  expect(client.getQueryState(["playback", "item-1"])?.isInvalidated).toBe(true);
+  expect(client.getQueryState(["playback", "item-2"])?.isInvalidated).toBe(true);
+  for (const key of progressUntouchedKeys.filter((key) => key[0] !== "playback")) {
+    expect(client.getQueryState(key)?.isInvalidated).toBe(false);
+  }
+});
