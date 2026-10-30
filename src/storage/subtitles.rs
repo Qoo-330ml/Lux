@@ -265,7 +265,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)]
     pub(crate) async fn list_subtitle_streams(
         &self,
         item_id: &str,

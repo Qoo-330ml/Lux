@@ -1,17 +1,16 @@
 use super::*;
 
 const NFO_METADATA_BATCH_SIZE: usize = 400;
+#[cfg(test)]
+use crate::domain::content_restrictions::ContentRestrictionIndexProjection;
+use crate::storage::{
+    CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexBatchOutcome,
+    ContentRestrictionIndexWrite, MediaContentRestrictionIndexCandidate,
+};
 use crate::storage::{
     CatalogSearchQuery, GlobalCollectionSourcePreference, GlobalMovieCollectionReference,
     GlobalMovieCollectionReferenceUpdate, StoredMovieNfoCollectionReferenceReconciliation,
     global_collection_title_fallback, global_collection_title_is_placeholder,
-};
-use crate::{
-    domain::content_restrictions::ContentRestrictionIndexProjection,
-    storage::{
-        CONTENT_RESTRICTION_INDEX_BATCH_LIMIT, ContentRestrictionIndexBatchOutcome,
-        ContentRestrictionIndexWrite, MediaContentRestrictionIndexCandidate,
-    },
 };
 
 const RECOMMENDATION_PLAYBACK_WINDOW_SECONDS: i64 = 180 * 86_400;
@@ -8099,8 +8098,7 @@ impl Database {
         Ok(classifications.into_values().collect())
     }
 
-    // LUX-684 consumes this compare-and-swap before persisting a projected index.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub(crate) async fn replace_media_content_restriction_index_if_nfo_json_matches(
         &self,
         item_id: &str,
@@ -8914,7 +8912,7 @@ impl Database {
         Ok(inserted_count)
     }
 
-    #[allow(dead_code)] // Storage tests seed fallback state before exercising batch writes.
+    #[cfg(test)]
     pub(crate) async fn set_poster_fallback_required(
         &self,
         item_id: &str,
