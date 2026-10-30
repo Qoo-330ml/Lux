@@ -7,7 +7,7 @@ import { LuxLogo } from "../../components/LuxLogo";
 import type { LibraryKind } from "../../lib/api/types";
 import { LuxButton, LuxDisclosure, LuxSelectField, LuxTextField } from "../../components/ui";
 
-export function AdminSetupForm() {
+export function AdminSetupForm({ onRestarting }: { onRestarting?: () => void } = {}) {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
   const [values, setValues] = useState({
@@ -21,7 +21,15 @@ export function AdminSetupForm() {
   const setup = useMutation({
     mutationFn: () =>
       api.setup(values),
-    onSuccess: () => {
+    onSuccess: (result) => {
+      // The server restarts a moment after this 201 (docs/SETUP-RESTART-DESIGN.md
+      // §5.2). Caching initialized:true here would make App.tsx leave the setup
+      // route immediately, so the restart notice would never be shown: hand the
+      // rest of the flow to SetupPage, which owns the polling.
+      if (result.restarting && onRestarting) {
+        onRestarting();
+        return;
+      }
       queryClient.setQueryData(queryKeys.setup, { initialized: true });
       queryClient.removeQueries({ queryKey: queryKeys.me });
       navigate("/login", { replace: true });
