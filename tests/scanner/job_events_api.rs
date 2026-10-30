@@ -236,6 +236,34 @@ async fn admin_can_filter_and_page_scan_job_events() -> Result<(), Box<dyn std::
     assert_eq!(no_matches.status(), reqwest::StatusCode::OK);
     assert_eq!(no_matches.json::<Value>().await?["total"], 0);
 
+    let cancelled = client
+        .post(format!("{base_url}/api/v1/admin/jobs/{job_id}/cancel"))
+        .header(COOKIE, &cookies)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(cancelled.status(), reqwest::StatusCode::ACCEPTED);
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let scan_cancelled = audit["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["eventType"] == "SCAN_CANCELLED")
+        })
+        .ok_or("missing SCAN_CANCELLED")?;
+    assert_eq!(
+        scan_cancelled["metadata"]["libraryId"],
+        json!(library.id.to_string())
+    );
+    assert!(scan_cancelled["metadata"]["previousStatus"].is_string());
+
     server.abort();
     Ok(())
 }
