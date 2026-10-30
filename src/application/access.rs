@@ -518,8 +518,7 @@ mod tests {
         second_library_id: String,
     }
 
-    async fn playback_cache_fixture() -> Result<PlaybackCacheFixture, Box<dyn std::error::Error>>
-    {
+    async fn playback_cache_fixture() -> Result<PlaybackCacheFixture, Box<dyn std::error::Error>> {
         let directory = tempfile::tempdir()?;
         let database = Database::connect(&Config {
             http_addr: "127.0.0.1:8097".parse()?,
@@ -641,8 +640,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_access_cache_never_caches_a_denial()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn playback_access_cache_never_caches_a_denial() -> Result<(), Box<dyn std::error::Error>>
+    {
         let fixture = playback_cache_fixture().await?;
         fixture
             .database
@@ -670,8 +669,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn playback_access_cache_expires_after_the_ttl()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn playback_access_cache_expires_after_the_ttl() -> Result<(), Box<dyn std::error::Error>>
+    {
         let fixture = playback_cache_fixture().await?;
         let clock = TestClock::new();
         let access = fixture
