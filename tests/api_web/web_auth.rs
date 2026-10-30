@@ -42,6 +42,7 @@ async fn test_server_with_setup_restart(
         String,
         tokio::task::JoinHandle<Result<(), std::io::Error>>,
         watch::Receiver<ShutdownReason>,
+        Database,
     ),
     Box<dyn std::error::Error>,
 > {
@@ -51,14 +52,14 @@ async fn test_server_with_setup_restart(
     let emby_auth = EmbyAuthService::new(database.clone())?;
     let (restart_sender, restart_receiver) = watch::channel(ShutdownReason::Running);
     let app = app_with_state(
-        AppState::ready(config, database, setup, auth, emby_auth)
+        AppState::ready(config, database.clone(), setup, auth, emby_auth)
             .with_restart_handle(RestartHandle::new(restart_sender))
             .with_setup_restart_delay(setup_restart_delay),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
     let server = tokio::spawn(async move { axum::serve(listener, app).await });
-    Ok((format!("http://{address}"), server, restart_receiver))
+    Ok((format!("http://{address}"), server, restart_receiver, database))
 }
 
 fn test_config(temp_dir: &tempfile::TempDir) -> Result<Config, Box<dyn std::error::Error>> {
@@ -491,7 +492,7 @@ async fn setup_complete_requests_a_restart_after_the_response()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let config = test_config(&temp_dir)?;
-    let (base_url, server, mut restart) =
+    let (base_url, server, mut restart, _database) =
         test_server_with_setup_restart(config, Duration::from_millis(200)).await?;
     let client = test_client();
 
@@ -575,6 +576,159 @@ async fn setup_complete_without_a_restart_handle_keeps_the_created_body()
     assert_eq!(body["warnings"], json!([]));
     assert_eq!(body["scanJob"]["jobType"], json!("RECONCILE_LIBRARY"));
     assert_eq!(body["scanJob"]["libraryId"], body["library"]["id"]);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_complete_does_not_restart_again_when_the_admin_exists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = test_config(&temp_dir)?;
+    let (base_url, server, mut restart, _database) =
+        test_server_with_setup_restart(config, Duration::from_millis(200)).await?;
+    let client = test_client();
+    let request = json!({
+        "username": "Admin",
+        "displayName": "Admin",
+        "password": "correct password",
+    });
+
+    let first = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(first.status(), reqwest::StatusCode::CREATED);
+    timeout(Duration::from_secs(5), restart.changed())
+        .await
+        .expect("the first setup should request the restart")?;
+
+    // A second setup is a pure read of the "already initialized" state: 409, and no new restart
+    // request is scheduled (the handle is one-shot, so `changed()` never fires again).
+    let second = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(second.status(), reqwest::StatusCode::CONFLICT);
+    let body = second.json::<serde_json::Value>().await?;
+    assert_eq!(body["error"]["code"], json!("SETUP_ALREADY_COMPLETED"));
+    assert!(
+        timeout(Duration::from_millis(300), restart.changed())
+            .await
+            .is_err(),
+        "a rejected setup must not schedule a second restart"
+    );
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_complete_restarts_even_when_the_first_library_cannot_be_created()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = test_config(&temp_dir)?;
+    let (base_url, server, mut restart, database) =
+        test_server_with_setup_restart(config, Duration::from_millis(200)).await?;
+    let client = test_client();
+    let root_path = temp_dir.path().join("movies");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root_path = root_path.to_str().ok_or("non-UTF-8 root path")?;
+
+    // The administrator is stored first, so a failing first-library step leaves the instance in a
+    // half-configured state that only the restart can resolve. A storage failure is the remaining
+    // failure mode here: an unusable `rootPath` is rejected before the admin exists (see the next
+    // test), and the library row itself is written before the root.
+    sqlx::query("DROP TABLE libraries")
+        .execute(database.pool())
+        .await?;
+
+    let setup = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password",
+            "firstLibrary": { "name": "Movies", "kind": "MOVIE", "rootPath": root_path },
+        }))
+        .send()
+        .await?;
+    assert_eq!(setup.status(), reqwest::StatusCode::SERVICE_UNAVAILABLE);
+    let body = setup.json::<serde_json::Value>().await?;
+    assert_eq!(body["error"]["code"], json!("DATABASE_UNAVAILABLE"));
+    assert!(
+        !body.as_object().is_some_and(|body| body.contains_key("restarting")),
+        "the 4xx/5xx body keeps the plain api_error shape: {body}"
+    );
+    assert!(
+        SetupService::new(database.clone())?.status().await?,
+        "the administrator is stored even though the first library failed"
+    );
+    timeout(Duration::from_secs(5), restart.changed())
+        .await
+        .expect("a partial success must still request the restart")?;
+    assert_eq!(*restart.borrow(), ShutdownReason::Restart);
+
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn setup_complete_rejects_an_unusable_root_path_before_the_admin_exists()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = test_config(&temp_dir)?;
+    let (base_url, server, mut restart, database) =
+        test_server_with_setup_restart(config, Duration::from_millis(200)).await?;
+    let client = test_client();
+    let missing_root = temp_dir.path().join("missing");
+    let missing_root = missing_root.to_str().ok_or("non-UTF-8 root path")?;
+    let request = json!({
+        "username": "Admin",
+        "displayName": "Admin",
+        "password": "correct password",
+        "firstLibrary": { "name": "Movies", "kind": "MOVIE", "rootPath": missing_root },
+    });
+
+    let rejected = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&request)
+        .send()
+        .await?;
+    assert_eq!(rejected.status(), reqwest::StatusCode::BAD_REQUEST);
+    // The root path is inspected before the administrator is stored, so nothing happened yet: setup
+    // stays open and must not restart.
+    assert!(!SetupService::new(database.clone())?.status().await?);
+    assert!(
+        timeout(Duration::from_millis(300), restart.changed())
+            .await
+            .is_err(),
+        "a request rejected before the admin exists must not restart"
+    );
+
+    // The instance is still in the setup mode, so a corrected request succeeds and restarts.
+    let root_path = temp_dir.path().join("movies");
+    tokio::fs::create_dir_all(&root_path).await?;
+    let root_path = root_path.to_str().ok_or("non-UTF-8 root path")?;
+    let accepted = client
+        .post(format!("{base_url}/api/v1/setup/complete"))
+        .json(&json!({
+            "username": "Admin",
+            "displayName": "Admin",
+            "password": "correct password",
+            "firstLibrary": { "name": "Movies", "kind": "MOVIE", "rootPath": root_path },
+        }))
+        .send()
+        .await?;
+    assert_eq!(accepted.status(), reqwest::StatusCode::CREATED);
+    let body = accepted.json::<serde_json::Value>().await?;
+    assert_eq!(body["restarting"], json!(true));
+    timeout(Duration::from_secs(5), restart.changed())
+        .await
+        .expect("the corrected setup should request the restart")?;
 
     server.abort();
     Ok(())
