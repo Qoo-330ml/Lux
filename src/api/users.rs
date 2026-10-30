@@ -876,9 +876,10 @@ async fn record_web_device_observation(
     device_id: Option<&str>,
     remote_ip: Option<String>,
 ) {
-    let (Some(device_id), Some(database)) = (device_id, Some(state.database())) else {
+    let Some(device_id) = device_id else {
         return;
     };
+    let database = state.database();
     if let Err(error) = database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
@@ -1119,8 +1120,8 @@ pub(super) async fn auth_accept_user_invitation(
             .into_response();
         }
     };
-    let (Some(database), Some(config_dir)) = (Some(state.database()), state.config_dir.as_ref())
-    else {
+    let database = state.database();
+    let Some(config_dir) = state.config_dir.as_ref() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,

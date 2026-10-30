@@ -1037,17 +1037,16 @@ pub(super) async fn emby_query_users(
             .await
             .unwrap_or_default()
     };
-    let stored_configurations = match Some(state.database()) {
-        Some(database) => database
-            .list_user_emby_configurations(&user_ids)
-            .await
-            .unwrap_or_default(),
-        None => std::collections::HashMap::new(),
-    };
-    let force_admin_library_order = match Some(state.database()) {
-        Some(database) => database.force_admin_library_order().await.unwrap_or(false),
-        None => false,
-    };
+    let stored_configurations = state
+        .database()
+        .list_user_emby_configurations(&user_ids)
+        .await
+        .unwrap_or_default();
+    let force_admin_library_order = state
+        .database()
+        .force_admin_library_order()
+        .await
+        .unwrap_or(false);
     let mut items = Vec::with_capacity(users.len());
     for user in users {
         let user_id = user.id.to_string();
@@ -2279,7 +2278,8 @@ async fn emby_authentication_success_response(
     state.login_rate_limiter.record_success(login_key).await;
     let user_id = result.user.id.to_string();
     if let Some(device_id) = bounded_emby_device_field(&result.device.device_id) {
-        if let Some(database) = Some(state.database()) {
+        {
+            let database = state.database();
             let device_name = bounded_emby_device_field(&result.device.device);
             let client_name = bounded_emby_device_field(&result.device.client);
             let client_version = bounded_emby_device_field(&result.device.version);

@@ -949,7 +949,7 @@ pub(crate) async fn admin_list_library_deletion_jobs(
     if status.as_deref().is_some_and(|status| {
         !matches!(
             status,
-            "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED"
+            "OPEN" | "PENDING" | "RUNNING" | "COMPLETED" | "FAILED" | "CANCELLED"
         )
     }) {
         return api_error(

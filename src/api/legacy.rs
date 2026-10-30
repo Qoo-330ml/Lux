@@ -288,7 +288,6 @@ macro_rules! ready_service_accessor {
     ($($field:ident -> $ty:ty),* $(,)?) => {
         $(
             #[doc = concat!("Reads the required `ReadyServices::", stringify!($field), "`.")]
-            #[allow(dead_code)]
             pub(crate) fn $field(&self) -> &$ty {
                 &self.services.$field
             }
@@ -300,7 +299,6 @@ macro_rules! ready_optional_service_accessor {
     ($($field:ident -> $ty:ty),* $(,)?) => {
         $(
             #[doc = concat!("Reads the feature-optional `ReadyServices::", stringify!($field), "`.")]
-            #[allow(dead_code)]
             pub(crate) fn $field(&self) -> Option<&$ty> {
                 self.services.$field.as_ref()
             }
@@ -340,7 +338,6 @@ impl ReadyAppState {
 ///
 /// They are batch-0 scaffolding: each migration batch turns `require_service!(state.<field>)` into
 /// `state.<field>()` in its own files, which is why nothing calls them yet.
-#[allow(dead_code)]
 impl ReadyAppState {
     pub(crate) fn database(&self) -> &Database {
         &self.database
@@ -357,7 +354,6 @@ impl ReadyAppState {
     }
 
     ready_service_accessor! {
-        database_setup -> DatabaseSetupService,
         setup -> SetupService,
         auth -> WebAuthService,
         emby_auth -> EmbyAuthService,
@@ -387,11 +383,7 @@ impl ReadyAppState {
         danmaku -> DanmakuService,
         plugins -> PluginService,
         emby_migration -> Arc<EmbyMigrationService>,
-        scraper_resolver -> ScraperResolver,
-        scraper -> ScraperProvider,
         collections -> CollectionService,
-        global_collection_sync_worker -> GlobalCollectionSyncWorker,
-        identity_merge_worker -> IdentityMergeWorker,
         people -> PeopleService,
         local_nfo -> LocalNfoMetadataStore,
         user_avatars -> UserAvatarService,
@@ -405,7 +397,6 @@ impl ReadyAppState {
         downloads -> DownloadService,
         strm_playback -> StrmPlaybackResolver,
         webhooks -> WebhookService,
-        content_restriction_index_worker -> ContentRestrictionIndexWorker,
     }
 }
 
@@ -488,31 +479,6 @@ pub(crate) enum AppMode {
     NotReady(AppState),
 }
 
-/// Transitional bridge for the cross-file helpers that still take `&AppState`.
-///
-/// The 25 helpers that more than one file calls (`require_admin`, `require_web_principal`,
-/// `require_emby_user`, …) take `&impl StateView` so that a migrated file can pass a
-/// `&ReadyAppState` while the others keep passing a `&AppState`; the call sites do not change,
-/// because `impl Trait` in argument position is implicit generics. The trait goes away with the
-/// compatibility accessors in the closing batch, when every helper takes `&ReadyAppState`.
-#[allow(dead_code)]
-pub(crate) trait StateView: std::ops::Deref<Target = CoreState> {
-    /// The shared service table, or `None` for a not-ready state.
-    fn ready_services(&self) -> Option<&ReadyServices>;
-}
-
-impl StateView for AppState {
-    fn ready_services(&self) -> Option<&ReadyServices> {
-        self.ready.as_deref()
-    }
-}
-
-impl StateView for ReadyAppState {
-    fn ready_services(&self) -> Option<&ReadyServices> {
-        Some(&self.services)
-    }
-}
-
 /// The batch-0 conversions between the three states, and nothing more.
 ///
 /// Only the directions the split needs exist: a ready state can be viewed as the compatibility
@@ -561,7 +527,6 @@ macro_rules! required_service_accessor {
     ($($field:ident -> $ty:ty),* $(,)?) => {
         $(
             #[doc = concat!("Reads `ReadyServices::", stringify!($field), "` when the state is ready.")]
-            #[allow(dead_code)]
             pub(crate) fn $field(&self) -> Option<&$ty> {
                 self.ready.as_ref().map(|services| &services.$field)
             }
@@ -573,7 +538,6 @@ macro_rules! optional_service_accessor {
     ($($field:ident -> $ty:ty),* $(,)?) => {
         $(
             #[doc = concat!("Reads the feature-optional `ReadyServices::", stringify!($field), "`.")]
-            #[allow(dead_code)]
             pub(crate) fn $field(&self) -> Option<&$ty> {
                 self.ready
                     .as_ref()
@@ -634,51 +598,21 @@ impl AppState {
     required_service_accessor! {
         database_setup -> DatabaseSetupService,
         setup -> SetupService,
-        auth -> WebAuthService,
-        emby_auth -> EmbyAuthService,
-        device_pairings -> DevicePairingService,
-        admin_api_key -> AdminApiKeyService,
         database_diagnostics -> DatabaseDiagnosticsService,
         libraries -> LibraryService,
-        catalog -> CatalogService,
-        home -> HomeService,
-        images -> ImageService,
-        image_variants -> Arc<ImageVariantService>,
-        image_candidates -> ImageCandidateService,
-        library_covers -> LibraryCoverService,
-        access -> MediaAccessService,
-        metadata_candidates -> MetadataCandidateService,
-        metadata_writes -> MetadataWriteService,
         metadata_reidentify -> MetadataReidentifyService,
-        deletion -> MediaDeleteService,
-        item_merge -> ItemMergeService,
         probe -> MediaProbeService,
-        embedded_subtitle -> EmbeddedSubtitleService,
         thumbnails -> ThumbnailService,
         scan_jobs -> ScanJobService,
-        strm_probe -> StrmProbeService,
-        chapter_detection -> ChapterDetectionService,
         scheduled_tasks -> ScheduledTaskService,
-        danmaku -> DanmakuService,
         plugins -> PluginService,
-        emby_migration -> Arc<EmbyMigrationService>,
-        scraper_resolver -> ScraperResolver,
-        scraper -> ScraperProvider,
-        collections -> CollectionService,
         global_collection_sync_worker -> GlobalCollectionSyncWorker,
         identity_merge_worker -> IdentityMergeWorker,
         people -> PeopleService,
-        local_nfo -> LocalNfoMetadataStore,
         user_avatars -> UserAvatarService,
-        ip_location -> IpLocationService,
-        web_playback -> WebPlaybackSessionService,
     }
 
     optional_service_accessor! {
-        image_writes -> ImageWriteService,
-        metadata_selection -> MetadataSelectionService,
-        downloads -> DownloadService,
-        strm_playback -> StrmPlaybackResolver,
         webhooks -> WebhookService,
         content_restriction_index_worker -> ContentRestrictionIndexWorker,
     }
@@ -2910,100 +2844,6 @@ mod tests {
             temp,
             AppState::ready(config, database, setup, auth, emby_auth),
         ))
-    }
-
-    /// Characterization test for the ready-state business service slots.
-    ///
-    /// The services that the application always builds on the ready path must all be reachable
-    /// after construction, and the unreadiness signal must stay observable (`None`) for a state
-    /// built through `Default`, which is what keeps the bare `503` behaviour.
-    #[tokio::test]
-    async fn ready_state_exposes_every_business_service_slot()
-    -> Result<(), Box<dyn std::error::Error>> {
-        let (_temp, state) = ready_test_state().await?;
-        let required = [
-            ("database_setup", state.database_setup().is_some()),
-            ("setup", state.setup().is_some()),
-            ("auth", state.auth().is_some()),
-            ("emby_auth", state.emby_auth().is_some()),
-            ("device_pairings", state.device_pairings().is_some()),
-            ("admin_api_key", state.admin_api_key().is_some()),
-            (
-                "database_diagnostics",
-                state.database_diagnostics().is_some(),
-            ),
-            ("libraries", state.libraries().is_some()),
-            ("catalog", state.catalog().is_some()),
-            ("home", state.home().is_some()),
-            ("images", state.images().is_some()),
-            ("image_variants", state.image_variants().is_some()),
-            ("image_candidates", state.image_candidates().is_some()),
-            ("library_covers", state.library_covers().is_some()),
-            ("access", state.access().is_some()),
-            ("metadata_candidates", state.metadata_candidates().is_some()),
-            ("metadata_writes", state.metadata_writes().is_some()),
-            ("metadata_reidentify", state.metadata_reidentify().is_some()),
-            ("deletion", state.deletion().is_some()),
-            ("item_merge", state.item_merge().is_some()),
-            ("probe", state.probe().is_some()),
-            ("embedded_subtitle", state.embedded_subtitle().is_some()),
-            ("thumbnails", state.thumbnails().is_some()),
-            ("scan_jobs", state.scan_jobs().is_some()),
-            ("strm_probe", state.strm_probe().is_some()),
-            ("chapter_detection", state.chapter_detection().is_some()),
-            ("scheduled_tasks", state.scheduled_tasks().is_some()),
-            ("danmaku", state.danmaku().is_some()),
-            ("plugins", state.plugins().is_some()),
-            ("emby_migration", state.emby_migration().is_some()),
-            ("scraper_resolver", state.scraper_resolver().is_some()),
-            ("scraper", state.scraper().is_some()),
-            ("collections", state.collections().is_some()),
-            (
-                "global_collection_sync_worker",
-                state.global_collection_sync_worker().is_some(),
-            ),
-            (
-                "identity_merge_worker",
-                state.identity_merge_worker().is_some(),
-            ),
-            ("people", state.people().is_some()),
-            ("local_nfo", state.local_nfo().is_some()),
-            ("user_avatars", state.user_avatars().is_some()),
-            ("ip_location", state.ip_location().is_some()),
-            ("web_playback", state.web_playback().is_some()),
-        ];
-        for (field, present) in required {
-            assert!(present, "ready state is missing the {field} service");
-        }
-        // Feature-optional slots keep their `Option` shape on the ready path: their absence is a
-        // degraded capability, not unreadiness. Their constructors can legitimately fail in a given
-        // environment, so presence is not asserted; touching the accessors proves the slots still
-        // exist with an `Option<&_>` shape.
-        let _ = (
-            state.image_writes(),
-            state.metadata_selection(),
-            state.downloads(),
-            state.strm_playback(),
-            state.webhooks(),
-        );
-        // The restriction index worker is started after construction, never by the constructor.
-        assert!(
-            state.content_restriction_index_worker().is_none(),
-            "content_restriction_index_worker"
-        );
-        state.shutdown_background_workers().await;
-
-        // A state built through `Default` reports every slot as absent; that is the signal the
-        // handlers turn into the bare `503`.
-        let default_state = AppState::default();
-        assert!(default_state.catalog().is_none());
-        assert!(default_state.people().is_none());
-        assert!(default_state.image_writes().is_none());
-        assert!(default_state.metadata_selection().is_none());
-        assert!(default_state.downloads().is_none());
-        assert!(default_state.strm_playback().is_none());
-        assert!(default_state.webhooks().is_none());
-        Ok(())
     }
 
     #[test]

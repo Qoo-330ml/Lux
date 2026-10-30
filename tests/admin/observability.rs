@@ -46,6 +46,22 @@ mod unix {
         Ok(())
     }
 
+    /// An initialised server mounts the business routes; a fresh one serves only the setup wizard.
+    async fn seed_administrator(
+        config_dir: &std::path::Path,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let config = luxd::config::Config {
+            http_addr: "127.0.0.1:0".parse()?,
+            config_dir: config_dir.to_path_buf(),
+        };
+        let database = luxd::storage::Database::connect(&config).await?;
+        luxd::application::setup::SetupService::new(database.clone())?
+            .complete("Admin", "Admin", "correct password")
+            .await?;
+        database.close().await;
+        Ok(())
+    }
+
     async fn read_daily_logs(
         config_dir: &std::path::Path,
     ) -> Result<String, Box<dyn std::error::Error>> {
@@ -70,6 +86,7 @@ mod unix {
     -> Result<(), Box<dyn std::error::Error>> {
         let temp_dir = tempfile::tempdir()?;
         let config_dir = temp_dir.path().join("config");
+        seed_administrator(&config_dir).await?;
         let probe_listener = std::net::TcpListener::bind("127.0.0.1:0")?;
         let address = probe_listener.local_addr()?;
         drop(probe_listener);
