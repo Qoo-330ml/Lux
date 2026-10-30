@@ -170,6 +170,14 @@ pub(crate) const FIRST_SCAN_RESUME_MAX_LIBRARIES: usize = 512;
 /// How many still-eligible libraries the "reached the limit" log counts.
 const FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT: i64 = 10_000;
 
+/// Outcome of one startup's first-scan recovery.
+pub(crate) struct FirstScanRecovery {
+    /// How many libraries were queued for a new first scan.
+    pub(crate) resumed: usize,
+    /// How many still-eligible libraries the per-startup bound left for the next startup.
+    pub(crate) skipped_by_limit: usize,
+}
+
 /// Requeues the first scans that a shutdown cancelled mid-way.
 ///
 /// The intent of a first scan is already persisted (the `scan_jobs` row setup created before it
@@ -184,8 +192,29 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
     database: &Database,
     scan_jobs: &ScanJobService,
     workers: ScanWorkerServices,
-) -> Result<usize, StorageError> {
+) -> Result<FirstScanRecovery, StorageError> {
+    resume_shutdown_interrupted_first_scans_bounded(
+        database,
+        scan_jobs,
+        workers,
+        FIRST_SCAN_RESUME_MAX_LIBRARIES,
+    )
+    .await
+}
+
+/// [`resume_shutdown_interrupted_first_scans`] with an explicit per-startup bound.
+///
+/// The bound is a parameter so the limit accounting can be tested without creating 512 libraries.
+async fn resume_shutdown_interrupted_first_scans_bounded(
+    database: &Database,
+    scan_jobs: &ScanJobService,
+    workers: ScanWorkerServices,
+    max_libraries: usize,
+) -> Result<FirstScanRecovery, StorageError> {
     let mut cursor: Option<String> = None;
+    // The last library the loop actually handled. The limit accounting counts what comes after it,
+    // which also covers the libraries that sit behind the limit inside the same page.
+    let mut last_processed: Option<String> = None;
     let mut resumed = 0_usize;
     loop {
         let library_ids = database
@@ -200,22 +229,26 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
         let last_page = (library_ids.len() as i64) < FIRST_SCAN_RESUME_PAGE_SIZE;
         cursor = library_ids.last().cloned();
         for library_id in library_ids {
-            if resumed >= FIRST_SCAN_RESUME_MAX_LIBRARIES {
+            if resumed >= max_libraries {
                 let remaining = database
                     .list_shutdown_interrupted_first_scan_library_ids(
-                        cursor.as_deref(),
+                        last_processed.as_deref(),
                         FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT,
                     )
                     .await?;
                 tracing::warn!(
-                    max = FIRST_SCAN_RESUME_MAX_LIBRARIES,
+                    max = max_libraries,
                     queued = resumed,
                     remaining = remaining.len(),
                     "first-scan recovery reached its per-startup limit; the remaining libraries stay \
                      eligible for the next startup"
                 );
-                return Ok(resumed);
+                return Ok(FirstScanRecovery {
+                    resumed,
+                    skipped_by_limit: remaining.len(),
+                });
             }
+            last_processed = Some(library_id.clone());
             let Ok(library_id) = library_id.parse::<LibraryId>() else {
                 tracing::warn!(
                     %library_id,
@@ -250,7 +283,10 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
             break;
         }
     }
-    Ok(resumed)
+    Ok(FirstScanRecovery {
+        resumed,
+        skipped_by_limit: 0,
+    })
 }
 
 pub(crate) fn spawn_scan_job_worker(
@@ -271,4 +307,57 @@ pub(crate) fn spawn_scan_job_worker(
             )
             .await;
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+    /// Creates `count` libraries, each with an available root and a first scan that a shutdown
+    /// cancelled, i.e. exactly the state the recovery is meant to pick up.
+    async fn cancelled_first_scans(
+        count: usize,
+    ) -> Result<(tempfile::TempDir, Database, ScanJobService), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        let libraries = LibraryService::new(database.clone());
+        let scan_jobs = ScanJobService::new(database.clone());
+        for index in 0..count {
+            let library = libraries
+                .create_library(&format!("Movies {index:02}"), LibraryKind::Movie, false)
+                .await?;
+            let root_path = temp_dir.path().join(format!("movies-{index:02}"));
+            tokio::fs::create_dir_all(&root_path).await?;
+            libraries
+                .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+                .await?;
+            scan_jobs.create_movie_scan_job(library.id).await?;
+        }
+        database.cancel_incomplete_jobs_for_shutdown().await?;
+        Ok((temp_dir, database, scan_jobs))
+    }
+
+    #[tokio::test]
+    async fn the_limit_accounting_counts_every_library_left_for_the_next_startup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database, scan_jobs) = cancelled_first_scans(5).await?;
+        let recovery = resume_shutdown_interrupted_first_scans_bounded(
+            &database,
+            &scan_jobs,
+            ScanWorkerServices::default(),
+            2,
+        )
+        .await?;
+
+        assert_eq!(recovery.resumed, 2);
+        // The three libraries that did not fit are all still eligible, including the ones that sat
+        // behind the limit inside the same page. Under-counting them would hide work from the log.
+        assert_eq!(recovery.skipped_by_limit, 3);
+        Ok(())
+    }
 }

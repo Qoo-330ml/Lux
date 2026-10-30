@@ -1012,6 +1012,7 @@ impl AppState {
             database, &scan_jobs, workers,
         )
         .await
+        .map(|recovery| recovery.resumed)
         .map_err(|error| error.to_string())
     }
 
