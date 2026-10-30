@@ -94,8 +94,8 @@ async fn admin_create_user_invitation(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let (Some(database), Some(config_dir)) = (Some(state.database()), state.config_dir.as_deref())
-    else {
+    let database = state.database();
+    let Some(config_dir) = state.config_dir.as_deref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let created_by_user_id = admin_invitation_creator(&headers, &state).await;
