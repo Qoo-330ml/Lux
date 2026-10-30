@@ -297,18 +297,21 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 
 | 用例 | 位置/命令 | 断言 |
 | --- | --- | --- |
-| `setup_complete_requests_a_restart_after_the_response` | `tests/api_web/web_auth.rs`，`cargo test --locked --test api_web web_auth::`（`docs/TEST-TARGETS.md:60`） | 注入 `with_restart_handle` + `with_setup_restart_delay(200ms)`，并在测试里持有 `watch::Receiver`：拿到 `201` + `restarting: true` 之后**立即**断言 `*rx.borrow() == Running`（响应已送达、重启尚未排上），再 `timeout(5s, rx.changed())` 断言变成 `Restart` |
+| `setup_complete_answers_before_it_requests_the_restart` | `tests/api_web/web_auth.rs`，`cargo test --locked --test api_web web_auth::`（`docs/TEST-TARGETS.md:60`） | 注入 `with_restart_handle` + `with_setup_restart_delay(60s)`，并在测试里持有 `watch::Receiver`：拿到 `201` + `restarting: true` 之后断言 `*rx.borrow() == Running`（响应已送达、重启尚未排上）。延迟刻意取得远大于任何往返时间，断言不依赖墙钟窗口 |
+| `setup_complete_eventually_requests_the_restart` | 同上 | 注入 `with_setup_restart_delay(0)`：拿到 `201` 后 `timeout(5s, rx.changed())` 断言观察到 `Restart`（延迟只是把请求移出响应路径，唤醒由通道观察而非测试内 sleep） |
 | `setup_complete_without_a_restart_handle_keeps_the_created_body` | 同上 | 201、`restarting: false`、`user`/`library`/`scanJob` 字段与今天逐字一致（防止“为了重启而改动响应形状”） |
 | `setup_complete_does_not_restart_again_when_the_admin_exists` | 同上 | 先完整跑一次成功初始化（重启已排上，等 `rx.changed()` 观察到 `Restart`），再用同一 state 发第二次 POST：得 409 `SETUP_ALREADY_COMPLETED`，且后续 `timeout(300ms, rx.changed())` 超时（`watch` 不会再有第二次变更） |
-| `setup_complete_restarts_even_when_the_first_library_is_rejected` | 同上 | 非法 `rootPath` → 4xx，但随后仍观察到 `Restart`（对应 §4.2 的部分成功策略） |
-| `startup_resumes_first_scans_interrupted_by_shutdown` | `tests/scanner/shutdown_jobs.rs`，`cargo test --locked --test scanner shutdown_jobs::`（`docs/TEST-TARGETS.md:91`） | 建库 + 加根 + 建扫描任务 → `cancel_incomplete_jobs_for_shutdown()` → 跑恢复流程 → 该库出现新的 `PENDING/RUNNING` 任务，`libraries.last_scan_at` 仍为 `NULL` |
-| 恢复流程的反向用例 | 同上 | ① `last_scan_at` 已写 → 不恢复；② 任务 `error != 'SERVER_SHUTDOWN'`（真实失败）→ 不恢复；③ 库已停用 → 不恢复；④ 库没有 root → 不恢复（这一条正是 SQL 里 `EXISTS(library_roots)` 的作用，`start_library_scan` 本身不拒绝零 root 的库，见 `src/application/scanner/jobs/lifecycle.rs:910`）；⑤ 连跑两次 → 只产生一个活动任务（第二次走 `AlreadyActive` 跳过） |
+| `setup_complete_restarts_even_when_the_first_library_cannot_be_created` | 同上 | 管理员已落库、首个媒体库步骤失败（本实现用缺失的 `libraries` 表制造确定的 5xx）→ 响应仍是普通 `api_error` 形状（无 `restarting`），随后仍观察到 `Restart`（对应 §4.2 的部分成功策略） |
+| `setup_complete_rejects_an_unusable_root_path_before_the_admin_exists` | 同上 | 非法 `rootPath` → 400，且**不重启**：`rootPath` 的 `inspect_root_path` 校验发生在 `setup.complete()` 之前，此时管理员尚未落库，`setup/status` 仍是未初始化；随后带正确路径的请求返回 201 + `restarting: true` 并观察 `Restart`。**注意**：这条与 §4.2 不矛盾——§4.2 说的是“管理员已建**之后**”的失败仍要重启，被 4xx 拒绝的根路径发生在之前，因此不在部分成功的范围里 |
+| `startup_resumes_first_scans_interrupted_by_shutdown` | `tests/scanner/shutdown_jobs.rs`，`cargo test --locked --test scanner shutdown_jobs::`（`docs/TEST-TARGETS.md:91`） | 建库 + 加根 + 建扫描任务 → `cancel_incomplete_jobs_for_shutdown()` → 跑恢复流程 → 该库恰好出现一个新的 `RECONCILE_LIBRARY` 任务；它跑完（`COMPLETED`）并写入 `libraries.last_scan_at` 后，再跑一次恢复返回 0（谓词不再命中）。实现里的 worker 是 spawn 出来的，所以断言终态而不是抓瞬时的 `PENDING/RUNNING` |
+| `startup_resumes_more_interrupted_first_scans_than_a_single_batch` | 同上 | 33 个库（> 一页 32）全部被重排，每库都是“取消的旧任务 + 一个新任务” |
+| 恢复流程的反向用例 | 同上 | ① `last_scan_at` 已写 → 不恢复；② 任务 `error != 'SERVER_SHUTDOWN'`（真实失败）→ 不恢复；③ 库已停用 → 不恢复；④ 库没有 root → 不恢复（这一条正是 SQL 里 `EXISTS(library_roots)` 的作用，`start_library_scan` 本身不拒绝零 root 的库，见 `src/application/scanner/jobs/lifecycle.rs:910`）；⑤ 已有活动扫描任务（`PENDING`/`RUNNING`）→ 不恢复（`NOT EXISTS` + `AlreadyActive` 双保险）；⑥ 该库**最近一次**扫描是 `FAILED` → 不恢复（持续失败的库不会每次启动都重扫） |
 | `restart_handle` 一次性 | `src/application/restart.rs:33-45`（已有） | 复用现有单元测试，不新增 |
 
-**为什么 200 ms 的时序断言不会 flaky**：201 是本地 reqwest 往返（毫秒级以内），200 ms 是三个数量级
-以上的余量；上界用 5 s 超时。若阶段 2 实测发现 CI 抖动，可把注入延迟提到 500 ms，或改用
-`tokio::time::pause()/advance()`（但暂停时钟下 `tokio` 会在空闲时自动推进，断言顺序反而不可控，
-故不默认使用）。
+**为什么“先响应后重启”的断言不依赖时序**：顺序断言用 60 s 的注入延迟，任何往返时间与调度抖动都
+不可能在拿到 `201` 之前触发该定时器，因此不需要在测试里等待或推进时钟（`tokio::time::pause()`
+与真实 TCP 往返混用会让自动推进变得不可控，故不使用）。延迟任务确实会请求重启这一点由另一个
+用例用 0 延迟单独覆盖，两者合起来既证明顺序、又证明唤醒。
 
 **默认延迟不拖慢现有测试**：只有注入了重启句柄的用例才会 spawn 延迟任务；现有所有
 `setup/complete` 用例（`tests/api_web/web_auth.rs:58`、`tests/library/libraries_api.rs:113`、
