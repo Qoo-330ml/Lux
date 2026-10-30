@@ -27,6 +27,9 @@
 #   LUX_SETUP_FIRST_SCAN_APPEAR_TIMEOUT  how long to look for the re-queued first scan (default 30)
 #   LUX_SETUP_FIRST_SCAN_TIMEOUT         how long that scan may run (default 600)
 #
+# `lux_wait_for_first_scan_settled` only accepts an explicit `done`; a state it cannot observe
+# (`unknown`) keeps polling and becomes an error at the deadline.
+#
 # Every helper returns non-zero with a message on stderr when the deadline passes.
 
 # Prints the HTTP status of a URL, or `000` when the request could not be made.
@@ -190,30 +193,37 @@ lux_wait_for_first_scan_settled() {
     local appear_timeout="${LUX_SETUP_FIRST_SCAN_APPEAR_TIMEOUT:-30}"
     local settle_timeout="${LUX_SETUP_FIRST_SCAN_TIMEOUT:-600}"
     local deadline state
+    local saw_active=0
 
+    # Phase 1: wait until the re-queued scan is visible, or until it is already recorded as done.
     deadline=$((SECONDS + appear_timeout))
-    state=""
+    state="unknown"
     while ((SECONDS < deadline)); do
         state="$(lux_restart_library_scan_state "$base_url" "$library_id" "$@")"
         case "$state" in
-            active) break ;;
+            active)
+                saw_active=1
+                break
+                ;;
             done) return 0 ;;
         esac
         sleep 0.1
     done
-    if [[ "$state" != "active" ]]; then
-        echo "warning: no re-queued first scan appeared for library $library_id within ${appear_timeout}s; continuing" >&2
-        return 0
+    if ((saw_active != 1)); then
+        echo "error: the first scan of library $library_id never became observable within ${appear_timeout}s (last state: $state); refusing to continue" >&2
+        return 1
     fi
 
+    # Phase 2: wait for the end of that scan. `unknown` keeps waiting, it never means "finished".
     deadline=$((SECONDS + settle_timeout))
+    state="active"
     while ((SECONDS < deadline)); do
         state="$(lux_restart_library_scan_state "$base_url" "$library_id" "$@")"
-        if [[ "$state" != "active" ]]; then
+        if [[ "$state" == "done" ]]; then
             return 0
         fi
         sleep 0.2
     done
-    echo "error: the first scan of library $library_id is still running after ${settle_timeout}s; the restart recovery did not settle" >&2
+    echo "error: the first scan of library $library_id did not settle within ${settle_timeout}s (last state: $state); the restart recovery did not settle" >&2
     return 1
 }
