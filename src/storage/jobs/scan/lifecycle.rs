@@ -305,10 +305,9 @@ impl Database {
     /// convention and adds the first-scan specifics: the library is still enabled, it was never
     /// scanned (`last_scan_at IS NULL`), it still has a root, and no scan is active for it.
     ///
-    /// At least one root has to be *available*: reconcile "warns and continues" for an unavailable
-    /// root (a NAS mount that is not ready yet at startup), completes with zero items and still
-    /// records `last_scan_at`, which would consume the first-scan intent for good. Skipping it here
-    /// keeps the library eligible for the next startup.
+    /// The stored `library_roots.is_available` flag is deliberately *not* part of the predicate: it
+    /// is only written by the scan path, so it is stale after a mount dropped and came back. The
+    /// application layer probes the roots right before queueing instead.
     ///
     /// Only the **latest** `RECONCILE_LIBRARY` scan of a library counts. A recovery that creates a
     /// replacement job which then fails (`FAILED`) must not be retried on every startup, so an older
@@ -329,10 +328,7 @@ impl Database {
                AND jobs.error = 'SERVER_SHUTDOWN'
                AND lib.is_enabled = 1
                AND lib.last_scan_at IS NULL
-               AND EXISTS (
-                   SELECT 1 FROM library_roots root
-                   WHERE root.library_id = lib.id AND root.is_available = 1
-               )
+               AND EXISTS (SELECT 1 FROM library_roots root WHERE root.library_id = lib.id)
                AND NOT EXISTS (
                    SELECT 1 FROM scan_jobs newer
                    WHERE newer.library_id = jobs.library_id
@@ -351,50 +347,6 @@ impl Database {
         )
         .bind(after_library_id)
         .bind(after_library_id)
-        .bind(limit)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(self.sqlx_err())
-    }
-
-    /// Lists the libraries the first-scan recovery skips because none of their roots is available.
-    ///
-    /// It answers "why is this library not re-queued?" for the startup log: a NAS or network mount
-    /// that is not ready yet makes reconcile warn and continue, and the scan then records
-    /// `last_scan_at` without having scanned anything. The evidence clause matches
-    /// [`Self::list_shutdown_interrupted_first_scan_library_ids`]; keep the two in sync.
-    pub(crate) async fn list_first_scan_recovery_library_ids_without_an_available_root(
-        &self,
-        limit: i64,
-    ) -> Result<Vec<String>, StorageError> {
-        self.query_scalar(
-            "SELECT jobs.library_id
-             FROM scan_jobs jobs
-             JOIN libraries lib ON lib.id = jobs.library_id
-             WHERE jobs.job_type = 'RECONCILE_LIBRARY'
-               AND jobs.status = 'CANCELLED'
-               AND jobs.error = 'SERVER_SHUTDOWN'
-               AND lib.is_enabled = 1
-               AND lib.last_scan_at IS NULL
-               AND EXISTS (SELECT 1 FROM library_roots root WHERE root.library_id = lib.id)
-               AND NOT EXISTS (
-                   SELECT 1 FROM library_roots available
-                   WHERE available.library_id = lib.id AND available.is_available = 1
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM scan_jobs newer
-                   WHERE newer.library_id = jobs.library_id
-                     AND newer.job_type = 'RECONCILE_LIBRARY'
-                     AND (newer.created_at, newer.id) > (jobs.created_at, jobs.id)
-               )
-               AND NOT EXISTS (
-                   SELECT 1 FROM scan_jobs active
-                   WHERE active.library_id = jobs.library_id
-                     AND active.status IN ('PENDING', 'RUNNING')
-               )
-             ORDER BY jobs.library_id
-             LIMIT ?",
-        )
         .bind(limit)
         .fetch_all(&self.pool)
         .await

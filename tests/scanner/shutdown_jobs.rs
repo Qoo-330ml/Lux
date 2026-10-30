@@ -548,17 +548,49 @@ async fn startup_skips_first_scans_whose_replacement_failed()
 }
 
 #[tokio::test]
-async fn startup_keeps_first_scans_with_an_unavailable_root_eligible()
+async fn startup_probes_the_root_instead_of_trusting_the_stored_flag()
 -> Result<(), Box<dyn std::error::Error>> {
-    // A NAS/network mount that is not ready when the process starts makes reconcile "warn and
-    // continue": the scan completes with zero items and still writes `last_scan_at`, which would
-    // consume the first-scan intent for good. The recovery must therefore skip a library whose
-    // roots are all unavailable and leave it eligible for a later startup.
+    // `library_roots.is_available` is only written by the scan path, so a mount that dropped during
+    // a scan stays marked unavailable even after it is back at startup. Deciding on the column would
+    // skip that library forever, so the recovery probes the path and corrects the stale flag.
     let fixture = interrupted_first_scan(true).await?;
     sqlx::query("UPDATE library_roots SET is_available = 0 WHERE library_id = ?")
         .bind(fixture.library_id.to_string())
         .execute(fixture.database.pool())
         .await?;
+
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 1);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
+        2
+    );
+    let is_available: i64 =
+        sqlx::query_scalar("SELECT is_available FROM library_roots WHERE library_id = ?")
+            .bind(fixture.library_id.to_string())
+            .fetch_one(fixture.database.pool())
+            .await?;
+    assert_eq!(
+        is_available, 1,
+        "the probe has to refresh the flag, otherwise the queued scan discards the root"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_skips_first_scans_whose_root_is_really_missing()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A NAS/network mount that is not ready at startup makes reconcile warn and continue: the scan
+    // completes with zero items and records `last_scan_at`, which would consume the first-scan
+    // intent. The stored flag still says available, so only a real probe can tell.
+    let fixture = interrupted_first_scan(true).await?;
+    let root_path: String =
+        sqlx::query_scalar("SELECT canonical_path FROM library_roots WHERE library_id = ?")
+            .bind(fixture.library_id.to_string())
+            .fetch_one(fixture.database.pool())
+            .await?;
+    tokio::fs::remove_dir_all(&root_path).await?;
 
     assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
@@ -566,7 +598,7 @@ async fn startup_keeps_first_scans_with_an_unavailable_root_eligible()
             .await
             .len(),
         1,
-        "no replacement scan may be queued while every root is unavailable"
+        "no replacement scan may be queued while the only root is missing"
     );
     let last_scan_at: Option<i64> =
         sqlx::query_scalar("SELECT last_scan_at FROM libraries WHERE id = ?")
@@ -578,11 +610,8 @@ async fn startup_keeps_first_scans_with_an_unavailable_root_eligible()
         "the first-scan intent must not be consumed while the mount is missing"
     );
 
-    // The mount came back: the next startup still has the cancellation as evidence.
-    sqlx::query("UPDATE library_roots SET is_available = 1 WHERE library_id = ?")
-        .bind(fixture.library_id.to_string())
-        .execute(fixture.database.pool())
-        .await?;
+    // The mount is back: the next startup probes again and recovers the library.
+    tokio::fs::create_dir_all(&root_path).await?;
     assert_eq!(resume_fixture_first_scans(&fixture).await?, 1);
     assert_eq!(
         scan_job_ids(&fixture.database, fixture.library_id)

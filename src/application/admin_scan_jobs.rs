@@ -160,15 +160,28 @@ pub(crate) async fn start_library_scan(
 /// How many libraries one page of the first-scan recovery reads from storage.
 pub(crate) const FIRST_SCAN_RESUME_PAGE_SIZE: i64 = 32;
 
-/// Upper bound of first scans one startup queues.
+/// Upper bound of candidates one startup examines and queues.
 ///
 /// The recovery pages through every eligible library, but a pathological database must not turn one
-/// startup into an unbounded scan storm (the scan queue serializes the work anyway). When the bound
-/// trips, the remaining libraries stay eligible for the next startup and the count is logged.
+/// startup into an unbounded scan storm (the scan queue serializes the work anyway). Every examined
+/// candidate costs a filesystem probe, so the bound covers both the queued and the skipped ones.
+/// When the bound trips, the remaining libraries stay eligible for the next startup and are counted
+/// (up to [`FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT`]) for the log.
 pub(crate) const FIRST_SCAN_RESUME_MAX_LIBRARIES: usize = 512;
 
 /// How many still-eligible libraries the "reached the limit" log counts.
+///
+/// The count is only for the log; when it hits this bound the log says "at least" instead of
+/// claiming an exact number.
 const FIRST_SCAN_RESUME_REMAINDER_PROBE_LIMIT: i64 = 10_000;
+
+/// How long the probe of a single root may take before the root counts as unavailable.
+///
+/// A hung network mount must not hold up startup. The probe itself is `crate::library::
+/// inspect_root_path`, which uses `tokio::fs` (the blocking pool), so this only bounds how long the
+/// recovery waits for an answer.
+pub(crate) const FIRST_SCAN_ROOT_PROBE_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(5);
 
 /// Outcome of one startup's first-scan recovery.
 pub(crate) struct FirstScanRecovery {
@@ -193,7 +206,6 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
     scan_jobs: &ScanJobService,
     workers: ScanWorkerServices,
 ) -> Result<FirstScanRecovery, StorageError> {
-    log_first_scans_skipped_for_unavailable_roots(database).await;
     resume_shutdown_interrupted_first_scans_bounded(
         database,
         scan_jobs,
@@ -203,30 +215,75 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
     .await
 }
 
-/// Logs the libraries the recovery leaves alone because none of their roots is available.
+/// Whether any root of the library is usable right now, and why not when none is.
 ///
-/// Without the line the intent would disappear silently: the library matches the cancellation
-/// evidence, but a scan against a missing mount reports success with zero items. Failing to log is
-/// not fatal for the recovery itself.
-async fn log_first_scans_skipped_for_unavailable_roots(database: &Database) {
-    match database
-        .list_first_scan_recovery_library_ids_without_an_available_root(FIRST_SCAN_RESUME_PAGE_SIZE)
-        .await
-    {
-        Ok(library_ids) => {
-            for library_id in library_ids {
+/// The stored `library_roots.is_available` flag is not refreshed at startup (only the scan path
+/// writes it), so a mount that dropped during a scan stays marked unavailable even after it is back.
+/// Deciding on the column alone would skip such a library on every startup, which is why the
+/// recovery probes the paths instead. A stale flag is corrected to `true` on a successful probe,
+/// because a queued scan discards roots the column calls unavailable.
+async fn first_scan_root_state(
+    database: &Database,
+    library_id: &str,
+) -> Result<FirstScanRootState, StorageError> {
+    let roots = database.list_library_roots(library_id).await?;
+    if roots.is_empty() {
+        return Ok(FirstScanRootState::Unavailable("the library has no root"));
+    }
+    let mut reason = "every library root is unavailable";
+    let mut any_available = false;
+    for root in roots {
+        let path = std::path::PathBuf::from(&root.canonical_path);
+        let probe = first_scan_probe_within(
+            FIRST_SCAN_ROOT_PROBE_TIMEOUT,
+            crate::library::inspect_root_path(&path),
+        )
+        .await;
+        match probe {
+            Some(Ok(_)) => {
+                any_available = true;
+                if !root.is_available
+                    && let Err(error) = database
+                        .update_library_root_availability(&root.id, true)
+                        .await
+                {
+                    tracing::warn!(
+                        %library_id,
+                        root_id = %root.id,
+                        %error,
+                        "could not refresh the availability of a library root"
+                    );
+                }
+            }
+            Some(Err(_)) => {}
+            None => {
+                reason = "probing a library root timed out";
                 tracing::warn!(
                     %library_id,
-                    reason = "no available library root",
-                    "first scan not re-queued: every media root is unavailable; the next startup \
-                     will retry once the mount is back"
+                    root_id = %root.id,
+                    "probing a library root timed out; treating the root as unavailable"
                 );
             }
         }
-        Err(error) => {
-            tracing::warn!(%error, "could not list first scans skipped for unavailable roots");
-        }
     }
+    if any_available {
+        Ok(FirstScanRootState::Available)
+    } else {
+        Ok(FirstScanRootState::Unavailable(reason))
+    }
+}
+
+enum FirstScanRootState {
+    Available,
+    Unavailable(&'static str),
+}
+
+/// Runs one root probe under a time budget; `None` means the budget was exhausted.
+async fn first_scan_probe_within<F, T>(budget: std::time::Duration, probe: F) -> Option<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    tokio::time::timeout(budget, probe).await.ok()
 }
 
 /// [`resume_shutdown_interrupted_first_scans`] with an explicit per-startup bound.
@@ -242,6 +299,7 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
     // The last library the loop actually handled. The limit accounting counts what comes after it,
     // which also covers the libraries that sit behind the limit inside the same page.
     let mut last_processed: Option<String> = None;
+    let mut examined = 0_usize;
     let mut resumed = 0_usize;
     loop {
         let library_ids = database
@@ -256,7 +314,7 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
         let last_page = (library_ids.len() as i64) < FIRST_SCAN_RESUME_PAGE_SIZE;
         cursor = library_ids.last().cloned();
         for library_id in library_ids {
-            if resumed >= max_libraries {
+            if examined >= max_libraries {
                 let remaining = database
                     .list_shutdown_interrupted_first_scan_library_ids(
                         last_processed.as_deref(),
@@ -271,20 +329,44 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
                     max = max_libraries,
                     queued = recovery.resumed,
                     remaining = recovery.skipped_by_limit,
-                    "first-scan recovery reached its per-startup limit; the remaining libraries stay \
+                    "first-scan recovery examined its per-startup limit; the remaining libraries stay \
                      eligible for the next startup"
                 );
                 return Ok(recovery);
             }
+            examined += 1;
             last_processed = Some(library_id.clone());
-            let Ok(library_id) = library_id.parse::<LibraryId>() else {
+            let Ok(parsed_library_id) = library_id.parse::<LibraryId>() else {
                 tracing::warn!(
                     %library_id,
                     "ignoring an unparsable library id from the first-scan recovery query"
                 );
                 continue;
             };
-            match start_library_scan(scan_jobs, library_id, workers.clone()).await {
+            match first_scan_root_state(database, &library_id).await {
+                // A scan against a missing mount reports success with zero items and records
+                // `last_scan_at`, which would consume the first-scan intent. Probing now keeps the
+                // library eligible: the next startup probes again.
+                Ok(FirstScanRootState::Unavailable(reason)) => {
+                    tracing::warn!(
+                        %library_id,
+                        reason,
+                        "first scan not re-queued: no media root is usable right now; the next \
+                         startup probes again"
+                    );
+                    continue;
+                }
+                Ok(FirstScanRootState::Available) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        %library_id,
+                        %error,
+                        "could not probe the media roots of an interrupted first scan"
+                    );
+                    continue;
+                }
+            }
+            match start_library_scan(scan_jobs, parsed_library_id, workers.clone()).await {
                 Ok(Some(job)) => {
                     tracing::info!(
                         %library_id,
@@ -368,6 +450,28 @@ mod tests {
         }
         database.cancel_incomplete_jobs_for_shutdown().await?;
         Ok((temp_dir, database, scan_jobs))
+    }
+
+    #[tokio::test]
+    async fn the_root_probe_gives_up_instead_of_hanging_the_startup() {
+        // A hung network mount is modelled by a probe that never resolves: the budget has to end the
+        // wait and report "unprobed" instead of blocking the recovery.
+        let started = std::time::Instant::now();
+        let probed = first_scan_probe_within(
+            std::time::Duration::from_millis(20),
+            std::future::pending::<()>(),
+        )
+        .await;
+
+        assert!(
+            probed.is_none(),
+            "an exhausted budget must report the root as unprobed"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(5),
+            "the wait has to stay bounded, took {:?}",
+            started.elapsed()
+        );
     }
 
     #[tokio::test]
