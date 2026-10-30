@@ -3094,18 +3094,15 @@ fn parse_lux_user_token(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-pub(super) fn api_routes() -> Router<ReadyAppState> {
-    // `/health/live`, `/health/ready` and `/api/v1/version` live in
-    // `routes::core_routes()` now: both router trees mount them.
+/// The setup wizard routes, mounted by both the ready tree and the setup tree.
+///
+/// Their handlers answer from the shared `AppState` façade, which both trees can resolve.
+pub(super) fn setup_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: FromRef<S>,
+{
     Router::new()
-        .route(
-            "/api/v1/auth/login-background",
-            get(users::login_background),
-        )
-        .route(
-            "/api/v1/auth/login-background/custom-image",
-            get(users::login_background_custom_image),
-        )
         .route("/api/v1/setup/status", get(users::setup_status))
         .route("/api/v1/setup/database", get(users::setup_database_status))
         .route(
@@ -3121,6 +3118,31 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
             post(users::setup_database_restart),
         )
         .route("/api/v1/setup/complete", post(users::setup_complete))
+}
+
+/// The fixed answer of `GET /api/v1/auth/me` while no administrator exists: no session can exist.
+pub(super) async fn setup_auth_me(headers: HeaderMap) -> Response {
+    api_error(
+        &headers,
+        StatusCode::UNAUTHORIZED,
+        lux::ApiErrorCode::AuthenticationRequired,
+        "需要登录",
+    )
+    .into_response()
+}
+
+pub(super) fn api_routes() -> Router<ReadyAppState> {
+    // `/health/live`, `/health/ready` and `/api/v1/version` live in
+    // `routes::core_routes()` now: both router trees mount them.
+    Router::new()
+        .route(
+            "/api/v1/auth/login-background",
+            get(users::login_background),
+        )
+        .route(
+            "/api/v1/auth/login-background/custom-image",
+            get(users::login_background_custom_image),
+        )
         .route(
             "/api/v1/auth/login",
             post(users::auth_login).layer(DefaultBodyLimit::max(8 * 1024)),

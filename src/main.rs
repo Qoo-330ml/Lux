@@ -1,7 +1,7 @@
 //! Lux server binary entry point.
 
 use luxd::{
-    api::{AppState, app_with_state},
+    api::{AppState, app_with_state, setup_app_with_state},
     application::restart::{RestartHandle, ShutdownReason},
     application::{settings::read_network_proxy_url, setup::SetupService},
     auth::{emby::EmbyAuthService, sessions::WebAuthService},
@@ -36,15 +36,52 @@ async fn main() -> Result<(), BoxError> {
         control_tx.clone(),
     )
     .await?;
+    let mode = decide_mode(&database, requires_database_selection).await;
     serve(
         &config,
         discovery_config,
         database,
         app_state,
+        mode,
         control_tx,
         control_rx,
     )
     .await
+}
+
+/// Which route table the process serves.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StartupMode {
+    /// No administrator exists yet: only the setup wizard is reachable.
+    Setup,
+    /// The server is initialised: every business route is served.
+    Ready,
+}
+
+/// Decides the route table from the same fact the setup endpoints use: whether any user exists.
+///
+/// Failing to find out serves the ready tree. The setup routes can create the first administrator
+/// and rewrite the database selection, so an uncertain start must not hand them out; a server that
+/// really is uninitialised is still reachable after a restart once the database answers.
+async fn decide_mode(database: &Database, requires_database_selection: bool) -> StartupMode {
+    if requires_database_selection {
+        return StartupMode::Setup;
+    }
+    let setup = match luxd::application::setup::SetupService::new(database.clone()) {
+        Ok(setup) => setup,
+        Err(error) => {
+            error!(%error, "could not decide the startup mode; serving the ready tree");
+            return StartupMode::Ready;
+        }
+    };
+    match setup.status().await {
+        Ok(true) => StartupMode::Ready,
+        Ok(false) => StartupMode::Setup,
+        Err(error) => {
+            error!(%error, "could not decide the startup mode; serving the ready tree");
+            StartupMode::Ready
+        }
+    }
 }
 
 /// Opens the database, applies migrations, and drains the legacy log tables.
@@ -226,6 +263,7 @@ async fn serve(
     discovery_config: DiscoveryConfig,
     database: Database,
     app_state: AppState,
+    mode: StartupMode,
     control_tx: watch::Sender<ShutdownReason>,
     control_rx: watch::Receiver<ShutdownReason>,
 ) -> Result<(), BoxError> {
@@ -262,7 +300,10 @@ async fn serve(
     luxd::application::scan_fingerprint_migration::start(database.clone(), control_rx.clone());
     app_state.start_database_diagnostics().await;
     let shutdown_state = app_state.clone();
-    let app = app_with_state(app_state);
+    let app = match mode {
+        StartupMode::Setup => setup_app_with_state(app_state),
+        StartupMode::Ready => app_with_state(app_state),
+    };
 
     let serve_result = axum::serve(
         listener,

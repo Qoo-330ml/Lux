@@ -1324,6 +1324,12 @@ pub fn app_with_state(state: AppState) -> Router {
     routes::app_with_state(state)
 }
 
+/// The router a server serves until its first administrator exists: the setup wizard routes and
+/// the public discovery probes, with every business route left unregistered.
+pub fn setup_app_with_state(state: AppState) -> Router {
+    routes::setup_router(state)
+}
+
 async fn require_web_user(
     headers: &HeaderMap,
     state: &ReadyAppState,

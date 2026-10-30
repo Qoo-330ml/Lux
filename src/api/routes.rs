@@ -141,11 +141,36 @@ fn ready_router(state: ReadyAppState) -> Router {
     let app = Router::new()
         .route("/logo.svg", get(web_logo))
         .merge(core_routes::<ReadyAppState>())
+        .merge(users::setup_routes())
         .merge(users::api_routes())
         .merge(admin::api_routes())
         .merge(lux_api::api_routes())
         .merge(emby_routes.clone())
         .nest("/emby", emby_routes)
+        .fallback_service(spa_service())
+        .with_state(state);
+    let app = apply_common_layers(app, &core, slots);
+    case_insensitive_emby_router(app, emby_path_templates)
+}
+
+/// The tree a server serves while no administrator exists: only what a setup wizard needs.
+///
+/// Business routes are not registered, so they answer through the SPA fallback and the namespace
+/// middlewares like any unknown path (Lux JSON 404 envelope, bare Emby 404). The state is the same
+/// `AppState` the ready tree is built from; setup mode still builds every service (the first scan
+/// needs them), only the route table is smaller.
+pub(super) fn setup_router(state: AppState) -> Router {
+    let core = state.core.clone();
+    let slots = RequestSlots::default();
+    let (_emby_routes, emby_path_templates) = emby::api_routes();
+    let app = Router::new()
+        .route("/logo.svg", get(web_logo))
+        .merge(core_routes::<AppState>())
+        .merge(users::setup_routes())
+        .route("/api/v1/auth/me", get(users::setup_auth_me))
+        .route("/System/Ping", get(emby_ping).post(emby_ping))
+        .route("/System/Info/Public", get(emby_public_system_info))
+        .route("/Users/Public", get(emby_public_users))
         .fallback_service(spa_service())
         .with_state(state);
     let app = apply_common_layers(app, &core, slots);
@@ -1288,6 +1313,43 @@ mod tests {
         assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(header(&throttled, "retry-after"), Some("60"));
         assert_eq!(json_body(throttled).await["error"]["code"], "RATE_LIMITED");
+    }
+
+    /// The setup tree serves the wizard, the probes and the public Emby discovery, and nothing else.
+    #[tokio::test]
+    async fn setup_tree_serves_only_the_wizard_and_the_public_probes() {
+        let app = setup_router(AppState::default());
+
+        for path in ["/health/live", "/System/Ping"] {
+            let response = send(app.clone(), test_request(Method::GET, path, &[])).await;
+            assert_eq!(response.status(), StatusCode::OK, "{path}");
+        }
+        let public_users = send(app.clone(), test_request(Method::GET, "/Users/Public", &[])).await;
+        assert_eq!(public_users.status(), StatusCode::OK);
+        assert_eq!(json_body(public_users).await, json!([]));
+
+        let me = send(
+            app.clone(),
+            test_request(Method::GET, "/api/v1/auth/me", &[]),
+        )
+        .await;
+        assert_eq!(me.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            json_body(me).await["error"]["code"],
+            "AUTHENTICATION_REQUIRED"
+        );
+
+        // Business and login routes are not registered: JSON 404 under /api/, bare 404 for Emby.
+        for path in [
+            "/api/v1/libraries",
+            "/api/v1/admin/users",
+            "/api/v1/auth/login-background",
+            "/System/Info",
+            "/Items",
+        ] {
+            let response = send(app.clone(), test_request(Method::GET, path, &[])).await;
+            assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+        }
     }
 
     /// The six responses the frozen `tests/**` pin for `app()`/`AppState::default()`, byte for
