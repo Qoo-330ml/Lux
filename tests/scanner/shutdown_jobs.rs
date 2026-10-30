@@ -520,3 +520,27 @@ async fn startup_resumes_more_interrupted_first_scans_than_a_single_batch()
     }
     Ok(())
 }
+
+#[tokio::test]
+async fn startup_skips_first_scans_whose_replacement_failed()
+-> Result<(), Box<dyn std::error::Error>> {
+    // A scan that keeps failing must not be retried on every startup: only the *latest* scan of the
+    // library decides, and a `FAILED` one is not the "cancelled by a shutdown" evidence.
+    let fixture = interrupted_first_scan(true).await?;
+    sqlx::query(
+        "INSERT INTO scan_jobs (id, library_id, job_type, status, generation, error, created_at)
+         VALUES ('failed-replacement', ?, 'RECONCILE_LIBRARY', 'FAILED', 'generation-failed',
+                 'DISK_READ_FAILED', unixepoch() + 10)",
+    )
+    .bind(fixture.library_id.to_string())
+    .execute(fixture.database.pool())
+    .await?;
+
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
+    assert_eq!(
+        scan_job_ids(&fixture.database, fixture.library_id).await.len(),
+        2,
+        "the failed replacement must not be retried"
+    );
+    Ok(())
+}

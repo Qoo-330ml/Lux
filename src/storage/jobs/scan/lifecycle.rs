@@ -303,8 +303,13 @@ impl Database {
     ///
     /// The predicate reuses the project-wide "`CANCELLED` + `SERVER_SHUTDOWN` means resumable"
     /// convention and adds the first-scan specifics: the library is still enabled, it was never
-    /// scanned (`last_scan_at IS NULL`), it still has a root, and no scan is active for it. The
-    /// `GROUP BY` collapses the repeated cancellations that consecutive restarts leave behind.
+    /// scanned (`last_scan_at IS NULL`), it still has a root, and no scan is active for it.
+    ///
+    /// Only the **latest** `RECONCILE_LIBRARY` scan of a library counts. A recovery that creates a
+    /// replacement job which then fails (`FAILED`) must not be retried on every startup, so an older
+    /// cancelled row may not speak for the library any more. `(created_at, id)` is the creation
+    /// order: the ids are UUIDv7 and compare correctly as text, and the tuple comparison keeps the
+    /// query portable between SQLite and PostgreSQL.
     pub(crate) async fn list_shutdown_interrupted_first_scan_library_ids(
         &self,
         after_library_id: Option<&str>,
@@ -320,6 +325,12 @@ impl Database {
                AND lib.is_enabled = 1
                AND lib.last_scan_at IS NULL
                AND EXISTS (SELECT 1 FROM library_roots root WHERE root.library_id = lib.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_jobs newer
+                   WHERE newer.library_id = jobs.library_id
+                     AND newer.job_type = 'RECONCILE_LIBRARY'
+                     AND (newer.created_at, newer.id) > (jobs.created_at, jobs.id)
+               )
                AND NOT EXISTS (
                    SELECT 1 FROM scan_jobs active
                    WHERE active.library_id = jobs.library_id
