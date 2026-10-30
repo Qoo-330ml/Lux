@@ -646,6 +646,7 @@ impl Database {
         .map_err(self.sqlx_err())?;
 
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(user_id);
         Ok(true)
     }
 
@@ -1300,6 +1301,8 @@ impl Database {
         .execute(&self.pool)
         .await
         .map_err(self.sqlx_err())?;
+        // The cached principal carries the display name, so a profile edit is visible next request.
+        self.auth_cache().invalidate_user(user_id);
         self.find_user_by_id(user_id).await
     }
 
@@ -1467,6 +1470,9 @@ impl Database {
             .map_err(self.sqlx_err())?;
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // Disabling, demoting or re-flagging a user must invalidate the cached principal and
+        // access context before the next request is served.
+        self.auth_cache().invalidate_user(user_id);
         Ok(self
             .find_user_by_id(user_id)
             .await?
@@ -1509,6 +1515,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(user_id);
         Ok(true)
     }
 
@@ -1630,6 +1637,7 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(user_id);
         Ok(Some(hls_session_ids))
     }
 
@@ -1647,7 +1655,11 @@ impl Database {
             .execute(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            self.auth_cache().invalidate_user(user_id);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) async fn purge_deleted_user(&self, user_id: &str) -> Result<bool, StorageError> {
@@ -1657,7 +1669,11 @@ impl Database {
             .execute(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(result.rows_affected() == 1)
+        if result.rows_affected() == 1 {
+            self.auth_cache().invalidate_user(user_id);
+            return Ok(true);
+        }
+        Ok(false)
     }
 
     pub(crate) async fn purge_expired_deleted_users(
@@ -1683,6 +1699,9 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
+        for user_id in &rows {
+            self.auth_cache().invalidate_user(user_id);
+        }
         Ok(rows)
     }
 
@@ -1759,7 +1778,9 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(target_user_id);
+        Ok(())
     }
 
     pub(crate) async fn mark_user_logged_in(&self, user_id: &str) -> Result<(), StorageError> {
@@ -1968,6 +1989,9 @@ impl Database {
         .execute(&self.pool)
         .await
         .map_err(self.sqlx_err())?;
+        // Global rules are rows with a NULL user_id, so this also covers "the rule applies to
+        // everyone" cases. Rule changes decide blacklist outcomes, never a cached value.
+        self.auth_cache().invalidate_rules();
         Ok(())
     }
 
@@ -2149,11 +2173,16 @@ impl Database {
         if let Some(user_id) = user_id {
             update = update.bind(user_id);
         }
-        update
+        let changed = update
             .execute(&self.pool)
             .await
-            .map(|result| result.rows_affected() > 0)
-            .map_err(self.sqlx_err())
+            .map_err(self.sqlx_err())?
+            .rows_affected()
+            > 0;
+        if changed {
+            self.auth_cache().invalidate_rules();
+        }
+        Ok(changed)
     }
 
     pub(crate) async fn delete_user_access_blacklist_rule(
@@ -2171,11 +2200,16 @@ impl Database {
         if let Some(user_id) = user_id {
             delete = delete.bind(user_id);
         }
-        delete
+        let deleted = delete
             .execute(&self.pool)
             .await
-            .map(|result| result.rows_affected() > 0)
-            .map_err(self.sqlx_err())
+            .map_err(self.sqlx_err())?
+            .rows_affected()
+            > 0;
+        if deleted {
+            self.auth_cache().invalidate_rules();
+        }
+        Ok(deleted)
     }
 
     pub(crate) async fn list_user_activity_events(
@@ -2378,53 +2412,55 @@ impl Database {
         Ok(usernames)
     }
 
-    pub(crate) async fn find_user_by_access_token(
-        &self,
-        token_hash: &[u8],
-    ) -> Result<Option<StoredUser>, StorageError> {
-        self.find_user_by_scoped_access_token(token_hash, false)
-            .await
-    }
-
-    /// Resolves a token for Emby routes, which also honor playback-only tokens. Callers must have
-    /// already restricted the request to the playback allow-list.
-    pub(crate) async fn find_user_by_emby_route_access_token(
-        &self,
-        token_hash: &[u8],
-    ) -> Result<Option<StoredUser>, StorageError> {
-        self.find_user_by_scoped_access_token(token_hash, true)
-            .await
-    }
-
-    async fn find_user_by_scoped_access_token(
+    /// Resolves an Emby access token to its user and its device identity in one JOIN.
+    ///
+    /// The device columns belong to the same `access_tokens` row as the credential, so a single
+    /// query replaces the two lookups the resolver used to issue (token to user, then token to
+    /// device). Playback-scoped tokens only resolve when `allow_playback_scope` is set.
+    pub(crate) async fn find_route_token_principal(
         &self,
         token_hash: &[u8],
         allow_playback_scope: bool,
-    ) -> Result<Option<StoredUser>, StorageError> {
-        self.query(
-            "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
-                    u.has_password, u.is_disabled, u.is_admin, u.can_manage_server,
-                    u.can_remote_access, u.can_download, u.email, u.email_verified_at,
-                    u.deleted_at, u.deletion_purge_at, u.last_login_at,
-                    COALESCE(
-                        (SELECT MAX(COALESCE(at2.last_seen_at, at2.created_at))
-                         FROM access_tokens at2 WHERE at2.user_id = u.id),
-                        u.last_login_at
-                    ) AS last_activity_at
-             FROM access_tokens at
-             JOIN users u ON u.id = at.user_id
-             WHERE at.token_hash = ? AND at.revoked_at IS NULL
-               AND (at.expires_at IS NULL OR at.expires_at > unixepoch())
-               AND (at.scope = 'FULL' OR CAST(? AS BIGINT) = 1)",
-        )
-        .bind(token_hash)
-        .bind(i64::from(allow_playback_scope))
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(self.sqlx_err())?
-        .map(stored_user)
-        .transpose()
-        .map_err(self.sqlx_err())
+    ) -> Result<Option<StoredRouteTokenPrincipal>, StorageError> {
+        let row = self
+            .query(
+                "SELECT u.id, u.username_normalized, u.display_name, u.password_hash,
+                        u.has_password, u.is_disabled, u.is_admin, u.can_manage_server,
+                        u.can_remote_access, u.can_download, u.email, u.email_verified_at,
+                        u.deleted_at, u.deletion_purge_at, u.last_login_at,
+                        COALESCE(
+                            (SELECT MAX(COALESCE(at2.last_seen_at, at2.created_at))
+                             FROM access_tokens at2 WHERE at2.user_id = u.id),
+                            u.last_login_at
+                        ) AS last_activity_at,
+                        at.device_id AS token_device_id,
+                        at.client_name AS token_client_name,
+                        at.device_name AS token_device_name,
+                        at.client_version AS token_client_version
+                 FROM access_tokens at
+                 JOIN users u ON u.id = at.user_id
+                 WHERE at.token_hash = ? AND at.revoked_at IS NULL
+                   AND (at.expires_at IS NULL OR at.expires_at > unixepoch())
+                   AND (at.scope = 'FULL' OR CAST(? AS BIGINT) = 1)",
+            )
+            .bind(token_hash)
+            .bind(i64::from(allow_playback_scope))
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let device = StoredAccessTokenDevice {
+            device_id: row.try_get("token_device_id").map_err(self.sqlx_err())?,
+            client_name: row.try_get("token_client_name").map_err(self.sqlx_err())?,
+            device_name: row.try_get("token_device_name").map_err(self.sqlx_err())?,
+            client_version: row
+                .try_get("token_client_version")
+                .map_err(self.sqlx_err())?,
+        };
+        let user = stored_user(row).map_err(self.sqlx_err())?;
+        Ok(Some(StoredRouteTokenPrincipal { user, device }))
     }
 
     pub(crate) async fn create_playback_access_token(
@@ -2452,20 +2488,27 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Revokes every playback token issued for a playback session.
     pub(crate) async fn revoke_playback_access_tokens(
         &self,
         playback_session_id: &str,
     ) -> Result<u64, StorageError> {
-        self.query(
-            "UPDATE access_tokens
-             SET revoked_at = unixepoch(), updated_at = unixepoch()
-             WHERE playback_session_id = ? AND scope = 'PLAYBACK' AND revoked_at IS NULL",
-        )
-        .bind(playback_session_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(self.sqlx_err())
+        let revoked = self
+            .query(
+                "UPDATE access_tokens
+                 SET revoked_at = unixepoch(), updated_at = unixepoch()
+                 WHERE playback_session_id = ? AND scope = 'PLAYBACK' AND revoked_at IS NULL",
+            )
+            .bind(playback_session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        if revoked > 0 {
+            // Stopping a playback session must end its token on the very next request.
+            self.auth_cache().invalidate_credentials();
+        }
+        Ok(revoked)
     }
 
     pub(crate) async fn find_access_token_device(
@@ -2529,17 +2572,26 @@ impl Database {
         user_id: &str,
         session_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE access_tokens
-             SET revoked_at = unixepoch(), updated_at = unixepoch()
-             WHERE user_id = ? AND id = ? AND revoked_at IS NULL AND scope = 'FULL'",
-        )
-        .bind(user_id)
-        .bind(session_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() > 0)
-        .map_err(self.sqlx_err())
+        let revoked = self
+            .query(
+                "UPDATE access_tokens
+                 SET revoked_at = unixepoch(), updated_at = unixepoch()
+                 WHERE user_id = ? AND id = ? AND revoked_at IS NULL AND scope = 'FULL'",
+            )
+            .bind(user_id)
+            .bind(session_id)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected()
+            > 0;
+        if revoked {
+            // Admin-side revocation must be visible to the next request, not only after the
+            // principal cache TTL expired.
+            self.auth_cache().invalidate_credentials();
+            self.auth_cache().invalidate_user(user_id);
+        }
+        Ok(revoked)
     }
 
     pub(crate) async fn revoke_all_user_emby_login_sessions_for_admin(
@@ -2554,16 +2606,22 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<u64, StorageError> {
-        self.query(
-            "UPDATE access_tokens
-             SET revoked_at = unixepoch(), updated_at = unixepoch()
-             WHERE user_id = ? AND revoked_at IS NULL",
-        )
-        .bind(user_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected())
-        .map_err(self.sqlx_err())
+        let revoked = self
+            .query(
+                "UPDATE access_tokens
+                 SET revoked_at = unixepoch(), updated_at = unixepoch()
+                 WHERE user_id = ? AND revoked_at IS NULL",
+            )
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        if revoked > 0 {
+            self.auth_cache().invalidate_credentials();
+            self.auth_cache().invalidate_user(user_id);
+        }
+        Ok(revoked)
     }
 
     pub(crate) async fn set_user_library_access(
@@ -2597,7 +2655,9 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(user_id);
+        Ok(())
     }
 
     pub(crate) async fn set_user_library_access_batch(
@@ -2647,7 +2707,9 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(user_id);
+        Ok(())
     }
 
     pub(crate) async fn user_library_access_mode(
@@ -2701,9 +2763,15 @@ impl Database {
             }
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(user_id);
         Ok(true)
     }
 
+    /// Single-library variant of [`Self::list_accessible_library_ids`].
+    ///
+    /// The access layer resolves the whole per-user context once per cache window, so only the
+    /// storage tests exercise this predicate today.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) async fn has_user_library_access(
         &self,
         user_id: &str,
@@ -3648,6 +3716,7 @@ impl Database {
         }
 
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_user(target_user_id);
         Ok(UserPermissionCopyResult::Updated)
     }
 
@@ -3875,6 +3944,8 @@ impl Database {
             }
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // Parental-control policy is part of the cached access context.
+        self.auth_cache().invalidate_user(user_id);
         let Some(updated) = self.user_content_restrictions(user_id).await? else {
             return Ok(UserContentRestrictionsCasResult::UserUnavailable);
         };

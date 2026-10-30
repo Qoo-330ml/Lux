@@ -26,6 +26,9 @@ use sqlx::{
 use tokio::{fs, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
+#[path = "auth_cache.rs"]
+mod auth_cache;
+pub(crate) use auth_cache::{AuthCacheEpochSnapshot, AuthCacheEpochs};
 #[path = "catalog.rs"]
 mod catalog;
 #[path = "database_cleanup.rs"]
@@ -626,6 +629,9 @@ pub struct Database {
     dashboard_stats_cache: Arc<AsyncMutex<Option<CachedDashboardStats>>>,
     write_probe: Arc<AsyncMutex<Option<std::time::Instant>>>,
     filesystem_path_templates: Arc<SqlTemplateCache>,
+    /// Invalidation epochs shared with the in-process authentication and access caches. Every
+    /// credential, user, rule or library write bumps them so a cache never delays the write.
+    auth_cache: Arc<AuthCacheEpochs>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -1254,6 +1260,7 @@ impl Database {
             dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
             write_probe: Arc::new(AsyncMutex::new(None)),
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+            auth_cache: Arc::new(AuthCacheEpochs::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -1709,6 +1716,14 @@ impl Database {
         self.query_count.store(0, AtomicOrdering::Relaxed);
     }
 
+    /// The invalidation epochs of the in-process authentication and access caches.
+    ///
+    /// Caches snapshot the epochs before reading and only reuse a value while the snapshot is
+    /// still current; storage writes bump them after committing.
+    pub(crate) fn auth_cache(&self) -> &AuthCacheEpochs {
+        &self.auth_cache
+    }
+
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
         self.query_count.load(AtomicOrdering::Relaxed)
@@ -1956,6 +1971,15 @@ pub(crate) struct StoredAccessTokenDevice {
     pub(crate) client_name: String,
     pub(crate) device_name: String,
     pub(crate) client_version: String,
+}
+
+/// One Emby-route credential: the token's user together with the device identity it was issued to.
+///
+/// The resolver needs both to apply the device and client rules, and reading them with one JOIN
+/// replaces the separate token-to-user and token-to-device lookups that used to run per request.
+pub(crate) struct StoredRouteTokenPrincipal {
+    pub(crate) user: StoredUser,
+    pub(crate) device: StoredAccessTokenDevice,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

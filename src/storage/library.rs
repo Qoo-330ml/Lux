@@ -513,7 +513,10 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         }
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        // A new library is immediately visible to every principal that may see it.
+        self.auth_cache().invalidate_libraries();
+        Ok(())
     }
 
     pub(crate) async fn person_index_item_state_matches_snapshot(
@@ -986,6 +989,9 @@ impl Database {
             .rows_affected()
             == 1;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        if deleted {
+            self.auth_cache().invalidate_libraries();
+        }
         Ok(deleted)
     }
 
@@ -1269,6 +1275,8 @@ impl Database {
         }
 
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // The enabled flag and the name decide which libraries a principal can see.
+        self.auth_cache().invalidate_libraries();
         Ok(true)
     }
 

@@ -416,6 +416,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // The library was disabled for the deletion, so cached access contexts must be dropped now.
+        self.auth_cache().invalidate_libraries();
         Ok(Some(stored_library_deletion_job(row)))
     }
 
@@ -978,6 +980,9 @@ impl Database {
             .map_err(self.sqlx_err())?;
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        if deleted {
+            self.auth_cache().invalidate_libraries();
+        }
         Ok(Some(deleted))
     }
 }

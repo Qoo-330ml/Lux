@@ -9588,8 +9588,10 @@ impl Database {
         .bind(token_hash)
         .execute(&self.pool)
         .await
-        .map(|_| ())
-        .map_err(self.sqlx_err())
+        .map_err(self.sqlx_err())?;
+        // A revocation must reach the next request instead of waiting for the principal cache TTL.
+        self.auth_cache().invalidate_credentials();
+        Ok(())
     }
 
     pub(crate) async fn has_valid_access_token(
@@ -9710,8 +9712,9 @@ impl Database {
         .bind(session_token_hash)
         .execute(&self.pool)
         .await
-        .map(|_| ())
-        .map_err(self.sqlx_err())
+        .map_err(self.sqlx_err())?;
+        self.auth_cache().invalidate_credentials();
+        Ok(())
     }
 
     /// Revokes every active web session of a user, optionally keeping the caller's own session.
@@ -9737,11 +9740,16 @@ impl Database {
                 )
                 .bind(user_id),
         };
-        statement
+        let revoked = statement
             .execute(&self.pool)
             .await
-            .map(|result| result.rows_affected())
-            .map_err(self.sqlx_err())
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        if revoked > 0 {
+            self.auth_cache().invalidate_credentials();
+            self.auth_cache().invalidate_user(user_id);
+        }
+        Ok(revoked)
     }
 
     pub(crate) async fn list_web_session_summaries(
@@ -9829,18 +9837,25 @@ impl Database {
         user_id: &str,
         session_id: &str,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE web_sessions
-             SET revoked_at = unixepoch(), updated_at = unixepoch()
-             WHERE id = ? AND user_id = ? AND revoked_at IS NULL
-               AND expires_at > unixepoch()",
-        )
-        .bind(session_id)
-        .bind(user_id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(self.sqlx_err())
+        let revoked = self
+            .query(
+                "UPDATE web_sessions
+                 SET revoked_at = unixepoch(), updated_at = unixepoch()
+                 WHERE id = ? AND user_id = ? AND revoked_at IS NULL
+                   AND expires_at > unixepoch()",
+            )
+            .bind(session_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected()
+            == 1;
+        if revoked {
+            self.auth_cache().invalidate_credentials();
+            self.auth_cache().invalidate_user(user_id);
+        }
+        Ok(revoked)
     }
 
     pub(crate) async fn is_active_web_session_token(
