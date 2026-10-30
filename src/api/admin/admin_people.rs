@@ -258,7 +258,7 @@ pub(crate) async fn admin_cancel_people_index_rebuild(
         "PEOPLE_INDEX_REBUILD_CANCEL_REQUESTED",
         Some("library"),
         Some(&library_id_string),
-        "{}",
+        &json!({"status": job.status}).to_string(),
     )
     .await;
     (

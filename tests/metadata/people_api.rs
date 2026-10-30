@@ -1718,10 +1718,24 @@ async fn people_index_rebuild_admin_api_supports_csrf_pagination_cancel_and_requ
         .send()
         .await?;
     assert_eq!(cancelled.status(), reqwest::StatusCode::ACCEPTED);
-    assert_eq!(
-        cancelled.json::<Value>().await?["job"]["status"],
-        "CANCELLED"
-    );
+    let cancelled_body = cancelled.json::<Value>().await?;
+    assert_eq!(cancelled_body["job"]["status"], "CANCELLED");
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let cancel_event = audit["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["eventType"] == "PEOPLE_INDEX_REBUILD_CANCEL_REQUESTED")
+        })
+        .ok_or("missing PEOPLE_INDEX_REBUILD_CANCEL_REQUESTED")?;
+    assert_eq!(cancel_event["metadata"]["status"], "CANCELLED");
 
     let requeued = client
         .post(format!(
