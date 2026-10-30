@@ -30,6 +30,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminLibrary, AdminLibraryDeletionJob, AdminLibraryDeletionJobsPage, AdminLibraryScraper, AdminPlugin, ChapterSource, LibraryKind, MediaImageVariantCacheSettings, MediaStrategySettings, MetadataRefreshMode } from "../../lib/api/types";
 import { orderLibraries } from "../account/account-settings";
 import { DirectoryPicker } from "./DirectoryPicker";
+import { AdminLibraryDeletionPanel } from "./AdminLibraryDeletionPanel";
 import { LuxButton, LuxRadio, LuxSelectField, LuxSwitch, LuxTextField } from "../../components/ui";
 
 const libraryKindOptions: Array<{ value: LibraryKind; label: string }> = [
@@ -224,7 +225,8 @@ export function AdminLibrariesPage() {
           </div>
           {createNotice ? <p className="lux-error-copy" role="status">{createNotice}</p> : null}
           {deletionNotice ? <p className="lux-admin-muted" role="status">{deletionNotice}</p> : null}
-          {items.length === 0 ? <div className="lux-admin-empty"><Database size={24} /><h2>还没有媒体库</h2><p>创建第一个媒体库后，Lux 才能开始索引内容。</p></div> : <div className="lux-admin-library-grid">{items.map((library) => <LibraryAdminCard key={library.id} library={library} plugins={pluginItems} chapterSources={chapterSourceItems} globalStrategy={strategy ?? undefined} onDeleteAccepted={(libraryName) => setDeletionNotice(`“${libraryName}”已从可用媒体库移除，正在后台清理。进度可在“任务与日志”查看。`)} />)}</div>}
+          <AdminLibraryDeletionPanel />
+          {items.length === 0 ? <div className="lux-admin-empty"><Database size={24} /><h2>还没有媒体库</h2><p>创建第一个媒体库后，Lux 才能开始索引内容。</p></div> : <div className="lux-admin-library-grid">{items.map((library) => <LibraryAdminCard key={library.id} library={library} plugins={pluginItems} chapterSources={chapterSourceItems} globalStrategy={strategy ?? undefined} onDeleteAccepted={(libraryName) => setDeletionNotice(`“${libraryName}”已从可用媒体库移除，正在后台清理。进度和重试显示在下方。`)} />)}</div>}
         </>
       ) : (
         settings.isPending ? <AdminLibraryState title="正在加载高级配置" label="正在读取全局策略…" /> : settings.error ? <AdminLibraryState title="高级配置加载失败" label={settings.error.message} error /> : strategy ? <GlobalStrategyPanel strategy={strategy} plugins={pluginItems} saved={strategySaved} saving={saveStrategy.isPending} refreshing={refreshAll.isPending} error={saveStrategy.error?.message || refreshAll.error?.message} onChange={(next) => { setStrategySaved(false); setStrategy(next); }} onSave={(next) => saveStrategy.mutate(next)} onRefresh={(mode) => refreshAll.mutate(mode)} onBack={() => setActiveView("libraries")} /> : <AdminLibraryState title="高级配置不可用" label="全局策略为空，请稍后重试。" error />
@@ -480,7 +482,7 @@ function LibraryAdminCard({ library, plugins, chapterSources, globalStrategy, on
       setRemoveError("");
       setDeleteOpen(false);
       onDeleteAccepted(job.libraryName);
-      queryClient.setQueryData<AdminLibraryDeletionJobsPage>(queryKeys.adminLibraryDeletionJobs(undefined, 1), (data) => {
+      queryClient.setQueryData<AdminLibraryDeletionJobsPage>(queryKeys.adminLibraryDeletionJobs("OPEN", 1), (data) => {
         const alreadyListed = data?.jobs.some((item: AdminLibraryDeletionJob) => item.id === job.id) ?? false;
         return {
           jobs: [job, ...(data?.jobs ?? []).filter((item: AdminLibraryDeletionJob) => item.id !== job.id)].slice(0, 20),

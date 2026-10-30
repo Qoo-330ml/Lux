@@ -103,6 +103,7 @@ describe("AdminLibrariesPage library cards", () => {
     vi.spyOn(api, "libraryOrder").mockResolvedValue({ libraryOrder: [library.id] });
     vi.spyOn(api, "adminPlugins").mockResolvedValue({ plugins: [configuredScraper] });
     vi.spyOn(api, "adminChapterSources").mockResolvedValue({ sources: [] });
+    vi.spyOn(api, "adminLibraryDeletionJobs").mockResolvedValue({ jobs: [], page: 1, pageSize: 20, total: 0 });
     vi.spyOn(api, "adminSettings").mockResolvedValue({
       resumePlayedPercent: 90,
       resumeMinTicks: 1_200_000_000,
@@ -567,6 +568,39 @@ describe("AdminLibrariesPage library cards", () => {
     expect(nativeConfirm).not.toHaveBeenCalled();
     expect(container.textContent).toContain("还没有媒体库");
     expect(container.textContent).toContain("正在后台清理");
+  });
+
+  it("shows unfinished deletion jobs with retry on the library page", async () => {
+    vi.mocked(api.adminLibraries).mockResolvedValue({ libraries: [] });
+    const job: AdminLibraryDeletionJob = {
+      id: "deletion-failed",
+      libraryId: "library-2",
+      libraryName: "02纪录片",
+      status: "FAILED",
+      stage: "CANCELLING_SCANS",
+      processedCount: 1280,
+      errorCode: "SERVER_SHUTDOWN",
+      createdAt: 1_700_000_000,
+      updatedAt: 1_700_000_060,
+      startedAt: 1_700_000_010,
+      finishedAt: 1_700_000_060,
+    };
+    const deletionJobs = vi.mocked(api.adminLibraryDeletionJobs).mockResolvedValue({ jobs: [job], page: 1, pageSize: 20, total: 1 });
+    const retry = vi.spyOn(api, "retryAdminLibraryDeletion").mockResolvedValue({ job: { ...job, status: "PENDING", errorCode: null, finishedAt: null } });
+    await renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("02纪录片"));
+    });
+    expect(deletionJobs).toHaveBeenCalledWith("OPEN", 1);
+    expect(container.textContent).toContain("正在删除的媒体库");
+    expect(container.textContent).toContain("服务重启后任务已暂停，可重试继续清理。");
+    expect(container.textContent).toContain("已处理 1,280 条记录");
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="重试删除媒体库“02纪录片”"]')?.click());
+    await act(async () => {
+      await vi.waitFor(() => expect(retry).toHaveBeenCalledWith("deletion-failed"));
+    });
   });
 
   it("starts metadata refresh from the library actions menu", async () => {

@@ -397,6 +397,9 @@ describe("AdminOperationsPage", () => {
     expect(metadataRow?.textContent).not.toContain("总耗时");
     expect(container.querySelector<HTMLAnchorElement>('a[href="/libraries/library-1?metadataStatus=pending"]')).not.toBeNull();
     expect(container.textContent).toContain("完成时间");
+    // 媒体库删除是一次性动作，进度与重试在媒体库页，不进入运行记录。
+    expect(container.textContent).not.toContain("媒体库删除");
+    expect(container.textContent).not.toContain("正在删除的媒体库");
     const runList = container.querySelector<HTMLElement>(".lux-admin-job-list");
     expect(runList?.textContent).toContain("媒体库：电影库");
     expect(runList?.textContent).not.toContain("library-1");

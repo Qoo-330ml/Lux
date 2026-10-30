@@ -4366,6 +4366,20 @@ pub(crate) struct StoredPlaybackSession {
     pub(crate) last_event_at: i64,
 }
 
+/// Duration candidates for one playback callback, read without the item detail projection.
+///
+/// [`Database::find_catalog_rows`] joins sources, streams, image tags and catalog details only to
+/// read a runtime, and every playback callback needs nothing but these four values. Each field is
+/// the raw column value, so the caller keeps the established precedence and the "zero means
+/// unknown" filtering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub(crate) struct StoredPlaybackDurations {
+    pub(crate) runtime_ticks: Option<i64>,
+    pub(crate) requested_source_ticks: Option<i64>,
+    pub(crate) default_source_ticks: Option<i64>,
+    pub(crate) first_source_ticks: Option<i64>,
+}
+
 /// Row of every [`StoredPlaybackSession`] projection.
 ///
 /// `is_paused` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the conversion
