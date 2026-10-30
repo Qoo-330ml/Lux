@@ -1,8 +1,6 @@
-mod common;
-
 use std::{path::Path, sync::Arc, time::Duration};
 
-use common::{TestScraper, TestScraperConfig};
+use crate::common::{TestScraper, TestScraperConfig};
 use luxd::{
     application::{
         access::{AccessPrincipal, MediaAccessService},

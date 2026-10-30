@@ -2053,6 +2053,11 @@ services:
 
 ## 24. 全局完成标准
 
+> 集成测试已按领域合并为少数几个 binary（`tests/<group>/main.rs`）。任务书里旧的
+> `cargo test --locked --test <名>` 现在写作 `cargo test --locked --test <组> <模块>::`；
+> 旧名到新命令的完整映射、各分组测试数与合并前后度量见 `docs/TEST-TARGETS.md`。
+> 本文档历史任务中的旧命令名保持原样，不再逐条改写。
+
 任何任务只有同时满足以下条件才算完成：
 
 - 规格对应的验收条件全部满足。

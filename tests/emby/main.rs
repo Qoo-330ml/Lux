@@ -1,0 +1,10 @@
+mod discovery;
+mod download_api;
+mod emby_auth;
+mod emby_counts;
+mod emby_global_collection_playback;
+mod emby_incremental_refresh;
+mod emby_multi_part_playback;
+mod emby_system;
+mod mixed_library_api;
+mod search;

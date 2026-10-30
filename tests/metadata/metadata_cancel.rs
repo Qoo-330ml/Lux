@@ -1,5 +1,3 @@
-mod common;
-
 use std::{
     sync::{
         Arc,
@@ -8,8 +6,8 @@ use std::{
     time::Duration,
 };
 
+use crate::common::{TestScraper, TestScraperConfig};
 use axum::{Json, Router, extract::State, http::Uri, routing::any};
-use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{

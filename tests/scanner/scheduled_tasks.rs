@@ -15,9 +15,7 @@ use axum::{
     routing::any,
 };
 
-mod common;
-
-use common::{TestScraper, TestScraperConfig};
+use crate::common::{TestScraper, TestScraperConfig};
 use luxd::application::{
     candidates::MetadataSelectionService,
     chapter_detector::{ChapterDetectionService, DEFAULT_CHAPTER_DETECTOR_PLUGIN_ID},

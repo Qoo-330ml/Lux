@@ -1,9 +1,7 @@
-mod common;
-
 use std::time::Duration;
 
+use crate::common::{TestScraper, TestScraperConfig};
 use axum::{Json, Router, routing::get};
-use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{

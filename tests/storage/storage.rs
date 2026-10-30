@@ -101,7 +101,8 @@ async fn user_activity_events_migration_runs_from_an_empty_database()
     assert_eq!(target_id, None);
     assert!(occurred_at > 0);
 
-    let postgres_migration = include_str!("../migrations-postgres/0193_user_activity_events.sql");
+    let postgres_migration =
+        include_str!("../../migrations-postgres/0193_user_activity_events.sql");
     assert!(postgres_migration.contains("user_id TEXT NOT NULL"));
     assert!(postgres_migration.contains("actor_user_id TEXT"));
     assert!(postgres_migration.contains("occurred_at BIGINT NOT NULL"));
@@ -338,8 +339,8 @@ async fn user_device_inventory_migration_runs_from_an_empty_database()
         assert!(postgres_migration.contains(expected), "missing {expected}");
     }
     assert_eq!(
-        include_str!("../migrations/0195_web_session_device_id.sql"),
-        include_str!("../migrations-postgres/0195_web_session_device_id.sql")
+        include_str!("../../migrations/0195_web_session_device_id.sql"),
+        include_str!("../../migrations-postgres/0195_web_session_device_id.sql")
     );
 
     Ok(())
@@ -804,7 +805,7 @@ async fn scan_job_processed_media_storage_is_migrated_from_an_empty_database()
     assert_eq!(job_foreign_key, 1);
 
     let postgres_migration =
-        include_str!("../migrations-postgres/0183_scan_job_processed_media.sql");
+        include_str!("../../migrations-postgres/0183_scan_job_processed_media.sql");
     assert!(postgres_migration.contains("processed_media_count BIGINT"));
     assert!(postgres_migration.contains("scan_job_processed_media_items"));
     assert!(postgres_migration.contains("ON DELETE CASCADE"));
@@ -1031,7 +1032,7 @@ async fn user_content_restrictions_migration_runs_from_an_empty_database()
     );
 
     let postgres_migration =
-        include_str!("../migrations-postgres/0190_user_content_restrictions.sql");
+        include_str!("../../migrations-postgres/0190_user_content_restrictions.sql");
     assert!(postgres_migration.contains("CREATE TABLE user_content_restrictions"));
     assert!(postgres_migration.contains("CREATE TABLE user_content_restriction_tags"));
     assert!(postgres_migration.contains("ON DELETE CASCADE"));
@@ -2162,9 +2163,9 @@ async fn sqlite_upgrade_and_missing_transitions_clear_file_fingerprints()
 
 #[test]
 fn postgres_migration_0158_preserves_legacy_media_chapters_version() {
-    let legacy = include_str!("../migrations-postgres/0158_media_info_chapters.sql");
+    let legacy = include_str!("../../migrations-postgres/0158_media_info_chapters.sql");
     let additive = include_str!(
-        "../migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql"
+        "../../migrations-postgres/0160_scan_local_metadata_backfill_non_retryable_items.sql"
     );
 
     assert!(legacy.contains("CREATE TABLE media_info_chapters"));
@@ -2173,8 +2174,9 @@ fn postgres_migration_0158_preserves_legacy_media_chapters_version() {
 
 #[test]
 fn person_index_relation_checksum_migration_is_nullable_on_both_backends() {
-    let sqlite = include_str!("../migrations/0166_person_index_relation_checksum.sql");
-    let postgres = include_str!("../migrations-postgres/0166_person_index_relation_checksum.sql");
+    let sqlite = include_str!("../../migrations/0166_person_index_relation_checksum.sql");
+    let postgres =
+        include_str!("../../migrations-postgres/0166_person_index_relation_checksum.sql");
 
     for migration in [sqlite, postgres] {
         let normalized = migration.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -2387,7 +2389,7 @@ fn metadata_migrations_keep_deployed_checksums() -> Result<(), Box<dyn std::erro
 
 #[test]
 fn historical_media_catalog_migration_keeps_its_original_checksum() {
-    let migration = include_str!("../migrations/0006_media_catalog.sql");
+    let migration = include_str!("../../migrations/0006_media_catalog.sql");
 
     assert_eq!(
         format!("{:x}", Sha384::digest(migration.as_bytes())),
@@ -2397,7 +2399,7 @@ fn historical_media_catalog_migration_keeps_its_original_checksum() {
 
 #[test]
 fn postgres_bootstrap_migration_keeps_its_original_checksum() {
-    let migration = include_str!("../migrations-postgres/0001_bootstrap.sql");
+    let migration = include_str!("../../migrations-postgres/0001_bootstrap.sql");
 
     assert_eq!(
         format!("{:x}", Sha384::digest(migration.as_bytes())),
@@ -2407,7 +2409,8 @@ fn postgres_bootstrap_migration_keeps_its_original_checksum() {
 
 #[test]
 fn postgres_derived_index_refresh_uses_statement_level_triggers() {
-    let migration = include_str!("../migrations-postgres/0137_statement_derived_index_refresh.sql");
+    let migration =
+        include_str!("../../migrations-postgres/0137_statement_derived_index_refresh.sql");
 
     for trigger in [
         "media_items_search_ai",
@@ -2435,7 +2438,7 @@ fn postgres_derived_index_refresh_uses_statement_level_triggers() {
 #[test]
 fn postgres_provider_index_refresh_uses_statement_level_triggers() {
     let migration =
-        include_str!("../migrations-postgres/0141_statement_provider_index_refresh.sql");
+        include_str!("../../migrations-postgres/0141_statement_provider_index_refresh.sql");
 
     for trigger in ["media_item_provider_ids_ai", "media_item_provider_ids_au"] {
         assert!(
@@ -2452,7 +2455,7 @@ fn postgres_provider_index_refresh_uses_statement_level_triggers() {
 #[test]
 fn postgres_media_search_refresh_owns_provider_index_refresh() {
     let migration =
-        include_str!("../migrations-postgres/0143_merge_provider_refresh_into_media_search.sql");
+        include_str!("../../migrations-postgres/0143_merge_provider_refresh_into_media_search.sql");
 
     assert!(migration.contains("lux_refresh_media_search_items_insert_stmt"));
     assert!(migration.contains("lux_refresh_media_search_items_update_stmt"));
@@ -2475,7 +2478,7 @@ fn postgres_media_search_refresh_owns_provider_index_refresh() {
 #[test]
 fn postgres_provider_insert_refresh_filters_empty_provider_documents() {
     let migration =
-        include_str!("../migrations-postgres/0146_skip_empty_provider_index_expansion.sql");
+        include_str!("../../migrations-postgres/0146_skip_empty_provider_index_expansion.sql");
 
     assert!(migration.contains("WITH provider_rows AS MATERIALIZED"));
     assert!(migration.contains("WHERE n.provider_ids_json IS NOT NULL"));
@@ -2486,8 +2489,8 @@ fn postgres_provider_insert_refresh_filters_empty_provider_documents() {
 
 #[test]
 fn sqlite_media_search_triggers_skip_only_ascii_case_equivalent_sort_titles() {
-    let migration = include_str!("../migrations/0147_skip_redundant_sort_title_fts_tokens.sql");
-    let legacy_rebuild = include_str!("../src/storage/migration.rs");
+    let migration = include_str!("../../migrations/0147_skip_redundant_sort_title_fts_tokens.sql");
+    let legacy_rebuild = include_str!("../../src/storage/migration.rs");
 
     assert_eq!(
         migration
@@ -2501,7 +2504,7 @@ fn sqlite_media_search_triggers_skip_only_ascii_case_equivalent_sort_titles() {
     assert!(migration.contains("CREATE TRIGGER media_items_search_au"));
     // Since W4 the legacy rebuild only enqueues: the sort-title normalisation and the FTS write moved
     // into the `search_reindex` consumer, so the invariant is checked there instead.
-    let consumer = include_str!("../src/storage/search_reindex.rs");
+    let consumer = include_str!("../../src/storage/search_reindex.rs");
     assert_eq!(
         consumer
             .matches("CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE")
@@ -2726,7 +2729,7 @@ async fn sqlite_media_search_rowid_map_upgrade_preserves_existing_rows()
 #[test]
 fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
     let migration =
-        include_str!("../migrations-postgres/0138_avoid_alias_rescan_on_media_item_refresh.sql");
+        include_str!("../../migrations-postgres/0138_avoid_alias_rescan_on_media_item_refresh.sql");
 
     assert!(migration.contains("lux_refresh_media_search_items_insert_stmt"));
     assert!(migration.contains("           ''"));
@@ -2736,8 +2739,9 @@ fn postgres_media_search_refresh_does_not_rescan_aliases_per_item() {
 
 #[test]
 fn postgres_media_source_insert_refresh_only_promotes_unavailable_items() {
-    let migration =
-        include_str!("../migrations-postgres/0139_promote_media_availability_on_source_insert.sql");
+    let migration = include_str!(
+        "../../migrations-postgres/0139_promote_media_availability_on_source_insert.sql"
+    );
 
     assert!(migration.contains("SET has_available_source = 1"));
     assert!(migration.contains("has_available_source = 0"));
@@ -2748,7 +2752,7 @@ fn postgres_media_source_insert_refresh_only_promotes_unavailable_items() {
 #[test]
 fn postgres_media_source_insert_filters_available_items_before_filesystem_lookup() {
     let migration =
-        include_str!("../migrations-postgres/0142_filter_available_source_promotions.sql");
+        include_str!("../../migrations-postgres/0142_filter_available_source_promotions.sql");
 
     assert!(migration.contains("JOIN media_items candidate"));
     assert!(migration.contains("candidate.has_available_source = 0"));
@@ -2757,8 +2761,9 @@ fn postgres_media_source_insert_filters_available_items_before_filesystem_lookup
 
 #[test]
 fn postgres_media_search_insert_refresh_avoids_redundant_upsert() {
-    let migration =
-        include_str!("../migrations-postgres/0140_media_search_insert_without_conflict_probe.sql");
+    let migration = include_str!(
+        "../../migrations-postgres/0140_media_search_insert_without_conflict_probe.sql"
+    );
 
     assert!(migration.contains("INSERT INTO media_search"));
     assert!(migration.contains("lux_refresh_media_search_items_insert_stmt"));
@@ -2767,7 +2772,7 @@ fn postgres_media_search_insert_refresh_avoids_redundant_upsert() {
 
 #[test]
 fn postgres_media_search_drops_the_trigger_redundant_item_foreign_key() {
-    let migration = include_str!("../migrations-postgres/0147_drop_media_search_item_fk.sql");
+    let migration = include_str!("../../migrations-postgres/0147_drop_media_search_item_fk.sql");
 
     assert!(migration.contains("ALTER TABLE media_search"));
     assert!(migration.contains("DROP CONSTRAINT IF EXISTS media_search_item_id_fkey"));
@@ -2795,7 +2800,7 @@ async fn postgres_scan_job_migration_allows_one_active_job_per_type()
     .execute(&pool)
     .await?;
 
-    for statement in include_str!("../migrations-postgres/0109_scan_job_active_by_type.sql")
+    for statement in include_str!("../../migrations-postgres/0109_scan_job_active_by_type.sql")
         .split(';')
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
@@ -2866,7 +2871,7 @@ async fn metadata_candidate_identity_migration_collapses_pending_duplicates()
         .await?;
     }
 
-    for statement in include_str!("../migrations/0095_metadata_candidate_identity.sql")
+    for statement in include_str!("../../migrations/0095_metadata_candidate_identity.sql")
         .split(';')
         .map(str::trim)
         .filter(|statement| !statement.is_empty())
@@ -4461,7 +4466,7 @@ async fn full_scan_manifest_upgrade_preserves_existing_scan_data()
 #[tokio::test]
 async fn postgres_manifest_migration_uses_only_supported_schema_constructs()
 -> Result<(), Box<dyn std::error::Error>> {
-    let postgres_migration = include_str!("../migrations-postgres/0128_full_scan_manifest.sql");
+    let postgres_migration = include_str!("../../migrations-postgres/0128_full_scan_manifest.sql");
     for forbidden in ["COPY ", "UPDATE ", "FOR UPDATE", "TEMP TABLE"] {
         assert!(
             !postgres_migration.contains(forbidden),
@@ -4477,32 +4482,34 @@ async fn postgres_manifest_migration_uses_only_supported_schema_constructs()
             "DEFAULT (unixepoch())",
         );
     let postgres_device_migration =
-        include_str!("../migrations-postgres/0130_scan_manifest_entry_device.sql");
+        include_str!("../../migrations-postgres/0130_scan_manifest_entry_device.sql");
     assert!(!postgres_device_migration.contains("BIGSERIAL"));
     let postgres_resume_state_migration =
-        include_str!("../migrations-postgres/0131_scan_manifest_resume_state.sql");
+        include_str!("../../migrations-postgres/0131_scan_manifest_resume_state.sql");
     assert!(!postgres_resume_state_migration.contains("BIGSERIAL"));
     let postgres_streamed_manifest_migration =
-        include_str!("../migrations-postgres/0132_streamed_manifest_indexing.sql");
+        include_str!("../../migrations-postgres/0132_streamed_manifest_indexing.sql");
     assert!(!postgres_streamed_manifest_migration.contains("BIGSERIAL"));
-    let postgres_availability_migration =
-        include_str!("../migrations-postgres/0133_skip_redundant_source_availability_update.sql");
+    let postgres_availability_migration = include_str!(
+        "../../migrations-postgres/0133_skip_redundant_source_availability_update.sql"
+    );
     assert!(postgres_availability_migration.contains("has_available_source = 0"));
     assert_eq!(
-        include_str!("../migrations-postgres/0134_drop_redundant_manifest_entry_index.sql"),
-        include_str!("../migrations/0134_drop_redundant_manifest_entry_index.sql")
+        include_str!("../../migrations-postgres/0134_drop_redundant_manifest_entry_index.sql"),
+        include_str!("../../migrations/0134_drop_redundant_manifest_entry_index.sql")
     );
     let postgres_seen_paths_migration =
-        include_str!("../migrations-postgres/0135_manifest_discovery_format_and_seen_paths.sql");
+        include_str!("../../migrations-postgres/0135_manifest_discovery_format_and_seen_paths.sql");
     assert_eq!(
         postgres_seen_paths_migration.replace("BIGINT", "INTEGER"),
-        include_str!("../migrations/0135_manifest_discovery_format_and_seen_paths.sql")
+        include_str!("../../migrations/0135_manifest_discovery_format_and_seen_paths.sql")
     );
-    let postgres_target_checkpoint_migration =
-        include_str!("../migrations-postgres/0136_manifest_postprocessing_target_checkpoint.sql");
+    let postgres_target_checkpoint_migration = include_str!(
+        "../../migrations-postgres/0136_manifest_postprocessing_target_checkpoint.sql"
+    );
     assert_eq!(
         postgres_target_checkpoint_migration.replace("BIGINT", "INTEGER"),
-        include_str!("../migrations/0136_manifest_postprocessing_target_checkpoint.sql")
+        include_str!("../../migrations/0136_manifest_postprocessing_target_checkpoint.sql")
     );
     let temp_dir = tempfile::tempdir()?;
     let migration_dir = temp_dir.path().join("migrations");
