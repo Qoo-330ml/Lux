@@ -9,6 +9,7 @@ use crate::{
         catalog::{CatalogItem, CatalogService},
         ip_location::{IpLocation, IpLocationService},
         libraries::LibraryService,
+        playback_progress::PlaybackProgressService,
     },
     auth::users::{UserRecord, UserStore},
     domain::ids::UserId,
@@ -28,6 +29,9 @@ pub(crate) struct AdminDashboardServices<'a> {
     pub(crate) catalog: Option<&'a CatalogService>,
     pub(crate) ip_location: Option<&'a IpLocationService>,
     pub(crate) health_probe_cache: &'a AdminHealthProbeCache,
+    /// Reads the "now playing" list through the playback progress coalescer, so a position that
+    /// is still waiting for its write is shown instead of the previous one.
+    pub(crate) playback_progress: Option<&'a PlaybackProgressService>,
 }
 
 pub(crate) struct AdminDashboardSnapshot {
@@ -100,10 +104,11 @@ pub(crate) async fn load_admin_dashboard(
         .dashboard_stats()
         .await
         .map_err(|_| AdminDashboardError::Statistics)?;
-    let sessions = database
-        .list_playback_sessions(None, None)
-        .await
-        .map_err(|_| AdminDashboardError::PlaybackSessions)?;
+    let sessions = match services.playback_progress {
+        Some(playback_progress) => playback_progress.list_sessions(None, None).await,
+        None => database.list_playback_sessions(None, None).await,
+    }
+    .map_err(|_| AdminDashboardError::PlaybackSessions)?;
     let users = UserStore::new(database.clone())
         .map_err(|_| AdminDashboardError::Users)?
         .list_users()

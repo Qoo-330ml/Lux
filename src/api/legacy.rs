@@ -45,6 +45,7 @@ use crate::{
         WebPlaybackSessionError, WebPlaybackSessionService,
     },
     application::playback::{ByteRange, RangeError, parse_single_range},
+    application::playback_progress::PlaybackProgressService,
     application::probe::{FfprobeRunner, MediaProbeService},
     application::setup::{SetupError, SetupService},
     application::{
@@ -256,6 +257,7 @@ pub struct ReadyServices {
     user_avatars: UserAvatarService,
     ip_location: IpLocationService,
     web_playback: WebPlaybackSessionService,
+    playback_progress: PlaybackProgressService,
 }
 
 /// Shared HTTP state: a single `Router` is mounted for both modes.
@@ -389,6 +391,7 @@ impl ReadyAppState {
         user_avatars -> UserAvatarService,
         ip_location -> IpLocationService,
         web_playback -> WebPlaybackSessionService,
+        playback_progress -> PlaybackProgressService,
     }
 
     ready_optional_service_accessor! {
@@ -610,6 +613,7 @@ impl AppState {
         identity_merge_worker -> IdentityMergeWorker,
         people -> PeopleService,
         user_avatars -> UserAvatarService,
+        playback_progress -> PlaybackProgressService,
     }
 
     optional_service_accessor! {
@@ -661,6 +665,11 @@ impl AppState {
         }
         if let Some(scheduled_tasks) = self.scheduled_tasks() {
             scheduled_tasks.shutdown().await;
+        }
+        // Playback progress lives in memory between ticks, so the drain has to write it before the
+        // database goes away.
+        if let Some(playback_progress) = self.playback_progress() {
+            playback_progress.shutdown().await;
         }
         Ok(())
     }
@@ -758,6 +767,13 @@ impl AppState {
                 // Load the policy and validate the hardware encoder before the first playback.
                 service.refresh_hardware_status().await;
             });
+        }
+        let playback_progress = PlaybackProgressService::new(database.clone());
+        // The periodic flush needs a runtime. Without one the request path still writes a merged
+        // tick as soon as its window elapses and shutdown drains the rest, so nothing is lost.
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            let service = playback_progress.clone();
+            handle.spawn(async move { service.spawn().await });
         }
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
@@ -978,6 +994,7 @@ impl AppState {
             user_avatars,
             ip_location: IpLocationService::new(plugins.clone()),
             web_playback,
+            playback_progress,
         };
         // One `Arc<ReadyServices>` is shared by every clone of the state, so handlers, background
         // workers, and plugins keep observing the same service instances.
