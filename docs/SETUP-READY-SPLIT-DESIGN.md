@@ -845,3 +845,60 @@ python3 scripts/check-backend-branches.py
 - 不为 setup 树引入性能基准：setup 模式请求量极小，`src/api/routes.rs:290` 的指标逻辑不动即可。
 - 不验证"setup 完成后进程真的重启"：那是第 ② 步（`docs/SETUP-RESTART-DESIGN.md` §6）的验收范围，
   第 ③ 步只依赖"重启后进入 ready 模式"这一事实。
+
+## 附录 A：三种状态的关系与不变式
+
+| | `AppState`（兼容门面，`tests/**` 的构造入口） | `ReadyAppState`（ready 树的状态） | `SetupState`（setup 树的状态） |
+| --- | --- | --- | --- |
+| 字段 | `core: CoreState`、`database: Option<Database>`、`services: Option<Arc<ReadyServices>>` | `core`、`database: Database`、`services: Arc<ReadyServices>` | 内部包一个 `ReadyAppState`（§2.1），只暴露 4 个服务访问器 |
+| 谁构造 | `Default`、`ready*` 构造器、`main`（经 `build_app_state`） | `AppState::into_ready()` | `SetupState::from(ReadyAppState)` |
+| 谁消费 | `app_with_state`（分派）、`tests/**`、`main` 的关停路径 | `ready_router` | `setup_router` |
+| 服务可见性 | 46 个 `Option<&Service>` 访问器（迁移期） | 40 个 `&Service` + 6 个 `Option<&Service>` + `&Database` | `setup`/`database_setup`/`libraries`/`scan_jobs` + `database`（其余不可达） |
+| `Deref` | → `CoreState` | → `CoreState` | → `CoreState` |
+| 迁移期额外 impl | — | `FromRef<ReadyAppState> for AppState`、`FromRef<ReadyAppState> for SetupState` | `FromRef<SetupState> for CoreState`、`StateView` |
+
+不变式（实现时写进注释，review 时逐条核对）：
+
+1. `ReadyAppState` 一旦构造，`database` 与 `services` 永不为 `None`；`into_ready()` 是唯一的入口，
+   失败走启动错误（不 panic、不 `unwrap`）。
+2. 三种状态共享**同一个** `Arc<ReadyServices>`；任何转换只允许 `Arc::clone`（`Arc::ptr_eq` 由
+   `src/api/legacy.rs:2490-2507` 与新增单测守护）。
+3. `Arc::make_mut` 只允许在 `AppState` 的 builder 里、`into_ready()` 之前调用（§6）。
+4. 业务 handler 只出现在 `ready_router` 的注册里；`setup_router` 里出现的每个 handler 都必须在
+   §4.2 的表里有一行说明。
+5. 未就绪兼容树只允许合成 §9.2 的 6 条响应，不允许注册任何业务 handler。
+
+## 附录 B：测量命令（可复现 §1–§7 的数字）
+
+基线 `test` = `c4861069`，全部命令在仓库根目录执行。
+
+```bash
+# 命令 1：每个文件里带 State<AppState> 的 handler/extractor（合计 359）
+grep -rlc "State<AppState>" src/api | while read -r f; do
+  printf "%4d %s\n" "$(grep -c "State<AppState>" "$f")" "$f"
+done | sort -rn
+
+# 命令 2：取 &AppState 的 helper（合计 111）与其中跨文件被调用的（25）
+grep -rn "state: &AppState" src/api | wc -l            # 111（含换行参数，按函数计见正文方法）
+grep -rn "state: &AppState" src/api | cut -d: -f1 | sort | uniq -c | sort -rn
+
+# 命令 3：守卫计数（require_service! 303 = 301 调用点 + 2 处文档；else 守卫 110 = 108 + 2 处文档）
+grep -rn "require_service!" src/api | wc -l
+grep -rEn "state\.[a-z_]+\(\) else \{" src/api | wc -l
+grep -rn "require_service!(state.database)" src/api | wc -l                 # 121
+grep -rEn "require_service!\(state\.(image_writes|downloads|strm_playback)\)" src/api | wc -l   # 7
+
+# 命令 4：tests/** 的 AppState 构造点（3 / 8 / 163）
+grep -rn "AppState::default()" tests/ | wc -l
+grep -rn "\bapp()" tests/ | wc -l
+grep -rn "AppState::ready" tests/ | wc -l
+
+# 命令 5：CoreState.database 字段读取（改名 database_slot 的 36 处文本）
+grep -rn "state\.database\b" src/api |
+  grep -v "state\.database(" |
+  grep -v "require_service!(state.database)" | wc -l
+```
+
+计数口径说明：`State<AppState>` 的 359 处是"handler/extractor 出现次数"，与 §3.4 批次表的合计一致；
+`require_service!` 与 else 守卫各减去 2 处只出现在 `src/api/mod.rs` 的宏文档/宏体里的示例
+（`src/api/mod.rs:8`、`:53`），得到 301 与 108 的真实调用点。
