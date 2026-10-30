@@ -1263,7 +1263,7 @@ impl LocalNfoMetadataStore {
         Ok(())
     }
 
-    #[allow(dead_code)] // exercised by unit tests; scan pages use the deferred batch path
+    #[cfg(test)]
     pub(crate) async fn write_item_with_semantic_fingerprint(
         &self,
         item_id: &str,

@@ -33,7 +33,10 @@ pub(crate) struct CatalogRebuildReport {
 }
 
 /// Rebuilds every row and the library/global counters, returning the validation summary.
-#[allow(dead_code)] // used by tests and the future manual rebuild endpoint
+///
+/// Startup uses `rebuild_catalog_read_model_from` with a resume point; only the crate's storage
+/// regression tests drive the unbounded-from-the-start wrapper.
+#[cfg(test)]
 pub(crate) async fn rebuild_catalog_read_model(
     database: &Database,
     batch: i64,
