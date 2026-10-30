@@ -1698,7 +1698,7 @@ impl Database {
             )));
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
-        Ok(stored_canonical_person(person).map_err(self.sqlx_err())?)
+        stored_canonical_person(person).map_err(self.sqlx_err())
     }
 
     pub(crate) async fn attach_canonical_person_identities(
@@ -1795,7 +1795,7 @@ impl Database {
         }
 
         transaction.commit().await.map_err(self.sqlx_err())?;
-        Ok(stored_canonical_person(person).map_err(self.sqlx_err())?)
+        stored_canonical_person(person).map_err(self.sqlx_err())
     }
 
     /// One page of item ids credited to a person, ordered by item id.

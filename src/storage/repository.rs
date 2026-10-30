@@ -6958,42 +6958,28 @@ mod stored_row_decoding_tests {
             .await?;
 
         let errors = [
-            StoredScanJobRow::from_row(&row)
-                .err()
-                .expect("scan job columns must not decode"),
+            StoredScanJobRow::from_row(&row).expect_err("scan job columns must not decode"),
             StoredScanLocalMetadataBatchRow::from_row(&row)
-                .err()
-                .expect("local metadata batch columns must not decode"),
+                .expect_err("local metadata batch columns must not decode"),
             StoredScanJobPathRow::from_row(&row)
-                .err()
-                .expect("scan job path columns must not decode"),
+                .expect_err("scan job path columns must not decode"),
             StoredReconciliationScanEntryRow::from_row(&row)
-                .err()
-                .expect("reconciliation entry columns must not decode"),
+                .expect_err("reconciliation entry columns must not decode"),
             StoredStrmProbeJobRow::from_row(&row)
-                .err()
-                .expect("STRM probe job columns must not decode"),
+                .expect_err("STRM probe job columns must not decode"),
             StoredChapterDetectionJobRow::from_row(&row)
-                .err()
-                .expect("chapter detection job columns must not decode"),
-            StoredLibraryRootRow::from_row(&row)
-                .err()
-                .expect("library root columns must not decode"),
+                .expect_err("chapter detection job columns must not decode"),
+            StoredLibraryRootRow::from_row(&row).expect_err("library root columns must not decode"),
             StoredFilesystemEntryRow::from_row(&row)
-                .err()
-                .expect("filesystem entry columns must not decode"),
+                .expect_err("filesystem entry columns must not decode"),
             StoredCanonicalPersonRow::from_row(&row)
-                .err()
-                .expect("canonical person columns must not decode"),
+                .expect_err("canonical person columns must not decode"),
             StoredPersonMatchCandidateRow::from_row(&row)
-                .err()
-                .expect("person match candidate columns must not decode"),
+                .expect_err("person match candidate columns must not decode"),
             StoredPersonCreditRow::from_row(&row)
-                .err()
-                .expect("person credit columns must not decode"),
+                .expect_err("person credit columns must not decode"),
             StoredPersonIndexRebuildJobRow::from_row(&row)
-                .err()
-                .expect("person index rebuild job columns must not decode"),
+                .expect_err("person index rebuild job columns must not decode"),
         ];
         for error in errors {
             assert!(
