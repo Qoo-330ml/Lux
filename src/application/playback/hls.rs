@@ -2694,7 +2694,7 @@ mod tests {
         SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, asset_segment_number,
         emby_init_segment_number, ffmpeg_args, ffmpeg_args_for_output, ffmpeg_args_with_audio,
         ffmpeg_args_with_timeline, hls_segment_path, hls_start_number, is_valid_asset,
-        vod_manifest,
+        sanitize_probe_error, vod_manifest,
     };
 
     fn fake_process(directory: PathBuf, total_bytes: Option<u64>) -> super::HlsProcess {
