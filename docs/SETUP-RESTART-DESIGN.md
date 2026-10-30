@@ -46,7 +46,7 @@ Router 拆分。
 
 **目标**：客户端必须先拿到 `201` + 管理员/库信息，进程才进入关停。
 
-**做法**（handler 末尾，成功分支）：
+**做法**（handler 末尾；“管理员已创建”的所有返回路径，见 §4.2）：
 
 1. 构造完响应 JSON（含 `restarting` 字段，见 §4），克隆 `state.restart_handle`。
 2. `tokio::spawn` 一个延迟任务：`sleep(delay)` → `handle.request_restart()`；失败只记 `info` 日志
