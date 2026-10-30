@@ -1,15 +1,18 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     fmt,
     io::Cursor,
     net::IpAddr,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock, Weak},
+    sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock, Weak},
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::{Client, Url, header::CONTENT_TYPE};
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::atomic::AtomicUsize;
 use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
@@ -35,7 +38,7 @@ use crate::{
     observability::resources::ResourceMetrics,
     storage::{
         Database, ItemImageMetadata, MetadataImageAttemptUpdate, StorageError, StoredItemImage,
-        StoredMediaWritebackContext,
+        StoredItemImageCandidate, StoredMediaWritebackContext,
     },
 };
 
@@ -2387,11 +2390,185 @@ fn image_io_error(path: &Path, source: std::io::Error) -> ImageWriteError {
     }
 }
 
+/// Upper bound on cached image resolutions.
+///
+/// An entry is a handful of small strings and one [`PathBuf`], so the cap keeps the worst case in
+/// the low single-digit megabytes while still covering the images of a large browsing session.
+const IMAGE_RESOLUTION_CACHE_CAPACITY: usize = 4096;
+
+/// Cache key for one resolved item image candidate.
+///
+/// `content_tag` is the sha256 of the stored bytes, so replacing or rescraping an image produces a
+/// different key instead of a stale hit. The local path and library root are deliberately *not*
+/// part of the key: they are re-checked against the current database row on every lookup, so an
+/// out-of-band `item_images.local_path` update is never served from the cache.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ImageResolutionKey {
+    image_id: String,
+    content_tag: Option<String>,
+}
+
+impl ImageResolutionKey {
+    fn for_candidate(candidate: &StoredItemImageCandidate) -> Self {
+        Self {
+            image_id: candidate.id.clone(),
+            content_tag: candidate.content_tag.clone(),
+        }
+    }
+}
+
+/// A candidate that already passed the root containment checks, plus the file identity observed
+/// when it did. Only results that passed those checks are ever stored here.
+#[derive(Clone, Debug)]
+struct ResolvedItemImage {
+    local_path: String,
+    root_path: String,
+    canonical_path: PathBuf,
+    content_type: &'static str,
+    device: u64,
+    inode: u64,
+    size: u64,
+    modified: Option<(u64, u32)>,
+    parent_device: u64,
+    parent_inode: u64,
+}
+
+impl ResolvedItemImage {
+    /// True when the database row still points at the path and root this entry was validated for.
+    fn matches(&self, local_path: &str, root_path: &str) -> bool {
+        self.local_path == local_path && self.root_path == root_path
+    }
+
+    /// True when `metadata` still describes the exact file that was validated.
+    ///
+    /// Reusing the cached canonical path is only safe while the path resolves to the same inode
+    /// with the same stamp, so a replaced, rewritten, or deleted image always falls back to the
+    /// full canonicalize + containment path.
+    fn still_current(&self, metadata: &std::fs::Metadata) -> bool {
+        metadata.file_type().is_file()
+            && metadata.dev() == self.device
+            && metadata.ino() == self.inode
+            && metadata.len() == self.size
+            && modified_stamp(metadata) == self.modified
+    }
+
+    /// True when the validated parent directory is still the same real directory.
+    ///
+    /// Together with [`Self::still_current`] this proves the cached path resolves to the very file
+    /// that passed containment, even if any directory above it was replaced by a symlink: swapping
+    /// the parent for a link changes either its own metadata (a link is not a directory) or the
+    /// directory the path resolves to, and both fail here.
+    fn parent_is_current(&self, metadata: &std::fs::Metadata) -> bool {
+        metadata.file_type().is_dir()
+            && metadata.dev() == self.parent_device
+            && metadata.ino() == self.parent_inode
+    }
+}
+
+fn modified_stamp(metadata: &std::fs::Metadata) -> Option<(u64, u32)> {
+    metadata.modified().ok().and_then(|time| {
+        time.duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| (duration.as_secs(), duration.subsec_nanos()))
+    })
+}
+
+#[derive(Default)]
+struct ImageResolutionCache {
+    entries: HashMap<ImageResolutionKey, ResolvedItemImage>,
+    insertion_order: VecDeque<ImageResolutionKey>,
+}
+
+impl ImageResolutionCache {
+    fn get(&self, key: &ImageResolutionKey) -> Option<&ResolvedItemImage> {
+        self.entries.get(key)
+    }
+
+    fn insert(&mut self, key: ImageResolutionKey, image: ResolvedItemImage) {
+        if let Some(existing) = self.entries.get_mut(&key) {
+            *existing = image;
+            return;
+        }
+        while self.entries.len() >= IMAGE_RESOLUTION_CACHE_CAPACITY {
+            let Some(evicted) = self.insertion_order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&evicted);
+        }
+        self.insertion_order.push_back(key.clone());
+        self.entries.insert(key, image);
+    }
+
+    fn remove(&mut self, key: &ImageResolutionKey) {
+        if self.entries.remove(key).is_none() {
+            return;
+        }
+        if let Some(position) = self.insertion_order.iter().position(|entry| entry == key) {
+            self.insertion_order.remove(position);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.entries.len()
+    }
+}
+
+#[derive(Default)]
+struct ImageResolutionState {
+    cache: StdMutex<ImageResolutionCache>,
+    canonical_metadata_root: StdMutex<Option<PathBuf>>,
+    #[cfg(test)]
+    path_validations: AtomicUsize,
+    #[cfg(test)]
+    cache_hits: AtomicUsize,
+    #[cfg(test)]
+    metadata_root_canonicalizations: AtomicUsize,
+}
+
+fn resolution_lock<T>(mutex: &StdMutex<T>) -> StdMutexGuard<'_, T> {
+    mutex
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn resolved_image(
+    candidate: &StoredItemImageCandidate,
+    canonical_path: &Path,
+    content_type: &'static str,
+    metadata: &std::fs::Metadata,
+) -> ResolvedImage {
+    let modified = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok());
+    let etag = format!(
+        "\"{}-{}-{}\"",
+        metadata.len(),
+        modified.map(|value| value.as_secs()).unwrap_or_default(),
+        modified
+            .map(|value| value.subsec_nanos())
+            .unwrap_or_default()
+    );
+    ResolvedImage {
+        id: candidate.id.clone(),
+        image_type: candidate.image_type.clone(),
+        path: canonical_path.to_owned(),
+        content_type,
+        content_length: metadata.len(),
+        etag,
+        content_tag: candidate.content_tag.clone(),
+        width: candidate.width,
+        height: candidate.height,
+    }
+}
+
 #[derive(Clone)]
 pub struct ImageService {
     database: Database,
     access: MediaAccessService,
     config_dir: PathBuf,
+    resolution: Arc<ImageResolutionState>,
 }
 
 impl ImageService {
@@ -2400,7 +2577,119 @@ impl ImageService {
             database,
             access,
             config_dir,
+            resolution: Arc::new(ImageResolutionState::default()),
         }
+    }
+
+    /// Canonical metadata root, canonicalized once per service instance.
+    ///
+    /// `config_dir` is fixed for the process (it comes from the environment at startup), so a
+    /// successful canonicalization is reused instead of being repeated for every image request.
+    /// Failures are not cached: the metadata directory may not exist yet when the first request
+    /// arrives and has to be picked up as soon as it appears.
+    async fn canonical_metadata_root(&self) -> Option<PathBuf> {
+        {
+            let cached = resolution_lock(&self.resolution.canonical_metadata_root);
+            if let Some(root) = cached.as_ref() {
+                return Some(root.clone());
+            }
+        }
+        #[cfg(test)]
+        self.resolution
+            .metadata_root_canonicalizations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let canonical = fs::canonicalize(metadata_root(&self.config_dir))
+            .await
+            .ok()?;
+        *resolution_lock(&self.resolution.canonical_metadata_root) = Some(canonical.clone());
+        Some(canonical)
+    }
+
+    /// Returns the cached resolution for `candidate` while it is still trustworthy.
+    ///
+    /// A hit costs two `lstat` calls (the file and its directory) instead of a canonicalize plus a
+    /// containment check. When the file or its directory can no longer be inspected, or their
+    /// identity/stamp changed, the entry is dropped and the caller falls back to the full
+    /// validation path, so a deleted, replaced, relocated, or newly escaping path is never served
+    /// from a stale entry.
+    async fn cached_resolution(
+        &self,
+        candidate: &StoredItemImageCandidate,
+    ) -> Option<ResolvedImage> {
+        let key = ImageResolutionKey::for_candidate(candidate);
+        let cached = {
+            let cache = resolution_lock(&self.resolution.cache);
+            cache
+                .get(&key)
+                .filter(|image| image.matches(&candidate.local_path, &candidate.root_path))
+                .cloned()
+        }?;
+        let metadata = match fs::symlink_metadata(&cached.canonical_path).await {
+            Ok(metadata) => metadata,
+            Err(_) => {
+                self.forget_resolution(&key);
+                return None;
+            }
+        };
+        let Some(parent) = cached.canonical_path.parent() else {
+            self.forget_resolution(&key);
+            return None;
+        };
+        let parent_metadata = match fs::symlink_metadata(parent).await {
+            Ok(parent_metadata) => parent_metadata,
+            Err(_) => {
+                self.forget_resolution(&key);
+                return None;
+            }
+        };
+        if !cached.still_current(&metadata) || !cached.parent_is_current(&parent_metadata) {
+            self.forget_resolution(&key);
+            return None;
+        }
+        #[cfg(test)]
+        self.resolution
+            .cache_hits
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Some(resolved_image(
+            candidate,
+            &cached.canonical_path,
+            cached.content_type,
+            &metadata,
+        ))
+    }
+
+    fn remember_resolution(&self, key: ImageResolutionKey, image: ResolvedItemImage) {
+        resolution_lock(&self.resolution.cache).insert(key, image);
+    }
+
+    fn forget_resolution(&self, key: &ImageResolutionKey) {
+        resolution_lock(&self.resolution.cache).remove(key);
+    }
+
+    #[cfg(test)]
+    fn path_validation_count(&self) -> usize {
+        self.resolution
+            .path_validations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn cached_resolution_count(&self) -> usize {
+        resolution_lock(&self.resolution.cache).len()
+    }
+
+    #[cfg(test)]
+    fn metadata_root_canonicalization_count(&self) -> usize {
+        self.resolution
+            .metadata_root_canonicalizations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn cache_hit_count(&self) -> usize {
+        self.resolution
+            .cache_hits
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn resolve(
@@ -2452,22 +2741,28 @@ impl ImageService {
 
     async fn resolve_candidates(
         &self,
-        candidates: Vec<crate::storage::StoredItemImageCandidate>,
+        candidates: Vec<StoredItemImageCandidate>,
     ) -> Result<Option<ResolvedImage>, ImageError> {
         if candidates.is_empty() {
             return Ok(None);
         }
 
-        let metadata_root = fs::canonicalize(metadata_root(&self.config_dir)).await.ok();
+        let metadata_root = self.canonical_metadata_root().await;
         let mut canonical_roots = HashMap::<PathBuf, Option<PathBuf>>::new();
         let mut canonical_paths = HashMap::<PathBuf, Option<PathBuf>>::new();
-        let mut metadata_by_path = HashMap::<PathBuf, std::fs::Metadata>::new();
         let mut saw_outside_root = false;
         for candidate in candidates {
+            if let Some(image) = self.cached_resolution(&candidate).await {
+                return Ok(Some(image));
+            }
             let path = PathBuf::from(&candidate.local_path);
             let canonical_path = if let Some(canonical_path) = canonical_paths.get(&path) {
                 canonical_path.clone()
             } else {
+                #[cfg(test)]
+                self.resolution
+                    .path_validations
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let canonical_path = fs::canonicalize(&path).await.ok();
                 canonical_paths.insert(path, canonical_path.clone());
                 canonical_path
@@ -2493,19 +2788,13 @@ impl ImageService {
                 saw_outside_root = true;
                 continue;
             }
-            let metadata = if let Some(metadata) = metadata_by_path.get(&canonical_path) {
-                metadata.clone()
-            } else {
-                let metadata =
-                    fs::metadata(&canonical_path)
-                        .await
-                        .map_err(|source| ImageError::Io {
-                            path: canonical_path.clone(),
-                            source,
-                        })?;
-                metadata_by_path.insert(canonical_path.clone(), metadata.clone());
-                metadata
-            };
+            let metadata =
+                fs::metadata(&canonical_path)
+                    .await
+                    .map_err(|source| ImageError::Io {
+                        path: canonical_path.clone(),
+                        source,
+                    })?;
             if !metadata.is_file() {
                 return Ok(None);
             }
@@ -2518,29 +2807,35 @@ impl ImageService {
             let Some(content_type) = content_type(&canonical_path) else {
                 return Ok(None);
             };
-            let modified = metadata
-                .modified()
-                .ok()
-                .and_then(|time| time.duration_since(UNIX_EPOCH).ok());
-            let etag = format!(
-                "\"{}-{}-{}\"",
-                metadata.len(),
-                modified.map(|value| value.as_secs()).unwrap_or_default(),
-                modified
-                    .map(|value| value.subsec_nanos())
-                    .unwrap_or_default()
-            );
-            return Ok(Some(ResolvedImage {
-                id: candidate.id,
-                image_type: candidate.image_type,
-                path: canonical_path,
+            // Only a candidate that just passed the root containment checks is cached, and the
+            // entry records the file and its directory identity so a later hit can prove the path
+            // still resolves to the file that was validated instead of skipping the checks.
+            if let Some(parent) = canonical_path.parent()
+                && let Ok(parent_metadata) = fs::symlink_metadata(parent).await
+                && parent_metadata.is_dir()
+            {
+                self.remember_resolution(
+                    ImageResolutionKey::for_candidate(&candidate),
+                    ResolvedItemImage {
+                        local_path: candidate.local_path.clone(),
+                        root_path: candidate.root_path.clone(),
+                        canonical_path: canonical_path.clone(),
+                        content_type,
+                        device: metadata.dev(),
+                        inode: metadata.ino(),
+                        size: metadata.len(),
+                        modified: modified_stamp(&metadata),
+                        parent_device: parent_metadata.dev(),
+                        parent_inode: parent_metadata.ino(),
+                    },
+                );
+            }
+            return Ok(Some(resolved_image(
+                &candidate,
+                &canonical_path,
                 content_type,
-                content_length: metadata.len(),
-                etag,
-                content_tag: candidate.content_tag,
-                width: candidate.width,
-                height: candidate.height,
-            }));
+                &metadata,
+            )));
         }
 
         if saw_outside_root {
@@ -2888,13 +3183,20 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::{
-        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RETRY_BASE_DELAY, IMAGE_RETRY_MAX_DELAY, ImagePermitPool,
-        ImageWriteError, background_image_content_tag_and_dimensions_from_bytes,
-        canonical_image_stems, ensure_public_image_host, global_image_download_permits,
-        global_image_write_permits, image_attempt_failure,
-        image_content_tag_and_dimensions_from_bytes, image_download_retry_delay,
-        image_language_matches, image_lookup_stems, is_allowed_scraper_image_url,
-        retryable_image_status, should_suppress_internal_image_write, write_image_atomically,
+        IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
+        IMAGE_RETRY_MAX_DELAY, ImageError, ImagePermitPool, ImageResolutionCache,
+        ImageResolutionKey, ImageService, ImageWriteError,
+        background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
+        ensure_public_image_host, global_image_download_permits, global_image_write_permits,
+        image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
+        image_download_retry_delay, image_language_matches, image_lookup_stems,
+        is_allowed_scraper_image_url, retryable_image_status, should_suppress_internal_image_write,
+        write_image_atomically,
+    };
+    use crate::{
+        application::access::MediaAccessService,
+        config::Config,
+        storage::{Database, StoredItemImageCandidate},
     };
     use reqwest::Url;
 
@@ -3141,5 +3443,402 @@ mod tests {
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-fanart1"));
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb1"));
         assert!(lookup.iter().any(|stem| stem == "Example.S01E01-thumb-1"));
+    }
+
+    fn stored_image_candidate(
+        id: &str,
+        local_path: &std::path::Path,
+        root_path: &std::path::Path,
+        content_tag: &str,
+    ) -> StoredItemImageCandidate {
+        StoredItemImageCandidate {
+            id: id.to_owned(),
+            image_type: "POSTER".to_owned(),
+            local_path: local_path
+                .to_str()
+                .expect("test image path is valid UTF-8")
+                .to_owned(),
+            root_path: root_path
+                .to_str()
+                .expect("test library root is valid UTF-8")
+                .to_owned(),
+            content_tag: Some(content_tag.to_owned()),
+            width: Some(1000),
+            height: Some(1500),
+        }
+    }
+
+    async fn image_service_for_tests(
+        config_dir: &std::path::Path,
+    ) -> Result<ImageService, Box<dyn std::error::Error>> {
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.to_owned(),
+        })
+        .await?;
+        Ok(ImageService::new(
+            database.clone(),
+            MediaAccessService::new(database),
+            config_dir.to_owned(),
+        ))
+    }
+
+    fn resolution_key(id: &str, content_tag: &str) -> ImageResolutionKey {
+        ImageResolutionKey {
+            image_id: id.to_owned(),
+            content_tag: Some(content_tag.to_owned()),
+        }
+    }
+
+    #[tokio::test]
+    async fn repeated_image_resolution_reuses_the_validated_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Cached Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        let first = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("first resolution")?;
+        assert_eq!(service.path_validation_count(), 1);
+        assert_eq!(service.cached_resolution_count(), 1);
+        assert_eq!(service.cache_hit_count(), 0);
+
+        let second = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("cached resolution")?;
+
+        assert_eq!(second, first, "a cached resolution keeps the same etag");
+        assert_eq!(
+            service.path_validation_count(),
+            1,
+            "a cache hit must not repeat canonicalize/containment validation"
+        );
+        assert_eq!(service.cached_resolution_count(), 1);
+        assert_eq!(service.cache_hit_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn metadata_root_is_canonicalized_once_per_service()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config_dir = temp.path().join("config");
+        let metadata_root = config_dir.join("metadata");
+        tokio::fs::create_dir_all(&metadata_root).await?;
+        let service = image_service_for_tests(&config_dir).await?;
+        let root = temp.path().join("Movies");
+        tokio::fs::create_dir_all(&root).await?;
+        let managed_dir = metadata_root.join("library").join("item");
+        tokio::fs::create_dir_all(&managed_dir).await?;
+        let managed_poster = managed_dir.join("poster.jpg");
+        tokio::fs::write(&managed_poster, b"managed").await?;
+
+        for _ in 0..3 {
+            let original_root = temp.path().join("missing-root");
+            service
+                .resolve_candidates(vec![stored_image_candidate(
+                    "image-1",
+                    &managed_poster,
+                    &original_root,
+                    "tag-1",
+                )])
+                .await?
+                .ok_or("managed image resolution")?;
+        }
+
+        assert_eq!(
+            service.metadata_root_canonicalization_count(),
+            1,
+            "the metadata root is canonicalized once and reused"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_resolution_falls_back_when_the_file_is_removed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Deleted Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+        assert_eq!(service.cached_resolution_count(), 1);
+
+        tokio::fs::remove_file(&poster).await?;
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?;
+
+        assert!(resolved.is_none(), "a deleted image no longer resolves");
+        assert_eq!(
+            service.cached_resolution_count(),
+            0,
+            "the stale cache entry is dropped after the load fails"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_resolution_rejects_a_directory_that_became_an_escaping_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Escaping Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await?;
+        // Move the validated directory out of the library root and link it back, so the poster
+        // keeps its inode and stamp: only the directory identity can expose the escape.
+        tokio::fs::rename(&movie_dir, outside.join("movie")).await?;
+        std::os::unix::fs::symlink(outside.join("movie"), &movie_dir)?;
+
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await;
+
+        assert!(
+            matches!(resolved, Err(ImageError::Forbidden)),
+            "a cached resolution must re-check containment after the path escapes the root, got {resolved:?}"
+        );
+        assert_eq!(
+            service.cached_resolution_count(),
+            0,
+            "the escaping cache entry is dropped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_resolution_rejects_a_replaced_escaping_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Swapped Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await?;
+        tokio::fs::write(outside.join("poster.jpg"), b"outside-poster-bytes").await?;
+        tokio::fs::remove_dir_all(&movie_dir).await?;
+        std::os::unix::fs::symlink(&outside, &movie_dir)?;
+
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await;
+
+        assert!(matches!(resolved, Err(ImageError::Forbidden)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn candidate_paths_outside_every_root_are_rejected()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        tokio::fs::create_dir_all(&root).await?;
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await?;
+        let outside_poster = outside.join("poster.jpg");
+        tokio::fs::write(&outside_poster, b"outside").await?;
+        let traversing = root.join("..").join("outside").join("poster.jpg");
+
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1",
+                &traversing,
+                &root,
+                "tag-1",
+            )])
+            .await;
+
+        assert!(matches!(resolved, Err(ImageError::Forbidden)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_changed_local_path_bypasses_the_cached_resolution()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Replaced Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+        let replacement = movie_dir.join("poster.png");
+        tokio::fs::write(&replacement, b"replacement-bytes").await?;
+
+        let first = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+        assert_eq!(first.path, poster.canonicalize()?);
+
+        let second = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1",
+                &replacement,
+                &root,
+                "tag-1",
+            )])
+            .await?
+            .ok_or("updated resolution")?;
+
+        assert_eq!(
+            second.path,
+            replacement.canonicalize()?,
+            "a database path change must not be served from the cache"
+        );
+        assert_eq!(second.content_length, "replacement-bytes".len() as u64);
+        assert_eq!(service.path_validation_count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_new_content_tag_is_resolved_again() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Retagged Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-2",
+            )])
+            .await?
+            .ok_or("retagged resolution")?;
+
+        assert_eq!(
+            service.path_validation_count(),
+            2,
+            "a new content tag has no cached path"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_replaced_file_refreshes_the_etag() -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Rewritten Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        let first = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+
+        tokio::fs::write(&poster, b"poster-bytes-with-a-new-length").await?;
+        let second = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("rewritten resolution")?;
+
+        assert_eq!(second.content_length, 30);
+        assert_ne!(
+            second.etag, first.etag,
+            "the cached resolution still reports the current file stamp"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn resolution_cache_evicts_beyond_its_capacity() {
+        let mut cache = ImageResolutionCache::default();
+        assert_eq!(cache.len(), 0);
+        for index in 0..IMAGE_RESOLUTION_CACHE_CAPACITY + 3 {
+            cache.insert(
+                resolution_key(&format!("image-{index}"), "tag"),
+                super::ResolvedItemImage {
+                    local_path: format!("/media/poster-{index}.jpg"),
+                    root_path: "/media".to_owned(),
+                    canonical_path: std::path::PathBuf::from(format!("/media/poster-{index}.jpg")),
+                    content_type: "image/jpeg",
+                    device: 1,
+                    inode: index as u64,
+                    size: 8,
+                    modified: Some((1, 0)),
+                    parent_device: 1,
+                    parent_inode: 1,
+                },
+            );
+        }
+
+        assert_eq!(cache.len(), IMAGE_RESOLUTION_CACHE_CAPACITY);
+        assert!(cache.get(&resolution_key("image-0", "tag")).is_none());
+        assert!(
+            cache
+                .get(&resolution_key(
+                    &format!("image-{}", IMAGE_RESOLUTION_CACHE_CAPACITY + 2),
+                    "tag"
+                ))
+                .is_some()
+        );
     }
 }
