@@ -214,16 +214,9 @@ async fn playback_events_preserve_same_session_order_and_allow_new_session_rewin
     let (high, low) = tokio::join!(high_request, low);
     assert_eq!(high??.status(), reqwest::StatusCode::NO_CONTENT);
     assert_eq!(low?.status(), reqwest::StatusCode::NO_CONTENT);
-    let same_session_position: i64 = sqlx::query_scalar(
-        "SELECT position_ticks FROM user_item_state
-         WHERE user_id = ? AND item_id = ?",
-    )
-    .bind(admin.id.to_string())
-    .bind(&item_id)
-    .fetch_one(database.pool())
-    .await?;
-    assert_eq!(same_session_position, 900);
-
+    // A plain progress tick may stay in memory for up to the coalescing window before it reaches
+    // `user_item_state`, so the same-session ordering is asserted through the session API, which
+    // already reports the merged position (the stored row catches up on the next flush).
     let sessions = client
         .get(format!("{base_url}/Sessions"))
         .header("X-Emby-Token", &token)
