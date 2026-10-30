@@ -53,7 +53,6 @@ export function CollectionDetailPage() {
   return (
     <main className="lux-detail-page lux-collection-detail">
       <MediaDetailArtwork media={collection} placement="backdrop" />
-      <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
         <Link className="lux-detail-collection-return lux-collection-back" to={`/libraries/${GLOBAL_COLLECTION_LIBRARY_ID}`}>
           <ArrowLeft size={16} aria-hidden="true" /> 返回合集库

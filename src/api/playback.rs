@@ -1502,8 +1502,10 @@ pub(super) async fn handle_emby_playback_event(
     let item_access = if is_global_collection_work {
         access.can_view_item(principal, &internal_item_id).await
     } else {
+        // A progress tick repeats this check every ~10 s for the same session, so it may reuse a
+        // recent "allowed" answer. The global collection branch above keeps its own lookup.
         access
-            .can_view_item_in_library(
+            .can_view_item_in_library_cached(
                 principal,
                 &internal_item_id,
                 resolved_item_library_id.as_deref(),
@@ -1784,7 +1786,7 @@ pub(super) async fn handle_emby_playback_event(
             {
                 return web_playback_error(&headers, error);
             }
-            state.user_events.publish_home_coalesced().await;
+            state.user_events.publish_home_coalesced_for(&user_id).await;
             if state_name != "STOPPED"
                 && let Some(session_id) = emby_transcode_session_id
             {
@@ -4557,7 +4559,18 @@ pub(super) async fn lux_web_playback_event(
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        state.user_events.publish_home_coalesced().await;
+        state
+            .user_events
+            .publish_progress_coalesced(&session.user_id, &session.item_id)
+            .await;
+        // A played flip changes the episode, season, series and library played
+        // markers, which the narrow progress refresh does not cover. Notify the
+        // user's other tabs with the full user-level item scope.
+        if effects.is_played_changed {
+            state
+                .user_events
+                .publish_for_user(UserEventScope::Item, &session.user_id);
+        }
         if let Some(event_type) = activity_event {
             record_activity_event(
                 Some(database),
@@ -4792,8 +4805,10 @@ pub(super) async fn lux_post_progress(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let access = state.access();
+    // The web player posts progress every ~10 s for the same item, so this tick may reuse a recent
+    // "allowed" answer instead of re-reading library access and content restrictions.
     match access
-        .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
+        .can_view_item_cached(AccessPrincipal::new(user.id, user.is_admin), &item_id)
         .await
     {
         Ok(true) => {}
@@ -4872,7 +4887,7 @@ pub(super) async fn lux_post_progress(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            state.user_events.publish_home_coalesced().await;
+            state.user_events.publish_home_coalesced_for(&user_id).await;
             if let Some(event_type) = activity_event {
                 record_activity_event(
                     Some(database),
@@ -5014,11 +5029,14 @@ pub(super) async fn handle_emby_user_flag(
                 Ok(user_state) => user_state,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            state.user_events.publish(if played {
-                UserEventScope::Item
-            } else {
-                UserEventScope::Favorites
-            });
+            state.user_events.publish_for_user(
+                if played {
+                    UserEventScope::Item
+                } else {
+                    UserEventScope::Favorites
+                },
+                &target_user_id,
+            );
             Json(emby_user_item_data_json(&item_id, user_state.as_ref())).into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -5113,7 +5131,9 @@ pub(super) async fn lux_set_favorite(
         .await
     {
         Ok(()) => {
-            state.user_events.publish(UserEventScope::Favorites);
+            state
+                .user_events
+                .publish_for_user(UserEventScope::Favorites, &user.id.to_string());
             StatusCode::NO_CONTENT.into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -5155,7 +5175,9 @@ pub(super) async fn lux_set_played(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            state.user_events.publish(UserEventScope::Item);
+            state
+                .user_events
+                .publish_for_user(UserEventScope::Item, &user.id.to_string());
             StatusCode::NO_CONTENT.into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),

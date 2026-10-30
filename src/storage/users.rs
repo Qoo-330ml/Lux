@@ -646,6 +646,8 @@ impl Database {
         .map_err(self.sqlx_err())?;
 
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // The preset replaces `library_access_mode` and every `user_library_access` row above.
+        self.access_changes.invalidate_user(user_id);
         Ok(true)
     }
 
@@ -1509,6 +1511,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.access_changes.invalidate_user(user_id);
         Ok(true)
     }
 
@@ -1630,6 +1633,7 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.access_changes.invalidate_user(user_id);
         Ok(Some(hls_session_ids))
     }
 
@@ -1759,7 +1763,9 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        self.access_changes.invalidate_user(target_user_id);
+        Ok(())
     }
 
     pub(crate) async fn mark_user_logged_in(&self, user_id: &str) -> Result<(), StorageError> {
@@ -2597,7 +2603,9 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        self.access_changes.invalidate_user(user_id);
+        Ok(())
     }
 
     pub(crate) async fn set_user_library_access_batch(
@@ -2647,7 +2655,9 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        self.access_changes.invalidate_user(user_id);
+        Ok(())
     }
 
     pub(crate) async fn user_library_access_mode(
@@ -2701,6 +2711,7 @@ impl Database {
             }
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.access_changes.invalidate_user(user_id);
         Ok(true)
     }
 
@@ -3648,6 +3659,8 @@ impl Database {
         }
 
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // Both the library access group and the content group change what the target user may see.
+        self.access_changes.invalidate_user(target_user_id);
         Ok(UserPermissionCopyResult::Updated)
     }
 
@@ -3875,6 +3888,9 @@ impl Database {
             }
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // The new policy changes which items this user may see, so a cached "allowed" answer for
+        // the same item is no longer trustworthy.
+        self.access_changes.invalidate_user(user_id);
         let Some(updated) = self.user_content_restrictions(user_id).await? else {
             return Ok(UserContentRestrictionsCasResult::UserUnavailable);
         };

@@ -5,7 +5,7 @@ import { ArrowLeft, Sparkles, Star, X } from "lucide-react";
 import { api } from "../../lib/api/client";
 import { queryKeys, queryRefreshIntervals } from "../../lib/api/query-keys";
 import type { MediaItem } from "../../lib/api/types";
-import { episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media-display";
+import { detailBackdropUrl, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback, runtimeLabel } from "../home/media-display";
 import { useImageVariants } from "../home/image-variants";
 import { useMediaSource } from "./MediaSourcePanel";
 import { sourceBadges } from "./media-source";
@@ -51,24 +51,32 @@ function useDetailIdentity(media: MediaItem) {
   const backdropWidth = enabled ? 1280 : undefined;
   const posterWidth = enabled ? 720 : undefined;
   const seriesImageFallback = media.itemType === "SEASON" ? series : undefined;
-  const backdrop = imageUrl(media, "fanart", backdropWidth) ?? imageUrl(media, "poster", backdropWidth)
+  const backdrop = detailBackdropUrl(media, series, backdropWidth);
+  const landscape = imageUrl(media, "fanart", backdropWidth) ?? imageUrl(media, "poster", backdropWidth)
     ?? (seriesImageFallback
       ? imageUrl(seriesImageFallback, "fanart", backdropWidth) ?? imageUrl(seriesImageFallback, "poster", backdropWidth)
       : undefined);
   const poster = posterUrlWithFallback(media, seriesImageFallback, posterWidth);
-  return { series, backdrop, poster };
+  return { series, backdrop, landscape, poster };
 }
 
 export const MediaDetailArtwork = memo(function MediaDetailArtwork({ media, placement }: { media: MediaItem; placement: "backdrop" | "poster" }) {
-  const { backdrop, poster } = useDetailIdentity(media);
+  const { backdrop, landscape, poster } = useDetailIdentity(media);
   const isEpisode = media.itemType === "EPISODE";
-  if (placement === "backdrop") return backdrop ? <img className="lux-detail-backdrop" src={backdrop} alt="" /> : null;
+  if (placement === "backdrop") {
+    return backdrop
+      ? <div className="lux-detail-backdrop-frame">
+        <img className="lux-detail-backdrop" src={backdrop} alt="" />
+        <div className="lux-detail-overlay" />
+      </div>
+      : null;
+  }
   return (
           <div className="lux-detail-poster-column">
             <div className={`lux-detail-poster${isEpisode ? " is-landscape" : ""}${isEpisode && poster ? " has-portrait" : ""}`}>
-              {isEpisode && backdrop
+              {isEpisode && landscape
                 ? <>
-                  <img className="lux-detail-poster-landscape" src={backdrop} alt={`${mediaTitle(media)} 剧照`} />
+                  <img className="lux-detail-poster-landscape" src={landscape} alt={`${mediaTitle(media)} 剧照`} />
                   {poster ? <img className="lux-detail-poster-portrait" src={poster} alt={`${mediaTitle(media)} 海报`} /> : null}
                 </>
                 : poster

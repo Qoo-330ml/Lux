@@ -1764,7 +1764,7 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
         .await?;
 
     let user_events = UserEventHub::new();
-    let mut user_event_receiver = user_events.subscribe();
+    let mut user_event_receiver = user_events.subscribe_for("viewer");
     let jobs = ScanJobService::new(database.clone()).with_user_events(user_events);
     let job = jobs.create_movie_scan_job(library.id).await?;
     let discovery_mode: String =
@@ -1833,7 +1833,9 @@ async fn full_scan_manifest_indexes_safe_positive_batches_during_discovery()
                 "indexing should remain bounded per batch"
             );
             assert_eq!(
-                tokio::time::timeout(Duration::from_secs(1), user_event_receiver.recv()).await??,
+                tokio::time::timeout(Duration::from_secs(1), user_event_receiver.recv())
+                    .await??
+                    .scope(),
                 UserEventScope::Home,
                 "a committed positive batch notifies home before discovery ends"
             );
@@ -2138,7 +2140,7 @@ async fn streamed_manifest_rolls_back_local_outbox_with_positive_index()
         .await?;
 
     let user_events = UserEventHub::new();
-    let mut user_event_receiver = user_events.subscribe();
+    let mut user_event_receiver = user_events.subscribe_for("viewer");
     let jobs = ScanJobService::new(database.clone()).with_user_events(user_events);
     let job = jobs.create_movie_scan_job(library.id).await?;
     jobs.run_batch(&job.id, 100).await?;

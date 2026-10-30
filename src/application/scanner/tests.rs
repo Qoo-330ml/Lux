@@ -1117,7 +1117,7 @@ async fn full_manifest_scan_refreshes_home_once_before_postprocessing()
     assert_eq!(before.recently_added.total, 0);
 
     let user_events = UserEventHub::new();
-    let mut receiver = user_events.subscribe();
+    let mut receiver = user_events.subscribe_for("viewer");
     let webhooks = WebhookService::new(database.clone(), config.config_dir.clone())?;
     webhooks
         .create_destination(
@@ -1147,7 +1147,10 @@ async fn full_manifest_scan_refreshes_home_once_before_postprocessing()
         .await?
         .ok_or("scan job disappeared")?;
     assert_eq!(stored_job.scan_phase, "POSTPROCESSING");
-    assert_eq!(receiver.try_recv(), Ok(UserEventScope::Home));
+    assert_eq!(
+        receiver.try_recv().ok().map(|event| event.scope()),
+        Some(UserEventScope::Home)
+    );
     assert!(matches!(
         receiver.try_recv(),
         Err(tokio::sync::broadcast::error::TryRecvError::Empty)
@@ -2435,7 +2438,7 @@ async fn local_metadata_worker_dispatches_fill_missing_without_blocking_scan()
         "workflow 3 does not enqueue a second terminal library job"
     );
     tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
-    let mut user_events_receiver = user_events.subscribe();
+    let mut user_events_receiver = user_events.subscribe_for("viewer");
     gate_scraper.release_search.add_permits(16);
     tokio::time::timeout(std::time::Duration::from_secs(10), async {
         loop {
@@ -2480,7 +2483,8 @@ async fn local_metadata_worker_dispatches_fill_missing_without_blocking_scan()
         std::time::Duration::from_secs(5),
         user_events_receiver.recv(),
     )
-    .await??;
+    .await??
+    .scope();
     assert_eq!(home_event, UserEventScope::Home);
     Ok(())
 }
