@@ -2429,8 +2429,6 @@ struct ResolvedItemImage {
     inode: u64,
     size: u64,
     modified: Option<(u64, u32)>,
-    parent_device: u64,
-    parent_inode: u64,
 }
 
 impl ResolvedItemImage {
@@ -2443,25 +2441,14 @@ impl ResolvedItemImage {
     ///
     /// Reusing the cached canonical path is only safe while the path resolves to the same inode
     /// with the same stamp, so a replaced, rewritten, or deleted image always falls back to the
-    /// full canonicalize + containment path.
+    /// full canonicalize + containment path. `metadata` must come from `lstat`, so a poster that
+    /// was replaced by a symlink is not mistaken for the validated file.
     fn still_current(&self, metadata: &std::fs::Metadata) -> bool {
         metadata.file_type().is_file()
             && metadata.dev() == self.device
             && metadata.ino() == self.inode
             && metadata.len() == self.size
             && modified_stamp(metadata) == self.modified
-    }
-
-    /// True when the validated parent directory is still the same real directory.
-    ///
-    /// Together with [`Self::still_current`] this proves the cached path resolves to the very file
-    /// that passed containment, even if any directory above it was replaced by a symlink: swapping
-    /// the parent for a link changes either its own metadata (a link is not a directory) or the
-    /// directory the path resolves to, and both fail here.
-    fn parent_is_current(&self, metadata: &std::fs::Metadata) -> bool {
-        metadata.file_type().is_dir()
-            && metadata.dev() == self.parent_device
-            && metadata.ino() == self.parent_inode
     }
 }
 
@@ -2514,10 +2501,22 @@ impl ImageResolutionCache {
     }
 }
 
+/// The canonical metadata root together with the directory identity it was canonicalized from.
+///
+/// The identity is re-checked with one `stat` per resolution, so a metadata directory that is
+/// removed, recreated, or re-pointed through a symlink is canonicalized again instead of being
+/// compared against a stale path for the rest of the process lifetime.
+#[derive(Clone, Debug)]
+struct CachedMetadataRoot {
+    path: PathBuf,
+    device: u64,
+    inode: u64,
+}
+
 #[derive(Default)]
 struct ImageResolutionState {
     cache: StdMutex<ImageResolutionCache>,
-    canonical_metadata_root: StdMutex<Option<PathBuf>>,
+    canonical_metadata_root: StdMutex<Option<CachedMetadataRoot>>,
     #[cfg(test)]
     path_validations: AtomicUsize,
     #[cfg(test)]
@@ -2581,37 +2580,52 @@ impl ImageService {
         }
     }
 
-    /// Canonical metadata root, canonicalized once per service instance.
+    /// Canonical metadata root, canonicalized once per service instance and revalidated cheaply.
     ///
     /// `config_dir` is fixed for the process (it comes from the environment at startup), so a
     /// successful canonicalization is reused instead of being repeated for every image request.
-    /// Failures are not cached: the metadata directory may not exist yet when the first request
-    /// arrives and has to be picked up as soon as it appears.
+    /// The cached value carries the directory identity of the configured metadata root and is
+    /// verified with one `stat` per resolution: when the directory is removed, recreated, or
+    /// re-pointed through a symlink, it is canonicalized again. Failures are not cached either, so
+    /// a metadata directory created after startup is still picked up.
     async fn canonical_metadata_root(&self) -> Option<PathBuf> {
-        {
-            let cached = resolution_lock(&self.resolution.canonical_metadata_root);
-            if let Some(root) = cached.as_ref() {
-                return Some(root.clone());
+        let configured = metadata_root(&self.config_dir);
+        let cached = resolution_lock(&self.resolution.canonical_metadata_root).clone();
+        if let Some(cached) = cached {
+            let current = fs::metadata(&configured).await.ok();
+            if current.is_some_and(|metadata| {
+                metadata.is_dir()
+                    && metadata.dev() == cached.device
+                    && metadata.ino() == cached.inode
+            }) {
+                return Some(cached.path);
             }
+            *resolution_lock(&self.resolution.canonical_metadata_root) = None;
         }
         #[cfg(test)]
         self.resolution
             .metadata_root_canonicalizations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let canonical = fs::canonicalize(metadata_root(&self.config_dir))
-            .await
-            .ok()?;
-        *resolution_lock(&self.resolution.canonical_metadata_root) = Some(canonical.clone());
+        let canonical = fs::canonicalize(&configured).await.ok()?;
+        let metadata = fs::metadata(&configured).await.ok()?;
+        if !metadata.is_dir() {
+            return None;
+        }
+        *resolution_lock(&self.resolution.canonical_metadata_root) = Some(CachedMetadataRoot {
+            path: canonical.clone(),
+            device: metadata.dev(),
+            inode: metadata.ino(),
+        });
         Some(canonical)
     }
 
     /// Returns the cached resolution for `candidate` while it is still trustworthy.
     ///
-    /// A hit costs two `lstat` calls (the file and its directory) instead of a canonicalize plus a
-    /// containment check. When the file or its directory can no longer be inspected, or their
-    /// identity/stamp changed, the entry is dropped and the caller falls back to the full
-    /// validation path, so a deleted, replaced, relocated, or newly escaping path is never served
-    /// from a stale entry.
+    /// A hit costs one `lstat` plus one `realpath` instead of the full candidate validation. When
+    /// the file cannot be inspected, its identity/stamp changed, or its path no longer resolves to
+    /// the validated location, the entry is dropped and the caller falls back to the full
+    /// canonicalize + containment check, so a deleted, replaced, relocated, or newly escaping path
+    /// is never served from a stale entry.
     async fn cached_resolution(
         &self,
         candidate: &StoredItemImageCandidate,
@@ -2631,18 +2645,7 @@ impl ImageService {
                 return None;
             }
         };
-        let Some(parent) = cached.canonical_path.parent() else {
-            self.forget_resolution(&key);
-            return None;
-        };
-        let parent_metadata = match fs::symlink_metadata(parent).await {
-            Ok(parent_metadata) => parent_metadata,
-            Err(_) => {
-                self.forget_resolution(&key);
-                return None;
-            }
-        };
-        if !cached.still_current(&metadata) || !cached.parent_is_current(&parent_metadata) {
+        if !cached.still_current(&metadata) || !self.cached_path_still_contained(&cached).await {
             self.forget_resolution(&key);
             return None;
         }
@@ -2658,10 +2661,26 @@ impl ImageService {
         ))
     }
 
+    /// Re-proves that a cached path still resolves inside the roots it was validated against.
+    ///
+    /// The parent directory of a validated canonical path is canonical itself and a prefix of a
+    /// path that passed the containment check, so canonicalizing it again has to return the very
+    /// same path. Any ancestor replaced by a symlink - including directories several levels above
+    /// the file, whose child inode is unchanged - changes that result and forces the caller back
+    /// through the full canonicalize + containment path, so a cache hit can never release a path
+    /// the cold path would reject.
+    async fn cached_path_still_contained(&self, cached: &ResolvedItemImage) -> bool {
+        let Some(parent) = cached.canonical_path.parent() else {
+            return false;
+        };
+        fs::canonicalize(parent)
+            .await
+            .is_ok_and(|resolved| resolved.as_path() == parent)
+    }
+
     fn remember_resolution(&self, key: ImageResolutionKey, image: ResolvedItemImage) {
         resolution_lock(&self.resolution.cache).insert(key, image);
     }
-
     fn forget_resolution(&self, key: &ImageResolutionKey) {
         resolution_lock(&self.resolution.cache).remove(key);
     }
@@ -2807,29 +2826,23 @@ impl ImageService {
             let Some(content_type) = content_type(&canonical_path) else {
                 return Ok(None);
             };
-            // Only a candidate that just passed the root containment checks is cached, and the
-            // entry records the file and its directory identity so a later hit can prove the path
-            // still resolves to the file that was validated instead of skipping the checks.
-            if let Some(parent) = canonical_path.parent()
-                && let Ok(parent_metadata) = fs::symlink_metadata(parent).await
-                && parent_metadata.is_dir()
-            {
-                self.remember_resolution(
-                    ImageResolutionKey::for_candidate(&candidate),
-                    ResolvedItemImage {
-                        local_path: candidate.local_path.clone(),
-                        root_path: candidate.root_path.clone(),
-                        canonical_path: canonical_path.clone(),
-                        content_type,
-                        device: metadata.dev(),
-                        inode: metadata.ino(),
-                        size: metadata.len(),
-                        modified: modified_stamp(&metadata),
-                        parent_device: parent_metadata.dev(),
-                        parent_inode: parent_metadata.ino(),
-                    },
-                );
-            }
+            // Only a candidate that just passed the root containment checks is cached. The entry
+            // records the file identity so a later hit can prove the path still resolves to the
+            // file that was validated, and [`Self::cached_path_still_contained`] re-proves the
+            // containment itself.
+            self.remember_resolution(
+                ImageResolutionKey::for_candidate(&candidate),
+                ResolvedItemImage {
+                    local_path: candidate.local_path.clone(),
+                    root_path: candidate.root_path.clone(),
+                    canonical_path: canonical_path.clone(),
+                    content_type,
+                    device: metadata.dev(),
+                    inode: metadata.ino(),
+                    size: metadata.len(),
+                    modified: modified_stamp(&metadata),
+                },
+            );
             return Ok(Some(resolved_image(
                 &candidate,
                 &canonical_path,
@@ -3199,6 +3212,7 @@ mod tests {
         storage::{Database, StoredItemImageCandidate},
     };
     use reqwest::Url;
+    use std::path::PathBuf;
 
     #[test]
     fn image_retries_only_transient_upstream_statuses() {
@@ -3566,6 +3580,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn metadata_root_is_canonicalized_again_when_the_directory_is_repointed()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let config_dir = temp.path().join("config");
+        let configured_metadata_root = config_dir.join("metadata");
+        let managed_relative = PathBuf::from("library").join("item").join("poster.jpg");
+        tokio::fs::create_dir_all(configured_metadata_root.join("library").join("item")).await?;
+        let configured_poster = configured_metadata_root.join(&managed_relative);
+        tokio::fs::write(&configured_poster, b"managed").await?;
+        let service = image_service_for_tests(&config_dir).await?;
+        let missing_media_root = temp.path().join("missing-root");
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1",
+                &configured_poster,
+                &missing_media_root,
+                "tag-1",
+            )])
+            .await?
+            .ok_or("managed image resolution")?;
+
+        // The metadata directory is replaced by a link to another location, exactly like moving
+        // the managed images to another disk: a stale canonical root would reject the new path.
+        let moved_root = temp.path().join("moved-metadata");
+        tokio::fs::create_dir_all(moved_root.join("library").join("item")).await?;
+        tokio::fs::write(moved_root.join(&managed_relative), b"moved-managed").await?;
+        tokio::fs::remove_dir_all(&configured_metadata_root).await?;
+        std::os::unix::fs::symlink(&moved_root, &configured_metadata_root)?;
+
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1",
+                &configured_poster,
+                &missing_media_root,
+                "tag-1",
+            )])
+            .await?
+            .ok_or("repointed managed image resolution")?;
+
+        assert_eq!(resolved.content_length, "moved-managed".len() as u64);
+        assert_eq!(
+            service.metadata_root_canonicalization_count(),
+            2,
+            "the metadata root is canonicalized again after it is repointed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn cached_resolution_falls_back_when_the_file_is_removed()
     -> Result<(), Box<dyn std::error::Error>> {
         let temp = tempfile::tempdir()?;
@@ -3666,6 +3730,85 @@ mod tests {
         tokio::fs::write(outside.join("poster.jpg"), b"outside-poster-bytes").await?;
         tokio::fs::remove_dir_all(&movie_dir).await?;
         std::os::unix::fs::symlink(&outside, &movie_dir)?;
+
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await;
+
+        assert!(matches!(resolved, Err(ImageError::Forbidden)));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_resolution_rejects_an_intermediate_directory_that_became_an_escaping_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let studio_dir = root.join("Studio");
+        let movie_dir = studio_dir.join("Nested Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+
+        // Move the whole studio directory out of the library root and link it back. The poster and
+        // its direct parent keep their inodes; only a directory above the parent became a link.
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await?;
+        tokio::fs::rename(&studio_dir, outside.join("Studio")).await?;
+        std::os::unix::fs::symlink(outside.join("Studio"), &studio_dir)?;
+
+        let resolved = service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await;
+
+        assert!(
+            matches!(resolved, Err(ImageError::Forbidden)),
+            "an intermediate directory that escapes the root must not be served from the cache, got {resolved:?}"
+        );
+        assert_eq!(
+            service.cached_resolution_count(),
+            0,
+            "the escaping cache entry is dropped"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_resolution_rejects_a_poster_replaced_by_an_escaping_symlink()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let service = image_service_for_tests(&temp.path().join("config")).await?;
+        let root = temp.path().join("Movies");
+        let movie_dir = root.join("Linked Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        let poster = movie_dir.join("poster.jpg");
+        tokio::fs::write(&poster, b"poster-bytes").await?;
+
+        service
+            .resolve_candidates(vec![stored_image_candidate(
+                "image-1", &poster, &root, "tag-1",
+            )])
+            .await?
+            .ok_or("initial resolution")?;
+
+        let outside = temp.path().join("outside");
+        tokio::fs::create_dir_all(&outside).await?;
+        let outside_poster = outside.join("poster.jpg");
+        tokio::fs::write(&outside_poster, b"outside-poster-bytes").await?;
+        tokio::fs::remove_file(&poster).await?;
+        std::os::unix::fs::symlink(&outside_poster, &poster)?;
 
         let resolved = service
             .resolve_candidates(vec![stored_image_candidate(
@@ -3864,8 +4007,6 @@ mod tests {
                     inode: index as u64,
                     size: 8,
                     modified: Some((1, 0)),
-                    parent_device: 1,
-                    parent_inode: 1,
                 },
             );
         }

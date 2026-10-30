@@ -16,12 +16,16 @@ use serde_json::json;
 use tokio::net::TcpListener;
 
 /// A movie whose poster sits inside the library root, served through a warm image resolution cache.
+///
+/// The movie is nested one directory below the root so both a direct parent swap and an
+/// intermediate directory swap can be exercised.
 struct ImageCacheFixture {
     _temp: tempfile::TempDir,
     client: reqwest::Client,
     base_url: String,
     item_id: String,
     cookies: String,
+    studio_dir: PathBuf,
     movie_dir: PathBuf,
     server: tokio::task::JoinHandle<Result<(), std::io::Error>>,
 }
@@ -47,7 +51,8 @@ impl ImageCacheFixture {
             .create_library("Movies", LibraryKind::Movie, false)
             .await?;
         let media_root = temp.path().join("Movies");
-        let movie_dir = media_root.join("Cached Image Movie (2020)");
+        let studio_dir = media_root.join("Studio");
+        let movie_dir = studio_dir.join("Cached Image Movie (2020)");
         tokio::fs::create_dir_all(&movie_dir).await?;
         tokio::fs::write(movie_dir.join("Cached.Image.Movie.2020.mkv"), b"movie").await?;
         tokio::fs::write(movie_dir.join("poster.jpg"), b"poster-bytes").await?;
@@ -93,6 +98,7 @@ impl ImageCacheFixture {
             base_url,
             item_id,
             cookies,
+            studio_dir,
             movie_dir,
             server,
         })
@@ -164,6 +170,28 @@ async fn a_cached_poster_is_rejected_after_its_directory_escapes_the_library_roo
         response.status(),
         reqwest::StatusCode::FORBIDDEN,
         "a cached resolution must not serve an image that left the library root"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn a_cached_poster_is_rejected_after_an_intermediate_directory_escapes_the_library_root()
+-> Result<(), Box<dyn std::error::Error>> {
+    let fixture = ImageCacheFixture::start().await?;
+    fixture.warm_poster_cache().await?;
+
+    // Swap a directory above the poster's parent for a link to the moved tree. The poster and its
+    // direct parent keep their inodes, so the hit has to re-resolve the ancestor chain.
+    let outside = fixture._temp.path().join("outside").join("escaped-studio");
+    tokio::fs::create_dir_all(outside.parent().ok_or("missing outside directory")?).await?;
+    tokio::fs::rename(&fixture.studio_dir, &outside).await?;
+    std::os::unix::fs::symlink(&outside, &fixture.studio_dir)?;
+
+    let response = fixture.poster().await?;
+    assert_eq!(
+        response.status(),
+        reqwest::StatusCode::FORBIDDEN,
+        "a cached resolution must not serve an image reached through an escaping directory"
     );
     Ok(())
 }
