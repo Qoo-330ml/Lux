@@ -4162,6 +4162,14 @@ pub(crate) struct NewPlaybackEvent<'a> {
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) played_percent: i64,
     pub(crate) is_paused: bool,
+    /// State the same session reported before this event, when it already existed. A matching
+    /// state means the event is a plain progress tick, which must not rewrite the derived resume
+    /// pointer or the played container states.
+    pub(crate) previous_state: Option<&'a str>,
+    /// Renew the matching playback admission in the same transaction as the session and item
+    /// state writes. Callers that renew on a separate statement leave this `false` so the write
+    /// pattern stays unchanged for their paths.
+    pub(crate) renew_admission: bool,
 }
 
 /// Episode container identifiers, read once while a playback event refreshes the resume pointer.
@@ -4169,6 +4177,16 @@ pub(crate) struct NewPlaybackEvent<'a> {
 pub(crate) struct PlaybackContainerScope {
     pub(crate) parent_id: Option<String>,
     pub(crate) series_id: Option<String>,
+}
+
+/// What [`Database::record_playback_event`] changed beyond the reported progress position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackEventEffects {
+    /// `user_item_state.is_played` flipped from `0` to `1` while recording this event.
+    pub(crate) is_played_changed: bool,
+    /// Container scope, present when the event refreshed the resume pointer. The played-state
+    /// sync reuses it instead of reading the episode hierarchy a second time.
+    pub(crate) container_scope: Option<PlaybackContainerScope>,
 }
 
 pub(crate) struct NewWebPlaybackSession<'a> {

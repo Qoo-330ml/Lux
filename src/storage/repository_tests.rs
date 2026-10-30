@@ -18728,6 +18728,8 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             duration_ticks: Some(100),
             played_percent: 95,
             is_paused: true,
+            previous_state: None,
+            renew_admission: false,
         })
         .await?;
     let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
@@ -18765,6 +18767,8 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             duration_ticks: Some(100),
             played_percent: 95,
             is_paused: false,
+            previous_state: Some("PAUSED"),
+            renew_admission: false,
         })
         .await?;
     assert!(
@@ -35058,6 +35062,35 @@ async fn playback_progress_fixture()
     Ok((temp, database, user_id))
 }
 
+fn playback_progress_event<'a>(
+    user_id: &'a str,
+    item_id: &'a str,
+    play_session_id: &'a str,
+    state: &'a str,
+    position_ticks: i64,
+    previous_state: Option<&'a str>,
+) -> NewPlaybackEvent<'a> {
+    NewPlaybackEvent {
+        user_id,
+        item_id,
+        media_source_id: None,
+        play_session_id,
+        device_id: "progress-device",
+        client: Some("Progress"),
+        device_name: Some("Progress"),
+        client_version: None,
+        device_type: Some("Progress"),
+        remote_ip: None,
+        state,
+        position_ticks,
+        duration_ticks: Some(PLAYBACK_PROGRESS_RUNTIME_TICKS),
+        played_percent: 95,
+        is_paused: state == "PAUSED",
+        previous_state,
+        renew_admission: false,
+    }
+}
+
 async fn progress_pointer_log(
     database: &Database,
 ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
@@ -35079,6 +35112,265 @@ async fn progress_pointer(
     .bind(user_id)
     .fetch_optional(database.pool())
     .await?)
+}
+
+#[tokio::test]
+async fn playback_progress_tick_skips_the_resume_pointer_and_container_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    let start = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-tick-session",
+            "PLAYING",
+            0,
+            None,
+        ))
+        .await?;
+    assert!(!start.is_played_changed);
+    assert_eq!(
+        start
+            .container_scope
+            .as_ref()
+            .and_then(|scope| scope.series_id.as_deref()),
+        Some("progress-series"),
+        "the first event of a session is a start and refreshes the resume pointer"
+    );
+    let pointer_writes = progress_pointer_log(&database).await?;
+
+    database.reset_query_count();
+    let tick = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-tick-session",
+            "PLAYING",
+            1_000_000_000,
+            Some("PLAYING"),
+        ))
+        .await?;
+    assert!(!tick.is_played_changed);
+    assert!(
+        tick.container_scope.is_none(),
+        "a plain progress tick must not refresh the resume pointer"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        pointer_writes,
+        "a plain progress tick must not write user_series_next"
+    );
+    assert_eq!(
+        database.query_count(),
+        2,
+        "a plain tick only writes the session row and the user item state"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            0,
+            None,
+        ))
+        .await?;
+    let mid_episode = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            1_800_000_000,
+            Some("PLAYING"),
+        ))
+        .await?;
+    assert!(!mid_episode.is_played_changed);
+    assert!(mid_episode.container_scope.is_none());
+
+    database.reset_query_count();
+    let flipped = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            PLAYBACK_PROGRESS_RUNTIME_TICKS,
+            Some("PLAYING"),
+        ))
+        .await?;
+    assert!(
+        flipped.is_played_changed,
+        "crossing the played threshold flips is_played"
+    );
+    let scope = flipped
+        .container_scope
+        .as_ref()
+        .ok_or("a played flip must refresh the resume pointer")?;
+    database
+        .sync_played_container_states_for_scope(&user_id, scope)
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        7,
+        "the flip event and its container sync cost two hierarchy reads and five writes"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 0)),
+        "the pointer advances to the next unplayed episode"
+    );
+    assert_eq!(
+        progress_container_states(&database, &user_id).await?,
+        vec![
+            ("progress-season".to_owned(), 0),
+            ("progress-series".to_owned(), 0),
+        ],
+        "the sync ran for the flip and reports the still-unplayed episodes"
+    );
+
+    let pointer_writes = progress_pointer_log(&database).await?;
+    database.reset_query_count();
+    let after_played = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            PLAYBACK_PROGRESS_RUNTIME_TICKS,
+            Some("PLAYING"),
+        ))
+        .await?;
+    assert!(
+        !after_played.is_played_changed,
+        "a later tick must not report another played flip"
+    );
+    assert!(after_played.container_scope.is_none());
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+    assert_eq!(
+        database.query_count(),
+        3,
+        "a tick past the played threshold writes the session row, the item state, and the \
+         last-played stamp only"
+    );
+
+    // Finish the series through the same event path: each remaining episode flips once and only
+    // then does the season and series become played.
+    for episode in 2..=3 {
+        let item_id = format!("progress-episode-{episode}");
+        let session_id = format!("progress-flip-session-{episode}");
+        database
+            .record_playback_event(playback_progress_event(
+                &user_id,
+                &item_id,
+                &session_id,
+                "PLAYING",
+                0,
+                None,
+            ))
+            .await?;
+        let flipped = database
+            .record_playback_event(playback_progress_event(
+                &user_id,
+                &item_id,
+                &session_id,
+                "PLAYING",
+                PLAYBACK_PROGRESS_RUNTIME_TICKS,
+                Some("PLAYING"),
+            ))
+            .await?;
+        assert!(flipped.is_played_changed);
+        let scope = flipped
+            .container_scope
+            .as_ref()
+            .ok_or("each played flip refreshes the resume pointer")?;
+        database
+            .sync_played_container_states_for_scope(&user_id, scope)
+            .await?;
+    }
+    assert_eq!(
+        progress_container_states(&database, &user_id).await?,
+        vec![
+            ("progress-season".to_owned(), 1),
+            ("progress-series".to_owned(), 1),
+        ],
+        "the last played episode marks the season and the series played"
+    );
+    assert!(
+        progress_pointer(&database, &user_id).await?.is_none(),
+        "a fully played series has no resume pointer"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_state_changes_refresh_the_resume_pointer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "PLAYING",
+            1_800_000_000,
+            None,
+        ))
+        .await?;
+    let after_start = progress_pointer_log(&database).await?;
+    assert!(!after_start.is_empty());
+
+    database.reset_query_count();
+    let paused = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "PAUSED",
+            1_800_000_000,
+            Some("PLAYING"),
+        ))
+        .await?;
+    assert!(
+        paused.container_scope.is_some(),
+        "pausing refreshes the resume pointer"
+    );
+    assert_eq!(
+        database.query_count(),
+        4,
+        "a pause writes the session, the item state, and the pointer in one transaction"
+    );
+    let after_pause = progress_pointer_log(&database).await?;
+    assert!(after_pause.len() > after_start.len());
+
+    let stopped = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "STOPPED",
+            1_800_000_000,
+            Some("PAUSED"),
+        ))
+        .await?;
+    assert!(
+        stopped.container_scope.is_some(),
+        "stopping refreshes the resume pointer"
+    );
+    assert!(progress_pointer_log(&database).await?.len() > after_pause.len());
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-1".to_owned(), 1_800_000_000)),
+        "the in-progress episode stays the resume pointer"
+    );
+    Ok(())
 }
 
 #[tokio::test]
@@ -35154,4 +35446,121 @@ async fn resume_pointer_refresh_upserts_instead_of_deleting_the_row()
         "the pointer is deleted only once the series has no next episode"
     );
     Ok(())
+}
+
+#[tokio::test]
+async fn playback_event_renews_the_admission_in_its_own_transaction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    database
+        .reserve_playback_admission(&user_id, "progress-admission-session", now)
+        .await?
+        .expect("user exists");
+    let stale_stamp = now.saturating_sub(40);
+    sqlx::query(
+        "UPDATE playback_admissions SET admitted_at = ?, last_seen_at = ?
+         WHERE user_id = ? AND play_session_id = 'progress-admission-session'",
+    )
+    .bind(stale_stamp.saturating_sub(10))
+    .bind(stale_stamp)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    let mut event = playback_progress_event(
+        &user_id,
+        "progress-episode-1",
+        "progress-admission-session",
+        "PLAYING",
+        1_000_000_000,
+        None,
+    );
+    event.renew_admission = false;
+    database.record_playback_event(event).await?;
+    assert_eq!(
+        progress_admission_stamp(&database, &user_id).await?,
+        stale_stamp,
+        "a plain tick that does not renew leaves the admission untouched"
+    );
+
+    let mut event = playback_progress_event(
+        &user_id,
+        "progress-episode-1",
+        "progress-admission-session",
+        "PLAYING",
+        1_200_000_000,
+        Some("PLAYING"),
+    );
+    event.renew_admission = true;
+    database.record_playback_event(event).await?;
+    assert!(
+        progress_admission_stamp(&database, &user_id).await? > stale_stamp,
+        "a renewing event advances the admission stamp"
+    );
+
+    // The renewal has to commit or roll back with the session and item-state writes: if the item
+    // state write fails, the admission must stay at its old stamp.
+    sqlx::query(
+        "UPDATE playback_admissions SET last_seen_at = ?
+         WHERE user_id = ? AND play_session_id = 'progress-admission-session'",
+    )
+    .bind(stale_stamp)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER progress_fail_item_state BEFORE INSERT ON user_item_state
+         BEGIN SELECT RAISE(ABORT, 'progress item state failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let mut event = playback_progress_event(
+        &user_id,
+        "progress-episode-2",
+        "progress-admission-session",
+        "PLAYING",
+        1_000_000_000,
+        None,
+    );
+    event.renew_admission = true;
+    assert!(
+        database.record_playback_event(event).await.is_err(),
+        "the aborted item-state write fails the event"
+    );
+    assert_eq!(
+        progress_admission_stamp(&database, &user_id).await?,
+        stale_stamp,
+        "the admission renewal rolls back with the rest of the event"
+    );
+    Ok(())
+}
+
+async fn progress_admission_stamp(
+    database: &Database,
+    user_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT last_seen_at FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = 'progress-admission-session'",
+    )
+    .bind(user_id)
+    .fetch_one(database.pool())
+    .await?)
+}
+
+async fn progress_container_states(
+    database: &Database,
+    user_id: &str,
+) -> Result<Vec<(String, i64)>, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_as(
+        "SELECT item_id, is_played FROM user_item_state
+         WHERE user_id = ? AND item_id IN ('progress-season', 'progress-series')
+         ORDER BY item_id",
+    )
+    .bind(user_id)
+    .fetch_all(database.pool())
+    .await?)
 }

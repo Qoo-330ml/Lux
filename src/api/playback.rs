@@ -1736,33 +1736,31 @@ pub(super) async fn handle_emby_playback_event(
             duration_ticks,
             played_percent,
             is_paused: request.is_paused || state_name == "PAUSED",
+            previous_state: previous_session
+                .as_ref()
+                .map(|session| session.state.as_str()),
+            // The renewal joins the event transaction instead of committing on its own.
+            renew_admission: state_name != "STOPPED",
         })
         .await
     {
-        Ok(()) => {
-            if database
-                .sync_played_container_states(&user_id, &internal_item_id)
-                .await
-                .is_err()
+        Ok(effects) => {
+            if effects.is_played_changed
+                && let Some(scope) = effects.container_scope.as_ref()
+                && database
+                    .sync_played_container_states_for_scope(&user_id, scope)
+                    .await
+                    .is_err()
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
+            if state_name == "STOPPED"
+                && let Err(error) = state
+                    .web_playback()
+                    .release_playback_session_admission(&user_id, &play_session_id)
+                    .await
             {
-                let service = state.web_playback();
-                let admission_update = if state_name == "STOPPED" {
-                    service
-                        .release_playback_session_admission(&user_id, &play_session_id)
-                        .await
-                        .map(|_| ())
-                } else {
-                    service
-                        .renew_playback_session_admission(&user_id, &play_session_id)
-                        .await
-                        .map(|_| ())
-                };
-                if let Err(error) = admission_update {
-                    return web_playback_error(&headers, error);
-                }
+                return web_playback_error(&headers, error);
             }
             state.user_events.publish_home_coalesced().await;
             if state_name != "STOPPED"
@@ -4461,7 +4459,7 @@ pub(super) async fn lux_web_playback_event(
             Ok(value) => value,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
-        if database
+        let effects = match database
             .record_playback_event(NewPlaybackEvent {
                 user_id: &session.user_id,
                 item_id: &session.item_id,
@@ -4478,16 +4476,22 @@ pub(super) async fn lux_web_playback_event(
                 duration_ticks: request.duration_ticks,
                 played_percent,
                 is_paused: matches!(request.state, LuxPlaybackState::Paused),
+                previous_state: previous_session
+                    .as_ref()
+                    .map(|previous| previous.state.as_str()),
+                renew_admission: false,
             })
             .await
-            .is_err()
         {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        }
-        if database
-            .sync_played_container_states(&session.user_id, &session.item_id)
-            .await
-            .is_err()
+            Ok(effects) => effects,
+            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        };
+        if effects.is_played_changed
+            && let Some(scope) = effects.container_scope.as_ref()
+            && database
+                .sync_played_container_states_for_scope(&session.user_id, scope)
+                .await
+                .is_err()
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
@@ -4784,14 +4788,20 @@ pub(super) async fn lux_post_progress(
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             },
             is_paused: matches!(playback_state, LuxPlaybackState::Paused),
+            previous_state: previous_session
+                .as_ref()
+                .map(|previous| previous.state.as_str()),
+            renew_admission: false,
         })
         .await
     {
-        Ok(()) => {
-            if database
-                .sync_played_container_states(&user_id, &item_id)
-                .await
-                .is_err()
+        Ok(effects) => {
+            if effects.is_played_changed
+                && let Some(scope) = effects.container_scope.as_ref()
+                && database
+                    .sync_played_container_states_for_scope(&user_id, scope)
+                    .await
+                    .is_err()
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }

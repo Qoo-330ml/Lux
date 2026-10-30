@@ -946,6 +946,8 @@ mod tests {
                 duration_ticks: Some(2_000_000_000),
                 played_percent: 90,
                 is_paused: false,
+                previous_state: None,
+                renew_admission: false,
             })
             .await
             .expect("playback state");

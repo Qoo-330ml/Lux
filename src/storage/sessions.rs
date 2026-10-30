@@ -31,6 +31,8 @@ struct PlaybackAdmissionCountsRow {
 #[derive(Debug, sqlx::FromRow)]
 struct PlaySessionPointerRow {
     last_play_session_id: String,
+    /// `is_played` as stored before this event flips it, so the flip is reported exactly once.
+    is_played: i64,
 }
 
 /// Row of the container-wide played aggregation read by
@@ -527,10 +529,15 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Records one playback event and reports the state it changed.
+    ///
+    /// The session row, the user item state, the optional admission renewal, and the resume
+    /// pointer (only when the event is a state change or a played flip) commit together, so a
+    /// single event costs one write transaction.
     pub(crate) async fn record_playback_event(
         &self,
         event: NewPlaybackEvent<'_>,
-    ) -> Result<(), StorageError> {
+    ) -> Result<PlaybackEventEffects, StorageError> {
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let max_function = self.scalar_max_function();
         let auto_played = event.duration_ticks.is_some_and(|duration_ticks| {
@@ -583,6 +590,21 @@ impl Database {
             .execute(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
+        if event.renew_admission {
+            let renew_query = format!(
+                "UPDATE playback_admissions
+                 SET last_seen_at = {max_function}(last_seen_at, unixepoch())
+                 WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'
+                   AND last_seen_at > unixepoch() - ?"
+            );
+            self.query(sqlx::AssertSqlSafe(renew_query))
+                .bind(event.user_id)
+                .bind(event.play_session_id)
+                .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
+                .execute(&mut *transaction)
+                .await
+                .map_err(self.sqlx_err())?;
+        }
         let same_session = "user_item_state.last_play_session_id = excluded.last_play_session_id";
         let newer_session = "(user_item_state.last_play_session_id IS NULL OR EXISTS (
             SELECT 1
@@ -617,7 +639,7 @@ impl Database {
                     WHEN {same_session} AND excluded.position_ticks <= user_item_state.position_ticks
                     THEN 0 ELSE 1 END
              WHERE {same_session} OR {newer_session}
-             RETURNING last_play_session_id"
+             RETURNING last_play_session_id, is_played"
         );
         let persisted_session = self
             .query_as::<PlaySessionPointerRow>(sqlx::AssertSqlSafe(user_item_state_query))
@@ -631,6 +653,11 @@ impl Database {
         let event_session_is_current = persisted_session
             .as_ref()
             .is_some_and(|row| row.last_play_session_id == event.play_session_id);
+        // The upsert above left `is_played` alone, so this is the value the event starts from.
+        let already_played = persisted_session
+            .as_ref()
+            .is_some_and(|row| row.is_played != 0);
+        let is_played_changed = auto_played && event_session_is_current && !already_played;
         if auto_played && event_session_is_current {
             self.query(
                 "UPDATE user_item_state
@@ -646,9 +673,24 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         }
+        // A plain progress tick leaves the derived pointer and the played container states alone;
+        // only a start, pause, stop, or played flip can change what they hold.
+        let state_changed = event.previous_state != Some(event.state);
+        let mut container_scope = None;
+        if state_changed || is_played_changed {
+            container_scope = self
+                .refresh_user_series_next_for_item_in(
+                    &mut transaction,
+                    event.user_id,
+                    event.item_id,
+                )
+                .await?;
+        }
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.refresh_user_series_next_for_item(event.user_id, event.item_id)
-            .await
+        Ok(PlaybackEventEffects {
+            is_played_changed,
+            container_scope,
+        })
     }
 
     /// Recomputes the played state of the episode's season and series.
