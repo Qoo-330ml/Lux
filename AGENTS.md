@@ -18,8 +18,10 @@
    passing change, then refactor only when the tests remain green.
 4. Keep increments small, compilable, and independently revertible. Run the narrowest relevant
    checks after every increment and commit each completed increment atomically. For Rust behavior
-   changes, run the related `cargo test --locked --test <target>` target(s), or
-   `cargo test --locked --lib <module-or-test-filter>` for library tests. Do not run
+   changes, run the related integration test group with
+   `cargo test --locked --test <group> <module>::` (see `docs/TEST-TARGETS.md` for the former
+   per-file target → group mapping), or `cargo test --locked --lib <module-or-test-filter>` for
+   library tests. Do not run
    `cargo test --locked --all-targets` during routine increments; reserve it for task completion,
    a documented phase gate, cross-cutting changes, or an explicit project-owner request.
 5. Report changed files, acceptance results, test results, and remaining risks at the end of a task.
@@ -60,8 +62,10 @@
 ### AI test selection
 
 - Before testing, identify the narrowest Rust target named by the assigned task's acceptance
-  criteria or the changed behavior. Prefer one or more explicit `--test <target>` flags; do not
-  use a broad test-name filter as a substitute for selecting the target.
+  criteria or the changed behavior. Integration tests are grouped by domain: select one explicit
+  `--test <group>` flag, then narrow it with a module prefix (`--test <group> <module>::`).
+  `docs/TEST-TARGETS.md` maps every former per-file target to its group; do not use a broad
+  test-name filter as a substitute for selecting the target.
 - For a library-only change, prefer `cargo test --locked --lib <module-or-test-filter>`.
 - Run `cargo test --locked --all-targets` only at the completion or phase-gate conditions stated
   above. It remains part of the full Rust completion gate and is not waived by targeted tests.
