@@ -5,9 +5,8 @@
 
 use super::*;
 
-// LUX-783 wires the worker and LUX-784 wires the admin queue API to this storage contract.
-#[allow(dead_code)]
 impl Database {
+    #[cfg(test)]
     pub(crate) async fn enqueue_mail_outbox(
         &self,
         message: NewMailOutboxMessage<'_>,
@@ -223,6 +222,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn retry_failed_mail_outbox(
         &self,
         id: &str,
@@ -249,6 +249,7 @@ impl Database {
         Ok(result.rows_affected() == 1)
     }
 
+    #[cfg(test)]
     pub(crate) async fn list_mail_outbox_page(
         &self,
         status: Option<MailOutboxStatus>,
