@@ -425,11 +425,21 @@ impl EmbyAuthService {
     pub async fn issue_playback_token(
         &self,
         user: &UserRecord,
+        item_public_id: &str,
         playback_session_id: &str,
         device: &EmbyDeviceInfo,
         expires_at: i64,
         client_ip: Option<IpAddr>,
     ) -> Result<Option<String>, EmbyAuthError> {
+        // The item id travels inside the token (the hash covers it), so the router can confine
+        // the token to one item without a database lookup.
+        if item_public_id.is_empty()
+            || !item_public_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Ok(None);
+        }
         let user_id = user.id.to_string();
         if self.user_access_blacklist_matches(&user_id, device).await?
             || self.is_user_ip_blacklisted(&user_id, client_ip).await?
@@ -442,7 +452,10 @@ impl EmbyAuthService {
                 i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
             });
         let expires_at = expires_at.min(now.saturating_add(PLAYBACK_TOKEN_MAX_TTL_SECONDS));
-        let token = format!("{PLAYBACK_TOKEN_PREFIX}{}", generate_token()?);
+        let token = format!(
+            "{PLAYBACK_TOKEN_PREFIX}{item_public_id}_{}",
+            generate_token()?
+        );
         let token_id = UserId::new().to_string();
         let token_hash = hash_token(&token);
         self.database
@@ -600,6 +613,12 @@ const PLAYBACK_TOKEN_MAX_TTL_SECONDS: i64 = 12 * 60 * 60;
 /// Whether `token` has the shape of a playback-only token (it may still be unknown or expired).
 pub fn is_playback_token(token: &str) -> bool {
     token.starts_with(PLAYBACK_TOKEN_PREFIX)
+}
+
+/// The item id a playback-only token is bound to (`luxpb_{item}_{random}`).
+pub fn playback_token_item(token: &str) -> Option<&str> {
+    let (item, _) = token.strip_prefix(PLAYBACK_TOKEN_PREFIX)?.split_once('_')?;
+    (!item.is_empty()).then_some(item)
 }
 
 fn generate_token() -> Result<String, EmbyAuthError> {

@@ -53,7 +53,7 @@ async fn playback_token_is_rejected_by_the_default_resolver_and_accepted_on_emby
 -> Result<(), Box<dyn std::error::Error>> {
     let (_dir, auth, user) = auth_with_user().await?;
     let token = auth
-        .issue_playback_token(&user, "play-session-1", &device(), now() + 600, None)
+        .issue_playback_token(&user, "100", "play-session-1", &device(), now() + 600, None)
         .await?
         .ok_or("token was not issued")?;
 
@@ -99,7 +99,14 @@ async fn playback_token_stops_working_when_expired_or_revoked()
     let (_dir, auth, user) = auth_with_user().await?;
 
     let expired = auth
-        .issue_playback_token(&user, "play-session-expired", &device(), now() - 10, None)
+        .issue_playback_token(
+            &user,
+            "100",
+            "play-session-expired",
+            &device(),
+            now() - 10,
+            None,
+        )
         .await?;
     if let Some(expired) = expired {
         assert!(
@@ -110,11 +117,11 @@ async fn playback_token_stops_working_when_expired_or_revoked()
     }
 
     let first = auth
-        .issue_playback_token(&user, "play-session-2", &device(), now() + 600, None)
+        .issue_playback_token(&user, "100", "play-session-2", &device(), now() + 600, None)
         .await?
         .ok_or("token was not issued")?;
     let other = auth
-        .issue_playback_token(&user, "play-session-3", &device(), now() + 600, None)
+        .issue_playback_token(&user, "100", "play-session-3", &device(), now() + 600, None)
         .await?
         .ok_or("token was not issued")?;
     assert_ne!(first, other);
@@ -140,7 +147,7 @@ async fn playback_token_is_not_listed_as_a_login_session() -> Result<(), Box<dyn
     let (_dir, auth, user) = auth_with_user().await?;
     let user_id = user.id.to_string();
     let before = auth.list_admin_login_sessions(&user_id, 50, 0).await?.1;
-    auth.issue_playback_token(&user, "play-session-4", &device(), now() + 600, None)
+    auth.issue_playback_token(&user, "100", "play-session-4", &device(), now() + 600, None)
         .await?
         .ok_or("token was not issued")?;
     let after = auth.list_admin_login_sessions(&user_id, 50, 0).await?.1;
@@ -153,7 +160,7 @@ async fn playback_token_resolves_through_the_route_resolver_with_an_admin_user()
 -> Result<(), Box<dyn std::error::Error>> {
     let (_dir, auth, user) = auth_with_user().await?;
     let token = auth
-        .issue_playback_token(&user, "play-session-9", &device(), now() + 600, None)
+        .issue_playback_token(&user, "100", "play-session-9", &device(), now() + 600, None)
         .await?
         .ok_or("token was not issued")?;
     assert!(
@@ -162,5 +169,43 @@ async fn playback_token_resolves_through_the_route_resolver_with_an_admin_user()
             .is_some(),
         "route resolver rejected a freshly issued playback token"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_token_carries_the_item_it_is_bound_to() -> Result<(), Box<dyn std::error::Error>>
+{
+    let (_dir, auth, user) = auth_with_user().await?;
+    let token = auth
+        .issue_playback_token(
+            &user,
+            "424242",
+            "play-session-item",
+            &device(),
+            now() + 600,
+            None,
+        )
+        .await?
+        .ok_or("token was not issued")?;
+    assert_eq!(
+        luxd::auth::emby::playback_token_item(&token),
+        Some("424242")
+    );
+    // An item id that could break the `luxpb_{item}_{random}` shape is refused outright.
+    for item in ["", "12_3", "12/3", "12 3"] {
+        assert!(
+            auth.issue_playback_token(
+                &user,
+                item,
+                "play-session-bad",
+                &device(),
+                now() + 600,
+                None
+            )
+            .await?
+            .is_none(),
+            "{item:?}"
+        );
+    }
     Ok(())
 }

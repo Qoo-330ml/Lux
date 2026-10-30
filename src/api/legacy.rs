@@ -1152,8 +1152,8 @@ async fn reject_playback_token_outside_allow_list(request: Request<Body>, next: 
         return next.run(request).await;
     }
     let is_allowed = match request.extensions().get::<axum::extract::OriginalUri>() {
-        Some(original) => emby::path_accepts_playback_token(original.0.path()),
-        None => emby::path_accepts_playback_token(request.uri().path()),
+        Some(original) => emby::path_accepts_playback_token(&token, original.0.path()),
+        None => emby::path_accepts_playback_token(&token, request.uri().path()),
     };
     if is_allowed {
         return next.run(request).await;
