@@ -3299,18 +3299,36 @@ fn stored_chapter_detection_job(
     })
 }
 
-fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
-    StoredLibraryRoot {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        canonical_path: row.get("canonical_path"),
-        display_path: row.get("display_path"),
-        is_available: row.get::<i64, _>("is_available") != 0,
-        is_writable: row.get::<i64, _>("is_writable") != 0,
-        last_checked_at: row.get("last_checked_at"),
-        unavailable_since: row.get("unavailable_since"),
-        scan_cursor: row.get("scan_cursor"),
-    }
+/// Row of the library-root projections that decode into [`StoredLibraryRoot`].
+///
+/// The availability flags stay `i64` because both backends store them as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_library_root`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredLibraryRootRow {
+    id: String,
+    library_id: String,
+    canonical_path: String,
+    display_path: String,
+    is_available: i64,
+    is_writable: i64,
+    last_checked_at: i64,
+    unavailable_since: Option<i64>,
+    scan_cursor: Option<String>,
+}
+
+fn stored_library_root(row: sqlx::any::AnyRow) -> Result<StoredLibraryRoot, sqlx::Error> {
+    let row = StoredLibraryRootRow::from_row(&row)?;
+    Ok(StoredLibraryRoot {
+        id: row.id,
+        library_id: row.library_id,
+        canonical_path: row.canonical_path,
+        display_path: row.display_path,
+        is_available: row.is_available != 0,
+        is_writable: row.is_writable != 0,
+        last_checked_at: row.last_checked_at,
+        unavailable_since: row.unavailable_since,
+        scan_cursor: row.scan_cursor,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -3382,24 +3400,48 @@ pub(crate) struct StoredEpisodeIdentityCandidate {
     pub(crate) relative_path: String,
 }
 
-fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
-    StoredFilesystemEntry {
-        id: row.get("id"),
-        relative_path: row.get("relative_path"),
-        entry_kind: row.get("entry_kind"),
-        size: row.get("size"),
-        modified_at: row.get("modified_at"),
-        device: row.get("device"),
-        inode: row.get("inode"),
-        fingerprint: row.get("fingerprint"),
-        last_seen_generation: row.get("last_seen_generation"),
-        is_missing: row.get::<i64, _>("is_missing") != 0,
-        item_id: row.get("item_id"),
-        parent_identity_key: row.get("parent_identity_key"),
-        item_type: row.get("item_type"),
-        item_identity_key: row.get("item_identity_key"),
-        series_provider_ids_json: row.get("series_provider_ids_json"),
-    }
+/// Row of the filesystem-entry projections that decode into [`StoredFilesystemEntry`].
+///
+/// The item/parent/series columns come from `LEFT JOIN`s, so they are nullable; `is_missing`
+/// stays `i64` because both backends store it as `BIGINT` 0/1.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredFilesystemEntryRow {
+    id: String,
+    relative_path: String,
+    entry_kind: String,
+    size: i64,
+    modified_at: i64,
+    device: Option<i64>,
+    inode: Option<i64>,
+    fingerprint: Option<Vec<u8>>,
+    last_seen_generation: String,
+    is_missing: i64,
+    item_id: Option<String>,
+    parent_identity_key: Option<String>,
+    item_type: Option<String>,
+    item_identity_key: Option<String>,
+    series_provider_ids_json: Option<String>,
+}
+
+fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> Result<StoredFilesystemEntry, sqlx::Error> {
+    let row = StoredFilesystemEntryRow::from_row(&row)?;
+    Ok(StoredFilesystemEntry {
+        id: row.id,
+        relative_path: row.relative_path,
+        entry_kind: row.entry_kind,
+        size: row.size,
+        modified_at: row.modified_at,
+        device: row.device,
+        inode: row.inode,
+        fingerprint: row.fingerprint,
+        last_seen_generation: row.last_seen_generation,
+        is_missing: row.is_missing != 0,
+        item_id: row.item_id,
+        parent_identity_key: row.parent_identity_key,
+        item_type: row.item_type,
+        item_identity_key: row.item_identity_key,
+        series_provider_ids_json: row.series_provider_ids_json,
+    })
 }
 
 #[derive(Debug)]
@@ -3449,8 +3491,15 @@ pub(crate) struct StoredCanonicalPersonMatch {
     pub(crate) birthdays: Vec<String>,
 }
 
-fn stored_canonical_person(row: sqlx::any::AnyRow) -> StoredCanonicalPerson {
-    StoredCanonicalPerson { id: row.get("id") }
+/// Row of the canonical-person projections that decode into [`StoredCanonicalPerson`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredCanonicalPersonRow {
+    id: String,
+}
+
+fn stored_canonical_person(row: sqlx::any::AnyRow) -> Result<StoredCanonicalPerson, sqlx::Error> {
+    let row = StoredCanonicalPersonRow::from_row(&row)?;
+    Ok(StoredCanonicalPerson { id: row.id })
 }
 
 #[derive(Debug)]
@@ -3484,21 +3533,42 @@ pub(crate) struct PersonMatchCandidateRestore<'a> {
     pub(crate) updated_at: i64,
 }
 
-fn stored_person_match_candidate(row: sqlx::any::AnyRow) -> StoredPersonMatchCandidate {
-    StoredPersonMatchCandidate {
-        id: row.get("id"),
-        item_id: row.get("item_id"),
-        provider: row.get("provider"),
-        provider_id: row.get("provider_id"),
-        candidate_person_ids_json: row.get("candidate_person_ids_json"),
-        status: row.get("status"),
-        score: row.get("score"),
-        evidence_json: row.get("evidence_json"),
-        target_person_id: row.get("target_person_id"),
-        previous_person_id: row.get("previous_person_id"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+/// Row of the person-match candidate projections that decode into
+/// [`StoredPersonMatchCandidate`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPersonMatchCandidateRow {
+    id: String,
+    item_id: String,
+    provider: String,
+    provider_id: String,
+    candidate_person_ids_json: String,
+    status: String,
+    score: Option<f64>,
+    evidence_json: String,
+    target_person_id: Option<String>,
+    previous_person_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_person_match_candidate(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredPersonMatchCandidate, sqlx::Error> {
+    let row = StoredPersonMatchCandidateRow::from_row(&row)?;
+    Ok(StoredPersonMatchCandidate {
+        id: row.id,
+        item_id: row.item_id,
+        provider: row.provider,
+        provider_id: row.provider_id,
+        candidate_person_ids_json: row.candidate_person_ids_json,
+        status: row.status,
+        score: row.score,
+        evidence_json: row.evidence_json,
+        target_person_id: row.target_person_id,
+        previous_person_id: row.previous_person_id,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 #[derive(Debug)]
@@ -3540,36 +3610,61 @@ fn person_credit_json<T: serde::de::DeserializeOwned + Default>(
     })
 }
 
-fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
-    let provider_ids_json: String = row.get("provider_ids_json");
-    let genres_json: String = row.get("genres_json");
-    let tags_json: String = row.get("tags_json");
-    let production_locations_json: String = row.get("production_locations_json");
-    let taglines_json: String = row.get("taglines_json");
-    StoredPersonCredit {
-        item_id: row.get("item_id"),
-        person_id: row.get("person_id"),
-        lux_person_id: row.try_get("lux_person_id").ok(),
-        provider: row.get("provider"),
-        person_name: row.get("person_name"),
-        role: row.get("role"),
-        date_created: row.get("date_created"),
-        biography: row.get("biography"),
-        birthday: row.get("birthday"),
-        deathday: row.get("deathday"),
-        known_for_department: row.get("known_for_department"),
-        place_of_birth: row.get("place_of_birth"),
-        provider_ids: person_credit_json(&provider_ids_json, "provider_ids_json"),
-        genres: person_credit_json(&genres_json, "genres_json"),
-        tags: person_credit_json(&tags_json, "tags_json"),
+/// Row of the person-credit projections that decode into [`StoredPersonCredit`].
+///
+/// `lux_person_id` keeps `#[sqlx(default)]` because the former decoder used
+/// `try_get(..).ok()`: a projection that omits the column still decodes to `None` instead of
+/// failing the whole row. The JSON columns are decoded by [`person_credit_json`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPersonCreditRow {
+    item_id: String,
+    person_id: String,
+    #[sqlx(default)]
+    lux_person_id: Option<String>,
+    provider: String,
+    person_name: String,
+    role: String,
+    date_created: i64,
+    biography: Option<String>,
+    birthday: Option<String>,
+    deathday: Option<String>,
+    known_for_department: Option<String>,
+    place_of_birth: Option<String>,
+    provider_ids_json: String,
+    genres_json: String,
+    tags_json: String,
+    production_locations_json: String,
+    premiere_date: Option<String>,
+    production_year: Option<i64>,
+    taglines_json: String,
+}
+
+fn stored_person_credit(row: sqlx::any::AnyRow) -> Result<StoredPersonCredit, sqlx::Error> {
+    let row = StoredPersonCreditRow::from_row(&row)?;
+    Ok(StoredPersonCredit {
+        item_id: row.item_id,
+        person_id: row.person_id,
+        lux_person_id: row.lux_person_id,
+        provider: row.provider,
+        person_name: row.person_name,
+        role: row.role,
+        date_created: row.date_created,
+        biography: row.biography,
+        birthday: row.birthday,
+        deathday: row.deathday,
+        known_for_department: row.known_for_department,
+        place_of_birth: row.place_of_birth,
+        provider_ids: person_credit_json(&row.provider_ids_json, "provider_ids_json"),
+        genres: person_credit_json(&row.genres_json, "genres_json"),
+        tags: person_credit_json(&row.tags_json, "tags_json"),
         production_locations: person_credit_json(
-            &production_locations_json,
+            &row.production_locations_json,
             "production_locations_json",
         ),
-        premiere_date: row.get("premiere_date"),
-        production_year: row.get("production_year"),
-        taglines: person_credit_json(&taglines_json, "taglines_json"),
-    }
+        premiere_date: row.premiere_date,
+        production_year: row.production_year,
+        taglines: person_credit_json(&row.taglines_json, "taglines_json"),
+    })
 }
 
 #[derive(Debug)]
@@ -3582,15 +3677,32 @@ pub(crate) struct StoredPersonIndexRebuildJob {
     pub(crate) cancel_requested: bool,
 }
 
-fn stored_person_index_rebuild_job(row: sqlx::any::AnyRow) -> StoredPersonIndexRebuildJob {
-    StoredPersonIndexRebuildJob {
-        library_id: row.get("library_id"),
-        status: row.get("status"),
-        cursor_id: row.get("cursor_id"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-    }
+/// Row of the person-index rebuild job projections that decode into
+/// [`StoredPersonIndexRebuildJob`].
+///
+/// `cancel_requested` stays `i64` because both backends store it as `BIGINT` 0/1.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPersonIndexRebuildJobRow {
+    library_id: String,
+    status: String,
+    cursor_id: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    cancel_requested: i64,
+}
+
+fn stored_person_index_rebuild_job(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredPersonIndexRebuildJob, sqlx::Error> {
+    let row = StoredPersonIndexRebuildJobRow::from_row(&row)?;
+    Ok(StoredPersonIndexRebuildJob {
+        library_id: row.library_id,
+        status: row.status,
+        cursor_id: row.cursor_id,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        cancel_requested: row.cancel_requested != 0,
+    })
 }
 
 #[derive(Debug)]
@@ -6737,6 +6849,102 @@ mod stored_row_decoding_tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn stored_library_root_and_filesystem_entry_rows_decode_existing_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('root-lib', 'Roots', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .insert_library_root(NewLibraryRoot {
+                id: "root-a",
+                library_id: "root-lib",
+                canonical_path: "/media/root-a",
+                display_path: "Root A",
+                is_available: true,
+                is_writable: false,
+            })
+            .await?;
+
+        let root = database
+            .find_library_root("root-a")
+            .await?
+            .expect("library root should exist");
+        assert_eq!(root.library_id, "root-lib");
+        assert_eq!(root.canonical_path, "/media/root-a");
+        assert_eq!(root.display_path, "Root A");
+        assert!(root.is_available);
+        assert!(!root.is_writable);
+        assert_eq!(root.unavailable_since, None);
+        assert_eq!(root.scan_cursor, None);
+
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: "entry-a",
+                library_root_id: "root-a",
+                relative_path: "movies/a.mkv",
+                entry_kind: "FILE",
+                size: 1024,
+                modified_at: 1_800_000_000,
+                device: Some(7),
+                inode: Some(11),
+                fingerprint: b"fingerprint-a",
+                last_seen_generation: "generation-a",
+            })
+            .await?;
+        let entry = database
+            .find_filesystem_entry("root-a", "movies/a.mkv")
+            .await?
+            .expect("filesystem entry should exist");
+        assert_eq!(entry.entry_kind, "FILE");
+        assert_eq!(entry.size, 1024);
+        assert_eq!(entry.modified_at, 1_800_000_000);
+        assert_eq!(entry.device, Some(7));
+        assert_eq!(entry.inode, Some(11));
+        assert_eq!(entry.fingerprint.as_deref(), Some(&b"fingerprint-a"[..]));
+        assert_eq!(entry.last_seen_generation, "generation-a");
+        assert!(!entry.is_missing);
+        assert_eq!(entry.item_id, None);
+        assert_eq!(entry.parent_identity_key, None);
+        assert_eq!(entry.item_type, None);
+        assert_eq!(entry.item_identity_key, None);
+        assert_eq!(entry.series_provider_ids_json, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_person_index_rebuild_job_row_decodes_the_queue_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind, is_enabled)
+             VALUES ('rebuild-lib', 'Rebuild', 'MOVIE', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let jobs = database.sync_person_index_rebuild_jobs(1).await?;
+        let queued = jobs
+            .iter()
+            .find(|job| job.library_id == "rebuild-lib")
+            .expect("rebuild job should be queued");
+        assert_eq!(queued.status, "QUEUED");
+        assert_eq!(queued.cursor_id, None);
+        assert_eq!(queued.processed_count, 0);
+        assert_eq!(queued.total_count, 0);
+        assert!(!queued.cancel_requested);
+
+        let stored = database
+            .get_person_index_rebuild_job("rebuild-lib")
+            .await?
+            .expect("rebuild job should be readable");
+        assert_eq!(stored.library_id, "rebuild-lib");
+        assert_eq!(stored.status, "QUEUED");
+        assert!(!stored.cancel_requested);
+        Ok(())
+    }
+
     /// A projection that drifts from its row struct must surface as a storage error.
     ///
     /// The scan/person decoders used to call `row.get`, which panicked on a missing
@@ -6768,6 +6976,24 @@ mod stored_row_decoding_tests {
             StoredChapterDetectionJobRow::from_row(&row)
                 .err()
                 .expect("chapter detection job columns must not decode"),
+            StoredLibraryRootRow::from_row(&row)
+                .err()
+                .expect("library root columns must not decode"),
+            StoredFilesystemEntryRow::from_row(&row)
+                .err()
+                .expect("filesystem entry columns must not decode"),
+            StoredCanonicalPersonRow::from_row(&row)
+                .err()
+                .expect("canonical person columns must not decode"),
+            StoredPersonMatchCandidateRow::from_row(&row)
+                .err()
+                .expect("person match candidate columns must not decode"),
+            StoredPersonCreditRow::from_row(&row)
+                .err()
+                .expect("person credit columns must not decode"),
+            StoredPersonIndexRebuildJobRow::from_row(&row)
+                .err()
+                .expect("person index rebuild job columns must not decode"),
         ];
         for error in errors {
             assert!(

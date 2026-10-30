@@ -51,7 +51,10 @@ impl Database {
         .bind(library_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_library_root).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_library_root)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -83,7 +86,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let root = stored_library_root(row);
+                let root = stored_library_root(row).map_err(self.sqlx_err())?;
                 roots.insert(root.id.clone(), root);
             }
         }
@@ -123,7 +126,7 @@ impl Database {
                 roots
                     .entry(library_id)
                     .or_default()
-                    .push(stored_library_root(row));
+                    .push(stored_library_root(row).map_err(self.sqlx_err())?);
             }
         }
         Ok(roots)
@@ -222,7 +225,10 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_library_root).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_library_root)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -241,7 +247,10 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_library_root).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_library_root)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -284,7 +293,9 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_library_root))
+        .map_err(self.sqlx_err())?
+        .map(stored_library_root)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
