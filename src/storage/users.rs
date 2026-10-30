@@ -248,6 +248,133 @@ struct UserLibraryAccessRow {
     library_id: String,
 }
 
+/// Typed projection of one `user_devices` page row; the login flag is an integer in both backends.
+#[derive(sqlx::FromRow)]
+struct UserDeviceRow {
+    device_id: String,
+    device_name: Option<String>,
+    device_type: Option<String>,
+    client_name: String,
+    client_version: Option<String>,
+    first_seen_at: i64,
+    last_seen_at: i64,
+    last_remote_ip: Option<String>,
+    has_active_login: i64,
+}
+
+impl UserDeviceRow {
+    fn into_device(self) -> StoredUserDevice {
+        StoredUserDevice {
+            device_id: self.device_id,
+            has_active_login: self.has_active_login != 0,
+            device_name: self.device_name,
+            device_type: self.device_type,
+            client_name: self.client_name,
+            client_version: self.client_version,
+            first_seen_at: self.first_seen_at,
+            last_seen_at: self.last_seen_at,
+            last_remote_ip: self.last_remote_ip,
+        }
+    }
+}
+
+/// Typed projection of one `user_access_blacklist_rules` row.
+///
+/// The enabled flag stays an integer in both backends and is converted by
+/// [`Self::into_rule`].
+#[derive(sqlx::FromRow)]
+struct UserAccessBlacklistRuleRow {
+    id: String,
+    user_id: Option<String>,
+    rule_type: String,
+    match_value: String,
+    is_enabled: i64,
+    created_by: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+impl UserAccessBlacklistRuleRow {
+    fn into_rule(self) -> StoredUserAccessBlacklistRule {
+        StoredUserAccessBlacklistRule {
+            id: self.id,
+            user_id: self.user_id,
+            rule_type: self.rule_type,
+            match_value: self.match_value,
+            is_enabled: self.is_enabled != 0,
+            created_by: self.created_by,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+        }
+    }
+}
+
+/// Typed projection of the rule-type/value pairs evaluated per request.
+#[derive(sqlx::FromRow)]
+struct UserAccessBlacklistRuleValueRow {
+    rule_type: String,
+    match_value: String,
+}
+
+/// Typed projection of the EXISTS probes that decide which rule types to load.
+#[derive(sqlx::FromRow)]
+struct AccessBlacklistRulePresenceRow {
+    has_device_rules: i64,
+    has_client_rules: i64,
+}
+
+/// Typed projection of the device metadata stored on an access token.
+///
+/// The token hash is deliberately not part of the projection, so this type carries no secret.
+#[derive(sqlx::FromRow)]
+struct AccessTokenDeviceRow {
+    device_id: String,
+    client_name: String,
+    device_name: String,
+    client_version: String,
+}
+
+impl AccessTokenDeviceRow {
+    fn into_device(self) -> StoredAccessTokenDevice {
+        StoredAccessTokenDevice {
+            device_id: self.device_id,
+            client_name: self.client_name,
+            device_name: self.device_name,
+            client_version: self.client_version,
+        }
+    }
+}
+
+/// Typed projection of one active Emby login session (`access_tokens` row).
+#[derive(sqlx::FromRow)]
+struct EmbyLoginSessionRow {
+    id: String,
+    device_id: String,
+    device_name: String,
+    device_type: Option<String>,
+    client_name: String,
+    client_version: String,
+    created_at: i64,
+    updated_at: i64,
+    last_seen_at: Option<i64>,
+}
+
+impl EmbyLoginSessionRow {
+    fn into_summary(self) -> StoredEmbyLoginSessionSummary {
+        StoredEmbyLoginSessionSummary {
+            id: self.id,
+            device_id: self.device_id,
+            device_name: self.device_name,
+            device_type: self.device_type,
+            client_name: self.client_name,
+            client_version: self.client_version,
+            created_at: self.created_at,
+            updated_at: self.updated_at,
+            last_seen_at: self.last_seen_at,
+        }
+    }
+}
+
 impl Database {
     pub(crate) async fn apply_user_permission_preset(
         &self,
@@ -1648,15 +1775,16 @@ impl Database {
         query: UserDevicePageQuery<'_>,
     ) -> Result<(Vec<StoredUserDevice>, i64), StorageError> {
         let total_count = self
-            .query("SELECT COUNT(*) AS total_count FROM user_devices WHERE user_id = ?")
+            .query_scalar::<i64>(
+                "SELECT COUNT(*) AS total_count FROM user_devices WHERE user_id = ?",
+            )
             .bind(query.user_id)
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("total_count"))
             .map_err(self.sqlx_err())?;
 
         let rows = self
-            .query(
+            .query_as::<UserDeviceRow>(
                 "SELECT ud.device_id, ud.device_name, ud.device_type, ud.client_name,
                         ud.client_version, ud.first_seen_at, ud.last_seen_at,
                         ud.last_remote_ip,
@@ -1685,20 +1813,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let devices = rows
-            .into_iter()
-            .map(|row| StoredUserDevice {
-                device_id: row.get("device_id"),
-                has_active_login: row.get::<i64, _>("has_active_login") != 0,
-                device_name: row.get("device_name"),
-                device_type: row.get("device_type"),
-                client_name: row.get("client_name"),
-                client_version: row.get("client_version"),
-                first_seen_at: row.get("first_seen_at"),
-                last_seen_at: row.get("last_seen_at"),
-                last_remote_ip: row.get("last_remote_ip"),
-            })
-            .collect();
+        let devices = rows.into_iter().map(UserDeviceRow::into_device).collect();
 
         Ok((devices, total_count))
     }
@@ -1738,14 +1853,13 @@ impl Database {
         let count_sql = format!(
             "SELECT COUNT(*) AS total_count FROM user_access_blacklist_rules WHERE {where_clause}"
         );
-        let mut count_query = self.query(sqlx::AssertSqlSafe(count_sql));
+        let mut count_query = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql));
         if let Some(user_id) = user_id {
             count_query = count_query.bind(user_id);
         }
         let total_count = count_query
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("total_count"))
             .map_err(self.sqlx_err())?;
 
         let page_sql = format!(
@@ -1755,7 +1869,8 @@ impl Database {
              ORDER BY created_at DESC, id ASC
              LIMIT ? OFFSET ?"
         );
-        let mut page_query = self.query(sqlx::AssertSqlSafe(page_sql));
+        let mut page_query =
+            self.query_as::<UserAccessBlacklistRuleRow>(sqlx::AssertSqlSafe(page_sql));
         if let Some(user_id) = user_id {
             page_query = page_query.bind(user_id);
         }
@@ -1767,16 +1882,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let rules = rows
             .into_iter()
-            .map(|row| StoredUserAccessBlacklistRule {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                rule_type: row.get("rule_type"),
-                match_value: row.get("match_value"),
-                is_enabled: row.get::<i64, _>("is_enabled") != 0,
-                created_by: row.get("created_by"),
-                created_at: row.get("created_at"),
-                updated_at: row.get("updated_at"),
-            })
+            .map(UserAccessBlacklistRuleRow::into_rule)
             .collect();
         Ok((rules, total_count))
     }
@@ -1795,25 +1901,16 @@ impl Database {
                     created_at, updated_at
              FROM user_access_blacklist_rules WHERE id = ? AND {where_clause}"
         );
-        let mut query = self.query(sqlx::AssertSqlSafe(sql)).bind(rule_id);
+        let mut query = self
+            .query_as::<UserAccessBlacklistRuleRow>(sqlx::AssertSqlSafe(sql))
+            .bind(rule_id);
         if let Some(user_id) = user_id {
             query = query.bind(user_id);
         }
         query
             .fetch_optional(&self.pool)
             .await
-            .map(|row| {
-                row.map(|row| StoredUserAccessBlacklistRule {
-                    id: row.get("id"),
-                    user_id: row.get("user_id"),
-                    rule_type: row.get("rule_type"),
-                    match_value: row.get("match_value"),
-                    is_enabled: row.get::<i64, _>("is_enabled") != 0,
-                    created_by: row.get("created_by"),
-                    created_at: row.get("created_at"),
-                    updated_at: row.get("updated_at"),
-                })
-            })
+            .map(|row| row.map(UserAccessBlacklistRuleRow::into_rule))
             .map_err(self.sqlx_err())
     }
 
@@ -1824,7 +1921,7 @@ impl Database {
         if query.device_id.is_none() && query.client_name.is_none() {
             return Ok(false);
         }
-        self.query(
+        self.query_scalar::<i64>(
             // A bare EXISTS returns BOOLEAN on PostgreSQL, but INTEGER on SQLite.
             "SELECT CAST(CASE WHEN EXISTS (
                  SELECT 1
@@ -1844,7 +1941,7 @@ impl Database {
         .bind(query.client_name)
         .fetch_one(&self.pool)
         .await
-        .and_then(|row| row.try_get::<i64, _>("matched").map(|value| value != 0))
+        .map(|matched: i64| matched != 0)
         .map_err(self.sqlx_err())
     }
 
@@ -1852,7 +1949,7 @@ impl Database {
         &self,
         user_id: &str,
     ) -> Result<(bool, bool), StorageError> {
-        self.query(
+        self.query_as::<AccessBlacklistRulePresenceRow>(
             "SELECT
                  CAST(CASE WHEN EXISTS (
                      SELECT 1 FROM user_access_blacklist_rules
@@ -1871,12 +1968,7 @@ impl Database {
         .bind(user_id)
         .fetch_one(&self.pool)
         .await
-        .and_then(|row| {
-            Ok((
-                row.try_get::<i64, _>("has_device_rules")? != 0,
-                row.try_get::<i64, _>("has_client_rules")? != 0,
-            ))
-        })
+        .map(|row| (row.has_device_rules != 0, row.has_client_rules != 0))
         .map_err(self.sqlx_err())
     }
 
@@ -1887,7 +1979,7 @@ impl Database {
         query: UserAccessBlacklistIpRuleQuery<'_>,
     ) -> Result<Vec<String>, StorageError> {
         let rows = self
-            .query(
+            .query_scalar::<String>(
                 "SELECT match_value
                  FROM user_access_blacklist_rules
                  WHERE is_enabled = 1
@@ -1902,7 +1994,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(rows.into_iter().map(|row| row.get("match_value")).collect())
+        Ok(rows)
     }
 
     pub(crate) async fn set_user_access_blacklist_rule_enabled(
@@ -2249,7 +2341,7 @@ impl Database {
         &self,
         token_hash: &[u8],
     ) -> Result<Option<StoredAccessTokenDevice>, StorageError> {
-        self.query(
+        self.query_as::<AccessTokenDeviceRow>(
             "SELECT device_id, client_name, device_name, client_version
              FROM access_tokens
              WHERE token_hash = ? AND revoked_at IS NULL
@@ -2258,14 +2350,7 @@ impl Database {
         .bind(token_hash)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredAccessTokenDevice {
-                device_id: row.get("device_id"),
-                client_name: row.get("client_name"),
-                device_name: row.get("device_name"),
-                client_version: row.get("client_version"),
-            })
-        })
+        .map(|row| row.map(AccessTokenDeviceRow::into_device))
         .map_err(self.sqlx_err())
     }
 
@@ -2287,7 +2372,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let sessions = self
-            .query(
+            .query_as::<EmbyLoginSessionRow>(
                 "SELECT id, device_id, device_name, device_type, client_name, client_version,
                         created_at, updated_at, last_seen_at
                  FROM access_tokens
@@ -2300,22 +2385,11 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| StoredEmbyLoginSessionSummary {
-                        id: row.get("id"),
-                        device_id: row.get("device_id"),
-                        device_name: row.get("device_name"),
-                        device_type: row.get("device_type"),
-                        client_name: row.get("client_name"),
-                        client_version: row.get("client_version"),
-                        created_at: row.get("created_at"),
-                        updated_at: row.get("updated_at"),
-                        last_seen_at: row.get("last_seen_at"),
-                    })
-                    .collect()
-            })
             .map_err(self.sqlx_err())?;
+        let sessions = sessions
+            .into_iter()
+            .map(EmbyLoginSessionRow::into_summary)
+            .collect();
         Ok((sessions, total_count))
     }
 
@@ -4527,7 +4601,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<(String, String)>, StorageError> {
         let rows = self
-            .query(
+            .query_as::<UserAccessBlacklistRuleValueRow>(
                 "SELECT rule_type, match_value
                  FROM user_access_blacklist_rules
                  WHERE is_enabled = 1 AND (user_id IS NULL OR user_id = ?)
@@ -4541,7 +4615,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
-            .map(|row| (row.get("rule_type"), row.get("match_value")))
+            .map(|row| (row.rule_type, row.match_value))
             .collect())
     }
 }
@@ -4980,6 +5054,147 @@ mod tests {
                 .await?,
             Vec::<String>::new()
         );
+        Ok(())
+    }
+
+    /// Device pages, access-token metadata and access rules decode from their typed rows.
+    #[tokio::test]
+    async fn device_token_and_access_rule_projections_decode_from_typed_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::repository::{
+            NewAccessToken, NewUserAccessBlacklistRule, NewUserDeviceObservation,
+            UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+            UserAccessBlacklistRulePageQuery, UserAccessBlacklistRuleScope, UserDevicePageQuery,
+        };
+
+        let (_temp_dir, database) = test_database().await?;
+        let user_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&user_id, "decoding-admin", "Decoding Admin", "hash")
+            .await?;
+        database
+            .upsert_user_device(NewUserDeviceObservation {
+                user_id: &user_id,
+                device_id: "decoding-device",
+                device_name: Some("Decoding Device"),
+                device_type: Some("PHONE"),
+                client_name: "Decoding Client",
+                client_version: Some("9.9"),
+                last_remote_ip: Some("203.0.113.7"),
+                seen_at: 1_000,
+            })
+            .await?;
+
+        let (devices, total_count) = database
+            .list_user_devices_page(UserDevicePageQuery {
+                user_id: &user_id,
+                offset: 0,
+                limit: 10,
+            })
+            .await?;
+        assert_eq!(total_count, 1);
+        let device = devices
+            .first()
+            .ok_or("the device page must include the stored observation")?;
+        assert_eq!(device.device_id, "decoding-device");
+        assert_eq!(device.device_name.as_deref(), Some("Decoding Device"));
+        assert_eq!(device.device_type.as_deref(), Some("PHONE"));
+        assert_eq!(device.client_name, "Decoding Client");
+        assert_eq!(device.client_version.as_deref(), Some("9.9"));
+        assert_eq!(device.first_seen_at, 1_000);
+        assert_eq!(device.last_remote_ip.as_deref(), Some("203.0.113.7"));
+        assert!(!device.has_active_login);
+
+        let token_hash = [3_u8; 32];
+        database
+            .create_access_token(NewAccessToken {
+                id: "decoding-token",
+                token_hash: &token_hash,
+                user_id: &user_id,
+                device_id: "decoding-device",
+                client_name: "Decoding Client",
+                device_name: "Decoding Device",
+                client_version: "9.9",
+                device_type: Some("PHONE"),
+            })
+            .await?;
+        let token_device = database
+            .find_access_token_device(&token_hash)
+            .await?
+            .ok_or("the created token must resolve its device metadata")?;
+        assert_eq!(token_device.device_id, "decoding-device");
+        assert_eq!(token_device.device_name, "Decoding Device");
+        assert_eq!(token_device.client_version, "9.9");
+
+        for (rule_id, rule_type, match_value) in [
+            ("decoding-rule-client", "CLIENT", "Decoding Client"),
+            ("decoding-rule-ip", "IP_CIDR", "203.0.113.0/24"),
+        ] {
+            database
+                .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                    id: rule_id,
+                    user_id: Some(&user_id),
+                    rule_type,
+                    match_value,
+                    is_enabled: true,
+                    created_by: Some(&user_id),
+                    created_at: 2_000,
+                })
+                .await?;
+        }
+        assert_eq!(
+            database
+                .user_access_blacklist_rules_for_user(&user_id, 10)
+                .await?,
+            vec![
+                ("CLIENT".to_owned(), "Decoding Client".to_owned()),
+                ("IP_CIDR".to_owned(), "203.0.113.0/24".to_owned()),
+            ]
+        );
+        assert_eq!(
+            database
+                .list_user_access_ip_blacklist_rule_values(UserAccessBlacklistIpRuleQuery {
+                    user_id: &user_id,
+                    limit: 10,
+                })
+                .await?,
+            vec!["203.0.113.0/24".to_owned()]
+        );
+        assert_eq!(
+            database
+                .active_user_access_device_client_blacklist_rules(&user_id)
+                .await?,
+            (false, true)
+        );
+        assert!(
+            database
+                .user_access_blacklist_matches(UserAccessBlacklistRuleMatchQuery {
+                    user_id: &user_id,
+                    device_id: None,
+                    client_name: Some("Decoding Client"),
+                })
+                .await?
+        );
+
+        let rule = database
+            .find_user_access_blacklist_rule(
+                UserAccessBlacklistRuleScope::User(&user_id),
+                "decoding-rule-ip",
+            )
+            .await?
+            .ok_or("the inserted rule must be readable")?;
+        assert_eq!(rule.rule_type, "IP_CIDR");
+        assert!(rule.is_enabled);
+        assert_eq!(rule.created_at, 2_000);
+        let (rules, rules_total) = database
+            .list_user_access_blacklist_rules_page(UserAccessBlacklistRulePageQuery {
+                scope: UserAccessBlacklistRuleScope::User(&user_id),
+                offset: 0,
+                limit: 10,
+            })
+            .await?;
+        assert_eq!(rules_total, 2);
+        assert_eq!(rules.len(), 2);
         Ok(())
     }
 }
