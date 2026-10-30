@@ -196,11 +196,84 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 
 ## 4. 设计问题 3：幂等与失败
 
-（待填）
+### 4.1 原则
+
+**setup 一旦成功就不回退**：管理员已经写入数据库（`src/auth/users.rs:617-638`），重启机制的任何失败都只能
+降级为“本次不重启”，不能把 201 改成错误。
+
+### 4.2 重启请求的“排期点”：管理员创建成功之后
+
+推荐把排期放在 `setup.complete(..)` 返回 `Ok` 之后（`src/api/users.rs:692-694` 的 `match` 成功分支），而不是只在 201 分支末尾：
+
+- 因为后面的步骤（校验路径、建库、加根、起扫描）都可能返回 4xx；如果只在 201 分支排期，就会出现
+  “管理员已存在、setup 已永久关闭，但进程仍停在 setup 模式”的半状态。方案 B 第 ③ 步之后，这个半状态
+  意味着 ready 路由压根没挂载，管理员无法自助建库，只能重启进程。
+- 排在“handler 末尾”而不是紧跟 `complete()` 之后，可以避免一次网络路径上的 `inspect_root_path`
+  与重启延迟重叠（延迟从 handler 结束开始算）。
+
+结论：handler 里记一个 `admin_created: bool`，在返回响应前统一排期；**4xx 响应体不加 `restarting` 字段**
+（保持 `api_error` 的既有形状），前端把它当普通错误展示，重启后 `setup/status` 变 `initialized: true`，
+页面自然进入登录。
+
+### 4.3 三种失败/重入场景
+
+| 场景 | 行为 | 理由 |
+| --- | --- | --- |
+| `state.restart_handle` 为 `None` | 返回 201，`restarting: false`，`warn!` 一条日志 | 生产路径一定注入句柄（`src/main.rs:195`）；`None` 只出现在库内测试/嵌入式构造（`src/api/legacy.rs:752` 说明它是可选注入）。此时不能报错，否则所有现有 `setup_complete` 集成测试（`tests/api_web/web_auth.rs:58` 等）都会失败 |
+| 延迟任务里 `request_restart()` 返回 `false` | 保持 201 + `restarting: true`，`info!` 一条日志 | 一次性句柄（`src/application/restart.rs:20-26`），`false` 的语义是“已经在准备重启”，例如数据库切换流程（`src/api/users.rs:546`）刚排过；对客户端而言结果相同 |
+| setup 已完成后再调 `setup_complete` | 409 `SETUP_ALREADY_COMPLETED`（`src/api/users.rs:753`），**不排期重启** | 该分支在 `setup.complete` 失败后就返回，早于排期代码；语义上也应如此（幂等读，不产生副作用） |
+| 两个 `setup_complete` 并发 | 只有一个插入成功：`insert_initial_user` 是单事务里的 `INSERT ... SELECT ... WHERE NOT EXISTS (SELECT 1 FROM users)`（`src/storage/users.rs:717-734`），失败方拿到 `SetupAlreadyCompleted` → 409 | 排期只在成功方执行一次；失败方的 409 可能正好撞上重启窗口而被连接重置，客户端重试会得到同样的 409（可重入） |
+| `exec` 本身失败（非 unix，或 `current_exe` 失败） | `restart_process` 返回 `Err` → `serve` 返回 `Err` → `main` 返回错误，进程**退出**而不是继续服务 | 这是既有行为（`src/main.rs:346-359`），数据库切换重启也一样；容器/守护进程重启策略负责拉起。setup 数据已提交且 `database.close()` 已执行（`src/main.rs:281`），不会丢 |
 
 ## 5. 设计问题 4：前端
 
-（待填）
+### 5.1 现状
+
+- `SetupPage` 已经有一套“正在重启”引导，但它服务于**数据库切换**：`restartRequested` 状态
+  （`web/src/features/auth/SetupPage.tsx:11`）、轮询 `setupDatabaseStatus`（`:16`）、全屏重启提示
+  （`:32-33`）。它之所以不会“提前判定就绪”，是因为 `restartRequired` 在重启真正发生前一直是
+  `true`（数据库侧持久标记），重启后才翻转。
+- setup 完成后的流程完全不同：`AdminSetupForm` 在 `onSuccess` 里直接
+  `queryClient.setQueryData(queryKeys.setup, { initialized: true })` 然后 `navigate("/login")`
+  （`web/src/features/auth/AdminSetupForm.tsx:24-27`）。**注意**：`initialized` 在 201 之后立刻就是
+  `true`（管理员已落库），而进程还没重启，所以用“`initialized === true` 即就绪”的判据会提前放行。
+- 客户端 `setup()` 目前只声明 `{ user: LuxUser }`（`web/src/lib/api/client.ts:426-436`），
+  数据库重启已有 `{ restarting: boolean }` 的先例（`client.ts:420-423`）。
+
+### 5.2 改动
+
+| 文件 | 改动 |
+| --- | --- |
+| `web/src/lib/api/client.ts` | `setup()` 返回类型改为 `{ user: LuxUser; restarting?: boolean }`（`restarting` 可选：兼容旧后端） |
+| `web/src/lib/api/types.ts` | 若需要，加 `SetupCompleteResult` 类型（可选字段 `restarting?: boolean`） |
+| `web/src/features/auth/AdminSetupForm.tsx` | `onSuccess` 读 `result.restarting`：`true` → 调父组件传入的 `onRestarting()`，不再自行 `navigate`；`false/undefined` → 保持现有行为（`setQueryData` + `navigate("/login")`） |
+| `web/src/features/auth/SetupPage.tsx` | 持有 `phase: "form" \| "restarting"`；`restarting` 时渲染与数据库流程同款的全屏提示（复用 `:33` 的 `lux-state-screen` 结构，文案改为“初始化已完成，正在重启 Lux…”），并轮询就绪 |
+| `web/tests/setup-page.test.tsx` | 新增：`restarting: true` 的 201 后出现“正在重启 Lux”；就绪后进入登录；`restarting: false` 仍是直接跳转 |
+
+### 5.3 轮询就绪的方式（关键细节）
+
+因为 `setup/status` 在 201 之后**立刻**返回 `initialized: true`，不能用“一次成功即就绪”。用
+“先看到断开、再看到恢复”的判据：
+
+1. 进入 `restarting` 后每 1 s 调一次 `api.setupStatus()`（沿用 `SetupPage.tsx:16` 的
+   `refetchInterval` 写法）。
+2. 状态机 `waiting-for-down → waiting-for-up → ready`：
+   - 第一次**网络层失败**（`fetch` 抛 `TypeError`，说明端口已关）→ 转 `waiting-for-up`；
+   - 之后第一次成功 → `invalidateQueries(queryKeys.setup)` 并 `navigate("/login")`；
+   - 兜底：10 s 内一次失败都没出现（重启被跳过、或反向代理把请求缓存/重试掉了）→ 直接进入登录页，
+     登录请求本身会重试，失败时用户看到错误并可再提交。
+3. 出现 `restarting === false`（旧后端或无重启句柄）→ 完全走今天的路径，不显示重启页。
+
+反向代理部署提示：重启窗口内 `502/504` 由代理产生，同样算“连接失败”，与 `TypeError` 一起按失败处理。
+
+### 5.4 兼容性
+
+- **旧前端 + 新后端**：旧前端不认识 `restarting`，会立刻 `navigate("/login")`，登录请求可能撞上重启窗口
+  失败一次，用户重试即可 → 降级可用，不阻塞发布。
+- **新前端 + 旧后端**：`restarting` 缺省 → 当作 `false`，行为与今天一致。
+- **Emby 客户端**：不走 setup（`docs/LUX-DEVELOPMENT.md:1620-1626` 列出的 setup 端点与 Emby 路由/DTO
+  是两套；`setup_complete` 只有 Web 初始化页调用），因此没有协议兼容问题。它们只会经历与现有数据库
+  切换重启相同的数秒连接中断，随后按既有重试逻辑恢复。这一点与方案 B 的所有者决策一致（已接受）。
 
 ## 6. 设计问题 5：测试策略
 
