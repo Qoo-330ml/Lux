@@ -19062,7 +19062,9 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
   进程停在一个“setup 已关闭”的半状态。
 - C2 首次扫描恢复：采用方案 (b)，无 schema 变更。判据是 `scan_jobs` 里该库**最近一次**
   `RECONCILE_LIBRARY` 任务是 `status='CANCELLED'` + `error='SERVER_SHUTDOWN'` 且库仍启用、
-  `last_scan_at IS NULL`、有 root、无活动扫描（因此恢复出的新任务若 `FAILED`，下次启动不会再排）；
+  `last_scan_at IS NULL`、至少有一个**可用** root（`is_available = 1`；根全不可用时跳过并打一条带库 ID
+  与原因的 `warn!`，避免 reconcile 对不可用根“警告后继续”却写入 `last_scan_at` 把首次扫描意图消耗掉，
+  该库保持可被下一次启动补扫）、无活动扫描（因此恢复出的新任务若 `FAILED`，下次启动不会再排）；
   `storage::list_shutdown_interrupted_first_scan_library_ids`（SQL 留在 storage）与
   `application::admin_scan_jobs::resume_shutdown_interrupted_first_scans`（复用 setup 用的
   `start_library_scan`，按 32 个库一页翻页读取，单次启动最多排队 512 个库，达上限时日志报告剩余数量）
@@ -19084,11 +19086,15 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
       `Running`”（顺序断言不依赖墙钟）、“注入 0 延迟仍观察到 `Restart`”、“无句柄保持 201 与完整 body
       （键集合逐字固定，`restarting: false`）”、“重复 setup 409 且不再触发 `watch`”、“管理员已建后首库
       失败仍重启”、“`rootPath` 不可用被更早拒绝且不重启、随后修正请求正常完成”。
-- [x] `cargo test --locked --test scanner shutdown_jobs::` 9/9：恢复用例（取消记录 → 新任务 → 扫描
-      完成写入 `last_scan_at` → 再次启动不再排队）、33 个库（多于一页）全部重排，以及反向用例
-      （已扫描 / 真实失败 / 库停用 / 无 root / 已有活动扫描 / 最近一次扫描 `FAILED`）。
-- [x] `bash scripts/restart-recovery-smoke.sh` 实跑通过（arm64 裸进程，5000 个文件）：输出
-      `interruptedStatus: CANCELLED`、`replacementStatus: COMPLETED`、`lastScanAtRecorded: true`。另外用
+- [x] `cargo test --locked --test scanner shutdown_jobs::` 10/10：恢复用例（取消记录 → 新任务 → 扫描
+      完成写入 `last_scan_at` → 再次启动不再排队）、33 个库（多于一页）全部重排、根全部不可用时跳过且
+      `last_scan_at` 仍为空、根恢复后下一次启动补扫成功，以及反向用例（已扫描 / 真实失败 / 库停用 /
+      无 root / 已有活动扫描 / 最近一次扫描 `FAILED`）。
+- [x] `cargo test --locked --lib admin_scan_jobs::`：`the_limit_accounting_counts_every_library_left_for_the_next_startup`
+      固定上限记账（5 个库、上限 2 → 排队 2、剩余 3）。
+- [x] `bash scripts/restart-recovery-smoke.sh` 连续实跑 3 次通过（arm64 裸进程，5000 个文件）：每次都是
+      `interruptedStatus: CANCELLED`、`replacementStatus: COMPLETED`、`lastScanAtRecorded: true`。替换任务
+      候选按 `(createdAt, id)` 必须晚于被中断任务，避免恢复任务尚未落库时把旧的取消记录当结果。另外用
       真实实例验证了 `lux_select_sqlite_database` 与 `lux_wait_for_first_scan_settled`（等待后
       `POST /admin/libraries/{id}/scan` 返回 `202` 而不是 `409`）。Docker 类脚本本机无 Docker，只做
       `bash -n` 语法检查。

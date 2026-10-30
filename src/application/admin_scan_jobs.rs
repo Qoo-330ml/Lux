@@ -193,6 +193,7 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
     scan_jobs: &ScanJobService,
     workers: ScanWorkerServices,
 ) -> Result<FirstScanRecovery, StorageError> {
+    log_first_scans_skipped_for_unavailable_roots(database).await;
     resume_shutdown_interrupted_first_scans_bounded(
         database,
         scan_jobs,
@@ -200,6 +201,32 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
         FIRST_SCAN_RESUME_MAX_LIBRARIES,
     )
     .await
+}
+
+/// Logs the libraries the recovery leaves alone because none of their roots is available.
+///
+/// Without the line the intent would disappear silently: the library matches the cancellation
+/// evidence, but a scan against a missing mount reports success with zero items. Failing to log is
+/// not fatal for the recovery itself.
+async fn log_first_scans_skipped_for_unavailable_roots(database: &Database) {
+    match database
+        .list_first_scan_recovery_library_ids_without_an_available_root(FIRST_SCAN_RESUME_PAGE_SIZE)
+        .await
+    {
+        Ok(library_ids) => {
+            for library_id in library_ids {
+                tracing::warn!(
+                    %library_id,
+                    reason = "no available library root",
+                    "first scan not re-queued: every media root is unavailable; the next startup \
+                     will retry once the mount is back"
+                );
+            }
+        }
+        Err(error) => {
+            tracing::warn!(%error, "could not list first scans skipped for unavailable roots");
+        }
+    }
 }
 
 /// [`resume_shutdown_interrupted_first_scans`] with an explicit per-startup bound.
