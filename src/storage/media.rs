@@ -131,7 +131,7 @@ fn movie_parent_folder_id_from_cache(
 /// Row of the two item-metadata batch readers (`list_media_item_metadata_by_ids` and
 /// `list_active_media_item_metadata_with_libraries`): both select the same projection, so one
 /// struct decodes it and [`stored_media_metadata`] turns it into [`StoredMediaMetadata`].
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MediaMetadataRow {
     item_id: String,
     library_id: String,
@@ -4081,7 +4081,398 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_folder_identity_key;
+    use super::*;
+    use crate::config::Config;
+    use sqlx::FromRow;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        Ok((temp_dir, database))
+    }
+
+    async fn insert_library(
+        database: &Database,
+        library_id: &str,
+        scraper_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind, is_enabled, scraper_id)
+             VALUES (?, ?, 'MIXED', 1, ?)",
+        )
+        .bind(library_id)
+        .bind(library_id)
+        .bind(scraper_id)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn insert_media_item(
+        database: &Database,
+        library_id: &str,
+        item: TestMediaItem<'_>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, title, sort_title,
+                 original_title, production_year, original_language, provider_ids_json,
+                 identification_status, identity_key
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+        )
+        .bind(item.id)
+        .bind(library_id)
+        .bind(item.item_type)
+        .bind(item.parent_id)
+        .bind(item.series_id)
+        .bind(item.title)
+        .bind(item.title.to_lowercase())
+        .bind(item.original_title)
+        .bind(item.production_year)
+        .bind(item.original_language)
+        .bind(item.provider_ids_json)
+        .bind(item.identity_key)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    struct TestMediaItem<'a> {
+        id: &'a str,
+        item_type: &'a str,
+        parent_id: Option<&'a str>,
+        series_id: Option<&'a str>,
+        title: &'a str,
+        original_title: Option<&'a str>,
+        production_year: Option<i64>,
+        original_language: Option<&'a str>,
+        provider_ids_json: Option<&'a str>,
+        identity_key: Option<&'a str>,
+    }
+
+    /// One library root, one movie with a local source and one FOLDER item, so every scan-path
+    /// lookup has a row to decode.
+    async fn seed_scan_path_rows(database: &Database) -> Result<(), sqlx::Error> {
+        const LIBRARY_ID: &str = "library-scan";
+        const ROOT_ID: &str = "root-scan";
+        const RELATIVE_PATH: &str = "Movies/Dune/Dune.2021.mkv";
+        insert_library(database, LIBRARY_ID, None).await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES (?, ?, '/srv/movies', '/srv/movies', 1, 1)",
+        )
+        .bind(ROOT_ID)
+        .bind(LIBRARY_ID)
+        .execute(database.pool())
+        .await?;
+        insert_media_item(
+            database,
+            LIBRARY_ID,
+            TestMediaItem {
+                id: "movie-dune",
+                item_type: "MOVIE",
+                parent_id: None,
+                series_id: None,
+                title: "Dune",
+                original_title: Some("Dune"),
+                production_year: Some(2021),
+                original_language: Some("en"),
+                provider_ids_json: Some(r#"{"Tmdb":"movie-438631"}"#),
+                identity_key: Some("movie:root-scan:Movies/Dune/Dune.2021.mkv"),
+            },
+        )
+        .await?;
+        insert_media_item(
+            database,
+            LIBRARY_ID,
+            TestMediaItem {
+                id: "folder-dune",
+                item_type: "FOLDER",
+                parent_id: Some(LIBRARY_ID),
+                series_id: None,
+                title: "Dune",
+                original_title: Some("Dune"),
+                production_year: None,
+                original_language: None,
+                provider_ids_json: None,
+                identity_key: Some("folder:root-scan:Movies/Dune"),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, is_missing
+             ) VALUES (?, ?, ?, 'FILE', 4096, 1700000000, 7, 42, ?, 'generation-1', 0)",
+        )
+        .bind("entry-dune")
+        .bind(ROOT_ID)
+        .bind(RELATIVE_PATH)
+        .bind(b"fingerprint-dune".to_vec())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, size, is_default, probe_status
+             ) VALUES (?, ?, 'LOCAL_FILE', ?, 4096, 1, 'READY')",
+        )
+        .bind("source-dune")
+        .bind("movie-dune")
+        .bind("entry-dune")
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_path_queries_decode_typed_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        seed_scan_path_rows(&database).await?;
+        const RELATIVE_PATH: &str = "Movies/Dune/Dune.2021.mkv";
+
+        let scan_path = database
+            .find_item_scan_source_path("movie-dune")
+            .await?
+            .expect("item scan path");
+        assert_eq!(scan_path.library_id, "library-scan");
+        assert_eq!(scan_path.library_root_id, "root-scan");
+        assert_eq!(scan_path.relative_path, RELATIVE_PATH);
+
+        let locator = database
+            .find_item_source_locator("movie-dune")
+            .await?
+            .expect("source locator");
+        assert_eq!(locator.root_path, "/srv/movies");
+        assert_eq!(locator.relative_path, RELATIVE_PATH);
+        assert_eq!(locator.fingerprint, Some(b"fingerprint-dune".to_vec()));
+        assert_eq!(locator.size, 4096);
+        assert_eq!(locator.modified_at, 1_700_000_000);
+        assert_eq!(locator.device, Some(7));
+        assert_eq!(locator.inode, Some(42));
+        assert_eq!(locator.title, "Dune");
+        assert_eq!(locator.production_year, Some(2021));
+
+        let by_locator = database
+            .find_item_by_source_locator("/srv/movies", RELATIVE_PATH)
+            .await?
+            .expect("source locator by path");
+        assert_eq!(by_locator.title, "Dune");
+        assert_eq!(by_locator.relative_path, RELATIVE_PATH);
+
+        let by_fingerprint = database
+            .find_items_by_source_fingerprint(b"fingerprint-dune", None, None)
+            .await?;
+        assert_eq!(by_fingerprint.len(), 1);
+        assert_eq!(by_fingerprint[0].title, "Dune");
+        assert_eq!(by_fingerprint[0].fingerprint, locator.fingerprint);
+
+        let folder = database
+            .find_folder_scan_path("folder-dune")
+            .await?
+            .expect("folder scan path");
+        assert_eq!(folder.library_id, "library-scan");
+        assert_eq!(folder.library_root_id, "root-scan");
+        assert_eq!(folder.relative_path, "Movies/Dune");
+
+        let (page, total) = database
+            .list_folder_scan_paths_page(&["library-scan".to_owned()], 0, 10)
+            .await?;
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "folder-dune");
+        assert_eq!(page[0].library_id, "library-scan");
+        assert_eq!(page[0].parent_id.as_deref(), Some("library-scan"));
+        assert_eq!(page[0].title, "Dune");
+        assert_eq!(page[0].library_root_id, "root-scan");
+        assert_eq!(page[0].relative_path, "Movies/Dune");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scraper_role_and_identity_queries_decode_typed_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_library(&database, "library-identity", Some("org.lux.scraper.tmdb")).await?;
+        sqlx::query(
+            "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+             VALUES ('library-identity', 'org.lux.scraper.tmdb', 0, 'PRIMARY')",
+        )
+        .execute(database.pool())
+        .await?;
+        insert_media_item(
+            &database,
+            "library-identity",
+            TestMediaItem {
+                id: "series-identity",
+                item_type: "SERIES",
+                parent_id: Some("library-identity"),
+                series_id: None,
+                title: "Foundation",
+                original_title: None,
+                production_year: Some(2021),
+                original_language: Some("en"),
+                provider_ids_json: Some(r#"{"Tmdb":"series-93740"}"#),
+                identity_key: None,
+            },
+        )
+        .await?;
+        insert_media_item(
+            &database,
+            "library-identity",
+            TestMediaItem {
+                id: "episode-identity",
+                item_type: "EPISODE",
+                parent_id: Some("library-identity"),
+                series_id: Some("series-identity"),
+                title: "The Emperor's Peace",
+                original_title: None,
+                production_year: None,
+                original_language: None,
+                provider_ids_json: None,
+                identity_key: None,
+            },
+        )
+        .await?;
+        insert_media_item(
+            &database,
+            "library-identity",
+            TestMediaItem {
+                id: "movie-identity",
+                item_type: "MOVIE",
+                parent_id: None,
+                series_id: None,
+                title: "Dune",
+                original_title: None,
+                production_year: Some(2021),
+                original_language: Some("en"),
+                provider_ids_json: Some(r#"{"Tmdb":"movie-438631"}"#),
+                identity_key: None,
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            database
+                .find_item_scraper_role("episode-identity", "org.lux.scraper.tmdb")
+                .await?,
+            Some("PRIMARY".to_owned())
+        );
+        assert_eq!(
+            database
+                .find_item_scraper_role("episode-identity", "org.lux.scraper.missing")
+                .await?,
+            None
+        );
+
+        let image_identity = database
+            .find_media_item_image_identity("episode-identity")
+            .await?
+            .expect("image identity");
+        assert_eq!(image_identity.item_type, "EPISODE");
+        assert_eq!(image_identity.original_language.as_deref(), Some("en"));
+        assert_eq!(image_identity.provider_name.as_deref(), Some("Tmdb"));
+        assert_eq!(image_identity.provider_id.as_deref(), Some("series-93740"));
+        assert_eq!(image_identity.season_number, None);
+        assert_eq!(image_identity.episode_number, None);
+
+        let movie_identity = database
+            .find_movie_identity("movie-identity")
+            .await?
+            .expect("movie identity");
+        assert_eq!(movie_identity.library_id, "library-identity");
+        assert_eq!(movie_identity.provider_name, "Tmdb");
+        assert_eq!(movie_identity.provider_id, "movie-438631");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collection_queries_decode_existing_rows_and_member_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_library(&database, "library-collection", None).await?;
+        for index in 1..=2_i64 {
+            let item_id = format!("collection-movie-{index}");
+            let title = format!("Movie {index}");
+            let provider_ids_json = format!(r#"{{"tmdb":"{index}"}}"#);
+            insert_media_item(
+                &database,
+                "library-collection",
+                TestMediaItem {
+                    id: &item_id,
+                    item_type: "MOVIE",
+                    parent_id: None,
+                    series_id: None,
+                    title: &title,
+                    original_title: None,
+                    production_year: Some(2000 + index),
+                    original_language: None,
+                    provider_ids_json: Some(&provider_ids_json),
+                    identity_key: None,
+                },
+            )
+            .await?;
+        }
+        // list_collection_member_ids_page only reports catalog-visible members.
+        sqlx::query(
+            "UPDATE media_items SET has_available_source = 1
+             WHERE library_id = 'library-collection'",
+        )
+        .execute(database.pool())
+        .await?;
+        let member_provider_ids = (1..=2)
+            .map(|index| ("TMDB".to_owned(), index.to_string(), index))
+            .collect::<Vec<_>>();
+        let collection = |title: &'static str| NewCollection {
+            library_id: "library-collection",
+            provider: "tmdb",
+            provider_id: "collection-1",
+            title,
+            overview: None,
+            poster_path: None,
+            backdrop_path: None,
+            member_provider_ids: &member_provider_ids,
+        };
+
+        let created = database.upsert_collection(collection("Collection")).await?;
+        assert_eq!(created.member_count, 2);
+        // The second refresh takes the existing-collection branch that decodes `id`/`item_id`.
+        let refreshed = database.upsert_collection(collection("Collection")).await?;
+        assert_eq!(refreshed.member_count, 2);
+        assert_eq!(refreshed.collection_item_id, created.collection_item_id);
+
+        let (member_ids, total) = database
+            .list_collection_member_ids_page(&created.collection_item_id, None, None, 0, 10)
+            .await?;
+        assert_eq!(total, 2);
+        assert_eq!(
+            member_ids,
+            vec![
+                "collection-movie-1".to_owned(),
+                "collection-movie-2".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_metadata_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = MediaMetadataRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn parses_folder_identity_into_root_and_relative_path() {
