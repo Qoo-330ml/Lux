@@ -10,8 +10,6 @@ const MAX_LISTED_PLAYBACK_SESSIONS: i64 = 500;
 const MAX_SESSIONS_PER_SOURCE: i64 = 32;
 
 impl Database {
-    // LUX-736 wires this bounded storage contract into the admin playback API.
-    #[allow(dead_code)]
     pub(crate) async fn list_current_user_playback_sessions(
         &self,
         user_id: &str,
@@ -101,8 +99,6 @@ impl Database {
         }))
     }
 
-    // LUX-620 wires this storage contract into Web, Emby, and STRM playback entry points.
-    #[allow(dead_code)]
     pub(crate) async fn reserve_playback_admission(
         &self,
         user_id: &str,
@@ -258,8 +254,7 @@ impl Database {
             .map_err(self.sqlx_err())
     }
 
-    // LUX-620 calls this after playback stop, failure, or expiry.
-    #[allow(dead_code)]
+    // Called after playback stop, failure, or expiry.
     pub(crate) async fn release_playback_admission(
         &self,
         user_id: &str,
@@ -829,7 +824,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
     pub(crate) async fn set_web_playback_access_context(
         &self,
         session_id: &str,
@@ -854,7 +848,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-771 consumes the saved playback authorization context.
     pub(crate) async fn find_web_playback_access_context(
         &self,
         session_id: &str,
@@ -975,7 +968,6 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    #[allow(dead_code)] // LUX-776 periodically drops expired direct-ticket contexts.
     pub(crate) async fn delete_expired_emby_direct_playback_tickets(
         &self,
         now: i64,
