@@ -83,7 +83,7 @@ struct MergeItemStateRow {
 ///
 /// `owner_id` is the merge root the row belongs to: the item itself for roots, `series_id`
 /// for seasons and episodes. It only routes the row onto a record, never leaves this module.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MergeItemStateSelectRow {
     id: String,
     item_type: String,
@@ -94,7 +94,7 @@ struct MergeItemStateSelectRow {
 }
 
 /// Row of the media-source snapshot inside `record_media_merges_in_transaction`.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MergeSourceStateSelectRow {
     id: String,
     item_id: String,
@@ -102,7 +102,7 @@ struct MergeSourceStateSelectRow {
 }
 
 /// Row of the saved hierarchy of one merged item, replayed by `unmerge_media_items`.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MergeItemStateRestoreRow {
     item_id: String,
     parent_id: Option<String>,
@@ -111,7 +111,7 @@ struct MergeItemStateRestoreRow {
 }
 
 /// Row of one saved media source, replayed by `unmerge_media_items`.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MergeSourceStateRestoreRow {
     source_id: String,
     item_id: String,
@@ -122,7 +122,7 @@ struct MergeSourceStateRestoreRow {
 ///
 /// The column is spelled `source` in the table; [`StoredMediaMergeRecord`] exposes it as
 /// `origin`, so the conversion lives in one place.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MediaMergeRecordRow {
     id: String,
     library_id: String,
@@ -154,7 +154,7 @@ impl From<MediaMergeRecordRow> for StoredMediaMergeRecord {
 }
 
 /// Row of the merge-record lookup at the start of `unmerge_media_items`.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MediaMergeRecordKeyRow {
     id: String,
     library_id: String,
@@ -162,7 +162,7 @@ struct MediaMergeRecordKeyRow {
 }
 
 /// Row of the provider keys the two items being unmerged still share.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MergeSuppressionProviderKeyRow {
     provider: String,
     provider_id: String,
@@ -171,14 +171,14 @@ struct MergeSuppressionProviderKeyRow {
 /// Row of the title+year suppression key of the primary item.
 ///
 /// `production_year` is selected with `IS NOT NULL`, so both fields stay non-optional.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct MergeSuppressionTitleKeyRow {
     sort_title: String,
     production_year: i64,
 }
 
 /// Row of `list_provider_identity_merge_keys`: the provider half of a candidate key.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct ProviderIdentityMergeKeyRow {
     library_id: String,
     item_type: String,
@@ -200,7 +200,7 @@ impl From<ProviderIdentityMergeKeyRow> for StoredIdentityMergeCandidateKey {
 }
 
 /// Row of `list_title_identity_merge_keys`: the title+year half of a candidate key.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct TitleIdentityMergeKeyRow {
     library_id: String,
     item_type: String,
@@ -222,7 +222,7 @@ impl From<TitleIdentityMergeKeyRow> for StoredIdentityMergeCandidateKey {
 }
 
 /// Row of the candidate-group readers, which share one projection.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct IdentityGroupItemRow {
     id: String,
     added_at: i64,
@@ -244,7 +244,7 @@ impl From<IdentityGroupItemRow> for StoredIdentityMergeCandidateItem {
 }
 
 /// Row of `list_identity_group_source_paths`.
-#[derive(sqlx::FromRow)]
+#[derive(Debug, sqlx::FromRow)]
 struct IdentityGroupSourcePathRow {
     item_id: String,
     relative_path: String,
@@ -1031,6 +1031,7 @@ mod tests {
             .await?;
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].merged_item_id, "movie-b");
+        assert_eq!(records[0].merged_item_title, "movie-b");
         assert_eq!(records[0].origin, "MANUAL");
         assert_eq!(records[0].source_count, 1);
         assert!(records[0].undone_at.is_none());
@@ -1334,6 +1335,162 @@ mod tests {
             .collect::<std::collections::HashMap<_, _>>();
         assert_eq!(edition_flags.get("provider-a"), Some(&0));
         assert_eq!(edition_flags.get("provider-b"), Some(&1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn title_identity_group_items_decode_source_and_edition_counts()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        // Both items lack provider IDs, so they only fall into the title+year fallback group.
+        insert_item(
+            &database,
+            &library_id,
+            "plain-a",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1999),
+            "Same Title",
+        )
+        .await?;
+        insert_item(
+            &database,
+            &library_id,
+            "plain-b",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(1999),
+            "Same Title",
+        )
+        .await?;
+        insert_source(&database, "plain-a-main", "plain-a", None, 1).await?;
+        insert_source(&database, "plain-a-extra", "plain-a", None, 0).await?;
+        insert_source(
+            &database,
+            "plain-b-cut",
+            "plain-b",
+            Some("Director's Cut"),
+            1,
+        )
+        .await?;
+
+        let key = StoredIdentityMergeCandidateKey {
+            library_id: library_id.clone(),
+            item_type: "MOVIE".to_owned(),
+            provider: None,
+            provider_id: None,
+            sort_title: Some("same title".to_owned()),
+            production_year: Some(1999),
+        };
+        let items = database.list_title_identity_group_items(&key).await?;
+        let decoded = items
+            .iter()
+            .map(|item| {
+                (
+                    item.id.as_str(),
+                    item.source_count,
+                    item.default_source_count,
+                    item.edition_source_count,
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(decoded, vec![("plain-a", 2, 1, 0), ("plain-b", 1, 1, 1)]);
+        assert!(items.iter().all(|item| item.added_at > 0));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn identity_group_source_paths_decode_item_and_relative_path()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        insert_item(
+            &database,
+            &library_id,
+            "path-item",
+            "MOVIE",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(2010),
+            "path-item",
+        )
+        .await?;
+        let root_path = temp_dir.path().to_string_lossy().into_owned();
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('path-root', ?, ?, ?, 1, 1)",
+        )
+        .bind(&library_id)
+        .bind(&root_path)
+        .bind(&root_path)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation
+             ) VALUES
+                ('path-movie-file', 'path-root', 'Movies (2010)/path.mkv', 'FILE', 10, 1,
+                 'generation'),
+                ('path-blank-file', 'path-root', '', 'DIRECTORY', 0, 1, 'generation')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+             ) VALUES
+                ('path-movie-source', 'path-item', 'LOCAL_FILE', 'path-movie-file', 1, 'READY'),
+                ('path-blank-source', 'path-item', 'LOCAL_FILE', 'path-blank-file', 0, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let paths = database
+            .list_identity_group_source_paths(&["path-item".to_owned()])
+            .await?;
+        // The blank relative path is filtered by the query, not by the decoder.
+        assert_eq!(
+            paths,
+            vec![("path-item".to_owned(), "Movies (2010)/path.mkv".to_owned())]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_merge_record_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error =
+            MediaMergeRecordRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
         Ok(())
     }
 }
