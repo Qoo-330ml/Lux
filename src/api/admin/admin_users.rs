@@ -3123,7 +3123,7 @@ pub(crate) async fn admin_update_user_avatar(
     }
 }
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/content-restriction-index",

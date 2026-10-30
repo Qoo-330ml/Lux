@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route("/api/v1/admin/events", get(admin_events))
         .route("/api/v1/events", get(user_events))

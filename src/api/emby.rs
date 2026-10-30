@@ -6,7 +6,7 @@ mod credentials;
 pub(super) const NORMALIZED_CREDENTIAL_HEADER: &str = "x-lux-internal-emby-credential";
 
 struct EmbyRouteBuilder {
-    router: Router<AppState>,
+    router: Router<ReadyAppState>,
     path_templates: Vec<String>,
 }
 
@@ -18,7 +18,7 @@ impl EmbyRouteBuilder {
         }
     }
 
-    fn route(mut self, path: &str, methods: axum::routing::MethodRouter<AppState>) -> Self {
+    fn route(mut self, path: &str, methods: axum::routing::MethodRouter<ReadyAppState>) -> Self {
         if self
             .path_templates
             .iter()
@@ -33,7 +33,7 @@ impl EmbyRouteBuilder {
         self
     }
 
-    fn finish(self) -> (Router<AppState>, Vec<String>) {
+    fn finish(self) -> (Router<ReadyAppState>, Vec<String>) {
         (self.router, self.path_templates)
     }
 }
@@ -44,7 +44,7 @@ pub(super) fn path_accepts_playback_token(token: &str, path: &str) -> bool {
     credentials::playback_token_may_call(token, path)
 }
 
-pub(super) fn api_routes() -> (Router<AppState>, Vec<String>) {
+pub(super) fn api_routes() -> (Router<ReadyAppState>, Vec<String>) {
     // Discovery and password login do not consume token credentials.
     let (public_routes, public_path_templates) = EmbyRouteBuilder::new()
         .route("/System/Info/Public", get(emby_public_system_info))

@@ -140,15 +140,14 @@ fn ready_router(state: ReadyAppState) -> Router {
     let (emby_routes, emby_path_templates) = emby::api_routes();
     let app = Router::new()
         .route("/logo.svg", get(web_logo))
+        .merge(core_routes::<ReadyAppState>())
         .merge(users::api_routes())
         .merge(admin::api_routes())
         .merge(lux_api::api_routes())
         .merge(emby_routes.clone())
         .nest("/emby", emby_routes)
         .fallback_service(spa_service())
-        // The `api_routes()` builders still produce `Router<AppState>`; they flip to
-        // `Router<ReadyAppState>` in the next commit, which turns this into `.with_state(state)`.
-        .with_state(AppState::from_ref(&state));
+        .with_state(state);
     let app = apply_common_layers(app, &core, slots);
     case_insensitive_emby_router(app, emby_path_templates)
 }
@@ -167,9 +166,7 @@ fn not_ready_compat_router(state: AppState) -> Router {
     let app = Router::new()
         .route("/logo.svg", get(web_logo))
         // The three core probes are real handlers: they answer correctly without services.
-        .route("/health/live", get(users::live))
-        .route("/health/ready", get(users::ready))
-        .route("/api/v1/version", get(users::version))
+        .merge(core_routes::<AppState>())
         // Synthesised for the frozen tests only (§9.2 #3, #4, #5, #6).
         .route(
             "/api/v1/auth/sessions",
@@ -188,6 +185,24 @@ fn not_ready_compat_router(state: AppState) -> Router {
         .with_state(state);
     let app = apply_common_layers(app, &core, slots);
     case_insensitive_emby_router(app, vec!["/System/Info".to_owned()])
+}
+
+/// The three routes both router trees mount: the liveness/readiness probes and the version.
+///
+/// The handlers still take `State<AppState>`, so the only generic bound is `AppState: FromRef<S>`:
+/// the ready tree resolves it through the migration-period shim and the compatibility tree through
+/// `AppState` itself. When the closing batch switches these handlers to `State<CoreState>` the
+/// bound becomes `S: FromRef<CoreState>`, which is what lets the setup tree mount them too
+/// (docs/SETUP-READY-SPLIT-DESIGN.md §2.3).
+pub(super) fn core_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: FromRef<S>,
+{
+    Router::new()
+        .route("/health/live", get(users::live))
+        .route("/health/ready", get(users::ready))
+        .route("/api/v1/version", get(users::version))
 }
 
 /// The bare `503` the pre-split handlers answered for a missing service.
@@ -1322,6 +1337,14 @@ mod tests {
                 .await
                 .expect("Emby 503 body")
                 .is_empty()
+        );
+
+        // The case-insensitive Emby wrapper is still the outermost layer of this tree.
+        let emby_info_lowercase =
+            send(app.clone(), test_request(Method::GET, "/system/info", &[])).await;
+        assert_eq!(
+            emby_info_lowercase.status(),
+            StatusCode::SERVICE_UNAVAILABLE
         );
 
         // 6. GET /api/v1/items/item-1/danmaku -> structured bare-503 normalisation.

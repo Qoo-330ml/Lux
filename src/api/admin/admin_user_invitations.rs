@@ -25,7 +25,7 @@ struct CreateAdminUserInvitationRequest {
     preset_id: String,
 }
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/user-invitations",

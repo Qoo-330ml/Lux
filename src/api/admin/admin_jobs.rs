@@ -10,7 +10,7 @@ fn scan_worker_services(
     }
 }
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/libraries/{library_id}/scan",

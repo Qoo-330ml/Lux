@@ -3167,11 +3167,10 @@ fn parse_lux_user_token(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
+    // `/health/live`, `/health/ready` and `/api/v1/version` live in
+    // `routes::core_routes()` now: both router trees mount them.
     Router::new()
-        .route("/health/live", get(users::live))
-        .route("/health/ready", get(users::ready))
-        .route("/api/v1/version", get(users::version))
         .route(
             "/api/v1/auth/login-background",
             get(users::login_background),
