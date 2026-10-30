@@ -128,21 +128,88 @@ fn movie_parent_folder_id_from_cache(
     Ok(parent_folder_id)
 }
 
-fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
-    let scraper_id = row.get::<Option<String>, _>("scraper_id");
-    let series_scraper_id = row
-        .get::<Option<String>, _>("series_metadata_scraper_id")
-        .or_else(|| scraper_id.clone());
-    let series_provider = first_provider_id(
-        row.get("series_provider_ids_json"),
-        None,
-        series_scraper_id.as_deref(),
-    );
+/// Row of the two item-metadata batch readers (`list_media_item_metadata_by_ids` and
+/// `list_active_media_item_metadata_with_libraries`): both select the same projection, so one
+/// struct decodes it and [`stored_media_metadata`] turns it into [`StoredMediaMetadata`].
+#[derive(Debug, sqlx::FromRow)]
+struct MediaMetadataRow {
+    item_id: String,
+    library_id: String,
+    item_type: String,
+    title: String,
+    original_title: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i64>,
+    premiere_date: Option<String>,
+    last_air_date: Option<String>,
+    status: Option<String>,
+    original_language: Option<String>,
+    rating: Option<f64>,
+    provider_ids_json: Option<String>,
+    metadata_scraper_id: Option<String>,
+    identification_status: String,
+    metadata_provenance_json: Option<String>,
+    locked_fields_json: Option<String>,
+    nfo_metadata_json: Option<String>,
+    metadata_fingerprint: Option<Vec<u8>>,
+    nfo_collection_reference_key: Option<String>,
+    series_id: Option<String>,
+    collection_movie_provider: Option<String>,
+    collection_movie_provider_id: Option<String>,
+    collection_provider: Option<String>,
+    collection_provider_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    series_title: Option<String>,
+    series_production_year: Option<i64>,
+    series_provider_ids_json: Option<String>,
+    series_metadata_scraper_id: Option<String>,
+    scraper_id: Option<String>,
+}
+
+fn stored_media_metadata(row: MediaMetadataRow) -> StoredMediaMetadata {
+    let MediaMetadataRow {
+        item_id: _,
+        library_id,
+        item_type,
+        title,
+        original_title,
+        overview,
+        production_year,
+        premiere_date,
+        last_air_date,
+        status,
+        original_language,
+        rating,
+        provider_ids_json,
+        metadata_scraper_id,
+        identification_status,
+        metadata_provenance_json,
+        locked_fields_json,
+        nfo_metadata_json,
+        metadata_fingerprint,
+        nfo_collection_reference_key,
+        series_id,
+        collection_movie_provider,
+        collection_movie_provider_id,
+        collection_provider,
+        collection_provider_id,
+        season_number,
+        episode_number,
+        series_title,
+        series_production_year,
+        series_provider_ids_json,
+        series_metadata_scraper_id,
+        scraper_id,
+    } = row;
+    let series_scraper_id = series_metadata_scraper_id.or_else(|| scraper_id.clone());
+    let series_provider =
+        first_provider_id(series_provider_ids_json, None, series_scraper_id.as_deref());
     let collection_reference_identity_key = match (
-        row.get::<Option<String>, _>("collection_movie_provider"),
-        row.get::<Option<String>, _>("collection_movie_provider_id"),
-        row.get::<Option<String>, _>("collection_provider"),
-        row.get::<Option<String>, _>("collection_provider_id"),
+        collection_movie_provider,
+        collection_movie_provider_id,
+        collection_provider,
+        collection_provider_id,
     ) {
         (Some(movie_provider), Some(movie_id), Some(collection_provider), Some(collection_id)) => {
             Some(global_movie_collection_reference_identity_key(
@@ -155,35 +222,261 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
         _ => None,
     };
     StoredMediaMetadata {
-        library_id: row.get("library_id"),
-        item_type: row.get("item_type"),
-        title: row.get("title"),
-        original_title: row.get("original_title"),
-        overview: row.get("overview"),
-        production_year: row.get("production_year"),
-        premiere_date: row.get("premiere_date"),
-        last_air_date: row.get("last_air_date"),
-        status: row.get("status"),
-        original_language: row.get("original_language"),
-        rating: row.get("rating"),
-        provider_ids_json: row.get("provider_ids_json"),
-        metadata_scraper_id: row.get("metadata_scraper_id"),
-        identification_status: row.get("identification_status"),
+        library_id,
+        item_type,
+        title,
+        original_title,
+        overview,
+        production_year,
+        premiere_date,
+        last_air_date,
+        status,
+        original_language,
+        rating,
+        provider_ids_json,
+        metadata_scraper_id,
+        identification_status,
         scraper_id,
-        provenance_json: row.get("metadata_provenance_json"),
-        locked_fields_json: row.get("locked_fields_json"),
-        nfo_metadata_json: row.get("nfo_metadata_json"),
-        metadata_fingerprint: row.get("metadata_fingerprint"),
-        nfo_collection_reference_key: row.get("nfo_collection_reference_key"),
+        provenance_json: metadata_provenance_json,
+        locked_fields_json,
+        nfo_metadata_json,
+        metadata_fingerprint,
+        nfo_collection_reference_key,
         collection_reference_identity_key,
-        series_item_id: row.get("series_id"),
-        series_title: row.get("series_title"),
-        series_production_year: row.get("series_production_year"),
+        series_item_id: series_id,
+        series_title,
+        series_production_year,
         series_provider_name: series_provider.as_ref().map(|(name, _)| name.clone()),
         series_provider_id: series_provider.map(|(_, id)| id),
-        season_number: row.get("season_number"),
-        episode_number: row.get("episode_number"),
+        season_number,
+        episode_number,
     }
+}
+
+/// Row of `find_item_media_strategy_settings`: the library strategy plus the global fallback.
+#[derive(sqlx::FromRow)]
+struct ItemMediaStrategySettingsRow {
+    library_strategy: Option<String>,
+    global_strategy: Option<String>,
+}
+
+/// Row of `list_item_media_strategy_settings_by_ids`: the same projection keyed by item.
+#[derive(sqlx::FromRow)]
+struct ItemMediaStrategySettingsByIdRow {
+    item_id: String,
+    library_strategy: Option<String>,
+    global_strategy: Option<String>,
+}
+
+/// Row of `find_item_scan_source_path`.
+#[derive(sqlx::FromRow)]
+struct ItemScanPathRow {
+    library_id: String,
+    library_root_id: String,
+    relative_path: String,
+}
+
+impl From<ItemScanPathRow> for StoredItemScanPath {
+    fn from(row: ItemScanPathRow) -> Self {
+        Self {
+            library_id: row.library_id,
+            library_root_id: row.library_root_id,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
+/// Row of `find_folder_scan_path`: a folder item's library and folder identity key.
+#[derive(sqlx::FromRow)]
+struct FolderIdentityKeyRow {
+    library_id: String,
+    identity_key: String,
+}
+
+/// Row of `list_folder_scan_paths_page`.
+#[derive(sqlx::FromRow)]
+struct FolderScanPathRow {
+    id: String,
+    library_id: String,
+    parent_id: Option<String>,
+    title: String,
+    identity_key: String,
+}
+
+/// Row of `list_item_scraper_configurations_by_ids`.
+#[derive(sqlx::FromRow)]
+struct ItemScraperConfigurationRow {
+    item_id: String,
+    legacy_scraper_id: Option<String>,
+    selected_scraper_id: Option<String>,
+    position: Option<i64>,
+    role: Option<String>,
+}
+
+/// Row shared by `find_item_source_locator`, `find_item_by_source_locator` and
+/// `find_items_by_source_fingerprint`: all three select the same source-locator projection.
+#[derive(sqlx::FromRow)]
+struct ItemSourceLocatorRow {
+    canonical_path: String,
+    relative_path: String,
+    fingerprint: Option<Vec<u8>>,
+    size: i64,
+    modified_at: i64,
+    device: Option<i64>,
+    inode: Option<i64>,
+    title: String,
+    production_year: Option<i32>,
+}
+
+impl From<ItemSourceLocatorRow> for StoredItemSourceLocator {
+    fn from(row: ItemSourceLocatorRow) -> Self {
+        Self {
+            root_path: row.canonical_path,
+            relative_path: row.relative_path,
+            fingerprint: row.fingerprint,
+            size: row.size,
+            modified_at: row.modified_at,
+            device: row.device,
+            inode: row.inode,
+            title: row.title,
+            production_year: row.production_year,
+        }
+    }
+}
+
+/// Row of the manifest write batches that only read back the claimed row's `id`.
+#[derive(sqlx::FromRow)]
+struct ReturningIdRow {
+    id: String,
+}
+
+/// Row of the manifest ADD claim that reads back `relative_path`.
+#[derive(sqlx::FromRow)]
+struct ReturningRelativePathRow {
+    relative_path: String,
+}
+
+/// Row of every media-item identity lookup that selects `id` and `identity_key` together.
+#[derive(sqlx::FromRow)]
+struct ItemIdentityKeyIdRow {
+    id: String,
+    identity_key: String,
+}
+
+/// Row of `prefetch_movie_items_in_transaction`.
+#[derive(sqlx::FromRow)]
+struct PrefetchedMovieItemRow {
+    id: String,
+    sort_title: String,
+    production_year: Option<i64>,
+    parent_id: Option<String>,
+    provider_ids_json: Option<String>,
+    removed_at: Option<i64>,
+}
+
+/// Row of `find_item_scraper_role`.
+#[derive(sqlx::FromRow)]
+struct ScraperRoleRow {
+    role: String,
+}
+
+/// Row of `find_media_item_image_identity`.
+#[derive(sqlx::FromRow)]
+struct ImageIdentityRow {
+    item_type: String,
+    item_original_language: Option<String>,
+    provider_ids_json: Option<String>,
+    series_original_language: Option<String>,
+    series_provider_ids_json: Option<String>,
+    series_scraper_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    scraper_id: Option<String>,
+}
+
+impl From<ImageIdentityRow> for StoredImageIdentity {
+    fn from(row: ImageIdentityRow) -> Self {
+        let provider = first_provider_id(
+            row.provider_ids_json,
+            row.series_provider_ids_json,
+            row.series_scraper_id
+                .as_deref()
+                .or(row.scraper_id.as_deref()),
+        );
+        Self {
+            item_type: row.item_type,
+            original_language: row.item_original_language.or(row.series_original_language),
+            provider_name: provider.as_ref().map(|(name, _)| name.clone()),
+            provider_id: provider.map(|(_, id)| id),
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+        }
+    }
+}
+
+/// Row of `find_movie_identity`.
+#[derive(sqlx::FromRow)]
+struct MovieIdentityRow {
+    library_id: String,
+    provider_ids_json: Option<String>,
+    scraper_id: Option<String>,
+}
+
+/// Row of the `collections` lookup in `upsert_collection`.
+#[derive(sqlx::FromRow)]
+struct CollectionIdRow {
+    id: String,
+    item_id: String,
+}
+
+/// Row of the requested-member match query in `upsert_collection`.
+#[derive(sqlx::FromRow)]
+struct CollectionMemberMatchRow {
+    ordinal: i64,
+    sort_order: i64,
+    media_item_id: String,
+}
+
+/// Row of `list_collection_member_ids_page`.
+#[derive(sqlx::FromRow)]
+struct CollectionMemberItemIdRow {
+    item_id: String,
+}
+
+/// Row of the existing-collection lookup in `create_emby_collection`.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionItemRow {
+    item_id: String,
+}
+
+/// Row of `add_emby_collection_items`.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionRow {
+    library_id: String,
+    title: String,
+}
+
+/// Row of `remove_emby_collection_items`, which also needs the collection row id.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionWithIdRow {
+    id: String,
+    library_id: String,
+    title: String,
+}
+
+/// Row of `add_emby_collection_members_in_transaction`.
+#[derive(sqlx::FromRow)]
+struct EmbyCollectionSortOrderRow {
+    id: String,
+    max_sort_order: i64,
+}
+
+/// Row of `list_hierarchy_ids_in_transaction`.
+#[derive(sqlx::FromRow)]
+struct HierarchyIdentityRow {
+    id: String,
+    identity_key: String,
+    removed_at: Option<i64>,
 }
 
 impl Database {
@@ -243,7 +536,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<(Option<String>, Option<String>)>, StorageError> {
-        self.query(
+        self.query_as::<ItemMediaStrategySettingsRow>(
             "SELECT libraries.media_strategy_json AS library_strategy,
                     server_settings.value AS global_strategy
              FROM media_items
@@ -255,7 +548,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(|row| (row.get("library_strategy"), row.get("global_strategy"))))
+        .map(|row| row.map(|row| (row.library_strategy, row.global_strategy)))
         .map_err(self.sqlx_err())
     }
 
@@ -263,7 +556,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredItemScanPath>, StorageError> {
-        self.query(
+        self.query_as::<ItemScanPathRow>(
             "SELECT source_item.library_id, fe.library_root_id, fe.relative_path
              FROM media_items source_item
              JOIN media_sources ms ON ms.item_id = source_item.id
@@ -288,13 +581,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredItemScanPath {
-                library_id: row.get("library_id"),
-                library_root_id: row.get("library_root_id"),
-                relative_path: row.get("relative_path"),
-            })
-        })
+        .map(|row| row.map(StoredItemScanPath::from))
         .map_err(self.sqlx_err())
     }
 
@@ -321,7 +608,8 @@ impl Database {
                  WHERE media_items.id IN ({placeholders})
                    AND media_items.removed_at IS NULL"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<ItemMediaStrategySettingsByIdRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -330,10 +618,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                strategies.insert(
-                    row.get("item_id"),
-                    (row.get("library_strategy"), row.get("global_strategy")),
-                );
+                strategies.insert(row.item_id, (row.library_strategy, row.global_strategy));
             }
         }
         Ok(strategies)
@@ -343,8 +628,8 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredItemScanPath>, StorageError> {
-        let Some((library_id, identity_key)) = self
-            .query(
+        let Some(row) = self
+            .query_as::<FolderIdentityKeyRow>(
                 "SELECT mi.library_id, mi.identity_key
                  FROM media_items mi
                  JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -357,27 +642,21 @@ impl Database {
             .fetch_optional(&self.pool)
             .await
             .map_err(self.sqlx_err())?
-            .map(|row| {
-                (
-                    row.get::<String, _>("library_id"),
-                    row.get::<String, _>("identity_key"),
-                )
-            })
         else {
             return Ok(None);
         };
-        let Some((library_root_id, relative_path)) = parse_folder_identity_key(&identity_key)
+        let Some((library_root_id, relative_path)) = parse_folder_identity_key(&row.identity_key)
         else {
             return Ok(None);
         };
         let Some(root) = self.find_library_root(&library_root_id).await? else {
             return Ok(None);
         };
-        if root.library_id != library_id {
+        if root.library_id != row.library_id {
             return Ok(None);
         }
         Ok(Some(StoredItemScanPath {
-            library_id,
+            library_id: row.library_id,
             library_root_id,
             relative_path,
         }))
@@ -421,7 +700,8 @@ impl Database {
              ORDER BY mi.identity_key, mi.id
              LIMIT ? OFFSET ?"
         );
-        let mut rows_statement = self.query(sqlx::AssertSqlSafe(rows_query));
+        let mut rows_statement =
+            self.query_as::<FolderScanPathRow>(sqlx::AssertSqlSafe(rows_query));
         for library_id in library_ids {
             rows_statement = rows_statement.bind(library_id);
         }
@@ -435,12 +715,12 @@ impl Database {
             .into_iter()
             .filter_map(|row| {
                 let (library_root_id, relative_path) =
-                    parse_folder_identity_key(row.get("identity_key"))?;
+                    parse_folder_identity_key(&row.identity_key)?;
                 Some(StoredFolderScanPath {
-                    id: row.get("id"),
-                    library_id: row.get("library_id"),
-                    parent_id: row.get("parent_id"),
-                    title: row.get("title"),
+                    id: row.id,
+                    library_id: row.library_id,
+                    parent_id: row.parent_id,
+                    title: row.title,
                     library_root_id,
                     relative_path,
                 })
@@ -453,7 +733,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
-        self.query(
+        self.query_as::<ItemSourceLocatorRow>(
             "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
@@ -468,19 +748,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredItemSourceLocator {
-                root_path: row.get("canonical_path"),
-                relative_path: row.get("relative_path"),
-                fingerprint: row.get("fingerprint"),
-                size: row.get("size"),
-                modified_at: row.get("modified_at"),
-                device: row.get("device"),
-                inode: row.get("inode"),
-                title: row.get("title"),
-                production_year: row.get("production_year"),
-            })
-        })
+        .map(|row| row.map(StoredItemSourceLocator::from))
         .map_err(self.sqlx_err())
     }
 
@@ -489,7 +757,7 @@ impl Database {
         root_path: &str,
         relative_path: &str,
     ) -> Result<Option<StoredItemSourceLocator>, StorageError> {
-        self.query(
+        self.query_as::<ItemSourceLocatorRow>(
             "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
@@ -506,19 +774,7 @@ impl Database {
         .bind(relative_path)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredItemSourceLocator {
-                root_path: row.get("canonical_path"),
-                relative_path: row.get("relative_path"),
-                fingerprint: row.get("fingerprint"),
-                size: row.get("size"),
-                modified_at: row.get("modified_at"),
-                device: row.get("device"),
-                inode: row.get("inode"),
-                title: row.get("title"),
-                production_year: row.get("production_year"),
-            })
-        })
+        .map(|row| row.map(StoredItemSourceLocator::from))
         .map_err(self.sqlx_err())
     }
 
@@ -528,7 +784,7 @@ impl Database {
         legacy_size: Option<i64>,
         legacy_modified_at: Option<i64>,
     ) -> Result<Vec<StoredItemSourceLocator>, StorageError> {
-        self.query(
+        self.query_as::<ItemSourceLocatorRow>(
             "SELECT lr.canonical_path, fe.relative_path,
                     fe.fingerprint, fe.size, fe.modified_at, fe.device, fe.inode,
                     mi.title, mi.production_year
@@ -551,17 +807,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredItemSourceLocator {
-                    root_path: row.get("canonical_path"),
-                    relative_path: row.get("relative_path"),
-                    fingerprint: row.get("fingerprint"),
-                    size: row.get("size"),
-                    modified_at: row.get("modified_at"),
-                    device: row.get("device"),
-                    inode: row.get("inode"),
-                    title: row.get("title"),
-                    production_year: row.get("production_year"),
-                })
+                .map(StoredItemSourceLocator::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -588,7 +834,8 @@ impl Database {
                  WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL
                  ORDER BY mi.id, ls.position"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<ItemScraperConfigurationRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -597,18 +844,22 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let item_id = row.get::<String, _>("item_id");
-                let legacy_scraper_id = row
-                    .get::<Option<String>, _>("legacy_scraper_id")
-                    .filter(|value| !value.trim().is_empty());
+                let ItemScraperConfigurationRow {
+                    item_id,
+                    legacy_scraper_id,
+                    selected_scraper_id,
+                    position,
+                    role,
+                } = row;
+                let legacy_scraper_id = legacy_scraper_id.filter(|value| !value.trim().is_empty());
                 let entry = configurations
                     .entry(item_id)
                     .or_insert_with(|| (Vec::new(), legacy_scraper_id.clone()));
-                if let Some(scraper_id) = row.get::<Option<String>, _>("selected_scraper_id") {
+                if let Some(scraper_id) = selected_scraper_id {
                     entry.0.push(StoredLibraryScraper {
                         scraper_id,
-                        position: row.get::<Option<i64>, _>("position").unwrap_or_default(),
-                        role: row.get::<Option<String>, _>("role").unwrap_or_default(),
+                        position: position.unwrap_or_default(),
+                        role: role.unwrap_or_default(),
                     });
                 }
             }
@@ -781,7 +1032,7 @@ impl Database {
                         OR (entry.fingerprint IS NULL AND incoming.base_fingerprint IS NULL))
                  RETURNING id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<ReturningIdRow>(sqlx::AssertSqlSafe(query));
             for update in chunk {
                 statement = statement
                     .bind(update.filesystem_entry_id)
@@ -807,7 +1058,7 @@ impl Database {
                 .fetch_all(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
-            applied_ids.extend(rows.into_iter().map(|row| row.get::<String, _>("id")));
+            applied_ids.extend(rows.into_iter().map(|row| row.id));
         }
 
         let applied_updates = updates
@@ -1019,7 +1270,8 @@ impl Database {
                 ON CONFLICT(library_root_id, relative_path) DO NOTHING
                 RETURNING relative_path"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<ReturningRelativePathRow>(sqlx::AssertSqlSafe(query));
             for entry in chunk {
                 statement = statement
                     .bind(entry.id)
@@ -1037,7 +1289,7 @@ impl Database {
                 .fetch_all(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
-            inserted_paths.extend(rows.into_iter().map(|row| row.get("relative_path")));
+            inserted_paths.extend(rows.into_iter().map(|row| row.relative_path));
         }
         Ok(inserted_paths)
     }
@@ -1162,8 +1414,9 @@ impl Database {
                 std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, unixepoch())", chunk.len())
                     .collect::<Vec<_>>()
                     .join(", ");
-            let mut item_write = self.query(sqlx::AssertSqlSafe(format!(
-                "INSERT INTO media_items (
+            let mut item_write =
+                self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO media_items (
                      id, library_id, item_type, parent_id, title, sort_title,
                      original_title, identification_status, identity_key, has_available_source,
                      updated_at
@@ -1176,7 +1429,7 @@ impl Database {
                      removed_at = NULL, updated_at = unixepoch()
                  WHERE media_items.library_id = excluded.library_id
                  RETURNING id, identity_key"
-            )));
+                )));
             for (file, parent_id) in chunk.iter().zip(parent_chunk) {
                 item_write = item_write
                     .bind(&file.item_id)
@@ -1202,14 +1455,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
                 .into_iter()
-                .map(|row| {
-                    Ok((
-                        row.try_get::<String, _>("identity_key")?,
-                        row.try_get::<String, _>("id")?,
-                    ))
-                })
-                .collect::<Result<HashMap<_, _>, sqlx::Error>>()
-                .map_err(self.sqlx_err())?;
+                .map(|row| (row.identity_key, row.id))
+                .collect::<HashMap<_, _>>();
 
             let source_values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
                 .collect::<Vec<_>>()
@@ -1370,7 +1617,9 @@ impl Database {
                           CASE WHEN target_item.removed_at IS NULL THEN 0 ELSE 1 END,
                           target_item.id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+            let mut statement = self
+                .query_as::<PrefetchedMovieItemRow>(sqlx::AssertSqlSafe(query))
+                .bind(library_id);
             for sort_title in chunk {
                 statement = statement.bind(sort_title);
             }
@@ -1379,22 +1628,14 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                let sort_title = row
-                    .try_get::<String, _>("sort_title")
-                    .map_err(self.sqlx_err())?;
-                let production_year = row
-                    .try_get::<Option<i64>, _>("production_year")
-                    .map_err(self.sqlx_err())?;
-                let parent_id = row
-                    .try_get::<Option<String>, _>("parent_id")
-                    .map_err(self.sqlx_err())?;
-                let provider_ids_json = row
-                    .try_get::<Option<String>, _>("provider_ids_json")
-                    .map_err(self.sqlx_err())?;
-                let removed_at = row
-                    .try_get::<Option<i64>, _>("removed_at")
-                    .map_err(self.sqlx_err())?;
+                let PrefetchedMovieItemRow {
+                    id,
+                    sort_title,
+                    production_year,
+                    parent_id,
+                    provider_ids_json,
+                    removed_at,
+                } = row;
                 movie_items
                     .entry((sort_title, production_year))
                     .or_insert(PrefetchedMovieItem {
@@ -1451,7 +1692,7 @@ impl Database {
                  FROM media_items
                  WHERE item_type = 'FOLDER' AND identity_key IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(query));
             for identity_key in chunk {
                 statement = statement.bind(identity_key);
             }
@@ -1460,11 +1701,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                let identity_key = row
-                    .try_get::<String, _>("identity_key")
-                    .map_err(self.sqlx_err())?;
-                folders.insert(identity_key, id);
+                folders.insert(row.identity_key, row.id);
             }
         }
         Ok(folders)
@@ -1551,7 +1788,8 @@ impl Database {
                      ON CONFLICT(identity_key) WHERE identity_key IS NOT NULL DO NOTHING
                      RETURNING id, identity_key"
                 );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                let mut statement =
+                    self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(query));
                 for folder in chunk {
                     let parent_id = match folder.parent_identity_key.as_deref() {
                         Some(identity_key) => folder_cache
@@ -1579,12 +1817,8 @@ impl Database {
                     .await
                     .map_err(self.sqlx_err())?;
                 for row in &inserted_rows {
-                    let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                    let identity_key = row
-                        .try_get::<String, _>("identity_key")
-                        .map_err(self.sqlx_err())?;
-                    folder_cache.insert(identity_key.clone(), id);
-                    touched_folders.insert(identity_key);
+                    folder_cache.insert(row.identity_key.clone(), row.id.clone());
+                    touched_folders.insert(row.identity_key.clone());
                 }
                 if inserted_rows.len() != chunk.len() {
                     let unresolved = chunk
@@ -1599,7 +1833,8 @@ impl Database {
                             "SELECT id, identity_key FROM media_items
                              WHERE item_type = 'FOLDER' AND identity_key IN ({placeholders})"
                         );
-                        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                        let mut statement =
+                            self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(query));
                         for folder in unresolved_chunk {
                             statement = statement.bind(&folder.identity_key);
                         }
@@ -1608,11 +1843,7 @@ impl Database {
                             .await
                             .map_err(self.sqlx_err())?;
                         for row in rows {
-                            let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                            let identity_key = row
-                                .try_get::<String, _>("identity_key")
-                                .map_err(self.sqlx_err())?;
-                            folder_cache.insert(identity_key, id);
+                            folder_cache.insert(row.identity_key, row.id);
                         }
                     }
                 }
@@ -2708,7 +2939,7 @@ impl Database {
                 "SELECT id, identity_key, removed_at
                  FROM media_items WHERE identity_key IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<HierarchyIdentityRow>(sqlx::AssertSqlSafe(query));
             for identity_key in chunk {
                 statement = statement.bind(identity_key);
             }
@@ -2717,18 +2948,10 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let identity_key = row
-                    .try_get::<String, _>("identity_key")
-                    .map_err(self.sqlx_err())?;
-                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                if row
-                    .try_get::<Option<i64>, _>("removed_at")
-                    .map_err(self.sqlx_err())?
-                    .is_some()
-                {
-                    removed_ids.insert(identity_key.clone());
+                if row.removed_at.is_some() {
+                    removed_ids.insert(row.identity_key.clone());
                 }
-                ids.insert(identity_key, id);
+                ids.insert(row.identity_key, row.id);
             }
         }
         Ok((ids, removed_ids))
@@ -3110,7 +3333,7 @@ impl Database {
         item_id: &str,
         scraper_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        self.query(
+        self.query_as::<ScraperRoleRow>(
             "SELECT library_scrapers.role AS role
              FROM library_scrapers
              JOIN media_items ON media_items.library_id = library_scrapers.library_id
@@ -3121,7 +3344,7 @@ impl Database {
         .bind(scraper_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(|row| row.get::<String, _>("role")))
+        .map(|row| row.map(|row| row.role))
         .map_err(self.sqlx_err())
     }
 
@@ -3173,7 +3396,7 @@ impl Database {
                  LEFT JOIN libraries ON libraries.id = mi.library_id
                  WHERE mi.id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<MediaMetadataRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -3182,7 +3405,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let item_id = row.get::<String, _>("item_id");
+                let item_id = row.item_id.clone();
                 metadata.insert(item_id, stored_media_metadata(row));
             }
         }
@@ -3229,7 +3452,7 @@ impl Database {
                  LEFT JOIN media_items series ON series.id = mi.series_id
                  WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<MediaMetadataRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -3238,8 +3461,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let item_id = row.get::<String, _>("item_id");
-                let library_id = row.get::<String, _>("library_id");
+                let item_id = row.item_id.clone();
+                let library_id = row.library_id.clone();
                 metadata.insert(item_id, (library_id, stored_media_metadata(row)));
             }
         }
@@ -3288,7 +3511,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredImageIdentity>, StorageError> {
-        self.query(
+        self.query_as::<ImageIdentityRow>(
             "SELECT mi.item_type, mi.original_language AS item_original_language, mi.provider_ids_json,
                     series.original_language AS series_original_language,
                     series.provider_ids_json AS series_provider_ids_json,
@@ -3304,27 +3527,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| {
-                let series_scraper_id = row.get::<Option<String>, _>("series_scraper_id");
-                let scraper_id = row.get::<Option<String>, _>("scraper_id");
-                let provider = first_provider_id(
-                    row.get("provider_ids_json"),
-                    row.get("series_provider_ids_json"),
-                    series_scraper_id.as_deref().or(scraper_id.as_deref()),
-                );
-                StoredImageIdentity {
-                    item_type: row.get("item_type"),
-                    original_language: row
-                        .get::<Option<String>, _>("item_original_language")
-                        .or_else(|| row.get("series_original_language")),
-                    provider_name: provider.as_ref().map(|(name, _)| name.clone()),
-                    provider_id: provider.map(|(_, id)| id),
-                    season_number: row.get("season_number"),
-                    episode_number: row.get("episode_number"),
-                }
-            })
-        })
+        .map(|row| row.map(StoredImageIdentity::from))
         .map_err(self.sqlx_err())
     }
 
@@ -3332,7 +3535,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMovieIdentity>, StorageError> {
-        self.query(
+        self.query_as::<MovieIdentityRow>(
             "SELECT mi.library_id, mi.provider_ids_json,
                     COALESCE(mi.metadata_scraper_id, l.scraper_id) AS scraper_id
              FROM media_items mi
@@ -3344,11 +3547,10 @@ impl Database {
         .await
         .map(|row| {
             row.and_then(|row| {
-                let scraper_id = row.get::<Option<String>, _>("scraper_id");
                 let provider =
-                    first_provider_id(row.get("provider_ids_json"), None, scraper_id.as_deref())?;
+                    first_provider_id(row.provider_ids_json, None, row.scraper_id.as_deref())?;
                 Some(StoredMovieIdentity {
-                    library_id: row.get("library_id"),
+                    library_id: row.library_id,
                     provider_name: provider.0,
                     provider_id: provider.1,
                 })
@@ -3375,7 +3577,7 @@ impl Database {
         let provider_key = provider.to_ascii_lowercase();
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let existing = self
-            .query(
+            .query_as::<CollectionIdRow>(
                 "SELECT id, item_id
              FROM collections
              WHERE library_id = ? AND lower(provider) = lower(?) AND provider_id = ?",
@@ -3387,7 +3589,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let (collection_id, item_id) = if let Some(row) = existing {
-            (row.get::<String, _>("id"), row.get::<String, _>("item_id"))
+            (row.id, row.item_id)
         } else {
             let collection_id = Uuid::now_v7().to_string();
             let item_id = Uuid::now_v7().to_string();
@@ -3489,7 +3691,8 @@ impl Database {
                  WHERE mi.library_id = ? AND mi.removed_at IS NULL
                  ORDER BY requested.ordinal, provider.media_item_id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<CollectionMemberMatchRow>(sqlx::AssertSqlSafe(query));
             for (offset, (member_provider, member_provider_id, sort_order)) in
                 chunk.iter().enumerate()
             {
@@ -3506,14 +3709,10 @@ impl Database {
                 .map_err(self.sqlx_err())?;
             let mut seen_ordinals = HashSet::new();
             for row in rows {
-                let ordinal = row.get::<i64, _>("ordinal");
-                if !seen_ordinals.insert(ordinal) {
+                if !seen_ordinals.insert(row.ordinal) {
                     continue;
                 }
-                matched_members.push((
-                    row.get::<String, _>("media_item_id"),
-                    row.get::<i64, _>("sort_order"),
-                ));
+                matched_members.push((row.media_item_id, row.sort_order));
             }
         }
         let mut member_count = 0_usize;
@@ -3604,7 +3803,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
 
         let mut list_statement = self
-            .query(sqlx::AssertSqlSafe(format!(
+            .query_as::<CollectionMemberItemIdRow>(sqlx::AssertSqlSafe(format!(
                 "SELECT ci.item_id {from_where}
                  ORDER BY ci.sort_order, ci.item_id
                  LIMIT ? OFFSET ?"
@@ -3628,10 +3827,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok((
-            rows.into_iter().map(|row| row.get("item_id")).collect(),
-            total,
-        ))
+        Ok((rows.into_iter().map(|row| row.item_id).collect(), total))
     }
 
     pub(crate) async fn create_emby_collection(
@@ -3673,7 +3869,7 @@ impl Database {
             return Ok(None);
         };
         let existing = self
-            .query(
+            .query_as::<EmbyCollectionItemRow>(
                 "SELECT item_id, title
                  FROM collections
                  WHERE library_id = ? AND lower(provider) = 'emby' AND lower(title) = lower(?)
@@ -3685,7 +3881,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let collection_item_id = if let Some(row) = existing {
-            row.get::<String, _>("item_id")
+            row.item_id
         } else {
             let item_id = Uuid::now_v7().to_string();
             let collection_id = Uuid::now_v7().to_string();
@@ -3742,7 +3938,7 @@ impl Database {
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let Some(row) = self
-            .query(
+            .query_as::<EmbyCollectionRow>(
                 "SELECT c.library_id, c.title
                  FROM collections c
                  WHERE c.item_id = ? AND lower(c.provider) = 'emby'",
@@ -3754,8 +3950,8 @@ impl Database {
         else {
             return Ok(None);
         };
-        let library_id = row.get::<String, _>("library_id");
-        let title = row.get::<String, _>("title");
+        let library_id = row.library_id;
+        let title = row.title;
         self.add_emby_collection_members_in_transaction(
             &mut transaction,
             collection_item_id,
@@ -3778,7 +3974,7 @@ impl Database {
     ) -> Result<Option<StoredEmbyCollection>, StorageError> {
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let Some(row) = self
-            .query(
+            .query_as::<EmbyCollectionWithIdRow>(
                 "SELECT c.id, c.library_id, c.title
                  FROM collections c
                  WHERE c.item_id = ? AND lower(c.provider) = 'emby'",
@@ -3790,9 +3986,9 @@ impl Database {
         else {
             return Ok(None);
         };
-        let collection_id = row.get::<String, _>("id");
-        let library_id = row.get::<String, _>("library_id");
-        let title = row.get::<String, _>("title");
+        let collection_id = row.id;
+        let library_id = row.library_id;
+        let title = row.title;
         for chunk in item_ids.chunks(EMBY_COLLECTION_MEMBER_DELETE_BATCH_SIZE) {
             if chunk.is_empty() {
                 continue;
@@ -3829,7 +4025,7 @@ impl Database {
         item_ids: &[String],
     ) -> Result<(), StorageError> {
         let row = self
-            .query(
+            .query_as::<EmbyCollectionSortOrderRow>(
                 "SELECT c.id,
                         COALESCE(MAX(ci.sort_order), -1) AS max_sort_order
                  FROM collections c
@@ -3841,8 +4037,8 @@ impl Database {
             .fetch_one(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let collection_id = row.get::<String, _>("id");
-        let mut sort_order = row.get::<i64, _>("max_sort_order");
+        let collection_id = row.id;
+        let mut sort_order = row.max_sort_order;
         let mut seen = HashSet::new();
         let mut rows = Vec::with_capacity(item_ids.len());
         for item_id in item_ids {
@@ -3885,7 +4081,398 @@ impl Database {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_folder_identity_key;
+    use super::*;
+    use crate::config::Config;
+    use sqlx::FromRow;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        Ok((temp_dir, database))
+    }
+
+    async fn insert_library(
+        database: &Database,
+        library_id: &str,
+        scraper_id: Option<&str>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind, is_enabled, scraper_id)
+             VALUES (?, ?, 'MIXED', 1, ?)",
+        )
+        .bind(library_id)
+        .bind(library_id)
+        .bind(scraper_id)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn insert_media_item(
+        database: &Database,
+        library_id: &str,
+        item: TestMediaItem<'_>,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, parent_id, series_id, title, sort_title,
+                 original_title, production_year, original_language, provider_ids_json,
+                 identification_status, identity_key
+             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?)",
+        )
+        .bind(item.id)
+        .bind(library_id)
+        .bind(item.item_type)
+        .bind(item.parent_id)
+        .bind(item.series_id)
+        .bind(item.title)
+        .bind(item.title.to_lowercase())
+        .bind(item.original_title)
+        .bind(item.production_year)
+        .bind(item.original_language)
+        .bind(item.provider_ids_json)
+        .bind(item.identity_key)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    struct TestMediaItem<'a> {
+        id: &'a str,
+        item_type: &'a str,
+        parent_id: Option<&'a str>,
+        series_id: Option<&'a str>,
+        title: &'a str,
+        original_title: Option<&'a str>,
+        production_year: Option<i64>,
+        original_language: Option<&'a str>,
+        provider_ids_json: Option<&'a str>,
+        identity_key: Option<&'a str>,
+    }
+
+    /// One library root, one movie with a local source and one FOLDER item, so every scan-path
+    /// lookup has a row to decode.
+    async fn seed_scan_path_rows(database: &Database) -> Result<(), sqlx::Error> {
+        const LIBRARY_ID: &str = "library-scan";
+        const ROOT_ID: &str = "root-scan";
+        const RELATIVE_PATH: &str = "Movies/Dune/Dune.2021.mkv";
+        insert_library(database, LIBRARY_ID, None).await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES (?, ?, '/srv/movies', '/srv/movies', 1, 1)",
+        )
+        .bind(ROOT_ID)
+        .bind(LIBRARY_ID)
+        .execute(database.pool())
+        .await?;
+        insert_media_item(
+            database,
+            LIBRARY_ID,
+            TestMediaItem {
+                id: "movie-dune",
+                item_type: "MOVIE",
+                parent_id: None,
+                series_id: None,
+                title: "Dune",
+                original_title: Some("Dune"),
+                production_year: Some(2021),
+                original_language: Some("en"),
+                provider_ids_json: Some(r#"{"Tmdb":"movie-438631"}"#),
+                identity_key: Some("movie:root-scan:Movies/Dune/Dune.2021.mkv"),
+            },
+        )
+        .await?;
+        insert_media_item(
+            database,
+            LIBRARY_ID,
+            TestMediaItem {
+                id: "folder-dune",
+                item_type: "FOLDER",
+                parent_id: Some(LIBRARY_ID),
+                series_id: None,
+                title: "Dune",
+                original_title: Some("Dune"),
+                production_year: None,
+                original_language: None,
+                provider_ids_json: None,
+                identity_key: Some("folder:root-scan:Movies/Dune"),
+            },
+        )
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, is_missing
+             ) VALUES (?, ?, ?, 'FILE', 4096, 1700000000, 7, 42, ?, 'generation-1', 0)",
+        )
+        .bind("entry-dune")
+        .bind(ROOT_ID)
+        .bind(RELATIVE_PATH)
+        .bind(b"fingerprint-dune".to_vec())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, size, is_default, probe_status
+             ) VALUES (?, ?, 'LOCAL_FILE', ?, 4096, 1, 'READY')",
+        )
+        .bind("source-dune")
+        .bind("movie-dune")
+        .bind("entry-dune")
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scan_path_queries_decode_typed_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        seed_scan_path_rows(&database).await?;
+        const RELATIVE_PATH: &str = "Movies/Dune/Dune.2021.mkv";
+
+        let scan_path = database
+            .find_item_scan_source_path("movie-dune")
+            .await?
+            .expect("item scan path");
+        assert_eq!(scan_path.library_id, "library-scan");
+        assert_eq!(scan_path.library_root_id, "root-scan");
+        assert_eq!(scan_path.relative_path, RELATIVE_PATH);
+
+        let locator = database
+            .find_item_source_locator("movie-dune")
+            .await?
+            .expect("source locator");
+        assert_eq!(locator.root_path, "/srv/movies");
+        assert_eq!(locator.relative_path, RELATIVE_PATH);
+        assert_eq!(locator.fingerprint, Some(b"fingerprint-dune".to_vec()));
+        assert_eq!(locator.size, 4096);
+        assert_eq!(locator.modified_at, 1_700_000_000);
+        assert_eq!(locator.device, Some(7));
+        assert_eq!(locator.inode, Some(42));
+        assert_eq!(locator.title, "Dune");
+        assert_eq!(locator.production_year, Some(2021));
+
+        let by_locator = database
+            .find_item_by_source_locator("/srv/movies", RELATIVE_PATH)
+            .await?
+            .expect("source locator by path");
+        assert_eq!(by_locator.title, "Dune");
+        assert_eq!(by_locator.relative_path, RELATIVE_PATH);
+
+        let by_fingerprint = database
+            .find_items_by_source_fingerprint(b"fingerprint-dune", None, None)
+            .await?;
+        assert_eq!(by_fingerprint.len(), 1);
+        assert_eq!(by_fingerprint[0].title, "Dune");
+        assert_eq!(by_fingerprint[0].fingerprint, locator.fingerprint);
+
+        let folder = database
+            .find_folder_scan_path("folder-dune")
+            .await?
+            .expect("folder scan path");
+        assert_eq!(folder.library_id, "library-scan");
+        assert_eq!(folder.library_root_id, "root-scan");
+        assert_eq!(folder.relative_path, "Movies/Dune");
+
+        let (page, total) = database
+            .list_folder_scan_paths_page(&["library-scan".to_owned()], 0, 10)
+            .await?;
+        assert_eq!(total, 1);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "folder-dune");
+        assert_eq!(page[0].library_id, "library-scan");
+        assert_eq!(page[0].parent_id.as_deref(), Some("library-scan"));
+        assert_eq!(page[0].title, "Dune");
+        assert_eq!(page[0].library_root_id, "root-scan");
+        assert_eq!(page[0].relative_path, "Movies/Dune");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scraper_role_and_identity_queries_decode_typed_rows()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_library(&database, "library-identity", Some("org.lux.scraper.tmdb")).await?;
+        sqlx::query(
+            "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+             VALUES ('library-identity', 'org.lux.scraper.tmdb', 0, 'PRIMARY')",
+        )
+        .execute(database.pool())
+        .await?;
+        insert_media_item(
+            &database,
+            "library-identity",
+            TestMediaItem {
+                id: "series-identity",
+                item_type: "SERIES",
+                parent_id: Some("library-identity"),
+                series_id: None,
+                title: "Foundation",
+                original_title: None,
+                production_year: Some(2021),
+                original_language: Some("en"),
+                provider_ids_json: Some(r#"{"Tmdb":"series-93740"}"#),
+                identity_key: None,
+            },
+        )
+        .await?;
+        insert_media_item(
+            &database,
+            "library-identity",
+            TestMediaItem {
+                id: "episode-identity",
+                item_type: "EPISODE",
+                parent_id: Some("library-identity"),
+                series_id: Some("series-identity"),
+                title: "The Emperor's Peace",
+                original_title: None,
+                production_year: None,
+                original_language: None,
+                provider_ids_json: None,
+                identity_key: None,
+            },
+        )
+        .await?;
+        insert_media_item(
+            &database,
+            "library-identity",
+            TestMediaItem {
+                id: "movie-identity",
+                item_type: "MOVIE",
+                parent_id: None,
+                series_id: None,
+                title: "Dune",
+                original_title: None,
+                production_year: Some(2021),
+                original_language: Some("en"),
+                provider_ids_json: Some(r#"{"Tmdb":"movie-438631"}"#),
+                identity_key: None,
+            },
+        )
+        .await?;
+
+        assert_eq!(
+            database
+                .find_item_scraper_role("episode-identity", "org.lux.scraper.tmdb")
+                .await?,
+            Some("PRIMARY".to_owned())
+        );
+        assert_eq!(
+            database
+                .find_item_scraper_role("episode-identity", "org.lux.scraper.missing")
+                .await?,
+            None
+        );
+
+        let image_identity = database
+            .find_media_item_image_identity("episode-identity")
+            .await?
+            .expect("image identity");
+        assert_eq!(image_identity.item_type, "EPISODE");
+        assert_eq!(image_identity.original_language.as_deref(), Some("en"));
+        assert_eq!(image_identity.provider_name.as_deref(), Some("Tmdb"));
+        assert_eq!(image_identity.provider_id.as_deref(), Some("series-93740"));
+        assert_eq!(image_identity.season_number, None);
+        assert_eq!(image_identity.episode_number, None);
+
+        let movie_identity = database
+            .find_movie_identity("movie-identity")
+            .await?
+            .expect("movie identity");
+        assert_eq!(movie_identity.library_id, "library-identity");
+        assert_eq!(movie_identity.provider_name, "Tmdb");
+        assert_eq!(movie_identity.provider_id, "movie-438631");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn collection_queries_decode_existing_rows_and_member_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_library(&database, "library-collection", None).await?;
+        for index in 1..=2_i64 {
+            let item_id = format!("collection-movie-{index}");
+            let title = format!("Movie {index}");
+            let provider_ids_json = format!(r#"{{"tmdb":"{index}"}}"#);
+            insert_media_item(
+                &database,
+                "library-collection",
+                TestMediaItem {
+                    id: &item_id,
+                    item_type: "MOVIE",
+                    parent_id: None,
+                    series_id: None,
+                    title: &title,
+                    original_title: None,
+                    production_year: Some(2000 + index),
+                    original_language: None,
+                    provider_ids_json: Some(&provider_ids_json),
+                    identity_key: None,
+                },
+            )
+            .await?;
+        }
+        // list_collection_member_ids_page only reports catalog-visible members.
+        sqlx::query(
+            "UPDATE media_items SET has_available_source = 1
+             WHERE library_id = 'library-collection'",
+        )
+        .execute(database.pool())
+        .await?;
+        let member_provider_ids = (1..=2)
+            .map(|index| ("TMDB".to_owned(), index.to_string(), index))
+            .collect::<Vec<_>>();
+        let collection = |title: &'static str| NewCollection {
+            library_id: "library-collection",
+            provider: "tmdb",
+            provider_id: "collection-1",
+            title,
+            overview: None,
+            poster_path: None,
+            backdrop_path: None,
+            member_provider_ids: &member_provider_ids,
+        };
+
+        let created = database.upsert_collection(collection("Collection")).await?;
+        assert_eq!(created.member_count, 2);
+        // The second refresh takes the existing-collection branch that decodes `id`/`item_id`.
+        let refreshed = database.upsert_collection(collection("Collection")).await?;
+        assert_eq!(refreshed.member_count, 2);
+        assert_eq!(refreshed.collection_item_id, created.collection_item_id);
+
+        let (member_ids, total) = database
+            .list_collection_member_ids_page(&created.collection_item_id, None, None, 0, 10)
+            .await?;
+        assert_eq!(total, 2);
+        assert_eq!(
+            member_ids,
+            vec![
+                "collection-movie-1".to_owned(),
+                "collection-movie-2".to_owned(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_metadata_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = MediaMetadataRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
+        Ok(())
+    }
 
     #[test]
     fn parses_folder_identity_into_root_and_relative_path() {
