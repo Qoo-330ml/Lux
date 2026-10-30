@@ -190,6 +190,13 @@ pub(crate) const FIRST_SCAN_RESUME_MAX_INTERRUPTIONS: i64 = 3;
 pub(crate) const FIRST_SCAN_ROOT_PROBE_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(5);
 
+/// How many root probes may run at the same time.
+///
+/// A probe of a lost mount keeps its blocking thread until the filesystem call answers, no matter
+/// how soon the recovery stops waiting. Bounding the concurrency keeps that from growing with the
+/// number of candidate libraries and starving every other `tokio::fs` user in the process.
+pub(crate) const FIRST_SCAN_ROOT_PROBE_CONCURRENCY: usize = 4;
+
 /// Outcome of one startup's first-scan recovery.
 pub(crate) struct FirstScanRecovery {
     /// How many libraries were queued for a new first scan.
@@ -225,65 +232,179 @@ pub(crate) async fn resume_shutdown_interrupted_first_scans(
     .await
 }
 
-/// Whether any root of the library is usable right now, and why not when none is.
+/// Outcome of probing the filesystem that hosts a library root.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MountProbe {
+    Available,
+    Unavailable,
+    TimedOut,
+}
+
+/// The future a root probe returns; `true` means the path is usable.
+type RootProbeFuture = std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>;
+
+/// A root probe, injectable so tests can model a mount that never answers.
+type RootProbeFn = std::sync::Arc<dyn Fn(std::path::PathBuf) -> RootProbeFuture + Send + Sync>;
+
+/// Probes the roots of the first-scan candidates without letting one lost mount dominate startup.
 ///
 /// The stored `library_roots.is_available` flag is not refreshed at startup (only the scan path
 /// writes it), so a mount that dropped during a scan stays marked unavailable even after it is back.
 /// Deciding on the column alone would skip such a library on every startup, which is why the
 /// recovery probes the paths instead. A stale flag is corrected to `true` on a successful probe,
 /// because a queued scan discards roots the column calls unavailable.
-async fn first_scan_root_state(
-    database: &Database,
-    library_id: &str,
-) -> Result<FirstScanRootState, StorageError> {
-    let roots = database.list_library_roots(library_id).await?;
-    if roots.is_empty() {
-        return Ok(FirstScanRootState::Unavailable("the library has no root"));
-    }
-    let mut reason = "every library root is unavailable";
-    let mut any_available = false;
-    for root in roots {
-        let path = std::path::PathBuf::from(&root.canonical_path);
-        let probe = first_scan_probe_within(
+///
+/// Three properties keep a missing NAS share affordable:
+/// - roots are grouped by their mount prefix, so every root of one share is probed once per startup
+///   instead of once per library (a lost share then costs one timeout, not one per candidate);
+/// - at most [`FIRST_SCAN_ROOT_PROBE_CONCURRENCY`] probes run at a time;
+/// - a probe that exhausts its budget is logged with the library id and the path, so the abandoned
+///   work is visible in the log.
+struct FirstScanProber<'a> {
+    database: &'a Database,
+    probe: RootProbeFn,
+    timeout: std::time::Duration,
+    permits: tokio::sync::Semaphore,
+    mount_outcomes: tokio::sync::Mutex<std::collections::HashMap<String, MountProbe>>,
+    probes_started: std::sync::atomic::AtomicUsize,
+    probes_timed_out: std::sync::atomic::AtomicUsize,
+    probes_running: std::sync::atomic::AtomicUsize,
+    probes_running_peak: std::sync::atomic::AtomicUsize,
+}
+
+impl<'a> FirstScanProber<'a> {
+    fn new(database: &'a Database) -> Self {
+        Self::with_probe(
+            database,
             FIRST_SCAN_ROOT_PROBE_TIMEOUT,
-            crate::library::inspect_root_path(&path),
+            std::sync::Arc::new(|path| {
+                Box::pin(async move { crate::library::inspect_root_path(&path).await.is_ok() })
+            }),
         )
-        .await;
-        match probe {
-            Some(Ok(_)) => {
-                // One usable root is enough to queue the scan, and every further probe could cost
-                // another full timeout on a lost mount.
-                any_available = true;
-                if !root.is_available
-                    && let Err(error) = database
-                        .update_library_root_availability(&root.id, true)
-                        .await
-                {
-                    tracing::warn!(
-                        %library_id,
-                        root_id = %root.id,
-                        %error,
-                        "could not refresh the availability of a library root"
-                    );
-                }
-                break;
-            }
-            Some(Err(_)) => {}
-            None => {
-                reason = "probing a library root timed out";
-                tracing::warn!(
-                    %library_id,
-                    root_id = %root.id,
-                    "probing a library root timed out; treating the root as unavailable"
-                );
-            }
+    }
+
+    fn with_probe(
+        database: &'a Database,
+        timeout: std::time::Duration,
+        probe: RootProbeFn,
+    ) -> Self {
+        Self {
+            database,
+            probe,
+            timeout,
+            permits: tokio::sync::Semaphore::new(FIRST_SCAN_ROOT_PROBE_CONCURRENCY),
+            mount_outcomes: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            probes_started: std::sync::atomic::AtomicUsize::new(0),
+            probes_timed_out: std::sync::atomic::AtomicUsize::new(0),
+            probes_running: std::sync::atomic::AtomicUsize::new(0),
+            probes_running_peak: std::sync::atomic::AtomicUsize::new(0),
         }
     }
-    if any_available {
-        Ok(FirstScanRootState::Available)
-    } else {
+
+    /// Probes one mount, or reuses what this startup already learned about it.
+    async fn probe_mount(&self, library_id: &str, root_path: &std::path::Path) -> MountProbe {
+        let key = first_scan_mount_key(root_path);
+        if let Some(outcome) = self.known_mount(&key).await {
+            return outcome;
+        }
+        // The permit is what bounds the number of blocking threads a lost mount can occupy.
+        let Ok(_permit) = self.permits.acquire().await else {
+            return MountProbe::Unavailable;
+        };
+        // Another candidate may have finished the same mount while this one waited for a permit.
+        if let Some(outcome) = self.known_mount(&key).await {
+            return outcome;
+        }
+        self.probes_started
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let running = self
+            .probes_running
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            + 1;
+        self.probes_running_peak
+            .fetch_max(running, std::sync::atomic::Ordering::Relaxed);
+        let probe = (self.probe)(root_path.to_path_buf());
+        let outcome = match first_scan_probe_within(self.timeout, probe).await {
+            Some(true) => MountProbe::Available,
+            Some(false) => MountProbe::Unavailable,
+            None => {
+                self.probes_timed_out
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                tracing::warn!(
+                    %library_id,
+                    path = %root_path.display(),
+                    mount = %key,
+                    "probing a library root timed out; the mount counts as unavailable for this                      startup and is not probed again"
+                );
+                MountProbe::TimedOut
+            }
+        };
+        self.probes_running
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+        self.mount_outcomes.lock().await.insert(key, outcome);
+        outcome
+    }
+
+    async fn known_mount(&self, key: &str) -> Option<MountProbe> {
+        self.mount_outcomes.lock().await.get(key).copied()
+    }
+
+    /// Whether any root of the library is usable right now, and why not when none is.
+    async fn root_state(&self, library_id: &str) -> Result<FirstScanRootState, StorageError> {
+        let roots = self.database.list_library_roots(library_id).await?;
+        if roots.is_empty() {
+            return Ok(FirstScanRootState::Unavailable("the library has no root"));
+        }
+        let mut reason = "every library root is unavailable";
+        for root in roots {
+            let path = std::path::PathBuf::from(&root.canonical_path);
+            match self.probe_mount(library_id, &path).await {
+                // One usable root is enough to queue the scan, and every further probe could cost
+                // another full timeout on a lost mount.
+                MountProbe::Available => {
+                    if !root.is_available
+                        && let Err(error) = self
+                            .database
+                            .update_library_root_availability(&root.id, true)
+                            .await
+                    {
+                        tracing::warn!(
+                            %library_id,
+                            root_id = %root.id,
+                            %error,
+                            "could not refresh the availability of a library root"
+                        );
+                    }
+                    return Ok(FirstScanRootState::Available);
+                }
+                MountProbe::Unavailable => {}
+                MountProbe::TimedOut => {
+                    reason = "probing a library root timed out";
+                }
+            }
+        }
         Ok(FirstScanRootState::Unavailable(reason))
     }
+}
+
+/// Groups the roots of one share under a key.
+///
+/// `library_roots.canonical_path` is already canonical (it is stored after `canonicalize` when the
+/// root is added), so no filesystem call is needed here: the first two components (`/Volumes/NAS`)
+/// identify the mount that all of them live on.
+fn first_scan_mount_key(root_path: &std::path::Path) -> String {
+    let mut components = root_path.components();
+    let mut key = std::path::PathBuf::new();
+    if let Some(root) = components.next() {
+        key.push(root);
+    }
+    if let Some(first) = components.next() {
+        key.push(first);
+    }
+    if key.as_os_str().is_empty() {
+        return root_path.to_string_lossy().into_owned();
+    }
+    key.to_string_lossy().into_owned()
 }
 
 enum FirstScanRootState {
@@ -310,6 +431,7 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
     max_libraries: usize,
     remainder_limit: i64,
 ) -> Result<FirstScanRecovery, StorageError> {
+    let prober = FirstScanProber::new(database);
     let mut cursor: Option<String> = None;
     // The last library the loop actually handled. The limit accounting counts what comes after it,
     // which also covers the libraries that sit behind the limit inside the same page.
@@ -394,7 +516,7 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
                     );
                 }
             }
-            match first_scan_root_state(database, &library_id).await {
+            match prober.root_state(&library_id).await {
                 // A scan against a missing mount reports success with zero items and records
                 // `last_scan_at`, which would consume the first-scan intent. Probing now keeps the
                 // library eligible: the next startup probes again.
@@ -444,6 +566,18 @@ async fn resume_shutdown_interrupted_first_scans_bounded(
             break;
         }
     }
+    tracing::debug!(
+        probes = prober
+            .probes_started
+            .load(std::sync::atomic::Ordering::Relaxed),
+        timed_out = prober
+            .probes_timed_out
+            .load(std::sync::atomic::Ordering::Relaxed),
+        peak_concurrency = prober
+            .probes_running_peak
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "first-scan recovery finished probing the media roots"
+    );
     Ok(FirstScanRecovery {
         resumed,
         skipped_by_limit: 0,
@@ -527,26 +661,130 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn the_root_probe_gives_up_instead_of_hanging_the_startup() {
-        // A hung network mount is modelled by a probe that never resolves: the budget has to end the
-        // wait and report "unprobed" instead of blocking the recovery.
-        let started = std::time::Instant::now();
-        let probed = first_scan_probe_within(
-            std::time::Duration::from_millis(20),
-            std::future::pending::<()>(),
-        )
-        .await;
+    /// A probe that never resolves models a share that stopped answering.
+    fn hanging_probe() -> RootProbeFn {
+        std::sync::Arc::new(|_path: std::path::PathBuf| {
+            Box::pin(std::future::pending::<bool>()) as RootProbeFuture
+        })
+    }
 
-        assert!(
-            probed.is_none(),
-            "an exhausted budget must report the root as unprobed"
+    #[tokio::test]
+    async fn the_root_probe_gives_up_instead_of_hanging_the_startup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database, _scan_jobs) = cancelled_first_scans(0).await?;
+        let prober = FirstScanProber::with_probe(
+            &database,
+            std::time::Duration::from_millis(20),
+            hanging_probe(),
         );
+
+        let started = std::time::Instant::now();
+        let outcome = prober
+            .probe_mount("library", std::path::Path::new("/mnt/hung/movies"))
+            .await;
+
+        assert_eq!(outcome, MountProbe::TimedOut);
         assert!(
             started.elapsed() < std::time::Duration::from_secs(5),
             "the wait has to stay bounded, took {:?}",
             started.elapsed()
         );
+        assert_eq!(
+            prober
+                .probes_timed_out
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn every_candidate_on_one_lost_mount_costs_a_single_probe()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database, _scan_jobs) = cancelled_first_scans(0).await?;
+        let timeout = std::time::Duration::from_millis(20);
+        let prober = FirstScanProber::with_probe(&database, timeout, hanging_probe());
+        let mount = std::path::Path::new("/Volumes/lost-nas/movies");
+
+        let started = std::time::Instant::now();
+        for index in 0..512 {
+            assert_eq!(
+                prober
+                    .probe_mount(&format!("library-{index:03}"), mount)
+                    .await,
+                MountProbe::TimedOut
+            );
+        }
+
+        assert_eq!(
+            prober
+                .probes_started
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "all 512 candidates share one mount, so it is probed once"
+        );
+        assert_eq!(
+            prober
+                .probes_timed_out
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert!(
+            started.elapsed() < timeout * 2,
+            "512 candidates must cost one timeout, took {:?}",
+            started.elapsed()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn the_probes_never_exceed_the_concurrency_limit()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database, _scan_jobs) = cancelled_first_scans(0).await?;
+        let prober = FirstScanProber::with_probe(
+            &database,
+            std::time::Duration::from_secs(5),
+            std::sync::Arc::new(|_path: std::path::PathBuf| {
+                Box::pin(async {
+                    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+                    true
+                }) as RootProbeFuture
+            }),
+        );
+        let paths = (0..8)
+            .map(|index| std::path::PathBuf::from(format!("/mnt/share{index}/movies")))
+            .collect::<Vec<_>>();
+        let probe = |index: usize| prober.probe_mount("library", &paths[index]);
+
+        let outcomes = tokio::join!(
+            probe(0),
+            probe(1),
+            probe(2),
+            probe(3),
+            probe(4),
+            probe(5),
+            probe(6),
+            probe(7)
+        );
+        for outcome in [
+            outcomes.0, outcomes.1, outcomes.2, outcomes.3, outcomes.4, outcomes.5, outcomes.6,
+            outcomes.7,
+        ] {
+            assert_eq!(outcome, MountProbe::Available);
+        }
+
+        let peak = prober
+            .probes_running_peak
+            .load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            peak <= FIRST_SCAN_ROOT_PROBE_CONCURRENCY,
+            "peak concurrency {peak} exceeded the limit {FIRST_SCAN_ROOT_PROBE_CONCURRENCY}"
+        );
+        assert!(
+            peak >= 2,
+            "the probes are supposed to overlap, peak was only {peak}"
+        );
+        Ok(())
     }
 
     #[tokio::test]

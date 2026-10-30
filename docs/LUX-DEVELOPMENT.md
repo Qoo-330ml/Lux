@@ -19067,7 +19067,9 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
   `RECONCILE_LIBRARY` 记录达到 `FIRST_SCAN_RESUME_MAX_INTERRUPTIONS = 3` 且 `last_scan_at` 仍为空时停止
   补扫并 `warn!`（库 ID、次数、请手动扫描并检查内存与日志），避免“反复 OOM/被 SIGKILL 杀死 → 启动再排队”
   的无退避循环；不需要新表。
-  排队前对候选库的根做一次**启动时实测**（`library::inspect_root_path`，单根 5 秒上限，超时按不可用），
+  排队前对候选库的根做一次**启动时实测**（`library::inspect_root_path`，单根 5 秒上限，超时按不可用并
+  `warn!` 库 ID 与路径；同一挂载的根按 `canonical_path` 的前两段前缀去重，一次启动对同一失联挂载只付一次
+  超时；探测并发上限 `FIRST_SCAN_ROOT_PROBE_CONCURRENCY = 4`，避免失联挂载占满 blocking 池），
   至少一个根可用才补扫并把过期的 `library_roots.is_available` 修正为可用（reconcile 会丢弃该列为 0 的
   根，不修正则补扫等于空扫并写入 `last_scan_at`）；全部不可用则跳过并打带库 ID 与原因的 `warn!`，
   `last_scan_at` 保持为空、下一次启动重新探测。**不**把 `is_available = 1` 放进 SQL 谓词——该标志只在
@@ -19100,7 +19102,9 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
       真实失败 / 库停用 / 无 root / 已有活动扫描 / 最近一次扫描 `FAILED`）。
 - [x] `cargo test --locked --lib admin_scan_jobs::`：`the_limit_accounting_counts_every_library_left_for_the_next_startup`
       固定上限记账（5 个库、上限 2 → 排队 2、剩余 3）；`the_root_probe_gives_up_instead_of_hanging_the_startup`
-      固定“探测超时不挂死启动”；`the_limit_log_reports_a_lower_bound_when_the_remainder_is_truncated`
+      固定“探测超时不挂死启动”；`every_candidate_on_one_lost_mount_costs_a_single_probe` 固定“512 个共享
+      同一挂载的候选只探测一次、总耗时小于两倍单根超时”；`the_probes_never_exceed_the_concurrency_limit`
+      固定“并发探测不超过 4”；`the_limit_log_reports_a_lower_bound_when_the_remainder_is_truncated`
       固定“剩余数被截断时日志写 `remaining_at_least`”而不是精确值。
 - [x] `bash scripts/restart-recovery-smoke.sh` 连续实跑 3 次通过（arm64 裸进程，5000 个文件）：每次都是
       `interruptedStatus: CANCELLED`、`replacementStatus: COMPLETED`、`lastScanAtRecorded: true`。替换任务
