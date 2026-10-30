@@ -251,6 +251,9 @@ pub(crate) async fn apply_user_permission_copy(
         return Err(PermissionCopyApplicationError::SourceVersionConflict);
     }
 
+    // The snapshot reads above are already one bounded batch; this loop only performs the CAS
+    // write, and each target keeps its own transaction so one failure cannot roll back another.
+    // Merging the writes into a batch would merge those transactions and the per-target codes.
     let mut results = Vec::with_capacity(input.targets.len());
     for (target, target_user_id) in input.targets.iter().zip(target_user_ids.iter()) {
         let error_code = match snapshots.get(target_user_id) {
