@@ -11796,7 +11796,9 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             limit: 24,
             include_total: true,
         };
-        let plan = database.explain_filtered_catalog_rows(&filter).await?;
+        let plan = database
+            .explain_filtered_catalog_rows(&filter, crate::storage::CatalogRowProjection::Full)
+            .await?;
         let joined = plan.join("\n");
         assert!(
             joined.contains(index_name),

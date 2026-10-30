@@ -237,6 +237,9 @@ struct LibraryPageCacheKey {
     offset: i64,
     limit: i64,
     content_restriction_version: Option<i64>,
+    /// Cached pages differ by DTO projection: a card page is cached without stream rows, so it
+    /// must never be served to a full-projection request.
+    projection: CatalogItemProjection,
 }
 
 #[derive(Clone)]
@@ -248,6 +251,7 @@ struct LibraryPageRequest {
     offset: i64,
     limit: i64,
     content_restrictions: Option<UserContentRestrictions>,
+    projection: CatalogItemProjection,
 }
 
 struct CachedLibraryPage {
@@ -363,6 +367,7 @@ impl LibraryPageCache {
                 .content_restrictions
                 .as_ref()
                 .map(|restrictions| restrictions.version),
+            projection: request.projection,
         };
         let entry = self.entry(key, request).await;
         *entry.last_accessed_at.lock().await = Instant::now();
@@ -983,8 +988,12 @@ impl CatalogService {
         }
         let (total, rows) = tokio::try_join!(
             self.database.count_catalog_items(Some(library_id)),
-            self.database
-                .list_catalog_rows(Some(library_id), offset, limit),
+            self.database.list_catalog_rows(
+                Some(library_id),
+                offset,
+                limit,
+                crate::storage::CatalogRowProjection::Full,
+            ),
         )?;
         let mut items = assemble_items(rows);
         let content_restrictions = self.content_restrictions_for_principal(principal).await?;
@@ -1014,6 +1023,35 @@ impl CatalogService {
         offset: i64,
         limit: i64,
     ) -> Result<CatalogPage, CatalogError> {
+        self.list_library_items_in_scope_with_projection(
+            principal,
+            library_id,
+            filter,
+            parent_scope,
+            offset,
+            limit,
+            CatalogItemProjection::Full,
+        )
+        .await
+    }
+
+    /// Library page with an explicit DTO projection.
+    ///
+    /// A [`CatalogItemProjection::Card`] page is read with the summary row projection: the grid
+    /// renders the item columns, the image tags and the preferred source duration, so the
+    /// per-source stream rows are not read at all. Cached pages keep the projection in their key,
+    /// so a card page can never be served to a full-projection request.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_library_items_in_scope_with_projection(
+        &self,
+        principal: AccessPrincipal,
+        library_id: &str,
+        filter: &CatalogFilter,
+        parent_scope: Option<CatalogParentScope>,
+        offset: i64,
+        limit: i64,
+        projection: CatalogItemProjection,
+    ) -> Result<CatalogPage, CatalogError> {
         let Some(library) = self.database.find_library(library_id).await? else {
             return Err(CatalogError::LibraryNotFound);
         };
@@ -1038,6 +1076,7 @@ impl CatalogService {
             offset,
             limit,
             content_restrictions,
+            projection,
         };
         return self.library_page_cache.get_or_load(self, request).await;
     }
@@ -1200,7 +1239,13 @@ impl CatalogService {
                     .await?
             }
             _ => {
-                let (rows, total) = self.database.list_filtered_catalog_rows(&query).await?;
+                let (rows, total) = self
+                    .database
+                    .list_filtered_catalog_rows_with_projection(
+                        &query,
+                        request.projection.row_projection(),
+                    )
+                    .await?;
                 if self.read_model_mode == ReadModelMode::Shadow && read_model_sort.is_some() {
                     self.compare_read_model_page(&query, &rows, total).await;
                 }
@@ -2882,11 +2927,28 @@ impl CatalogPage {
     }
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+/// Which catalogue item DTO a list response needs.
+///
+/// `Card` is the grid projection: it renders the item columns, the image tags and the preferred
+/// source duration, and omits `mediaSources`, `overview`, `providerIds` and the other detail
+/// fields. The storage layer uses the same distinction to pick the row projection, so a card page
+/// never pays for per-source media streams.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
 pub enum CatalogItemProjection {
     #[default]
     Full,
     Card,
+}
+
+impl CatalogItemProjection {
+    /// Row projection the list queries need for this DTO.
+    fn row_projection(self) -> crate::storage::CatalogRowProjection {
+        match self {
+            // The full DTO carries `mediaSources[].streams`, so the rows must hydrate them.
+            Self::Full => crate::storage::CatalogRowProjection::Full,
+            Self::Card => crate::storage::CatalogRowProjection::Summary,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

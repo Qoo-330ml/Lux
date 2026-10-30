@@ -84,6 +84,7 @@ mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;
 #[path = "catalog_read_model.rs"]
 mod catalog_read_model;
+pub(crate) use catalog::CatalogRowProjection;
 pub(crate) use catalog_read_model::{
     CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND, ReadModelPageQuery, ReadModelSort,
     RecentByLibraryReadModelQuery, RecentReadModelQuery,
@@ -4066,7 +4067,7 @@ fn stored_media_item(row: sqlx::any::AnyRow) -> Result<StoredMediaItem, sqlx::Er
     Ok(StoredMediaItem { id: row.id })
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredCatalogRow {
     pub(crate) item_id: String,
     pub(crate) library_id: String,
