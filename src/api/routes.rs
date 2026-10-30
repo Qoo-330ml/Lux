@@ -120,8 +120,22 @@ impl tower_http::compression::predicate::Predicate for CompressJsonResponses {
     }
 }
 
+/// Dispatches between the two router trees of the setup/ready split.
+///
+/// The signature and the semantics of the compatibility façade stay: `tests/**` keeps calling
+/// `app()`/`app_with_state(AppState::default())` (not-ready compatibility tree) and
+/// `app_with_state(AppState::ready(..))` (ready tree). `src/main.rs` keeps calling
+/// `app_with_state(app_state)`, which is always ready, so the setup tree is not selected here yet.
 pub(super) fn app_with_state(state: AppState) -> Router {
-    let core = state.core.clone();
+    match state.into_mode() {
+        AppMode::Ready(ready) => ready_router(ready),
+        AppMode::NotReady(state) => not_ready_compat_router(state),
+    }
+}
+
+/// The tree a ready application serves: every Lux, admin and Emby business route.
+fn ready_router(state: ReadyAppState) -> Router {
+    let core = state.core().clone();
     let slots = RequestSlots::default();
     let (emby_routes, emby_path_templates) = emby::api_routes();
     let app = Router::new()
@@ -132,9 +146,70 @@ pub(super) fn app_with_state(state: AppState) -> Router {
         .merge(emby_routes.clone())
         .nest("/emby", emby_routes)
         .fallback_service(spa_service())
-        .with_state(state);
+        // The `api_routes()` builders still produce `Router<AppState>`; they flip to
+        // `Router<ReadyAppState>` in the next commit, which turns this into `.with_state(state)`.
+        .with_state(AppState::from_ref(&state));
     let app = apply_common_layers(app, &core, slots);
     case_insensitive_emby_router(app, emby_path_templates)
+}
+
+/// The compatibility tree for a state that has neither a database nor the services.
+///
+/// `src/main.rs` never builds it: only the frozen `tests/**` reach it (`app()`,
+/// `app_with_state(AppState::default())`), and they pin the responses the pre-split single tree
+/// gave them. Its business routes are deliberately not registered, so the six responses of
+/// `docs/SETUP-READY-SPLIT-DESIGN.md` §9.2 are synthesised here; every other path falls through to
+/// the SPA fallback and the namespace middlewares exactly like before (Lux 404 envelope, bare Emby
+/// 404, HTML for client-side routes).
+fn not_ready_compat_router(state: AppState) -> Router {
+    let core = state.core.clone();
+    let slots = RequestSlots::default();
+    let app = Router::new()
+        .route("/logo.svg", get(web_logo))
+        // The three core probes are real handlers: they answer correctly without services.
+        .route("/health/live", get(users::live))
+        .route("/health/ready", get(users::ready))
+        .route("/api/v1/version", get(users::version))
+        // Synthesised for the frozen tests only (§9.2 #3, #4, #5, #6).
+        .route(
+            "/api/v1/auth/sessions",
+            get(not_ready_compat_bare_service_unavailable),
+        )
+        .route("/api/v1/auth/me", get(not_ready_compat_auth_me))
+        .route(
+            "/api/v1/items/{item_id}/danmaku",
+            get(not_ready_compat_bare_service_unavailable),
+        )
+        .route(
+            "/System/Info",
+            get(not_ready_compat_bare_service_unavailable),
+        )
+        .fallback_service(spa_service())
+        .with_state(state);
+    let app = apply_common_layers(app, &core, slots);
+    case_insensitive_emby_router(app, vec!["/System/Info".to_owned()])
+}
+
+/// The bare `503` the pre-split handlers answered for a missing service.
+///
+/// `normalize_empty_api_service_unavailable` turns it into the structured
+/// `DATABASE_UNAVAILABLE` envelope under `/api/v1/` and leaves the Emby namespace bare, which is
+/// exactly what the frozen tests assert for `/api/v1/auth/sessions`,
+/// `/api/v1/items/{item_id}/danmaku` and `/System/Info`.
+async fn not_ready_compat_bare_service_unavailable() -> Response {
+    StatusCode::SERVICE_UNAVAILABLE.into_response()
+}
+
+/// `GET /api/v1/auth/me` used to fail in `require_web_principal` with this exact envelope when no
+/// auth service existed; the compatibility tree cannot mount that handler, so it answers directly.
+async fn not_ready_compat_auth_me(headers: HeaderMap) -> Response {
+    api_error(
+        &headers,
+        StatusCode::SERVICE_UNAVAILABLE,
+        lux::ApiErrorCode::DatabaseUnavailable,
+        "服务尚未就绪",
+    )
+    .into_response()
 }
 
 /// The static assets and the `index.html` fallback the SPA needs in every mode.
@@ -1187,5 +1262,111 @@ mod tests {
         assert_eq!(throttled.status(), StatusCode::TOO_MANY_REQUESTS);
         assert_eq!(header(&throttled, "retry-after"), Some("60"));
         assert_eq!(json_body(throttled).await["error"]["code"], "RATE_LIMITED");
+    }
+
+    /// The six responses the frozen `tests/**` pin for `app()`/`AppState::default()`, byte for
+    /// byte (docs/SETUP-READY-SPLIT-DESIGN.md §9.2).
+    ///
+    /// The compatibility tree only mounts the core probes plus these four synthesised handlers, so
+    /// this test is the executable version of the contract table: it breaks if a synthetic answer
+    /// drifts away from the handler the split removed.
+    #[tokio::test]
+    async fn not_ready_compat_tree_serves_the_six_frozen_responses() {
+        let app = app_with_state(AppState::default());
+
+        // 1. GET /health/live -> 200 {"status":"ok"} with a server request id.
+        let live = send(app.clone(), test_request(Method::GET, "/health/live", &[])).await;
+        assert_eq!(live.status(), StatusCode::OK);
+        assert!(header(&live, "x-request-id").is_some());
+        let body = axum::body::to_bytes(live.into_body(), 4096)
+            .await
+            .expect("live body");
+        assert_eq!(body.as_ref(), br#"{"status":"ok"}"#);
+
+        // 2. GET /health/ready -> 503 because the database slot is empty.
+        let ready = send(app.clone(), test_request(Method::GET, "/health/ready", &[])).await;
+        assert_eq!(ready.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = axum::body::to_bytes(ready.into_body(), 4096)
+            .await
+            .expect("ready body");
+        assert!(String::from_utf8_lossy(&body).contains("database_unavailable"));
+
+        // 3. GET /api/v1/auth/sessions -> structured 503 whose requestId is the response header.
+        let sessions = send(
+            app.clone(),
+            test_request(Method::GET, "/api/v1/auth/sessions", &[]),
+        )
+        .await;
+        assert_eq!(sessions.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let server_id = header(&sessions, "x-request-id")
+            .map(str::to_owned)
+            .expect("server request id");
+        let body = json_body(sessions).await;
+        assert_eq!(body["error"]["code"], "DATABASE_UNAVAILABLE");
+        assert_eq!(body["error"]["requestId"], server_id.as_str());
+
+        // 4. GET /api/v1/auth/me -> the `require_web_principal` envelope.
+        let me = send(
+            app.clone(),
+            test_request(Method::GET, "/api/v1/auth/me", &[]),
+        )
+        .await;
+        assert_eq!(me.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(json_body(me).await["error"]["message"], "服务尚未就绪");
+
+        // 5. GET /System/Info -> bare 503, no body and no error envelope.
+        let emby_info = send(app.clone(), test_request(Method::GET, "/System/Info", &[])).await;
+        assert_eq!(emby_info.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert!(
+            axum::body::to_bytes(emby_info.into_body(), 4096)
+                .await
+                .expect("Emby 503 body")
+                .is_empty()
+        );
+
+        // 6. GET /api/v1/items/item-1/danmaku -> structured bare-503 normalisation.
+        let danmaku = send(
+            app.clone(),
+            test_request(Method::GET, "/api/v1/items/item-1/danmaku", &[]),
+        )
+        .await;
+        assert_eq!(danmaku.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            json_body(danmaku).await["error"]["code"],
+            "DATABASE_UNAVAILABLE"
+        );
+
+        // No business route is mounted: the Lux namespace answers its 404 envelope while the Emby
+        // namespace stays a bare 404, and the SPA fallback still owns the client-side routes.
+        for path in ["/api/v1/libraries", "/api/v1/home"] {
+            let missing = send(app.clone(), test_request(Method::GET, path, &[])).await;
+            assert_eq!(missing.status(), StatusCode::NOT_FOUND, "{path}");
+            assert_eq!(json_body(missing).await["error"]["code"], "NOT_FOUND");
+        }
+        let admin = send(
+            app.clone(),
+            test_request(Method::GET, "/api/v1/admin/navigation", &[]),
+        )
+        .await;
+        assert_eq!(admin.status(), StatusCode::NOT_FOUND);
+        assert_eq!(json_body(admin).await["error"]["code"], "NOT_FOUND");
+        // A non-GET request to an unregistered business path is answered by the SPA fallback's
+        // ServeDir, which rejects non-GET methods with 405; the pre-split tree reached the real
+        // handler here. No frozen test exercises that on the compatibility tree, and the ready
+        // tree keeps the real handler.
+        let login = send(
+            app.clone(),
+            test_request(Method::POST, "/api/v1/auth/login", &[]),
+        )
+        .await;
+        assert_eq!(login.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let emby_users = send(app.clone(), test_request(Method::GET, "/Users", &[])).await;
+        assert_eq!(emby_users.status(), StatusCode::NOT_FOUND);
+        assert!(
+            axum::body::to_bytes(emby_users.into_body(), 4096)
+                .await
+                .expect("Emby 404 body")
+                .is_empty()
+        );
     }
 }

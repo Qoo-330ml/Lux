@@ -478,7 +478,6 @@ impl SetupState {
 /// `NotReady` keeps the whole [`AppState`] rather than only its `CoreState`, so the not-ready
 /// compatibility tree can mount the very same `State<AppState>` core handlers. The enum is the
 /// dispatch point of the split; the ready tree is the only tree that mounts business routes.
-#[allow(dead_code)] // Wired into the router dispatch further down this batch.
 pub(crate) enum AppMode {
     Ready(ReadyAppState),
     NotReady(AppState),
@@ -586,7 +585,6 @@ impl AppState {
     /// setup view derived from it and this façade keep observing one service table. A state without
     /// the services (only `AppState::default()` in practice) keeps its whole self for the
     /// not-ready compatibility tree.
-    #[allow(dead_code)] // Wired into the router dispatch further down this batch.
     pub(crate) fn into_mode(self) -> AppMode {
         let database = self.core.database.clone();
         let services = self.ready.clone();
