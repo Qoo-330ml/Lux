@@ -5849,7 +5849,9 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_chapter_detection_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_chapter_detection_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -5905,7 +5907,10 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
         };
-        rows.map(|rows| rows.into_iter().map(stored_chapter_detection_job).collect())
+        rows.map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_chapter_detection_job)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())
     }
 

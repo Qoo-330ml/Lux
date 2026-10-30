@@ -54,11 +54,10 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_reconciliation_scan_entry)
-                .collect()
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_reconciliation_scan_entry)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 

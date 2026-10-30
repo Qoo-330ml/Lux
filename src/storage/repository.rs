@@ -3065,108 +3065,238 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) total_count: i64,
 }
 
-fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
-    StoredScanJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        job_type: row.get("job_type"),
-        status: row.get("status"),
-        generation: row.get("generation"),
-        cursor: row.get("cursor"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        processed_media_count: row.get("processed_media_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-        discovery_completed: row.get::<i64, _>("discovery_completed") != 0,
-        auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
-        current_item: row.get("current_item"),
-        scan_phase: row.get("scan_phase"),
-    }
+/// Row of the scan-job projections that decode into [`StoredScanJob`].
+///
+/// The three flag columns stay `i64` because both backends store them as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_scan_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScanJobRow {
+    id: String,
+    library_id: String,
+    job_type: String,
+    status: String,
+    generation: String,
+    cursor: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    processed_media_count: Option<i64>,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+    discovery_completed: i64,
+    auto_metadata_match: i64,
+    current_item: Option<String>,
+    scan_phase: String,
 }
 
-fn stored_scan_local_metadata_batch(row: sqlx::any::AnyRow) -> StoredScanLocalMetadataBatch {
-    StoredScanLocalMetadataBatch {
-        id: row.get("id"),
-        job_id: row.get("job_id"),
-        library_root_id: row.get("library_root_id"),
-        batch_sequence: row.get("batch_sequence"),
-        source_refs_json: row.get("source_refs_json"),
-        non_retryable_item_ids_json: row.get("non_retryable_item_ids_json"),
-        source_count: row.get("source_count"),
-        images_completed_at: row.get("images_completed_at"),
-        status: row.get("status"),
-        attempts: row.get("attempts"),
-        next_attempt_at: row.get("next_attempt_at"),
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+fn stored_scan_job(row: sqlx::any::AnyRow) -> Result<StoredScanJob, sqlx::Error> {
+    let row = StoredScanJobRow::from_row(&row)?;
+    Ok(StoredScanJob {
+        id: row.id,
+        library_id: row.library_id,
+        job_type: row.job_type,
+        status: row.status,
+        generation: row.generation,
+        cursor: row.cursor,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        processed_media_count: row.processed_media_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        discovery_completed: row.discovery_completed != 0,
+        auto_metadata_match: row.auto_metadata_match != 0,
+        current_item: row.current_item,
+        scan_phase: row.scan_phase,
+    })
 }
 
-fn stored_scan_job_path(row: sqlx::any::AnyRow) -> StoredScanJobPath {
-    StoredScanJobPath {
-        library_root_id: row.get("library_root_id"),
-        relative_path: row.get("relative_path"),
-        change_kind: row.get("change_kind"),
+/// Row of the local-metadata batch projections that decode into
+/// [`StoredScanLocalMetadataBatch`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScanLocalMetadataBatchRow {
+    id: String,
+    job_id: String,
+    library_root_id: String,
+    batch_sequence: i64,
+    source_refs_json: String,
+    non_retryable_item_ids_json: String,
+    source_count: i64,
+    images_completed_at: Option<i64>,
+    status: String,
+    attempts: i64,
+    next_attempt_at: Option<i64>,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_scan_local_metadata_batch(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredScanLocalMetadataBatch, sqlx::Error> {
+    let row = StoredScanLocalMetadataBatchRow::from_row(&row)?;
+    Ok(StoredScanLocalMetadataBatch {
+        id: row.id,
+        job_id: row.job_id,
+        library_root_id: row.library_root_id,
+        batch_sequence: row.batch_sequence,
+        source_refs_json: row.source_refs_json,
+        non_retryable_item_ids_json: row.non_retryable_item_ids_json,
+        source_count: row.source_count,
+        images_completed_at: row.images_completed_at,
+        status: row.status,
+        attempts: row.attempts,
+        next_attempt_at: row.next_attempt_at,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+/// Row of the pending scan-job path projections that decode into [`StoredScanJobPath`].
+///
+/// `file_change_revision` has no column: normal scan paths never carry a revision, so the
+/// decoder keeps defaulting it to `None`.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScanJobPathRow {
+    library_root_id: String,
+    relative_path: String,
+    change_kind: String,
+}
+
+fn stored_scan_job_path(row: sqlx::any::AnyRow) -> Result<StoredScanJobPath, sqlx::Error> {
+    let row = StoredScanJobPathRow::from_row(&row)?;
+    Ok(StoredScanJobPath {
+        library_root_id: row.library_root_id,
+        relative_path: row.relative_path,
+        change_kind: row.change_kind,
         file_change_revision: None,
-    }
+    })
 }
 
-fn stored_reconciliation_scan_entry(row: sqlx::any::AnyRow) -> StoredReconciliationScanEntry {
-    StoredReconciliationScanEntry {
-        library_root_id: row.get("library_root_id"),
-        relative_path: row.get("relative_path"),
-    }
+/// Row of the pending reconciliation-entry projections that decode into
+/// [`StoredReconciliationScanEntry`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredReconciliationScanEntryRow {
+    library_root_id: String,
+    relative_path: String,
 }
 
-fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
-    StoredStrmProbeJob {
-        id: row.get("id"),
-        operation_id: row.get("operation_id"),
-        library_id: row.get("library_id"),
-        status: row.get("status"),
-        concurrency: row.get("concurrency"),
-        include_ready: row.get::<i64, _>("include_ready") != 0,
-        write_sidecars: row.get::<i64, _>("write_sidecars") != 0,
-        media_info_enabled: row.get::<i64, _>("media_info_enabled") != 0,
-        thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
-        thumbnail_position_percent: row.get("thumbnail_position_percent"),
-        target_scan_job_id: row.get("target_scan_job_id"),
-        target_source_id: row.get("target_source_id"),
-        cursor: row.get("cursor"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+fn stored_reconciliation_scan_entry(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredReconciliationScanEntry, sqlx::Error> {
+    let row = StoredReconciliationScanEntryRow::from_row(&row)?;
+    Ok(StoredReconciliationScanEntry {
+        library_root_id: row.library_root_id,
+        relative_path: row.relative_path,
+    })
 }
 
-fn stored_chapter_detection_job(row: sqlx::any::AnyRow) -> StoredChapterDetectionJob {
-    StoredChapterDetectionJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        plugin_id: row.get("plugin_id"),
-        status: row.get("status"),
-        concurrency: row.get("concurrency"),
-        intro_window_seconds: row.get("intro_window_seconds"),
-        credits_window_seconds: row.get("credits_window_seconds"),
-        match_threshold: row.get("match_threshold"),
-        cursor: row.get("cursor"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+/// Row of the STRM probe job projections that decode into [`StoredStrmProbeJob`].
+///
+/// The flag columns stay `i64` because both backends store them as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_strm_probe_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredStrmProbeJobRow {
+    id: String,
+    operation_id: String,
+    library_id: String,
+    status: String,
+    concurrency: i64,
+    include_ready: i64,
+    write_sidecars: i64,
+    media_info_enabled: i64,
+    thumbnail_enabled: i64,
+    thumbnail_position_percent: i64,
+    target_scan_job_id: Option<String>,
+    target_source_id: Option<String>,
+    cursor: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> Result<StoredStrmProbeJob, sqlx::Error> {
+    let row = StoredStrmProbeJobRow::from_row(&row)?;
+    Ok(StoredStrmProbeJob {
+        id: row.id,
+        operation_id: row.operation_id,
+        library_id: row.library_id,
+        status: row.status,
+        concurrency: row.concurrency,
+        include_ready: row.include_ready != 0,
+        write_sidecars: row.write_sidecars != 0,
+        media_info_enabled: row.media_info_enabled != 0,
+        thumbnail_enabled: row.thumbnail_enabled != 0,
+        thumbnail_position_percent: row.thumbnail_position_percent,
+        target_scan_job_id: row.target_scan_job_id,
+        target_source_id: row.target_source_id,
+        cursor: row.cursor,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
+}
+
+/// Row of the chapter-detection job projections that decode into
+/// [`StoredChapterDetectionJob`].
+///
+/// `cancel_requested` stays `i64` because both backends store it as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_chapter_detection_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredChapterDetectionJobRow {
+    id: String,
+    library_id: String,
+    plugin_id: String,
+    status: String,
+    concurrency: i64,
+    intro_window_seconds: i64,
+    credits_window_seconds: i64,
+    match_threshold: f64,
+    cursor: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn stored_chapter_detection_job(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredChapterDetectionJob, sqlx::Error> {
+    let row = StoredChapterDetectionJobRow::from_row(&row)?;
+    Ok(StoredChapterDetectionJob {
+        id: row.id,
+        library_id: row.library_id,
+        plugin_id: row.plugin_id,
+        status: row.status,
+        concurrency: row.concurrency,
+        intro_window_seconds: row.intro_window_seconds,
+        credits_window_seconds: row.credits_window_seconds,
+        match_threshold: row.match_threshold,
+        cursor: row.cursor,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
 }
 
 fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
@@ -6554,6 +6684,97 @@ mod stored_row_decoding_tests {
         assert_eq!(delivery.destination_url, "https://example.test/hook");
         assert!(!delivery.allow_private_network);
         assert_eq!(delivery.provider_plugin_id, "builtin.webhook");
+        Ok(())
+    }
+
+    /// Covers the STRM probe job decoder, which has no other library test path.
+    #[tokio::test]
+    async fn stored_strm_probe_job_row_decodes_the_job_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('strm-lib', 'STRM', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .create_strm_probe_job(NewStrmProbeJob {
+                id: "probe-job",
+                operation_id: "probe-operation",
+                library_id: "strm-lib",
+                concurrency: 2,
+                include_ready: true,
+                write_sidecars: false,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 25,
+                target_scan_job_id: None,
+                target_source_id: None,
+                total_count: 3,
+            })
+            .await?;
+
+        let job = database
+            .find_strm_probe_job("probe-job")
+            .await?
+            .expect("probe job should exist");
+        assert_eq!(job.operation_id, "probe-operation");
+        assert_eq!(job.library_id, "strm-lib");
+        assert_eq!(job.status, "PENDING");
+        assert_eq!(job.concurrency, 2);
+        assert!(job.include_ready);
+        assert!(!job.write_sidecars);
+        assert!(job.media_info_enabled);
+        assert!(!job.thumbnail_enabled);
+        assert_eq!(job.thumbnail_position_percent, 25);
+        assert_eq!(job.target_scan_job_id, None);
+        assert_eq!(job.target_source_id, None);
+        assert_eq!(job.cursor, None);
+        assert_eq!(job.processed_count, 0);
+        assert_eq!(job.total_count, 3);
+        assert!(!job.cancel_requested);
+        assert_eq!(job.error, None);
+        assert_eq!(job.started_at, None);
+        assert_eq!(job.finished_at, None);
+        Ok(())
+    }
+
+    /// A projection that drifts from its row struct must surface as a storage error.
+    ///
+    /// The scan/person decoders used to call `row.get`, which panicked on a missing
+    /// column; each `*Row` struct reports `ColumnNotFound` instead.
+    #[tokio::test]
+    async fn stored_row_structs_report_missing_columns_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+
+        let errors = [
+            StoredScanJobRow::from_row(&row)
+                .err()
+                .expect("scan job columns must not decode"),
+            StoredScanLocalMetadataBatchRow::from_row(&row)
+                .err()
+                .expect("local metadata batch columns must not decode"),
+            StoredScanJobPathRow::from_row(&row)
+                .err()
+                .expect("scan job path columns must not decode"),
+            StoredReconciliationScanEntryRow::from_row(&row)
+                .err()
+                .expect("reconciliation entry columns must not decode"),
+            StoredStrmProbeJobRow::from_row(&row)
+                .err()
+                .expect("STRM probe job columns must not decode"),
+            StoredChapterDetectionJobRow::from_row(&row)
+                .err()
+                .expect("chapter detection job columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
         Ok(())
     }
 }
