@@ -102,9 +102,11 @@ pub struct ReadyAppState { core: CoreState, /* 46 个服务字段，非 Option *
 - 服务副本语义：所有状态克隆共享同一个 `Arc<ReadyServices>`（`cloning_the_state_shares_one_ready_services_instance`
   断言 `Arc::ptr_eq` + 字段地址相同 + `strong_count == 2`）；启动期 builder（`with_strm_playback_resolver`、
   `with_embedded_subtitle_executable`、`with_hls_executable`、`with_scraper`、`start_content_restriction_index_worker`）
-  通过 `Arc::make_mut` 修改：`Arc` 独享时原地改，已共享时只复制一份**句柄结构**（每个服务的 `Clone` 都是
-  指针级克隆，内部仍共享 `Arc`/数据库连接池 —— 拆分前每个请求克隆整个 `AppState` 时就是这种克隆），
-  builder 只改自己那份，其他持有者看到的服务实例不变。语义与拆分前"克隆状态后重建个别服务"完全一致；
+  通过 `Arc::make_mut` 修改：`Arc` 独享时原地改，已共享时只复制一份**句柄结构**，builder 只改自己那份，
+  其他持有者看到的服务实例不变。前提是**每个服务的可变状态都在 `Arc`/数据库连接池里共享**，`Clone` 只重建
+  句柄：其中 14 个服务在 `Clone` 时还会顺带复制 `PathBuf`/`String` 这类**不可变配置值**（`config_dir`、
+  `ffmpeg_executable`、`cache_root` 等），这些值只在构造时写入，不承载运行期可变状态。拆分前"每个请求
+  克隆整个 `AppState`"依赖的正是这条性质，所以 `make_mut` 的语义与拆分前"克隆状态后重建个别服务"完全一致；
   这也是集成测试 `metadata_api::*`（`tmdb.map_or(state.clone(), |tmdb| state.with_scraper(..))`）
   继续通过的前提 —— 首发实现用 `Arc::get_mut` 时该路径会静默失效，已用 `make_mut` 修正。
   `with_hls_executable` 用 `WebPlaybackSessionService` 的 `Clone`（内部 HLS 进程表、槽位、硬件状态全是
