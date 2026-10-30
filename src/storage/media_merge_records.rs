@@ -79,6 +79,87 @@ struct MergeItemStateRow {
     merged_into_item_id: Option<String>,
 }
 
+/// Row of the item-state snapshot inside `record_media_merges_in_transaction`.
+///
+/// `owner_id` is the merge root the row belongs to: the item itself for roots, `series_id`
+/// for seasons and episodes. It only routes the row onto a record, never leaves this module.
+#[derive(sqlx::FromRow)]
+struct MergeItemStateSelectRow {
+    id: String,
+    item_type: String,
+    parent_id: Option<String>,
+    series_id: Option<String>,
+    merged_into_item_id: Option<String>,
+    owner_id: String,
+}
+
+/// Row of the media-source snapshot inside `record_media_merges_in_transaction`.
+#[derive(sqlx::FromRow)]
+struct MergeSourceStateSelectRow {
+    id: String,
+    item_id: String,
+    is_default: i64,
+}
+
+/// Row of `list_media_merge_records_for_item`.
+///
+/// The column is spelled `source` in the table; [`StoredMediaMergeRecord`] exposes it as
+/// `origin`, so the conversion lives in one place.
+#[derive(sqlx::FromRow)]
+struct MediaMergeRecordRow {
+    id: String,
+    library_id: String,
+    item_type: String,
+    primary_item_id: String,
+    merged_item_id: String,
+    merged_item_title: String,
+    source: String,
+    merged_at: i64,
+    undone_at: Option<i64>,
+    source_count: i64,
+}
+
+impl From<MediaMergeRecordRow> for StoredMediaMergeRecord {
+    fn from(row: MediaMergeRecordRow) -> Self {
+        Self {
+            id: row.id,
+            library_id: row.library_id,
+            item_type: row.item_type,
+            primary_item_id: row.primary_item_id,
+            merged_item_id: row.merged_item_id,
+            merged_item_title: row.merged_item_title,
+            origin: row.source,
+            merged_at: row.merged_at,
+            undone_at: row.undone_at,
+            source_count: row.source_count,
+        }
+    }
+}
+
+/// Row of the merge-record lookup at the start of `unmerge_media_items`.
+#[derive(sqlx::FromRow)]
+struct MediaMergeRecordKeyRow {
+    id: String,
+    library_id: String,
+    item_type: String,
+}
+
+/// Row of the provider keys the two items being unmerged still share.
+#[derive(sqlx::FromRow)]
+struct MergeSuppressionProviderKeyRow {
+    provider: String,
+    provider_id: String,
+}
+
+/// Row of the title+year suppression key of the primary item.
+///
+/// `production_year` is selected with `IS NOT NULL`, so both fields stay non-optional.
+#[derive(sqlx::FromRow)]
+struct MergeSuppressionTitleKeyRow {
+    sort_title: String,
+    production_year: i64,
+}
+
 impl Database {
     /// Records one merge record per merged root in a single pass: records, the hierarchy fields a
     /// merge is about to change, and the media sources it is about to move.
@@ -132,12 +213,13 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut query = self.query(sqlx::AssertSqlSafe(format!(
-                "SELECT id, item_type, parent_id, series_id, merged_into_item_id,
+            let mut query =
+                self.query_as::<MergeItemStateSelectRow>(sqlx::AssertSqlSafe(format!(
+                    "SELECT id, item_type, parent_id, series_id, merged_into_item_id,
                         CASE WHEN series_id IS NULL THEN id ELSE series_id END AS owner_id
                  FROM media_items
                  WHERE id IN ({placeholders}) OR series_id IN ({placeholders})"
-            )));
+                )));
             for merged_item_id in chunk {
                 query = query.bind(merged_item_id);
             }
@@ -149,17 +231,16 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let owner_id: String = row.get("owner_id");
-                let Some(record_id) = owners.get(&owner_id).cloned() else {
+                let Some(record_id) = owners.get(&row.owner_id).cloned() else {
                     continue;
                 };
                 states.push(MergeItemStateRow {
                     record_id,
-                    item_id: row.get("id"),
-                    item_type: row.get("item_type"),
-                    parent_id: row.get("parent_id"),
-                    series_id: row.get("series_id"),
-                    merged_into_item_id: row.get("merged_into_item_id"),
+                    item_id: row.id,
+                    item_type: row.item_type,
+                    parent_id: row.parent_id,
+                    series_id: row.series_id,
+                    merged_into_item_id: row.merged_into_item_id,
                 });
             }
         }
@@ -193,10 +274,11 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut query = self.query(sqlx::AssertSqlSafe(format!(
-                "SELECT id, item_id, CAST(is_default AS BIGINT) AS is_default
+            let mut query =
+                self.query_as::<MergeSourceStateSelectRow>(sqlx::AssertSqlSafe(format!(
+                    "SELECT id, item_id, CAST(is_default AS BIGINT) AS is_default
                  FROM media_sources WHERE item_id IN ({placeholders})"
-            )));
+                )));
             for state in chunk {
                 query = query.bind(&state.item_id);
             }
@@ -209,11 +291,10 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                let item_id: String = row.get("item_id");
-                let Some(record_id) = record_by_item.get(&item_id).cloned() else {
+                let Some(record_id) = record_by_item.get(&row.item_id).cloned() else {
                     continue;
                 };
-                sources.push((record_id, row.get("id"), item_id, row.get("is_default")));
+                sources.push((record_id, row.id, row.item_id, row.is_default));
             }
         }
 
@@ -247,7 +328,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredMediaMergeRecord>, StorageError> {
         let limit = limit.clamp(1, MAX_IDENTITY_MERGE_KEY_PAGE_SIZE);
-        self.query(
+        self.query_as::<MediaMergeRecordRow>(
             "SELECT record.id, record.library_id, record.item_type,
                     record.primary_item_id, record.merged_item_id,
                     merged_item.title AS merged_item_title, record.source,
@@ -267,18 +348,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredMediaMergeRecord {
-                    id: row.get("id"),
-                    library_id: row.get("library_id"),
-                    item_type: row.get("item_type"),
-                    primary_item_id: row.get("primary_item_id"),
-                    merged_item_id: row.get("merged_item_id"),
-                    merged_item_title: row.get("merged_item_title"),
-                    origin: row.get("source"),
-                    merged_at: row.get("merged_at"),
-                    undone_at: row.get("undone_at"),
-                    source_count: row.get("source_count"),
-                })
+                .map(StoredMediaMergeRecord::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -297,7 +367,7 @@ impl Database {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let record = self
-            .query(
+            .query_as::<MediaMergeRecordKeyRow>(
                 "SELECT id, library_id, item_type FROM media_merge_records
                  WHERE primary_item_id = ? AND merged_item_id = ? AND undone_at IS NULL
                  ORDER BY merged_at DESC, id DESC
@@ -311,9 +381,9 @@ impl Database {
         let Some(record) = record else {
             return Err(StorageError::Conflict("没有可撤销的合并记录".to_owned()));
         };
-        let record_id: String = record.get("id");
-        let library_id: String = record.get("library_id");
-        let item_type: String = record.get("item_type");
+        let record_id = record.id;
+        let library_id = record.library_id;
+        let item_type = record.item_type;
         let still_merged = self
             .query_scalar::<i64>(
                 "SELECT CAST(CASE WHEN EXISTS (
@@ -333,7 +403,7 @@ impl Database {
         // same items right back. Provider keys cover TMDb groups; the title+year key covers the
         // fallback for items without provider IDs.
         let shared_provider_keys = self
-            .query(
+            .query_as::<MergeSuppressionProviderKeyRow>(
                 "SELECT provider, provider_id
                  FROM media_item_provider_ids
                  WHERE media_item_id IN (?, ?)
@@ -347,7 +417,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         if shared_provider_keys.is_empty() {
             let title_key = self
-                .query(
+                .query_as::<MergeSuppressionTitleKeyRow>(
                     "SELECT sort_title, production_year FROM media_items
                      WHERE id = ? AND production_year IS NOT NULL",
                 )
@@ -356,8 +426,6 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             if let Some(title_key) = title_key {
-                let sort_title: String = title_key.get("sort_title");
-                let production_year: i64 = title_key.get("production_year");
                 self.query(
                     "INSERT INTO merge_suppressions
                          (library_id, item_type, sort_title, production_year)
@@ -365,16 +433,14 @@ impl Database {
                 )
                 .bind(&library_id)
                 .bind(&item_type)
-                .bind(sort_title)
-                .bind(production_year)
+                .bind(title_key.sort_title)
+                .bind(title_key.production_year)
                 .execute(&mut *transaction)
                 .await
                 .map_err(self.sqlx_err())?;
             }
         } else {
             for row in shared_provider_keys {
-                let provider: String = row.get("provider");
-                let provider_id: String = row.get("provider_id");
                 self.query(
                     "INSERT INTO merge_suppressions
                          (library_id, item_type, provider, provider_id)
@@ -382,8 +448,8 @@ impl Database {
                 )
                 .bind(&library_id)
                 .bind(&item_type)
-                .bind(provider)
-                .bind(provider_id)
+                .bind(row.provider)
+                .bind(row.provider_id)
                 .execute(&mut *transaction)
                 .await
                 .map_err(self.sqlx_err())?;
