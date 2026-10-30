@@ -4348,11 +4348,10 @@ pub(super) async fn emby_primary_image_aspect_ratio(
     if width <= 0 || height <= 0 {
         return None;
     }
-    if let Some(database) = Some(state.database()) {
-        let _ = database
-            .set_item_image_dimensions(item_id, "POSTER", 0, width, height)
-            .await;
-    }
+    let _ = state
+        .database()
+        .set_item_image_dimensions(item_id, "POSTER", 0, width, height)
+        .await;
     Some(f64::from(width) / f64::from(height))
 }
 
