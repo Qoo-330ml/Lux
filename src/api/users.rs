@@ -2256,7 +2256,11 @@ pub(super) async fn auth_update_settings(
         )
         .await
         {
-            Ok(updated) => preferences = updated,
+            Ok(updated) => {
+                preferences = updated;
+                // The auto-played threshold decides which items continue watching keeps.
+                state.home().invalidate_user(&user.id.to_string());
+            }
             Err(error) => return account_preferences_error(&headers, error),
         }
     }
