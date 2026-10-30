@@ -110,6 +110,57 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   DANMAKU_MATCH_STARTED: "开始弹幕匹配",
   DANMAKU_MATCH_CANCEL_REQUESTED: "取消弹幕匹配",
   DANMAKU_MATCH_RETRIED: "重试弹幕匹配",
+  ADMIN_API_KEY_REVOKED: "吊销管理 API 密钥",
+  ADMIN_API_KEY_ROTATED: "轮换管理 API 密钥",
+  COLLECTION_REFRESHED: "刷新合集",
+  EMBY_MIGRATION_CREATED: "创建 Emby 迁移任务",
+  EMBY_REFRESH_STARTED: "开始 Emby 数据刷新",
+  IMAGE_DELETED: "删除图片",
+  IMAGE_SELECTED: "选择图片",
+  LIBRARY_ACCESS_MODE_UPDATED: "更新媒体库访问模式",
+  LIBRARY_DELETION_REQUESTED: "请求删除媒体库",
+  LIBRARY_DELETION_RETRIED: "重试删除媒体库",
+  LOCAL_METADATA_REFRESH_STARTED: "开始本地元数据刷新",
+  MEDIA_DELETED: "删除媒体",
+  MEDIA_ITEMS_MERGED: "合并媒体条目",
+  MEDIA_ITEM_UNMERGED: "拆分媒体条目",
+  METADATA_BATCH_CONFIRMED: "批量确认元数据",
+  METADATA_REIDENTIFY_CANCELLED: "取消元数据匹配",
+  PEOPLE_INDEX_REBUILD_CANCEL_REQUESTED: "取消人物索引重建",
+  PEOPLE_INDEX_REBUILD_QUEUED: "排队重建人物索引",
+  PERSON_FIELD_LOCKS_UPDATED: "更新人物字段锁定",
+  PERSON_IDENTITY_SPLIT: "拆分人物身份",
+  PERSON_MATCH_CONFIRMED: "确认人物匹配",
+  PERSON_MATCH_REJECTED: "拒绝人物匹配",
+  PERSON_MATCH_UNDONE: "撤销人物匹配",
+  PERSON_METADATA_EDITED: "编辑人物资料",
+  PLUGIN_ENABLED: "启用插件",
+  PLUGIN_STORE_UPDATED: "更新插件商店",
+  PLUGIN_UNINSTALLED: "卸载插件",
+  PLUGIN_UPDATED: "更新插件",
+  SCAN_PATH_STARTED: "开始扫描指定路径",
+  SUBTITLE_UPDATED: "更新字幕",
+  TRANSCODING_SESSION_STOPPED: "停止转码会话",
+  USER_ACCOUNT_PREFERENCES_COPIED: "复制用户账户偏好",
+  USER_CONTENT_RESTRICTIONS_UPDATED: "更新用户内容限制",
+  USER_DELETED: "删除用户",
+  USER_EMBY_LOGIN_SESSIONS_REVOKED: "注销用户全部 Emby 登录会话",
+  USER_EMBY_LOGIN_SESSION_REVOKED: "注销用户 Emby 登录会话",
+  USER_INVITATION_CREATED: "创建用户邀请",
+  USER_INVITATION_RESEND_QUEUED: "重发用户邀请",
+  USER_INVITATION_REVOKED: "撤销用户邀请",
+  USER_PERMISSION_GROUPS_COPIED: "复制用户权限组",
+  USER_PERMISSION_PRESET_APPLIED: "应用权限预设",
+  USER_PERMISSION_PRESET_CREATED: "创建权限预设",
+  USER_PERMISSION_PRESET_DELETED: "删除权限预设",
+  USER_PERMISSION_PRESET_UPDATED: "更新权限预设",
+  USER_PLAYBACK_POLICY_UPDATED: "更新用户播放策略",
+  USER_PLAYBACK_STOPPED: "停止用户播放",
+  USER_PURGED: "彻底清除用户",
+  USER_REGISTRATION_APPROVED: "通过注册申请",
+  USER_REGISTRATION_REJECTED: "拒绝注册申请",
+  USER_RESTORED: "恢复用户",
+  USER_SESSION_REVOKED: "注销用户会话",
 };
 
 const ERROR_LABELS: Record<string, string> = {
@@ -424,6 +475,7 @@ export function AdminOperationsPage() {
       {tab === "logs" ? (
         logsLoading ? <AdminOperationsState label="正在读取系统日志…" /> : <LogsSection
           logs={logItems}
+          libraryNames={libraryNames}
           level={logLevel}
           search={logSearch}
           onLevelChange={setLogLevel}
@@ -893,6 +945,7 @@ function RunsSection({
 
 function LogsSection({
   logs,
+  libraryNames,
   level,
   search,
   onLevelChange,
@@ -907,6 +960,7 @@ function LogsSection({
   exportSuccess,
 }: {
   logs: AdminAuditEvent[];
+  libraryNames: ReadonlyMap<string, string>;
   level: string;
   search: string;
   onLevelChange: (level: string) => void;
@@ -933,15 +987,60 @@ function LogsSection({
       {exportSuccess ? <p className="lux-log-export-success" role="status">日志已导出。</p> : null}
     </div>
     <div className="lux-operations-log-toolbar"><LuxTextField aria-label="搜索系统日志" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索事件、操作者或对象" /><LuxSelect value={level} options={[{ value: "", label: "全部级别" }, { value: "INFO", label: "信息" }, { value: "WARN", label: "警告" }, { value: "ERROR", label: "错误" }]} onChange={onLevelChange} aria-label="日志级别" /></div>
-    <div className="lux-admin-log-list">{logs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无日志</strong><p>系统产生管理员事件后，会在这里保留脱敏记录。</p></div></div> : logs.map((log) => <LogRow key={log.id} log={log} />)}</div>
+    <div className="lux-admin-log-list">{logs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无日志</strong><p>系统产生管理员事件后，会在这里保留脱敏记录。</p></div></div> : logs.map((log) => <LogRow key={log.id} log={log} libraryNames={libraryNames} />)}</div>
   </section>;
 }
 
-function LogRow({ log }: { log: AdminAuditEvent }) {
+function LogRow({ log, libraryNames }: { log: AdminAuditEvent; libraryNames: ReadonlyMap<string, string> }) {
   const [open, setOpen] = useState(false);
   const level = auditLevel(log);
-  const metadata = log.metadata && Object.keys(log.metadata).length > 0 ? JSON.stringify(log.metadata, null, 2) : "";
-  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{log.targetId ? ` · ${log.targetId}` : ""}</p>{open && metadata ? <pre>{metadata}</pre> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadata ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
+  const metadataRows = formatAuditMetadata(log.metadata ?? {}, libraryNames);
+  const targetName = log.targetType === "library" && log.targetId ? libraryNames.get(log.targetId) ?? log.targetId : log.targetId;
+  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{targetName ? ` · ${targetName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
+}
+
+const AUDIT_METADATA_LABELS: Record<string, string> = {
+  libraryId: "媒体库",
+  pluginId: "插件",
+  jobId: "任务",
+  newJobId: "新任务",
+  jobCount: "任务数",
+  itemId: "条目",
+  itemCount: "条目数",
+  fileCount: "文件数",
+  sourceCount: "来源数",
+  setId: "合集",
+  mode: "模式",
+  scope: "范围",
+  kind: "类型",
+  transcodingEnabled: "转码已启用",
+  transcodingPreset: "转码预设",
+  processed: "已处理",
+  discovered: "已发现",
+  generated: "已生成",
+  reused: "已复用",
+  considered: "已考虑",
+  failed: "失败",
+  skipped: "跳过",
+  elapsedMs: "耗时（毫秒）",
+};
+
+type AuditMetadataRow = { key: string; label: string; value: string };
+
+function formatAuditMetadata(metadata: Record<string, unknown>, libraryNames: ReadonlyMap<string, string>): AuditMetadataRow[] {
+  return Object.entries(metadata).map(([key, value]) => ({
+    key,
+    label: AUDIT_METADATA_LABELS[key] ?? key,
+    value: formatAuditMetadataValue(key, value, libraryNames),
+  }));
+}
+
+function formatAuditMetadataValue(key: string, value: unknown, libraryNames: ReadonlyMap<string, string>): string {
+  if (key === "libraryId" && typeof value === "string") return libraryNames.get(value) ?? value;
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (Array.isArray(value)) return value.map(String).join("、");
+  if (value !== null && typeof value === "object") return JSON.stringify(value);
+  return String(value ?? "");
 }
 
 function OperationsStat({ label, value, detail, icon, tone = "default" }: { label: string; value: number; detail: string; icon: ReactNode; tone?: "default" | "warn" }) {
@@ -1190,7 +1289,7 @@ function formatJobDuration(job: OperationsJob) {
 }
 
 function formatAuditEvent(eventType: string) {
-  return AUDIT_EVENT_LABELS[eventType] || "系统操作记录";
+  return AUDIT_EVENT_LABELS[eventType] || eventType;
 }
 
 function formatTargetType(targetType: string) {
@@ -1203,13 +1302,39 @@ function formatTargetType(targetType: string) {
     user: "用户",
     plugin: "插件",
     scheduled_task: "注册任务",
+    item: "媒体条目",
+    items: "媒体条目",
+    media_items: "媒体条目",
+    metadata_items: "媒体条目",
+    item_image: "图片",
+    media_stream: "媒体流",
+    user_permission_preset: "权限预设",
+    user_invitation: "用户邀请",
+    user_registration_request: "注册申请",
+    user_library_access: "用户媒体库权限",
+    registration_settings: "注册设置",
+    person: "人物",
+    person_match_candidate: "人物匹配候选",
+    danmaku_match_job: "弹幕任务",
+    chapter_detection_job: "片头片尾任务",
+    strm_probe_job: "STRM任务",
+    admin_api_key: "管理 API 密钥",
+    web_session: "网页会话",
+    transcoding_session: "转码会话",
+    playback_session: "播放会话",
+    scheduled_task_plan: "执行计划",
+    plugin_store: "插件商店",
+    library_root: "媒体库路径",
+    library_deletion_job: "媒体库删除任务",
+    emby_migration_job: "Emby 迁移任务",
+    emby_login_session: "Emby 登录会话",
   };
-  return labels[targetType] || "系统对象";
+  return labels[targetType] || targetType;
 }
 
 function auditLevel(log: AdminAuditEvent) {
   if (/FAILED|ERROR|DENIED/.test(log.eventType)) return "ERROR";
-  if (/CANCELLED|DISABLED/.test(log.eventType)) return "WARN";
+  if (/CANCEL|DISABLED|REJECTED|REVOKED|STOPPED|DELETED|PURGED|UNINSTALLED|UNDONE/.test(log.eventType)) return "WARN";
   return "INFO";
 }
 

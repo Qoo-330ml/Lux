@@ -976,6 +976,43 @@ describe("AdminOperationsPage", () => {
     await act(async () => await vi.waitFor(() => expect(retryDanmaku).toHaveBeenCalledWith("danmaku-job-1")));
   });
 
+  it("shows library names and readable metadata for system log events", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [{
+      id: "event-1",
+      actorUsername: "admin",
+      eventType: "LIBRARY_UPDATED",
+      targetType: "library",
+      targetId: "library-1",
+      metadata: { libraryId: "library-1", itemCount: 12, mode: "FULL", newJobId: "job-9", transcodingEnabled: true, scope: ["movies", "shows"] },
+      createdAt: "2026-10-30T01:00:00.000Z",
+    }] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(3)')?.click());
+    expect(container.querySelector(".lux-operations-log-copy p")?.textContent).toContain("媒体库 · 电影库");
+    expect(container.querySelector(".lux-operations-log-copy p")?.textContent).not.toContain("library-1");
+
+    act(() => container.querySelector<HTMLButtonElement>('button[aria-label="展开日志详情"]')?.click());
+    const details = container.querySelector<HTMLElement>(".lux-operations-log-details");
+    expect(details).not.toBeNull();
+    expect(details?.querySelector("pre")).toBeNull();
+    const rows = [...(details?.querySelectorAll("li") ?? [])].map((item) => item.textContent);
+    expect(rows).toEqual([
+      "媒体库电影库",
+      "条目数12",
+      "模式FULL",
+      "新任务job-9",
+      "转码已启用是",
+      "范围movies、shows",
+    ]);
+  });
+
   it("exports a selected UTC log date range from the system log tab", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });

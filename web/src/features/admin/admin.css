@@ -2569,3 +2569,14 @@ html[data-lux-theme="light"] .lux-operations-log-row:hover { background: rgba(28
   .lux-admin-job-row { grid-template-columns: 34px minmax(0, 1fr); }
   .lux-admin-job-actions { grid-column: 2; align-self: start; }
 }
+
+/* System log details: label/value rows instead of raw JSON. */
+.lux-operations-log-details { display: grid; gap: 4px; margin: 8px 0 0; padding: 8px 10px; border: 1px solid var(--lux-line-soft); border-radius: 7px; background: rgba(0,0,0,.14); list-style: none; }
+
+.lux-operations-log-details li { display: grid; grid-template-columns: minmax(96px, max-content) minmax(0, 1fr); gap: 10px; font-size: .68rem; line-height: 1.5; }
+
+.lux-operations-log-details li span { color: var(--lux-subtle); }
+
+.lux-operations-log-details li strong { min-width: 0; color: var(--lux-text); font-weight: 500; overflow-wrap: anywhere; }
+
+html[data-lux-theme="light"] .lux-operations-log-details { background: rgba(28,28,34,.04); }
