@@ -10,7 +10,6 @@ mod metadata_paths;
 mod metadata_selection;
 mod nfo_writer;
 mod people_api;
-mod scanned_metadata;
 mod scanned_series_metadata;
 mod scraper;
 mod series_metadata;
