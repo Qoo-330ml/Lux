@@ -85,15 +85,15 @@ impl EmbyActivityCache {
 /// Upper bound for one access-rule snapshot; the per-user rule list is tiny in practice.
 const ACCESS_RULE_SNAPSHOT_LIMIT: i64 = 400;
 
-/// A resolved Emby credential plus the rules a request still has to evaluate itself.
+/// A resolved Emby credential: the token's user and the device identity it was issued to.
 ///
-/// The rules are cached as data, never as a decision: the address rules are re-evaluated on every
-/// request with the address the access-IP resolver produced, so the cache cannot turn a decision
-/// made for one peer into a decision for another.
+/// The access rules are deliberately *not* cached: they are re-read on every request (one query)
+/// and evaluated against the address the access-IP resolver produced. The rule tables are the only
+/// ACL input that can change without any product code path, so keeping them out of the cache means
+/// a rule change can never be served stale.
 struct CachedEmbyPrincipal {
     user: UserRecord,
     device: EmbyDeviceInfo,
-    rules: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -416,7 +416,8 @@ impl EmbyAuthService {
             // string would still open a write transaction on every request.
             return Ok(None);
         };
-        if self.principal_is_blocked(&principal, client_ip)? {
+        let rules = self.rule_snapshot(principal.user.id).await?;
+        if Self::principal_is_blocked(&principal, &rules, client_ip)? {
             self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
@@ -428,7 +429,8 @@ impl EmbyAuthService {
         Ok(Some(principal.user.clone()))
     }
 
-    /// Reads the credential, its user, its device identity and the access rules once per TTL.
+    /// Reads and caches the credential, its user and its device identity; the rules are read
+    /// separately on every request.
     async fn token_principal(
         &self,
         token_hash: &[u8],
@@ -452,9 +454,8 @@ impl EmbyAuthService {
         if stored.user.is_disabled {
             return Ok(None);
         }
-        let user_id = stored.user.id.clone();
-        let rules = self.rule_snapshot(&user_id).await?;
         let user = user_record(stored.user)?;
+        let user_id = user.id.to_string();
         let device = EmbyDeviceInfo {
             client: stored.device.client_name,
             device: stored.device.device_name,
@@ -462,11 +463,7 @@ impl EmbyAuthService {
             version: stored.device.client_version,
             user_id: None,
         };
-        let principal = Arc::new(CachedEmbyPrincipal {
-            user,
-            device,
-            rules,
-        });
+        let principal = Arc::new(CachedEmbyPrincipal { user, device });
         // Store only when no invalidation raced the read, so the snapshot proves the value is
         // still the state the database returned.
         if epochs.fence_is_current(fence) {
@@ -478,7 +475,6 @@ impl EmbyAuthService {
                 CachedEmbyPrincipal {
                     user: principal.user.clone(),
                     device: principal.device.clone(),
-                    rules: principal.rules.clone(),
                 },
                 Instant::now(),
             );
@@ -486,21 +482,20 @@ impl EmbyAuthService {
         Ok(Some(principal))
     }
 
-    async fn rule_snapshot(&self, user_id: &str) -> Result<Vec<(String, String)>, EmbyAuthError> {
+    async fn rule_snapshot(&self, user_id: UserId) -> Result<Vec<(String, String)>, EmbyAuthError> {
         Ok(self
             .database
-            .user_access_blacklist_rules_for_user(user_id, ACCESS_RULE_SNAPSHOT_LIMIT)
+            .user_access_blacklist_rules_for_user(&user_id.to_string(), ACCESS_RULE_SNAPSHOT_LIMIT)
             .await?)
     }
 
-    /// Applies the cached rules to this request's address, device and client.
+    /// Applies the rules that apply to this credential against this request's address and device.
     fn principal_is_blocked(
-        &self,
         principal: &CachedEmbyPrincipal,
+        rules: &[(String, String)],
         client_ip: Option<IpAddr>,
     ) -> Result<bool, EmbyAuthError> {
-        let ip_rules = principal
-            .rules
+        let ip_rules = rules
             .iter()
             .filter(|(rule_type, _)| rule_type == "IP_CIDR")
             .map(|(_, value)| value.clone())
@@ -529,8 +524,7 @@ impl EmbyAuthService {
             &principal.device.client,
         )
         .ok();
-        Ok(principal
-            .rules
+        Ok(rules
             .iter()
             .any(|(rule_type, value)| match rule_type.as_str() {
                 "DEVICE" => device_id.as_deref() == Some(value.as_str()),
@@ -892,8 +886,8 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         assert_eq!(
             database.query_count(),
-            0,
-            "a repeat resolution inside the TTL must be served from the principal cache"
+            1,
+            "the credential is cached; the access rules are still read once per request"
         );
 
         service.logout(&token).await?;
@@ -907,13 +901,13 @@ mod route_token_tests {
     }
 
     #[tokio::test]
-    async fn token_resolution_cache_is_invalidated_by_device_and_client_rules()
+    async fn device_and_client_rules_apply_to_the_very_next_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, service, token, user_id) = fixture().await?;
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         add_rule(&database, Some(&user_id), "DEVICE", "device-cache").await;
         database.reset_query_count();
@@ -947,7 +941,7 @@ mod route_token_tests {
                 .await?
                 .is_some()
         );
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         assert_eq!(
             database
@@ -966,13 +960,13 @@ mod route_token_tests {
     }
 
     #[tokio::test]
-    async fn token_resolution_cache_is_invalidated_by_global_rules()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn global_rules_apply_to_the_very_next_request() -> Result<(), Box<dyn std::error::Error>>
+    {
         let (database, service, token, _user_id) = fixture().await?;
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         add_rule(&database, None, "CLIENT", "emby client").await;
         assert!(
@@ -989,7 +983,7 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         database
             .update_user(
@@ -1022,7 +1016,7 @@ mod route_token_tests {
         assert!(service.resolve_token(&token).await?.is_some());
         database.reset_query_count();
         assert!(service.resolve_token(&token).await?.is_some());
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         assert!(database.delete_user(&user_id).await?);
         assert!(service.resolve_token(&token).await?.is_none());
@@ -1047,7 +1041,7 @@ mod route_token_tests {
                 .await?
                 .is_some()
         );
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         assert!(
             service

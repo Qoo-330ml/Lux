@@ -58,13 +58,14 @@ pub(crate) enum PrincipalResolution {
     Session(AuthenticatedSession),
 }
 
-/// A resolved web session plus the rules a request still has to evaluate itself.
+/// A resolved web session, cached so a page load does not re-read the credential per connection.
 ///
-/// The rules are cached as data, never as a decision: the address rules are re-evaluated on every
-/// request with the address the access-IP resolver produced.
+/// The access rules are deliberately *not* part of this value: they are re-read on every request
+/// (one query) and evaluated against the address the access-IP resolver produced. The rule tables
+/// are the only ACL input that can change without any product code path, so keeping them out of
+/// the cache means no rule change can ever be served stale.
 struct CachedWebPrincipal {
     session: AuthenticatedSession,
-    rules: Vec<(String, String)>,
 }
 
 #[derive(Clone)]
@@ -269,8 +270,8 @@ impl WebAuthService {
         let Some(principal) = self.web_principal(&token_hash).await? else {
             return Ok(PrincipalResolution::Unauthenticated);
         };
-        let ip_rules = principal
-            .rules
+        let rules = self.rule_snapshot(principal.session.user.id).await?;
+        let ip_rules = rules
             .iter()
             .filter(|(rule_type, _)| rule_type == "IP_CIDR")
             .map(|(_, value)| value.clone())
@@ -291,8 +292,7 @@ impl WebAuthService {
             }
         }
         let device_id = principal.session.device_id.as_deref();
-        let denied = principal
-            .rules
+        let denied = rules
             .iter()
             .any(|(rule_type, value)| match rule_type.as_str() {
                 "DEVICE" => device_id == Some(value.as_str()),
@@ -305,7 +305,7 @@ impl WebAuthService {
         Ok(PrincipalResolution::Session(principal.session.clone()))
     }
 
-    /// Reads the session row and the access rules once per cache entry.
+    /// Reads and caches the session row; the rules are read separately on every request.
     async fn web_principal(
         &self,
         token_hash: &[u8],
@@ -323,13 +323,9 @@ impl WebAuthService {
         if stored.is_disabled {
             return Ok(None);
         }
-        let user_id = stored.user_id.clone();
-        let rules = self
-            .database
-            .user_access_blacklist_rules_for_user(&user_id, ACCESS_RULE_SNAPSHOT_LIMIT)
-            .await?;
         let session = authenticated_session_from_stored(stored)?;
-        let principal = Arc::new(CachedWebPrincipal { session, rules });
+        let user_id = session.user.id.to_string();
+        let principal = Arc::new(CachedWebPrincipal { session });
         // Store only when no invalidation raced the read.
         if epochs.fence_is_current(fence) {
             let snapshot = epochs.snapshot(&user_id);
@@ -339,12 +335,19 @@ impl WebAuthService {
                 snapshot,
                 CachedWebPrincipal {
                     session: principal.session.clone(),
-                    rules: principal.rules.clone(),
                 },
                 Instant::now(),
             );
         }
         Ok(Some(principal))
+    }
+
+    /// Reads the enabled access rules that apply to a user (including global rules).
+    async fn rule_snapshot(&self, user_id: UserId) -> Result<Vec<(String, String)>, WebAuthError> {
+        Ok(self
+            .database
+            .user_access_blacklist_rules_for_user(&user_id.to_string(), ACCESS_RULE_SNAPSHOT_LIMIT)
+            .await?)
     }
 
     async fn is_user_ip_blacklisted(
@@ -684,8 +687,8 @@ mod principal_tests {
         ));
         assert_eq!(
             database.query_count(),
-            0,
-            "a repeat request inside the TTL must be served from the principal cache"
+            1,
+            "the session is cached; the access rules are still read once per request"
         );
 
         service.logout(&token).await?;
@@ -694,15 +697,16 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::Unauthenticated
         ));
-        assert!(
-            database.query_count() > 0,
+        assert_eq!(
+            database.query_count(),
+            1,
             "a revoked session must be re-read instead of being answered from the cache"
         );
         Ok(())
     }
 
     #[tokio::test]
-    async fn principal_cache_is_invalidated_by_device_and_global_rule_changes()
+    async fn device_and_global_rule_changes_apply_to_the_very_next_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, service, token, user_id) = fixture().await?;
         let ip = Some("127.0.0.1".parse()?);
@@ -715,7 +719,7 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::Session(_)
         ));
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         add_rule(&database, &user_id, "DEVICE", "device-1").await;
         database.reset_query_count();
@@ -731,7 +735,7 @@ mod principal_tests {
     }
 
     #[tokio::test]
-    async fn principal_cache_is_invalidated_by_global_rule_changes()
+    async fn global_rule_changes_apply_to_the_very_next_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, service, token, _user_id) = fixture().await?;
         let ip = Some("127.0.0.1".parse()?);
@@ -744,7 +748,7 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::Session(_)
         ));
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         add_global_rule(&database, "CLIENT", "lux web").await;
         database.reset_query_count();
@@ -774,7 +778,7 @@ mod principal_tests {
     }
 
     #[tokio::test]
-    async fn principal_cache_is_invalidated_by_ip_rule_changes()
+    async fn ip_rule_changes_apply_to_the_very_next_request()
     -> Result<(), Box<dyn std::error::Error>> {
         let (database, service, token, user_id) = fixture().await?;
         let ip = Some("127.0.0.1".parse()?);
@@ -787,7 +791,7 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::Session(_)
         ));
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         add_rule(&database, &user_id, "IP_CIDR", "127.0.0.0/8").await;
         assert!(
@@ -816,7 +820,7 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::Session(_)
         ));
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         database
             .update_user(
@@ -859,7 +863,7 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::Session(_)
         ));
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         assert!(
             service
@@ -898,7 +902,7 @@ mod principal_tests {
             service.resolve_principal(&token, ip).await?,
             PrincipalResolution::Session(_)
         ));
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         assert!(database.delete_user(&user_id).await?);
         database.reset_query_count();
@@ -925,7 +929,7 @@ mod principal_tests {
             service.resolve_principal(&token, allowed).await?,
             PrincipalResolution::Session(_)
         ));
-        assert_eq!(database.query_count(), 0);
+        assert_eq!(database.query_count(), 1);
 
         assert!(
             matches!(
