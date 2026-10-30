@@ -9,11 +9,14 @@ Router 拆分。
 
 ## 0. 一句话结论
 
-- 重启请求在 201 响应**构造完成后**由后台任务延迟约 250 ms 发出；响应的送达由 `axum::serve` 的
-  graceful shutdown 保证（而非靠延迟“猜”）。
-- setup 里**继续**启动首次扫描（不改 201 响应中的 `library`/`scanJob`），改为在启动流程中恢复
-  “被关停打断的首次扫描”。理由是这份“扫描意图”已经作为 `scan_jobs` 行落库，不需要第二处真源。
-- setup 已成功的请求**永不因重启机制失败**：`restart_handle` 缺失时返回 201 + `restarting: false`。
+| 问题 | 结论 | 详见 |
+| --- | --- | --- |
+| 1 重启时机 | 响应在 handler 里同步构造并返回；`spawn` 一个 250 ms 后 `request_restart()` 的任务。响应**不会丢**是因为 `axum::serve` 的 graceful shutdown 会排空在途请求（`src/main.rs:253-284`），延迟只为避开“写首字节”竞争。延迟可通过 `with_setup_restart_delay` 注入，测试用 200 ms 断言顺序 | §2 |
+| 2 首次扫描 | 推荐 (b)：setup **照旧**启动首次扫描，新增启动恢复流程“为被关停打断的首次扫描重新排队”。谓词：`RECONCILE_LIBRARY` + `CANCELLED` + `error='SERVER_SHUTDOWN'` + `last_scan_at IS NULL` + 启用 + 有 root + 无活动任务 | §3 |
+| 3 幂等与失败 | setup 成功即不可回退：无句柄→201 + `restarting:false`；`request_restart()` 返回 `false`→视为“已排上重启”；重复/并发调用→409 且不排期；排期点在管理员创建成功之后（含部分成功的 4xx） | §4 |
+| 4 前端 | `setup()` 返回体加可选 `restarting`；`AdminSetupForm` 交棒给 `SetupPage` 的全屏“正在重启 Lux”（复用数据库流程样式）；就绪判据用“先断开再恢复”，不能只看 `initialized` | §5 |
+| 5 测试 | 进程内注入 `watch` 句柄断言“先 201 再 Restart”；`exec` 只在 bin 目标，测试天然不触发；恢复流程用例放 `tests/scanner/shutdown_jobs.rs` | §6 |
+| 6 回滚 | 三个代码提交互相独立、无 schema 变更、不碰 `ReadyServices`/`require_ready!`/路由；回滚边界在第 ③ 步之前 | §7 |
 
 ## 1. 现状基线（代码证据）
 
@@ -355,20 +358,131 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 
 ## 8. 时序与数据流
 
-（待填）
+### 8.1 请求与重启（文字时序）
+
+```
+Web                setup_complete                main::serve             重新 exec 的进程
+ |   POST /setup/complete |                            |                        |
+ |----------------------->|  1 建管理员（事务，WHERE NOT EXISTS）              |
+ |                        |  2 可选建库 + 加根 + start_library_scan            |
+ |                        |     （先写 scan_jobs 行 = PENDING，再 spawn worker）|
+ |                        |  3 记 admin_created = true                         |
+ |                        |  4 响应体加 restarting: true                        |
+ |                        |  5 spawn: sleep(250ms) → request_restart()          |
+ |<--- 201 + body --------|      （响应同步返回，不等待第 5 步）                |
+ |                        |                            | watch 变 Restart       |
+ |                        |                            | 停止接入、排空在途请求 |
+ |                        |                            | （本响应此时早已写出） |
+ |                        |                            | 停后台 worker          |
+ |                        |                            | 取消未完成任务         |
+ |                        |                            |  → 首次扫描任务变      |
+ |                        |                            |    CANCELLED/SHUTDOWN  |
+ |                        |                            | database.close()       |
+ |                        |                            | exec(自己) ----------->|
+ |  轮询 setup/status ----|---- 连接失败（端口关闭）    |                        |
+ |  （前端进入“正在重启”） |                            |                        | 启动：
+ |                        |                            |                        |  迁移 + 启动取消
+ |                        |                            |                        |  build_app_state：
+ |                        |                            |                        |   resume 首次扫描
+ |                        |                            |                        |   （谓词命中 → 新任务）
+ |<-- 200 initialized:true|                            |                        |
+ |  跳转 /login，管理员登录 |                            |                        |
+```
+
+要点：
+
+1. **数据先于重启**：管理员、库、根、扫描任务都在 201 之前落库（`src/api/users.rs:692-751`）。
+2. **重启先于响应送达是安全的**：`with_graceful_shutdown`（`src/main.rs:257`）会排空在途请求，响应
+   不会因为 watch 提前变化而丢失；250 ms 只是避免“watch 变更”与“写首字节”竞争。
+3. **取消是最后一步动作**：`cancel_incomplete_jobs_for_shutdown` 在 `serve` 返回之后才执行
+   （`src/main.rs:271`），所以它取消的一定是“已经返回过 201 的那次扫描”。
+4. **恢复在新进程的 `build_app_state` 里**：与 `resume_interrupted_metadata_scraping`
+   （`src/main.rs:202`）同一位置、同一后台语义。
+
+### 8.2 恢复流程的数据流
+
+```
+scan_jobs(CANCELLED, error='SERVER_SHUTDOWN', job_type='RECONCILE_LIBRARY')
+   ⋈ libraries(last_scan_at IS NULL, is_enabled=1)
+   ⋈ EXISTS library_roots
+   ⋈ NOT EXISTS scan_jobs(status IN ('PENDING','RUNNING'))     ← 去重 / 避免并发
+        ↓  每库取一条（GROUP BY library_id，单次启动最多 32 个）
+start_library_scan(scan_jobs, library_id, workers)             ← 复用 setup 用的同一个入口
+        ↓
+新 scan_jobs 行(PENDING) + 新 scan_manifest + spawn worker
+        ↓  扫描成功
+libraries.last_scan_at = unixepoch()                           ← 下次重启不再命中谓词
+```
 
 ## 9. 涉及文件清单
 
-（待填）
+### 9.1 阶段 2（实现）——后端
+
+| 文件 | 改动 |
+| --- | --- |
+| `src/api/users.rs` | `setup_complete`：`admin_created` 标记、`restarting` 字段、handler 末尾统一排期；新增 `setup_restart_response` 帮助函数 |
+| `src/api/legacy.rs` | `CoreState` 增 `setup_restart_delay: Duration`（默认 250 ms，`src/api/legacy.rs:175/180`），新增 `#[doc(hidden)] with_setup_restart_delay`；新增 `AppState::resume_shutdown_interrupted_first_scans()`（放在 `resume_interrupted_metadata_scraping` 旁，`:953`） |
+| `src/main.rs` | `build_app_state` 里 `src/main.rs:202` 之后加一行调用 |
+| `src/application/admin_scan_jobs.rs` | 新增 `resume_shutdown_interrupted_first_scans(scan_jobs, workers, limit)`，内部复用 `start_library_scan`（`:143`） |
+| `src/storage/jobs/scan/lifecycle.rs` | 新增 `list_shutdown_interrupted_first_scan_library_ids(after, limit)`（与 `find_active_scan_job_for_library`（`:235`）同模块） |
+| `tests/api_web/web_auth.rs` | §6.2 的 4 个 HTTP 用例 |
+| `tests/scanner/shutdown_jobs.rs` | §6.2 的恢复流程用例与反向用例 |
+| `docs/LUX-DEVELOPMENT.md` | 追加本任务的 `LUX-*` 条目与验收结果（阶段 2 末尾） |
+| `docs/API.md` | `POST /api/v1/setup/complete` 的响应说明补 `restarting`（`:20`） |
+
+### 9.2 阶段 2（实现）——前端
+
+| 文件 | 改动 |
+| --- | --- |
+| `web/src/lib/api/client.ts` | `setup()` 返回类型加可选 `restarting`（`:426-436`） |
+| `web/src/lib/api/types.ts` | 可选：`SetupCompleteResult` 类型 |
+| `web/src/features/auth/AdminSetupForm.tsx` | `onSuccess` 分支（`:24-27`）：`restarting` 时交给父组件的重启引导 |
+| `web/src/features/auth/SetupPage.tsx` | 重启阶段状态机 + 轮询就绪（复用 `:32-33` 的全屏样式） |
+| `web/tests/setup-page.test.tsx` | §6.3 的 3 个用例 |
 
 ## 10. 风险表
 
-（待填）
+| # | 风险 | 影响 | 缓解 | 等级 |
+| --- | --- | --- | --- | --- |
+| R1 | 201 在重启时丢失（客户端看不到成功结果） | 用户以为初始化失败，重复提交得到 409 | graceful shutdown 排空在途请求（`src/main.rs:257`）+ 250 ms 延迟 + §6.2 的顺序断言 | 低 |
+| R2 | 首次扫描被取消后没有恢复 | 首个库长期为空，且没有任何提示 | §3.3 的启动恢复；`scanJob` 仍出现在 201 里便于排查 | 低 |
+| R3 | setup 时扫描**没能启动**（无任务行 ⇒ 无恢复证据） | 同上，但只能手动扫描 | 201 里 `scanJob` 为 `null`；`warn!` 日志（`src/api/users.rs:732`）；`docs/LUX-DEVELOPMENT.md` 的部署说明提示“若首库为空请手动扫描”。若要彻底覆盖需改用 (a1) 标记 | 中 |
+| R4 | 恢复谓词过宽导致批量重扫 | 升级后启动即全量扫描，IO 抖动 | 谓词要求“存在被关停打断的 `RECONCILE_LIBRARY` 任务”+`last_scan_at IS NULL`，历史库没有该证据（§3.1 证据 4）；单次启动上限 32 | 低 |
+| R5 | 前端把“还没重启”误判为“已就绪” | 登录请求撞上关停窗口，报一次网络错误 | §5.3 的 “先断开再恢复” 状态机 + 10 s 兜底 | 低 |
+| R6 | 重启窗口内 Emby/其它客户端断连数秒 | 播放/刮削请求失败重试 | 所有者已接受；与数据库切换重启同构（`src/api/users.rs:546`）；恢复后连接自然重连 | 已接受 |
+| R7 | `exec` 失败导致进程退出 | 服务不可用直到守护进程拉起 | 既有行为（`src/main.rs:346-359`）；文档记录对容器 `restart: unless-stopped` 的依赖 | 低 |
+| R8 | 部分成功（管理员已建、库建失败）后仍重启，用户只看到错误 | 用户困惑“为什么报错还重启” | 错误提示保持原样；重启后页面进入登录，管理员可自助建库。§4.2 已说明这是刻意的 | 低 |
+| R9 | 阶段 3 之后单独回退本步 | setup 模式无法退出 | §7.2 的回滚边界：第 ③ 步必须在本步稳定后再动 | 中 |
 
 ## 11. 被否决的方案与理由
 
-（待填）
+| 否决项 | 理由 |
+| --- | --- |
+| **(a1)** setup 不再启动扫描，改用 `lux_meta` 标记驱动重启后扫描 | 需要新 storage 公共 API（`lux_meta` 目前只在 `src/storage/database_cleanup.rs:384-401` 内部使用），引入“扫描意图”的第二处真源；201 的 `scanJob` 变 `null` 需要同步改 `docs/API.md` 与前端类型。仅作为 R3 的备选 |
+| **(a2)** 只用 `last_scan_at IS NULL` 作启动谓词 | `last_scan_at` 只有 manifest 时代的 3 个写入点、无历史回填（§1），升级后首次启动会给所有历史库排队全量扫描 |
+| **(c)** 关停时豁免 setup 创建的扫描任务 | 破坏 `src/storage/jobs/shutdown.rs:9-12` 的不变量，需要迁移；续跑还要处理半成品 manifest（`:18-38`） |
+| **(d)** 前端就绪后调 `POST /admin/libraries/{id}/scan` | 不构成保证（关页面、代理抖动、管理员未登录都会漏），不能作为唯一机制 |
+| **(e)/(f)** 在请求里等扫描完成 / 把重启延迟拉长到扫描完成 | 违反 `AGENTS.md`“不要在用户请求里扫描整个库”，201 会悬挂数分钟 |
+| 固定 5–10 s 延迟来“保证”响应已送达 | 延迟换不来保证，只是把失败概率换了个位置；真正的保证来自 graceful shutdown 排空，延迟保持 250 ms |
+| 响应 body 完成信号（`http_body` 包装器）作为**必须项** | 复杂度（约 40 行转发样板）与收益不成比例；保留为可选加固（§2） |
+| `restart_handle` 为 `None` 时返回 503/500 | setup 已成功，不能因为“没有重启能力”报错；且会让所有现有集成测试失败 |
+| 只在 201 分支排期重启 | 部分成功会停在 setup 模式（第 ③ 步之后等于死锁），见 §4.2 |
+| 前端用 `setup/status.initialized` 一次成功判就绪 | `initialized` 在 201 之后立刻为 `true`（`src/api/users.rs:229-241` 只查 `has_users()`），会提前放行 |
 
 ## 12. 阶段 2 实施顺序（TDD，小步提交）
 
-（待填）
+1. **C1 重启排期**（后端）：先写 `setup_complete_requests_a_restart_after_the_response` 与
+   “无句柄仍返回 201”两个用例（预期失败）→ 加 `CoreState.setup_restart_delay` + 注入辅助 + 排期逻辑
+   + `restarting` 字段 → `cargo test --locked --test api_web web_auth::`。
+2. **C1b 幂等用例**：重复 `setup/complete`（409，不排期）与“库建失败仍重启”两个用例 → 同上命令。
+3. **C2 首次扫描恢复**：先在 `tests/scanner/shutdown_jobs.rs` 写恢复与 5 个反向用例（失败）→ 加 storage
+   查询、application 函数、`AppState` 方法、`main.rs` 接线 → `cargo test --locked --test scanner shutdown_jobs::`。
+4. **C3 前端**：先在 `web/tests/setup-page.test.tsx` 写 3 个用例（失败）→ 改 `client.ts`/`types.ts`/
+   `AdminSetupForm.tsx`/`SetupPage.tsx` → `pnpm --dir web exec vitest run tests/setup-page.test.tsx`
+   → `pnpm --dir web test` → `pnpm --dir web build`。
+5. **C4 文档**：`docs/API.md` 补 `restarting`；`docs/LUX-DEVELOPMENT.md` 追加任务条目与验收结果；
+   本文件状态改为“已实施”。
+6. **门禁**：`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、
+   `cargo clippy --locked --all-targets --all-features -- -D warnings`、
+   `python3 scripts/check-migration-parity.py`、`python3 scripts/check-backend-branches.py`；
+   手动在 Docker 与裸进程各验证一次真实重启（记录 `uname -m`）。
