@@ -13,15 +13,15 @@ setup 模式的路由集、`main` 的模式判定、后台 worker 的 `Arc` 语�
 
 | 问题 | 结论 | 详见 |
 | --- | --- | --- |
-| 1 泛型扩散 | **两棵独立路由树**，handler 与路由构造函数一律不加类型参数。只有两个受控泛型边界：`core_routes<S: FromRef<CoreState>>()` 与 `setup_routes<S: FromRef<SetupState>>()`（各 ≤8 条路由，因为同一组 setup handler 要在两棵树里各挂一次），加一个迁移期专用、约 15 行的 `StateView` trait（只服务 10 个跨文件鉴权 helper，最后一批删除）。20 层中间件全部"无状态或只读 `CoreState`"，抽成 `apply_common_layers(Router)` 两棵树各调用一次，**不重复写**。 | §2 |
+| 1 泛型扩散 | **两棵独立路由树**，handler 与路由构造函数一律不加类型参数。只有两个受控泛型边界：`core_routes<S: FromRef<CoreState>>()` 与 `setup_routes<S: FromRef<SetupState>>()`（各 ≤8 条路由，因为同一组 setup handler 要在两棵树里各挂一次），加一个迁移期专用、约 15 行的 `StateView` trait（只服务 25 个跨文件 helper，最后一批删除）。20 层中间件全部"无状态或只读 `CoreState`"，抽成 `apply_common_layers(Router)` 两棵树各调用一次，**不重复写**。 | §2 |
 | 2 handler 迁移 | 7 批，先小后大；过渡期用 **`impl FromRef<ReadyAppState> for AppState`** 让未迁移 handler 继续工作，因此每批只改自己文件里的 handler + 本地 helper，`cargo build`/集成测试在每批都绿，可独立回滚。首批一次性把 24 个 `api_routes()` 的返回类型从 `Router<AppState>` 改成 `Router<ReadyAppState>`（纯类型改动，无行为变化），此后每批都是文件内改动。 | §3 |
-| 3 setup 模式路由 | 只挂 4 组：core 探针（`/health/live`、`/health/ready`、`/api/v1/version`）、setup 路由组（`/api/v1/setup/*` 6 条）、登录前最小端点（`/api/v1/auth/me`，固定 401）、静态资源 + SPA。Emby 只保留 2 条公共发现路由（`/System/Ping`、`/System/Info/Public`），其余 Emby 与全部 Lux 业务路由**不注册**：Lux 命名空间由现有中间件改写成 JSON 404，Emby 命名空间是裸 404，`/items/*` 这类不在命名空间表里的路径回落 SPA。与现状的差异逐条列出。 | §4 |
+| 3 setup 模式路由 | 只挂 4 组：core 探针（`/health/live`、`/health/ready`、`/api/v1/version`）、setup 路由组（`/api/v1/setup/*` 6 条）、登录前最小端点（`/api/v1/auth/me`，固定 401）、静态资源 + SPA。Emby 只保留 3 条公共发现路由（`/System/Ping`、`/System/Info/Public`、`/Users/Public`），其余 Emby 与全部 Lux 业务路由**不注册**：Lux 命名空间由现有中间件改写成 JSON 404，Emby 命名空间是裸 404，`/items/*` 这类不在命名空间表里的路径回落 SPA。与现状的差异逐条列出。 | §4 |
 | 4 `main` 选模式 | 谓词是 `requires_database_selection \|\| !SetupService::status()?`（`status()` = `users.has_users()`，一条查询）。查询失败 **fail-closed 选 Ready**：setup 模式能创建首个管理员、改写数据库配置，是敏感方向；选了 Ready 而数据库真的坏，只是业务接口 503 + 进程按今天的路径退出，不会给出提权入口。`tests/**` 的 3 处 `AppState::default()`、8 处 `app()`、163 处 `AppState::ready(..)` 全部不改，靠 `AppState` 兼容门面 + `app_with_state` 分派保持语义。 | §5 |
 | 5 后台 worker | 不变。worker 由 `AppState::start_*` 用**服务克隆**（`self.people()`、`self.scan_jobs().cloned()`）启动，从不持有 `AppState`；拆分后 `ReadyAppState`/`SetupState` 都只是同一份 `Arc<ReadyServices>` 的视图（`Arc::ptr_eq`），`Arc::make_mut` 仍只在构造期使用。 | §6 |
-| 6 删守卫 | `require_service!` 301 处调用点 + 108 处 `state.<field>() else {}`：**删 388 处**（required 服务、`database`、setup 服务，ready 模式下不可达），**保留 19 处**（6 个可选服务的降级分支，响应体逐字不变）。`api_error(503, DatabaseUnavailable, "…尚未就绪")` 的 79 处结构化 503 全删，因为 `ready` 构造器总会建出这些服务，分支不可达。 | §7 |
-| 7 回滚边界 | 8 个提交，前 7 个可单独回滚（每个都编译 + 集成测试绿）。第 8 个（删兼容层）与第 1 批合并后不可单独回退：一旦某 handler 改成 `State<ReadyAppState>`，回退它必须同时回退它的 `api_routes()`，属于同一提交。 | §8 |
-| 8 风险 | 最大风险是"冻结测试 `tests/**` 钉住的 not-ready 契约"与"未就绪不注册业务路由"直接冲突；本节给出 6 条必须保留的兼容响应、被否决的方案与被否决原因。**有 3 个需要所有者确认的决策点**。 | §9 |
-| 9 测试 | 新增 2 个集成测试组用例证明"setup 树里业务路径 404 / 探针 200"与"ready 树行为不变"；后者等价于"现有全量集成测试不改即通过"，逐组列出要跑的 target。 | §10 |
+| 6 删守卫 | `require_service!` 301 处调用点 + 108 处 `state.<field>() else {}`：**删 388 处**（required 服务、`database`、setup 服务，ready 模式下不可达），**保留 19 处**（6 个可选服务的降级分支，响应体逐字不变）。带自定义中文消息的结构化 503（"人物索引服务尚未就绪"等）也全删，因为 `ready` 构造器一次建出全部 required 服务，分支不可达（§7.2）。 | §7 |
+| 7 回滚边界 | 11 个提交：C0 文档、C1 骨架、C2–C9 八个批次、C10 收尾（含 `main` 选树）、C11 可选清理。C1–C9 每个都能单独 `git revert` 并保持编译；**只有 C10 必须整体回滚**（它同时删兼容访问器、`FromRef` shim 与 `StateView`）。 | §8 |
+| 8 风险 | 最大风险是"冻结测试 `tests/**` 钉住的 not-ready 契约"与"未就绪不注册业务路由"直接冲突；本节给出 6 条必须保留的兼容响应、被否决的方案与被否决原因。**有 5 个需要所有者确认的决策点（D1–D5）**。 | §9 |
+| 9 测试 | 只新增 **1 个 `src` 单元测试**（`tower::ServiceExt::oneshot` 打 `setup_router`，断言业务路径 404、探针 200），因此 `tests/**` 一行不加；"ready 模式行为不变"等价于"现有 19 个集成测试 target 不改即通过"，逐组列出命令。 | §10 |
 
 ## 1. 现状基线（代码证据）
 
@@ -208,7 +208,7 @@ pub(super) fn setup_router(state: SetupState) -> Router {
         .merge(core_routes::<SetupState>())
         .merge(setup_routes::<SetupState>())
         .merge(setup_pre_login_routes::<SetupState>())              // /api/v1/auth/me -> 401
-        .merge(setup_emby_discovery_routes::<SetupState>())         // 2 条公共发现（§4.2）
+        .merge(setup_emby_discovery_routes::<SetupState>())         // 3 条公共发现（§4.2 #11-13）
         .fallback_service(spa_service())
         .with_state(state);
     let router = apply_common_layers(router, &core, slots);
