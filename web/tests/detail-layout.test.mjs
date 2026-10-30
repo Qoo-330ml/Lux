@@ -207,8 +207,8 @@ test("media metadata uses an unframed surface with compact spacing", () => {
   assert.match(taglineRule, /font-size:\s*1rem/);
   assert.match(component, /lux-media-nfo-tagline[^\"]*font-serif/);
   assert.doesNotMatch(component, /lux-media-nfo-tagline[^\"]*text-xs/);
-  assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.4\)/);
-  assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.28\)/);
+  assert.match(lightOverlayRule, /rgba\(244,\s*243,\s*241,\s*\.55\)/);
+  assert.match(lightOverlayRule, /#f4f3f1\s+0%/);
 });
 
 test("media file address and summary share one surface with an unboxed toggle", () => {
@@ -446,4 +446,20 @@ test("detail section headings share the same type scale", () => {
   assert.match(headingRule, /font-size:\s*1\.15rem/);
   assert.match(headingRule, /font-weight:\s*700/);
   assert.match(headingRule, /letter-spacing:\s*\.02em/);
+});
+
+test("detail backdrop keeps the natural image height and fades into the page color", () => {
+  const hero = readFileSync(new URL("../src/features/detail/MediaDetailHero.tsx", import.meta.url), "utf8");
+  const backdropRule = allStyles.match(/\.lux-detail-backdrop\s*\{([^}]*)\}/)?.[1] ?? "";
+  const frameRule = allStyles.match(/\.lux-detail-backdrop-frame\s*\{([^}]*)\}/)?.[1] ?? "";
+  const overlayRule = allStyles.match(/\.lux-detail-overlay\s*\{([^}]*)\}/)?.[1] ?? "";
+
+  assert.match(hero, /className="lux-detail-backdrop-frame"/);
+  assert.match(frameRule, /top:\s*0/);
+  assert.doesNotMatch(frameRule, /bottom:|height:/);
+  assert.match(backdropRule, /width:\s*100%/);
+  assert.match(backdropRule, /height:\s*auto/);
+  assert.doesNotMatch(backdropRule, /object-fit|inset:\s*0|blur\(|opacity:|brightness\(/);
+  assert.match(overlayRule, /inset:\s*0/);
+  assert.match(overlayRule, /#08080a/);
 });

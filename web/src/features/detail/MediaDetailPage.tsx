@@ -50,7 +50,6 @@ function MediaDetailContent({ media }: { media: MediaItem }) {
     <article className={`lux-detail-page lux-detail-page-${detailKind}`}>
       <MediaDetailMobileHeader />
       <MediaDetailArtwork media={media} placement="backdrop" />
-      <div className="lux-detail-overlay" />
       <div className="lux-detail-content">
         <div className="lux-detail-grid">
           <MediaDetailArtwork media={media} placement="poster" />
