@@ -34625,3 +34625,335 @@ async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
         "the acquisition returned while another writer still held the lock, after {waited:?}"
     );
 }
+
+/// A2: the PostgreSQL placeholder rewrite memo.
+///
+/// These tests pin the memoized path to the uncached rewrite byte for byte and pin the memo's
+/// capacity behaviour. They live next to the other storage tests rather than inside
+/// `repository.rs` because `scripts/check-backend-branches.py` counts `DatabaseBackend::` uses in
+/// non-`*_tests.rs` files, and test-only uses must not look like new production backend branches.
+mod adapted_sql_cache_tests {
+    use super::*;
+
+    /// Statements where `?` is not always a placeholder.
+    const TRICKY_STATEMENTS: &[&str] = &[
+        "SELECT ?, '?' AS literal, \"?\" AS identifier, ?",
+        "SELECT * FROM t WHERE a = ? AND b = '?'",
+        "SELECT * FROM t -- note: ? placeholder\nWHERE a = ?",
+        "SELECT /* a ? b */ * FROM t WHERE a = ?",
+        "SELECT 'it''s ?' AS x, ? AS y",
+        "SELECT 'a''?''b' AS x, ? AS y",
+        "SELECT \"a?\" AS x, ? AS y",
+        "?",
+        "??",
+        "SELECT '?' -- question mark in a line comment\n",
+        "SELECT * FROM t WHERE a = ? -- trailing ? comment without newline",
+        "SELECT * FROM t /* unterminated ? block comment",
+        "SELECT 'unterminated ? literal",
+        "SELECT 'no parameters'",
+        "SELECT * FROM t -- only a comment mentions ?",
+        "SELECT * FROM t /* only a block comment mentions ? */",
+        "SELECT * FROM t WHERE a = 'x' || '?'",
+        "",
+    ];
+
+    fn uncached_rewrite(sql: &'static str) -> String {
+        adapt_postgres_sql_uncached(sqlx::AssertSqlSafe(sql.to_owned()))
+            .as_str()
+            .to_owned()
+    }
+
+    #[test]
+    fn memoized_rewrite_matches_the_uncached_rewrite_for_tricky_statements() {
+        let cache = AdaptedSqlCache::default();
+        for sql in TRICKY_STATEMENTS {
+            let cached = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            assert_eq!(
+                cached.as_str(),
+                uncached_rewrite(sql),
+                "memoized rewrite diverged for {sql:?}"
+            );
+            // A second call must answer from the memo, not from a rebuild.
+            let again = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            assert_eq!(again.as_str().as_bytes(), cached.as_str().as_bytes());
+            assert!(std::ptr::eq(
+                again.as_str().as_ptr(),
+                cached.as_str().as_ptr()
+            ));
+        }
+    }
+
+    #[test]
+    fn statements_without_question_marks_bypass_the_memo_entirely() {
+        let cache = AdaptedSqlCache::default();
+        let statements = ["SELECT 'no parameters'", "SELECT 1", ""];
+        for sql in statements {
+            let adapted = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            assert_eq!(adapted.as_str(), sql);
+            assert!(std::ptr::eq(sql.as_ptr(), adapted.as_str().as_ptr()));
+        }
+        // Nothing to rewrite means no lock, no allocation and no memo entry.
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.cached_text_bytes(), 0);
+    }
+
+    #[test]
+    fn memoized_rewrites_reuse_the_cached_buffer() {
+        let cache = AdaptedSqlCache::default();
+        let sql = "SELECT /* reuse ? */ ?, ? FROM t";
+        let first = adapt_static_sql_for_backend_with_cache(&cache, sql);
+        let second = adapt_static_sql_for_backend_with_cache(&cache, sql);
+        assert_eq!(first.as_str(), "SELECT /* reuse ? */ $1, $2 FROM t");
+        assert_eq!(first.as_str(), second.as_str());
+        assert!(std::ptr::eq(
+            first.as_str().as_ptr(),
+            second.as_str().as_ptr()
+        ));
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.cached_text_bytes(), first.as_str().len());
+    }
+
+    fn synthetic_statement(seed: u64) -> String {
+        const FRAGMENTS: &[&str] = &[
+            "SELECT ",
+            "FROM t ",
+            "WHERE ",
+            "a = ?",
+            "'?'",
+            "'it''s ?'",
+            "\"?\"",
+            "-- ? comment\n",
+            "/* ? */",
+            "/* unterminated ?",
+            "'unterminated ?",
+            "AND b = ?",
+            "('LOCAL_FILE', 'STRM_URL')",
+            "?",
+            " ",
+            "\n",
+            "c <> 'Who?'",
+            "LIMIT ?",
+            "ORDER BY id",
+            "",
+            "??",
+        ];
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let fragment_count = usize::try_from(next() % 13).unwrap_or_default();
+        let mut sql = String::new();
+        for _ in 0..fragment_count {
+            let index = usize::try_from(next() % u64::try_from(FRAGMENTS.len()).unwrap_or(1))
+                .unwrap_or_default();
+            sql.push_str(FRAGMENTS[index]);
+        }
+        sql
+    }
+
+    #[test]
+    fn memoized_rewrite_matches_the_uncached_rewrite_for_generated_statements() {
+        let cache = AdaptedSqlCache::default();
+        let mut rewritten_count = 0_usize;
+        for seed in 1..=2_000_u64 {
+            let sql = Box::leak(synthetic_statement(seed).into_boxed_str());
+            let cached = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            let uncached = uncached_rewrite(sql);
+            assert_eq!(
+                cached.as_str(),
+                uncached,
+                "seed {seed} diverged for {sql:?}"
+            );
+            assert_eq!(cached.as_str().as_bytes(), uncached.as_bytes());
+            if cached.as_str() != sql {
+                rewritten_count += 1;
+            }
+            assert!(cache.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
+            assert!(cache.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
+        }
+        assert!(
+            rewritten_count > 500,
+            "generator produced too few rewritten statements: {rewritten_count}"
+        );
+    }
+
+    #[test]
+    fn full_shard_keeps_its_entries_and_leaves_new_statements_uncached() {
+        // One shard, two entries: the third statement must not evict anything.
+        let cache = AdaptedSqlCache::with_shard_limits(1, 2, 1 << 20, 1 << 20);
+        let first = "SELECT ? /* keep a */";
+        let second = "SELECT ? /* keep b */";
+        let third = "SELECT ? /* too many */";
+        let cached_first = adapt_static_sql_for_backend_with_cache(&cache, first);
+        let cached_second = adapt_static_sql_for_backend_with_cache(&cache, second);
+        assert_eq!(cache.entry_count(), 2);
+
+        let rejected_once = adapt_static_sql_for_backend_with_cache(&cache, third);
+        let rejected_twice = adapt_static_sql_for_backend_with_cache(&cache, third);
+        assert_eq!(rejected_once.as_str(), "SELECT $1 /* too many */");
+        assert_eq!(rejected_once.as_str(), rejected_twice.as_str());
+        assert!(
+            !std::ptr::eq(
+                rejected_once.as_str().as_ptr(),
+                rejected_twice.as_str().as_ptr()
+            ),
+            "an over-capacity statement must keep taking the uncached path"
+        );
+
+        assert_eq!(cache.entry_count(), 2);
+        let still_cached = adapt_static_sql_for_backend_with_cache(&cache, first);
+        assert!(std::ptr::eq(
+            still_cached.as_str().as_ptr(),
+            cached_first.as_str().as_ptr()
+        ));
+        let still_cached = adapt_static_sql_for_backend_with_cache(&cache, second);
+        assert!(std::ptr::eq(
+            still_cached.as_str().as_ptr(),
+            cached_second.as_str().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn capacity_limits_stop_caching_without_evicting_or_scanning() {
+        // The entry cap binds first here: 64 distinct statements, room for 32.
+        let entry_bounded = AdaptedSqlCache::with_shard_limits(1, 32, 1 << 20, 1 << 20);
+        for index in 0..64 {
+            let sql = Box::leak(format!("SELECT ? /* kept entry {index} */").into_boxed_str());
+            let adapted = adapt_static_sql_for_backend_with_cache(&entry_bounded, sql);
+            assert_eq!(
+                adapted.as_str(),
+                format!("SELECT $1 /* kept entry {index} */")
+            );
+            assert!(entry_bounded.entry_count() <= 32);
+        }
+        assert_eq!(entry_bounded.entry_count(), 32);
+
+        // The byte budget binds first here: every stored rewrite is ~30 bytes, so 512 bytes hold
+        // only a handful of them even though 1,000 entries would be allowed.
+        let byte_bounded = AdaptedSqlCache::with_shard_limits(1, 1_000, 512, 1 << 20);
+        for index in 0..64 {
+            let sql = Box::leak(format!("SELECT ? /* kept entry {index} */").into_boxed_str());
+            let adapted = adapt_static_sql_for_backend_with_cache(&byte_bounded, sql);
+            assert_eq!(
+                adapted.as_str(),
+                format!("SELECT $1 /* kept entry {index} */")
+            );
+            assert!(byte_bounded.cached_text_bytes() <= 512);
+        }
+        assert!(byte_bounded.entry_count() < 64);
+        assert!(byte_bounded.cached_text_bytes() <= 512);
+    }
+
+    #[test]
+    fn statements_over_the_source_byte_limit_are_rewritten_every_call() {
+        // The limit applies to the source text, so 32 `?` bytes stay cacheable even though the
+        // rewritten text ("$1$2…$32") is longer than the limit.
+        let cache = AdaptedSqlCache::with_shard_limits(1, 8, 1 << 20, 32);
+        let at_limit = Box::leak("?".repeat(32).into_boxed_str());
+        let over_limit = Box::leak("?".repeat(33).into_boxed_str());
+
+        let cached_at_limit = adapt_static_sql_for_backend_with_cache(&cache, at_limit);
+        assert_eq!(cached_at_limit.as_str(), uncached_rewrite(at_limit));
+        assert!(cached_at_limit.as_str().len() > 32);
+        assert_eq!(cache.entry_count(), 1);
+
+        let once = adapt_static_sql_for_backend_with_cache(&cache, over_limit);
+        let twice = adapt_static_sql_for_backend_with_cache(&cache, over_limit);
+        assert_eq!(once.as_str(), uncached_rewrite(over_limit));
+        assert_eq!(once.as_str(), twice.as_str());
+        assert!(
+            !std::ptr::eq(once.as_str().as_ptr(), twice.as_str().as_ptr()),
+            "an over-limit statement must keep taking the uncached path"
+        );
+        assert_eq!(cache.entry_count(), 1);
+
+        let again = adapt_static_sql_for_backend_with_cache(&cache, at_limit);
+        assert!(std::ptr::eq(
+            again.as_str().as_ptr(),
+            cached_at_limit.as_str().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn a_zero_entry_cache_still_rewrites_correctly() {
+        let cache = AdaptedSqlCache::with_shard_limits(1, 0, 0, 1 << 20);
+        let adapted = adapt_static_sql_for_backend_with_cache(&cache, "SELECT ?");
+        assert_eq!(adapted.as_str(), "SELECT $1");
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn sqlite_adaptation_returns_the_source_without_rewriting_or_copying() {
+        let sql = "SELECT ? /* sqlite keeps placeholders */";
+        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sql);
+        assert_eq!(adapted.as_str(), sql);
+        assert!(std::ptr::eq(sql.as_ptr(), adapted.as_str().as_ptr()));
+
+        // An owned statement keeps its buffer too, so SQLite rewrites and copies nothing; the memo
+        // is only reachable from the PostgreSQL side of `adapt_sql_for_backend`.
+        let owned = String::from("SELECT ? FROM t WHERE a = ?");
+        let owned_pointer = owned.as_ptr();
+        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(owned));
+        assert_eq!(adapted.as_str(), "SELECT ? FROM t WHERE a = ?");
+        assert!(std::ptr::eq(owned_pointer, adapted.as_str().as_ptr()));
+
+        let shared: std::sync::Arc<str> = std::sync::Arc::from("SELECT ? FROM t");
+        let shared_pointer = shared.as_ptr();
+        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(shared));
+        assert_eq!(adapted.as_str(), "SELECT ? FROM t");
+        assert!(std::ptr::eq(shared_pointer, adapted.as_str().as_ptr()));
+    }
+
+    #[test]
+    fn dynamic_statements_are_rewritten_on_every_call() {
+        let sql = "SELECT ?, ? FROM t WHERE a = ?";
+        let first = adapt_sql_for_backend(
+            DatabaseBackend::Postgres,
+            sqlx::AssertSqlSafe(sql.to_owned()),
+        );
+        let second = adapt_sql_for_backend(
+            DatabaseBackend::Postgres,
+            sqlx::AssertSqlSafe(sql.to_owned()),
+        );
+        assert_eq!(first.as_str(), "SELECT $1, $2 FROM t WHERE a = $3");
+        assert_eq!(second.as_str(), first.as_str());
+        assert!(!std::ptr::eq(
+            first.as_str().as_ptr(),
+            second.as_str().as_ptr()
+        ));
+
+        // A `SqlStr` has unknown provenance, so it is never memoized either.
+        let from_str = adapt_sql_for_backend(
+            DatabaseBackend::Postgres,
+            sqlx::SqlStr::from_static("SELECT ? FROM t"),
+        );
+        assert_eq!(from_str.as_str(), "SELECT $1 FROM t");
+    }
+
+    #[test]
+    fn concurrent_memoized_rewrites_match_the_uncached_rewrite() {
+        let statements: &[&'static str] = &[
+            "SELECT ?, '?' AS literal FROM t WHERE a = ?",
+            "SELECT * FROM t /* ? */ WHERE b = ?",
+            "-- ? comment\nSELECT 1",
+            "SELECT 'it''s ?' AS x, ? AS y",
+        ];
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..250 {
+                        for sql in statements {
+                            let cached = adapt_sql_for_backend(DatabaseBackend::Postgres, *sql);
+                            assert_eq!(cached.as_str(), uncached_rewrite(sql));
+                        }
+                    }
+                });
+            }
+        });
+        assert!(ADAPTED_SQL_CACHE.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
+        assert!(ADAPTED_SQL_CACHE.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
+    }
+}

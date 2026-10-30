@@ -5405,21 +5405,32 @@ fn adapt_static_sql_for_backend(sql: &'static str) -> sqlx::SqlStr {
 }
 
 /// [`adapt_static_sql_for_backend`] against an explicit cache, so tests can bound and inspect one.
+///
+/// Statements without a `?` byte never touch the memo: they are not rewritten, keep their static
+/// pointer and cost a single `memchr` pass with no lock and no allocation.
 fn adapt_static_sql_for_backend_with_cache(
     cache: &AdaptedSqlCache,
     sql: &'static str,
 ) -> sqlx::SqlStr {
-    let key = StaticSqlKey::of(sql);
-    if let Some(adaptation) = cache.lookup(key) {
-        return adaptation.into_sql_str(sql);
+    if !sql.as_bytes().contains(&b'?') {
+        return sqlx::SqlStr::from_static(sql);
+    }
+    if sql.len() > cache.max_source_bytes {
+        return adapt_postgres_sql_uncached(sql);
     }
 
-    let adaptation = match rewrite_postgres_placeholders(sql) {
-        None => CachedAdaptation::Unchanged,
-        Some(rewritten) => CachedAdaptation::Rewritten(Arc::from(rewritten.as_str())),
+    let key = StaticSqlKey::of(sql);
+    if let Some(rewritten) = cache.lookup(key) {
+        return sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(rewritten));
+    }
+
+    // The fast path above guarantees a `?` byte, so the rewrite always produces text.
+    let Some(rewritten) = rewrite_postgres_placeholders(sql) else {
+        return sqlx::SqlStr::from_static(sql);
     };
-    cache.store(key, adaptation.clone());
-    adaptation.into_sql_str(sql)
+    let rewritten: Arc<str> = Arc::from(rewritten.as_str());
+    cache.store(key, Arc::clone(&rewritten));
+    sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(rewritten))
 }
 
 /// The pre-cache PostgreSQL rewrite, kept for dynamically built SQL and as the reference the memo
@@ -5432,13 +5443,18 @@ fn adapt_postgres_sql_uncached(sql: impl sqlx::SqlSafeStr) -> sqlx::SqlStr {
     }
 }
 
-/// Upper bound on memoized PostgreSQL rewrites. A build holds a fixed set of `&'static str`
-/// statements, so this is a bounded memo table rather than a cache that grows with traffic.
-const MAX_ADAPTED_SQL_CACHE_ENTRIES: usize = 256;
-/// Upper bound on the rewritten text the cache keeps alive; `Unchanged` entries cost no text.
-const MAX_ADAPTED_SQL_CACHE_TEXT_BYTES: usize = 1024 * 1024;
-/// Statements longer than this are rewritten on every call instead of being memoized.
-const MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES: usize = 64 * 1024;
+/// Number of independently locked memo shards; the count is rounded up to a power of two.
+const ADAPTED_SQL_CACHE_SHARDS: usize = 64;
+/// Upper bound on memoized statements. The production tree passes ~1,124 distinct static
+/// statements to `Database::query*` (counted in docs/PERFORMANCE.md), so this is ~7x headroom: the
+/// statement set is fixed at build time, the memo fills once and then only serves reads.
+const MAX_ADAPTED_SQL_CACHE_ENTRIES: usize = 8_192;
+/// Upper bound on the rewritten text the memo keeps alive. Those same statements rewrite to well
+/// under 1 MiB, so this is safety headroom rather than a working limit.
+const MAX_ADAPTED_SQL_CACHE_TEXT_BYTES: usize = 8 * 1024 * 1024;
+/// Source statements longer than this are rewritten on every call instead of being memoized. The
+/// limit is compared against the source length, before any rewrite work happens.
+const MAX_ADAPTED_SQL_CACHE_SOURCE_BYTES: usize = 64 * 1024;
 
 /// Identity of a `&'static str` statement. Static storage never moves and is never recycled, so
 /// the address plus the length identify the text for the whole process; two distinct static
@@ -5458,51 +5474,29 @@ impl StaticSqlKey {
     }
 }
 
-/// The adaptation of one statement: it either survives verbatim or gains `$n` placeholders.
-#[derive(Clone)]
-enum CachedAdaptation {
-    Unchanged,
-    Rewritten(Arc<str>),
-}
-
-impl CachedAdaptation {
-    fn text_bytes(&self) -> usize {
-        match self {
-            Self::Unchanged => 0,
-            Self::Rewritten(text) => text.len(),
-        }
-    }
-
-    fn into_sql_str(self, source: &'static str) -> sqlx::SqlStr {
-        match self {
-            Self::Unchanged => sqlx::SqlStr::from_static(source),
-            Self::Rewritten(text) => sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(text)),
-        }
-    }
-}
-
-struct CachedAdaptationEntry {
-    adaptation: CachedAdaptation,
-    last_used: u64,
-}
-
+/// One shard of the memo: rewritten statement text keyed by statement identity.
 #[derive(Default)]
-struct AdaptedSqlCacheState {
-    entries: HashMap<StaticSqlKey, CachedAdaptationEntry>,
-    cached_text_bytes: usize,
-    clock: u64,
+struct AdaptedSqlShard {
+    entries: HashMap<StaticSqlKey, Arc<str>>,
+    text_bytes: usize,
 }
 
-/// Bounded least-recently-used memo of PostgreSQL placeholder rewrites for static statements.
+/// Append-only memo of PostgreSQL placeholder rewrites for `&'static str` statements.
 ///
-/// The mutex is only ever held for map operations: `lookup` and `store` never call back into
-/// caller code and never await, so the cache cannot deadlock and cannot stall a Tokio worker
-/// beyond a hash-map probe.
+/// There is no eviction policy, and none is needed: the set of static statements is fixed when the
+/// binary is built, so the memo fills once and afterwards only serves reads. Capacity is enforced
+/// with per-shard limits that sum to the global limits; a statement that does not fit keeps taking
+/// the uncached path instead of costing an eviction scan on the miss path.
+///
+/// A lock is held for one hash-map operation on one shard: no await, no caller code and never two
+/// shards at once, so the memo cannot deadlock. A poisoned shard degrades to a miss (read) or
+/// skips the insert (write), because rewriting is always correct.
 struct AdaptedSqlCache {
-    state: std::sync::Mutex<AdaptedSqlCacheState>,
-    max_entries: usize,
-    max_text_bytes: usize,
-    max_entry_bytes: usize,
+    shards: Box<[std::sync::RwLock<AdaptedSqlShard>]>,
+    shard_mask: usize,
+    max_entries_per_shard: usize,
+    max_text_bytes_per_shard: usize,
+    max_source_bytes: usize,
 }
 
 static ADAPTED_SQL_CACHE: std::sync::LazyLock<AdaptedSqlCache> =
@@ -5513,93 +5507,97 @@ impl Default for AdaptedSqlCache {
         Self::with_limits(
             MAX_ADAPTED_SQL_CACHE_ENTRIES,
             MAX_ADAPTED_SQL_CACHE_TEXT_BYTES,
-            MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES,
+            MAX_ADAPTED_SQL_CACHE_SOURCE_BYTES,
         )
     }
 }
 
 impl AdaptedSqlCache {
-    fn with_limits(max_entries: usize, max_text_bytes: usize, max_entry_bytes: usize) -> Self {
+    /// Cache whose global limits are spread evenly over [`ADAPTED_SQL_CACHE_SHARDS`] shards.
+    fn with_limits(entries: usize, text_bytes: usize, source_bytes: usize) -> Self {
+        Self::with_shard_limits(
+            ADAPTED_SQL_CACHE_SHARDS,
+            entries.div_ceil(ADAPTED_SQL_CACHE_SHARDS),
+            text_bytes.div_ceil(ADAPTED_SQL_CACHE_SHARDS),
+            source_bytes,
+        )
+    }
+
+    /// Cache with explicit per-shard limits; tests use small values to reach them quickly.
+    fn with_shard_limits(
+        shards: usize,
+        entries_per_shard: usize,
+        text_bytes_per_shard: usize,
+        source_bytes: usize,
+    ) -> Self {
+        // Rounding up keeps the shard index a mask instead of a division, and cannot go out of
+        // bounds whatever the caller passes.
+        let shards = shards.max(1).next_power_of_two();
         Self {
-            state: std::sync::Mutex::new(AdaptedSqlCacheState::default()),
-            max_entries,
-            max_text_bytes,
-            max_entry_bytes,
+            shards: (0..shards)
+                .map(|_| std::sync::RwLock::new(AdaptedSqlShard::default()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            shard_mask: shards - 1,
+            max_entries_per_shard: entries_per_shard,
+            max_text_bytes_per_shard: text_bytes_per_shard,
+            max_source_bytes: source_bytes,
         }
     }
 
-    /// Returns the memoized adaptation of `key` and refreshes its recency stamp.
-    ///
-    /// A poisoned lock degrades to a cache miss; rewriting is always correct, so a panic in an
-    /// unrelated thread must not turn into a storage failure.
-    fn lookup(&self, key: StaticSqlKey) -> Option<CachedAdaptation> {
-        let mut state = self.state.lock().ok()?;
-        state.clock = state.clock.wrapping_add(1);
-        let last_used = state.clock;
-        let entry = state.entries.get_mut(&key)?;
-        entry.last_used = last_used;
-        Some(entry.adaptation.clone())
+    /// Statements live in read-only data, so their addresses are stable and distinct; the address
+    /// bits above the alignment boundary spread them across the shards.
+    fn shard_index(&self, key: StaticSqlKey) -> usize {
+        (key.address >> 3) & self.shard_mask
     }
 
-    fn store(&self, key: StaticSqlKey, adaptation: CachedAdaptation) {
-        let text_bytes = adaptation.text_bytes();
-        if self.max_entries == 0
-            || text_bytes > self.max_entry_bytes
-            || text_bytes > self.max_text_bytes
-        {
-            return;
-        }
-        let Ok(mut state) = self.state.lock() else {
+    /// Returns the memoized rewrite of `key`, taking only a read lock on its shard.
+    fn lookup(&self, key: StaticSqlKey) -> Option<Arc<str>> {
+        let guard = self.shards[self.shard_index(key)].read().ok()?;
+        guard.entries.get(&key).map(Arc::clone)
+    }
+
+    /// Memoizes one rewrite, or leaves it out when this shard is already full.
+    fn store(&self, key: StaticSqlKey, rewritten: Arc<str>) {
+        let Ok(mut guard) = self.shards[self.shard_index(key)].write() else {
             return;
         };
-        state.clock = state.clock.wrapping_add(1);
-        let last_used = state.clock;
-        if let Some(replaced) = state.entries.remove(&key) {
-            state.cached_text_bytes = state
-                .cached_text_bytes
-                .saturating_sub(replaced.adaptation.text_bytes());
+        if guard.entries.contains_key(&key) {
+            return;
         }
-        while state.entries.len() >= self.max_entries
-            || state.cached_text_bytes.saturating_add(text_bytes) > self.max_text_bytes
+        if guard.entries.len() >= self.max_entries_per_shard
+            || guard.text_bytes.saturating_add(rewritten.len()) > self.max_text_bytes_per_shard
         {
-            let oldest_key = state
-                .entries
-                .iter()
-                .min_by_key(|(_, entry)| entry.last_used)
-                .map(|(key, _)| *key);
-            let Some(oldest_key) = oldest_key else {
-                break;
-            };
-            if let Some(removed) = state.entries.remove(&oldest_key) {
-                state.cached_text_bytes = state
-                    .cached_text_bytes
-                    .saturating_sub(removed.adaptation.text_bytes());
-            }
+            return;
         }
-        state.cached_text_bytes = state.cached_text_bytes.saturating_add(text_bytes);
-        state.entries.insert(
-            key,
-            CachedAdaptationEntry {
-                adaptation,
-                last_used,
-            },
-        );
+        guard.text_bytes = guard.text_bytes.saturating_add(rewritten.len());
+        guard.entries.insert(key, rewritten);
     }
 
     #[cfg(test)]
     fn entry_count(&self) -> usize {
-        self.state
-            .lock()
-            .map(|state| state.entries.len())
-            .unwrap_or_default()
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .map(|shard| shard.entries.len())
+                    .unwrap_or_default()
+            })
+            .sum()
     }
 
     #[cfg(test)]
     fn cached_text_bytes(&self) -> usize {
-        self.state
-            .lock()
-            .map(|state| state.cached_text_bytes)
-            .unwrap_or_default()
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .map(|shard| shard.text_bytes)
+                    .unwrap_or_default()
+            })
+            .sum()
     }
 }
 
@@ -6192,308 +6190,6 @@ mod storage_error_mapping_tests {
         assert_eq!(&other_path, &second.path);
         assert_ne!(other_path.as_path(), helper_path.as_path());
         Ok(())
-    }
-}
-
-/// A2: the PostgreSQL placeholder rewrite memo. These tests pin the cached path to the uncached
-/// rewrite byte for byte, pin the bounds of the memo table, and cover the SQLite no-op path.
-#[cfg(test)]
-mod adapted_sql_cache_tests {
-    use super::*;
-
-    /// Statements where `?` is not always a placeholder.
-    const TRICKY_STATEMENTS: &[&str] = &[
-        "SELECT ?, '?' AS literal, \"?\" AS identifier, ?",
-        "SELECT * FROM t WHERE a = ? AND b = '?'",
-        "SELECT * FROM t -- note: ? placeholder\nWHERE a = ?",
-        "SELECT /* a ? b */ * FROM t WHERE a = ?",
-        "SELECT 'it''s ?' AS x, ? AS y",
-        "SELECT 'a''?''b' AS x, ? AS y",
-        "SELECT \"a?\" AS x, ? AS y",
-        "?",
-        "??",
-        "SELECT '?' -- question mark in a line comment\n",
-        "SELECT * FROM t WHERE a = ? -- trailing ? comment without newline",
-        "SELECT * FROM t /* unterminated ? block comment",
-        "SELECT 'unterminated ? literal",
-        "SELECT 'no parameters'",
-        "SELECT * FROM t -- only a comment mentions ?",
-        "SELECT * FROM t /* only a block comment mentions ? */",
-        "SELECT * FROM t WHERE a = 'x' || '?'",
-        "",
-    ];
-
-    fn uncached_rewrite(sql: &'static str) -> String {
-        adapt_postgres_sql_uncached(sqlx::AssertSqlSafe(sql.to_owned()))
-            .as_str()
-            .to_owned()
-    }
-
-    fn default_cache() -> AdaptedSqlCache {
-        AdaptedSqlCache::with_limits(
-            MAX_ADAPTED_SQL_CACHE_ENTRIES,
-            MAX_ADAPTED_SQL_CACHE_TEXT_BYTES,
-            MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES,
-        )
-    }
-
-    #[test]
-    fn cached_postgres_rewrite_matches_the_uncached_rewrite_for_tricky_statements() {
-        let cache = default_cache();
-        for sql in TRICKY_STATEMENTS {
-            let cached = adapt_static_sql_for_backend_with_cache(&cache, sql);
-            assert_eq!(
-                cached.as_str(),
-                uncached_rewrite(sql),
-                "cached rewrite diverged for {sql:?}"
-            );
-            // A second call must answer from the memo, not from a rebuild.
-            let again = adapt_static_sql_for_backend_with_cache(&cache, sql);
-            assert_eq!(again.as_str().as_bytes(), cached.as_str().as_bytes());
-        }
-    }
-
-    #[test]
-    fn static_statements_without_question_marks_keep_their_source_pointer() {
-        let cache = default_cache();
-        let statements = ["SELECT 'no parameters'", "SELECT 1", ""];
-        for sql in statements {
-            let adapted = adapt_static_sql_for_backend_with_cache(&cache, sql);
-            assert_eq!(adapted.as_str(), sql);
-            assert!(std::ptr::eq(sql.as_ptr(), adapted.as_str().as_ptr()));
-        }
-        // These still occupy memo slots, but no rewritten text is retained.
-        assert_eq!(cache.entry_count(), statements.len());
-        assert_eq!(cache.cached_text_bytes(), 0);
-    }
-
-    #[test]
-    fn memoized_static_rewrites_reuse_the_cached_buffer() {
-        let cache = default_cache();
-        let sql = "SELECT /* reuse ? */ ?, ? FROM t";
-        let first = adapt_static_sql_for_backend_with_cache(&cache, sql);
-        let second = adapt_static_sql_for_backend_with_cache(&cache, sql);
-        assert_eq!(first.as_str(), "SELECT /* reuse ? */ $1, $2 FROM t");
-        assert_eq!(first.as_str(), second.as_str());
-        assert!(std::ptr::eq(
-            first.as_str().as_ptr(),
-            second.as_str().as_ptr()
-        ));
-        assert_eq!(cache.entry_count(), 1);
-    }
-
-    fn synthetic_statement(seed: u64) -> String {
-        const FRAGMENTS: &[&str] = &[
-            "SELECT ",
-            "FROM t ",
-            "WHERE ",
-            "a = ?",
-            "'?'",
-            "'it''s ?'",
-            "\"?\"",
-            "-- ? comment\n",
-            "/* ? */",
-            "/* unterminated ?",
-            "'unterminated ?",
-            "AND b = ?",
-            "('LOCAL_FILE', 'STRM_URL')",
-            "?",
-            " ",
-            "\n",
-            "c <> 'Who?'",
-            "LIMIT ?",
-            "ORDER BY id",
-            "",
-            "??",
-        ];
-        let mut state = seed | 1;
-        let mut next = move || {
-            state ^= state << 13;
-            state ^= state >> 7;
-            state ^= state << 17;
-            state
-        };
-        let fragment_count = usize::try_from(next() % 13).unwrap_or_default();
-        let mut sql = String::new();
-        for _ in 0..fragment_count {
-            let index = usize::try_from(next() % u64::try_from(FRAGMENTS.len()).unwrap_or(1))
-                .unwrap_or_default();
-            sql.push_str(FRAGMENTS[index]);
-        }
-        sql
-    }
-
-    #[test]
-    fn cached_postgres_rewrite_matches_the_uncached_rewrite_for_generated_statements() {
-        let cache = default_cache();
-        let mut rewritten_count = 0_usize;
-        for seed in 1..=2_000_u64 {
-            let sql = Box::leak(synthetic_statement(seed).into_boxed_str());
-            let cached = adapt_static_sql_for_backend_with_cache(&cache, sql);
-            let uncached = uncached_rewrite(sql);
-            assert_eq!(
-                cached.as_str(),
-                uncached,
-                "seed {seed} diverged for {sql:?}"
-            );
-            assert_eq!(cached.as_str().as_bytes(), uncached.as_bytes());
-            if cached.as_str().contains('$') {
-                rewritten_count += 1;
-            }
-            assert!(cache.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
-            assert!(cache.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
-        }
-        assert!(
-            rewritten_count > 500,
-            "generator produced too few rewritten statements: {rewritten_count}"
-        );
-    }
-
-    #[test]
-    fn static_adaptation_cache_evicts_the_least_recently_used_entry() {
-        let cache = AdaptedSqlCache::with_limits(
-            2,
-            MAX_ADAPTED_SQL_CACHE_TEXT_BYTES,
-            MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES,
-        );
-        let first = "SELECT ? /* lru a */";
-        let second = "SELECT ? /* lru b */";
-        let third = "SELECT ? /* lru c */";
-        for sql in [first, second, first, third] {
-            adapt_static_sql_for_backend_with_cache(&cache, sql);
-        }
-        assert_eq!(cache.entry_count(), 2);
-        assert!(cache.lookup(StaticSqlKey::of(first)).is_some());
-        assert!(cache.lookup(StaticSqlKey::of(third)).is_some());
-        assert!(
-            cache.lookup(StaticSqlKey::of(second)).is_none(),
-            "the least recently used statement should have been evicted"
-        );
-    }
-
-    #[test]
-    fn static_adaptation_cache_stays_bounded_under_many_distinct_statements() {
-        let cache = default_cache();
-        for index in 0..(MAX_ADAPTED_SQL_CACHE_ENTRIES * 2) {
-            let sql = Box::leak(format!("SELECT ? /* statement {index} */").into_boxed_str());
-            let adapted = adapt_static_sql_for_backend_with_cache(&cache, sql);
-            assert_eq!(
-                adapted.as_str(),
-                format!("SELECT $1 /* statement {index} */")
-            );
-            assert!(cache.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
-            assert!(cache.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
-        }
-        assert_eq!(cache.entry_count(), MAX_ADAPTED_SQL_CACHE_ENTRIES);
-    }
-
-    #[test]
-    fn static_adaptation_cache_skips_oversized_statements_and_disabled_caches() {
-        let huge_sql = Box::leak(
-            format!(
-                "SELECT ? /* {} */",
-                "x".repeat(MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES)
-            )
-            .into_boxed_str(),
-        );
-        let entry_bounded = AdaptedSqlCache::with_limits(
-            8,
-            MAX_ADAPTED_SQL_CACHE_TEXT_BYTES,
-            MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES,
-        );
-        let adapted = adapt_static_sql_for_backend_with_cache(&entry_bounded, huge_sql);
-        assert!(adapted.as_str().starts_with("SELECT $1 /* x"));
-        assert_eq!(entry_bounded.entry_count(), 0);
-
-        let text_bounded = AdaptedSqlCache::with_limits(8, 16, MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES);
-        let sql = "SELECT ?, ? FROM a_table_that_is_longer_than_the_byte_budget";
-        let adapted = adapt_static_sql_for_backend_with_cache(&text_bounded, sql);
-        assert_eq!(
-            adapted.as_str(),
-            "SELECT $1, $2 FROM a_table_that_is_longer_than_the_byte_budget"
-        );
-        assert_eq!(text_bounded.entry_count(), 0);
-
-        let disabled = AdaptedSqlCache::with_limits(
-            0,
-            MAX_ADAPTED_SQL_CACHE_TEXT_BYTES,
-            MAX_ADAPTED_SQL_CACHE_ENTRY_BYTES,
-        );
-        let adapted = adapt_static_sql_for_backend_with_cache(&disabled, "SELECT ?");
-        assert_eq!(adapted.as_str(), "SELECT $1");
-        assert_eq!(disabled.entry_count(), 0);
-    }
-
-    #[test]
-    fn sqlite_adaptation_returns_the_source_without_rewriting_or_copying() {
-        let sql = "SELECT ? /* sqlite keeps placeholders */";
-        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sql);
-        assert_eq!(adapted.as_str(), sql);
-        assert!(std::ptr::eq(sql.as_ptr(), adapted.as_str().as_ptr()));
-
-        // An owned statement keeps its buffer too, so SQLite rewrites and copies nothing; the memo
-        // is only reachable from the PostgreSQL side of `adapt_sql_for_backend`.
-        let owned = String::from("SELECT ? FROM t WHERE a = ?");
-        let owned_pointer = owned.as_ptr();
-        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(owned));
-        assert_eq!(adapted.as_str(), "SELECT ? FROM t WHERE a = ?");
-        assert!(std::ptr::eq(owned_pointer, adapted.as_str().as_ptr()));
-
-        let shared: std::sync::Arc<str> = std::sync::Arc::from("SELECT ? FROM t");
-        let shared_pointer = shared.as_ptr();
-        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(shared));
-        assert_eq!(adapted.as_str(), "SELECT ? FROM t");
-        assert!(std::ptr::eq(shared_pointer, adapted.as_str().as_ptr()));
-    }
-
-    #[test]
-    fn dynamic_statements_are_rewritten_on_every_call() {
-        let sql = "SELECT ?, ? FROM t WHERE a = ?";
-        let first = adapt_sql_for_backend(
-            DatabaseBackend::Postgres,
-            sqlx::AssertSqlSafe(sql.to_owned()),
-        );
-        let second = adapt_sql_for_backend(
-            DatabaseBackend::Postgres,
-            sqlx::AssertSqlSafe(sql.to_owned()),
-        );
-        assert_eq!(first.as_str(), "SELECT $1, $2 FROM t WHERE a = $3");
-        assert_eq!(second.as_str(), first.as_str());
-        assert!(!std::ptr::eq(
-            first.as_str().as_ptr(),
-            second.as_str().as_ptr()
-        ));
-
-        // A `SqlStr` has unknown provenance, so it is never memoized either.
-        let from_str = adapt_sql_for_backend(
-            DatabaseBackend::Postgres,
-            sqlx::SqlStr::from_static("SELECT ? FROM t"),
-        );
-        assert_eq!(from_str.as_str(), "SELECT $1 FROM t");
-    }
-
-    #[test]
-    fn concurrent_static_adaptation_matches_the_uncached_rewrite() {
-        let statements: &[&'static str] = &[
-            "SELECT ?, '?' AS literal FROM t WHERE a = ?",
-            "SELECT * FROM t /* ? */ WHERE b = ?",
-            "-- ? comment\nSELECT 1",
-            "SELECT 'it''s ?' AS x, ? AS y",
-        ];
-        std::thread::scope(|scope| {
-            for _ in 0..8 {
-                scope.spawn(|| {
-                    for _ in 0..250 {
-                        for sql in statements {
-                            let cached = adapt_sql_for_backend(DatabaseBackend::Postgres, *sql);
-                            assert_eq!(cached.as_str(), uncached_rewrite(sql));
-                        }
-                    }
-                });
-            }
-        });
-        assert!(ADAPTED_SQL_CACHE.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
-        assert!(ADAPTED_SQL_CACHE.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
     }
 }
 
