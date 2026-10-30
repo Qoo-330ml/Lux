@@ -1099,24 +1099,32 @@ pub(crate) fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> 
     }
 }
 
-pub(crate) fn item_image_json(item_id: &str, image: &crate::storage::StoredItemImage) -> Value {
+pub(crate) fn item_image_json(
+    item_id: &str,
+    image: &crate::storage::StoredItemImage,
+) -> super::super::media::ItemImage {
     let image_type = image.image_type.to_ascii_lowercase();
     let index = if image.image_index > 0 {
         format!("/{}", image.image_index)
     } else {
         String::new()
     };
-    json!({
-        "id": image.id,
-        "itemId": item_id,
-        "imageType": image.image_type,
-        "imageIndex": image.image_index,
-        "fileSize": image.file_size,
-        "contentTag": image.content_tag,
-        "source": image.source,
-        "language": Value::Null,
-        "url": format!("/api/v1/items/{}/images/{}{}", encode_path_segment(item_id), image_type, index),
-    })
+    super::super::media::ItemImage {
+        content_tag: image.content_tag.clone(),
+        file_size: image.file_size,
+        id: image.id.clone(),
+        image_index: image.image_index,
+        image_type: image.image_type.clone(),
+        item_id: item_id.to_owned(),
+        language: None,
+        source: image.source.clone(),
+        url: format!(
+            "/api/v1/items/{}/images/{}{}",
+            encode_path_segment(item_id),
+            image_type,
+            index
+        ),
+    }
 }
 
 pub(crate) fn image_candidate_json(image: &crate::application::images::ImageCandidate) -> Value {
