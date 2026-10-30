@@ -9,8 +9,8 @@ use std::{
     time::Duration,
 };
 
-use common::{TestScraper, TestScraperConfig};
 use axum::{Json, Router, extract::State as AxumState, routing::any};
+use common::{TestScraper, TestScraperConfig};
 use luxd::{
     api::{AppState, app_with_state},
     application::{
