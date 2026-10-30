@@ -19,7 +19,7 @@ use super::{
     UserRegistrationStatus, UserRegistrationVerifyResult,
 };
 use sqlx::{
-    Acquire, Any, AnyPool, Executor, Row,
+    Acquire, Any, AnyPool, Executor, FromRow, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
 };
@@ -1956,60 +1956,121 @@ pub(crate) struct StoredEmbyLoginSessionSummary {
     pub(crate) last_seen_at: Option<i64>,
 }
 
-pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
-    StoredUser {
-        id: row.get("id"),
-        username_normalized: row.get("username_normalized"),
-        display_name: row.get("display_name"),
-        password_hash: row.get("password_hash"),
-        has_password: row.get::<i64, _>("has_password") != 0,
-        is_disabled: row.get::<i64, _>("is_disabled") != 0,
-        is_admin: row.get::<i64, _>("is_admin") != 0,
-        can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-        can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-        can_download: row.get::<i64, _>("can_download") != 0,
-        email: row.get("email"),
-        email_verified_at: row.get("email_verified_at"),
-        deleted_at: row.get("deleted_at"),
-        deletion_purge_at: row.get("deletion_purge_at"),
-        last_login_at: row.get("last_login_at"),
-        last_activity_at: row.get("last_activity_at"),
-    }
+/// Row of every user projection that decodes into [`StoredUser`].
+///
+/// The permission flags stay `i64` because both backends store them as `BIGINT` 0/1 and the
+/// conversion to `bool` happens in [`stored_user`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredUserRow {
+    id: String,
+    username_normalized: String,
+    display_name: String,
+    password_hash: String,
+    has_password: i64,
+    is_disabled: i64,
+    is_admin: i64,
+    can_manage_server: i64,
+    can_remote_access: i64,
+    can_download: i64,
+    email: Option<String>,
+    email_verified_at: Option<i64>,
+    deleted_at: Option<i64>,
+    deletion_purge_at: Option<i64>,
+    last_login_at: Option<i64>,
+    last_activity_at: Option<i64>,
 }
 
-pub(crate) fn stored_admin_user_list_item(row: sqlx::any::AnyRow) -> StoredAdminUserListItem {
-    StoredAdminUserListItem {
-        id: row.get("id"),
-        username_normalized: row.get("username_normalized"),
-        display_name: row.get("display_name"),
-        has_password: row.get::<i64, _>("has_password") != 0,
-        is_disabled: row.get::<i64, _>("is_disabled") != 0,
-        is_admin: row.get::<i64, _>("is_admin") != 0,
-        can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-        can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-        can_download: row.get::<i64, _>("can_download") != 0,
-        email: row.get("email"),
-        email_verified_at: row.get("email_verified_at"),
-        deleted_at: row.get("deleted_at"),
-        deletion_purge_at: row.get("deletion_purge_at"),
-        last_login_at: row.get("last_login_at"),
-        last_activity_at: row.get("last_activity_at"),
-        created_at: row.get("created_at"),
-        current_playback_count: row.get("current_playback_count"),
-    }
+pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> Result<StoredUser, sqlx::Error> {
+    let row = StoredUserRow::from_row(&row)?;
+    Ok(StoredUser {
+        id: row.id,
+        username_normalized: row.username_normalized,
+        display_name: row.display_name,
+        password_hash: row.password_hash,
+        has_password: row.has_password != 0,
+        is_disabled: row.is_disabled != 0,
+        is_admin: row.is_admin != 0,
+        can_manage_server: row.can_manage_server != 0,
+        can_remote_access: row.can_remote_access != 0,
+        can_download: row.can_download != 0,
+        email: row.email,
+        email_verified_at: row.email_verified_at,
+        deleted_at: row.deleted_at,
+        deletion_purge_at: row.deletion_purge_at,
+        last_login_at: row.last_login_at,
+        last_activity_at: row.last_activity_at,
+    })
+}
+
+/// Row of the administrator user list projection that decodes into
+/// [`StoredAdminUserListItem`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredAdminUserListItemRow {
+    id: String,
+    username_normalized: String,
+    display_name: String,
+    has_password: i64,
+    is_disabled: i64,
+    is_admin: i64,
+    can_manage_server: i64,
+    can_remote_access: i64,
+    can_download: i64,
+    email: Option<String>,
+    email_verified_at: Option<i64>,
+    deleted_at: Option<i64>,
+    deletion_purge_at: Option<i64>,
+    last_login_at: Option<i64>,
+    last_activity_at: Option<i64>,
+    created_at: i64,
+    current_playback_count: i64,
+}
+
+pub(crate) fn stored_admin_user_list_item(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredAdminUserListItem, sqlx::Error> {
+    let row = StoredAdminUserListItemRow::from_row(&row)?;
+    Ok(StoredAdminUserListItem {
+        id: row.id,
+        username_normalized: row.username_normalized,
+        display_name: row.display_name,
+        has_password: row.has_password != 0,
+        is_disabled: row.is_disabled != 0,
+        is_admin: row.is_admin != 0,
+        can_manage_server: row.can_manage_server != 0,
+        can_remote_access: row.can_remote_access != 0,
+        can_download: row.can_download != 0,
+        email: row.email,
+        email_verified_at: row.email_verified_at,
+        deleted_at: row.deleted_at,
+        deletion_purge_at: row.deletion_purge_at,
+        last_login_at: row.last_login_at,
+        last_activity_at: row.last_activity_at,
+        created_at: row.created_at,
+        current_playback_count: row.current_playback_count,
+    })
+}
+
+/// Row of the administrator permission-preset source projection.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredUserPermissionPresetSourceRow {
+    preset_id: String,
+    preset_name: String,
+    preset_version: i64,
+    applied_at: i64,
 }
 
 // LUX-648 uses this mapping when building administrator user projections.
 #[allow(dead_code)]
 pub(crate) fn stored_user_permission_preset_source(
     row: sqlx::any::AnyRow,
-) -> StoredUserPermissionPresetSource {
-    StoredUserPermissionPresetSource {
-        preset_id: row.get("preset_id"),
-        preset_name: row.get("preset_name"),
-        preset_version: row.get("preset_version"),
-        applied_at: row.get("applied_at"),
-    }
+) -> Result<StoredUserPermissionPresetSource, sqlx::Error> {
+    let row = StoredUserPermissionPresetSourceRow::from_row(&row)?;
+    Ok(StoredUserPermissionPresetSource {
+        preset_id: row.preset_id,
+        preset_name: row.preset_name,
+        preset_version: row.preset_version,
+        applied_at: row.applied_at,
+    })
 }
 
 pub(crate) struct UpdateUser<'a> {
@@ -2344,82 +2405,177 @@ pub(crate) struct StoredLibraryRoot {
     pub(crate) scan_cursor: Option<String>,
 }
 
-fn stored_scheduled_task(row: sqlx::any::AnyRow) -> StoredScheduledTaskConfig {
-    StoredScheduledTaskConfig {
-        owner_type: row.get("owner_type"),
-        owner_id: row.get("owner_id"),
-        task_type: row.get("task_type"),
-        plan_id: row.get("plan_id"),
-        task_name: row.get("task_name"),
-        task_description: row.get("task_description"),
-        source_type: row.get("source_type"),
-        plugin_id: row.get("plugin_id"),
-        cron_or_interval: row.get("cron_or_interval"),
-        is_enabled: row.get::<i64, _>("is_enabled") != 0,
-        resource_limit_json: row.get("resource_limit_json"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        library_name: row.get("library_name"),
-    }
+/// Row of the scheduled task config projections that decode into
+/// [`StoredScheduledTaskConfig`].
+///
+/// The library name is a nullable column because the query joins the owner library with a
+/// `LEFT JOIN` to keep `GLOBAL` owners decodable.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScheduledTaskConfigRow {
+    owner_type: String,
+    owner_id: String,
+    task_type: String,
+    plan_id: Option<String>,
+    task_name: String,
+    task_description: String,
+    source_type: String,
+    plugin_id: Option<String>,
+    cron_or_interval: Option<String>,
+    is_enabled: i64,
+    resource_limit_json: String,
+    created_at: i64,
+    updated_at: i64,
+    library_name: Option<String>,
 }
 
-fn stored_scheduled_task_plan(row: sqlx::any::AnyRow) -> StoredScheduledTaskPlan {
-    StoredScheduledTaskPlan {
-        id: row.get("id"),
-        task_type: row.get("task_type"),
-        plan_name: row.get("plan_name"),
-        task_name: row.get("task_name"),
-        task_description: row.get("task_description"),
-        source_type: row.get("source_type"),
-        plugin_id: row.get("plugin_id"),
-        cron_or_interval: row.get("cron_or_interval"),
-        is_enabled: row.get::<i64, _>("is_enabled") != 0,
-        resource_limit_json: row.get("resource_limit_json"),
-        scope_type: row.get("scope_type"),
-        is_default: row.get::<i64, _>("is_default") != 0,
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
+fn stored_scheduled_task(row: sqlx::any::AnyRow) -> Result<StoredScheduledTaskConfig, sqlx::Error> {
+    let row = StoredScheduledTaskConfigRow::from_row(&row)?;
+    Ok(StoredScheduledTaskConfig {
+        owner_type: row.owner_type,
+        owner_id: row.owner_id,
+        task_type: row.task_type,
+        plan_id: row.plan_id,
+        task_name: row.task_name,
+        task_description: row.task_description,
+        source_type: row.source_type,
+        plugin_id: row.plugin_id,
+        cron_or_interval: row.cron_or_interval,
+        is_enabled: row.is_enabled != 0,
+        resource_limit_json: row.resource_limit_json,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        library_name: row.library_name,
+    })
+}
+
+/// Row of the scheduled task plan projection. The attached libraries are loaded separately by
+/// `load_scheduled_task_plan_libraries`, so they are not part of this row.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScheduledTaskPlanRow {
+    id: String,
+    task_type: String,
+    plan_name: String,
+    task_name: String,
+    task_description: String,
+    source_type: String,
+    plugin_id: Option<String>,
+    cron_or_interval: Option<String>,
+    is_enabled: i64,
+    resource_limit_json: String,
+    scope_type: String,
+    is_default: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_scheduled_task_plan(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredScheduledTaskPlan, sqlx::Error> {
+    let row = StoredScheduledTaskPlanRow::from_row(&row)?;
+    Ok(StoredScheduledTaskPlan {
+        id: row.id,
+        task_type: row.task_type,
+        plan_name: row.plan_name,
+        task_name: row.task_name,
+        task_description: row.task_description,
+        source_type: row.source_type,
+        plugin_id: row.plugin_id,
+        cron_or_interval: row.cron_or_interval,
+        is_enabled: row.is_enabled != 0,
+        resource_limit_json: row.resource_limit_json,
+        scope_type: row.scope_type,
+        is_default: row.is_default != 0,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
         libraries: Vec::new(),
-    }
+    })
 }
 
-fn stored_notification_destination(row: sqlx::any::AnyRow) -> StoredNotificationDestination {
-    StoredNotificationDestination {
-        id: row.get("id"),
-        name: row.get("name"),
-        url: row.get("url"),
-        enabled: row.get::<i64, _>("enabled") != 0,
-        allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
-        event_types_json: row.get("event_types_json"),
-        payload_format: row.get("payload_format"),
-        provider_plugin_id: row.get("provider_plugin_id"),
-        provider_config_json: row.get("provider_config_json"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+/// Row of the notification destination projections.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredNotificationDestinationRow {
+    id: String,
+    name: String,
+    url: String,
+    enabled: i64,
+    allow_private_network: i64,
+    event_types_json: String,
+    payload_format: String,
+    provider_plugin_id: String,
+    provider_config_json: String,
+    created_at: i64,
+    updated_at: i64,
 }
 
-fn stored_notification_delivery(row: sqlx::any::AnyRow) -> StoredNotificationDelivery {
-    StoredNotificationDelivery {
-        id: row.get("id"),
-        event_id: row.get("event_id"),
-        destination_id: row.get("destination_id"),
-        status: row.get("status"),
-        attempt_count: row.get("attempt_count"),
-        next_attempt_at: row.get("next_attempt_at"),
-        last_http_status: row.get("last_http_status"),
-        last_error: row.get("last_error"),
-        delivered_at: row.get("delivered_at"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        event_type: row.get("event_type"),
-        payload_json: row.get("payload_json"),
-        destination_name: row.get("name"),
-        destination_url: row.get("url"),
-        allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
-        provider_plugin_id: row.get("provider_plugin_id"),
-        provider_config_json: row.get("provider_config_json"),
-    }
+fn stored_notification_destination(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredNotificationDestination, sqlx::Error> {
+    let row = StoredNotificationDestinationRow::from_row(&row)?;
+    Ok(StoredNotificationDestination {
+        id: row.id,
+        name: row.name,
+        url: row.url,
+        enabled: row.enabled != 0,
+        allow_private_network: row.allow_private_network != 0,
+        event_types_json: row.event_types_json,
+        payload_format: row.payload_format,
+        provider_plugin_id: row.provider_plugin_id,
+        provider_config_json: row.provider_config_json,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+/// Row of the notification delivery projections.
+///
+/// The destination is joined in, so its `name`/`url` columns decode into the delivery's
+/// `destination_name`/`destination_url` fields.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredNotificationDeliveryRow {
+    id: String,
+    event_id: String,
+    destination_id: String,
+    status: String,
+    attempt_count: i64,
+    next_attempt_at: i64,
+    last_http_status: Option<i64>,
+    last_error: Option<String>,
+    delivered_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+    event_type: String,
+    payload_json: String,
+    name: String,
+    url: String,
+    allow_private_network: i64,
+    provider_plugin_id: String,
+    provider_config_json: String,
+}
+
+fn stored_notification_delivery(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredNotificationDelivery, sqlx::Error> {
+    let row = StoredNotificationDeliveryRow::from_row(&row)?;
+    Ok(StoredNotificationDelivery {
+        id: row.id,
+        event_id: row.event_id,
+        destination_id: row.destination_id,
+        status: row.status,
+        attempt_count: row.attempt_count,
+        next_attempt_at: row.next_attempt_at,
+        last_http_status: row.last_http_status,
+        last_error: row.last_error,
+        delivered_at: row.delivered_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        event_type: row.event_type,
+        payload_json: row.payload_json,
+        destination_name: row.name,
+        destination_url: row.url,
+        allow_private_network: row.allow_private_network != 0,
+        provider_plugin_id: row.provider_plugin_id,
+        provider_config_json: row.provider_config_json,
+    })
 }
 
 #[derive(Debug)]
@@ -6211,8 +6367,8 @@ mod stored_row_decoding_tests {
     use crate::storage::test_database;
 
     #[tokio::test]
-    async fn stored_user_row_decodes_the_user_projection()
-    -> Result<(), Box<dyn std::error::Error>> {
+    async fn stored_user_row_decodes_the_user_projection() -> Result<(), Box<dyn std::error::Error>>
+    {
         let (_temp_dir, database) = test_database().await?;
         database
             .insert_user("user-alice", "alice", "Alice", "hash", false, true)
@@ -6231,6 +6387,21 @@ mod stored_row_decoding_tests {
         assert!(!user.is_disabled);
         assert_eq!(user.email, None);
         assert_eq!(user.last_login_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = StoredUserRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
         Ok(())
     }
 

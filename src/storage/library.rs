@@ -1454,7 +1454,12 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok((rows.into_iter().map(stored_scheduled_task).collect(), total))
+        let configs = rows
+            .into_iter()
+            .map(stored_scheduled_task)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
+        Ok((configs, total))
     }
 
     pub(crate) async fn list_scheduled_task_plans(
@@ -1517,7 +1522,8 @@ impl Database {
         let mut plans = rows
             .into_iter()
             .map(stored_scheduled_task_plan)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         let plan_ids = plans.iter().map(|plan| plan.id.clone()).collect::<Vec<_>>();
         self.load_scheduled_task_plan_libraries(&mut plans, &plan_ids)
             .await?;
@@ -1580,7 +1586,7 @@ impl Database {
         let Some(row) = row else {
             return Ok(None);
         };
-        let mut plans = vec![stored_scheduled_task_plan(row)];
+        let mut plans = vec![stored_scheduled_task_plan(row).map_err(self.sqlx_err())?];
         self.load_scheduled_task_plan_libraries(&mut plans, &[plan_id.to_owned()])
             .await?;
         Ok(plans.pop())
@@ -2584,7 +2590,9 @@ impl Database {
         .bind(task_type)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_scheduled_task))
+        .map_err(self.sqlx_err())?
+        .map(stored_scheduled_task)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -2627,7 +2635,7 @@ impl Database {
             }
             let rows = query.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
             for row in rows {
-                let config = stored_scheduled_task(row);
+                let config = stored_scheduled_task(row).map_err(self.sqlx_err())?;
                 configs.insert(config.owner_id.clone(), config);
             }
         }
