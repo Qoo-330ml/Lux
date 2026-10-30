@@ -41,6 +41,10 @@ struct CatalogDetailRow {
 /// columns, so one struct decodes them and [`StoredCatalogRow::from`] keeps the previous
 /// field-for-field mapping (0/1 integers become `Option<bool>`).
 ///
+/// [`CatalogRowProjection::Summary`] keeps the very same column list but binds the ten stream
+/// columns to `NULL` (see [`CATALOG_SUMMARY_STREAM_COLUMNS`]), so a grid page decodes through this
+/// struct with every non-stream field unchanged and `stream_*` cleared.
+///
 /// Three columns are not part of every projection: `series_name` is only selected by the resume
 /// query, `resume_total` only by the counted resume query, and `source_relative_path` is a
 /// subquery that only some detail projections carry. They keep their historical
@@ -2994,15 +2998,29 @@ impl Database {
         self.fetch_catalog_rows(&query, &binds).await
     }
 
+    /// Authoritative filtered page with the full row projection (sources and streams).
     pub(crate) async fn list_filtered_catalog_rows(
         &self,
         filter: &CatalogFilterQuery<'_>,
+    ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
+        self.list_filtered_catalog_rows_with_projection(filter, CatalogRowProjection::Full)
+            .await
+    }
+
+    /// Filtered page with an explicit row projection.
+    ///
+    /// [`CatalogRowProjection::Summary`] serves the grid/card projection, whose DTO carries the
+    /// item, image tags and media source columns but never the per-source streams.
+    pub(crate) async fn list_filtered_catalog_rows_with_projection(
+        &self,
+        filter: &CatalogFilterQuery<'_>,
+        projection: CatalogRowProjection,
     ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
         if filter.library_ids.is_empty() {
             return Ok((Vec::new(), 0));
         }
         let (where_clause, filter_binds) = catalog_filter_where_clause(filter);
-        let (query, list_binds) = filtered_catalog_list_query(filter);
+        let (query, list_binds) = filtered_catalog_list_query(filter, projection);
         if !filter.include_total {
             let rows = self.fetch_catalog_rows(&query, &list_binds).await?;
             return Ok((rows, 0));
@@ -3035,8 +3053,9 @@ impl Database {
     pub(crate) async fn explain_filtered_catalog_rows(
         &self,
         filter: &CatalogFilterQuery<'_>,
+        projection: CatalogRowProjection,
     ) -> Result<Vec<String>, StorageError> {
-        let (query, binds) = filtered_catalog_list_query(filter);
+        let (query, binds) = filtered_catalog_list_query(filter, projection);
         let explain = format!("EXPLAIN QUERY PLAN {query}");
         let mut statement = self.query(sqlx::AssertSqlSafe(explain));
         for bind in &binds {
@@ -3064,62 +3083,24 @@ impl Database {
             .collect()
     }
 
+    /// Catalog page of one library, or of every library, with an explicit row projection.
+    ///
+    /// [`CatalogRowProjection::Summary`] is for grid callers whose DTO drops the per-source
+    /// streams: the statement then skips the `media_streams` join and reports the stream columns
+    /// as `NULL`.
     pub(crate) async fn list_catalog_rows(
         &self,
         library_id: Option<&str>,
         offset: i64,
         limit: i64,
+        projection: CatalogRowProjection,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        let (query, binds) = match library_id {
+        let stream_columns = catalog_stream_columns(projection);
+        let stream_join = catalog_stream_join(projection);
+        let stream_order = catalog_stream_order(projection);
+        let (page_predicate, binds) = match library_id {
             Some(library_id) => (
-                format!(
-                    "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
-                        mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
-                        mi.title, mi.sort_title, mi.original_title, mi.overview,
-                        mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
-                        mi.added_at, mi.updated_at,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
-                         ORDER BY image_index LIMIT 1) AS poster_image_tag,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
-                         ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
-                         ORDER BY image_index LIMIT 1) AS thumb_image_tag,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
-                         ORDER BY image_index LIMIT 1) AS logo_image_tag,
-                        (SELECT fe.relative_path FROM filesystem_entries fe
-                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
-                        ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
-                        ms.edition_name, ms.quality_label,
-                        ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
-                        mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                        mt.codec, mt.language, mt.title AS stream_title,
-                        mt.details_json AS stream_details_json,
-                        mt.is_external AS stream_is_external,
-                        mt.is_default AS stream_is_default,
-                        mt.is_forced AS stream_is_forced
-                 FROM (
-                     SELECT mi.id, mi.library_id, mi.item_type,
-                            mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
-                            mi.title, mi.sort_title,
-                            mi.original_title, mi.overview, mi.production_year,
-                            mi.rating, mi.rating_source, mi.runtime_ticks,
-                            mi.added_at, mi.updated_at
-                     FROM media_items mi
-                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                 WHERE mi.library_id = ? AND mi.item_type <> 'FOLDER'
-                   AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                     ORDER BY mi.sort_title, mi.id
-                     LIMIT ? OFFSET ?
-                 ) mi
-                 LEFT JOIN media_sources ms
-                   ON ms.item_id = mi.id
-                  AND EXISTS (
-                      SELECT 1 FROM filesystem_entries fe
-                      WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
-                  )
-                 LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-                 ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index"
-                ),
+                "WHERE mi.library_id = ? AND ",
                 vec![
                     CatalogBind::Text(library_id),
                     CatalogBind::Integer(limit),
@@ -3127,57 +3108,55 @@ impl Database {
                 ],
             ),
             None => (
-                format!(
-                    "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
-                        mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
-                        mi.title, mi.sort_title, mi.original_title, mi.overview,
-                        mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
-                        mi.added_at, mi.updated_at,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
-                         ORDER BY image_index LIMIT 1) AS poster_image_tag,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
-                         ORDER BY image_index LIMIT 1) AS fanart_image_tag,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
-                         ORDER BY image_index LIMIT 1) AS thumb_image_tag,
-                        (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
-                         ORDER BY image_index LIMIT 1) AS logo_image_tag,
-                        (SELECT fe.relative_path FROM filesystem_entries fe
-                         WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
-                        ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
-                        ms.edition_name, ms.quality_label,
-                        ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
-                        mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                        mt.codec, mt.language, mt.title AS stream_title,
-                        mt.details_json AS stream_details_json,
-                        mt.is_external AS stream_is_external,
-                        mt.is_default AS stream_is_default,
-                        mt.is_forced AS stream_is_forced
-                 FROM (
-                     SELECT mi.id, mi.library_id, mi.item_type,
-                            mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
-                            mi.title, mi.sort_title,
-                            mi.original_title, mi.overview, mi.production_year,
-                            mi.rating, mi.rating_source, mi.runtime_ticks,
-                            mi.added_at, mi.updated_at
-                     FROM media_items mi
-                     JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
-                     WHERE mi.item_type <> 'FOLDER'
-                       AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
-                     ORDER BY mi.sort_title, mi.id
-                     LIMIT ? OFFSET ?
-                 ) mi
-                 LEFT JOIN media_sources ms
-                   ON ms.item_id = mi.id
-                  AND EXISTS (
-                      SELECT 1 FROM filesystem_entries fe
-                      WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
-                  )
-                 LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-                 ORDER BY mi.sort_title, mi.id, ms.id, mt.stream_index"
-                ),
+                "WHERE ",
                 vec![CatalogBind::Integer(limit), CatalogBind::Integer(offset)],
             ),
         };
+        let query = format!(
+            "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
+                mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                mi.title, mi.sort_title, mi.original_title, mi.overview,
+                mi.production_year, mi.rating, mi.rating_source, mi.runtime_ticks,
+                mi.added_at, mi.updated_at,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'POSTER'
+                 ORDER BY image_index LIMIT 1) AS poster_image_tag,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'FANART'
+                 ORDER BY image_index LIMIT 1) AS fanart_image_tag,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'THUMB'
+                 ORDER BY image_index LIMIT 1) AS thumb_image_tag,
+                (SELECT id FROM item_images WHERE item_id = mi.id AND image_type = 'LOGO'
+                 ORDER BY image_index LIMIT 1) AS logo_image_tag,
+                (SELECT fe.relative_path FROM filesystem_entries fe
+                 WHERE fe.id = ms.filesystem_entry_id) AS source_relative_path,
+                ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
+                ms.edition_name, ms.quality_label,
+                ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
+                {stream_columns}
+         FROM (
+             -- Page over items first: joining sources and streams before LIMIT would paginate
+             -- the joined rows, so a multi-source item could push other items off the page.
+             SELECT mi.id, mi.library_id, mi.item_type,
+                    mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
+                    mi.title, mi.sort_title,
+                    mi.original_title, mi.overview, mi.production_year,
+                    mi.rating, mi.rating_source, mi.runtime_ticks,
+                    mi.added_at, mi.updated_at
+             FROM media_items mi
+             JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
+             {page_predicate}mi.item_type <> 'FOLDER'
+               AND mi.removed_at IS NULL{CATALOG_VISIBLE_PREDICATE}
+             ORDER BY mi.sort_title, mi.id
+             LIMIT ? OFFSET ?
+         ) mi
+         LEFT JOIN media_sources ms
+           ON ms.item_id = mi.id
+          AND EXISTS (
+              SELECT 1 FROM filesystem_entries fe
+              WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
+          )
+         {stream_join}
+         ORDER BY mi.sort_title, mi.id, ms.id{stream_order}"
+        );
         self.fetch_catalog_rows(&query, &binds).await
     }
 
@@ -3534,6 +3513,12 @@ impl Database {
         self.fetch_catalog_rows_internal(query, binds, true).await
     }
 
+    /// Executes one catalog row statement and decodes it through [`CatalogListRow`].
+    ///
+    /// The caller owns the projection: the statement either joins `media_streams`
+    /// ([`CatalogRowProjection::Full`]) or reports the stream columns as `NULL`
+    /// ([`CatalogRowProjection::Summary`]). This function only decodes, so both projections share
+    /// the same 44-column contract and the same [`StoredCatalogRow`] shape.
     async fn fetch_catalog_rows_internal(
         &self,
         query: &str,
@@ -9866,8 +9851,81 @@ impl Database {
     }
 }
 
+/// Which columns a catalog list statement hydrates for every row.
+///
+/// [`CatalogRowProjection::Summary`] keeps everything a grid or card DTO renders — the item
+/// columns, the four image tags and the media source columns — and leaves the per-source media
+/// streams out. The statement then drops the `media_streams` join, so a page stops multiplying
+/// into `items × sources × streams` rows and stops carrying `details_json` per row.
+/// [`CatalogRowProjection::Full`] keeps that join for the callers whose DTO really carries
+/// streams: the item detail projection, Emby list/detail responses and `PlaybackInfo`.
+///
+/// Both projections emit the same column names, so [`CatalogListRow`] decodes either one and a
+/// summary row reports "no stream" instead of a differently shaped record.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
+pub(crate) enum CatalogRowProjection {
+    /// Item, image tag and media source columns only: what a grid page needs.
+    Summary,
+    /// Item, image tag, media source and media stream columns: the historical projection.
+    #[default]
+    Full,
+}
+
+/// Per-source stream columns of [`CatalogRowProjection::Full`].
+const CATALOG_STREAM_COLUMNS: &str = "mt.id AS stream_id, mt.stream_index, mt.stream_type,
+                mt.codec, mt.language, mt.title AS stream_title,
+                mt.details_json AS stream_details_json,
+                mt.is_external AS stream_is_external,
+                mt.is_default AS stream_is_default,
+                mt.is_forced AS stream_is_forced";
+
+/// Same column names as [`CATALOG_STREAM_COLUMNS`], bound to `NULL`, so one row struct decodes
+/// both projections. The casts keep PostgreSQL's `unknown` NULL typed and SQLite's untyped one
+/// identical to the joined column types (`TEXT`/`BIGINT`, the storage type of the `0/1` flags).
+const CATALOG_SUMMARY_STREAM_COLUMNS: &str = "CAST(NULL AS TEXT) AS stream_id,
+                CAST(NULL AS BIGINT) AS stream_index,
+                CAST(NULL AS TEXT) AS stream_type,
+                CAST(NULL AS TEXT) AS codec,
+                CAST(NULL AS TEXT) AS language,
+                CAST(NULL AS TEXT) AS stream_title,
+                CAST(NULL AS TEXT) AS stream_details_json,
+                CAST(NULL AS BIGINT) AS stream_is_external,
+                CAST(NULL AS BIGINT) AS stream_is_default,
+                CAST(NULL AS BIGINT) AS stream_is_forced";
+
+const CATALOG_STREAM_JOIN: &str = "LEFT JOIN media_streams mt ON mt.media_source_id = ms.id";
+
+/// Stream columns of the catalog list projection.
+///
+/// Shared with the read-model row builder so the authoritative and the derived list paths emit the
+/// same stream columns for the same projection.
+pub(super) fn catalog_stream_columns(projection: CatalogRowProjection) -> &'static str {
+    match projection {
+        CatalogRowProjection::Summary => CATALOG_SUMMARY_STREAM_COLUMNS,
+        CatalogRowProjection::Full => CATALOG_STREAM_COLUMNS,
+    }
+}
+
+/// `media_streams` join of the catalog list projection; empty for the summary projection.
+pub(super) fn catalog_stream_join(projection: CatalogRowProjection) -> &'static str {
+    match projection {
+        CatalogRowProjection::Summary => "",
+        CatalogRowProjection::Full => CATALOG_STREAM_JOIN,
+    }
+}
+
+/// `mt.stream_index` tie-breaker of the catalog list ordering; the summary projection has no
+/// `mt` alias in scope, so it must not name one.
+pub(super) fn catalog_stream_order(projection: CatalogRowProjection) -> &'static str {
+    match projection {
+        CatalogRowProjection::Summary => "",
+        CatalogRowProjection::Full => ", mt.stream_index",
+    }
+}
+
 fn filtered_catalog_list_query<'a>(
     filter: &CatalogFilterQuery<'a>,
+    projection: CatalogRowProjection,
 ) -> (String, Vec<CatalogBind<'a>>) {
     let (where_clause, binds) = catalog_filter_where_clause(filter);
     let item_order = catalog_item_order(filter.sort_by, filter.descending);
@@ -9880,7 +9938,7 @@ fn filtered_catalog_list_query<'a>(
         catalog_list_union_selected_sql(filter, &where_clause, &binds, item_order, fetch_limit)
     {
         return (
-            catalog_list_query_from_selected(&selected_sql, item_order),
+            catalog_list_query_from_selected(&selected_sql, item_order, projection),
             union_binds,
         );
     }
@@ -9896,12 +9954,19 @@ fn filtered_catalog_list_query<'a>(
     binds.push(CatalogBind::Integer(fetch_limit));
     binds.push(CatalogBind::Integer(filter.offset));
     (
-        catalog_list_query_from_selected(&selected_sql, item_order),
+        catalog_list_query_from_selected(&selected_sql, item_order, projection),
         binds,
     )
 }
 
-fn catalog_list_query_from_selected(selected_sql: &str, item_order: &str) -> String {
+fn catalog_list_query_from_selected(
+    selected_sql: &str,
+    item_order: &str,
+    projection: CatalogRowProjection,
+) -> String {
+    let stream_columns = catalog_stream_columns(projection);
+    let stream_join = catalog_stream_join(projection);
+    let stream_order = catalog_stream_order(projection);
     format!(
         "SELECT mi.id AS item_id, mi.library_id, mi.item_type,
                 mi.parent_id, mi.series_id, mi.season_number, mi.episode_number,
@@ -9921,12 +9986,7 @@ fn catalog_list_query_from_selected(selected_sql: &str, item_order: &str) -> Str
                 ms.id AS source_id, ms.source_kind, ms.container, ms.size, ms.external_url,
                 ms.edition_name, ms.quality_label,
                 ms.bitrate, ms.duration_ticks, ms.is_default, ms.probe_status,
-                mt.id AS stream_id, mt.stream_index, mt.stream_type,
-                mt.codec, mt.language, mt.title AS stream_title,
-                mt.details_json AS stream_details_json,
-                mt.is_external AS stream_is_external,
-                mt.is_default AS stream_is_default,
-                mt.is_forced AS stream_is_forced
+                {stream_columns}
          FROM ({selected_sql}) selected
          JOIN media_items mi ON mi.id = selected.id
          LEFT JOIN media_sources ms
@@ -9935,8 +9995,8 @@ fn catalog_list_query_from_selected(selected_sql: &str, item_order: &str) -> Str
               SELECT 1 FROM filesystem_entries fe
               WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
           )
-         LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
-         ORDER BY {item_order}, ms.id, mt.stream_index"
+         {stream_join}
+         ORDER BY {item_order}, ms.id{stream_order}"
     )
 }
 
@@ -10115,8 +10175,9 @@ mod tests {
     }
 
     use super::{
-        Database, GLOBAL_COLLECTION_LIBRARY_ID, RECOMMENDATION_STATS_CLEANUP_QUERY,
-        RECOMMENDATION_STATS_FINGERPRINT_QUERY, filtered_catalog_list_query,
+        CatalogRowProjection, Database, GLOBAL_COLLECTION_LIBRARY_ID,
+        RECOMMENDATION_STATS_CLEANUP_QUERY, RECOMMENDATION_STATS_FINGERPRINT_QUERY,
+        StoredCatalogRow, filtered_catalog_list_query,
         postgres_recent_catalog_rows_by_library_query, sqlite_recent_catalog_rows_by_library_query,
     };
     use crate::storage::repository::{CatalogFilterQuery, CatalogSort};
@@ -10241,6 +10302,231 @@ mod tests {
         Ok(())
     }
 
+    /// A grid page normally needs the item columns, the four image tags and the preferred source,
+    /// never the per-source stream rows. The summary projection must therefore return the same
+    /// rows (same order, same fields) with the stream group cleared, from the same single
+    /// statement, while the full projection keeps the `media_streams` join.
+    #[tokio::test]
+    async fn summary_projection_keeps_the_full_rows_without_the_stream_join()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let fixture =
+            "INSERT INTO libraries (id, name, kind) VALUES ('summary-lib', 'Summary', 'MOVIE');
+             INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES (
+                 'summary-root', 'summary-lib', '/summary', '/summary', 1, 1
+             );
+             INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation
+             ) VALUES
+                 ('summary-file-a', 'summary-root', 'One/one-a.mkv', 'FILE', 10, 10, 'gen'),
+                 ('summary-file-b', 'summary-root', 'One/one-b.mkv', 'FILE', 20, 10, 'gen'),
+                 ('summary-file-two', 'summary-root', 'Two/two.mkv', 'FILE', 30, 10, 'gen');
+             INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, overview, added_at,
+                 runtime_ticks, identification_status, has_available_source
+             ) VALUES
+                 ('summary-one', 'summary-lib', 'MOVIE', 'One', 'one', 'First overview',
+                  300, 36000000000, 'LOCAL_CONFIRMED', 1),
+                 ('summary-two', 'summary-lib', 'MOVIE', 'Two', 'two', NULL,
+                  200, NULL, 'LOCAL_CONFIRMED', 1),
+                 ('summary-three', 'summary-lib', 'MOVIE', 'Three', 'three', NULL,
+                  100, NULL, 'LOCAL_CONFIRMED', 1);
+             INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, edition_name, quality_label,
+                 container, size, bitrate, duration_ticks, is_default, probe_status
+             ) VALUES
+                 ('summary-source-a', 'summary-one', 'LOCAL_FILE', 'summary-file-a',
+                  'Theatrical', '1080p', 'mkv', 1000, 8000000, 36000000000, 1, 'READY'),
+                 ('summary-source-b', 'summary-one', 'LOCAL_FILE', 'summary-file-b',
+                  NULL, '2160p', 'mkv', 2000, 16000000, 36000000000, 0, 'READY'),
+                 ('summary-source-two', 'summary-two', 'LOCAL_FILE', 'summary-file-two',
+                  NULL, NULL, 'mkv', 3000, 4000000, 18000000000, 1, 'READY');
+             INSERT INTO media_streams (
+                 id, media_source_id, stream_index, stream_type, codec, language, title,
+                 details_json, is_external, is_default, is_forced
+             ) VALUES
+                 ('summary-stream-a0', 'summary-source-a', 0, 'VIDEO', 'h264', 'eng',
+                  '1080p H264', '{\"Width\":\"1920\"}', 0, 1, 0),
+                 ('summary-stream-a1', 'summary-source-a', 1, 'AUDIO', 'aac', 'eng',
+                  'AAC Stereo', '{\"Channels\":\"2\"}', 0, 1, 0),
+                 ('summary-stream-b0', 'summary-source-b', 0, 'VIDEO', 'hevc', 'eng',
+                  '2160p HEVC', '{\"Width\":\"3840\"}', 0, 1, 0);
+             INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+             VALUES ('summary-poster', 'summary-one', 'POSTER', 0, '/summary/poster.jpg')";
+        database.query(fixture).execute(database.pool()).await?;
+
+        let libraries = vec!["summary-lib".to_owned()];
+        let filter = CatalogFilterQuery {
+            library_ids: &libraries,
+            user_id: "summary-user",
+            item_types: &[],
+            excluded_item_types: &[],
+            item_ids: None,
+            person_id: None,
+            media_source_ids: None,
+            provider_id_equals: None,
+            years: &[],
+            is_played: None,
+            is_favorite: None,
+            min_date_last_saved: None,
+            metadata_pending: false,
+            parent_id_scope: None,
+            content_restrictions: None,
+            sort_by: CatalogSort::DateCreated,
+            descending: true,
+            offset: 0,
+            limit: 24,
+            include_total: false,
+        };
+
+        database.reset_query_count();
+        let (full_rows, _) = database.list_filtered_catalog_rows(&filter).await?;
+        assert_eq!(
+            database.query_count(),
+            1,
+            "the full projection is one statement"
+        );
+        database.reset_query_count();
+        let (summary_rows, _) = database
+            .list_filtered_catalog_rows_with_projection(&filter, CatalogRowProjection::Summary)
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            1,
+            "the summary projection must not fan out into a second statement"
+        );
+
+        let key = |row: &StoredCatalogRow| (row.item_id.clone(), row.source_id.clone());
+        assert_eq!(
+            full_rows.iter().map(key).collect::<Vec<_>>(),
+            [
+                (
+                    "summary-one".to_owned(),
+                    Some("summary-source-a".to_owned())
+                ),
+                (
+                    "summary-one".to_owned(),
+                    Some("summary-source-a".to_owned())
+                ),
+                (
+                    "summary-one".to_owned(),
+                    Some("summary-source-b".to_owned())
+                ),
+                (
+                    "summary-two".to_owned(),
+                    Some("summary-source-two".to_owned())
+                ),
+                ("summary-three".to_owned(), None),
+            ]
+        );
+        assert_eq!(
+            summary_rows.iter().map(key).collect::<Vec<_>>(),
+            [
+                (
+                    "summary-one".to_owned(),
+                    Some("summary-source-a".to_owned())
+                ),
+                (
+                    "summary-one".to_owned(),
+                    Some("summary-source-b".to_owned())
+                ),
+                (
+                    "summary-two".to_owned(),
+                    Some("summary-source-two".to_owned())
+                ),
+                ("summary-three".to_owned(), None),
+            ]
+        );
+        // Behaviour, not query-plan text: the full projection fans out into one row per stream and
+        // carries the stream columns, the summary projection stops at one row per source.
+        assert!(
+            full_rows.len() > summary_rows.len(),
+            "the full projection fans out into one row per stream: {} vs {}",
+            full_rows.len(),
+            summary_rows.len()
+        );
+        assert_eq!(
+            full_rows[0].stream_id.as_deref(),
+            Some("summary-stream-a0"),
+            "the full projection still hydrates streams"
+        );
+        assert_eq!(
+            full_rows[0].stream_details_json.as_deref(),
+            Some(r#"{"Width":"1920"}"#)
+        );
+        assert!(
+            summary_rows
+                .iter()
+                .all(|row| row.stream_id.is_none() && row.stream_details_json.is_none()),
+            "the summary projection reports no stream row and no details_json"
+        );
+        // The four image tags still come from the summary projection, unchanged.
+        assert_eq!(
+            summary_rows[0].poster_image_tag.as_deref(),
+            Some("summary-poster")
+        );
+
+        // Each summary row is the first full row of its (item, source) group with the stream
+        // columns cleared. Any other divergence would be a DTO change.
+        let mut expected: Vec<StoredCatalogRow> = Vec::new();
+        for row in &full_rows {
+            let repeated = expected.last().is_some_and(|previous| {
+                previous.item_id == row.item_id && previous.source_id == row.source_id
+            });
+            if repeated {
+                continue;
+            }
+            let mut row = row.clone();
+            row.stream_id = None;
+            row.stream_index = None;
+            row.stream_type = None;
+            row.codec = None;
+            row.language = None;
+            row.stream_title = None;
+            row.stream_details_json = None;
+            row.stream_is_external = None;
+            row.stream_is_default = None;
+            row.stream_is_forced = None;
+            expected.push(row);
+        }
+        assert_eq!(summary_rows, expected);
+
+        // Absence assertion only: the plan must not name `media_streams` at all. This stays true
+        // whatever index the planner picks, unlike a positive "the plan mentions the table because
+        // its generated index is named after it" check.
+        let summary_plan = database
+            .explain_filtered_catalog_rows(&filter, CatalogRowProjection::Summary)
+            .await?;
+        assert!(
+            !summary_plan
+                .iter()
+                .any(|line| line.contains("media_streams")),
+            "the summary projection must not read media_streams: {summary_plan:?}"
+        );
+
+        let counted = CatalogFilterQuery {
+            include_total: true,
+            ..filter
+        };
+        let (_, full_total) = database.list_filtered_catalog_rows(&counted).await?;
+        let (_, summary_total) = database
+            .list_filtered_catalog_rows_with_projection(&counted, CatalogRowProjection::Summary)
+            .await?;
+        assert_eq!(full_total, 3);
+        assert_eq!(summary_total, full_total);
+
+        database.close().await;
+        Ok(())
+    }
+
     #[test]
     fn multi_library_default_date_page_binds_match_placeholders() {
         let libraries = vec!["library-a".to_owned(), "library-b".to_owned()];
@@ -10266,7 +10552,7 @@ mod tests {
             limit: 24,
             include_total: false,
         };
-        let (query, binds) = filtered_catalog_list_query(&filter);
+        let (query, binds) = filtered_catalog_list_query(&filter, CatalogRowProjection::Full);
         assert!(query.contains("UNION ALL"));
         assert_eq!(
             query.matches('?').count(),
@@ -10300,7 +10586,7 @@ mod tests {
             limit: 24,
             include_total: true,
         };
-        let (query, binds) = filtered_catalog_list_query(&filter);
+        let (query, binds) = filtered_catalog_list_query(&filter, CatalogRowProjection::Full);
         assert!(query.contains("UNION ALL"));
         assert_eq!(query.matches("mi.library_id = ?").count(), 2);
         assert_eq!(binds.len(), 6);
@@ -10309,7 +10595,7 @@ mod tests {
             offset: 201,
             ..filter
         };
-        let (query, _) = filtered_catalog_list_query(&deep);
+        let (query, _) = filtered_catalog_list_query(&deep, CatalogRowProjection::Full);
         assert!(!query.contains("UNION ALL"));
     }
 

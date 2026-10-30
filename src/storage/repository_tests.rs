@@ -11796,7 +11796,9 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             limit: 24,
             include_total: true,
         };
-        let plan = database.explain_filtered_catalog_rows(&filter).await?;
+        let plan = database
+            .explain_filtered_catalog_rows(&filter, crate::storage::CatalogRowProjection::Full)
+            .await?;
         let joined = plan.join("\n");
         assert!(
             joined.contains(index_name),
@@ -23157,6 +23159,144 @@ async fn catalog_read_model_single_item_rows_match_the_legacy_join()
         assert_eq!(legacy.is_default, read_model.is_default);
         assert_eq!(legacy.poster_image_tag, read_model.poster_image_tag);
     }
+    Ok(())
+}
+
+/// The read model builds the legacy row shape from one core query plus one batched source query.
+/// A grid/card page asks for the summary projection, so that second query must stop joining
+/// `media_streams` and must stop reading `details_json` — while a full page keeps both, from the
+/// same statement count.
+#[tokio::test]
+async fn catalog_read_model_summary_projection_skips_streams_and_details_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::{CatalogRowProjection, ReadModelPageQuery, ReadModelSort, test_database};
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind)
+         VALUES ('read-model-summary-lib', 'Summary RM', 'MOVIE')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at
+         ) VALUES ('read-model-summary-item', 'read-model-summary-lib', 'MOVIE',
+                   'Summary RM', 'summary rm', 'LOCAL_CONFIRMED', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('read-model-summary-root', 'read-model-summary-lib', '/tmp', '/tmp', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+         ) VALUES ('read-model-summary-fe', 'read-model-summary-root', 'Summary.RM.mkv',
+                   'FILE', 1, 1, 1, 1, X'00', 'g1', 'NEW')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default,
+                                    probe_status, duration_ticks)
+         VALUES ('read-model-summary-source', 'read-model-summary-item', 'LOCAL_FILE',
+                 'read-model-summary-fe', 1, 'READY', 7200000000)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (
+             id, media_source_id, stream_index, stream_type, codec, details_json, is_default
+         ) VALUES ('read-model-summary-video', 'read-model-summary-source', 0, 'VIDEO',
+                   'h264', '{\"Width\":\"1920\"}', 1),
+                  ('read-model-summary-audio', 'read-model-summary-source', 1, 'AUDIO',
+                   'aac', '{\"Channels\":\"2\"}', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('read-model-summary-poster', 'read-model-summary-item', 'POSTER', 0,
+                 '/tmp/poster.jpg')",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let item_types = Vec::new();
+    let page = ReadModelPageQuery {
+        library_id: "read-model-summary-lib",
+        item_types: &item_types,
+        excluded_item_types: &[],
+        sort: ReadModelSort::SortTitle,
+        descending: false,
+        offset: 0,
+        limit: 24,
+        include_total: true,
+    };
+
+    database.reset_query_count();
+    let (full_rows, full_total) = database
+        .list_catalog_rows_from_read_model(&page, CatalogRowProjection::Full)
+        .await?;
+    let full_statements = database.query_count();
+    database.reset_query_count();
+    let (summary_rows, summary_total) = database
+        .list_catalog_rows_from_read_model(&page, CatalogRowProjection::Summary)
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        full_statements,
+        "the summary projection must not add a statement"
+    );
+
+    assert_eq!(full_total, 1);
+    assert_eq!(summary_total, full_total);
+    assert_eq!(
+        full_rows.len(),
+        2,
+        "the full projection fans out per stream"
+    );
+    assert_eq!(
+        summary_rows.len(),
+        1,
+        "the summary projection stops at sources"
+    );
+    assert!(full_rows.iter().any(|row| row.stream_id.is_some()));
+    assert!(
+        full_rows
+            .iter()
+            .any(|row| row.stream_details_json.as_deref() == Some(r#"{"Width":"1920"}"#))
+    );
+    assert!(
+        summary_rows
+            .iter()
+            .all(|row| row.stream_id.is_none() && row.stream_details_json.is_none()),
+        "the summary projection reports no stream row and no details_json"
+    );
+
+    // Everything outside the stream group must match the full projection field by field.
+    let mut expected = full_rows[0].clone();
+    expected.stream_id = None;
+    expected.stream_index = None;
+    expected.stream_type = None;
+    expected.codec = None;
+    expected.language = None;
+    expected.stream_title = None;
+    expected.stream_details_json = None;
+    expected.stream_is_external = None;
+    expected.stream_is_default = None;
+    expected.stream_is_forced = None;
+    assert_eq!(summary_rows[0], expected);
+
+    database.close().await;
     Ok(())
 }
 

@@ -2279,6 +2279,187 @@ async fn homevideo_catalog_folders_are_browsable() -> Result<(), Box<dyn std::er
     Ok(())
 }
 
+/// The web grid reads `fields=card`, whose DTO renders the item columns, the image tags and the
+/// preferred source duration but no `mediaSources`, so the catalogue reads that page with the
+/// summary row projection instead of joining `media_streams`. The full projection must keep
+/// returning the same rows *and* the streams, including when a card page for the same cache key
+/// was loaded (and cached) first.
+#[tokio::test]
+async fn library_grid_card_page_keeps_the_full_page_streams()
+-> Result<(), Box<dyn std::error::Error>> {
+    use luxd::application::catalog::{CatalogFilter, CatalogItemProjection, CatalogSort};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("admin", "Admin", "correct password")
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Grid Projection", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO library_roots (
+            id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('grid-projection-root', ?, '/grid', '/grid', 1, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+            id, library_root_id, relative_path, entry_kind, size, modified_at,
+            last_seen_generation
+         ) VALUES ('grid-projection-file', 'grid-projection-root', 'Grid/grid.mkv',
+                   'FILE', 10, 10, 'gen')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, overview, runtime_ticks,
+            identification_status, has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Grid Movie', 'grid movie', 'Grid overview',
+                   7200000000, 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&item_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (
+            id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+            size, bitrate, duration_ticks, is_default, probe_status
+         ) VALUES ('grid-projection-source', ?, 'LOCAL_FILE', 'grid-projection-file',
+                   '1080p', 'mkv', 1000, 8000000, 7200000000, 1, 'READY')",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (
+            id, media_source_id, stream_index, stream_type, codec, language, title,
+            details_json, is_default
+         ) VALUES ('grid-projection-video', 'grid-projection-source', 0, 'VIDEO',
+                   'h264', 'eng', '1080p H264', '{\"Width\":\"1920\"}', 1),
+                  ('grid-projection-audio', 'grid-projection-source', 1, 'AUDIO',
+                   'aac', 'eng', 'AAC Stereo', '{\"Channels\":\"2\"}', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('grid-projection-poster', ?, 'POSTER', 0, '/grid/poster.jpg')",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let principal = AccessPrincipal::new(admin.id, true);
+    let filter = CatalogFilter {
+        sort_by: CatalogSort::Name,
+        include_total: false,
+        ..CatalogFilter::default()
+    };
+
+    let card_page = catalog
+        .list_library_items_in_scope_with_projection(
+            principal,
+            &library_id,
+            &filter,
+            None,
+            0,
+            10,
+            CatalogItemProjection::Card,
+        )
+        .await?;
+    assert_eq!(card_page.items.len(), 1);
+    let card_item = &card_page.items[0];
+    assert_eq!(card_item.id, item_id);
+    assert_eq!(
+        card_item.poster_image_tag.as_deref(),
+        Some("grid-projection-poster")
+    );
+    let card_source = card_item
+        .media_sources
+        .first()
+        .ok_or("the card page lost the media source it renders defaultDurationTicks from")?;
+    assert_eq!(card_source.duration_ticks, Some(7_200_000_000));
+    assert!(card_source.is_default);
+    assert!(
+        card_source.streams.is_empty(),
+        "the card projection must not read media streams"
+    );
+
+    // Same cache key apart from the projection: the full page must not be served the summary rows.
+    let full_page = catalog
+        .list_library_items_in_scope(principal, &library_id, &filter, None, 0, 10)
+        .await?;
+    assert_eq!(full_page.items.len(), 1);
+    let full_item = &full_page.items[0];
+    assert_eq!(full_item.id, card_item.id);
+    assert_eq!(full_item.poster_image_tag, card_item.poster_image_tag);
+    assert_eq!(full_item.fanart_image_tag, card_item.fanart_image_tag);
+    assert_eq!(full_item.thumb_image_tag, card_item.thumb_image_tag);
+    assert_eq!(full_item.logo_image_tag, card_item.logo_image_tag);
+    assert_eq!(full_item.overview, card_item.overview);
+    assert_eq!(full_item.media_sources.len(), card_item.media_sources.len());
+    let full_source = &full_item.media_sources[0];
+    assert_eq!(full_source.id, card_source.id);
+    assert_eq!(full_source.duration_ticks, card_source.duration_ticks);
+    assert_eq!(full_source.is_default, card_source.is_default);
+    assert_eq!(full_source.quality_label, card_source.quality_label);
+    assert_eq!(full_source.container, card_source.container);
+    assert_eq!(full_source.size, card_source.size);
+    assert_eq!(full_source.bitrate, card_source.bitrate);
+    assert_eq!(
+        full_source
+            .streams
+            .iter()
+            .map(|stream| (
+                stream.index,
+                stream.stream_type.as_str(),
+                stream.codec.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [(0, "VIDEO", Some("h264")), (1, "AUDIO", Some("aac"))]
+    );
+    assert_eq!(
+        full_source.streams[0]
+            .details
+            .get("Width")
+            .and_then(serde_json::Value::as_str),
+        Some("1920"),
+        "the full projection still hydrates details_json"
+    );
+
+    // The cached card page stays stream-free after the full page was loaded.
+    let card_again = catalog
+        .list_library_items_in_scope_with_projection(
+            principal,
+            &library_id,
+            &filter,
+            None,
+            0,
+            10,
+            CatalogItemProjection::Card,
+        )
+        .await?;
+    assert!(
+        card_again.items[0].media_sources[0].streams.is_empty(),
+        "the card page must keep the summary projection"
+    );
+
+    database.close().await;
+    Ok(())
+}
+
 fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
     headers
         .get_all(SET_COOKIE)

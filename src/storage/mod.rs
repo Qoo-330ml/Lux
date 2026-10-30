@@ -829,6 +829,7 @@ pub(crate) struct ItemMetadataCompletenessCommit {
     pub(crate) scheduled_job_ids: Vec<String>,
 }
 
+pub(crate) use repository::CatalogRowProjection;
 pub(crate) use repository::GLOBAL_COLLECTION_LIBRARY_ID;
 pub(crate) use repository::MAX_PLAYBACK_SESSION_WINDOW_SECONDS;
 pub(crate) use repository::{AccessChangeEpochs, AccessEpoch};
