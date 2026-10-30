@@ -34403,6 +34403,75 @@ async fn batched_accessible_library_ids_match_single_user_queries() {
 }
 
 #[tokio::test]
+async fn library_deletion_open_filter_lists_only_unfinished_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    for (id, library_id, name, status, created_at) in [
+        ("job-open-pending", "lib-pending", "Pending", "PENDING", 3),
+        ("job-open-failed", "lib-failed", "Failed", "FAILED", 2),
+        (
+            "job-open-completed",
+            "lib-completed",
+            "Completed",
+            "COMPLETED",
+            1,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_deletion_jobs (
+                 id, library_id, library_name, status, stage, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'MEDIA_ITEMS', ?, ?)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(name)
+        .bind(status)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let open = database
+        .list_library_deletion_jobs(0, 20, Some("OPEN"))
+        .await?;
+    assert_eq!(
+        open.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        vec!["job-open-pending", "job-open-failed"],
+        "the operations filter must keep running failures visible and completed rows out"
+    );
+    assert_eq!(
+        database.count_library_deletion_jobs(Some("OPEN")).await?,
+        2,
+        "the paginated total follows the same predicate as the page"
+    );
+
+    let completed = database
+        .list_library_deletion_jobs(0, 20, Some("COMPLETED"))
+        .await?;
+    assert_eq!(
+        completed
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["job-open-completed"],
+        "completed history stays reachable by its exact status"
+    );
+    assert_eq!(database.count_library_deletion_jobs(None).await?, 3);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
 async fn media_item_child_delete_list_covers_every_cascade_edge()
 -> Result<(), Box<dyn std::error::Error>> {
     use super::library_deletion::MEDIA_ITEM_CHILD_DELETES;

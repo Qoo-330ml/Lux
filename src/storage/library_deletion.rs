@@ -302,6 +302,19 @@ fn deletion_restore_pragmas(backend: DatabaseBackend) -> &'static [&'static str]
     }
 }
 
+/// Translates the admin list filter into a SQL predicate and its bound parameter.
+///
+/// `OPEN` is the operations view's "still needs attention" alias: every deletion that has not
+/// finished yet. `COMPLETED` rows stay reachable by their exact status, so the history is kept
+/// without living in the default view.
+fn library_deletion_status_filter(status: Option<&str>) -> (&'static str, Option<&str>) {
+    match status {
+        Some("OPEN") => (" WHERE status <> 'COMPLETED'", None),
+        Some(status) => (" WHERE status = ?", Some(status)),
+        None => ("", None),
+    }
+}
+
 fn stored_library_deletion_job(row: sqlx::any::AnyRow) -> StoredLibraryDeletionJob {
     StoredLibraryDeletionJob {
         id: row.get("id"),
@@ -427,29 +440,21 @@ impl Database {
         limit: i64,
         status: Option<&str>,
     ) -> Result<Vec<StoredLibraryDeletionJob>, StorageError> {
-        let rows = if let Some(status) = status {
-            self.query(sqlx::AssertSqlSafe(format!(
-                "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
-                 FROM library_deletion_jobs WHERE status = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-            )))
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            self.query(sqlx::AssertSqlSafe(format!(
-                "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
-                 FROM library_deletion_jobs
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-            )))
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
+        let (filter, bound_status) = library_deletion_status_filter(status);
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
+             FROM library_deletion_jobs{filter}
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        )));
+        if let Some(bound_status) = bound_status {
+            query = query.bind(bound_status);
         }
-        .map_err(self.sqlx_err())?;
+        let rows = query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
         Ok(rows.into_iter().map(stored_library_deletion_job).collect())
     }
 
@@ -457,17 +462,14 @@ impl Database {
         &self,
         status: Option<&str>,
     ) -> Result<i64, StorageError> {
-        let count = if let Some(status) = status {
-            self.query_scalar("SELECT COUNT(*) FROM library_deletion_jobs WHERE status = ?")
-                .bind(status)
-                .fetch_one(&self.pool)
-                .await
-        } else {
-            self.query_scalar("SELECT COUNT(*) FROM library_deletion_jobs")
-                .fetch_one(&self.pool)
-                .await
+        let (filter, bound_status) = library_deletion_status_filter(status);
+        let mut query = self.query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM library_deletion_jobs{filter}"
+        )));
+        if let Some(bound_status) = bound_status {
+            query = query.bind(bound_status);
         }
-        .map_err(self.sqlx_err())?;
+        let count: i64 = query.fetch_one(&self.pool).await.map_err(self.sqlx_err())?;
         Ok(count)
     }
 

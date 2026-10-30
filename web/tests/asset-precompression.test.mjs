@@ -6,6 +6,9 @@ import zlib from "node:zlib";
 
 const assets = path.resolve(import.meta.dirname, "..", "dist", "assets");
 const extensions = new Set([".js", ".css", ".svg", ".html", ".json"]);
+// The precompression helper skips assets below this size; tower-http's precompressed_gzip
+// falls back to the uncompressed file, so tiny chunks legitimately ship without a sibling.
+const minimumBytes = 512;
 const repositoryRoot = path.resolve(import.meta.dirname, "../..");
 const webRoot = path.join(repositoryRoot, "web");
 
@@ -44,6 +47,7 @@ test("built Web assets have matching gzip siblings", () => {
   assert.ok(files.length > 0, "the build produced no static assets");
   for (const name of files) {
     const source = path.join(assets, name);
+    if (fs.statSync(source).size < minimumBytes) continue;
     const compressed = `${source}.gz`;
     assert.ok(fs.existsSync(compressed), `missing ${name}.gz`);
     assert.deepEqual(
