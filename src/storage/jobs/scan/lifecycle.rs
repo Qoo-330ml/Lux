@@ -96,7 +96,9 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_scan_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_scan_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -138,7 +140,10 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         };
-        rows.map(|rows| rows.into_iter().map(stored_scan_job).collect())
+        rows.map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_scan_job)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())
     }
 
@@ -162,7 +167,10 @@ impl Database {
         .bind(library_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_scan_job).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_scan_job)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -203,7 +211,10 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_scan_job).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_scan_job)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -239,7 +250,9 @@ impl Database {
         .bind(library_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_scan_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_scan_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -263,7 +276,9 @@ impl Database {
         .bind(job_type)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_scan_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_scan_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 

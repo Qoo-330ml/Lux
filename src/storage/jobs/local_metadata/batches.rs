@@ -273,10 +273,10 @@ impl Database {
             }
         }
         .map_err(self.sqlx_err())?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(stored_scan_local_metadata_batch)
-            .collect())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_scan_local_metadata_images_complete(
@@ -346,7 +346,10 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
-        Ok(claimed.map(stored_scan_local_metadata_batch))
+        claimed
+            .map(stored_scan_local_metadata_batch)
+            .transpose()
+            .map_err(self.sqlx_err())
     }
 
     #[cfg(test)]

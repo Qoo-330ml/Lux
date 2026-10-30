@@ -48,7 +48,9 @@ impl Database {
         .bind(relative_path)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_filesystem_entry))
+        .map_err(self.sqlx_err())?
+        .map(stored_filesystem_entry)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -114,7 +116,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let entry = stored_filesystem_entry(row);
+                let entry = stored_filesystem_entry(row).map_err(self.sqlx_err())?;
                 entries.insert(entry.relative_path.clone(), entry);
             }
         }
@@ -177,7 +179,11 @@ impl Database {
         if rows.len() != 1 {
             return Ok(None);
         }
-        Ok(rows.into_iter().next().map(stored_filesystem_entry))
+        rows.into_iter()
+            .next()
+            .map(stored_filesystem_entry)
+            .transpose()
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn move_filesystem_entry(
