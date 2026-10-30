@@ -361,6 +361,10 @@ export type { ItemMetadata } from "./generated/ItemMetadata";
 
 export type { ItemImage } from "./generated/ItemImage";
 
+export type { ItemImagesResponse } from "./generated/ItemImagesResponse";
+
+export type { ItemImageSelectResponse } from "./generated/ItemImageSelectResponse";
+
 export type ImageSearchResult = {
   id: string;
   imageType: string;

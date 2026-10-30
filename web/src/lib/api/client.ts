@@ -120,7 +120,8 @@ import type {
   MediaActor,
   MediaItem,
   ItemMetadata,
-  ItemImage,
+  ItemImagesResponse,
+  ItemImageSelectResponse,
   ImageSearchResult,
   LoginBackgroundResponse,
   MetadataFieldName,
@@ -847,7 +848,7 @@ export class LuxApiClient {
   }
 
   itemImages(itemId: string) {
-    return this.request<{ images?: ItemImage[] }>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
+    return this.request<ItemImagesResponse>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
   }
 
   searchItemImages(itemId: string, input: { imageType: string; language: string; source: string }) {
@@ -858,7 +859,7 @@ export class LuxApiClient {
   }
 
   selectItemImage(itemId: string, input: { imageType: string; url: string; language?: string | null }) {
-    return this.request<{ image: ItemImage }>(
+    return this.request<ItemImageSelectResponse>(
       `/api/v1/items/${encodeURIComponent(itemId)}/images/select`,
       { method: "POST", body: JSON.stringify(input) },
     );
