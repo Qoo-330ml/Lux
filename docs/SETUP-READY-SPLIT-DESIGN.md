@@ -624,3 +624,52 @@ src/api/users.rs:153,206              2 处  core 探针的 database 守卫（�
 步骤 3 的批次；真正的收尾提交（批 9）只负责删除**兼容层**：46 个 Option 访问器、`Deref<Target = CoreState>`
 for `AppState`、`FromRef<ReadyAppState> for AppState`、`StateView`、`require_service!`/`require_ready!`
 两个宏及其 6 个单元测试（`src/api/legacy.rs:2416-2485` 区域）。
+
+## 8. 问题 7：回滚边界与提交序列
+
+### 8.1 提交序列
+
+| # | 提交 | 内容 | 可单独回滚 | 回滚后仍编译 |
+| --- | --- | --- | --- | --- |
+| C0 | 本设计文档 | 只加 `docs/SETUP-READY-SPLIT-DESIGN.md` | 是 | 是（不动代码） |
+| C1 | **批 0**：类型与树骨架 | `ReadyAppState`/`SetupState`/`AppMode`、3 个 `FromRef`（含迁移期 `AppState`）、`StateView`、`apply_common_layers`、24 个 `api_routes()` 返回类型、`app_with_state` 分派 + 未就绪兼容树、`core_routes` 搬移 | 是 | 是（回到今天的单树 `AppState`，§8.3 有例外说明） |
+| C2–C9 | **批 1–8**：文件组迁移 | 每批改 `State<AppState>` → `State<ReadyAppState>`、删守卫、文件私有 helper 改签名 | 是，逐批独立 | 是（`FromRef<ReadyAppState> for AppState` 让未迁移文件继续工作） |
+| C10 | **批 9**：收尾 | `users.rs` + 6 个 setup handler 切 `State<SetupState>`、`admin_common` 2 处守卫、删两个宏与 6 个宏单测、删 46 个 Option 访问器、删 `FromRef<ReadyAppState> for AppState`、删 `StateView`、`main` 插入 `decide_mode` + 选树 | **否**（见 §8.2） | — |
+| C11 | 观察期后的清理（可选） | `CoreState.database_selection_required` 移入 `SetupState`，3 处 worker 短路改写 | 是 | 是 |
+
+`main` 的 6 行改动（§5.5）放进 C10 而不是 C1：C1 之后 `app_with_state` 已经能按状态分派，
+`main` 继续用 `app_with_state(app_state)` 也完全正确（永远走 ready 树），因此**在批次迁移期间不需要
+动 `main`**；只有 setup 树真正可用（C10 完成 setup handler 的 `State<SetupState>` 切换）时，才把
+`main` 切到显式选树。
+
+### 8.2 不可单独回退的组合
+
+1. **C10 必须整体回滚。** 它同时删除 `FromRef<ReadyAppState> for AppState`、`StateView` 与 46 个
+   Option 访问器；只回退其中一半会出现"某文件仍在用兼容访问器但访问器已删"或"某 helper 仍取
+   `&impl StateView` 但 trait 已删"的编译错误。回滚方式：`git revert C10` 单个提交即可（它在历史里
+   是原子的），不要把 C10 拆成多提交。
+2. **批 i 的 handler 改动与它的守卫删除是同一个提交。** 改签名后旧守卫（`require_service!` 返回
+   `Option<&Service>` 形态）必然编译不过，中间态不可存在。
+3. **`api_routes()` 的返回类型翻转（C1）不能单独回退而保留任何批 1–8 的成果。** 回退 C1 意味
+   所有 `api_routes()` 回到 `Router<AppState>`，此时 `State<ReadyAppState>` 的 handler 无法解析
+   `FromRef<AppState> for ReadyAppState`（本设计明确不实现，§3.1）→ 编译失败。因此回退顺序必须是
+   **先回退 C2–C10（或整体回到 C0），再回退 C1**。
+
+### 8.3 C1 单独回滚的一个已知例外
+
+C1 把 `/health/live`、`/health/ready`、`/api/v1/version` 三条注册从 `users::api_routes()` 搬进
+`core_routes()`，并在 `app_with_state` 里引入未就绪兼容树。回退 C1 会同时撤掉兼容树——这在
+C1 之后、C2 之前是安全的（此时还没有 handler 迁移）。但**如果 C2–C9 已经落地**，回退 C1 会破坏
+§8.2 第 3 条的约束；所以"回退 C1"只在"刚提交 C1 就发现构建/测试红"这个窗口内成立。
+
+### 8.4 每个提交的验证口径
+
+| 提交 | 必跑 |
+| --- | --- |
+| C0 | `cargo fmt --all -- --check`（只碰 docs，可省） |
+| C1 | `cargo build --locked`；`cargo test --locked --test api_web`；`cargo test --locked --test storage database_setup_api::`；`cargo test --locked --test plugins danmaku_api::` |
+| C2–C9 | `cargo build --locked` + 批 1–8 表里该组的窄命令（`cargo test --locked --test <group> <module>::`，见 `docs/TEST-TARGETS.md`）+ `cargo clippy --locked --all-targets --all-features -- -D warnings` |
+| C10 | 全量门禁：`cargo build --locked`、`cargo test --locked --all-targets`、`cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、`python3 scripts/check-migration-parity.py`、`python3 scripts/check-backend-branches.py` |
+| C11 | 同 C10 的全量门禁（它动 `CoreState` 字段与 worker 启动条件） |
+
+不 push、不合并到其它分支；C10 之前的每个提交都可以单独 `git revert`。
