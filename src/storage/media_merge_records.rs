@@ -1477,6 +1477,59 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unmerge_records_the_provider_suppression_shared_by_both_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        let library_id = library.id.to_string();
+        for (id, year) in [("movie-a", 2020), ("movie-b", 2021)] {
+            insert_item(
+                &database,
+                &library_id,
+                id,
+                "MOVIE",
+                None,
+                None,
+                None,
+                None,
+                Some(r#"{"tmdb":"42"}"#),
+                Some(year),
+                id,
+            )
+            .await?;
+            insert_source(&database, &format!("source-{id}"), id, None, 1).await?;
+        }
+        // The media_items trigger indexes each item's provider_ids_json, so both items now carry
+        // the same `tmdb`/`42` key: the unmerge must remember that provider key instead of falling
+        // back to the title+year suppression.
+        let indexed_keys: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_item_provider_ids
+             WHERE provider = 'tmdb' AND provider_id = '42'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(indexed_keys, 2);
+
+        database
+            .merge_media_items("movie-a", &["movie-a".to_owned(), "movie-b".to_owned()])
+            .await?;
+        database.unmerge_media_items("movie-a", "movie-b").await?;
+
+        let suppressions = sqlx::query_as::<_, (String, String)>(
+            "SELECT provider, provider_id FROM merge_suppressions
+             WHERE library_id = ? AND item_type = 'MOVIE'",
+        )
+        .bind(&library_id)
+        .fetch_all(database.pool())
+        .await?;
+        // A single provider row: the shared key branch ran and the title fallback did not.
+        assert_eq!(suppressions, vec![("tmdb".to_owned(), "42".to_owned())]);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn media_merge_record_row_reports_a_missing_column_instead_of_panicking()
     -> Result<(), Box<dyn std::error::Error>> {
         use sqlx::FromRow;
