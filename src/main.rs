@@ -115,6 +115,13 @@ fn legacy_log_migration_error_code(error: &StorageError) -> &'static str {
 }
 
 /// Applies the one-time repairs that must finish before the HTTP listener accepts requests.
+///
+/// Measured steady-state cost on a repaired database (66k media items, see
+/// `docs/STARTUP-REPAIRS.md`): every step below costs one `lux_meta` read and writes nothing,
+/// because the repairs already record their completion there. `run_database_lifecycle_cleanup`
+/// used to be the exception, re-running its claim protocol on every start; it now records the
+/// completed version with `Database::run_startup_repair_once` and only its recurring scan payload
+/// sweep still runs. New repairs belong behind that helper instead of an ad-hoc marker.
 async fn repair_historical_data(database: &Database) {
     match luxd::application::image_repairs::repair_episode_image_path_conflicts(database).await {
         Ok(report) if report.repaired > 0 || report.skipped > 0 => {

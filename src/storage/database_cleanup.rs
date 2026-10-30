@@ -3,6 +3,9 @@ use std::future::Future;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 const DATABASE_CLEANUP_MARKER: &str = "database_lifecycle_cleanup_v1";
+/// Name and version of the one-time lifecycle cleanup in `startup_repair:<name>`.
+const DATABASE_LIFECYCLE_CLEANUP_REPAIR: &str = "database_lifecycle_cleanup";
+const DATABASE_LIFECYCLE_CLEANUP_REPAIR_VERSION: i64 = 1;
 const MEDIA_SOURCE_DEFAULT_REPAIR_MARKER: &str = "startup_repair_media_source_defaults_v1";
 const DATABASE_CLEANUP_PENDING: &str = "PENDING";
 const DATABASE_CLEANUP_RUNNING: &str = "RUNNING";
@@ -427,21 +430,45 @@ impl Database {
     /// The marker is claimed atomically and only marked completed after every
     /// bounded batch has committed. A failed or interrupted run can therefore
     /// be retried by the next container start without losing resumable work.
+    ///
+    /// The claim protocol itself is skipped once `startup_repair:database_lifecycle_cleanup`
+    /// records the completed version, so a restart of a cleaned database no longer pays its two
+    /// no-op `lux_meta` updates (see `docs/STARTUP-REPAIRS.md`). Completed scan manifests can still
+    /// leave payloads behind when a scan is interrupted after this version was recorded, so
+    /// `cleanup_completed_scan_manifest_payloads` stays outside the registration and keeps running
+    /// on every start.
     pub async fn run_database_lifecycle_cleanup(
+        &self,
+    ) -> Result<Option<DatabaseLifecycleCleanupReport>, StorageError> {
+        let migrated = self
+            .run_startup_repair_once(
+                DATABASE_LIFECYCLE_CLEANUP_REPAIR,
+                DATABASE_LIFECYCLE_CLEANUP_REPAIR_VERSION,
+                || self.claim_and_run_database_lifecycle_cleanup(),
+            )
+            .await?;
+        match migrated {
+            // The one-time pass already drained the manifest payloads it found.
+            Some(report) => Ok(Some(report)),
+            None => {
+                let report = self.cleanup_completed_scan_manifest_payloads().await?;
+                let deleted_payloads = report.scan_manifest_deltas_deleted > 0
+                    || report.scan_manifest_entries_deleted > 0
+                    || report.scan_manifest_directories_deleted > 0
+                    || report.scan_local_metadata_batches_deleted > 0;
+                Ok(deleted_payloads.then_some(report))
+            }
+        }
+    }
+
+    /// Returns `Ok(None)` when the one-time cleanup is already finished or owned by another run:
+    /// nothing is left for this start to do, so the caller records the completed version.
+    async fn claim_and_run_database_lifecycle_cleanup(
         &self,
     ) -> Result<Option<DatabaseLifecycleCleanupReport>, StorageError> {
         self.reset_interrupted_database_cleanup().await?;
         if !self.claim_database_cleanup().await? {
-            let report = self.cleanup_completed_scan_manifest_payloads().await?;
-            return if report.scan_manifest_deltas_deleted > 0
-                || report.scan_manifest_entries_deleted > 0
-                || report.scan_manifest_directories_deleted > 0
-                || report.scan_local_metadata_batches_deleted > 0
-            {
-                Ok(Some(report))
-            } else {
-                Ok(None)
-            };
+            return Ok(None);
         }
 
         let cleanup_result = self.perform_database_cleanup().await;
@@ -1464,9 +1491,10 @@ impl Database {
     /// claim so the next start retries; a claim left behind by a crashed process expires after
     /// [`STARTUP_REPAIR_CLAIM_STALE_SECONDS`].
     ///
-    /// The repair returns `Ok(None)` when it found nothing to do, for example because another
-    /// process already completed the underlying one-time migration. That outcome leaves the
-    /// marker untouched, because this process did not finish the work.
+    /// The repair returns `Ok(None)` when it has nothing to report, which still counts as
+    /// completed: the caller that won the claim found the work already satisfied (for example by
+    /// an older marker) and nothing is left to retry. Return `Err` for anything the next start
+    /// must retry.
     pub async fn run_startup_repair_once<Repair, Fut, T>(
         &self,
         name: &str,
@@ -1491,22 +1519,15 @@ impl Database {
         let Some(claim) = self.claim_startup_repair(&key).await? else {
             return Ok(None);
         };
-        match repair().await {
-            Ok(Some(value)) => {
-                self.record_startup_repair_version(&key, version).await?;
-                Ok(Some(value))
-            }
-            Ok(None) => {
-                // Nothing was finished here, so the claim is released instead of recorded: the
-                // next start decides again whether the repair still has work to do.
-                let _ = self.release_startup_repair_claim(&key, &claim).await;
-                Ok(None)
-            }
+        let outcome = match repair().await {
+            Ok(outcome) => outcome,
             Err(error) => {
                 let _ = self.release_startup_repair_claim(&key, &claim).await;
-                Err(error)
+                return Err(error);
             }
-        }
+        };
+        self.record_startup_repair_version(&key, version).await?;
+        Ok(outcome)
     }
 
     async fn startup_repair_marker(&self, key: &str) -> Result<StartupRepairMarker, StorageError> {
@@ -2541,10 +2562,11 @@ mod startup_repair_tests {
         Ok(())
     }
 
-    /// A closure that reports "nothing to do" did not finish the work, so it must not record the
-    /// version: the process that owns the claim is the one that completes it.
+    /// A closure that reports "nothing to log" found the work already satisfied, which is the
+    /// same completion state: the version is recorded so the next start skips the repair, and the
+    /// caller still gets no value to log.
     #[tokio::test]
-    async fn startup_repair_records_nothing_when_the_repair_finds_nothing_to_do()
+    async fn startup_repair_records_the_version_when_the_repair_has_nothing_to_report()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_directory, database) = test_database().await?;
 
@@ -2554,7 +2576,10 @@ mod startup_repair_tests {
             })
             .await?;
         assert_eq!(outcome, None);
-        assert_eq!(marker(&database, "test_repair").await?, None);
+        assert_eq!(
+            marker(&database, "test_repair").await?.as_deref(),
+            Some("1")
+        );
         Ok(())
     }
 
