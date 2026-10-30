@@ -171,6 +171,83 @@ impl UserPermissionPresetSourceRow {
     }
 }
 
+/// Minimal user projection used to resolve display names by id.
+#[derive(sqlx::FromRow)]
+struct UserDisplayNameRow {
+    id: String,
+    display_name: String,
+}
+
+/// Minimal user projection used to resolve normalized usernames by id.
+#[derive(sqlx::FromRow)]
+struct UserIdUsernameRow {
+    id: String,
+    username_normalized: String,
+}
+
+/// Typed projection of `installed_plugins`; the enabled flag is an integer in both backends.
+#[derive(sqlx::FromRow)]
+struct PluginInstallationStatusRow {
+    plugin_id: String,
+    is_enabled: i64,
+}
+
+/// Typed projection of one `user_activity_events` row.
+#[derive(sqlx::FromRow)]
+struct UserActivityEventRow {
+    id: String,
+    user_id: String,
+    actor_user_id: Option<String>,
+    event_type: String,
+    target_type: Option<String>,
+    target_id: Option<String>,
+    metadata_json: String,
+    occurred_at: i64,
+}
+
+impl UserActivityEventRow {
+    fn into_event(self) -> StoredUserActivityEvent {
+        StoredUserActivityEvent {
+            id: self.id,
+            user_id: self.user_id,
+            actor_user_id: self.actor_user_id,
+            event_type: self.event_type,
+            target_type: self.target_type,
+            target_id: self.target_id,
+            metadata_json: self.metadata_json,
+            occurred_at: self.occurred_at,
+        }
+    }
+}
+
+/// Typed projection of `user_emby_configuration`.
+#[derive(sqlx::FromRow)]
+struct UserEmbyConfigurationRow {
+    user_id: String,
+    configuration_json: String,
+}
+
+/// Typed projection of `user_library_order`.
+#[derive(sqlx::FromRow)]
+struct UserLibraryOrderRow {
+    user_id: String,
+    library_id: String,
+}
+
+/// Typed projection of `user_library_order_preferences`; the flag is an integer in both backends.
+#[derive(sqlx::FromRow)]
+struct UserAdminLibraryOrderFlagRow {
+    user_id: String,
+    use_admin_library_order: i64,
+}
+
+/// Typed projection of the `user_library_access` join.
+#[derive(sqlx::FromRow)]
+struct UserLibraryAccessRow {
+    user_id: String,
+    library_id: String,
+}
+
 impl Database {
     pub(crate) async fn apply_user_permission_preset(
         &self,
@@ -798,7 +875,7 @@ impl Database {
                 .collect::<Vec<_>>()
                 .join(", ");
             let query = format!("SELECT id, display_name FROM users WHERE id IN ({placeholders})");
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserDisplayNameRow>(sqlx::AssertSqlSafe(query));
             for user_id in user_ids {
                 statement = statement.bind(user_id);
             }
@@ -807,7 +884,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                display_names.insert(row.get("id"), row.get("display_name"));
+                display_names.insert(row.id, row.display_name);
             }
         }
         Ok(display_names)
@@ -1333,7 +1410,7 @@ impl Database {
         batch_limit: i64,
     ) -> Result<Vec<String>, StorageError> {
         let rows = self
-            .query(
+            .query_scalar::<String>(
                 "DELETE FROM users
                  WHERE id IN (
                      SELECT id FROM users
@@ -1350,10 +1427,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(rows
-            .into_iter()
-            .map(|row| row.get::<String, _>("id"))
-            .collect())
+        Ok(rows)
     }
 
     pub(crate) async fn find_user_emby_configuration(
@@ -1906,7 +1980,7 @@ impl Database {
         let count_sql =
             format!("SELECT COUNT(*) AS total_count FROM user_activity_events{where_clause}");
         let mut count_query = self
-            .query(sqlx::AssertSqlSafe(count_sql))
+            .query_scalar::<i64>(sqlx::AssertSqlSafe(count_sql))
             .bind(query.user_id);
         if let Some(event_type) = event_type {
             count_query = count_query.bind(event_type);
@@ -1920,7 +1994,6 @@ impl Database {
         let total_count = count_query
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("total_count"))
             .map_err(self.sqlx_err())?;
 
         let page_sql = format!(
@@ -1931,7 +2004,7 @@ impl Database {
              LIMIT ? OFFSET ?"
         );
         let mut page_query = self
-            .query(sqlx::AssertSqlSafe(page_sql))
+            .query_as::<UserActivityEventRow>(sqlx::AssertSqlSafe(page_sql))
             .bind(query.user_id);
         if let Some(event_type) = event_type {
             page_query = page_query.bind(event_type);
@@ -1950,16 +2023,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let events = rows
             .into_iter()
-            .map(|row| StoredUserActivityEvent {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                actor_user_id: row.get("actor_user_id"),
-                event_type: row.get("event_type"),
-                target_type: row.get("target_type"),
-                target_id: row.get("target_id"),
-                metadata_json: row.get("metadata_json"),
-                occurred_at: row.get("occurred_at"),
-            })
+            .map(UserActivityEventRow::into_event)
             .collect();
         Ok((events, total_count))
     }
@@ -2077,7 +2141,7 @@ impl Database {
                 .join(", ");
             let query =
                 format!("SELECT id, username_normalized FROM users WHERE id IN ({placeholders})");
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserIdUsernameRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id.as_str());
             }
@@ -2085,12 +2149,10 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(self.sqlx_err())?;
-            usernames.extend(rows.into_iter().map(|row| {
-                (
-                    row.get::<String, _>("id"),
-                    row.get::<String, _>("username_normalized"),
-                )
-            }));
+            usernames.extend(
+                rows.into_iter()
+                    .map(|row| (row.id, row.username_normalized)),
+            );
         }
         Ok(usernames)
     }
@@ -2584,7 +2646,7 @@ impl Database {
                         )))
                  ORDER BY access_user.id, media_library.name, media_library.id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserLibraryAccessRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -2593,8 +2655,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                if let Some(library_ids) = accessible.get_mut(&row.get::<String, _>("user_id")) {
-                    library_ids.push(row.get("library_id"));
+                if let Some(library_ids) = accessible.get_mut(&row.user_id) {
+                    library_ids.push(row.library_id);
                 }
             }
         }
@@ -2683,7 +2745,8 @@ impl Database {
                  FROM installed_plugins
                  WHERE plugin_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<PluginInstallationStatusRow>(sqlx::AssertSqlSafe(query));
             for plugin_id in chunk {
                 statement = statement.bind(plugin_id);
             }
@@ -2692,10 +2755,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                statuses.insert(
-                    row.get::<String, _>("plugin_id"),
-                    row.get::<i64, _>("is_enabled") != 0,
-                );
+                statuses.insert(row.plugin_id, row.is_enabled != 0);
             }
         }
         Ok(statuses)
@@ -3899,7 +3959,7 @@ impl Database {
                  WHERE user_id IN ({placeholders})
                  ORDER BY user_id, position, library_id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<UserLibraryOrderRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -3908,10 +3968,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                orders
-                    .entry(row.get("user_id"))
-                    .or_default()
-                    .push(row.get("library_id"));
+                orders.entry(row.user_id).or_default().push(row.library_id);
             }
         }
         Ok(orders)
@@ -3937,7 +3994,8 @@ impl Database {
                 "SELECT user_id, use_admin_library_order FROM user_library_order_preferences
                  WHERE user_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<UserAdminLibraryOrderFlagRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -3946,10 +4004,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                flags.insert(
-                    row.get("user_id"),
-                    row.get::<i64, _>("use_admin_library_order") != 0,
-                );
+                flags.insert(row.user_id, row.use_admin_library_order != 0);
             }
         }
         for user_id in user_ids {
@@ -3975,7 +4030,8 @@ impl Database {
                 "SELECT user_id, configuration_json FROM user_emby_configuration
                  WHERE user_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<UserEmbyConfigurationRow>(sqlx::AssertSqlSafe(query));
             for user_id in chunk {
                 statement = statement.bind(user_id);
             }
@@ -3984,7 +4040,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
             {
-                configurations.insert(row.get("user_id"), row.get("configuration_json"));
+                configurations.insert(row.user_id, row.configuration_json);
             }
         }
         Ok(configurations)
@@ -4816,6 +4872,114 @@ mod tests {
             .await?;
         assert!(UserPlaybackPolicyRow::from_row(&row).is_err());
         assert!(UserPermissionStateRow::from_row(&row).is_err());
+        Ok(())
+    }
+
+    /// The batched user projections decode display names, configurations and library orders.
+    #[tokio::test]
+    async fn batched_user_projections_decode_display_names_configurations_and_orders()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use std::collections::HashMap;
+
+        let (_temp_dir, database) = test_database().await?;
+        let first_id = Uuid::now_v7().to_string();
+        let second_id = Uuid::now_v7().to_string();
+        let library_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&first_id, "batched-first", "Batched First", "hash")
+            .await?;
+        database
+            .insert_user(
+                &second_id,
+                "batched-second",
+                "Batched Second",
+                "hash",
+                false,
+                true,
+            )
+            .await?;
+        database
+            .set_user_emby_configuration(&first_id, "{\"server\":\"one\"}")
+            .await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(&library_id)
+            .bind(&library_id)
+            .execute(database.pool())
+            .await?;
+        database
+            .replace_user_library_order(&first_id, std::slice::from_ref(&library_id))
+            .await?;
+        database
+            .set_user_uses_admin_library_order(&first_id, false)
+            .await?;
+
+        assert_eq!(
+            database
+                .find_user_display_names(&[first_id.clone(), second_id.clone()])
+                .await?,
+            HashMap::from([
+                (first_id.clone(), "Batched First".to_owned()),
+                (second_id.clone(), "Batched Second".to_owned()),
+            ])
+        );
+        assert_eq!(
+            database
+                .list_user_emby_configurations(std::slice::from_ref(&first_id))
+                .await?,
+            HashMap::from([(first_id.clone(), "{\"server\":\"one\"}".to_owned())])
+        );
+        assert_eq!(
+            database
+                .user_library_orders(std::slice::from_ref(&first_id))
+                .await?,
+            HashMap::from([(first_id.clone(), vec![library_id.clone()])])
+        );
+        assert_eq!(
+            database
+                .user_admin_library_order_flags(&[first_id.clone(), second_id.clone()])
+                .await?,
+            HashMap::from([(first_id, false), (second_id, true)])
+        );
+        Ok(())
+    }
+
+    /// Purged accounts are returned from the `RETURNING id` projection as plain strings.
+    #[tokio::test]
+    async fn purge_expired_deleted_users_returns_the_purged_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let admin_id = Uuid::now_v7().to_string();
+        let member_id = Uuid::now_v7().to_string();
+        database
+            .insert_initial_user(&admin_id, "purge-admin", "Purge Admin", "hash")
+            .await?;
+        database
+            .insert_user(
+                &member_id,
+                "purge-member",
+                "Purge Member",
+                "hash",
+                false,
+                true,
+            )
+            .await?;
+        assert_eq!(
+            database.soft_delete_user(&member_id).await?,
+            Some(Vec::new())
+        );
+
+        assert_eq!(
+            database
+                .purge_expired_deleted_users(i64::from(i32::MAX), 10)
+                .await?,
+            vec![member_id]
+        );
+        assert_eq!(
+            database
+                .purge_expired_deleted_users(i64::from(i32::MAX), 10)
+                .await?,
+            Vec::<String>::new()
+        );
         Ok(())
     }
 }
