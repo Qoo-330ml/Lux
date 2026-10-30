@@ -118,6 +118,14 @@ struct LibraryIdentityRow {
     canonical_path: Option<String>,
 }
 
+/// Row of `load_scheduled_task_plan_libraries`: one library attached to a scheduled task plan.
+#[derive(Debug, sqlx::FromRow)]
+struct ScheduledTaskPlanLibraryRow {
+    plan_id: String,
+    library_id: String,
+    library_name: String,
+}
+
 impl Database {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn ensure_library_task_plan(
@@ -1527,7 +1535,7 @@ impl Database {
         let placeholders = std::iter::repeat_n("?", plan_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
-        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+        let mut query = self.query_as::<ScheduledTaskPlanLibraryRow>(sqlx::AssertSqlSafe(format!(
             "SELECT pl.plan_id, l.id AS library_id, l.name AS library_name
              FROM scheduled_task_plan_libraries pl
              JOIN libraries l ON l.id = pl.library_id
@@ -1541,11 +1549,11 @@ impl Database {
         let mut by_plan = HashMap::<String, Vec<StoredScheduledTaskPlanLibrary>>::new();
         for row in rows {
             by_plan
-                .entry(row.get("plan_id"))
+                .entry(row.plan_id)
                 .or_default()
                 .push(StoredScheduledTaskPlanLibrary {
-                    id: row.get("library_id"),
-                    name: row.get("library_name"),
+                    id: row.library_id,
+                    name: row.library_name,
                 });
         }
         for plan in plans {
@@ -3794,6 +3802,54 @@ mod library_row_decoding_tests {
                 ),
             ]
         );
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn scheduled_task_plan_library_rows_decode_named_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_library(&database, "library-a").await?;
+        insert_library(&database, "library-b").await?;
+        sqlx::query(
+            "INSERT INTO scheduled_task_plans (
+                 id, task_type, plan_name, task_name, task_description,
+                 source_type, cron_or_interval, scope_type
+             ) VALUES (
+                 'plan-a', 'RECONCILIATION_SCAN', 'Plan', 'Scan', 'Scan',
+                 'SYSTEM', '0 3 * * *', 'LIBRARY'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scheduled_task_plan_libraries (plan_id, library_id)
+             VALUES ('plan-a', 'library-b'), ('plan-a', 'library-a')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let (plans, total) = database
+            .list_scheduled_task_plans(0, 10, None, None)
+            .await?;
+        assert_eq!(total, 1);
+        assert_eq!(plans.len(), 1);
+        let libraries = plans[0]
+            .libraries
+            .iter()
+            .map(|library| (library.id.as_str(), library.name.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            libraries,
+            vec![("library-a", "library-a"), ("library-b", "library-b")]
+        );
+
+        let plan = database
+            .find_scheduled_task_plan("plan-a")
+            .await?
+            .expect("plan should exist");
+        assert_eq!(plan.libraries.len(), 2);
 
         Ok(())
     }
