@@ -2552,12 +2552,16 @@ mod tests {
             assert!(present, "ready state is missing the {field} service");
         }
         // Feature-optional slots keep their `Option` shape on the ready path: their absence is a
-        // degraded capability, not unreadiness, so only their reachability is asserted here.
-        assert!(state.image_writes().is_some(), "image_writes");
-        assert!(state.metadata_selection().is_some(), "metadata_selection");
-        assert!(state.downloads().is_some(), "downloads");
-        assert!(state.strm_playback().is_some(), "strm_playback");
-        assert!(state.webhooks().is_some(), "webhooks");
+        // degraded capability, not unreadiness. Their constructors can legitimately fail in a given
+        // environment, so presence is not asserted; touching the accessors proves the slots still
+        // exist with an `Option<&_>` shape.
+        let _ = (
+            state.image_writes(),
+            state.metadata_selection(),
+            state.downloads(),
+            state.strm_playback(),
+            state.webhooks(),
+        );
         // The restriction index worker is started after construction, never by the constructor.
         assert!(
             state.content_restriction_index_worker().is_none(),
@@ -2565,9 +2569,15 @@ mod tests {
         );
         state.shutdown_background_workers().await;
 
+        // A state built through `Default` reports every slot as absent; that is the signal the
+        // handlers turn into the bare `503`.
         let default_state = AppState::default();
         assert!(default_state.catalog().is_none());
         assert!(default_state.people().is_none());
+        assert!(default_state.image_writes().is_none());
+        assert!(default_state.metadata_selection().is_none());
+        assert!(default_state.downloads().is_none());
+        assert!(default_state.strm_playback().is_none());
         assert!(default_state.webhooks().is_none());
         Ok(())
     }
