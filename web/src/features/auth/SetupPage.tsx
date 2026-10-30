@@ -118,8 +118,11 @@ function SetupRestartGuide() {
       const abortTimer = setTimeout(() => controller.abort(), RESTART_PROBE_TIMEOUT_MS);
       let up = false;
       try {
-        await api.setupStatus({ signal: controller.signal });
-        up = true;
+        const status = await api.setupStatus({ signal: controller.signal });
+        // A reverse proxy may answer 200 with its own maintenance page, which
+        // decodes to an object without `initialized`. Only a genuine Lux status
+        // proves the restarted process is serving.
+        up = status?.initialized === true;
       } catch {
         // A network error, a 502/504 from the reverse proxy, or our own abort of
         // a hung connection all mean the server is unreachable right now — that

@@ -9,6 +9,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { SetupPage } from "../src/features/auth/SetupPage";
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
+import type { SetupStatus } from "../src/lib/api/types";
 import { chooseLuxOptionByValue, luxOptions } from "./lux-select-helpers";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -331,6 +332,36 @@ describe("SetupPage setup-complete restart", () => {
     await advance(1000);
     expect(container.textContent).toContain("Lux 重启耗时超出预期");
     expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+  });
+
+  it("does not treat a proxied 200 that carries no Lux status as recovery", async () => {
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+    vi.spyOn(api, "setupStatus")
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      // A reverse proxy maintenance page: HTTP 200, but not a Lux status body.
+      .mockResolvedValueOnce({} as SetupStatus)
+      .mockResolvedValueOnce(undefined as unknown as SetupStatus)
+      .mockResolvedValue({ initialized: true });
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    // Disconnect observed, so from here on any reply looks like the restart.
+    await advance(1000);
+    expect(container.textContent).toContain("正在重启 Lux");
+
+    await advance(1000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+    expect(container.textContent).toContain("正在重启 Lux");
+
+    await advance(1000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+    expect(container.textContent).toContain("正在重启 Lux");
+
+    // Only a body that really says initialized:true finishes the flow.
+    await advance(1000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
+    expect(container.textContent).toContain("登录页占位");
   });
 });
 
