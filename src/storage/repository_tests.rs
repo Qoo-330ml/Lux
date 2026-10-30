@@ -12409,6 +12409,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -15009,6 +15010,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -15079,6 +15081,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -15211,6 +15214,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -19086,6 +19090,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -19178,6 +19183,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -19682,6 +19688,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 

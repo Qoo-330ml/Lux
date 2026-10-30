@@ -416,6 +416,9 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        // The library is now `deletion_state = 'DELETING'` and disabled, which `has_user_library_access`
+        // treats as no access for every user.
+        self.access_changes.invalidate_all();
         Ok(Some(stored_library_deletion_job(row)))
     }
 

@@ -26,6 +26,9 @@ use sqlx::{
 use tokio::{fs, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
+#[path = "access_changes.rs"]
+mod access_changes;
+pub(crate) use access_changes::{AccessChangeEpochs, AccessEpoch};
 #[path = "catalog.rs"]
 mod catalog;
 #[path = "database_cleanup.rs"]
@@ -626,6 +629,7 @@ pub struct Database {
     dashboard_stats_cache: Arc<AsyncMutex<Option<CachedDashboardStats>>>,
     write_probe: Arc<AsyncMutex<Option<std::time::Instant>>>,
     filesystem_path_templates: Arc<SqlTemplateCache>,
+    access_changes: Arc<AccessChangeEpochs>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -1254,6 +1258,7 @@ impl Database {
             dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
             write_probe: Arc::new(AsyncMutex::new(None)),
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+            access_changes: Arc::new(AccessChangeEpochs::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -1712,6 +1717,13 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
         self.query_count.load(AtomicOrdering::Relaxed)
+    }
+
+    /// The change counters that the playback access cache stamps its entries with.
+    ///
+    /// The permission writes in this module bump these counters; the cache only reads them.
+    pub(crate) fn access_changes(&self) -> &AccessChangeEpochs {
+        &self.access_changes
     }
 
     /// Maps an sqlx failure onto a storage error that names the database it came from.
