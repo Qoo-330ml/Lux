@@ -101,6 +101,23 @@ struct MergeSourceStateSelectRow {
     is_default: i64,
 }
 
+/// Row of the saved hierarchy of one merged item, replayed by `unmerge_media_items`.
+#[derive(sqlx::FromRow)]
+struct MergeItemStateRestoreRow {
+    item_id: String,
+    parent_id: Option<String>,
+    series_id: Option<String>,
+    merged_into_item_id: Option<String>,
+}
+
+/// Row of one saved media source, replayed by `unmerge_media_items`.
+#[derive(sqlx::FromRow)]
+struct MergeSourceStateRestoreRow {
+    source_id: String,
+    item_id: String,
+    is_default: i64,
+}
+
 /// Row of `list_media_merge_records_for_item`.
 ///
 /// The column is spelled `source` in the table; [`StoredMediaMergeRecord`] exposes it as
@@ -457,7 +474,7 @@ impl Database {
         }
 
         let item_rows = self
-            .query(
+            .query_as::<MergeItemStateRestoreRow>(
                 "SELECT item_id, parent_id, series_id, merged_into_item_id
                  FROM media_merge_item_states WHERE record_id = ?",
             )
@@ -486,16 +503,15 @@ impl Database {
                  WHERE id IN ({id_placeholders})"
             )));
             for row in chunk {
-                let item_id: String = row.get("item_id");
-                restored_item_ids.push(item_id.clone());
+                restored_item_ids.push(row.item_id.clone());
                 query = query
-                    .bind(item_id)
-                    .bind(row.get::<Option<String>, _>("parent_id"))
-                    .bind(row.get::<Option<String>, _>("series_id"))
-                    .bind(row.get::<Option<String>, _>("merged_into_item_id"));
+                    .bind(&row.item_id)
+                    .bind(row.parent_id.as_deref())
+                    .bind(row.series_id.as_deref())
+                    .bind(row.merged_into_item_id.as_deref());
             }
             for row in chunk {
-                query = query.bind(row.get::<String, _>("item_id"));
+                query = query.bind(&row.item_id);
             }
             query
                 .execute(&mut *transaction)
@@ -504,7 +520,7 @@ impl Database {
         }
 
         let source_rows = self
-            .query(
+            .query_as::<MergeSourceStateRestoreRow>(
                 "SELECT source_id, item_id, CAST(is_default AS BIGINT) AS is_default
                  FROM media_merge_source_states WHERE record_id = ?",
             )
@@ -515,9 +531,8 @@ impl Database {
         let restored_source_count = source_rows.len();
         let mut normalize_ids = Vec::<String>::new();
         for row in &source_rows {
-            let item_id: String = row.get("item_id");
-            if !normalize_ids.contains(&item_id) {
-                normalize_ids.push(item_id);
+            if !normalize_ids.contains(&row.item_id) {
+                normalize_ids.push(row.item_id.clone());
             }
         }
         for chunk in source_rows.chunks(MAX_MERGE_RECORD_ROWS_PER_STATEMENT) {
@@ -539,12 +554,12 @@ impl Database {
             )));
             for row in chunk {
                 query = query
-                    .bind(row.get::<String, _>("source_id"))
-                    .bind(row.get::<String, _>("item_id"))
-                    .bind(row.get::<i64, _>("is_default"));
+                    .bind(&row.source_id)
+                    .bind(&row.item_id)
+                    .bind(row.is_default);
             }
             for row in chunk {
-                query = query.bind(row.get::<String, _>("source_id"));
+                query = query.bind(&row.source_id);
             }
             query
                 .execute(&mut *transaction)
