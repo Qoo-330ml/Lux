@@ -155,3 +155,104 @@
 - Lux API 45 条路由中，(b) `json!` 手拼占 56%，(a) 纯具名结构体只有 1 条；这正是 `types.ts` 需要手工镜像的根因。
 - 全量改造需要 11~16 人日，必须先做 `MediaItem` / 播放会话两个大件；本次试点取 3 组小形状（约 1.2 人日）先打通「Rust 结构体 → 生成 TS → re-export」和防漂移检查。
 - 清点过程中发现 4 处既有漂移，已记录为后续验收样本。
+
+## 阶段 2 小结（试点实现）
+
+### 依赖选择
+
+`Cargo.toml`：
+
+```toml
+[features]
+ts-bindings = ["dep:ts-rs"]
+
+[dependencies]
+ts-rs = { version = "12.0.1", optional = true, default-features = false, features = [
+    "serde-compat",
+] }
+```
+
+- **版本**：`12.0.1` 是 ts-rs 当前稳定版；其 MSRV 1.78 低于本项目的 1.94，与 serde 1.x 兼容。
+  12.x 才具备本次需要的两个能力：`#[ts(optional = nullable)]`（生成 `?: T | null`，与既有手写类型同形）
+  和 `#[ts(export)]`（为每个类型生成 `export_bindings_<type>` 测试，供防漂移检查复用）。
+- **默认特性**：ts-rs 唯一的默认特性是 `serde-compat`，本项目**必须**保留（否则 `#[serde(rename_all)]`
+  与 `Option` 语义不会传导到 TS）。这里仍写成 `default-features = false` + 显式 `serde-compat`，
+  这样将来 ts-rs 若新增默认特性（例如会引入 dprint 的 `format`）不会悄悄进入构建。
+- **`Cargo.lock`**：只新增 `ts-rs`、`ts-rs-macros`、`termcolor` 三个包，其余版本不变。
+- **默认构建**：`cargo tree --locked -e normal` 不含 `ts-rs`；只有 `--features ts-bindings` 才出现。
+
+### 试点结构体
+
+| 类型 | 定义位置 | 覆盖路由 | 生成文件 |
+| --- | --- | --- | --- |
+| `ItemImage` | `src/api/media.rs` | `GET .../images`、`POST .../images/select` | `ItemImage.ts` |
+| `ItemImagesResponse` | `src/api/media.rs` | `GET .../images` | `ItemImagesResponse.ts` |
+| `ItemImageSelectResponse` | `src/api/media.rs` | `POST .../images/select` | `ItemImageSelectResponse.ts` |
+| `ItemMetadata` | `src/api/media.rs` | `GET`/`PATCH .../metadata` | `ItemMetadata.ts` |
+| `MetadataField` | `src/application/metadata.rs` | `ItemMetadata.lockedFields` | `MetadataField.ts` |
+| `WebDanmakuInfo` | `src/api/media.rs` | `GET .../danmaku` | `WebDanmakuInfo.ts` |
+| `DanmakuFormat` | `src/api/media.rs` | `WebDanmakuInfo.format` | `DanmakuFormat.ts` |
+
+`item_image_json`（`src/api/admin/admin_metadata.rs`）与 `metadata_json`、`danmaku_info_json`（`src/api/media.rs`）
+仍然叫原来的名字，只是返回类型从 `serde_json::Value` 变成了结构体；因此两个 handler 的 `Json(...)` 调用点几乎没有改动。
+
+### 保持序列化字节一致的两个关键点
+
+1. **字段顺序**：`serde_json` 未启用 `preserve_order`，`json!` 输出的对象键是**字母序**（`BTreeMap`），
+   而 `#[derive(Serialize)]` 按**声明顺序**输出。所以结构体字段按序列化后的键名字母序声明，
+   否则响应字节会变（内容不变，但字节不同）。这条约束在每个 DTO 上都有 `//` 注释说明。
+2. **`Option` / `null`**：结构体没有 `skip_serializing_if`，`None` 和其他 `Option` 一样序列化成 `null`，
+   与改前完全一致。`#[ts(optional = nullable)]` **只影响 TypeScript 输出**（生成 `field?: T | null`），
+   不改变 JSON。之所以标成可选，是为了让生成的类型与 `types.ts` 里既有的手写类型同形，
+   从而满足「`types.ts` 对外导出名不变、前端其余代码零改动」。
+
+`src/api/media.rs` 末尾的 `lux_dto_tests` 用**改前**抓取的字节字面量固定了 6 个断言：
+
+- 先写测试（改前通过）→ 再改实现（仍通过），确保改前改后 `serde_json::to_string` 输出逐字节相同；
+  字节相等强于 `serde_json::Value` 结构相等，因此不再单独断言 `Value`。
+- 覆盖了 `null`、`0` 与非 `0` 的 `imageIndex`（URL 后缀分支）、`lockedFields` 缺失、`sourceId` 缺失。
+
+### 生成命令与产物
+
+```bash
+scripts/generate-api-types.sh
+# 等价于：cargo test --locked --features ts-bindings --lib export_bindings
+```
+
+脚本固定了两个环境变量（ts-rs 在测试运行时读取）：
+
+| 变量 | 值 | 原因 |
+| --- | --- | --- |
+| `TS_RS_EXPORT_DIR` | 仓库根（绝对路径） | 让 `#[ts(export_to = "web/src/lib/api/generated/")]` 与调用目录无关 |
+| `TS_RS_LARGE_INT` | `number` | ts-rs 默认把 `i64` 渲染成 `bigint`，会改变所有时间戳/计数类型 |
+
+产物提交在 `web/src/lib/api/generated/`（7 个文件，含文件头注释与 `import type`）。
+`web/src/lib/api/types.ts` 用 re-export 保持导出名不变：
+
+```ts
+export type { MetadataField as MetadataFieldName } from "./generated/MetadataField";
+export type { ItemMetadata } from "./generated/ItemMetadata";
+export type { ItemImage } from "./generated/ItemImage";
+export type { WebDanmakuInfo } from "./generated/WebDanmakuInfo";
+```
+
+生成的类型与手写类型的差异（都是放宽，读路径零影响）：
+
+- `ItemImage.source`：`string`（原来是 `string | null` 可选）。服务端一直发送字符串，`json!` 里 `source` 不是 `Option`。
+- `WebDanmakuInfo.available`：`boolean`（原来是字面量 `true`）——Rust 侧是 `bool`，ts-rs 不表达「恒为 true」；
+  若要保留字面量可加 `#[ts(type = "true")]`，本次选择接受放宽。
+- `WebDanmakuInfo.format`：`DanmakuFormat` = `"BILIBILI_XML"`（用单变体枚举保住了字面量，未退化为 `string`）。
+- `WebDanmakuInfo.sourceId`：`sourceId?: string | null`（原来是必填）。JSON 始终发送该键。
+
+### 门禁结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo build --locked` | 通过 |
+| `cargo build --locked --features ts-bindings` | 通过 |
+| `cargo test --locked --lib lux_dto_tests` | 5 → 6 个断言通过（改前/改后各跑一次） |
+| `cargo test --locked --features ts-bindings --lib lux_dto_tests` | 通过 |
+| `cargo fmt --all -- --check` | 通过 |
+| `cargo clippy --locked --all-targets --all-features -- -D warnings` | 通过 |
+| `pnpm --dir web build` | 通过（生成文件参与 `tsc --noEmit`） |
+| `pnpm --dir web test` | 127 个文件 / 986 个用例通过 |
