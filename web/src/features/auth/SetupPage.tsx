@@ -8,11 +8,14 @@ import { DatabaseSetupPanel } from "./DatabaseSetupPanel";
 import { LuxLogo } from "../../components/LuxLogo";
 import { LuxButton } from "../../components/ui";
 
-// Cadence of the readiness probes while the process restarts, and the fallback
+// Cadence of the readiness probes while the process restarts, the fallback
 // deadline for the case where the port never actually closes (restart skipped,
-// or a reverse proxy that keeps answering). See docs/SETUP-RESTART-DESIGN.md §5.3.
+// or a reverse proxy that keeps answering), and the deadline after a disconnect
+// during which the restarted process is expected to be back. See
+// docs/SETUP-RESTART-DESIGN.md §5.3.
 const RESTART_POLL_INTERVAL_MS = 1000;
 const RESTART_PROBE_DEADLINE_MS = 10_000;
+const RESTART_RECOVERY_DEADLINE_MS = 60_000;
 
 export function SetupPage() {
   const [restartRequested, setRestartRequested] = useState(false);
@@ -63,10 +66,12 @@ export function SetupPage() {
 function SetupRestartGuide() {
   const navigate = useNavigate();
   const queryClient = useQueryClient();
+  const [overdue, setOverdue] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
     let sawDisconnect = false;
+    let overdueShown = false;
     let elapsed = 0;
     let timer: ReturnType<typeof setTimeout> | undefined;
 
@@ -80,6 +85,16 @@ function SetupRestartGuide() {
       queryClient.setQueryData(queryKeys.setup, { initialized: true });
       queryClient.removeQueries({ queryKey: queryKeys.me });
       navigate("/login", { replace: true });
+    };
+
+    // A failing exec exits the process instead of coming back
+    // (docs/SETUP-RESTART-DESIGN.md §4.3), so a disconnect alone must not spin
+    // forever: after a minute say so and offer a reload, but keep polling so a
+    // late recovery still lands on the login page.
+    const markOverdue = () => {
+      if (cancelled || overdueShown) return;
+      overdueShown = true;
+      setOverdue(true);
     };
 
     const probe = async () => {
@@ -107,6 +122,9 @@ function SetupRestartGuide() {
         finish();
         return;
       }
+      if (sawDisconnect && elapsed >= RESTART_RECOVERY_DEADLINE_MS) {
+        markOverdue();
+      }
       timer = setTimeout(() => { void probe(); }, RESTART_POLL_INTERVAL_MS);
     };
 
@@ -117,6 +135,15 @@ function SetupRestartGuide() {
     };
   }, [navigate, queryClient]);
 
+  if (overdue) {
+    return (
+      <main className="lux-state-screen" role="alert">
+        <h1>Lux 重启耗时超出预期</h1>
+        <p>初始化已完成，但服务在 60 秒内没有恢复。请检查 Lux 服务日志确认进程是否成功重启，或稍后刷新页面。</p>
+        <LuxButton tone="primary" type="button" onClick={() => window.location.reload()}>刷新页面</LuxButton>
+      </main>
+    );
+  }
   return <RestartingScreen description="初始化已完成，Lux 正在重启以应用新配置。请不要关闭此页面，服务恢复后会自动进入登录页。" />;
 }
 

@@ -259,6 +259,39 @@ describe("SetupPage setup-complete restart", () => {
     expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
     expect(container.textContent).toContain("登录页占位");
   });
+
+  it("offers a reload hint when the service has not recovered 60 s after the disconnect", async () => {
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+    let probes = 0;
+    vi.spyOn(api, "setupStatus").mockImplementation(async () => {
+      probes += 1;
+      // The process died instead of coming back (docs/SETUP-RESTART-DESIGN.md
+      // §4.3: a failing exec exits the process), so keep failing for a minute.
+      if (probes < 62) throw new TypeError("Failed to fetch");
+      return { initialized: true };
+    });
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    await advance(1000);
+    expect(container.textContent).toContain("正在重启 Lux");
+    expect(container.textContent).not.toContain("重启耗时超出预期");
+
+    // Wall clock reaches 60 s without a single successful probe.
+    await advance(59_000);
+    expect(container.textContent).toContain("Lux 重启耗时超出预期");
+    expect(container.textContent).toContain("请检查 Lux 服务日志");
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+    const reload = [...container.querySelectorAll<HTMLButtonElement>("button")]
+      .find((candidate) => candidate.textContent?.includes("刷新页面"));
+    expect(reload).toBeTruthy();
+
+    // Polling continues behind the notice: recovery still ends up on /login.
+    await advance(2000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
+    expect(container.textContent).toContain("登录页占位");
+  });
 });
 
 describe("legacy setup form", () => {
