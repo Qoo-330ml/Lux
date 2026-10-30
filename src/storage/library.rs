@@ -23,6 +23,42 @@ type LegacyScheduledTaskConfigRow = (
     String,
 );
 
+/// Row of `person_index_item_state_matches_snapshot`: the snapshot marker recorded for one
+/// person index item.
+#[derive(sqlx::FromRow)]
+struct PersonIndexItemStateRow {
+    source_fingerprint: Option<String>,
+    relation_schema_version: i64,
+    relation_checksum: Option<String>,
+}
+
+/// Row shared by `list_library_scrapers`: one configured scraper of a library.
+#[derive(sqlx::FromRow)]
+struct LibraryScraperRow {
+    scraper_id: String,
+    position: i64,
+    role: String,
+}
+
+impl From<LibraryScraperRow> for StoredLibraryScraper {
+    fn from(row: LibraryScraperRow) -> Self {
+        Self {
+            scraper_id: row.scraper_id,
+            position: row.position,
+            role: row.role,
+        }
+    }
+}
+
+/// Row of `list_library_scrapers_by_library_ids`: the same projection keyed by library.
+#[derive(sqlx::FromRow)]
+struct LibraryScraperByLibraryRow {
+    library_id: String,
+    scraper_id: String,
+    position: i64,
+    role: String,
+}
+
 impl Database {
     #[allow(clippy::too_many_arguments, clippy::type_complexity)]
     async fn ensure_library_task_plan(
@@ -425,7 +461,7 @@ impl Database {
             return Ok(false);
         };
         let row = self
-            .query(
+            .query_as::<PersonIndexItemStateRow>(
                 "SELECT source_fingerprint, relation_schema_version, relation_checksum
                  FROM person_index_item_state WHERE item_id = ?",
             )
@@ -434,12 +470,9 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         Ok(row.is_some_and(|row| {
-            row.get::<Option<String>, _>("source_fingerprint")
-                .as_deref()
-                == Some(source_fingerprint)
-                && row.get::<Option<String>, _>("relation_checksum").as_deref()
-                    == Some(relation_checksum)
-                && row.get::<i64, _>("relation_schema_version") == 2
+            row.source_fingerprint.as_deref() == Some(source_fingerprint)
+                && row.relation_checksum.as_deref() == Some(relation_checksum)
+                && row.relation_schema_version == 2
         }))
     }
 
@@ -447,7 +480,7 @@ impl Database {
         &self,
         library_id: &str,
     ) -> Result<Vec<StoredLibraryScraper>, StorageError> {
-        self.query(
+        self.query_as::<LibraryScraperRow>(
             "SELECT scraper_id, position, role
              FROM library_scrapers
              WHERE library_id = ?
@@ -456,15 +489,7 @@ impl Database {
         .bind(library_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredLibraryScraper {
-                    scraper_id: row.get("scraper_id"),
-                    position: row.get("position"),
-                    role: row.get("role"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredLibraryScraper::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -486,7 +511,8 @@ impl Database {
                  WHERE library_id IN ({placeholders})
                  ORDER BY library_id, position"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<LibraryScraperByLibraryRow>(sqlx::AssertSqlSafe(query));
             for library_id in library_ids {
                 statement = statement.bind(library_id);
             }
@@ -495,14 +521,13 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let library_id: String = row.get("library_id");
                 scrapers
-                    .entry(library_id)
+                    .entry(row.library_id)
                     .or_default()
                     .push(StoredLibraryScraper {
-                        scraper_id: row.get("scraper_id"),
-                        position: row.get("position"),
-                        role: row.get("role"),
+                        scraper_id: row.scraper_id,
+                        position: row.position,
+                        role: row.role,
                     });
             }
         }
@@ -3588,5 +3613,81 @@ mod library_scraper_batch_tests {
                 .await
                 .expect("rows after failed batch");
         assert_eq!(count, 5);
+    }
+}
+
+#[cfg(test)]
+mod library_row_decoding_tests {
+    use super::*;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        crate::storage::test_database().await
+    }
+
+    async fn insert_scraper(
+        database: &Database,
+        library_id: &str,
+        scraper_id: &str,
+        position: i64,
+        role: &str,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO library_scrapers (library_id, scraper_id, position, role)
+             VALUES (?, ?, ?, ?)",
+        )
+        .bind(library_id)
+        .bind(scraper_id)
+        .bind(position)
+        .bind(role)
+        .execute(database.pool())
+        .await
+        .map(|_| ())
+    }
+
+    async fn insert_library(database: &Database, library_id: &str) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(library_id)
+            .bind(library_id)
+            .execute(database.pool())
+            .await
+            .map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn library_scraper_queries_decode_named_rows() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_library(&database, "library-a").await?;
+        insert_library(&database, "library-b").await?;
+        insert_scraper(&database, "library-a", "scraper-1", 1, "PRIMARY").await?;
+        insert_scraper(&database, "library-a", "scraper-2", 2, "SUPPLEMENT").await?;
+        insert_scraper(&database, "library-b", "scraper-3", 1, "BACKUP").await?;
+
+        let single = database.list_library_scrapers("library-a").await?;
+        let single = single
+            .into_iter()
+            .map(|scraper| (scraper.scraper_id, scraper.position, scraper.role))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            single,
+            vec![
+                ("scraper-1".to_owned(), 1, "PRIMARY".to_owned()),
+                ("scraper-2".to_owned(), 2, "SUPPLEMENT".to_owned()),
+            ]
+        );
+
+        let batched = database
+            .list_library_scrapers_by_library_ids(&["library-a".to_owned(), "library-b".to_owned()])
+            .await?;
+        let roles = |library_id: &str| {
+            batched[library_id]
+                .iter()
+                .map(|scraper| scraper.role.as_str())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(roles("library-a"), vec!["PRIMARY", "SUPPLEMENT"]);
+        assert_eq!(roles("library-b"), vec!["BACKUP"]);
+        assert_eq!(batched["library-b"][0].position, 1);
+
+        Ok(())
     }
 }
