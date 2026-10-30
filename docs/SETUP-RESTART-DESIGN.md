@@ -54,19 +54,22 @@ Router 拆分。
 3. **同步返回** 201，不等待该任务。
 
 ```rust
-// src/api/users.rs，成功分支末尾（示意）
-if let Some(handle) = state.restart_handle.clone() {   // core 状态字段，见 src/api/legacy.rs:180
-    let delay = state.setup_restart_delay();           // 新增：默认 250 ms，测试可注入
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        if !handle.request_restart() {
-            tracing::info!("restart was already requested before setup completed");
-        }
-    });
-    response["restarting"] = json!(true);
-} else {
-    response["restarting"] = json!(false);             // 嵌入式/测试状态，见 §4
-    tracing::warn!("setup completed without a restart handle");
+// src/api/users.rs，handler 末尾（管理员已创建的所有返回路径，见 §4.2）
+let mut response = /* ... 已有的 201 / 4xx 响应体与状态码 ... */;
+if admin_created {
+    if let Some(handle) = state.restart_handle.clone() {  // core 状态字段，见 src/api/legacy.rs:180
+        let delay = state.setup_restart_delay();          // 新增：默认 250 ms，测试可注入
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if !handle.request_restart() {
+                tracing::info!("restart was already requested before setup completed");
+            }
+        });
+        response["restarting"] = json!(true);             // 仅 201 路径会带这个字段
+    } else {
+        tracing::warn!("setup completed without a restart handle");
+        response["restarting"] = json!(false);            // 嵌入式/测试状态，见 §4.3
+    }
 }
 ```
 
@@ -249,8 +252,8 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 | --- | --- |
 | `web/src/lib/api/client.ts` | `setup()` 返回类型改为 `{ user: LuxUser; restarting?: boolean }`（`restarting` 可选：兼容旧后端） |
 | `web/src/lib/api/types.ts` | 若需要，加 `SetupCompleteResult` 类型（可选字段 `restarting?: boolean`） |
-| `web/src/features/auth/AdminSetupForm.tsx` | `onSuccess` 读 `result.restarting`：`true` → 调父组件传入的 `onRestarting()`，不再自行 `navigate`；`false/undefined` → 保持现有行为（`setQueryData` + `navigate("/login")`） |
-| `web/src/features/auth/SetupPage.tsx` | 持有 `phase: "form" \| "restarting"`；`restarting` 时渲染与数据库流程同款的全屏提示（复用 `:33` 的 `lux-state-screen` 结构，文案改为“初始化已完成，正在重启 Lux…”），并轮询就绪 |
+| `web/src/features/auth/AdminSetupForm.tsx` | `onSuccess` 读 `result.restarting`：`true` → **不写** `queryKeys.setup`、不 `navigate`，改为调父组件传入的 `onRestarting()`（否则 `App.tsx:89` 的 `!setup.data.initialized` 判据会立刻把页面切走，重启提示根本没机会出现）；`false/undefined` → 保持现有行为（`setQueryData` + `navigate("/login")`） |
+| `web/src/features/auth/SetupPage.tsx` | 持有 `phase: "form" \| "restarting"`；`restarting` 时渲染与数据库流程同款的全屏提示（复用 `:33` 的 `lux-state-screen` 结构，文案改为“初始化已完成，正在重启 Lux…”），轮询就绪后再 `setQueryData(queryKeys.setup, { initialized: true })` 让 `App` 切到登录路由 |
 | `web/tests/setup-page.test.tsx` | 新增：`restarting: true` 的 201 后出现“正在重启 Lux”；就绪后进入登录；`restarting: false` 仍是直接跳转 |
 
 ### 5.3 轮询就绪的方式（关键细节）
@@ -266,6 +269,8 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
    - 兜底：10 s 内一次失败都没出现（重启被跳过、或反向代理把请求缓存/重试掉了）→ 直接进入登录页，
      登录请求本身会重试，失败时用户看到错误并可再提交。
 3. 出现 `restarting === false`（旧后端或无重启句柄）→ 完全走今天的路径，不显示重启页。
+4. 就绪后的收尾：`setQueryData(queryKeys.setup, { initialized: true })`（`App.tsx:89` 据此切到登录
+   路由）+ `removeQueries(queryKeys.me)`（沿用 `AdminSetupForm.tsx:26`），然后 `navigate("/login")`。
 
 反向代理部署提示：重启窗口内 `502/504` 由代理产生，同样算“连接失败”，与 `TypeError` 一起按失败处理。
 
@@ -293,7 +298,7 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 | --- | --- | --- |
 | `setup_complete_requests_a_restart_after_the_response` | `tests/api_web/web_auth.rs`，`cargo test --locked --test api_web web_auth::`（`docs/TEST-TARGETS.md:60`） | 注入 `with_restart_handle` + `with_setup_restart_delay(200ms)`，并在测试里持有 `watch::Receiver`：拿到 `201` + `restarting: true` 之后**立即**断言 `*rx.borrow() == Running`（响应已送达、重启尚未排上），再 `timeout(5s, rx.changed())` 断言变成 `Restart` |
 | `setup_complete_without_a_restart_handle_keeps_the_created_body` | 同上 | 201、`restarting: false`、`user`/`library`/`scanJob` 字段与今天逐字一致（防止“为了重启而改动响应形状”） |
-| `setup_complete_does_not_restart_when_the_admin_exists` | 同上 | 第二次 POST 得 409 `SETUP_ALREADY_COMPLETED`，并在 500 ms 后仍为 `Running` |
+| `setup_complete_does_not_restart_again_when_the_admin_exists` | 同上 | 先完整跑一次成功初始化（重启已排上，等 `rx.changed()` 观察到 `Restart`），再用同一 state 发第二次 POST：得 409 `SETUP_ALREADY_COMPLETED`，且后续 `timeout(300ms, rx.changed())` 超时（`watch` 不会再有第二次变更） |
 | `setup_complete_restarts_even_when_the_first_library_is_rejected` | 同上 | 非法 `rootPath` → 4xx，但随后仍观察到 `Restart`（对应 §4.2 的部分成功策略） |
 | `startup_resumes_first_scans_interrupted_by_shutdown` | `tests/scanner/shutdown_jobs.rs`，`cargo test --locked --test scanner shutdown_jobs::`（`docs/TEST-TARGETS.md:91`） | 建库 + 加根 + 建扫描任务 → `cancel_incomplete_jobs_for_shutdown()` → 跑恢复流程 → 该库出现新的 `PENDING/RUNNING` 任务，`libraries.last_scan_at` 仍为 `NULL` |
 | 恢复流程的反向用例 | 同上 | ① `last_scan_at` 已写 → 不恢复；② 任务 `error != 'SERVER_SHUTDOWN'`（真实失败）→ 不恢复；③ 库已停用 → 不恢复；④ 库没有 root → 不恢复（这一条正是 SQL 里 `EXISTS(library_roots)` 的作用，`start_library_scan` 本身不拒绝零 root 的库，见 `src/application/scanner/jobs/lifecycle.rs:910`）；⑤ 连跑两次 → 只产生一个活动任务（第二次走 `AlreadyActive` 跳过） |
@@ -353,7 +358,7 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 
 - 最轻的开关是“延迟注入”的公开形态：阶段 2 可决定是否把它接到 `Config`（例如
   `LUX_SETUP_RESTART_DELAY_MS`，默认 250）。**建议先不加环境变量**（项目惯例是不为假设需求加配置），
-  真的出现“重启过早”问题时，把 C1 里延迟常量调大即可，仍只是一个常量改动。
+  真的出现“重启过早”问题时，把 `setup_restart_delay` 的默认值调大即可，仍只是一个字段默认值改动。
 - 若首次扫描恢复出现异常（重复扫描/扫描风暴），单独回退 C2 即可止血，不影响 setup 流程本身。
 
 ## 8. 时序与数据流
@@ -486,3 +491,13 @@ libraries.last_scan_at = unixepoch()                           ← 下次重启�
    `cargo clippy --locked --all-targets --all-features -- -D warnings`、
    `python3 scripts/check-migration-parity.py`、`python3 scripts/check-backend-branches.py`；
    手动在 Docker 与裸进程各验证一次真实重启（记录 `uname -m`）。
+
+## 13. 需要确认的三个决策点
+
+1. **首次扫描的恢复策略**：采用 (b)（复用 `scan_jobs` 的 `CANCELLED/SERVER_SHUTDOWN` 作为恢复证据，
+   无 schema 变更），还是 (a1)（`lux_meta` 显式标记，能覆盖“扫描根本没启动”的遗漏面 R3）？
+   本设计推荐 (b)，并把 (a1) 记为 R3 的备选。
+2. **部分成功也重启**：管理员创建成功、但首个库因 4xx 失败时仍排期重启（§4.2）。这是为了第 ③ 步之后
+   不把进程卡在 setup 模式；代价是用户看到错误后仍会经历一次重启。
+3. **不加环境变量开关**：延迟只做可注入字段，不做 `LUX_SETUP_RESTART_*` 配置（§7.3）。若希望线上有
+   紧急关闭手段，需要额外一个 `Config` 字段，本设计默认不做。
