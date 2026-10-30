@@ -297,6 +297,38 @@ async fn chapter_detection_http_api_enforces_admin_csrf_and_persists_jobs()
     assert_eq!(detail.status(), reqwest::StatusCode::OK);
     assert_eq!(detail.json::<Value>().await?["job"]["pluginId"], PLUGIN_ID);
 
+    // The empty test library completes instantly; mark the job as running so the cancel path is reachable.
+    sqlx::query("UPDATE chapter_detection_jobs SET status = 'RUNNING' WHERE id = ?")
+        .bind(&job_id)
+        .execute(database.pool())
+        .await?;
+    let cancelled = client
+        .post(format!(
+            "{base_url}/api/v1/admin/chapter-detection-jobs/{job_id}/cancel"
+        ))
+        .header(COOKIE, &cookie)
+        .header("x-csrf-token", &csrf)
+        .send()
+        .await?;
+    assert_eq!(cancelled.status(), reqwest::StatusCode::ACCEPTED);
+    let audit = client
+        .get(format!("{base_url}/api/v1/admin/audit"))
+        .header(COOKIE, &cookie)
+        .send()
+        .await?
+        .json::<Value>()
+        .await?;
+    let cancel_event = audit["events"]
+        .as_array()
+        .and_then(|events| {
+            events
+                .iter()
+                .find(|event| event["eventType"] == "CHAPTER_DETECTION_CANCEL_REQUESTED")
+        })
+        .ok_or("missing CHAPTER_DETECTION_CANCEL_REQUESTED")?;
+    assert_eq!(cancel_event["metadata"]["libraryId"], json!(library_id));
+    assert_eq!(cancel_event["metadata"]["previousStatus"], "RUNNING");
+
     let task_count: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM scheduled_task_configs WHERE task_type = 'CHAPTER_DETECTION'",
     )

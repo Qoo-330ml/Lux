@@ -263,6 +263,16 @@ pub(crate) async fn admin_cancel_scan(
         return response;
     }
     let scan_jobs = require_service!(state.scan_jobs);
+    let database = require_service!(state.database);
+    let previous = crate::application::admin_scan_jobs::find_admin_scan_job(database, &job_id)
+        .await
+        .ok()
+        .flatten();
+    let cancel_metadata = json!({
+        "libraryId": previous.as_ref().map(|found| found.job.library_id.clone()),
+        "previousStatus": previous.as_ref().map(|found| found.job.status.clone()),
+    })
+    .to_string();
     match scan_jobs.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -271,7 +281,7 @@ pub(crate) async fn admin_cancel_scan(
                 "SCAN_CANCELLED",
                 Some("scan_job"),
                 Some(&job_id),
-                "{}",
+                &cancel_metadata,
             )
             .await;
             StatusCode::ACCEPTED.into_response()
@@ -388,6 +398,12 @@ pub(crate) async fn admin_cancel_strm_probe(
         return response;
     }
     let service = require_service!(state.strm_probe);
+    let previous = service.get(&job_id).await.ok();
+    let cancel_metadata = json!({
+        "libraryId": previous.as_ref().map(|job| job.library_id.clone()),
+        "previousStatus": previous.as_ref().map(|job| job.status.clone()),
+    })
+    .to_string();
     match service.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -396,7 +412,7 @@ pub(crate) async fn admin_cancel_strm_probe(
                 "STRM_PROBE_CANCEL_REQUESTED",
                 Some("strm_probe_job"),
                 Some(&job_id),
-                "{}",
+                &cancel_metadata,
             )
             .await;
             StatusCode::ACCEPTED.into_response()
@@ -574,6 +590,12 @@ pub(crate) async fn admin_cancel_chapter_detection(
         return response;
     }
     let service = require_service!(state.chapter_detection);
+    let previous = service.get(&job_id).await.ok();
+    let cancel_metadata = json!({
+        "libraryId": previous.as_ref().map(|job| job.library_id.clone()),
+        "previousStatus": previous.as_ref().map(|job| job.status.clone()),
+    })
+    .to_string();
     match service.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -582,7 +604,7 @@ pub(crate) async fn admin_cancel_chapter_detection(
                 "CHAPTER_DETECTION_CANCEL_REQUESTED",
                 Some("chapter_detection_job"),
                 Some(&job_id),
-                "{}",
+                &cancel_metadata,
             )
             .await;
             StatusCode::ACCEPTED.into_response()
