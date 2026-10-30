@@ -15,7 +15,7 @@ pub(super) async fn emby_sync_media_info(
     headers: HeaderMap,
     RawQuery(raw_query): RawQuery,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let auth_principal =
@@ -28,9 +28,7 @@ pub(super) async fn emby_sync_media_info(
     if !auth_principal.is_admin() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let Some(plugins) = state.plugins() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let plugins = state.plugins();
     let path = "/Items/SyncMediaInfo";
     let target = match plugins.emby_route_target("POST", path).await {
         Ok(Some(target)) => target,
@@ -107,7 +105,7 @@ pub(super) async fn emby_sync_media_info(
                     return StatusCode::BAD_REQUEST.into_response();
                 };
                 let id = emby_internal_id(&id);
-                let database = require_service!(state.database);
+                let database = state.database();
                 let Some(source) = database
                     .find_strm_source_by_emby_id(&id)
                     .await
@@ -130,7 +128,7 @@ pub(super) async fn emby_sync_media_info(
         } else {
             return StatusCode::OK.into_response();
         };
-        let service = require_service!(state.probe);
+        let service = state.probe();
         if service
             .import_media_info_for_absolute_path(&path, &probe, &chapters)
             .await
@@ -160,12 +158,10 @@ pub(super) async fn emby_sync_media_info(
 }
 
 async fn resolve_media_info_target(
-    state: &AppState,
+    state: &ReadyAppState,
     target: &PluginMediaInfoTarget,
 ) -> Result<Option<String>, ()> {
-    let Some(database) = state.database.as_ref() else {
-        return Err(());
-    };
+    let database = state.database();
     let source = if let Some(path) = target.path.as_deref() {
         database
             .find_strm_source_by_absolute_path(path)
@@ -315,14 +311,14 @@ pub(super) async fn emby_danmaku_info(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<DanmakuQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let access = require_service!(state.access);
+    let access = state.access();
     let public_item_id = item_id.clone();
     let item_id = emby_internal_id(&item_id);
     let principal = match emby_access_principal(&auth_principal, None) {
@@ -334,7 +330,7 @@ pub(super) async fn emby_danmaku_info(
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let service = require_service!(state.danmaku);
+    let service = state.danmaku();
     match service.read_sidecar(&item_id).await {
         Ok(Some(_)) => Json(json!({
             "hasDanmaku": true,
@@ -353,14 +349,14 @@ pub(super) async fn emby_danmaku_raw(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<DanmakuQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let access = require_service!(state.access);
+    let access = state.access();
     let item_id = emby_internal_id(&item_id);
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
@@ -371,7 +367,7 @@ pub(super) async fn emby_danmaku_raw(
         Ok(false) => return StatusCode::FORBIDDEN.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let service = require_service!(state.danmaku);
+    let service = state.danmaku();
     match service.read_sidecar(&item_id).await {
         Ok(Some(bytes)) => Response::builder()
             .status(StatusCode::OK)
@@ -384,7 +380,7 @@ pub(super) async fn emby_danmaku_raw(
     }
 }
 
-pub(super) async fn current_emby_server_name(state: &AppState) -> String {
+pub(super) async fn current_emby_server_name(state: &CoreState) -> String {
     let Some(database) = state.database.as_ref() else {
         return DEFAULT_SERVER_NAME.to_owned();
     };
@@ -395,8 +391,8 @@ pub(super) async fn current_emby_server_name(state: &AppState) -> String {
 }
 
 pub(super) async fn emby_public_system_info(State(state): State<AppState>) -> Json<Value> {
-    let startup_wizard_completed = match state.setup() {
-        Some(setup) => setup.status().await.unwrap_or(false),
+    let startup_wizard_completed = match state.as_ready() {
+        Some(ready) => ready.setup().status().await.unwrap_or(false),
         None => false,
     };
     let server_name = current_emby_server_name(&state).await;
@@ -412,7 +408,7 @@ pub(super) async fn emby_public_system_info(State(state): State<AppState>) -> Js
 pub(super) async fn emby_system_info(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(status) = require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
         return status.into_response();
@@ -440,7 +436,7 @@ pub(super) async fn emby_system_info(
 pub(super) async fn emby_auth_keys(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(status) =
         require_playback_route_principal(&headers, &state, query.api_key.as_deref()).await
@@ -454,7 +450,7 @@ pub(super) async fn emby_refresh_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<EmbyRefreshQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
@@ -467,7 +463,7 @@ pub(super) async fn emby_refresh_item(
     if query.recursive == Some(false) {
         return StatusCode::UNPROCESSABLE_ENTITY.into_response();
     }
-    let scan_jobs = require_service!(state.scan_jobs);
+    let scan_jobs = state.scan_jobs();
     let item_id = emby_internal_id(&item_id);
     let (job, scope) = match scan_jobs.create_folder_scan_job(&item_id).await {
         Ok(job) => (job, "FOLDER"),
@@ -509,7 +505,7 @@ pub(super) async fn emby_refresh_item(
 pub(super) async fn emby_refresh_library(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -519,8 +515,8 @@ pub(super) async fn emby_refresh_library(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = require_service!(state.database);
-    let scan_jobs = require_service!(state.scan_jobs);
+    let database = state.database();
+    let scan_jobs = state.scan_jobs();
     let library_ids = match database.list_enabled_library_ids().await {
         Ok(library_ids) => library_ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -560,7 +556,7 @@ pub(super) async fn emby_refresh_library(
 pub(super) async fn emby_media_updated(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<EmbyMediaUpdatedRequest>,
 ) -> Response {
     let auth_principal =
@@ -571,8 +567,8 @@ pub(super) async fn emby_media_updated(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = require_service!(state.database);
-    let scan_jobs = require_service!(state.scan_jobs);
+    let database = state.database();
+    let scan_jobs = state.scan_jobs();
     if request.updates.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
@@ -686,7 +682,7 @@ pub(super) async fn emby_media_updated(
 pub(super) async fn emby_scheduled_tasks(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -696,7 +692,7 @@ pub(super) async fn emby_scheduled_tasks(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let mut active_full_scan = None;
     for status in ["PENDING", "RUNNING"] {
         let jobs = match database.list_scan_jobs(Some(status), 0, 10_000).await {
@@ -767,17 +763,15 @@ fn emby_matching_root<'a>(
     matching
 }
 
-fn spawn_emby_scan_job(state: &AppState, job_id: String) {
-    let Some(scan_jobs) = state.scan_jobs() else {
-        return;
-    };
+fn spawn_emby_scan_job(state: &ReadyAppState, job_id: String) {
+    let scan_jobs = state.scan_jobs();
     crate::application::admin_scan_jobs::spawn_scan_job_worker(
         scan_jobs,
         &job_id,
         crate::application::admin_scan_jobs::ScanWorkerServices {
-            probe: state.probe().cloned(),
-            metadata: state.metadata_reidentify().cloned(),
-            thumbnails: state.thumbnails().cloned(),
+            probe: Some(state.probe().clone()),
+            metadata: Some(state.metadata_reidentify().clone()),
+            thumbnails: Some(state.thumbnails().clone()),
         },
     );
 }
@@ -796,7 +790,7 @@ pub(super) async fn emby_display_preferences(
     headers: HeaderMap,
     Path(display_preferences_id): Path<String>,
     Query(query): Query<EmbyDisplayPreferencesQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let principal = match require_emby_principal_with_query(&headers, &state, &query.auth).await {
         Ok(principal) => principal,
@@ -849,11 +843,11 @@ pub(super) async fn emby_ping(
 
 pub(super) async fn emby_public_users(State(state): State<AppState>) -> Json<Value> {
     let server_id = state.server_id.clone();
-    let Some(auth) = state.emby_auth() else {
+    let Some(state) = state.as_ready() else {
         return Json(json!([]));
     };
     let server_name = current_emby_server_name(&state).await;
-    let users = auth.public_users().await.unwrap_or_default();
+    let users = state.emby_auth().public_users().await.unwrap_or_default();
     let snapshots = emby_user_access_snapshots(&state, &users).await;
     Json(Value::Array(
         users
@@ -874,7 +868,7 @@ pub(super) async fn emby_public_users(State(state): State<AppState>) -> Json<Val
 pub(super) async fn emby_users(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -884,7 +878,7 @@ pub(super) async fn emby_users(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let auth = require_service!(state.emby_auth);
+    let auth = state.emby_auth();
     let users = match auth.public_users().await {
         Ok(users) => users,
         Err(_) => return StatusCode::INTERNAL_SERVER_ERROR.into_response(),
@@ -943,7 +937,7 @@ pub(super) struct EmbyUsersQuery {
 pub(super) async fn emby_query_users(
     headers: HeaderMap,
     Query(query): Query<EmbyUsersQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let acting_principal =
         match require_emby_principal_with_query(&headers, &state, &query.auth).await {
@@ -982,7 +976,7 @@ pub(super) async fn emby_query_users(
         }))
         .into_response();
     }
-    let auth = require_service!(state.emby_auth);
+    let auth = state.emby_auth();
     let (users, total_count) = match auth
         .query_users(
             query.is_disabled,
@@ -1008,12 +1002,12 @@ pub(super) async fn emby_query_users(
         .iter()
         .map(|user| (user.id.to_string(), user.is_admin))
         .collect::<Vec<_>>();
-    let accessible_libraries = match state.access() {
-        Some(access) => access
+    let accessible_libraries = {
+        let access = state.access();
+        access
             .accessible_library_ids_for_users(&access_requests)
             .await
-            .unwrap_or_default(),
-        None => std::collections::HashMap::new(),
+            .unwrap_or_default()
     };
     let mut order_requests = Vec::with_capacity(users.len());
     for user in &users {
@@ -1036,21 +1030,21 @@ pub(super) async fn emby_query_users(
         };
         order_requests.push((user_id, user.is_admin, order_scope));
     }
-    let ordered_views = match state.libraries() {
-        Some(libraries) => libraries
+    let ordered_views = {
+        let libraries = state.libraries();
+        libraries
             .saved_library_orders_for_users(&order_requests)
             .await
-            .unwrap_or_default(),
-        None => std::collections::HashMap::new(),
+            .unwrap_or_default()
     };
-    let stored_configurations = match state.database.as_ref() {
+    let stored_configurations = match Some(state.database()) {
         Some(database) => database
             .list_user_emby_configurations(&user_ids)
             .await
             .unwrap_or_default(),
         None => std::collections::HashMap::new(),
     };
-    let force_admin_library_order = match state.database.as_ref() {
+    let force_admin_library_order = match Some(state.database()) {
         Some(database) => database.force_admin_library_order().await.unwrap_or(false),
         None => false,
     };
@@ -1101,7 +1095,7 @@ pub(super) async fn emby_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let principal = match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
         Ok(principal) => principal,
@@ -1112,7 +1106,7 @@ pub(super) async fn emby_user(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let auth = require_service!(state.emby_auth);
+    let auth = state.emby_auth();
     let user = match auth.user_by_id(&user_id).await {
         Ok(Some(user)) if !user.is_disabled => user,
         Ok(Some(_) | None) => return StatusCode::NOT_FOUND.into_response(),
@@ -1159,7 +1153,7 @@ fn parse_emby_collection_item_ids(ids: Option<&str>) -> Result<Vec<String>, Stat
 pub(super) async fn emby_create_collection(
     headers: HeaderMap,
     Query(query): Query<EmbyCollectionMutationQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let principal =
         match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
@@ -1184,7 +1178,7 @@ pub(super) async fn emby_create_collection(
         Ok(ids) => ids,
         Err(status) => return status.into_response(),
     };
-    let collections = require_service!(state.collections);
+    let collections = state.collections();
     match collections.create_emby_collection(name, &ids).await {
         Ok(Some(collection)) => Json(json!({
             "Id": emby_public_id(&collection.collection_item_id),
@@ -1203,7 +1197,7 @@ pub(super) async fn emby_add_collection_items(
     headers: HeaderMap,
     Path(collection_id): Path<String>,
     Query(query): Query<EmbyCollectionMutationQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     emby_mutate_collection_items(&headers, &collection_id, query, &state, true).await
 }
@@ -1212,7 +1206,7 @@ pub(super) async fn emby_remove_collection_items(
     headers: HeaderMap,
     Path(collection_id): Path<String>,
     Query(query): Query<EmbyCollectionMutationQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     emby_mutate_collection_items(&headers, &collection_id, query, &state, false).await
 }
@@ -1221,7 +1215,7 @@ async fn emby_mutate_collection_items(
     headers: &HeaderMap,
     collection_id: &str,
     query: EmbyCollectionMutationQuery,
-    state: &AppState,
+    state: &ReadyAppState,
     add: bool,
 ) -> Response {
     let principal =
@@ -1236,7 +1230,7 @@ async fn emby_mutate_collection_items(
         Ok(ids) => ids,
         Err(status) => return status.into_response(),
     };
-    let collections = require_service!(state.collections);
+    let collections = state.collections();
     let collection_id = emby_internal_id(collection_id);
     let result = if add {
         collections
@@ -1273,7 +1267,7 @@ pub(super) struct EmbyCreateUserQuery {
 pub(super) async fn emby_create_user(
     headers: HeaderMap,
     Query(query): Query<EmbyCreateUserQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_create_user_request(&headers, &body, query.name.as_deref()) {
@@ -1296,7 +1290,7 @@ pub(super) async fn emby_create_user(
     else {
         return StatusCode::BAD_REQUEST.into_response();
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1305,7 +1299,7 @@ pub(super) async fn emby_create_user(
         if source_id.parse::<UserId>().is_err() {
             return StatusCode::BAD_REQUEST.into_response();
         }
-        let auth = require_service!(state.emby_auth);
+        let auth = state.emby_auth();
         match auth.user_by_id(source_id).await {
             Ok(Some(source)) => Some(source),
             Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -1414,7 +1408,7 @@ pub(super) async fn emby_delete_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if user_id.parse::<UserId>().is_err() {
         return StatusCode::BAD_REQUEST.into_response();
@@ -1427,14 +1421,15 @@ pub(super) async fn emby_delete_user(
     if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match users.soft_delete_user(&user_id).await {
         Ok(Some(hls_session_ids)) => {
-            if let Some(web_playback) = state.web_playback() {
+            {
+                let web_playback = state.web_playback();
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -1692,7 +1687,7 @@ pub(super) async fn emby_update_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_user_update_request(&headers, &body) {
@@ -1717,7 +1712,7 @@ pub(super) async fn emby_update_user(
     if request.policy.is_some() && !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1753,7 +1748,8 @@ pub(super) async fn emby_update_user(
         .await
     {
         Ok(Some((user, hls_session_ids))) => {
-            if let Some(web_playback) = state.web_playback() {
+            {
+                let web_playback = state.web_playback();
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -1786,7 +1782,7 @@ pub(super) async fn emby_update_user_policy(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_user_policy_request(&headers, &body) {
@@ -1804,7 +1800,7 @@ pub(super) async fn emby_update_user_policy(
     if !acting_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1824,7 +1820,8 @@ pub(super) async fn emby_update_user_policy(
         .await
     {
         Ok(Some((_, hls_session_ids))) => {
-            if let Some(web_playback) = state.web_playback() {
+            {
+                let web_playback = state.web_playback();
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -1841,7 +1838,7 @@ pub(super) async fn emby_update_user_password(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_password_request(&headers, &body) {
@@ -1869,7 +1866,7 @@ pub(super) async fn emby_update_user_password(
     if new_password.is_empty() {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1909,7 +1906,7 @@ async fn emby_user_avatar_response(
     image_type: &str,
     user_id: &str,
     index: Option<i32>,
-    state: &AppState,
+    state: &ReadyAppState,
     head_only: bool,
 ) -> Response {
     if let Err(status) = check_primary_user_image(image_type)
@@ -1918,7 +1915,7 @@ async fn emby_user_avatar_response(
     {
         return status.into_response();
     }
-    let avatars = require_service!(state.user_avatars);
+    let avatars = state.user_avatars();
     let Some(target_user_id) = user_id.parse::<UserId>().ok() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -1947,7 +1944,7 @@ pub(super) async fn emby_user_avatar(
     headers: HeaderMap,
     Path((user_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     // Avatars are user data: require a valid Emby credential before serving them.
     if let Err(status) =
@@ -1962,7 +1959,7 @@ pub(super) async fn emby_user_avatar_head(
     headers: HeaderMap,
     Path((user_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(status) =
         require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await
@@ -1977,7 +1974,7 @@ async fn update_emby_user_avatar(
     user_id: String,
     image_type: String,
     query: EmbyUserImageQuery,
-    state: AppState,
+    state: ReadyAppState,
     body: Bytes,
     index: Option<i32>,
 ) -> Response {
@@ -1999,7 +1996,7 @@ async fn update_emby_user_avatar(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let avatars = require_service!(state.user_avatars);
+    let avatars = state.user_avatars();
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -2030,7 +2027,7 @@ pub(super) async fn emby_update_user_avatar(
     headers: HeaderMap,
     Path((user_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let index = query.index;
@@ -2040,7 +2037,7 @@ pub(super) async fn emby_update_user_avatar(
 pub(super) async fn emby_user_avatar_at_index(
     Path((user_id, image_type, image_index)): Path<(String, String, i32)>,
     Query(_query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     emby_user_avatar_response(&image_type, &user_id, Some(image_index), &state, false).await
 }
@@ -2048,7 +2045,7 @@ pub(super) async fn emby_user_avatar_at_index(
 pub(super) async fn emby_user_avatar_at_index_head(
     Path((user_id, image_type, image_index)): Path<(String, String, i32)>,
     Query(_query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     emby_user_avatar_response(&image_type, &user_id, Some(image_index), &state, true).await
 }
@@ -2057,7 +2054,7 @@ pub(super) async fn emby_update_user_avatar_at_index(
     headers: HeaderMap,
     Path((user_id, image_type, image_index)): Path<(String, String, i32)>,
     Query(query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     update_emby_user_avatar(
@@ -2076,7 +2073,7 @@ pub(super) async fn emby_delete_user_avatar_at_index(
     headers: HeaderMap,
     Path((user_id, image_type, image_index)): Path<(String, String, i32)>,
     Query(query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     delete_emby_user_avatar(
         headers,
@@ -2094,7 +2091,7 @@ async fn delete_emby_user_avatar(
     user_id: String,
     image_type: String,
     query: EmbyUserImageQuery,
-    state: AppState,
+    state: ReadyAppState,
     index: Option<i32>,
 ) -> Response {
     if let Err(status) = check_primary_user_image(&image_type)
@@ -2115,7 +2112,7 @@ async fn delete_emby_user_avatar(
     {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let avatars = require_service!(state.user_avatars);
+    let avatars = state.user_avatars();
     let Some(target_user_id) = user_id.parse::<UserId>().ok() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -2129,16 +2126,14 @@ pub(super) async fn emby_delete_user_avatar(
     headers: HeaderMap,
     Path((user_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyUserImageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let index = query.index;
     delete_emby_user_avatar(headers, user_id, image_type, query, state, index).await
 }
 
-pub(super) async fn emby_ordered_views(state: &AppState, user: &UserRecord) -> Vec<String> {
-    let Some(libraries) = state.libraries() else {
-        return Vec::new();
-    };
+pub(super) async fn emby_ordered_views(state: &ReadyAppState, user: &UserRecord) -> Vec<String> {
+    let libraries = state.libraries();
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let Ok((order_scope, _)) =
         super::emby_catalog::emby_library_order_scope(state, principal).await
@@ -2170,16 +2165,14 @@ pub(super) struct EmbyAuthenticateUserRequest {
 
 pub(super) async fn emby_authenticate(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_authenticate_request(&headers, &body) {
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
-    let Some(auth) = state.emby_auth().cloned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = state.emby_auth().clone();
     let login_key = login_attempt_key(&headers, &request.username);
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -2203,7 +2196,7 @@ pub(super) async fn emby_authenticate(
                 .await
             {
                 record_failed_authentication_event(
-                    state.database.as_ref(),
+                    Some(state.database()),
                     &state.admin_events,
                     &user_id,
                     "LUX_EMBY",
@@ -2223,16 +2216,14 @@ pub(super) async fn emby_authenticate(
 pub(super) async fn emby_authenticate_user_id(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_authenticate_user_request(&headers, &body) {
         Ok(request) => request,
         Err(status) => return status.into_response(),
     };
-    let Some(auth) = state.emby_auth().cloned() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = state.emby_auth().clone();
     let login_key = login_attempt_key(&headers, &user_id);
     if !state.login_rate_limiter.is_allowed(&login_key).await {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -2253,7 +2244,7 @@ pub(super) async fn emby_authenticate_user_id(
             state.login_rate_limiter.record_failure(&login_key).await;
             if let Ok(Some(user)) = auth.user_by_id(&user_id).await {
                 record_failed_authentication_event(
-                    state.database.as_ref(),
+                    Some(state.database()),
                     &state.admin_events,
                     &user.id.to_string(),
                     "LUX_EMBY",
@@ -2272,7 +2263,7 @@ pub(super) async fn emby_authenticate_user_id(
 
 async fn emby_authentication_success_response(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     auth: &EmbyAuthService,
     login_key: &str,
     result: crate::auth::emby::EmbyAuthResult,
@@ -2288,7 +2279,7 @@ async fn emby_authentication_success_response(
     state.login_rate_limiter.record_success(login_key).await;
     let user_id = result.user.id.to_string();
     if let Some(device_id) = bounded_emby_device_field(&result.device.device_id) {
-        if let Some(database) = state.database.as_ref() {
+        if let Some(database) = Some(state.database()) {
             let device_name = bounded_emby_device_field(&result.device.device);
             let client_name = bounded_emby_device_field(&result.device.client);
             let client_version = bounded_emby_device_field(&result.device.version);
@@ -2312,7 +2303,7 @@ async fn emby_authentication_success_response(
         }
     }
     record_activity_event(
-        state.database.as_ref(),
+        Some(state.database()),
         &state.admin_events,
         &user_id,
         "AUTH_LOGIN",
@@ -2615,7 +2606,7 @@ pub(super) fn emby_authorization_token(value: &str) -> Option<String> {
 
 pub(super) async fn require_emby_user(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     api_key: Option<&str>,
 ) -> Result<UserRecord, StatusCode> {
     let query = EmbyTokenQuery {
@@ -2629,12 +2620,10 @@ pub(super) async fn require_emby_user(
 
 pub(super) async fn require_emby_user_with_query(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     query: &EmbyTokenQuery,
 ) -> Result<UserRecord, StatusCode> {
-    let Some(auth) = state.emby_auth() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let auth = state.emby_auth();
     let client_ip = super::request_access_ip(headers, state)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
@@ -2654,7 +2643,7 @@ pub(super) async fn require_emby_user_with_query(
 
 pub(super) async fn require_emby_principal(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     api_key: Option<&str>,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
     require_emby_principal_allowing_playback_tokens(headers, state, api_key, false).await
@@ -2664,7 +2653,7 @@ pub(super) async fn require_emby_principal(
 /// playback-only token; the router has already rejected every other Emby path for such a token.
 pub(super) async fn require_playback_route_principal(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     api_key: Option<&str>,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
     require_emby_principal_allowing_playback_tokens(headers, state, api_key, true).await
@@ -2672,7 +2661,7 @@ pub(super) async fn require_playback_route_principal(
 
 async fn require_emby_principal_allowing_playback_tokens(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     api_key: Option<&str>,
     allow_playback_token: bool,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
@@ -2687,7 +2676,7 @@ async fn require_emby_principal_allowing_playback_tokens(
 
 pub(super) async fn require_emby_principal_with_query(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     query: &EmbyTokenQuery,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
     require_emby_principal_scoped(headers, state, query, false).await
@@ -2695,27 +2684,24 @@ pub(super) async fn require_emby_principal_with_query(
 
 async fn require_emby_principal_scoped(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     query: &EmbyTokenQuery,
     allow_playback_token: bool,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, StatusCode> {
-    let Some(auth) = state.emby_auth() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let auth = state.emby_auth();
     let token = emby_token_from_headers(headers)
         .or_else(|| query.api_key.clone())
         .ok_or(StatusCode::UNAUTHORIZED)?;
     if crate::auth::emby::is_playback_token(&token) && !allow_playback_token {
         return Err(StatusCode::UNAUTHORIZED);
     }
-    let principal = if let Some(service) = state.admin_api_key() {
+    let principal = {
+        let service = state.admin_api_key();
         match service.resolve_principal(&token).await {
             Ok(Some(principal)) => Some(principal),
             Ok(None) => None,
             Err(_) => return Err(StatusCode::INTERNAL_SERVER_ERROR),
         }
-    } else {
-        None
     };
     let principal = if let Some(principal) = principal {
         principal
@@ -2753,14 +2739,12 @@ async fn require_emby_principal_scoped(
 
 async fn record_emby_device_access(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     auth: &EmbyAuthService,
     token: &str,
     user_id: &str,
 ) {
-    let Some(database) = state.database.as_ref() else {
-        return;
-    };
+    let database = state.database();
     if !auth.device_access_refresh_due(token) {
         return;
     }
@@ -2820,7 +2804,7 @@ pub(super) fn emby_access_principal(
 }
 
 pub(super) async fn emby_access_principal_for_target(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: &crate::auth::users::AuthenticationPrincipal,
     target_user_id: Option<&str>,
 ) -> Result<AccessPrincipal, StatusCode> {
@@ -2831,9 +2815,7 @@ pub(super) async fn emby_access_principal_for_target(
     if principal.user_id() == Some(target_user_id) {
         return Ok(access_principal);
     }
-    let Some(auth) = state.emby_auth() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let auth = state.emby_auth();
     match auth.user_by_id(&target_user_id.to_string()).await {
         Ok(Some(user)) if !user.is_disabled => Ok(access_principal),
         Ok(Some(_) | None) => Err(StatusCode::NOT_FOUND),
@@ -2844,11 +2826,9 @@ pub(super) async fn emby_access_principal_for_target(
 pub(super) async fn emby_logout(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> StatusCode {
-    let Some(auth) = state.emby_auth() else {
-        return StatusCode::SERVICE_UNAVAILABLE;
-    };
+    let auth = state.emby_auth();
     let token = emby_token_from_headers(&headers).or(query.api_key);
     let Some(token) = token else {
         return StatusCode::UNAUTHORIZED;
@@ -2861,12 +2841,10 @@ pub(super) async fn emby_logout(
 
 /// Loads restriction and library-access state for the users that are about to be serialized.
 async fn emby_user_access_snapshots(
-    state: &AppState,
+    state: &ReadyAppState,
     users: &[UserRecord],
 ) -> std::collections::HashMap<String, crate::storage::UserAccessSnapshot> {
-    let Some(database) = state.database.as_ref() else {
-        return std::collections::HashMap::new();
-    };
+    let database = state.database();
     let user_ids = users
         .iter()
         .map(|user| user.id.to_string())
@@ -2911,13 +2889,11 @@ fn emby_user_date(timestamp: Option<i64>) -> Value {
 }
 
 async fn emby_user_configuration(
-    state: &AppState,
+    state: &ReadyAppState,
     user: &UserRecord,
     ordered_views: &[String],
 ) -> Value {
-    let Some(database) = state.database.as_ref() else {
-        return emby_user_configuration_json(ordered_views);
-    };
+    let database = state.database();
     let stored = database
         .find_user_emby_configuration(&user.id.to_string())
         .await

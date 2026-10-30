@@ -171,20 +171,12 @@ where
 
 pub(crate) async fn admin_list_libraries(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(libraries) = state.libraries() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let libraries = state.libraries();
     match libraries.list_libraries().await {
         Ok(views) => Json(json!({
             "libraries": views
@@ -200,7 +192,7 @@ pub(crate) async fn admin_list_libraries(
 pub(crate) async fn admin_list_directories(
     headers: HeaderMap,
     Query(query): Query<DirectoryBrowseQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -252,18 +244,10 @@ pub(crate) async fn admin_list_directories(
 
 pub(crate) async fn validate_scraper_selection(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     scraper_id: Option<&str>,
 ) -> Result<(), Response> {
-    let Some(plugins) = state.plugins() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response());
-    };
+    let plugins = state.plugins();
     plugins
         .validate_selection(scraper_id)
         .await
@@ -328,7 +312,7 @@ pub(crate) fn update_library_scrapers(
 
 pub(crate) async fn validate_scraper_selections(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     scrapers: &[LibraryScraper],
 ) -> Result<(), Response> {
     for scraper in scrapers {
@@ -339,7 +323,7 @@ pub(crate) async fn validate_scraper_selections(
 
 pub(crate) async fn validate_chapter_source_selection(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     kind: LibraryKind,
     chapter_source_id: Option<&str>,
 ) -> Result<(), Response> {
@@ -358,9 +342,7 @@ pub(crate) async fn validate_chapter_source_selection(
         )
         .into_response());
     }
-    let Some(plugins) = state.plugins() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
+    let plugins = state.plugins();
     match plugins
         .has_available_chapter_source(chapter_source_id)
         .await
@@ -376,21 +358,13 @@ pub(crate) async fn validate_chapter_source_selection(
 
 pub(crate) async fn admin_create_library(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<CreateLibraryRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(libraries) = state.libraries() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let libraries = state.libraries();
     let scrapers = match create_library_scrapers(&request) {
         Ok(scrapers) => scrapers,
         Err(message) => {
@@ -430,8 +404,8 @@ pub(crate) async fn admin_create_library(
     }
     match crate::application::admin_library_settings::create_library(
         libraries,
-        state.home(),
-        state.plugins(),
+        Some(state.home()),
+        Some(state.plugins()),
         crate::application::admin_library_settings::CreateLibraryInput {
             name: &request.name,
             kind,
@@ -477,7 +451,7 @@ pub(crate) async fn admin_create_library(
 pub(crate) async fn admin_update_library(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UpdateLibraryRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -492,15 +466,7 @@ pub(crate) async fn admin_update_library(
             );
         }
     };
-    let Some(libraries) = state.libraries() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let libraries = state.libraries();
     let kind = match request.kind.as_deref() {
         Some(value) => match value.parse::<LibraryKind>() {
             Ok(kind) => Some(kind),
@@ -598,8 +564,8 @@ pub(crate) async fn admin_update_library(
     };
     match crate::application::admin_library_settings::update_library_settings(
         libraries,
-        state.home(),
-        state.plugins(),
+        Some(state.home()),
+        Some(state.plugins()),
         library_id,
         settings,
     )
@@ -638,7 +604,7 @@ pub(crate) async fn admin_update_library(
 pub(crate) async fn admin_update_library_cover(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -653,7 +619,7 @@ pub(crate) async fn admin_update_library_cover(
             );
         }
     };
-    let covers = require_service!(state.library_covers);
+    let covers = state.library_covers();
     let content_type = headers
         .get("content-type")
         .and_then(|value| value.to_str().ok())
@@ -693,7 +659,7 @@ pub(crate) async fn admin_update_library_cover(
 pub(crate) async fn admin_list_library_cover_jobs(
     headers: HeaderMap,
     Query(query): Query<AdminJobsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -725,7 +691,7 @@ pub(crate) async fn admin_list_library_cover_jobs(
         )
         .into_response();
     }
-    let service = require_service!(state.library_covers);
+    let service = state.library_covers();
     match service.list(status.as_deref(), offset, limit).await {
         Ok(jobs) => Json(json!({
             "jobs": jobs,
@@ -740,12 +706,12 @@ pub(crate) async fn admin_list_library_cover_jobs(
 pub(crate) async fn admin_get_library_cover_job(
     headers: HeaderMap,
     Path(job_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let service = require_service!(state.library_covers);
+    let service = state.library_covers();
     match service.get(&job_id).await {
         Ok(job) => Json(json!({ "job": job })).into_response(),
         Err(error) => library_cover_error(&headers, error),
@@ -755,7 +721,7 @@ pub(crate) async fn admin_get_library_cover_job(
 pub(crate) async fn admin_run_auto_library_cover(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -770,7 +736,7 @@ pub(crate) async fn admin_run_auto_library_cover(
         }
     };
     let library_id_text = library_id.to_string();
-    let covers = require_service!(state.library_covers);
+    let covers = state.library_covers();
     let job = match covers.dispatch_manual_job(library_id).await {
         Ok(job) => job,
         Err(
@@ -814,7 +780,7 @@ pub(crate) async fn admin_run_auto_library_cover(
 pub(crate) async fn admin_delete_library_root(
     headers: HeaderMap,
     Path((library_id, root_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -837,10 +803,10 @@ pub(crate) async fn admin_delete_library_root(
             );
         }
     };
-    let libraries = require_service!(state.libraries);
+    let libraries = state.libraries();
     match crate::application::admin_library_settings::delete_library_root(
         libraries,
-        state.home(),
+        Some(state.home()),
         library_id,
         root_id,
     )
@@ -866,7 +832,7 @@ pub(crate) async fn admin_delete_library_root(
 pub(crate) async fn admin_delete_library(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -880,13 +846,13 @@ pub(crate) async fn admin_delete_library(
             );
         }
     };
-    let database = require_service!(state.database);
-    let libraries = require_service!(state.libraries);
+    let database = state.database();
+    let libraries = state.libraries();
     let service = crate::application::library_deletion::LibraryDeletionService::new(
         database.clone(),
-        state.scan_jobs().cloned(),
-        state.plugins().cloned(),
-        state.home().cloned(),
+        Some(state.scan_jobs().clone()),
+        Some(state.plugins().clone()),
+        Some(state.home().clone()),
     );
     let job = match service.request(library_id).await {
         Ok(job) => job,
@@ -931,7 +897,8 @@ pub(crate) async fn admin_delete_library(
     };
     let target_id = library_id.to_string();
     libraries.notify_library_changed();
-    if let Some(home) = state.home() {
+    {
+        let home = state.home();
         home.invalidate();
     }
     record_audit_event(
@@ -961,7 +928,7 @@ pub(crate) struct LibraryDeletionJobsQuery {
 pub(crate) async fn admin_list_library_deletion_jobs(
     headers: HeaderMap,
     Query(query): Query<LibraryDeletionJobsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -993,12 +960,12 @@ pub(crate) async fn admin_list_library_deletion_jobs(
         )
         .into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let service = crate::application::library_deletion::LibraryDeletionService::new(
         database.clone(),
-        state.scan_jobs().cloned(),
-        state.plugins().cloned(),
-        state.home().cloned(),
+        Some(state.scan_jobs().clone()),
+        Some(state.plugins().clone()),
+        Some(state.home().clone()),
     );
     match service.list(offset, limit, status.as_deref()).await {
         Ok((jobs, total)) => (
@@ -1027,7 +994,7 @@ pub(crate) async fn admin_list_library_deletion_jobs(
 pub(crate) async fn admin_retry_library_deletion(
     headers: HeaderMap,
     Path(job_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -1044,12 +1011,12 @@ pub(crate) async fn admin_retry_library_deletion(
             .into_response();
         }
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let service = crate::application::library_deletion::LibraryDeletionService::new(
         database.clone(),
-        state.scan_jobs().cloned(),
-        state.plugins().cloned(),
-        state.home().cloned(),
+        Some(state.scan_jobs().clone()),
+        Some(state.plugins().clone()),
+        Some(state.home().clone()),
     );
     let job = match service.retry(&job_id).await {
         Ok(job) => job,
@@ -1117,7 +1084,7 @@ fn library_deletion_job_json(job: &crate::storage::StoredLibraryDeletionJob) -> 
 pub(crate) async fn admin_add_library_root(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AddLibraryRootRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -1132,18 +1099,10 @@ pub(crate) async fn admin_add_library_root(
             );
         }
     };
-    let Some(libraries) = state.libraries() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let libraries = state.libraries();
     match crate::application::admin_library_settings::add_library_root(
         libraries,
-        state.home(),
+        Some(state.home()),
         library_id,
         &request.path,
     )

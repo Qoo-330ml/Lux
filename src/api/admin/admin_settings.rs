@@ -52,12 +52,12 @@ fn registration_settings_response(settings: crate::storage::StoredRegistrationMo
 
 async fn admin_get_registration_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::settings::read_registration_mode(database).await {
         Ok(settings) => registration_settings_response(settings),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -66,7 +66,7 @@ async fn admin_get_registration_settings(
 
 async fn admin_update_registration_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -100,7 +100,7 @@ async fn admin_update_registration_settings(
     if request.version.is_some_and(|version| version < 0) {
         return invalid();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let Some(mode) = request.registration_mode else {
         return match crate::application::settings::read_registration_mode(database).await {
             Ok(settings) => registration_settings_response(settings),
@@ -139,7 +139,7 @@ async fn admin_update_registration_settings(
 
 pub(crate) async fn admin_get_mail_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -166,7 +166,7 @@ pub(crate) async fn admin_get_mail_settings(
 
 pub(crate) async fn admin_update_mail_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(settings): Json<crate::application::mail::MailSettings>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -199,7 +199,7 @@ pub(crate) async fn admin_update_mail_settings(
 
 pub(crate) async fn admin_update_mail_credentials(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(credentials): Json<crate::application::mail::SmtpCredentials>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -232,7 +232,7 @@ pub(crate) async fn admin_update_mail_credentials(
 
 pub(crate) async fn admin_delete_mail_credentials(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -248,7 +248,7 @@ pub(crate) async fn admin_delete_mail_credentials(
 
 pub(crate) async fn admin_test_mail_connection(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -297,12 +297,12 @@ pub(crate) async fn admin_test_mail_connection(
 /// Re-runs the hardware encoder self-test on demand.
 pub(crate) async fn admin_probe_transcoding(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     let status = service.refresh_hardware_status().await;
     Json(json!({
         "transcodingStatus": {
@@ -315,14 +315,17 @@ pub(crate) async fn admin_probe_transcoding(
     .into_response()
 }
 
-pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(crate) async fn admin_settings(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let settings = match crate::application::settings::read_admin_settings(
         database,
-        state.plugins(),
+        Some(state.plugins()),
         state.config_dir.as_deref(),
     )
     .await
@@ -330,9 +333,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Ok(settings) => settings,
         Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let status = state
-        .web_playback()
-        .map(|service| service.hardware_status());
+    let status = Some(state.web_playback().hardware_status());
     Json(admin_settings_json(&settings, status.as_ref())).into_response()
 }
 
@@ -398,7 +399,7 @@ pub(crate) struct NetworkProxyProbeResponse {
 
 pub(crate) async fn admin_test_network_proxy(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<NetworkProxyTestRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -477,12 +478,12 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
 
 pub(crate) async fn admin_get_api_key(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin_web_session(&headers, &state, false).await {
         return response;
     }
-    let service = require_service!(state.admin_api_key);
+    let service = state.admin_api_key();
     match service.current().await {
         Ok(api_key) => Json(json!({
             "configured": api_key.is_some(),
@@ -495,12 +496,12 @@ pub(crate) async fn admin_get_api_key(
 
 pub(crate) async fn admin_rotate_api_key(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin_web_session(&headers, &state, true).await {
         return response;
     }
-    let service = require_service!(state.admin_api_key);
+    let service = state.admin_api_key();
     match service.rotate().await {
         Ok(api_key) => {
             record_audit_event(
@@ -524,12 +525,12 @@ pub(crate) async fn admin_rotate_api_key(
 
 pub(crate) async fn admin_revoke_api_key(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin_web_session(&headers, &state, true).await {
         return response;
     }
-    let service = require_service!(state.admin_api_key);
+    let service = state.admin_api_key();
     match service.revoke().await {
         Ok(()) => {
             record_audit_event(
@@ -549,13 +550,13 @@ pub(crate) async fn admin_revoke_api_key(
 
 pub(crate) async fn admin_update_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UpdatePlaybackSettingsRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let network_proxy = match request.extra.get("networkProxyUrl") {
         None => crate::application::settings::NetworkProxyChange::Unchanged,
         Some(Value::Null) => crate::application::settings::NetworkProxyChange::Set(None),
@@ -566,8 +567,8 @@ pub(crate) async fn admin_update_settings(
     };
     let settings = match crate::application::settings::update_admin_settings(
         database,
-        state.home(),
-        state.plugins(),
+        Some(state.home()),
+        Some(state.plugins()),
         state.config_dir.as_deref(),
         crate::application::settings::AdminSettingsUpdate {
             server_name: request.server_name,
@@ -687,16 +688,15 @@ pub(crate) async fn admin_update_settings(
             return plugin_error(&headers, error);
         }
     };
-    if let Some(variants) = state.image_variants() {
+    {
+        let variants = state.image_variants();
         variants.apply_settings(settings.media_strategy.images.variant_cache.clone());
     }
-    let hardware_status = match state.web_playback() {
-        Some(web_playback) => {
-            web_playback.apply_transcoding_settings(&settings.transcoding);
-            // Re-run the self-test so the response and the capability flags agree immediately.
-            Some(web_playback.refresh_hardware_status().await)
-        }
-        None => None,
+    let hardware_status = {
+        let web_playback = state.web_playback();
+        web_playback.apply_transcoding_settings(&settings.transcoding);
+        // Re-run the self-test so the response and the capability flags agree immediately.
+        Some(web_playback.refresh_hardware_status().await)
     };
     record_audit_event(
         &state,

@@ -389,7 +389,7 @@ pub(super) async fn emby_user_views(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -418,7 +418,7 @@ pub(super) async fn emby_user_views(
 pub(super) async fn emby_library_virtual_folders(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -428,9 +428,9 @@ pub(super) async fn emby_library_virtual_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let libraries = require_service!(state.libraries);
-    let database = require_service!(state.database);
-    let access = require_service!(state.access);
+    let libraries = state.libraries();
+    let database = state.database();
+    let access = state.access();
     let media_strategy = match read_media_strategy_settings(database).await {
         Ok(settings) => settings,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -499,7 +499,7 @@ async fn emby_libraries_for_principal(
 pub(super) async fn emby_library_selectable_media_folders(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -509,8 +509,8 @@ pub(super) async fn emby_library_selectable_media_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let libraries = require_service!(state.libraries);
-    let access = require_service!(state.access);
+    let libraries = state.libraries();
+    let access = state.access();
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
@@ -534,7 +534,7 @@ pub(super) async fn emby_library_selectable_media_folders(
 pub(super) async fn emby_library_media_folders(
     headers: HeaderMap,
     Query(query): Query<EmbyMediaFoldersQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
@@ -544,8 +544,8 @@ pub(super) async fn emby_library_media_folders(
     if !auth_principal.can_manage_server() {
         return StatusCode::FORBIDDEN.into_response();
     }
-    let database = require_service!(state.database);
-    let access = require_service!(state.access);
+    let database = state.database();
+    let access = state.access();
     let principal = match emby_access_principal(&auth_principal, None) {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
@@ -653,7 +653,7 @@ fn emby_media_folder_page_params(query: &EmbyMediaFoldersQuery) -> Result<(i64, 
 pub(super) async fn emby_persons(
     headers: HeaderMap,
     Query(query): Query<EmbyPersonsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal_with_query(&headers, &state, &query.auth).await {
@@ -667,7 +667,7 @@ pub(super) async fn emby_persons(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let access = require_service!(state.access);
+    let access = state.access();
     let accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -712,7 +712,7 @@ pub(super) async fn emby_persons(
             .into_response();
         }
     };
-    let people = require_service!(state.people);
+    let people = state.people();
     let result = match parent_id.as_deref() {
         Some(parent_id) => {
             people
@@ -746,7 +746,7 @@ pub(super) async fn emby_person(
     headers: HeaderMap,
     Path(person_id_or_name): Path<String>,
     Query(query): Query<EmbyPersonQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal_with_query(&headers, &state, &query.auth).await {
@@ -760,12 +760,12 @@ pub(super) async fn emby_person(
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let access = require_service!(state.access);
+    let access = state.access();
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let people = require_service!(state.people);
+    let people = state.people();
     match people
         .find_person(&library_ids, "Actor", &person_id_or_name)
         .await
@@ -786,7 +786,7 @@ pub(super) async fn emby_user_root(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -804,7 +804,7 @@ pub(super) async fn emby_user_root(
 pub(super) async fn emby_items_root(
     headers: HeaderMap,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -822,7 +822,7 @@ pub(super) async fn emby_items_root(
 }
 
 pub(super) async fn emby_user_root_response(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
 ) -> Response {
     let items = match emby_visible_library_items(state, principal).await {
@@ -852,12 +852,10 @@ pub(super) async fn emby_user_root_response(
 }
 
 pub(super) async fn emby_visible_library_items(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
 ) -> Result<Vec<Value>, StatusCode> {
-    let Some(libraries) = state.libraries() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let libraries = state.libraries();
     let (order_scope, collection_count) = emby_library_order_scope(state, principal).await?;
     let accessible_library_ids = order_scope
         .iter()
@@ -872,7 +870,7 @@ pub(super) async fn emby_visible_library_items(
         )
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let catalog = state.catalog().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog();
     let child_counts = catalog
         .count_library_root_items(&accessible_library_ids)
         .await
@@ -922,15 +920,15 @@ pub(super) async fn emby_visible_library_items(
 }
 
 pub(super) async fn emby_library_order_scope(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
 ) -> Result<(Vec<String>, i64), StatusCode> {
-    let access = state.access().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let access = state.access();
     let library_ids = access
         .accessible_library_ids(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let catalog = state.catalog().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog();
     let content_restrictions = catalog
         .content_restrictions_for_principal(principal)
         .await
@@ -947,12 +945,12 @@ pub(super) async fn emby_library_order_scope(
 /// Resolves the Emby library scope when the caller already batched the accessible libraries and
 /// the content restrictions of the page.
 pub(super) async fn emby_library_order_scope_with_access(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     accessible_library_ids: Vec<String>,
     content_restrictions: Option<&crate::storage::UserContentRestrictions>,
 ) -> Result<(Vec<String>, i64), StatusCode> {
-    let catalog = state.catalog().ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog();
     // Only the total decides whether the collection library is part of the scope; building a
     // card for it would assemble catalog rows nobody reads.
     let collection_count = catalog
@@ -991,10 +989,10 @@ fn emby_global_collection_library_json(server_id: &str, child_count: i64) -> Val
 }
 
 async fn emby_global_collection_library_detail(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
 ) -> Response {
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     match catalog.list_global_collection_cards(principal, 0, 1).await {
         Ok(page) if page.total > 0 => Json(emby_global_collection_library_json(
             &state.server_id,
@@ -1007,14 +1005,12 @@ async fn emby_global_collection_library_detail(
 }
 
 pub(super) async fn emby_library_root_count(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     library_id: &str,
     kind: LibraryKind,
 ) -> Result<i64, StatusCode> {
-    let Some(catalog) = state.catalog() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let catalog = state.catalog();
     let item_types = match kind {
         LibraryKind::Movie => vec!["MOVIE".to_owned()],
         LibraryKind::Series => vec!["SERIES".to_owned()],
@@ -1056,7 +1052,7 @@ pub(super) async fn emby_user_resume(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1072,7 +1068,7 @@ pub(super) async fn emby_user_resume(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let page = match catalog
         .list_continue_watching(principal, &user_id, offset, limit)
         .await
@@ -1098,7 +1094,7 @@ pub(super) async fn emby_user_latest(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(mut query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1180,7 +1176,7 @@ pub(super) async fn emby_user_favorites(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(mut query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1204,16 +1200,16 @@ pub(super) async fn emby_user_favorites(
     .await
 }
 
-pub(super) async fn emby_parent_is_library(state: &AppState, parent_id: &str) -> bool {
+pub(super) async fn emby_parent_is_library(state: &ReadyAppState, parent_id: &str) -> bool {
     emby_parent_library_kind(state, parent_id).await.is_some()
 }
 
-async fn emby_parent_library_kind(state: &AppState, parent_id: &str) -> Option<LibraryKind> {
+async fn emby_parent_library_kind(state: &ReadyAppState, parent_id: &str) -> Option<LibraryKind> {
     let internal_id = emby_internal_id(parent_id);
     let Ok(library_id) = internal_id.parse::<crate::domain::ids::LibraryId>() else {
         return None;
     };
-    let libraries = state.libraries()?;
+    let libraries = state.libraries();
     match libraries.get_library(library_id).await {
         Ok(library) if library.is_enabled => Some(library.kind),
         _ => None,
@@ -1232,7 +1228,7 @@ pub(super) fn emby_latest_groups_children(query: &EmbyItemsQuery) -> bool {
 }
 
 pub(super) async fn emby_group_latest_page(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     page: CatalogPage,
 ) -> Result<(CatalogPage, HashMap<String, i64>), StatusCode> {
@@ -1260,9 +1256,7 @@ pub(super) async fn emby_group_latest_page(
         *group_counts.entry(series_id.to_owned()).or_insert(0) += 1;
     }
 
-    let Some(catalog) = state.catalog() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let catalog = state.catalog();
     let mut series_by_id = HashMap::new();
     if !series_ids.is_empty() {
         let filter = CatalogFilter {
@@ -1319,7 +1313,7 @@ pub(super) async fn emby_user_next_up(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1345,7 +1339,7 @@ pub(super) async fn emby_user_next_up(
 pub(super) async fn emby_shows_next_up(
     headers: HeaderMap,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1372,7 +1366,7 @@ pub(super) async fn emby_shows_next_up(
 }
 
 pub(super) async fn emby_next_up_response(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     user_id: &str,
     can_download: bool,
@@ -1383,7 +1377,7 @@ pub(super) async fn emby_next_up_response(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let series_id = query.series_id.as_deref().map(emby_internal_id);
     match catalog
         .list_next_up(principal, user_id, series_id.as_deref(), offset, limit)
@@ -1415,7 +1409,7 @@ pub(super) async fn emby_show_seasons(
     headers: HeaderMap,
     Path(series_id): Path<String>,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1433,7 +1427,7 @@ pub(super) async fn emby_show_seasons(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let series_id = emby_internal_id(&series_id);
     match catalog
         .list_children(principal, &series_id, "SEASON", offset, limit)
@@ -1461,7 +1455,7 @@ pub(super) async fn emby_show_episodes(
     headers: HeaderMap,
     Path(series_id): Path<String>,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1479,7 +1473,7 @@ pub(super) async fn emby_show_episodes(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let series_id = emby_internal_id(&series_id);
     // Emby clients commonly serialize an unset season selector as `SeasonId=`.
     // Treat it the same as an omitted selector instead of looking up an empty ID.
@@ -1547,7 +1541,7 @@ pub(super) async fn emby_collection_children(
     headers: HeaderMap,
     Path(collection_id): Path<String>,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1565,7 +1559,7 @@ pub(super) async fn emby_collection_children(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let collection_id = emby_internal_id(&collection_id);
     match catalog
         .list_collection_items(principal, &collection_id, offset, limit)
@@ -1590,7 +1584,7 @@ pub(super) async fn emby_collection_children(
 }
 
 pub(super) async fn emby_catalog_page_for_user_with_fields(
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
@@ -1619,7 +1613,7 @@ pub(super) struct EmbyCatalogPageOptions<'a> {
 }
 
 pub(super) async fn emby_catalog_page_for_user_with_preferred_source_and_options(
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
@@ -1654,7 +1648,7 @@ pub(super) async fn emby_catalog_page_for_user_with_preferred_source_and_options
 }
 
 pub(super) async fn emby_catalog_items_for_user(
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
@@ -1674,7 +1668,7 @@ pub(super) async fn emby_catalog_items_for_user(
 }
 
 pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: &str,
     page: &CatalogPage,
     fields: Option<&str>,
@@ -1682,9 +1676,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
     can_delete: bool,
     preferred_source_id: Option<&str>,
 ) -> Result<Vec<Value>, StatusCode> {
-    let Some(database) = state.database.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let database = state.database();
     let item_ids = page
         .items
         .iter()
@@ -1694,9 +1686,7 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
         Ok(states) => states,
         Err(_) => return Err(StatusCode::SERVICE_UNAVAILABLE),
     };
-    let Some(catalog) = state.catalog() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let catalog = state.catalog();
     let mut catalog_items = page.items.clone();
     if catalog
         .populate_image_tags(&mut catalog_items)
@@ -1718,8 +1708,8 @@ pub(super) async fn emby_catalog_items_for_user_with_preferred_source(
     let include_nfo = emby_nfo_fields_requested(fields);
     let include_people = fields.is_some_and(|fields| emby_fields_include(Some(fields), "People"));
     let extras = load_emby_item_extras(
-        state.local_nfo().cloned(),
-        state.people().cloned(),
+        Some(state.local_nfo().clone()),
+        Some(state.people().clone()),
         &catalog_items,
         include_nfo,
         include_people,
@@ -1904,7 +1894,7 @@ pub(super) async fn emby_user_items(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1932,7 +1922,7 @@ pub(super) async fn emby_user_items(
 pub(super) async fn emby_items(
     headers: HeaderMap,
     Query(query): Query<EmbyItemsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1960,7 +1950,7 @@ pub(super) async fn emby_items(
 pub(super) async fn emby_items_counts(
     headers: HeaderMap,
     Query(query): Query<EmbyItemCountsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
@@ -1975,7 +1965,7 @@ pub(super) async fn emby_items_counts(
             Err(status) => return status.into_response(),
         };
     let target_user_id = principal.user_id_string();
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let counts = match catalog
         .count_item_types(principal, &target_user_id, query.is_favorite)
         .await
@@ -2008,7 +1998,7 @@ pub(super) async fn emby_items_counts(
 
 pub(super) async fn emby_list_items(
     _headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     can_download: bool,
     can_delete: bool,
@@ -2071,7 +2061,7 @@ pub(super) async fn emby_list_items(
 }
 
 async fn emby_global_collection_root_items_response(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     user_id: &str,
     can_download: bool,
@@ -2082,7 +2072,7 @@ async fn emby_global_collection_root_items_response(
         Ok(params) => params,
         Err(status) => return status.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let page = match catalog
         .list_global_collection_cards(principal, offset, limit)
         .await
@@ -2155,7 +2145,7 @@ pub(super) fn emby_single_id_lookup(query: &EmbyItemsQuery) -> Option<&str> {
 }
 
 pub(super) async fn emby_single_id_lookup_response(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     can_download: bool,
     can_delete: bool,
@@ -2163,7 +2153,7 @@ pub(super) async fn emby_single_id_lookup_response(
 ) -> Option<Response> {
     let requested_id = emby_single_id_lookup(query)?;
     let internal_item_id = emby_internal_id(requested_id);
-    let catalog = state.catalog()?;
+    let catalog = state.catalog();
     let (item, preferred_source_id) = match catalog.find_item(principal, &internal_item_id).await {
         Ok(Some(item)) => (Some(item), None),
         Ok(None) => match catalog
@@ -2200,7 +2190,7 @@ pub(super) async fn emby_single_id_lookup_response(
     {
         return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
-    let database = state.database.as_ref()?;
+    let database = Some(state.database())?;
     let nfo = if emby_nfo_fields_requested(query.fields.as_deref()) {
         read_local_nfo_details(state, &item.id).await
     } else {
@@ -2255,8 +2245,9 @@ pub(super) async fn emby_single_id_lookup_response(
         return Some(StatusCode::SERVICE_UNAVAILABLE.into_response());
     }
     if emby_fields_include(query.fields.as_deref(), "People") {
-        let actors = match state.people() {
-            Some(people) => match people.list_item_actors(&item.id).await {
+        let actors = {
+            let people = state.people();
+            match people.list_item_actors(&item.id).await {
                 Ok(actors) => actors,
                 Err(error) => {
                     tracing::warn!(
@@ -2266,8 +2257,7 @@ pub(super) async fn emby_single_id_lookup_response(
                     );
                     Vec::new()
                 }
-            },
-            None => Vec::new(),
+            }
         };
         if let Value::Object(object) = &mut item_json {
             let mut people = actors
@@ -2290,7 +2280,7 @@ pub(super) async fn emby_single_id_lookup_response(
 }
 
 pub(super) async fn emby_query_requests_series_children(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     query: &EmbyItemsQuery,
 ) -> bool {
@@ -2309,9 +2299,7 @@ pub(super) async fn emby_query_requests_series_children(
     let Some(parent_id) = query.parent_id.as_deref() else {
         return false;
     };
-    let Some(catalog) = state.catalog() else {
-        return false;
-    };
+    let catalog = state.catalog();
     let parent_id = emby_internal_id(parent_id);
     matches!(
         catalog.find_item(principal, &parent_id).await,
@@ -2342,7 +2330,7 @@ pub(super) fn emby_query_targets_user_root_views(query: &EmbyItemsQuery, root_id
 }
 
 pub(super) async fn emby_catalog_page_from_query(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     query: &EmbyItemsQuery,
 ) -> Result<CatalogPage, StatusCode> {
@@ -2350,9 +2338,7 @@ pub(super) async fn emby_catalog_page_from_query(
         Ok(params) => params,
         Err(status) => return Err(status),
     };
-    let Some(catalog) = state.catalog() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let catalog = state.catalog();
     let parent_id = query.parent_id.as_deref().map(emby_internal_id);
     let parent_library_kind = match parent_id.as_deref() {
         Some(parent_id) => emby_parent_library_kind(state, parent_id).await,
@@ -2439,7 +2425,7 @@ pub(super) async fn emby_catalog_page_from_query(
 }
 
 pub(super) async fn emby_catalog_page_for_item_parent(
-    state: &AppState,
+    state: &ReadyAppState,
     catalog: &CatalogService,
     principal: AccessPrincipal,
     parent_id: &str,
@@ -2469,7 +2455,8 @@ pub(super) async fn emby_catalog_page_for_item_parent(
     let child_types = if !requested_types.is_empty() {
         requested_types.join(",")
     } else if parent.item_type == "FOLDER" {
-        let is_home_videos = if let Some(libraries) = state.libraries() {
+        let is_home_videos = {
+            let libraries = state.libraries();
             libraries
                 .get_library(
                     parent
@@ -2479,8 +2466,6 @@ pub(super) async fn emby_catalog_page_for_item_parent(
                 )
                 .await
                 .is_ok_and(|library| library.kind == LibraryKind::HomeVideos)
-        } else {
-            false
         };
         if is_home_videos {
             "FOLDER,VIDEO".to_owned()
@@ -2527,7 +2512,7 @@ pub(super) async fn emby_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     // On the playback allow-list: a 302 proxy resolves the original STRM path through this route.
     let auth_principal =
@@ -2569,7 +2554,7 @@ pub(super) async fn emby_delete_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<EmbyDeleteItemQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.auth.api_key.as_deref()).await {
@@ -2623,7 +2608,7 @@ pub(super) async fn emby_update_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<EmbyPersonUpdateRequest>,
 ) -> Response {
     let auth_principal =
@@ -2645,12 +2630,12 @@ pub(super) async fn emby_update_item(
     {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let access = require_service!(state.access);
+    let access = state.access();
     let library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let people = require_service!(state.people);
+    let people = state.people();
     let update = PersonMetadataUpdate {
         name: request.name.trim().to_owned(),
         biography: request.overview,
@@ -2691,7 +2676,7 @@ pub(super) async fn emby_user_item(
     headers: HeaderMap,
     Path((user_id, item_id)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     // On the playback allow-list, like `/Items/{id}`.
     let auth_principal =
@@ -2717,7 +2702,7 @@ pub(super) async fn emby_user_item(
 }
 
 pub(super) async fn emby_item_response(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     item_id: &str,
     can_download: bool,
@@ -2732,15 +2717,14 @@ pub(super) async fn emby_item_response(
         return emby_global_collection_library_detail(state, principal).await;
     }
     let response_fields = emby_item_detail_response_fields(fields);
-    if let Ok(library_id) = internal_item_id.parse::<crate::domain::ids::LibraryId>()
-        && let Some(libraries) = state.libraries()
-    {
+    if let Ok(library_id) = internal_item_id.parse::<crate::domain::ids::LibraryId>() {
+        let libraries = state.libraries();
         match libraries.get_library(library_id).await {
             Ok(library) => {
                 if !library.is_enabled {
                     return StatusCode::NOT_FOUND.into_response();
                 }
-                let access = require_service!(state.access);
+                let access = state.access();
                 match access.can_view_library(principal, &internal_item_id).await {
                     Ok(true) => {}
                     Ok(false) => return StatusCode::NOT_FOUND.into_response(),
@@ -2768,7 +2752,7 @@ pub(super) async fn emby_item_response(
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         }
     }
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let (catalog_item, resolved_from_media_source_id) =
         match catalog.find_item(principal, &internal_item_id).await {
             Ok(Some(item)) => (Some(item), false),
@@ -2839,7 +2823,7 @@ pub(super) async fn emby_item_response(
             Json(item_json).into_response()
         }
         Some(mut item) => {
-            let database = require_service!(state.database);
+            let database = state.database();
             let work_plan = emby_item_detail_work_plan(fields);
             if work_plan.populate_image_tags
                 && catalog
@@ -2870,8 +2854,9 @@ pub(super) async fn emby_item_response(
                     if !work_plan.read_people {
                         return Vec::new();
                     }
-                    match state.people() {
-                        Some(people) => match people.list_item_actors(&item.id).await {
+                    {
+                        let people = state.people();
+                        match people.list_item_actors(&item.id).await {
                             Ok(actors) => actors,
                             Err(error) => {
                                 tracing::warn!(
@@ -2881,8 +2866,7 @@ pub(super) async fn emby_item_response(
                                 );
                                 Vec::new()
                             }
-                        },
-                        None => Vec::new(),
+                        }
                     }
                 },
             );
@@ -2939,14 +2923,12 @@ pub(super) async fn emby_item_response(
             Json(item_json).into_response()
         }
         None => {
-            let access = require_service!(state.access);
+            let access = state.access();
             let library_ids = match access.accessible_library_ids(principal).await {
                 Ok(library_ids) => library_ids,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
             };
-            let Some(people) = state.people() else {
-                return StatusCode::NOT_FOUND.into_response();
-            };
+            let people = state.people();
             match people.find_person(&library_ids, "Actor", item_id).await {
                 Ok(Some(person)) => Json(emby_person_json_with_fields(
                     person,
@@ -2965,14 +2947,14 @@ pub(super) async fn emby_item_response(
 }
 
 async fn emby_global_collection_item_detail(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     collection_item_id: &str,
     fields: Option<&str>,
     can_download: bool,
     can_delete: bool,
 ) -> Response {
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let card = match catalog
         .find_global_collection_card(principal, collection_item_id)
         .await
@@ -3014,7 +2996,7 @@ pub(super) async fn emby_person_image(
     method: Method,
     Path((person_id, image_type)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     emby_person_image_response(&headers, &method, &person_id, &image_type, &query, &state).await
 }
@@ -3024,7 +3006,7 @@ pub(super) async fn emby_person_image_at_index(
     method: Method,
     Path((person_id, image_type, image_index)): Path<(String, String, String)>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if image_index.parse::<i64>().ok() != Some(0) {
         return StatusCode::NOT_FOUND.into_response();
@@ -3038,7 +3020,7 @@ pub(super) async fn emby_person_image_response(
     person_id: &str,
     image_type: &str,
     query: &EmbyTokenQuery,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Response {
     if normalize_image_type(image_type) != Some("POSTER") {
         return StatusCode::NOT_FOUND.into_response();
@@ -3046,9 +3028,7 @@ pub(super) async fn emby_person_image_response(
     if let Err(status) = require_emby_principal(headers, state, query.api_key.as_deref()).await {
         return status.into_response();
     }
-    let Some(people) = state.people() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let people = state.people();
     let image = match people.profile_image_for_emby_name_or_id(person_id).await {
         Ok(Some(image)) => image,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -3201,10 +3181,10 @@ pub(super) fn emby_nfo_crew_json(nfo: &LocalNfoDetails) -> Vec<Value> {
 }
 
 pub(super) async fn read_local_nfo_details(
-    state: &AppState,
+    state: &ReadyAppState,
     item_id: &str,
 ) -> Option<LocalNfoDetails> {
-    let store = state.local_nfo()?;
+    let store = state.local_nfo();
     match store.read_item(item_id).await {
         Ok(details) => details,
         Err(error) => {
@@ -4342,13 +4322,12 @@ pub(super) fn emby_video_stream_dimension(
 }
 
 pub(super) async fn emby_primary_image_aspect_ratio(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     item_id: &str,
 ) -> Option<f64> {
     if let Some((width, height)) = state
-        .database
-        .as_ref()?
+        .database()
         .find_primary_image_dimensions(item_id)
         .await
         .ok()?
@@ -4358,7 +4337,7 @@ pub(super) async fn emby_primary_image_aspect_ratio(
         return Some(f64::from(width) / f64::from(height));
     }
 
-    let images = state.images()?;
+    let images = state.images();
     let image = images
         .resolve(principal, item_id, "POSTER", 0)
         .await
@@ -4369,7 +4348,7 @@ pub(super) async fn emby_primary_image_aspect_ratio(
     if width <= 0 || height <= 0 {
         return None;
     }
-    if let Some(database) = state.database.as_ref() {
+    if let Some(database) = Some(state.database()) {
         let _ = database
             .set_item_image_dimensions(item_id, "POSTER", 0, width, height)
             .await;

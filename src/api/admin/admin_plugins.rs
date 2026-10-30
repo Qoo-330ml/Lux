@@ -54,7 +54,7 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
 pub(crate) async fn admin_list_plugins(
     headers: HeaderMap,
     Query(query): Query<LuxPageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     admin_list_plugins_with_scope(headers, query, state, false).await
 }
@@ -62,7 +62,7 @@ pub(crate) async fn admin_list_plugins(
 pub(crate) async fn admin_list_notification_providers(
     headers: HeaderMap,
     Query(query): Query<LuxPageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -79,7 +79,7 @@ pub(crate) async fn admin_list_notification_providers(
             .into_response();
         }
     };
-    let plugins = require_service!(state.plugins);
+    let plugins = state.plugins();
     match plugins.list_notification_plugins(offset, limit).await {
         Ok(page) => Json(plugin_page_json(&page)).into_response(),
         Err(error) => plugin_error(&headers, error),
@@ -89,7 +89,7 @@ pub(crate) async fn admin_list_notification_providers(
 pub(crate) async fn admin_list_chapter_sources(
     headers: HeaderMap,
     Query(query): Query<LuxPageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -106,7 +106,7 @@ pub(crate) async fn admin_list_chapter_sources(
             .into_response();
         }
     };
-    let plugins = require_service!(state.plugins);
+    let plugins = state.plugins();
     match plugins.list_chapter_sources(offset, limit).await {
         Ok(page) => Json(json!({
             "sources": page.sources.iter().map(|source| json!({
@@ -129,12 +129,12 @@ pub(crate) async fn admin_list_chapter_sources(
 
 pub(crate) async fn admin_plugin_store(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let plugins = require_service!(state.plugins);
+    let plugins = state.plugins();
     let urls = plugins.plugin_store_sources().await;
     let url = urls.first().cloned();
     Json(json!({
@@ -156,13 +156,13 @@ pub(crate) struct PluginStoreUpdateRequest {
 
 pub(crate) async fn admin_update_plugin_store(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PluginStoreUpdateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let plugins = require_service!(state.plugins);
+    let plugins = state.plugins();
     let sources = if request.urls.is_empty() {
         request.url.into_iter().collect()
     } else {
@@ -212,7 +212,7 @@ pub(crate) async fn admin_update_plugin_store(
 pub(crate) async fn admin_list_installed_plugins(
     headers: HeaderMap,
     Query(query): Query<LuxPageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     admin_list_plugins_with_scope(headers, query, state, true).await
 }
@@ -220,7 +220,7 @@ pub(crate) async fn admin_list_installed_plugins(
 pub(crate) async fn admin_list_plugins_with_scope(
     headers: HeaderMap,
     query: LuxPageQuery,
-    state: AppState,
+    state: ReadyAppState,
     installed_only: bool,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
@@ -238,15 +238,7 @@ pub(crate) async fn admin_list_plugins_with_scope(
             .into_response();
         }
     };
-    let Some(plugins) = state.plugins() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let plugins = state.plugins();
     let page = if installed_only {
         plugins.list_installed(offset, limit).await
     } else {
@@ -261,20 +253,12 @@ pub(crate) async fn admin_list_plugins_with_scope(
 pub(crate) async fn admin_install_plugin(
     headers: HeaderMap,
     Path(plugin_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let plugins = state.plugins();
     match plugins.install(&plugin_id).await {
         Ok(result) => {
             record_audit_event(
@@ -304,20 +288,12 @@ pub(crate) async fn admin_install_plugin(
 pub(crate) async fn admin_update_plugin(
     headers: HeaderMap,
     Path(plugin_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let plugins = state.plugins();
     match plugins.update(&plugin_id).await {
         Ok(plugin) => {
             record_audit_event(
@@ -338,23 +314,14 @@ pub(crate) async fn admin_update_plugin(
 pub(crate) async fn admin_uninstall_plugin(
     headers: HeaderMap,
     Path(plugin_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let plugins = state.plugins();
     if is_strm_media_info_plugin(&plugin_id)
-        && let Some(service) = state.strm_probe()
-        && let Err(error) = service.cancel_active_jobs().await
+        && let Err(error) = state.strm_probe().cancel_active_jobs().await
     {
         tracing::error!(%error, "STRM probe jobs could not be cancelled before plugin uninstall");
     }
@@ -384,33 +351,23 @@ pub(crate) struct PluginEnabledRequest {
 pub(crate) async fn admin_update_plugin_enabled(
     headers: HeaderMap,
     Path(plugin_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PluginEnabledRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let plugins = state.plugins();
     if is_strm_media_info_plugin(&plugin_id)
         && !request.enabled
-        && let Some(service) = state.strm_probe()
-        && let Err(error) = service.cancel_active_jobs().await
+        && let Err(error) = state.strm_probe().cancel_active_jobs().await
     {
         tracing::error!(%error, "STRM probe jobs could not be cancelled before plugin disable");
     }
     match plugins.set_enabled(&plugin_id, request.enabled).await {
         Ok(plugin) => {
-            if is_strm_media_info_plugin(&plugin_id)
-                && let Some(service) = state.strm_probe()
-            {
+            if is_strm_media_info_plugin(&plugin_id) {
+                let service = state.strm_probe();
                 if request.enabled {
                     service.schedule_configured_jobs_when_available();
                 }
@@ -448,21 +405,13 @@ pub(crate) struct PluginConfigRequest {
 pub(crate) async fn admin_update_plugin_config(
     headers: HeaderMap,
     Path(plugin_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PluginConfigRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let plugins = state.plugins();
     let is_strm_media_info = is_strm_media_info_plugin(&plugin_id);
     let previous_library_ids = if is_strm_media_info {
         configured_media_info_library_ids(plugins).await
@@ -476,10 +425,7 @@ pub(crate) async fn admin_update_plugin_config(
         Ok(plugin) => {
             let selection_changed = is_strm_media_info
                 && previous_library_ids != configured_media_info_library_ids(plugins).await;
-            if selection_changed
-                && let Some(service) = state.strm_probe()
-                && let Err(error) = service.cancel_active_jobs().await
-            {
+            if selection_changed && let Err(error) = state.strm_probe().cancel_active_jobs().await {
                 tracing::error!(%error, "STRM probe jobs could not be cancelled after library selection changed");
             }
             plugins.restart(&plugin_id).await;
@@ -488,8 +434,8 @@ pub(crate) async fn admin_update_plugin_config(
                     .enabled_media_info_settings()
                     .await
                     .is_ok_and(|settings| settings.is_some())
-                && let Some(service) = state.strm_probe()
             {
+                let service = state.strm_probe();
                 service.schedule_configured_jobs_when_available();
             }
             record_audit_event(
@@ -534,21 +480,13 @@ async fn configured_media_info_library_ids(plugins: &PluginService) -> Option<Ve
 pub(crate) async fn admin_upload_plugin_config_image(
     headers: HeaderMap,
     Path((plugin_id, field_key)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let plugins = state.plugins();
     match plugins
         .upload_login_background_image(&plugin_id, &field_key, &body)
         .await
@@ -687,7 +625,7 @@ pub(crate) fn plugin_page_json(page: &PluginPage) -> Value {
 pub(crate) async fn admin_run_plugin(
     headers: HeaderMap,
     Path(plugin_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -701,7 +639,7 @@ pub(crate) async fn admin_run_plugin(
         )
         .into_response();
     }
-    let service = require_service!(state.strm_probe);
+    let service = state.strm_probe();
     let jobs = match crate::application::admin_job_workers::start_configured_strm_probe_jobs(
         service,
     )

@@ -22,13 +22,13 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
 /// per-session FFmpeg snapshot. Expired or already stopped rows simply have no progress.
 pub(crate) async fn admin_transcoding_sessions(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
-    let service = require_service!(state.web_playback);
+    let database = state.database();
+    let service = state.web_playback();
     let rows = match database.active_server_transcoding_sessions(24).await {
         Ok(rows) => rows,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -128,13 +128,13 @@ fn transcoding_session_json(
 pub(crate) async fn admin_stop_transcoding_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
-    let service = require_service!(state.web_playback);
+    let database = state.database();
+    let service = state.web_playback();
     let session = match database.find_web_playback_session(&session_id).await {
         Ok(Some(session)) if session.plan == "SERVER_HLS" && session.state == "ACTIVE" => session,
         Ok(_) => return StatusCode::NOT_FOUND.into_response(),
@@ -175,12 +175,12 @@ pub(crate) struct TranscodingHistoryQuery {
 pub(crate) async fn admin_transcoding_history(
     headers: HeaderMap,
     Query(query): Query<TranscodingHistoryQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let page = query.page.unwrap_or(1).clamp(1, 10_000);
     let page_size = query.page_size.unwrap_or(10).clamp(1, 50);
     let offset = page.saturating_sub(1).saturating_mul(page_size);

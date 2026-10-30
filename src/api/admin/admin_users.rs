@@ -2,12 +2,12 @@ use super::*;
 
 async fn admin_content_restriction_index_status(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.media_content_restriction_index_status().await {
         Ok((total_items, indexed_items)) => Json(json!({
             "totalItems": total_items,
@@ -130,12 +130,12 @@ struct AdminUserActivityQuery {
 
 async fn admin_list_user_permission_presets(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::user_presets::list_user_permission_presets(database).await {
         Ok(presets) => Json(json!({ "presets": presets })).into_response(),
         Err(error) => user_permission_preset_error(&headers, error),
@@ -144,13 +144,13 @@ async fn admin_list_user_permission_presets(
 
 async fn admin_create_user_permission_preset(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<crate::application::user_presets::NewUserPermissionPresetInput>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::user_presets::create_user_permission_preset(database, request).await {
         Ok(preset) => {
             record_audit_event(
@@ -171,7 +171,7 @@ async fn admin_create_user_permission_preset(
 async fn admin_update_user_permission_preset(
     headers: HeaderMap,
     Path(preset_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UpdateUserPermissionPresetRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -180,7 +180,7 @@ async fn admin_update_user_permission_preset(
     if request.version == 0 {
         return invalid_user_permission_preset_request(&headers);
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::user_presets::update_user_permission_preset(
         database,
         &preset_id,
@@ -209,7 +209,7 @@ async fn admin_delete_user_permission_preset(
     headers: HeaderMap,
     Path(preset_id): Path<String>,
     Query(query): Query<DeleteUserPermissionPresetQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -217,7 +217,7 @@ async fn admin_delete_user_permission_preset(
     let Some(version) = query.version.filter(|version| *version > 0) else {
         return invalid_user_permission_preset_request(&headers);
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::user_presets::delete_user_permission_preset(
         database, &preset_id, version,
     )
@@ -242,7 +242,7 @@ async fn admin_delete_user_permission_preset(
 async fn admin_apply_user_permission_preset(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<ApplyUserPermissionPresetRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -252,7 +252,7 @@ async fn admin_apply_user_permission_preset(
         return invalid_user_permission_preset_request(&headers);
     };
     let user_id = user_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::user_presets::apply_user_permission_preset(
         database,
         &user_id,
@@ -278,7 +278,7 @@ async fn admin_apply_user_permission_preset(
 
 async fn admin_batch_apply_user_permission_preset(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<BatchApplyUserPermissionPresetRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -291,7 +291,7 @@ async fn admin_batch_apply_user_permission_preset(
     {
         return invalid_user_permission_preset_request(&headers);
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::user_presets::apply_user_permission_preset_batch(
         database,
         &request.user_ids,
@@ -324,7 +324,7 @@ async fn admin_batch_apply_user_permission_preset(
 
 async fn admin_batch_update_user_status(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<BatchUserStatusRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -343,7 +343,7 @@ async fn admin_batch_update_user_status(
         )
         .into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -355,9 +355,8 @@ async fn admin_batch_update_user_status(
     )
     .await;
     for item in result.results.iter().filter(|item| item.success) {
-        if request.is_disabled
-            && let Some(web_playback) = state.web_playback()
-        {
+        if request.is_disabled {
+            let web_playback = state.web_playback();
             web_playback
                 .stop_server_hls_sessions(&item.hls_session_ids)
                 .await;
@@ -382,7 +381,7 @@ async fn admin_batch_update_user_status(
 
 async fn admin_preview_account_preferences_copy(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(mut request): Json<
         crate::application::user_account_preferences::PreviewAccountPreferencesCopyInput,
     >,
@@ -390,7 +389,7 @@ async fn admin_preview_account_preferences_copy(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let Some(source_user_id) = canonical_user_id(&request.source_user_id) else {
         return invalid_account_preferences_copy_request(&headers);
     };
@@ -416,7 +415,7 @@ async fn admin_preview_account_preferences_copy(
 
 async fn admin_copy_account_preferences(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(mut request): Json<
         crate::application::user_account_preferences::CopyAccountPreferencesInput,
     >,
@@ -424,7 +423,7 @@ async fn admin_copy_account_preferences(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let Some(source_user_id) = canonical_user_id(&request.source_user_id) else {
         return invalid_account_preferences_copy_request(&headers);
     };
@@ -480,7 +479,7 @@ async fn admin_copy_account_preferences(
 
 async fn admin_preview_user_permission_copy(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
@@ -493,7 +492,7 @@ async fn admin_preview_user_permission_copy(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     match crate::application::user_permission_copy::preview_user_permission_copy(database, request)
         .await
     {
@@ -504,7 +503,7 @@ async fn admin_preview_user_permission_copy(
 
 async fn admin_apply_user_permission_copy(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -517,7 +516,7 @@ async fn admin_apply_user_permission_copy(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let groups = request.groups;
     match crate::application::user_permission_copy::apply_user_permission_copy(database, request)
         .await
@@ -684,7 +683,7 @@ async fn admin_list_user_sessions(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -699,7 +698,7 @@ async fn admin_list_user_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -713,7 +712,7 @@ async fn admin_list_user_sessions(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let auth = require_service!(state.auth);
+    let auth = state.auth();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = i64::from(query.page_size.unwrap_or(50).clamp(1, 100));
     let offset = i64::from(page.saturating_sub(1)).saturating_mul(page_size);
@@ -749,7 +748,7 @@ async fn admin_list_user_devices(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -764,7 +763,7 @@ async fn admin_list_user_devices(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -796,9 +795,7 @@ async fn admin_list_user_devices(
                     .last_remote_ip
                     .as_deref()
                     .and_then(|remote_ip| {
-                        state
-                            .ip_location()
-                            .and_then(|service| service.cached_or_schedule(remote_ip))
+                        state.ip_location().cached_or_schedule(remote_ip)
                     })
                     .map(|location| json!({
                         "country": location.country,
@@ -831,7 +828,7 @@ async fn admin_list_user_devices(
 async fn admin_list_global_user_access_blacklist_rules(
     headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<AdminUserAccessBlacklistRulesQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     list_user_access_blacklist_rules(&headers, &state, None, query).await
 }
@@ -840,14 +837,14 @@ async fn admin_list_scoped_user_access_blacklist_rules(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminUserAccessBlacklistRulesQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     list_user_access_blacklist_rules(&headers, &state, Some(user_id), query).await
 }
 
 async fn list_user_access_blacklist_rules(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: Option<String>,
     query: AdminUserAccessBlacklistRulesQuery,
 ) -> Response {
@@ -855,7 +852,7 @@ async fn list_user_access_blacklist_rules(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
     let offset = i64::from(page.saturating_sub(1)).saturating_mul(i64::from(page_size));
@@ -884,7 +881,7 @@ async fn list_user_access_blacklist_rules(
 
 async fn admin_create_global_user_access_blacklist_rule(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<CreateUserAccessBlacklistRuleRequest>,
 ) -> Response {
     create_user_access_blacklist_rule(&headers, &state, None, request).await
@@ -893,7 +890,7 @@ async fn admin_create_global_user_access_blacklist_rule(
 async fn admin_create_scoped_user_access_blacklist_rule(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<CreateUserAccessBlacklistRuleRequest>,
 ) -> Response {
     create_user_access_blacklist_rule(&headers, &state, Some(user_id), request).await
@@ -901,7 +898,7 @@ async fn admin_create_scoped_user_access_blacklist_rule(
 
 async fn create_user_access_blacklist_rule(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: Option<String>,
     request: CreateUserAccessBlacklistRuleRequest,
 ) -> Response {
@@ -936,7 +933,7 @@ async fn create_user_access_blacklist_rule(
                 .into_response();
             }
         };
-    let database = require_service!(state.database);
+    let database = state.database();
     let is_enabled = request.is_enabled.unwrap_or(true);
     if is_enabled
         && let Err(response) = ensure_user_access_rule_does_not_block_admin(
@@ -993,7 +990,7 @@ async fn create_user_access_blacklist_rule(
 async fn admin_set_global_user_access_blacklist_rule_enabled(
     headers: HeaderMap,
     Path(rule_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<SetUserAccessBlacklistRuleEnabledRequest>,
 ) -> Response {
     set_user_access_blacklist_rule_enabled(&headers, &state, None, rule_id, request).await
@@ -1002,7 +999,7 @@ async fn admin_set_global_user_access_blacklist_rule_enabled(
 async fn admin_set_scoped_user_access_blacklist_rule_enabled(
     headers: HeaderMap,
     Path((user_id, rule_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<SetUserAccessBlacklistRuleEnabledRequest>,
 ) -> Response {
     set_user_access_blacklist_rule_enabled(&headers, &state, Some(user_id), rule_id, request).await
@@ -1010,7 +1007,7 @@ async fn admin_set_scoped_user_access_blacklist_rule_enabled(
 
 async fn set_user_access_blacklist_rule_enabled(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: Option<String>,
     rule_id: String,
     request: SetUserAccessBlacklistRuleEnabledRequest,
@@ -1019,7 +1016,7 @@ async fn set_user_access_blacklist_rule_enabled(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let scope = user_id.as_deref().map_or(
         crate::storage::UserAccessBlacklistRuleScope::Global,
         crate::storage::UserAccessBlacklistRuleScope::User,
@@ -1078,7 +1075,7 @@ async fn set_user_access_blacklist_rule_enabled(
 
 async fn ensure_user_access_rule_does_not_block_admin(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     scope_user_id: Option<&str>,
     rule_type: crate::application::user_access_rules::UserAccessBlacklistRuleType,
     rule_value: &str,
@@ -1097,9 +1094,7 @@ async fn ensure_user_access_rule_does_not_block_admin(
         )
         .into_response());
     };
-    let Some(auth) = state.auth() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
+    let auth = state.auth();
     let session = match auth.resolve(&session_token).await {
         Ok(Some(session)) => session,
         Ok(None) => {
@@ -1141,7 +1136,7 @@ async fn ensure_user_access_rule_does_not_block_admin(
 
 async fn admin_request_access_ip(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<std::net::IpAddr, ()> {
     crate::api::legacy::request_access_ip(headers, state)
         .await
@@ -1162,7 +1157,7 @@ fn user_access_blacklist_conflict(headers: &HeaderMap) -> Response {
 async fn admin_delete_global_user_access_blacklist_rule(
     headers: HeaderMap,
     Path(rule_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     delete_user_access_blacklist_rule(&headers, &state, None, rule_id).await
 }
@@ -1170,14 +1165,14 @@ async fn admin_delete_global_user_access_blacklist_rule(
 async fn admin_delete_scoped_user_access_blacklist_rule(
     headers: HeaderMap,
     Path((user_id, rule_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     delete_user_access_blacklist_rule(&headers, &state, Some(user_id), rule_id).await
 }
 
 async fn delete_user_access_blacklist_rule(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: Option<String>,
     rule_id: String,
 ) -> Response {
@@ -1185,7 +1180,7 @@ async fn delete_user_access_blacklist_rule(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let scope = user_id.as_deref().map_or(
         crate::storage::UserAccessBlacklistRuleScope::Global,
         crate::storage::UserAccessBlacklistRuleScope::User,
@@ -1208,7 +1203,7 @@ async fn delete_user_access_blacklist_rule(
 
 async fn validate_user_access_blacklist_scope(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: Option<String>,
     require_csrf: bool,
 ) -> Result<Option<String>, Response> {
@@ -1228,9 +1223,7 @@ async fn validate_user_access_blacklist_scope(
             .into_response()
         })?
         .to_string();
-    let Some(database) = state.database.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => Ok(Some(user_id)),
         Ok(None) => Err(api_error(
@@ -1246,13 +1239,13 @@ async fn validate_user_access_blacklist_scope(
 
 async fn admin_user_access_blacklist_creator(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Option<String> {
     if lux_api_key_from_headers(headers).is_some() {
         return None;
     }
     let session_token = request_cookie(headers, "lux_session")?;
-    let auth = state.auth()?;
+    let auth = state.auth();
     auth.resolve(&session_token)
         .await
         .ok()
@@ -1276,7 +1269,7 @@ fn user_access_blacklist_rule_json(rule: &crate::storage::StoredUserAccessBlackl
 async fn admin_revoke_user_session(
     headers: HeaderMap,
     Path((user_id, session_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -1301,7 +1294,7 @@ async fn admin_revoke_user_session(
     };
     let user_id_string = user_id.to_string();
     let session_id_string = session_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id_string).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1315,7 +1308,7 @@ async fn admin_revoke_user_session(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let auth = require_service!(state.auth);
+    let auth = state.auth();
     if let Some(current_token) = request_cookie(&headers, "lux_session") {
         match auth
             .is_current_session_for_admin(&user_id_string, &session_id_string, &current_token)
@@ -1363,7 +1356,7 @@ async fn admin_list_user_emby_login_sessions(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -1378,7 +1371,7 @@ async fn admin_list_user_emby_login_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1392,7 +1385,7 @@ async fn admin_list_user_emby_login_sessions(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let auth = require_service!(state.emby_auth);
+    let auth = state.emby_auth();
     let page = query.page.unwrap_or(1).max(1);
     let page_size = i64::from(query.page_size.unwrap_or(50).clamp(1, 100));
     let offset = i64::from(page.saturating_sub(1)).saturating_mul(page_size);
@@ -1425,7 +1418,7 @@ async fn admin_list_user_activity(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminUserActivityQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -1440,7 +1433,7 @@ async fn admin_list_user_activity(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1537,7 +1530,7 @@ async fn admin_list_user_playback_sessions(
     headers: HeaderMap,
     Path(user_id): Path<String>,
     axum::extract::Query(query): axum::extract::Query<AdminUserSessionsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -1552,7 +1545,7 @@ async fn admin_list_user_playback_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1580,11 +1573,11 @@ async fn admin_list_user_playback_sessions(
         Ok(result) => result,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let playback_data = match crate::application::admin_dashboard::dashboard_playback_data(
         database,
         Some(catalog),
-        state.ip_location(),
+        Some(state.ip_location()),
         &sessions,
         std::slice::from_ref(&user),
         page_size as usize,
@@ -1626,7 +1619,7 @@ async fn admin_list_user_playback_sessions(
 async fn admin_stop_user_playback_session(
     headers: HeaderMap,
     Path((user_id, playback_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -1651,7 +1644,7 @@ async fn admin_stop_user_playback_session(
     };
     let user_id = user_id.to_string();
     let playback_id = playback_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1701,7 +1694,7 @@ async fn admin_stop_user_playback_session(
         )
         .into_response();
     };
-    let web_playback = require_service!(state.web_playback);
+    let web_playback = state.web_playback();
     if web_playback.stop(&web_session.id, &user_id).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -1720,7 +1713,7 @@ async fn admin_stop_user_playback_session(
 async fn admin_revoke_user_emby_login_session(
     headers: HeaderMap,
     Path((user_id, session_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -1745,7 +1738,7 @@ async fn admin_revoke_user_emby_login_session(
     };
     let user_id = user_id.to_string();
     let session_id = session_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1759,7 +1752,7 @@ async fn admin_revoke_user_emby_login_session(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let auth = require_service!(state.emby_auth);
+    let auth = state.emby_auth();
     match auth.revoke_admin_login_session(&user_id, &session_id).await {
         Ok(true) => {
             record_audit_event(
@@ -1787,7 +1780,7 @@ async fn admin_revoke_user_emby_login_session(
 async fn admin_revoke_all_user_emby_login_sessions(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -1802,7 +1795,7 @@ async fn admin_revoke_all_user_emby_login_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let database = require_service!(state.database);
+    let database = state.database();
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1816,7 +1809,7 @@ async fn admin_revoke_all_user_emby_login_sessions(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let auth = require_service!(state.emby_auth);
+    let auth = state.emby_auth();
     match auth.revoke_all_admin_login_sessions(&user_id).await {
         Ok(revoked_count) => {
             if revoked_count > 0 {
@@ -1922,12 +1915,12 @@ fn user_permission_preset_application_error(
 pub(crate) async fn admin_list_users(
     headers: HeaderMap,
     Query(query): Query<AdminUsersQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2052,7 +2045,7 @@ fn admin_user_permission_preset_source_fields(
 pub(crate) async fn admin_get_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -2066,7 +2059,7 @@ pub(crate) async fn admin_get_user(
         )
         .into_response();
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2089,7 +2082,7 @@ pub(crate) async fn admin_get_user(
 pub(crate) async fn admin_get_user_account_preferences(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -2103,7 +2096,7 @@ pub(crate) async fn admin_get_user_account_preferences(
         )
         .into_response();
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2178,13 +2171,13 @@ pub(crate) struct UpdateUserProfileRequest {
 pub(crate) async fn admin_update_user_profile(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UpdateUserProfileRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2230,12 +2223,12 @@ pub(crate) struct SetUserPlaybackPolicyRequest {
 pub(crate) async fn admin_get_user_playback_policy(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2258,13 +2251,13 @@ pub(crate) async fn admin_get_user_playback_policy(
 pub(crate) async fn admin_set_user_playback_policy(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<SetUserPlaybackPolicyRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2311,7 +2304,7 @@ pub(crate) async fn admin_set_user_playback_policy(
 async fn admin_get_user_content_restrictions(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -2325,7 +2318,7 @@ async fn admin_get_user_content_restrictions(
         )
         .into_response();
     };
-    let database = require_service!(state.database);
+    let database = state.database();
 
     match crate::application::user_content_restrictions::get_user_content_restrictions(
         database, user_id,
@@ -2340,7 +2333,7 @@ async fn admin_get_user_content_restrictions(
 async fn admin_update_user_content_restrictions(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<
         crate::application::user_content_restrictions::UpdateUserContentRestrictionsInput,
     >,
@@ -2357,7 +2350,7 @@ async fn admin_update_user_content_restrictions(
         )
         .into_response();
     };
-    let database = require_service!(state.database);
+    let database = state.database();
 
     match crate::application::user_content_restrictions::update_user_content_restrictions(
         database, user_id, request,
@@ -2437,7 +2430,7 @@ fn user_content_restrictions_error(
 pub(crate) async fn admin_list_user_library_access(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -2451,7 +2444,7 @@ pub(crate) async fn admin_list_user_library_access(
         )
         .into_response();
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let user_id = user_id.to_string();
     let mode = match database.user_library_access_mode(&user_id).await {
         Ok(Some(mode)) => mode,
@@ -2484,7 +2477,7 @@ pub(crate) async fn admin_list_user_library_access(
 pub(crate) async fn admin_replace_user_library_access(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<ReplaceLibraryAccessRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -2517,18 +2510,10 @@ pub(crate) async fn admin_replace_user_library_access(
             }
         }
     }
-    let Some(database) = state.database.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let database = state.database();
     match crate::application::admin_user_access::replace_library_access(
         database,
-        state.home(),
+        Some(state.home()),
         &user_id,
         &request.library_access_mode,
         &library_ids,
@@ -2612,13 +2597,13 @@ pub(crate) struct CreateUserRequest {
 
 pub(crate) async fn admin_create_user(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<CreateUserRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2695,13 +2680,13 @@ pub(crate) struct UpdateUserRequest {
 pub(crate) async fn admin_update_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UpdateUserRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2722,7 +2707,8 @@ pub(crate) async fn admin_update_user(
         .await
     {
         Ok(Some((user, hls_session_ids))) => {
-            if let Some(web_playback) = state.web_playback() {
+            {
+                let web_playback = state.web_playback();
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -2757,19 +2743,20 @@ pub(crate) async fn admin_update_user(
 pub(crate) async fn admin_delete_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     match users.soft_delete_user(&user_id).await {
         Ok(Some(hls_session_ids)) => {
-            if let Some(web_playback) = state.web_playback() {
+            {
+                let web_playback = state.web_playback();
                 web_playback
                     .stop_server_hls_sessions(&hls_session_ids)
                     .await;
@@ -2804,12 +2791,12 @@ pub(crate) async fn admin_delete_user(
 pub(crate) async fn admin_restore_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2846,12 +2833,12 @@ pub(crate) async fn admin_restore_user(
 pub(crate) async fn admin_purge_user(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2872,10 +2859,8 @@ pub(crate) async fn admin_purge_user(
     }
     match users.purge_deleted_user(&user_id).await {
         Ok(true) => {
-            if let (Some(avatars), Ok(user_id)) = (
-                state.user_avatars(),
-                user_id.parse::<crate::domain::ids::UserId>(),
-            ) && let Err(error) = avatars.remove(user_id).await
+            if let Ok(user_id) = user_id.parse::<crate::domain::ids::UserId>()
+                && let Err(error) = state.user_avatars().remove(user_id).await
             {
                 tracing::warn!(%error, "failed to remove purged user avatar");
             }
@@ -2967,7 +2952,7 @@ pub(crate) fn user_json(user: &UserRecord) -> Value {
 pub(crate) async fn admin_set_library_access(
     headers: HeaderMap,
     Path((user_id, library_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<SetLibraryAccessRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -2997,18 +2982,10 @@ pub(crate) async fn admin_set_library_access(
             .into_response();
         }
     };
-    let Some(database) = state.database.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let database = state.database();
     match crate::application::admin_user_access::set_library_access(
         database,
-        state.home(),
+        Some(state.home()),
         &user_id,
         &library_id,
         request.can_view,
@@ -3066,7 +3043,7 @@ pub(crate) async fn admin_set_library_access(
 pub(crate) async fn admin_get_user_avatar(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -3080,7 +3057,7 @@ pub(crate) async fn admin_get_user_avatar(
         )
         .into_response();
     };
-    let avatars = require_service!(state.user_avatars);
+    let avatars = state.user_avatars();
     match avatars.load(user_id).await {
         Ok(Some(avatar)) => Response::builder()
             .status(StatusCode::OK)
@@ -3096,7 +3073,7 @@ pub(crate) async fn admin_get_user_avatar(
 pub(crate) async fn admin_update_user_avatar(
     headers: HeaderMap,
     Path(user_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -3111,7 +3088,7 @@ pub(crate) async fn admin_update_user_avatar(
         )
         .into_response();
     };
-    let avatars = require_service!(state.user_avatars);
+    let avatars = state.user_avatars();
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())

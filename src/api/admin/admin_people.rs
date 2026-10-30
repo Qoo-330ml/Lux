@@ -77,7 +77,7 @@ pub(crate) struct PersonFieldLocksRequest {
 pub(crate) async fn admin_list_people_index_rebuild(
     headers: HeaderMap,
     Query(query): Query<AdminJobsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -94,15 +94,7 @@ pub(crate) async fn admin_list_people_index_rebuild(
             .into_response();
         }
     };
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "人物索引服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     match crate::application::admin_people::list_person_index_rebuild_jobs(people, offset, limit)
         .await
     {
@@ -126,7 +118,7 @@ pub(crate) async fn admin_list_people_index_rebuild(
 pub(crate) async fn admin_queue_people_index_rebuild(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -141,15 +133,7 @@ pub(crate) async fn admin_queue_people_index_rebuild(
         .into_response();
     };
     let library_id_string = library_id.to_string();
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "人物索引服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     let job = match crate::application::admin_people::queue_person_index_rebuild(people, library_id)
         .await
     {
@@ -202,7 +186,7 @@ pub(crate) async fn admin_queue_people_index_rebuild(
 pub(crate) async fn admin_cancel_people_index_rebuild(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -217,15 +201,7 @@ pub(crate) async fn admin_cancel_people_index_rebuild(
         .into_response();
     };
     let library_id_string = library_id.to_string();
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "人物索引服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     let job =
         match crate::application::admin_people::cancel_person_index_rebuild(people, library_id)
             .await
@@ -284,7 +260,7 @@ pub(crate) fn people_index_rebuild_job_json(
 pub(crate) async fn admin_list_pending_person_matches(
     headers: HeaderMap,
     Query(query): Query<MetadataCandidateQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -301,15 +277,7 @@ pub(crate) async fn admin_list_pending_person_matches(
             .into_response();
         }
     };
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     match people
         .list_pending_person_match_candidates(offset, limit)
         .await
@@ -328,21 +296,13 @@ pub(crate) async fn admin_list_pending_person_matches(
 pub(crate) async fn admin_confirm_person_match(
     headers: HeaderMap,
     Path(candidate_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PersonMatchConfirmRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     let evidence_json = match serde_json::to_string(&request.evidence) {
         Ok(value) if value.len() <= 16 * 1024 => value,
         Ok(_) => {
@@ -398,21 +358,13 @@ pub(crate) async fn admin_confirm_person_match(
 pub(crate) async fn admin_reject_person_match(
     headers: HeaderMap,
     Path(candidate_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PersonMatchRejectRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     let evidence_json = match serde_json::to_string(&request.evidence) {
         Ok(value) if value.len() <= 16 * 1024 => value,
         Ok(_) | Err(_) => {
@@ -452,21 +404,13 @@ pub(crate) async fn admin_reject_person_match(
 pub(crate) async fn admin_undo_person_match(
     headers: HeaderMap,
     Path(candidate_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PersonMatchRejectRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     let evidence_json = match serde_json::to_string(&request.evidence) {
         Ok(value) if value.len() <= 16 * 1024 => value,
         Ok(_) | Err(_) => {
@@ -507,21 +451,13 @@ pub(crate) async fn admin_undo_person_match(
 pub(crate) async fn admin_split_person_identity(
     headers: HeaderMap,
     Path(person_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PersonIdentitySplitRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     let evidence_json = match serde_json::to_string(&request.evidence) {
         Ok(value) if value.len() <= 16 * 1024 => value,
         Ok(_) | Err(_) => {
@@ -575,21 +511,13 @@ pub(crate) async fn admin_split_person_identity(
 pub(crate) async fn admin_set_person_field_locks(
     headers: HeaderMap,
     Path(person_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<PersonFieldLocksRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(people) = state.people() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let people = state.people();
     let evidence_json = match serde_json::to_string(&request.evidence) {
         Ok(value) if value.len() <= 16 * 1024 => value,
         Ok(_) | Err(_) => {

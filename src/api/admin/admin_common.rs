@@ -2,7 +2,7 @@ use super::*;
 
 pub(crate) async fn require_admin(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
     if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
@@ -42,15 +42,7 @@ pub(crate) async fn require_admin(
         .into_response());
     }
     if require_csrf && !users::has_client_token(headers) {
-        let Some(auth) = state.auth() else {
-            return Err(api_error(
-                headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "服务尚未就绪",
-            )
-            .into_response());
-        };
+        let auth = state.auth();
         let Some(session_token) = request_cookie(headers, "lux_session") else {
             return Err(api_error(
                 headers,
@@ -108,7 +100,7 @@ pub(crate) async fn require_admin(
 
 pub(crate) async fn require_admin_web_session(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     require_csrf: bool,
 ) -> Result<(), Response> {
     if users::has_client_token(headers) {
@@ -125,20 +117,12 @@ pub(crate) async fn require_admin_web_session(
 
 pub(crate) async fn resolve_shared_admin_api_key(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<Option<crate::auth::users::AuthenticationPrincipal>, Response> {
     let Some(candidate) = lux_api_key_from_headers(headers) else {
         return Ok(None);
     };
-    let Some(service) = state.admin_api_key() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "认证服务尚未就绪",
-        )
-        .into_response());
-    };
+    let service = state.admin_api_key();
     service.resolve_principal(&candidate).await.map_err(|_| {
         api_error(
             headers,

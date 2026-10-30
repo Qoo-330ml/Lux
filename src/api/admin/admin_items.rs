@@ -35,7 +35,7 @@ pub(crate) struct UpdateExternalSubtitleRequest {
 pub(crate) async fn admin_start_item_scan(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -49,14 +49,14 @@ pub(crate) async fn admin_start_item_scan(
         )
         .into_response();
     }
-    let scan_jobs = require_service!(state.scan_jobs);
+    let scan_jobs = state.scan_jobs();
     let job = match crate::application::admin_scan_jobs::start_item_folder_scan_job(
         scan_jobs,
         &item_id,
         crate::application::admin_scan_jobs::ScanWorkerServices {
-            probe: state.probe().cloned(),
-            metadata: state.metadata_reidentify().cloned(),
-            thumbnails: state.thumbnails().cloned(),
+            probe: Some(state.probe().clone()),
+            metadata: Some(state.metadata_reidentify().clone()),
+            thumbnails: Some(state.thumbnails().clone()),
         },
     )
     .await
@@ -111,7 +111,7 @@ pub(crate) async fn admin_start_item_scan(
 pub(crate) async fn admin_update_item_subtitle(
     headers: HeaderMap,
     Path((item_id, stream_index)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UpdateExternalSubtitleRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -155,7 +155,7 @@ pub(crate) async fn admin_update_item_subtitle(
         )
         .into_response();
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let title = request
         .title
         .as_deref()
@@ -214,7 +214,7 @@ pub(crate) async fn admin_delete_item(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<LuxStreamQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -224,7 +224,7 @@ pub(crate) async fn admin_delete_item(
 
 pub(crate) async fn delete_media_item(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     item_id: &str,
     source_id: Option<&str>,
 ) -> Response {
@@ -237,10 +237,10 @@ pub(crate) async fn delete_media_item(
         )
         .into_response();
     }
-    let deletion = require_service!(state.deletion);
+    let deletion = state.deletion();
     let report = match crate::application::admin_media_mutations::delete_media_item(
         deletion,
-        state.home(),
+        Some(state.home()),
         item_id,
         source_id,
     )
@@ -303,20 +303,12 @@ pub(crate) async fn delete_media_item(
 pub(crate) async fn admin_refresh_collection(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(collections) = state.collections() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "刮削器合集服务尚未配置",
-        )
-        .into_response();
-    };
+    let collections = state.collections();
     match collections.refresh_for_item(&item_id).await {
         Ok(report) => {
             record_audit_event(
@@ -383,7 +375,7 @@ pub(crate) async fn admin_list_item_merge_records(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<ItemMergeRecordsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -397,7 +389,7 @@ pub(crate) async fn admin_list_item_merge_records(
         )
         .into_response();
     }
-    let merge = require_service!(state.item_merge);
+    let merge = state.item_merge();
     let offset = query.offset.unwrap_or(0).max(0);
     let limit = query.limit.unwrap_or(50).clamp(1, 100);
     match crate::application::admin_media_mutations::list_media_merge_records(
@@ -429,7 +421,7 @@ pub(crate) async fn admin_list_item_merge_records(
 
 pub(crate) async fn admin_unmerge_items(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UnmergeItemsRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -452,11 +444,11 @@ pub(crate) async fn admin_unmerge_items(
         )
         .into_response();
     }
-    let merge = require_service!(state.item_merge);
+    let merge = state.item_merge();
     let result = match crate::application::admin_media_mutations::unmerge_media_items(
         merge,
-        state.home(),
-        state.catalog(),
+        Some(state.home()),
+        Some(state.catalog()),
         &request.primary_item_id,
         &request.merged_item_id,
     )

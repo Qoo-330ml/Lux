@@ -18,12 +18,12 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
 
 pub(crate) async fn admin_database_diagnostics_status(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let diagnostics = require_service!(state.database_diagnostics);
+    let diagnostics = state.database_diagnostics();
     let mut response = Json(diagnostics.status().await).into_response();
     response.headers_mut().insert(
         CACHE_CONTROL,
@@ -34,12 +34,12 @@ pub(crate) async fn admin_database_diagnostics_status(
 
 pub(crate) async fn admin_start_database_diagnostics(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let diagnostics = require_service!(state.database_diagnostics);
+    let diagnostics = state.database_diagnostics();
     match diagnostics.request_collection().await {
         Ok(status) => {
             let mut response = (StatusCode::ACCEPTED, Json(status)).into_response();
@@ -63,12 +63,12 @@ pub(crate) async fn admin_start_database_diagnostics(
 
 pub(crate) async fn admin_export_database_diagnostics(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let diagnostics = require_service!(state.database_diagnostics);
+    let diagnostics = state.database_diagnostics();
     let Some(report) = diagnostics.report().await else {
         return api_error(
             &headers,

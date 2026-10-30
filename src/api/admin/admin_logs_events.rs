@@ -15,29 +15,23 @@ pub(crate) struct AdminLogExportQuery {
     pub(crate) to: Option<String>,
 }
 pub(crate) async fn record_audit_event(
-    state: &AppState,
+    state: &ReadyAppState,
     headers: &HeaderMap,
     event_type: &str,
     target_type: Option<&str>,
     target_id: Option<&str>,
     metadata_json: &str,
 ) {
-    if state.database.is_none() {
-        return;
-    }
     let (actor_user_id, actor_username, metadata_json) =
         if let Some(candidate) = lux_api_key_from_headers(headers) {
-            let Some(service) = state.admin_api_key() else {
-                return;
-            };
+            let service = state.admin_api_key();
             let Ok(Some(_)) = service.resolve_principal(&candidate).await else {
                 return;
             };
             (None, None, audit_metadata_for_shared_api_key(metadata_json))
         } else {
-            let (Some(auth), Some(session_token)) =
-                (state.auth(), request_cookie(headers, "lux_session"))
-            else {
+            let auth = state.auth();
+            let Some(session_token) = request_cookie(headers, "lux_session") else {
                 return;
             };
             let Ok(Some(session)) = auth.resolve(&session_token).await else {
@@ -224,7 +218,7 @@ pub(crate) fn playback_activity_event_type(
 pub(crate) async fn admin_list_audit(
     headers: HeaderMap,
     Query(query): Query<MetadataCandidateQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -278,7 +272,7 @@ pub(crate) async fn admin_list_audit(
 pub(crate) async fn admin_list_logs(
     headers: HeaderMap,
     Query(query): Query<MetadataCandidateQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     admin_list_audit(headers, Query(query), State(state)).await
 }
@@ -286,7 +280,7 @@ pub(crate) async fn admin_list_logs(
 pub(crate) async fn admin_export_logs(
     headers: HeaderMap,
     Query(query): Query<AdminLogExportQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -295,7 +289,9 @@ pub(crate) async fn admin_export_logs(
         Ok(range) => range,
         Err(error) => return log_export_error_response(&headers, error),
     };
-    let config_dir = require_service!(state.config_dir);
+    let Some(config_dir) = state.config_dir.as_deref() else {
+        return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    };
     match export_logs(config_dir, range).await {
         Ok(export) => {
             let (content_type, filename, contents) = match export {
@@ -353,7 +349,10 @@ pub(crate) fn log_export_error_response(headers: &HeaderMap, error: LogExportErr
     }
 }
 
-pub(crate) async fn admin_events(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(crate) async fn admin_events(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
@@ -420,7 +419,10 @@ pub(crate) fn event_stream_response(reader: tokio::io::DuplexStream) -> Response
     response
 }
 
-pub(crate) async fn user_events(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(crate) async fn user_events(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     if let Err(response) = require_web_user(&headers, &state).await {
         return response;
     }

@@ -4,19 +4,22 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new().route("/api/v1/admin/dashboard", get(admin_dashboard))
 }
 
-pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(crate) async fn admin_dashboard(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let snapshot = match crate::application::admin_dashboard::load_admin_dashboard(
         database,
         state.config_dir.as_deref(),
         &state.resources,
         crate::application::admin_dashboard::AdminDashboardServices {
-            libraries: state.libraries(),
-            catalog: state.catalog(),
-            ip_location: state.ip_location(),
+            libraries: Some(state.libraries()),
+            catalog: Some(state.catalog()),
+            ip_location: Some(state.ip_location()),
             health_probe_cache: &state.admin_health_probe_cache,
         },
     )

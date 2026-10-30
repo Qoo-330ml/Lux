@@ -13,7 +13,7 @@ pub(super) fn api_routes() -> Router<ReadyAppState> {
 /// details, or media names; see `observability::request_metrics`.
 pub(crate) async fn admin_performance_metrics(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;

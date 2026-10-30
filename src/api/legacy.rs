@@ -351,6 +351,11 @@ impl ReadyAppState {
         &self.services
     }
 
+    /// Borrows the ready services for the `require_ready!` guard.
+    pub(crate) fn ready_services(&self) -> Option<&Arc<ReadyServices>> {
+        Some(&self.services)
+    }
+
     ready_service_accessor! {
         database_setup -> DatabaseSetupService,
         setup -> SetupService,
@@ -598,7 +603,20 @@ impl AppState {
         })
     }
 
+    /// A ready view of this state for the few handlers that serve both router trees, or `None`
+    /// while the services are absent.
+    pub(crate) fn as_ready(&self) -> Option<ReadyAppState> {
+        let database = self.core.database.clone()?;
+        let services = self.ready.clone()?;
+        Some(ReadyAppState {
+            core: self.core.clone(),
+            database,
+            services,
+        })
+    }
+
     /// Borrows the ready services for the `require_ready!` guard.
+    #[cfg(test)]
     pub(crate) fn ready_services(&self) -> Option<&Arc<ReadyServices>> {
         self.ready.as_ref()
     }
@@ -680,15 +698,6 @@ impl AppState {
     /// Every other core field is read through `Deref` because it is plain state, not a service.
     pub(crate) fn database(&self) -> Option<&Database> {
         self.core.database.as_ref()
-    }
-
-    /// Reads the core `config_dir` for `require_service!(state.config_dir)`.
-    ///
-    /// `require_service!` expands to a method call, so the one handler that guards on the config
-    /// directory (`admin::admin_logs_events::admin_export_logs`) needs this accessor even though
-    /// no hand-written code calls `config_dir()` directly.
-    pub(crate) fn config_dir(&self) -> Option<&PathBuf> {
-        self.core.config_dir.as_ref()
     }
 
     pub async fn shutdown_background_workers(&self) {
@@ -1315,18 +1324,21 @@ pub fn app_with_state(state: AppState) -> Router {
     routes::app_with_state(state)
 }
 
-async fn require_web_user(headers: &HeaderMap, state: &AppState) -> Result<UserRecord, Response> {
+async fn require_web_user(
+    headers: &HeaderMap,
+    state: &ReadyAppState,
+) -> Result<UserRecord, Response> {
     users::require_web_user(headers, state).await
 }
 
 async fn require_web_principal(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, Response> {
     users::require_web_principal(headers, state).await
 }
 
-async fn require_web_csrf(headers: &HeaderMap, state: &AppState) -> Result<(), Response> {
+async fn require_web_csrf(headers: &HeaderMap, state: &ReadyAppState) -> Result<(), Response> {
     users::require_web_csrf(headers, state).await
 }
 
@@ -1755,7 +1767,10 @@ fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
 ///
 /// Raw `X-Forwarded-For` values are attacker-controlled; only the trusted-proxy resolver may
 /// decide which address a request actually came from.
-pub(super) async fn request_client_ip(headers: &HeaderMap, state: &AppState) -> Option<String> {
+pub(super) async fn request_client_ip(
+    headers: &HeaderMap,
+    state: &ReadyAppState,
+) -> Option<String> {
     match request_access_ip(headers, state).await {
         Ok(address) => address.map(|address| address.to_string()),
         Err(_) => None,
@@ -1778,7 +1793,7 @@ fn sse_capacity_response(headers: &HeaderMap) -> Response {
 
 async fn request_access_ip(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &CoreState,
 ) -> Result<Option<std::net::IpAddr>, AccessIpResolutionError> {
     let Some(peer_value) = header_str(headers, "x-lux-peer-ip") else {
         return Ok(None);
@@ -1890,7 +1905,7 @@ struct LuxPeopleSearchQuery {
 async fn lux_search_people(
     headers: HeaderMap,
     Query(query): Query<LuxPeopleSearchQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal = match require_web_principal(&headers, &state).await {
         Ok(principal) => principal,
@@ -1959,7 +1974,7 @@ async fn lux_get_person_items(
     headers: HeaderMap,
     Path(person_id): Path<String>,
     Query(query): Query<LuxPageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal = match require_web_principal(&headers, &state).await {
         Ok(principal) => principal,
@@ -2004,7 +2019,7 @@ async fn lux_get_person_items(
         Err(PeopleError::Storage(_)) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     let filter = CatalogFilter {
         item_types: vec!["MOVIE".to_owned(), "SERIES".to_owned()],
         person_id: Some(person.lookup_id),
@@ -2034,7 +2049,7 @@ async fn lux_get_person_items(
 async fn lux_get_person_image(
     headers: HeaderMap,
     Path(person_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     lux_get_person_image_inner(headers, None, person_id, state).await
 }
@@ -2042,7 +2057,7 @@ async fn lux_get_person_image(
 async fn lux_get_person(
     headers: HeaderMap,
     Path(person_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal = match require_web_principal(&headers, &state).await {
         Ok(principal) => principal,
@@ -2057,7 +2072,7 @@ async fn lux_get_person(
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     match services
         .people
         .find_person(&library_ids, "Actor", &person_id)
@@ -2097,7 +2112,7 @@ async fn lux_get_person(
 async fn lux_set_person_favorite(
     headers: HeaderMap,
     Path(person_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<LuxFavoriteRequest>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -2127,7 +2142,7 @@ async fn lux_set_person_favorite(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let database = require_service!(state.database);
+    let database = state.database();
     match database
         .set_user_person_favorite(&user.id.to_string(), &person.id, request.favorite)
         .await
@@ -2173,7 +2188,7 @@ struct LuxPersonUpdateRequest {
 async fn lux_update_person(
     headers: HeaderMap,
     Path(person_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<LuxPersonUpdateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -2324,7 +2339,7 @@ fn person_update_is_bounded(request: &LuxPersonUpdateRequest) -> bool {
 async fn lux_get_person_image_for_provider(
     headers: HeaderMap,
     Path((provider, person_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     lux_get_person_image_inner(headers, Some(provider), person_id, state).await
 }
@@ -2333,14 +2348,12 @@ async fn lux_get_person_image_inner(
     headers: HeaderMap,
     provider: Option<String>,
     person_id: String,
-    state: AppState,
+    state: ReadyAppState,
 ) -> Response {
     if let Err(response) = require_web_principal(&headers, &state).await {
         return response;
     }
-    let Some(people) = state.people() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let people = state.people();
     let image = match people
         .profile_image_for_provider(provider.as_deref(), &person_id)
         .await

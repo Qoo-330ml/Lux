@@ -40,7 +40,7 @@ pub(super) async fn emby_playback_info(
     method: Method,
     Path(item_id): Path<String>,
     raw_query: RawQuery,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let force_transcode = method == Method::POST && emby_force_transcode_from_raw(&raw_query);
@@ -57,7 +57,7 @@ pub(super) async fn emby_playback_info(
         Ok(user) => user,
         Err(status) => return status.into_response(),
     };
-    let catalog = require_service!(state.catalog);
+    let catalog = state.catalog();
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let internal_item_id = emby_internal_id(&item_id);
     let item = match catalog.find_item(principal, &internal_item_id).await {
@@ -140,7 +140,7 @@ pub(super) async fn emby_playback_info(
         let source = sources.remove(index);
         sources.insert(0, source);
     }
-    let admission_service = require_service!(state.web_playback);
+    let admission_service = state.web_playback();
     if let Err(response) =
         check_web_playback_admission(&headers, admission_service, &user.id.to_string()).await
     {
@@ -187,12 +187,12 @@ pub(super) async fn emby_playback_info(
         .iter()
         .any(|(_, source)| emby_source_needs_strm_resolver(source))
     {
-        match state.plugins() {
-            Some(plugins) => match plugins.has_available_strm_resolver().await {
+        {
+            let plugins = state.plugins();
+            match plugins.has_available_strm_resolver().await {
                 Ok(available) => available,
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-            },
-            None => false,
+            }
         }
     } else {
         false
@@ -280,9 +280,9 @@ pub(super) async fn emby_playback_info(
         current_unix_timestamp().saturating_add(EMBY_DIRECT_STREAM_TTL_SECONDS);
     // When an administrator disables server transcoding, Emby clients are told direct play is the
     // only option instead of receiving a transcoding capability the server would refuse.
-    let transcoding_enabled = match state.web_playback() {
-        Some(service) => service.transcoding_settings().await.enabled,
-        None => false,
+    let transcoding_enabled = {
+        let service = state.web_playback();
+        service.transcoding_settings().await.enabled
     };
     let mut direct_ticket_issued = false;
     let media_sources = sources
@@ -334,7 +334,7 @@ pub(super) async fn emby_playback_info(
             }
             let has_direct_stream_url = value.get("DirectStreamUrl").is_some_and(Value::is_string);
             let transcoding_url = source_transcode_session.as_ref().and_then(|session| {
-                state.web_playback().and_then(|service| {
+                Some(state.web_playback()).and_then(|service| {
                     emby_transcoding_url(
                         service,
                         &source_item.id,
@@ -356,9 +356,8 @@ pub(super) async fn emby_playback_info(
             if let Value::Object(object) = &mut value {
                 if source_transcode_session.is_none()
                     && has_direct_stream_url
-                    && let Some(service) = state.web_playback()
                     && let Some(url) = emby_signed_direct_stream_url(
-                        service,
+                        state.web_playback(),
                         &source_item.id,
                         source,
                         &user,
@@ -442,7 +441,7 @@ pub(super) async fn emby_playback_info(
             Ok(context) => context,
             Err(status) => return status.into_response(),
         };
-        let service = require_service!(state.web_playback);
+        let service = state.web_playback();
         let user_id = user.id.to_string();
         if service
             .register_emby_direct_playback_ticket(
@@ -1052,7 +1051,7 @@ struct EmbyTranscodingSessionOptions<'a> {
 }
 
 async fn create_emby_transcoding_session(
-    state: &AppState,
+    state: &ReadyAppState,
     user: &UserRecord,
     item_id: &str,
     source: &crate::application::catalog::CatalogSource,
@@ -1061,15 +1060,11 @@ async fn create_emby_transcoding_session(
     if source.source_kind != "LOCAL_FILE" {
         return Ok(None);
     }
-    let Some(service) = state.web_playback() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let service = state.web_playback();
     if !service.transcoding_settings().await.enabled {
         return Ok(None);
     }
-    let Some(access) = state.access() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let access = state.access();
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let stored_source = match access
         .authorized_playback_source(principal, item_id, Some(&source.id))
@@ -1150,15 +1145,13 @@ async fn emby_playback_authorization_context(
     headers: &HeaderMap,
     query_api_key: Option<&str>,
     query_client: Option<&str>,
-    state: &AppState,
+    state: &ReadyAppState,
     request_device_id: &str,
 ) -> Result<(Option<String>, Option<String>), StatusCode> {
     let registered_device = if let Some(token) =
         emby_token_from_headers(headers).or_else(|| query_api_key.map(str::to_owned))
     {
-        let Some(auth) = state.emby_auth() else {
-            return Err(StatusCode::SERVICE_UNAVAILABLE);
-        };
+        let auth = state.emby_auth();
         auth.device_info(&token)
             .await
             .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?
@@ -1189,7 +1182,7 @@ async fn emby_playback_authorization_context(
 }
 
 async fn emby_transcoding_start_time_ticks(
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: &str,
     item_id: &str,
     requested_start_time_ticks: Option<i64>,
@@ -1201,9 +1194,7 @@ async fn emby_transcoding_start_time_ticks(
     if let Some(start_time_ticks) = requested_start_time_ticks {
         return Ok(emby_start_time_hint(start_time_ticks, runtime_ticks));
     }
-    let Some(database) = state.database.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+    let database = state.database();
     let user_state = database
         .find_user_item_state(user_id, item_id)
         .await
@@ -1241,7 +1232,7 @@ fn emby_playback_session_error_status(error: WebPlaybackSessionError) -> StatusC
 async fn standard_emby_playback_api_key(
     headers: &HeaderMap,
     query_api_key: Option<&str>,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Option<String> {
     // A normalized Emby credential is authoritative even when an unused Lux
     // key header is present. Without normalization, preserve the legacy guard.
@@ -1260,7 +1251,8 @@ async fn standard_emby_playback_api_key(
     // The shared management key is also accepted on Emby-compatible routes
     // for administration. Never copy it into a playback URL, even when it
     // was supplied as the query api_key.
-    if let Some(service) = state.admin_api_key() {
+    {
+        let service = state.admin_api_key();
         match service.resolve_principal(&token).await {
             Ok(Some(_)) | Err(_) => return None,
             Ok(None) => {}
@@ -1324,7 +1316,7 @@ fn parse_emby_playback_event(body: &Bytes) -> Result<PlaybackEventRequest, Statu
 pub(super) async fn emby_playing(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_playback_event(&body) {
@@ -1337,7 +1329,7 @@ pub(super) async fn emby_playing(
 pub(super) async fn emby_playing_progress(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_playback_event(&body) {
@@ -1355,7 +1347,7 @@ pub(super) async fn emby_playing_progress(
 pub(super) async fn emby_playing_stopped(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let request = match parse_emby_playback_event(&body) {
@@ -1368,7 +1360,7 @@ pub(super) async fn emby_playing_stopped(
 pub(super) async fn handle_emby_playback_event(
     headers: HeaderMap,
     query: EmbyTokenQuery,
-    state: AppState,
+    state: ReadyAppState,
     request: PlaybackEventRequest,
     state_name: &'static str,
 ) -> Response {
@@ -1402,17 +1394,7 @@ pub(super) async fn handle_emby_playback_event(
         return StatusCode::BAD_REQUEST.into_response();
     }
     let item_id_prefix = playback_identifier_prefix(&request.item_id);
-    let Some(database) = state.database.as_ref() else {
-        tracing::error!(
-            event = "emby_playback_callback_rejected",
-            stage = "database",
-            status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            playback_state = state_name,
-            item_id_prefix = %item_id_prefix,
-            "playback database is unavailable"
-        );
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let mut internal_item_id = emby_internal_id(&request.item_id);
     let requested_media_source_id = request
@@ -1440,7 +1422,7 @@ pub(super) async fn handle_emby_playback_event(
         };
     let is_global_collection_work = match database.find_item_library_id(&internal_item_id).await {
         Ok(Some(library_id)) if library_id == crate::storage::GLOBAL_COLLECTION_LIBRARY_ID => {
-            let catalog = require_service!(state.catalog);
+            let catalog = state.catalog();
             let logical_item = match catalog.find_item(principal, &internal_item_id).await {
                 Ok(Some(item)) if item.item_type == "MOVIE" => item,
                 Ok(Some(_)) => return StatusCode::NOT_FOUND.into_response(),
@@ -1511,17 +1493,7 @@ pub(super) async fn handle_emby_playback_event(
         Ok(_) => false,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(access) = state.access() else {
-        tracing::error!(
-            event = "emby_playback_callback_rejected",
-            stage = "access_service",
-            status_code = StatusCode::SERVICE_UNAVAILABLE.as_u16(),
-            playback_state = state_name,
-            item_id_prefix = %item_id_prefix,
-            "playback access service is unavailable"
-        );
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = state.access();
     match access.can_view_item(principal, &internal_item_id).await {
         Ok(true) => {}
         Ok(false) => {
@@ -1555,8 +1527,8 @@ pub(super) async fn handle_emby_playback_event(
         || header_device.version.is_empty()
     {
         let token = emby_token_from_headers(&headers).or_else(|| query.api_key.clone());
-        if let (Some(auth), Some(token)) = (state.emby_auth(), token) {
-            match auth.device_info(&token).await {
+        if let Some(token) = token {
+            match state.emby_auth().device_info(&token).await {
                 Ok(Some(device)) => merge_emby_device_info(&mut header_device, device),
                 Ok(None) => {}
                 Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1677,10 +1649,7 @@ pub(super) async fn handle_emby_playback_event(
             }
         }
     }
-    let playback_probe_source_id = if state_name == "PLAYING"
-        && !request.is_paused
-        && state.strm_probe().is_some()
-    {
+    let playback_probe_source_id = if state_name == "PLAYING" && !request.is_paused {
         match access
             .authorized_playback_source(principal, &internal_item_id, media_source_id.as_deref())
             .await
@@ -1697,8 +1666,8 @@ pub(super) async fn handle_emby_playback_event(
     // by the active session matching its item, source, and device.
     if state_name == "STOPPED"
         && let Some(session_id) = emby_transcode_session_id
-        && let Some(service) = state.web_playback()
     {
+        let service = state.web_playback();
         if let Err(error) = service.stop(session_id, &user_id).await {
             tracing::warn!(
                 event = "emby_transcoding_session_stop_failed",
@@ -1778,7 +1747,8 @@ pub(super) async fn handle_emby_playback_event(
             {
                 return StatusCode::SERVICE_UNAVAILABLE.into_response();
             }
-            if let Some(service) = state.web_playback() {
+            {
+                let service = state.web_playback();
                 let admission_update = if state_name == "STOPPED" {
                     service
                         .release_playback_session_admission(&user_id, &play_session_id)
@@ -1797,8 +1767,8 @@ pub(super) async fn handle_emby_playback_event(
             state.user_events.publish_home_coalesced().await;
             if state_name != "STOPPED"
                 && let Some(session_id) = emby_transcode_session_id
-                && let Some(service) = state.web_playback()
             {
+                let service = state.web_playback();
                 if let Err(error) = service.heartbeat(session_id, &user_id).await {
                     tracing::warn!(
                         event = "emby_transcoding_session_refresh_failed",
@@ -1855,9 +1825,8 @@ pub(super) async fn handle_emby_playback_event(
                 )
                 .await;
             }
-            if let Some(source_id) = playback_probe_source_id
-                && let Some(strm_probe) = state.strm_probe()
-            {
+            if let Some(source_id) = playback_probe_source_id {
+                let strm_probe = state.strm_probe();
                 strm_probe.schedule_playback_probe(&internal_item_id, &source_id);
             }
             tracing::info!(
@@ -1888,12 +1857,12 @@ pub(super) async fn handle_emby_playback_event(
 }
 
 async fn emby_playback_event_duration_ticks(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     item_id: &str,
     media_source_id: Option<&str>,
 ) -> Option<i64> {
-    let catalog = state.catalog()?;
+    let catalog = state.catalog();
     let item = catalog.find_item(principal, item_id).await.ok().flatten()?;
     item.runtime_ticks
         .filter(|ticks| *ticks > 0)
@@ -1990,18 +1959,13 @@ struct PlaybackNotificationContext {
 }
 
 async fn playback_notification_context(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     item_id: &str,
     media_source_id: Option<&str>,
     requested_play_method: Option<&str>,
 ) -> PlaybackNotificationContext {
-    let Some(catalog) = state.catalog() else {
-        return PlaybackNotificationContext {
-            play_method: requested_play_method.map(normalize_play_method),
-            ..PlaybackNotificationContext::default()
-        };
-    };
+    let catalog = state.catalog();
     let item = match catalog.find_item(principal, item_id).await {
         Ok(Some(item)) => item,
         Ok(None) | Err(_) => {
@@ -2079,7 +2043,7 @@ fn bounded_playback_overview(value: Option<&str>) -> Option<String> {
 
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn publish_playback_webhook(
-    state: &AppState,
+    state: &ReadyAppState,
     event_type: WebhookEventType,
     occurred_at: i64,
     item_id: &str,
@@ -2160,14 +2124,14 @@ pub(super) fn bounded_playback_text(value: Option<&str>) -> Option<String> {
 pub(super) async fn emby_sessions(
     headers: HeaderMap,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let database = require_service!(state.database);
+    let database = state.database();
     let user_id = auth_principal
         .user_id()
         .map(|user_id| user_id.to_string())
@@ -2228,22 +2192,7 @@ pub(super) async fn emby_sessions(
             .iter()
             .map(|session| session.item_id.clone())
             .collect::<Vec<_>>();
-        let Some(catalog) = state.catalog() else {
-            return Json(
-                sessions
-                    .iter()
-                    .map(|session| {
-                        emby_session_json(
-                            session,
-                            None,
-                            web_sessions.get(&session.play_session_id),
-                            user_names.get(&session.user_id).map(String::as_str),
-                        )
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .into_response();
-        };
+        let catalog = state.catalog();
         let access_principal = match emby_access_principal(&auth_principal, None) {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
@@ -2273,14 +2222,14 @@ pub(super) async fn emby_stop_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let auth_principal =
         match require_emby_principal(&headers, &state, query.api_key.as_deref()).await {
             Ok(principal) => principal,
             Err(status) => return status.into_response(),
         };
-    let database = require_service!(state.database);
+    let database = state.database();
     let session = match database.find_playback_session_by_id(&session_id).await {
         Ok(Some(session)) => session,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -2294,8 +2243,10 @@ pub(super) async fn emby_stop_session(
     }
     if let Some(transcode_session_id) =
         emby_transcode_session_id_from_play_session(&session.play_session_id)
-        && let Some(service) = state.web_playback()
-        && let Err(error) = service.stop(transcode_session_id, &session.user_id).await
+        && let Err(error) = state
+            .web_playback()
+            .stop(transcode_session_id, &session.user_id)
+            .await
     {
         tracing::warn!(
             session_id = %session.id,
@@ -2561,13 +2512,13 @@ fn session_runtime_ticks(
 pub(super) async fn lux_get_playback(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let access = require_service!(state.access);
+    let access = state.access();
     match access
         .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
         .await
@@ -2576,7 +2527,7 @@ pub(super) async fn lux_get_playback(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let user_id = user.id.to_string();
     let user_state = match database.find_user_item_state(&user_id, &item_id).await {
         Ok(state) => state,
@@ -2605,7 +2556,7 @@ pub(super) async fn lux_get_playback(
 pub(super) async fn lux_list_playback_history(
     headers: HeaderMap,
     Query(query): Query<AdminJobsQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
@@ -2623,7 +2574,7 @@ pub(super) async fn lux_list_playback_history(
             .into_response();
         }
     };
-    let service = require_service!(state.emby_migration);
+    let service = state.emby_migration();
     match service
         .list_playback_history(&user.id.to_string(), offset, limit)
         .await
@@ -2734,7 +2685,7 @@ pub(super) fn web_playback_error(headers: &HeaderMap, error: WebPlaybackSessionE
 
 async fn authorize_web_playback_resource(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     service: &WebPlaybackSessionService,
     session_id: &str,
     resource: &str,
@@ -2760,13 +2711,11 @@ fn web_playback_device_id(headers: &HeaderMap) -> Option<String> {
 
 async fn web_playback_authorization_context(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     expected_user_id: &str,
 ) -> Result<(Option<String>, Option<String>), WebPlaybackSessionError> {
     if let Some(session_token) = super::request_cookie(headers, "lux_session") {
-        let auth = state
-            .auth()
-            .ok_or(WebPlaybackSessionError::AccessRulesUnavailable)?;
+        let auth = state.auth();
         let client_ip = super::request_access_ip(headers, state)
             .await
             .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?;
@@ -2796,9 +2745,7 @@ async fn web_playback_authorization_context(
     let Some(token) = token else {
         return Err(WebPlaybackSessionError::NotFound);
     };
-    let auth = state
-        .emby_auth()
-        .ok_or(WebPlaybackSessionError::AccessRulesUnavailable)?;
+    let auth = state.emby_auth();
     let client_ip = super::request_access_ip(headers, state)
         .await
         .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)?;
@@ -3297,7 +3244,7 @@ pub(super) async fn emby_transcoding_master(
     method: Method,
     Path(item_id): Path<String>,
     raw_query: RawQuery,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let started = std::time::Instant::now();
     let query = emby_transcoding_query_from_raw(raw_query);
@@ -3333,7 +3280,7 @@ pub(super) async fn emby_transcoding_asset(
     method: Method,
     Path((item_id, session_id, asset)): Path<(String, String, String)>,
     raw_query: RawQuery,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let started = std::time::Instant::now();
     let query = emby_transcoding_query_from_raw(raw_query);
@@ -3366,7 +3313,7 @@ async fn serve_emby_transcoding_asset(
     session_id: &str,
     asset: &str,
     query: &EmbyTranscodingQuery,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Response {
     let Some(expires_at) = query.expires else {
         return StatusCode::UNAUTHORIZED.into_response();
@@ -3374,7 +3321,7 @@ async fn serve_emby_transcoding_asset(
     let Some(signature) = query.signature.as_deref() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     let Some(segment_container_value) = query.segment_container.as_deref() else {
         return StatusCode::UNAUTHORIZED.into_response();
     };
@@ -3605,13 +3552,11 @@ async fn check_web_playback_admission(
 
 pub(super) async fn admit_emby_direct_playback(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: &str,
     play_session_id: &str,
 ) -> Result<(), Response> {
-    let Some(service) = state.web_playback() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
+    let service = state.web_playback();
     let result = service
         .admit_playback_session(user_id, play_session_id)
         .await
@@ -3642,7 +3587,7 @@ async fn admit_web_playback_request(
 
 async fn create_web_playback_session_json(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     user: &UserRecord,
     item_id: &str,
     source: &crate::storage::StoredPlaybackSource,
@@ -3654,9 +3599,7 @@ async fn create_web_playback_session_json(
         "STRM_URL" => PlaybackSourceKind::Strm,
         _ => return Err(StatusCode::NOT_IMPLEMENTED.into_response()),
     };
-    let Some(service) = state.web_playback() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
+    let service = state.web_playback();
     check_web_playback_admission(headers, service, &user.id.to_string()).await?;
     if source_kind == PlaybackSourceKind::LocalFile && audio_stream_index.is_some() {
         // Direct Play cannot select a non-first source audio stream. Reuse
@@ -3869,7 +3812,7 @@ async fn create_web_playback_session_json(
 #[allow(clippy::too_many_arguments)]
 async fn web_direct_candidates(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     service: &crate::application::playback::session::WebPlaybackSessionService,
     user: &UserRecord,
     item_id: &str,
@@ -3903,7 +3846,7 @@ async fn web_direct_candidates(
 #[allow(clippy::too_many_arguments)]
 async fn web_proxy_candidate_url(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     service: &crate::application::playback::session::WebPlaybackSessionService,
     user: &UserRecord,
     item_id: &str,
@@ -3911,7 +3854,7 @@ async fn web_proxy_candidate_url(
     created: &crate::application::playback::session::CreatedWebPlaybackSession,
     device_id: Option<&str>,
 ) -> Option<String> {
-    let auth = state.emby_auth()?;
+    let auth = state.emby_auth();
     let client_ip = super::request_access_ip(headers, state).await.ok()?;
     let device = crate::auth::emby::EmbyDeviceInfo {
         client: "Lux Web".to_owned(),
@@ -3949,7 +3892,7 @@ async fn web_proxy_candidate_url(
 }
 
 async fn validate_web_audio_stream(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
     item_id: &str,
     source_id: &str,
@@ -3961,9 +3904,7 @@ async fn validate_web_audio_stream(
     if index < 0 {
         return Err(StatusCode::BAD_REQUEST.into_response());
     }
-    let Some(catalog) = state.catalog() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE.into_response());
-    };
+    let catalog = state.catalog();
     let item = match catalog.find_item(principal, item_id).await {
         Ok(Some(item)) => item,
         Ok(None) => return Err(StatusCode::NOT_FOUND.into_response()),
@@ -3994,7 +3935,7 @@ async fn validate_web_audio_stream(
 
 pub(super) async fn lux_create_web_playback_session(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<WebPlaybackSessionRequest>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -4004,7 +3945,7 @@ pub(super) async fn lux_create_web_playback_session(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let access = require_service!(state.access);
+    let access = state.access();
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let source = match access
         .authorized_playback_source(principal, &request.item_id, Some(&request.source_id))
@@ -4055,7 +3996,7 @@ pub(super) struct WebPlaybackBootstrapRequest {
 
 pub(super) async fn lux_create_web_playback_bootstrap(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<WebPlaybackBootstrapRequest>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -4065,9 +4006,9 @@ pub(super) async fn lux_create_web_playback_bootstrap(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let catalog = require_service!(state.catalog);
-    let access = require_service!(state.access);
-    let database = require_service!(state.database);
+    let catalog = state.catalog();
+    let access = state.access();
+    let database = state.database();
     let principal = AccessPrincipal::new(user.id, user.is_admin);
     let source_id = request
         .source_id
@@ -4152,9 +4093,9 @@ pub(super) async fn lux_web_playback_direct(
     method: Method,
     Path(session_id): Path<String>,
     Query(query): Query<WebPlaybackResourceQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     let session = match authorize_web_playback_resource(
         &headers,
         &state,
@@ -4177,7 +4118,7 @@ pub(super) async fn lux_web_playback_direct(
     {
         return response;
     }
-    let principal = match playback_resource_principal(state.database.as_ref(), &session).await {
+    let principal = match playback_resource_principal(Some(state.database()), &session).await {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
@@ -4202,9 +4143,9 @@ pub(super) async fn lux_web_playback_range(
     method: Method,
     Path(session_id): Path<String>,
     Query(query): Query<WebPlaybackResourceQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     let session = match authorize_web_playback_resource(
         &headers,
         &state,
@@ -4228,11 +4169,11 @@ pub(super) async fn lux_web_playback_range(
     let Some(range) = headers.get("range").and_then(|value| value.to_str().ok()) else {
         return StatusCode::RANGE_NOT_SATISFIABLE.into_response();
     };
-    let principal = match playback_resource_principal(state.database.as_ref(), &session).await {
+    let principal = match playback_resource_principal(Some(state.database()), &session).await {
         Ok(principal) => principal,
         Err(status) => return status.into_response(),
     };
-    let access = require_service!(state.access);
+    let access = state.access();
     let source = match access
         .authorized_playback_source(
             principal,
@@ -4278,7 +4219,8 @@ pub(super) async fn lux_web_playback_range(
             return StatusCode::BAD_GATEWAY.into_response();
         }
     };
-    if let Some(strm_probe) = state.strm_probe() {
+    {
+        let strm_probe = state.strm_probe();
         strm_probe.schedule_playback_probe(&session.item_id, &source.source_id);
     }
     let mut response = Response::builder()
@@ -4303,9 +4245,9 @@ pub(super) async fn lux_web_playback_hls(
     method: Method,
     Path((session_id, asset)): Path<(String, String)>,
     Query(query): Query<WebPlaybackResourceQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     let resource = format!("hls:{asset}");
     let session = match authorize_web_playback_resource(
         &headers,
@@ -4457,7 +4399,7 @@ pub(super) struct WebPlaybackEventRequest {
 pub(super) async fn lux_web_playback_event(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<WebPlaybackEventRequest>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -4467,7 +4409,7 @@ pub(super) async fn lux_web_playback_event(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     let (claim, session) = match service
         .claim_event(WebPlaybackEvent {
             session_id: &session_id,
@@ -4487,7 +4429,7 @@ pub(super) async fn lux_web_playback_event(
         return StatusCode::NOT_FOUND.into_response();
     };
     if claim == WebPlaybackEventClaim::Accepted {
-        let database = require_service!(state.database);
+        let database = state.database();
         let user_id = user.id.to_string();
         let previous_session = match database
             .find_playback_session(&user_id, &session.play_session_id)
@@ -4636,7 +4578,7 @@ fn web_playback_notification_method(
 pub(super) async fn lux_web_playback_heartbeat(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
@@ -4645,7 +4587,7 @@ pub(super) async fn lux_web_playback_heartbeat(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     match service.heartbeat(&session_id, &user.id.to_string()).await {
         Ok(expires_at) => {
             Json(json!({ "sessionId": session_id, "expiresAt": expires_at })).into_response()
@@ -4661,13 +4603,13 @@ pub(super) async fn lux_web_playback_heartbeat(
 pub(super) async fn lux_web_playback_stats(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     match service.stats(&session_id, &user.id.to_string()).await {
         Ok(stats) => Json(web_playback_stats_json(&stats)).into_response(),
         Err(error) => web_playback_error(&headers, error),
@@ -4721,7 +4663,7 @@ pub(super) fn web_playback_stats_json(
 pub(super) async fn lux_delete_web_playback_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
@@ -4730,7 +4672,7 @@ pub(super) async fn lux_delete_web_playback_session(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let service = require_service!(state.web_playback);
+    let service = state.web_playback();
     match service.stop(&session_id, &user.id.to_string()).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
         Err(error) => web_playback_error(&headers, error),
@@ -4770,7 +4712,7 @@ pub(super) struct LuxProgressRequest {
 pub(super) async fn lux_post_progress(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<LuxProgressRequest>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -4783,7 +4725,7 @@ pub(super) async fn lux_post_progress(
     if request.position_ticks < 0 || request.duration_ticks.is_some_and(|duration| duration < 0) {
         return StatusCode::BAD_REQUEST.into_response();
     }
-    let access = require_service!(state.access);
+    let access = state.access();
     match access
         .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
         .await
@@ -4792,7 +4734,7 @@ pub(super) async fn lux_post_progress(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let user_id = user.id.to_string();
     let play_session_id = format!("lux-web:{user_id}:{item_id}");
     let playback_state = request.state;
@@ -4909,7 +4851,7 @@ pub(super) async fn emby_mark_played(
     headers: HeaderMap,
     Path((user_id, item_id)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     handle_emby_user_flag(headers, user_id, item_id, query, state, true, true).await
 }
@@ -4918,7 +4860,7 @@ pub(super) async fn emby_unmark_played(
     headers: HeaderMap,
     Path((user_id, item_id)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     handle_emby_user_flag(headers, user_id, item_id, query, state, true, false).await
 }
@@ -4927,7 +4869,7 @@ pub(super) async fn emby_mark_favorite(
     headers: HeaderMap,
     Path((user_id, item_id)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     handle_emby_user_flag(headers, user_id, item_id, query, state, false, true).await
 }
@@ -4936,7 +4878,7 @@ pub(super) async fn emby_unmark_favorite(
     headers: HeaderMap,
     Path((user_id, item_id)): Path<(String, String)>,
     Query(query): Query<EmbyTokenQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     handle_emby_user_flag(headers, user_id, item_id, query, state, false, false).await
 }
@@ -4946,7 +4888,7 @@ pub(super) async fn handle_emby_user_flag(
     user_id: String,
     item_id: String,
     query: EmbyTokenQuery,
-    state: AppState,
+    state: ReadyAppState,
     played: bool,
     value: bool,
 ) -> Response {
@@ -4961,14 +4903,14 @@ pub(super) async fn handle_emby_user_flag(
             Err(status) => return status.into_response(),
         };
     let target_user_id = principal.user_id_string();
-    let access = require_service!(state.access);
+    let access = state.access();
     let item_id = emby_internal_id(&item_id);
     match access.can_view_item(principal, &item_id).await {
         Ok(true) => {}
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     let result = if played {
         database
             .set_user_item_played(&target_user_id, &item_id, value)
@@ -5069,7 +5011,7 @@ pub(super) struct LuxPlayedRequest {
 pub(super) async fn lux_set_favorite(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<LuxFavoriteRequest>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -5079,7 +5021,7 @@ pub(super) async fn lux_set_favorite(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let access = require_service!(state.access);
+    let access = state.access();
     match access
         .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
         .await
@@ -5088,7 +5030,7 @@ pub(super) async fn lux_set_favorite(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match database
         .set_user_item_favorite(&user.id.to_string(), &item_id, request.favorite)
         .await
@@ -5104,7 +5046,7 @@ pub(super) async fn lux_set_favorite(
 pub(super) async fn lux_set_played(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<LuxPlayedRequest>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -5114,7 +5056,7 @@ pub(super) async fn lux_set_played(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let access = require_service!(state.access);
+    let access = state.access();
     match access
         .can_view_item(AccessPrincipal::new(user.id, user.is_admin), &item_id)
         .await
@@ -5123,7 +5065,7 @@ pub(super) async fn lux_set_played(
         Ok(false) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let database = require_service!(state.database);
+    let database = state.database();
     match database
         .set_user_item_played(&user.id.to_string(), &item_id, request.played)
         .await
