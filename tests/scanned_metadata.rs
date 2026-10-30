@@ -298,7 +298,7 @@ async fn local_metadata_worker_backfills_posters_for_unchanged_indexed_items()
     .await?;
 
     let user_events = UserEventHub::new();
-    let mut user_event_receiver = user_events.subscribe();
+    let mut user_event_receiver = user_events.subscribe_for("viewer");
     let jobs = ScanJobService::new(database.clone()).with_user_events(user_events);
     jobs.start_local_metadata_outbox_worker().await?;
     let registered_roots: i64 = sqlx::query_scalar(
@@ -335,7 +335,8 @@ async fn local_metadata_worker_backfills_posters_for_unchanged_indexed_items()
             std::time::Duration::from_secs(1),
             user_event_receiver.recv(),
         )
-        .await??,
+        .await??
+        .scope(),
         UserEventScope::Home
     );
 
