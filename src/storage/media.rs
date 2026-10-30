@@ -277,6 +277,44 @@ impl From<ItemSourceLocatorRow> for StoredItemSourceLocator {
     }
 }
 
+/// Row of the manifest write batches that only read back the claimed row's `id`.
+#[derive(sqlx::FromRow)]
+struct ReturningIdRow {
+    id: String,
+}
+
+/// Row of the manifest ADD claim that reads back `relative_path`.
+#[derive(sqlx::FromRow)]
+struct ReturningRelativePathRow {
+    relative_path: String,
+}
+
+/// Row of every media-item identity lookup that selects `id` and `identity_key` together.
+#[derive(sqlx::FromRow)]
+struct ItemIdentityKeyIdRow {
+    id: String,
+    identity_key: String,
+}
+
+/// Row of `prefetch_movie_items_in_transaction`.
+#[derive(sqlx::FromRow)]
+struct PrefetchedMovieItemRow {
+    id: String,
+    sort_title: String,
+    production_year: Option<i64>,
+    parent_id: Option<String>,
+    provider_ids_json: Option<String>,
+    removed_at: Option<i64>,
+}
+
+/// Row of `list_hierarchy_ids_in_transaction`.
+#[derive(sqlx::FromRow)]
+struct HierarchyIdentityRow {
+    id: String,
+    identity_key: String,
+    removed_at: Option<i64>,
+}
+
 impl Database {
     pub(crate) async fn media_source_belongs_to_item(
         &self,
@@ -830,7 +868,7 @@ impl Database {
                         OR (entry.fingerprint IS NULL AND incoming.base_fingerprint IS NULL))
                  RETURNING id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<ReturningIdRow>(sqlx::AssertSqlSafe(query));
             for update in chunk {
                 statement = statement
                     .bind(update.filesystem_entry_id)
@@ -856,7 +894,7 @@ impl Database {
                 .fetch_all(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
-            applied_ids.extend(rows.into_iter().map(|row| row.get::<String, _>("id")));
+            applied_ids.extend(rows.into_iter().map(|row| row.id));
         }
 
         let applied_updates = updates
@@ -1068,7 +1106,8 @@ impl Database {
                 ON CONFLICT(library_root_id, relative_path) DO NOTHING
                 RETURNING relative_path"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<ReturningRelativePathRow>(sqlx::AssertSqlSafe(query));
             for entry in chunk {
                 statement = statement
                     .bind(entry.id)
@@ -1086,7 +1125,7 @@ impl Database {
                 .fetch_all(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
-            inserted_paths.extend(rows.into_iter().map(|row| row.get("relative_path")));
+            inserted_paths.extend(rows.into_iter().map(|row| row.relative_path));
         }
         Ok(inserted_paths)
     }
@@ -1211,8 +1250,9 @@ impl Database {
                 std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?, ?, 1, unixepoch())", chunk.len())
                     .collect::<Vec<_>>()
                     .join(", ");
-            let mut item_write = self.query(sqlx::AssertSqlSafe(format!(
-                "INSERT INTO media_items (
+            let mut item_write =
+                self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(format!(
+                    "INSERT INTO media_items (
                      id, library_id, item_type, parent_id, title, sort_title,
                      original_title, identification_status, identity_key, has_available_source,
                      updated_at
@@ -1225,7 +1265,7 @@ impl Database {
                      removed_at = NULL, updated_at = unixepoch()
                  WHERE media_items.library_id = excluded.library_id
                  RETURNING id, identity_key"
-            )));
+                )));
             for (file, parent_id) in chunk.iter().zip(parent_chunk) {
                 item_write = item_write
                     .bind(&file.item_id)
@@ -1251,14 +1291,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
                 .into_iter()
-                .map(|row| {
-                    Ok((
-                        row.try_get::<String, _>("identity_key")?,
-                        row.try_get::<String, _>("id")?,
-                    ))
-                })
-                .collect::<Result<HashMap<_, _>, sqlx::Error>>()
-                .map_err(self.sqlx_err())?;
+                .map(|row| (row.identity_key, row.id))
+                .collect::<HashMap<_, _>>();
 
             let source_values = std::iter::repeat_n("(?, ?, ?, ?, ?, ?, ?, ?)", chunk.len())
                 .collect::<Vec<_>>()
@@ -1419,7 +1453,9 @@ impl Database {
                           CASE WHEN target_item.removed_at IS NULL THEN 0 ELSE 1 END,
                           target_item.id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+            let mut statement = self
+                .query_as::<PrefetchedMovieItemRow>(sqlx::AssertSqlSafe(query))
+                .bind(library_id);
             for sort_title in chunk {
                 statement = statement.bind(sort_title);
             }
@@ -1428,22 +1464,14 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                let sort_title = row
-                    .try_get::<String, _>("sort_title")
-                    .map_err(self.sqlx_err())?;
-                let production_year = row
-                    .try_get::<Option<i64>, _>("production_year")
-                    .map_err(self.sqlx_err())?;
-                let parent_id = row
-                    .try_get::<Option<String>, _>("parent_id")
-                    .map_err(self.sqlx_err())?;
-                let provider_ids_json = row
-                    .try_get::<Option<String>, _>("provider_ids_json")
-                    .map_err(self.sqlx_err())?;
-                let removed_at = row
-                    .try_get::<Option<i64>, _>("removed_at")
-                    .map_err(self.sqlx_err())?;
+                let PrefetchedMovieItemRow {
+                    id,
+                    sort_title,
+                    production_year,
+                    parent_id,
+                    provider_ids_json,
+                    removed_at,
+                } = row;
                 movie_items
                     .entry((sort_title, production_year))
                     .or_insert(PrefetchedMovieItem {
@@ -1500,7 +1528,7 @@ impl Database {
                  FROM media_items
                  WHERE item_type = 'FOLDER' AND identity_key IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(query));
             for identity_key in chunk {
                 statement = statement.bind(identity_key);
             }
@@ -1509,11 +1537,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                let identity_key = row
-                    .try_get::<String, _>("identity_key")
-                    .map_err(self.sqlx_err())?;
-                folders.insert(identity_key, id);
+                folders.insert(row.identity_key, row.id);
             }
         }
         Ok(folders)
@@ -1600,7 +1624,8 @@ impl Database {
                      ON CONFLICT(identity_key) WHERE identity_key IS NOT NULL DO NOTHING
                      RETURNING id, identity_key"
                 );
-                let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                let mut statement =
+                    self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(query));
                 for folder in chunk {
                     let parent_id = match folder.parent_identity_key.as_deref() {
                         Some(identity_key) => folder_cache
@@ -1628,12 +1653,8 @@ impl Database {
                     .await
                     .map_err(self.sqlx_err())?;
                 for row in &inserted_rows {
-                    let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                    let identity_key = row
-                        .try_get::<String, _>("identity_key")
-                        .map_err(self.sqlx_err())?;
-                    folder_cache.insert(identity_key.clone(), id);
-                    touched_folders.insert(identity_key);
+                    folder_cache.insert(row.identity_key.clone(), row.id.clone());
+                    touched_folders.insert(row.identity_key.clone());
                 }
                 if inserted_rows.len() != chunk.len() {
                     let unresolved = chunk
@@ -1648,7 +1669,8 @@ impl Database {
                             "SELECT id, identity_key FROM media_items
                              WHERE item_type = 'FOLDER' AND identity_key IN ({placeholders})"
                         );
-                        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+                        let mut statement =
+                            self.query_as::<ItemIdentityKeyIdRow>(sqlx::AssertSqlSafe(query));
                         for folder in unresolved_chunk {
                             statement = statement.bind(&folder.identity_key);
                         }
@@ -1657,11 +1679,7 @@ impl Database {
                             .await
                             .map_err(self.sqlx_err())?;
                         for row in rows {
-                            let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                            let identity_key = row
-                                .try_get::<String, _>("identity_key")
-                                .map_err(self.sqlx_err())?;
-                            folder_cache.insert(identity_key, id);
+                            folder_cache.insert(row.identity_key, row.id);
                         }
                     }
                 }
@@ -2757,7 +2775,7 @@ impl Database {
                 "SELECT id, identity_key, removed_at
                  FROM media_items WHERE identity_key IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<HierarchyIdentityRow>(sqlx::AssertSqlSafe(query));
             for identity_key in chunk {
                 statement = statement.bind(identity_key);
             }
@@ -2766,18 +2784,10 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let identity_key = row
-                    .try_get::<String, _>("identity_key")
-                    .map_err(self.sqlx_err())?;
-                let id = row.try_get::<String, _>("id").map_err(self.sqlx_err())?;
-                if row
-                    .try_get::<Option<i64>, _>("removed_at")
-                    .map_err(self.sqlx_err())?
-                    .is_some()
-                {
-                    removed_ids.insert(identity_key.clone());
+                if row.removed_at.is_some() {
+                    removed_ids.insert(row.identity_key.clone());
                 }
-                ids.insert(identity_key, id);
+                ids.insert(row.identity_key, row.id);
             }
         }
         Ok((ids, removed_ids))
