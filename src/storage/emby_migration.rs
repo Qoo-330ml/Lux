@@ -4583,4 +4583,173 @@ mod tests {
         );
         Ok(())
     }
+
+    #[tokio::test]
+    async fn migration_source_is_looked_up_by_base_url() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .upsert_emby_migration_source(&StoredEmbyMigrationSource {
+                source_base_url: "https://emby.example.test/".to_owned(),
+                secret_ref: "emby-migration/source.json".to_owned(),
+                source_label: "emby.example.test".to_owned(),
+                history_capability: "EVENT_HISTORY".to_owned(),
+            })
+            .await?;
+
+        let source = database
+            .find_emby_migration_source("https://emby.example.test/")
+            .await?
+            .expect("the upserted source should be found");
+        assert_eq!(source.source_base_url, "https://emby.example.test/");
+        assert_eq!(source.secret_ref, "emby-migration/source.json");
+        assert_eq!(source.source_label, "emby.example.test");
+        assert_eq!(source.history_capability, "EVENT_HISTORY");
+        assert!(
+            database
+                .find_emby_migration_source("https://missing.example.test/")
+                .await?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_user_links_are_listed_in_username_order()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, _item_id) = insert_test_user_and_item(&database).await?;
+        let job_id = Uuid::now_v7().to_string();
+        database
+            .insert_emby_migration_job(&NewEmbyMigrationJob {
+                id: &job_id,
+                created_by_user_id: &user_id,
+                source_label: "Test Emby",
+                source_base_url: "https://emby.example.test/",
+                secret_ref: "emby-migration/test",
+                dry_run: false,
+                merge_policy: "MERGE",
+                scope_json: r#"{"userProfile":true}"#,
+                emby_user_ids_json: r#"["emby-alice","emby-bob"]"#,
+            })
+            .await?;
+        database
+            .upsert_emby_migration_user_links_batch(&[
+                StoredEmbyMigrationUserLink {
+                    job_id: job_id.clone(),
+                    emby_user_id: "emby-bob".to_owned(),
+                    emby_username: "Bob".to_owned(),
+                    lux_user_id: None,
+                    status: "SKIPPED".to_owned(),
+                    error: Some("no matching Lux user".to_owned()),
+                },
+                StoredEmbyMigrationUserLink {
+                    job_id: job_id.clone(),
+                    emby_user_id: "emby-alice".to_owned(),
+                    emby_username: "Alice".to_owned(),
+                    lux_user_id: Some(user_id.clone()),
+                    status: "LINKED".to_owned(),
+                    error: None,
+                },
+            ])
+            .await?;
+
+        let links = database
+            .list_emby_migration_user_links(&job_id, 0, 10)
+            .await?;
+        assert_eq!(links.len(), 2);
+        assert_eq!(links[0].job_id, job_id);
+        assert_eq!(links[0].emby_user_id, "emby-alice");
+        assert_eq!(links[0].emby_username, "Alice");
+        assert_eq!(links[0].lux_user_id.as_deref(), Some(user_id.as_str()));
+        assert_eq!(links[0].status, "LINKED");
+        assert_eq!(links[0].error, None);
+        assert_eq!(links[1].emby_user_id, "emby-bob");
+        assert_eq!(links[1].emby_username, "Bob");
+        assert_eq!(links[1].lux_user_id, None);
+        assert_eq!(links[1].status, "SKIPPED");
+        assert_eq!(links[1].error.as_deref(), Some("no matching Lux user"));
+
+        let second_page = database
+            .list_emby_migration_user_links(&job_id, 1, 10)
+            .await?;
+        assert_eq!(second_page.len(), 1);
+        assert_eq!(second_page[0].emby_username, "Bob");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn migration_playback_history_events_are_listed_newest_first()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (user_id, item_id) = insert_test_user_and_item(&database).await?;
+        for (source_event_key, position_ticks, duration_ticks, occurred_at) in [
+            ("event-old", 10_i64, None, 100_i64),
+            ("event-new", 20_i64, Some(500_i64), 200_i64),
+        ] {
+            let event = StoredPlaybackHistoryEvent {
+                id: Uuid::now_v7().to_string(),
+                user_id: user_id.clone(),
+                item_id: item_id.clone(),
+                event_type: "PLAY_PROGRESS".to_owned(),
+                position_ticks,
+                duration_ticks,
+                occurred_at,
+                source: "emby:test-server".to_owned(),
+                source_event_key: source_event_key.to_owned(),
+            };
+            assert!(database.insert_playback_history_event(&event).await?);
+        }
+
+        let events = database
+            .list_playback_history_events(&user_id, 0, 10)
+            .await?;
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event.source_event_key.as_str())
+                .collect::<Vec<_>>(),
+            vec!["event-new", "event-old"]
+        );
+        assert_eq!(events[0].user_id, user_id);
+        assert_eq!(events[0].item_id, item_id);
+        assert_eq!(events[0].event_type, "PLAY_PROGRESS");
+        assert_eq!(events[0].position_ticks, 20);
+        assert_eq!(events[0].duration_ticks, Some(500));
+        assert_eq!(events[0].occurred_at, 200);
+        assert_eq!(events[0].source, "emby:test-server");
+        assert_eq!(events[1].position_ticks, 10);
+        assert_eq!(events[1].duration_ticks, None);
+        Ok(())
+    }
+
+    /// A column that a `FromRow` struct expects but a result set lacks used to panic inside
+    /// `row.get`. It now surfaces as an ordinary `sqlx::Error::ColumnNotFound`, which the storage
+    /// entry points map onto `StorageError::Sqlx`.
+    #[tokio::test]
+    async fn migration_row_decoding_reports_missing_columns_as_errors()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error =
+            match <EmbyMigrationJobRow as sqlx::FromRow<'_, sqlx::any::AnyRow>>::from_row(&row) {
+                Ok(_) => {
+                    return Err("a row without the migration job columns must not decode".into());
+                }
+                Err(error) => error,
+            };
+        assert!(matches!(
+            error,
+            sqlx::Error::ColumnNotFound(ref column) if column == "id"
+        ));
+
+        let error = database
+            .query_as::<EmbyMigrationSourceRow>("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await
+            .map_err(database.sqlx_err());
+        assert!(matches!(error, Err(StorageError::Sqlx { .. })));
+        Ok(())
+    }
 }
