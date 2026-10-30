@@ -8,7 +8,7 @@ use std::{
 use axum::{
     Json, Router,
     body::{Body, Bytes, to_bytes},
-    extract::{ConnectInfo, DefaultBodyLimit, Path, Query, RawQuery, State},
+    extract::{ConnectInfo, DefaultBodyLimit, FromRef, Path, Query, RawQuery, State},
     http::{
         HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode,
         header::{CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_TYPE, COOKIE, SET_COOKIE},
@@ -279,6 +279,273 @@ impl std::ops::Deref for AppState {
     }
 }
 
+/// The ready-tree counterparts of the `AppState` accessor macros below.
+///
+/// A required service is returned by value-of-reference (`&Service`) because `ReadyServices` builds
+/// it unconditionally, which is what lets a migrated handler drop its `503` guard. The
+/// feature-optional slots keep `Option<&Service>`, so their degraded responses stay byte-identical.
+macro_rules! ready_service_accessor {
+    ($($field:ident -> $ty:ty),* $(,)?) => {
+        $(
+            #[doc = concat!("Reads the required `ReadyServices::", stringify!($field), "`.")]
+            #[allow(dead_code)]
+            pub(crate) fn $field(&self) -> &$ty {
+                &self.services.$field
+            }
+        )*
+    };
+}
+
+macro_rules! ready_optional_service_accessor {
+    ($($field:ident -> $ty:ty),* $(,)?) => {
+        $(
+            #[doc = concat!("Reads the feature-optional `ReadyServices::", stringify!($field), "`.")]
+            #[allow(dead_code)]
+            pub(crate) fn $field(&self) -> Option<&$ty> {
+                self.services.$field.as_ref()
+            }
+        )*
+    };
+}
+
+/// The state of the ready router tree: the database and every business service are present.
+///
+/// It is only ever built from [`AppState::into_mode`], never by hand, so it always shares the one
+/// `Arc<ReadyServices>` instance with the workers, the plugins and the [`AppState`] façade the
+/// frozen tests construct (`Arc::ptr_eq`, see the design's appendix A). Handlers migrate to this
+/// type batch by batch; until then `impl FromRef<ReadyAppState> for AppState` keeps them working.
+#[derive(Clone)]
+pub struct ReadyAppState {
+    core: CoreState,
+    database: Database,
+    services: Arc<ReadyServices>,
+}
+
+impl std::ops::Deref for ReadyAppState {
+    type Target = CoreState;
+
+    fn deref(&self) -> &CoreState {
+        &self.core
+    }
+}
+
+impl ReadyAppState {
+    /// The core state the middleware reads; `Deref` covers the handler-side field reads.
+    pub(crate) fn core(&self) -> &CoreState {
+        &self.core
+    }
+}
+
+/// The per-service accessors of the ready tree, replacing the `Option` accessors of [`AppState`].
+///
+/// They are batch-0 scaffolding: each migration batch turns `require_service!(state.<field>)` into
+/// `state.<field>()` in its own files, which is why nothing calls them yet.
+#[allow(dead_code)]
+impl ReadyAppState {
+    pub(crate) fn database(&self) -> &Database {
+        &self.database
+    }
+
+    /// The shared service table, for the `Arc::ptr_eq` invariant checks.
+    pub(crate) fn services(&self) -> &Arc<ReadyServices> {
+        &self.services
+    }
+
+    ready_service_accessor! {
+        database_setup -> DatabaseSetupService,
+        setup -> SetupService,
+        auth -> WebAuthService,
+        emby_auth -> EmbyAuthService,
+        device_pairings -> DevicePairingService,
+        admin_api_key -> AdminApiKeyService,
+        database_diagnostics -> DatabaseDiagnosticsService,
+        libraries -> LibraryService,
+        catalog -> CatalogService,
+        home -> HomeService,
+        images -> ImageService,
+        image_variants -> Arc<ImageVariantService>,
+        image_candidates -> ImageCandidateService,
+        library_covers -> LibraryCoverService,
+        access -> MediaAccessService,
+        metadata_candidates -> MetadataCandidateService,
+        metadata_writes -> MetadataWriteService,
+        metadata_reidentify -> MetadataReidentifyService,
+        deletion -> MediaDeleteService,
+        item_merge -> ItemMergeService,
+        probe -> MediaProbeService,
+        embedded_subtitle -> EmbeddedSubtitleService,
+        thumbnails -> ThumbnailService,
+        scan_jobs -> ScanJobService,
+        strm_probe -> StrmProbeService,
+        chapter_detection -> ChapterDetectionService,
+        scheduled_tasks -> ScheduledTaskService,
+        danmaku -> DanmakuService,
+        plugins -> PluginService,
+        emby_migration -> Arc<EmbyMigrationService>,
+        scraper_resolver -> ScraperResolver,
+        scraper -> ScraperProvider,
+        collections -> CollectionService,
+        global_collection_sync_worker -> GlobalCollectionSyncWorker,
+        identity_merge_worker -> IdentityMergeWorker,
+        people -> PeopleService,
+        local_nfo -> LocalNfoMetadataStore,
+        user_avatars -> UserAvatarService,
+        ip_location -> IpLocationService,
+        web_playback -> WebPlaybackSessionService,
+    }
+
+    ready_optional_service_accessor! {
+        image_writes -> ImageWriteService,
+        metadata_selection -> MetadataSelectionService,
+        downloads -> DownloadService,
+        strm_playback -> StrmPlaybackResolver,
+        webhooks -> WebhookService,
+        content_restriction_index_worker -> ContentRestrictionIndexWorker,
+    }
+}
+
+/// The state of the setup router tree.
+///
+/// It wraps the same [`ReadyAppState`] (same database, same `Arc<ReadyServices>`) but only exposes
+/// the services the setup wizard needs, so a business handler (`State<ReadyAppState>`) cannot be
+/// mounted on the setup tree by accident. Batch 0 ships the type and its conversions; the setup
+/// tree itself is wired in the closing batch, when the setup handlers switch to `State<SetupState>`.
+#[derive(Clone)]
+pub struct SetupState(ReadyAppState);
+
+impl std::ops::Deref for SetupState {
+    type Target = CoreState;
+
+    fn deref(&self) -> &CoreState {
+        &self.0.core
+    }
+}
+
+impl From<ReadyAppState> for SetupState {
+    fn from(state: ReadyAppState) -> Self {
+        Self(state)
+    }
+}
+
+#[allow(dead_code)]
+impl SetupState {
+    pub(crate) fn core(&self) -> &CoreState {
+        self.0.core()
+    }
+
+    pub(crate) fn database(&self) -> &Database {
+        self.0.database()
+    }
+
+    pub(crate) fn setup(&self) -> &SetupService {
+        &self.0.services.setup
+    }
+
+    pub(crate) fn database_setup(&self) -> &DatabaseSetupService {
+        &self.0.services.database_setup
+    }
+
+    pub(crate) fn libraries(&self) -> &LibraryService {
+        &self.0.services.libraries
+    }
+
+    pub(crate) fn scan_jobs(&self) -> &ScanJobService {
+        &self.0.services.scan_jobs
+    }
+
+    /// `probe`/`metadata_reidentify`/`thumbnails` only feed `ScanWorkerServices` for the first
+    /// scan that `setup/complete` starts.
+    pub(crate) fn probe(&self) -> &MediaProbeService {
+        &self.0.services.probe
+    }
+
+    pub(crate) fn metadata_reidentify(&self) -> &MetadataReidentifyService {
+        &self.0.services.metadata_reidentify
+    }
+
+    pub(crate) fn thumbnails(&self) -> &ThumbnailService {
+        &self.0.services.thumbnails
+    }
+
+    /// The shared service table, for the `Arc::ptr_eq` invariant checks.
+    pub(crate) fn inner_services(&self) -> &Arc<ReadyServices> {
+        self.0.services()
+    }
+}
+
+/// How [`app_with_state`](crate::api::app_with_state) picks the router tree.
+///
+/// `NotReady` keeps the whole [`AppState`] rather than only its `CoreState`, so the not-ready
+/// compatibility tree can mount the very same `State<AppState>` core handlers. The enum is the
+/// dispatch point of the split; the ready tree is the only tree that mounts business routes.
+#[allow(dead_code)] // Wired into the router dispatch further down this batch.
+pub(crate) enum AppMode {
+    Ready(ReadyAppState),
+    NotReady(AppState),
+}
+
+/// Transitional bridge for the cross-file helpers that still take `&AppState`.
+///
+/// The 25 helpers that more than one file calls (`require_admin`, `require_web_principal`,
+/// `require_emby_user`, …) take `&impl StateView` so that a migrated file can pass a
+/// `&ReadyAppState` while the others keep passing a `&AppState`; the call sites do not change,
+/// because `impl Trait` in argument position is implicit generics. The trait goes away with the
+/// compatibility accessors in the closing batch, when every helper takes `&ReadyAppState`.
+#[allow(dead_code)]
+pub(crate) trait StateView: std::ops::Deref<Target = CoreState> {
+    /// The shared service table, or `None` for a not-ready state.
+    fn ready_services(&self) -> Option<&ReadyServices>;
+}
+
+impl StateView for AppState {
+    fn ready_services(&self) -> Option<&ReadyServices> {
+        self.ready.as_deref()
+    }
+}
+
+impl StateView for ReadyAppState {
+    fn ready_services(&self) -> Option<&ReadyServices> {
+        Some(&self.services)
+    }
+}
+
+/// The batch-0 conversions between the three states, and nothing more.
+///
+/// Only the directions the split needs exist: a ready state can be viewed as the compatibility
+/// façade or as the setup state, and both trees can extract the core state. There is deliberately
+/// no `FromRef<AppState> for ReadyAppState`/`Deref<Target = AppState> for ReadyAppState`: a
+/// not-ready `AppState` cannot become a ready one, and re-exposing the `Option` accessor table on
+/// the ready type would hide the migration progress.
+impl FromRef<ReadyAppState> for CoreState {
+    fn from_ref(state: &ReadyAppState) -> CoreState {
+        state.core.clone()
+    }
+}
+
+impl FromRef<SetupState> for CoreState {
+    fn from_ref(state: &SetupState) -> CoreState {
+        state.0.core.clone()
+    }
+}
+
+impl FromRef<ReadyAppState> for SetupState {
+    fn from_ref(state: &ReadyAppState) -> SetupState {
+        SetupState(state.clone())
+    }
+}
+
+/// Migration-period shim: the handlers that still take `State<AppState>` read the ready tree
+/// through it. It only clones `CoreState` and the `Arc`, so every service instance stays shared
+/// (`Arc::ptr_eq`), and it disappears with the last migrated handler.
+impl FromRef<ReadyAppState> for AppState {
+    fn from_ref(state: &ReadyAppState) -> AppState {
+        AppState {
+            core: state.core.clone(),
+            ready: Some(Arc::clone(&state.services)),
+        }
+    }
+}
+
 /// Read accessors for the business services.
 ///
 /// They are the transitional seam of the `ReadyServices` split: the `require_service!` macro and
@@ -313,6 +580,26 @@ macro_rules! optional_service_accessor {
 }
 
 impl AppState {
+    /// Picks the router tree: ready when both the database and the services are present.
+    ///
+    /// The conversion is consuming and only clones the `Arc<ReadyServices>`, so the ready tree, the
+    /// setup view derived from it and this façade keep observing one service table. A state without
+    /// the services (only `AppState::default()` in practice) keeps its whole self for the
+    /// not-ready compatibility tree.
+    #[allow(dead_code)] // Wired into the router dispatch further down this batch.
+    pub(crate) fn into_mode(self) -> AppMode {
+        let database = self.core.database.clone();
+        let services = self.ready.clone();
+        let (Some(database), Some(services)) = (database, services) else {
+            return AppMode::NotReady(self);
+        };
+        AppMode::Ready(ReadyAppState {
+            core: self.core,
+            database,
+            services,
+        })
+    }
+
     /// Borrows the ready services for the `require_ready!` guard.
     pub(crate) fn ready_services(&self) -> Option<&Arc<ReadyServices>> {
         self.ready.as_ref()
@@ -2556,6 +2843,37 @@ mod tests {
         ));
         assert_eq!(std::sync::Arc::strong_count(shared), 2);
         state.shutdown_background_workers().await;
+        Ok(())
+    }
+
+    /// The dispatch point: a state without services stays on the not-ready compatibility tree.
+    #[test]
+    fn default_state_dispatches_to_the_not_ready_mode() {
+        assert!(matches!(
+            AppState::default().into_mode(),
+            super::AppMode::NotReady(_)
+        ));
+    }
+
+    /// Every view of the split shares one `ReadyServices` instance (design appendix A, invariant 2).
+    #[tokio::test]
+    async fn ready_mode_and_its_views_share_one_ready_services_instance()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, state) = ready_test_state().await?;
+        let super::AppMode::Ready(ready) = state.into_mode() else {
+            return Err("a state built by AppState::ready must dispatch to the ready tree".into());
+        };
+        let setup = super::SetupState::from(ready.clone());
+        let compat: AppState = super::FromRef::from_ref(&ready);
+        let compat_services = compat.ready_services().ok_or("missing ready services")?;
+
+        assert!(std::sync::Arc::ptr_eq(
+            ready.services(),
+            setup.inner_services()
+        ));
+        assert!(std::sync::Arc::ptr_eq(ready.services(), compat_services));
+
+        compat.shutdown_background_workers().await;
         Ok(())
     }
 
