@@ -5455,6 +5455,9 @@ const MAX_ADAPTED_SQL_CACHE_TEXT_BYTES: usize = 8 * 1024 * 1024;
 /// Source statements longer than this are rewritten on every call instead of being memoized. The
 /// limit is compared against the source length, before any rewrite work happens.
 const MAX_ADAPTED_SQL_CACHE_SOURCE_BYTES: usize = 64 * 1024;
+/// Odd multiplicative constant used to spread statement addresses over the shards (the 64-bit
+/// golden-ratio word, truncated on 32-bit targets).
+const ADAPTED_SQL_CACHE_SHARD_MULTIPLIER: usize = 0x9E37_79B9_7F4A_7C15_u64 as usize;
 
 /// Identity of a `&'static str` statement. Static storage never moves and is never recycled, so
 /// the address plus the length identify the text for the whole process; two distinct static
@@ -5545,10 +5548,15 @@ impl AdaptedSqlCache {
         }
     }
 
-    /// Statements live in read-only data, so their addresses are stable and distinct; the address
-    /// bits above the alignment boundary spread them across the shards.
+    /// Statements live in read-only data, so their addresses are stable and distinct.
+    ///
+    /// The address is multiplied and folded before masking: real statement addresses are often a
+    /// regular stride apart (consecutive string literals, or the heap blocks of a benchmark's leaked
+    /// statements), and masking the raw address would pile those onto a handful of shards until
+    /// their entry limits stopped the memo from caching them at all.
     fn shard_index(&self, key: StaticSqlKey) -> usize {
-        (key.address >> 3) & self.shard_mask
+        let mixed = key.address.wrapping_mul(ADAPTED_SQL_CACHE_SHARD_MULTIPLIER);
+        (mixed ^ (mixed >> 29)) & self.shard_mask
     }
 
     /// Returns the memoized rewrite of `key`, taking only a read lock on its shard.

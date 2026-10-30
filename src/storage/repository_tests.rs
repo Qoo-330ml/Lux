@@ -34781,6 +34781,31 @@ mod adapted_sql_cache_tests {
     }
 
     #[test]
+    fn default_memo_holds_a_real_sized_working_set() {
+        // The production tree passes ~1,124 distinct static statements to `Database::query*`. The
+        // default memo must hold a set that size: shards have to spread statements evenly, not
+        // funnel a regular stride of addresses onto one shard and stop caching the rest.
+        let cache = AdaptedSqlCache::default();
+        let statements = (0..1_000_usize)
+            .map(|index| {
+                let padding = "x".repeat(index % 97);
+                let sql = format!(
+                    "SELECT id FROM media_items_variant_{index:05}
+                     WHERE library_root_id = ? AND note <> '{padding}' -- {index}"
+                );
+                let leaked: &'static str = Box::leak(sql.into_boxed_str());
+                leaked
+            })
+            .collect::<Vec<_>>();
+        for sql in &statements {
+            let adapted = adapt_static_sql_for_backend_with_cache(&cache, *sql);
+            assert!(adapted.as_str().contains("$1"));
+        }
+        assert_eq!(cache.entry_count(), statements.len());
+        assert!(cache.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
+    }
+
+    #[test]
     fn full_shard_keeps_its_entries_and_leaves_new_statements_uncached() {
         // One shard, two entries: the third statement must not evict anything.
         let cache = AdaptedSqlCache::with_shard_limits(1, 2, 1 << 20, 1 << 20);
