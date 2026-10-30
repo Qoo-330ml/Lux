@@ -538,7 +538,9 @@ async fn startup_skips_first_scans_whose_replacement_failed()
 
     assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
-        scan_job_ids(&fixture.database, fixture.library_id).await.len(),
+        scan_job_ids(&fixture.database, fixture.library_id)
+            .await
+            .len(),
         2,
         "the failed replacement must not be retried"
     );

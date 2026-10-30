@@ -532,8 +532,8 @@ async fn setup_complete_answers_before_it_requests_the_restart()
 }
 
 #[tokio::test]
-async fn setup_complete_eventually_requests_the_restart()
--> Result<(), Box<dyn std::error::Error>> {
+async fn setup_complete_eventually_requests_the_restart() -> Result<(), Box<dyn std::error::Error>>
+{
     let temp_dir = tempfile::tempdir()?;
     let config = test_config(&temp_dir)?;
     // The delay only moves the request off the response path; a zero delay still has to happen and

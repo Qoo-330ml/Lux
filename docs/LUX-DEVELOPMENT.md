@@ -19060,23 +19060,38 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 - C1b 幂等与部分成功：无重启句柄 → 仍返回 201 且 `restarting: false`；重复/并发 setup → 409
   `SETUP_ALREADY_COMPLETED` 且不再排期；管理员已建但首个媒体库步骤失败（5xx/4xx）仍排期重启，避免
   进程停在一个“setup 已关闭”的半状态。
-- C2 首次扫描恢复：采用方案 (b)，无 schema 变更。判据是 `scan_jobs` 里 `job_type='RECONCILE_LIBRARY'`
-  + `status='CANCELLED'` + `error='SERVER_SHUTDOWN'` 且库仍启用、`last_scan_at IS NULL`、有 root、无活动
-  扫描；`storage::list_shutdown_interrupted_first_scan_library_ids`（SQL 留在 storage）与
+- C2 首次扫描恢复：采用方案 (b)，无 schema 变更。判据是 `scan_jobs` 里该库**最近一次**
+  `RECONCILE_LIBRARY` 任务是 `status='CANCELLED'` + `error='SERVER_SHUTDOWN'` 且库仍启用、
+  `last_scan_at IS NULL`、有 root、无活动扫描（因此恢复出的新任务若 `FAILED`，下次启动不会再排）；
+  `storage::list_shutdown_interrupted_first_scan_library_ids`（SQL 留在 storage）与
   `application::admin_scan_jobs::resume_shutdown_interrupted_first_scans`（复用 setup 用的
-  `start_library_scan`，单次启动最多 32 个库）实现，`AppState::resume_shutdown_interrupted_first_scans`
-  由 `main` 在 `resume_interrupted_metadata_scraping` 之后以后台任务调用。
+  `start_library_scan`，按 32 个库一页翻页读取，单次启动最多排队 512 个库，达上限时日志报告剩余数量）
+  实现，`AppState::resume_shutdown_interrupted_first_scans` 由 `main` 在
+  `resume_interrupted_metadata_scraping` 之后以后台任务调用。
 - C4 文档：本条目、`docs/API.md` 的 `restarting` 与首次扫描恢复说明、设计文档状态改为“后端已实施”。
+- 冒烟脚本适配（评审意见 P2）：`POST /setup/complete` 之后实例会自己重启，且全新配置目录处于数据库
+  选择模式（直接 setup 会得到 `409 DATABASE_CONFIGURATION_REQUIRED`）。新增共享库
+  `scripts/lib/wait-for-restart.sh`（选定 SQLite、观察一次连接失败再等 `/health/ready`、按需重新查询
+  当前扫描任务），`disk-write-fault-smoke.sh`、`mount-loss-smoke.sh`、`proxy-smoke.sh`、
+  `probe-smoke.sh` 都在 setup 之后等重启（要自己发起扫描的两个脚本还等重排的首扫结束，否则端点返回
+  `409`），`restart-recovery-smoke.sh` 改为验证“重排后的首扫被 `kill -9` → 重启标为
+  `CANCELLED`/`SERVER_SHUTDOWN` → 恢复排入替换任务 → 替换任务完成并写入 `lastScanAt`”；
+  `scripts/check-all.sh` 同时检查 `scripts/lib/*.sh` 的语法，`docs/DEPLOYMENT.md` 记录这些前提。
 
 验收（2026-11-04，本机 `uname -m` = `arm64`）：
 
-- [x] `cargo test --locked --test api_web web_auth::` 9/9：新增“201 之前 `watch` 仍是 `Running`、之后变
-      `Restart`”（注入 200 ms）、“无句柄保持 201 与完整 body（键集合逐字固定，`restarting: false`）”、
-      “重复 setup 409 且不再触发 `watch`”、“管理员已建后首库失败仍重启”、“`rootPath` 不可用被更早拒绝
-      且不重启、随后修正请求正常完成”。
-- [x] `cargo test --locked --test scanner shutdown_jobs::` 7/7：恢复用例（取消记录 → 新任务 → 扫描
-      完成写入 `last_scan_at` → 再次启动不再排队）与 5 个反向用例（已扫描 / 真实失败 / 库停用 / 无 root /
-      已有活动扫描）。
+- [x] `cargo test --locked --test api_web web_auth::` 10/10：新增“注入 60 s 延迟时拿到 201 后 `watch` 仍是
+      `Running`”（顺序断言不依赖墙钟）、“注入 0 延迟仍观察到 `Restart`”、“无句柄保持 201 与完整 body
+      （键集合逐字固定，`restarting: false`）”、“重复 setup 409 且不再触发 `watch`”、“管理员已建后首库
+      失败仍重启”、“`rootPath` 不可用被更早拒绝且不重启、随后修正请求正常完成”。
+- [x] `cargo test --locked --test scanner shutdown_jobs::` 9/9：恢复用例（取消记录 → 新任务 → 扫描
+      完成写入 `last_scan_at` → 再次启动不再排队）、33 个库（多于一页）全部重排，以及反向用例
+      （已扫描 / 真实失败 / 库停用 / 无 root / 已有活动扫描 / 最近一次扫描 `FAILED`）。
+- [x] `bash scripts/restart-recovery-smoke.sh` 实跑通过（arm64 裸进程，5000 个文件）：输出
+      `interruptedStatus: CANCELLED`、`replacementStatus: COMPLETED`、`lastScanAtRecorded: true`。另外用
+      真实实例验证了 `lux_select_sqlite_database` 与 `lux_wait_for_first_scan_settled`（等待后
+      `POST /admin/libraries/{id}/scan` 返回 `202` 而不是 `409`）。Docker 类脚本本机无 Docker，只做
+      `bash -n` 语法检查。
 - [x] `cargo test --locked --lib storage::`、`cargo test --locked --lib api::` 通过；`cargo build --locked`、
       `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
       `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（本步无迁移、无新增
