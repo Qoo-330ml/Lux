@@ -179,9 +179,7 @@ pub(crate) async fn admin_refresh_library_local_metadata(
         )
         .into_response();
     };
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = require_service!(state.scan_jobs);
     let accepted = match scan_jobs
         .start_local_metadata_refresh(library_id, request.root_id.as_deref(), &request.paths)
         .await
@@ -432,9 +430,7 @@ pub(crate) async fn admin_list_metadata_reidentify(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database
         .list_metadata_reidentify_jobs(status.as_deref(), offset, limit)
         .await
@@ -625,9 +621,7 @@ pub(crate) async fn admin_merge_items(
         )
         .into_response();
     }
-    let Some(service) = state.item_merge.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.item_merge);
     let result = match crate::application::admin_media_mutations::merge_media_items(
         service,
         state.home.as_ref(),
@@ -935,9 +929,7 @@ pub(crate) async fn admin_delete_item_image(
         )
         .into_response();
     }
-    let Some(images) = state.image_writes.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let images = require_service!(state.image_writes);
     match images.delete_item_image(&item_id, &image_id).await {
         Ok(()) => {
             record_audit_event(

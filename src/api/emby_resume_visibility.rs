@@ -51,9 +51,7 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
         (Some(hidden), _) | (_, Some(hidden)) => hidden,
         (None, None) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let item_id = emby_internal_id(&item_id);
     match catalog.set_resume_hidden(principal, &item_id, hidden).await {
         Ok(user_state) => {

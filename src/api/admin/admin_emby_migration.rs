@@ -80,9 +80,7 @@ pub(crate) async fn admin_list_emby_migration_source_users(
             .into_response();
         }
     };
-    let Some(service) = state.emby_migration.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.emby_migration);
     match service
         .list_source_users_filtered(offset, limit, query.search.as_deref())
         .await
@@ -155,9 +153,7 @@ pub(crate) async fn admin_list_emby_migrations(
             .into_response();
         }
     };
-    let Some(service) = state.emby_migration.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.emby_migration);
     let page = match service.list_job_page(offset, limit).await {
         Ok(page) => page,
         Err(error) => return emby_migration_error(&headers, error),
@@ -179,9 +175,7 @@ pub(crate) async fn admin_get_emby_migration(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.emby_migration.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.emby_migration);
     match service.get_job(&job_id).await {
         Ok(job) => Json(json!({ "job": job })).into_response(),
         Err(error) => emby_migration_error(&headers, error),
@@ -196,9 +190,7 @@ pub(crate) async fn admin_cancel_emby_migration(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.emby_migration.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.emby_migration);
     match service.cancel_job(&job_id).await {
         Ok(true) => Json(json!({ "cancelRequested": true })).into_response(),
         Ok(false) => api_error(
@@ -370,9 +362,7 @@ pub(crate) async fn admin_list_emby_migration_report(
             .into_response();
         }
     };
-    let Some(service) = state.emby_migration.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.emby_migration);
     let result = match kind {
         EmbyMigrationReportKind::Users => service
             .list_user_links(&job_id, offset, limit)

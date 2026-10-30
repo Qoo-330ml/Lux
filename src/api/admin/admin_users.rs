@@ -7,9 +7,7 @@ async fn admin_content_restriction_index_status(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.media_content_restriction_index_status().await {
         Ok((total_items, indexed_items)) => Json(json!({
             "totalItems": total_items,
@@ -137,9 +135,7 @@ async fn admin_list_user_permission_presets(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::user_presets::list_user_permission_presets(database).await {
         Ok(presets) => Json(json!({ "presets": presets })).into_response(),
         Err(error) => user_permission_preset_error(&headers, error),
@@ -154,9 +150,7 @@ async fn admin_create_user_permission_preset(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::user_presets::create_user_permission_preset(database, request).await {
         Ok(preset) => {
             record_audit_event(
@@ -186,9 +180,7 @@ async fn admin_update_user_permission_preset(
     if request.version == 0 {
         return invalid_user_permission_preset_request(&headers);
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::user_presets::update_user_permission_preset(
         database,
         &preset_id,
@@ -225,9 +217,7 @@ async fn admin_delete_user_permission_preset(
     let Some(version) = query.version.filter(|version| *version > 0) else {
         return invalid_user_permission_preset_request(&headers);
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::user_presets::delete_user_permission_preset(
         database, &preset_id, version,
     )
@@ -262,9 +252,7 @@ async fn admin_apply_user_permission_preset(
         return invalid_user_permission_preset_request(&headers);
     };
     let user_id = user_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::user_presets::apply_user_permission_preset(
         database,
         &user_id,
@@ -303,9 +291,7 @@ async fn admin_batch_apply_user_permission_preset(
     {
         return invalid_user_permission_preset_request(&headers);
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::user_presets::apply_user_permission_preset_batch(
         database,
         &request.user_ids,
@@ -357,9 +343,7 @@ async fn admin_batch_update_user_status(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -406,9 +390,7 @@ async fn admin_preview_account_preferences_copy(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let Some(source_user_id) = canonical_user_id(&request.source_user_id) else {
         return invalid_account_preferences_copy_request(&headers);
     };
@@ -442,9 +424,7 @@ async fn admin_copy_account_preferences(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let Some(source_user_id) = canonical_user_id(&request.source_user_id) else {
         return invalid_account_preferences_copy_request(&headers);
     };
@@ -513,9 +493,7 @@ async fn admin_preview_user_permission_copy(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::user_permission_copy::preview_user_permission_copy(database, request)
         .await
     {
@@ -539,9 +517,7 @@ async fn admin_apply_user_permission_copy(
         Ok(request) => request,
         Err(response) => return *response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let groups = request.groups;
     match crate::application::user_permission_copy::apply_user_permission_copy(database, request)
         .await
@@ -723,9 +699,7 @@ async fn admin_list_user_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -739,9 +713,7 @@ async fn admin_list_user_sessions(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let Some(auth) = state.auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.auth);
     let page = query.page.unwrap_or(1).max(1);
     let page_size = i64::from(query.page_size.unwrap_or(50).clamp(1, 100));
     let offset = i64::from(page.saturating_sub(1)).saturating_mul(page_size);
@@ -792,9 +764,7 @@ async fn admin_list_user_devices(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -886,9 +856,7 @@ async fn list_user_access_blacklist_rules(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let page = query.page.unwrap_or(1).max(1);
     let page_size = query.page_size.unwrap_or(20).clamp(1, 100);
     let offset = i64::from(page.saturating_sub(1)).saturating_mul(i64::from(page_size));
@@ -969,9 +937,7 @@ async fn create_user_access_blacklist_rule(
                 .into_response();
             }
         };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let is_enabled = request.is_enabled.unwrap_or(true);
     if is_enabled
         && let Err(response) = ensure_user_access_rule_does_not_block_admin(
@@ -1054,9 +1020,7 @@ async fn set_user_access_blacklist_rule_enabled(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let scope = user_id.as_deref().map_or(
         crate::storage::UserAccessBlacklistRuleScope::Global,
         crate::storage::UserAccessBlacklistRuleScope::User,
@@ -1222,9 +1186,7 @@ async fn delete_user_access_blacklist_rule(
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let scope = user_id.as_deref().map_or(
         crate::storage::UserAccessBlacklistRuleScope::Global,
         crate::storage::UserAccessBlacklistRuleScope::User,
@@ -1340,9 +1302,7 @@ async fn admin_revoke_user_session(
     };
     let user_id_string = user_id.to_string();
     let session_id_string = session_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id_string).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1356,9 +1316,7 @@ async fn admin_revoke_user_session(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let Some(auth) = state.auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.auth);
     if let Some(current_token) = request_cookie(&headers, "lux_session") {
         match auth
             .is_current_session_for_admin(&user_id_string, &session_id_string, &current_token)
@@ -1421,9 +1379,7 @@ async fn admin_list_user_emby_login_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1437,9 +1393,7 @@ async fn admin_list_user_emby_login_sessions(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.emby_auth);
     let page = query.page.unwrap_or(1).max(1);
     let page_size = i64::from(query.page_size.unwrap_or(50).clamp(1, 100));
     let offset = i64::from(page.saturating_sub(1)).saturating_mul(page_size);
@@ -1487,9 +1441,7 @@ async fn admin_list_user_activity(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1601,9 +1553,7 @@ async fn admin_list_user_playback_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1631,9 +1581,7 @@ async fn admin_list_user_playback_sessions(
         Ok(result) => result,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let playback_data = match crate::application::admin_dashboard::dashboard_playback_data(
         database,
         Some(catalog),
@@ -1704,9 +1652,7 @@ async fn admin_stop_user_playback_session(
     };
     let user_id = user_id.to_string();
     let playback_id = playback_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1756,9 +1702,7 @@ async fn admin_stop_user_playback_session(
         )
         .into_response();
     };
-    let Some(web_playback) = state.web_playback.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let web_playback = require_service!(state.web_playback);
     if web_playback.stop(&web_session.id, &user_id).await.is_err() {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
@@ -1802,9 +1746,7 @@ async fn admin_revoke_user_emby_login_session(
     };
     let user_id = user_id.to_string();
     let session_id = session_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1818,9 +1760,7 @@ async fn admin_revoke_user_emby_login_session(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.emby_auth);
     match auth.revoke_admin_login_session(&user_id, &session_id).await {
         Ok(true) => {
             record_audit_event(
@@ -1863,9 +1803,7 @@ async fn admin_revoke_all_user_emby_login_sessions(
         .into_response();
     };
     let user_id = user_id.to_string();
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match database.find_user_by_id(&user_id).await {
         Ok(Some(_)) => {}
         Ok(None) => {
@@ -1879,9 +1817,7 @@ async fn admin_revoke_all_user_emby_login_sessions(
         }
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
-    let Some(auth) = state.emby_auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = require_service!(state.emby_auth);
     match auth.revoke_all_admin_login_sessions(&user_id).await {
         Ok(revoked_count) => {
             if revoked_count > 0 {
@@ -1992,9 +1928,7 @@ pub(crate) async fn admin_list_users(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2133,9 +2067,7 @@ pub(crate) async fn admin_get_user(
         )
         .into_response();
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2172,9 +2104,7 @@ pub(crate) async fn admin_get_user_account_preferences(
         )
         .into_response();
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2212,16 +2142,12 @@ pub(crate) async fn admin_get_user_account_preferences(
     };
     let principal =
         crate::application::access::AccessPrincipal::new(profile.user.id, profile.user.is_admin);
-    let Some(access) = state.access.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let access = require_service!(state.access);
     let mut accessible_library_ids = match access.accessible_library_ids(principal).await {
         Ok(ids) => ids,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = require_service!(state.catalog);
     let collections = match catalog.list_global_collection_cards(principal, 0, 1).await {
         Ok(collections) => collections,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2256,9 +2182,7 @@ pub(crate) async fn admin_update_user_profile(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2309,9 +2233,7 @@ pub(crate) async fn admin_get_user_playback_policy(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2340,9 +2262,7 @@ pub(crate) async fn admin_set_user_playback_policy(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2403,9 +2323,7 @@ async fn admin_get_user_content_restrictions(
         )
         .into_response();
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
 
     match crate::application::user_content_restrictions::get_user_content_restrictions(
         database, user_id,
@@ -2437,9 +2355,7 @@ async fn admin_update_user_content_restrictions(
         )
         .into_response();
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
 
     match crate::application::user_content_restrictions::update_user_content_restrictions(
         database, user_id, request,
@@ -2533,9 +2449,7 @@ pub(crate) async fn admin_list_user_library_access(
         )
         .into_response();
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let user_id = user_id.to_string();
     let mode = match database.user_library_access_mode(&user_id).await {
         Ok(Some(mode)) => mode,
@@ -2702,9 +2616,7 @@ pub(crate) async fn admin_create_user(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2787,9 +2699,7 @@ pub(crate) async fn admin_update_user(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2850,9 +2760,7 @@ pub(crate) async fn admin_delete_user(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2899,9 +2807,7 @@ pub(crate) async fn admin_restore_user(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -2943,9 +2849,7 @@ pub(crate) async fn admin_purge_user(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -3174,9 +3078,7 @@ pub(crate) async fn admin_get_user_avatar(
         )
         .into_response();
     };
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = require_service!(state.user_avatars);
     match avatars.load(user_id).await {
         Ok(Some(avatar)) => Response::builder()
             .status(StatusCode::OK)
@@ -3207,9 +3109,7 @@ pub(crate) async fn admin_update_user_avatar(
         )
         .into_response();
     };
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = require_service!(state.user_avatars);
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())

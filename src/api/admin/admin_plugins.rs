@@ -79,9 +79,7 @@ pub(crate) async fn admin_list_notification_providers(
             .into_response();
         }
     };
-    let Some(plugins) = state.plugins.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let plugins = require_service!(state.plugins);
     match plugins.list_notification_plugins(offset, limit).await {
         Ok(page) => Json(plugin_page_json(&page)).into_response(),
         Err(error) => plugin_error(&headers, error),
@@ -108,9 +106,7 @@ pub(crate) async fn admin_list_chapter_sources(
             .into_response();
         }
     };
-    let Some(plugins) = state.plugins.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let plugins = require_service!(state.plugins);
     match plugins.list_chapter_sources(offset, limit).await {
         Ok(page) => Json(json!({
             "sources": page.sources.iter().map(|source| json!({
@@ -138,9 +134,7 @@ pub(crate) async fn admin_plugin_store(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let plugins = require_service!(state.plugins);
     let urls = plugins.plugin_store_sources().await;
     let url = urls.first().cloned();
     Json(json!({
@@ -168,9 +162,7 @@ pub(crate) async fn admin_update_plugin_store(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(plugins) = state.plugins.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let plugins = require_service!(state.plugins);
     let sources = if request.urls.is_empty() {
         request.url.into_iter().collect()
     } else {
@@ -709,9 +701,7 @@ pub(crate) async fn admin_run_plugin(
         )
         .into_response();
     }
-    let Some(service) = state.strm_probe.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.strm_probe);
     let jobs = match crate::application::admin_job_workers::start_configured_strm_probe_jobs(
         service,
     )

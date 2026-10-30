@@ -57,9 +57,7 @@ async fn admin_get_registration_settings(
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     match crate::application::settings::read_registration_mode(database).await {
         Ok(settings) => registration_settings_response(settings),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -102,9 +100,7 @@ async fn admin_update_registration_settings(
     if request.version.is_some_and(|version| version < 0) {
         return invalid();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let Some(mode) = request.registration_mode else {
         return match crate::application::settings::read_registration_mode(database).await {
             Ok(settings) => registration_settings_response(settings),
@@ -306,9 +302,7 @@ pub(crate) async fn admin_probe_transcoding(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.web_playback.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.web_playback);
     let status = service.refresh_hardware_status().await;
     Json(json!({
         "transcodingStatus": {
@@ -325,9 +319,7 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let settings = match crate::application::settings::read_admin_settings(
         database,
         state.plugins.as_ref(),
@@ -491,9 +483,7 @@ pub(crate) async fn admin_get_api_key(
     if let Err(response) = require_admin_web_session(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.admin_api_key.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.admin_api_key);
     match service.current().await {
         Ok(api_key) => Json(json!({
             "configured": api_key.is_some(),
@@ -511,9 +501,7 @@ pub(crate) async fn admin_rotate_api_key(
     if let Err(response) = require_admin_web_session(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.admin_api_key.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.admin_api_key);
     match service.rotate().await {
         Ok(api_key) => {
             record_audit_event(
@@ -542,9 +530,7 @@ pub(crate) async fn admin_revoke_api_key(
     if let Err(response) = require_admin_web_session(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.admin_api_key.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = require_service!(state.admin_api_key);
     match service.revoke().await {
         Ok(()) => {
             record_audit_event(
@@ -570,9 +556,7 @@ pub(crate) async fn admin_update_settings(
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = require_service!(state.database);
     let network_proxy = match request.extra.get("networkProxyUrl") {
         None => crate::application::settings::NetworkProxyChange::Unchanged,
         Some(Value::Null) => crate::application::settings::NetworkProxyChange::Set(None),
