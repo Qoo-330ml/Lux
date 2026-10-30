@@ -568,14 +568,10 @@ pub(super) async fn emby_library_media_folders(
         }
         None => accessible_library_ids,
     };
-    let mut root_paths = HashMap::new();
-    for library_id in &library_ids {
-        let roots = match database.list_library_roots(library_id).await {
-            Ok(roots) => roots,
-            Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
-        };
-        root_paths.extend(roots.into_iter().map(|root| (root.id, root.display_path)));
-    }
+    let root_paths = match emby_library_root_paths(database, &library_ids).await {
+        Ok(root_paths) => root_paths,
+        Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
+    };
     let (folders, total) = match database
         .list_folder_scan_paths_page(&library_ids, offset, limit)
         .await
@@ -606,6 +602,27 @@ pub(super) async fn emby_library_media_folders(
         "StartIndex": offset,
     }))
     .into_response()
+}
+
+/// Loads `root_id -> display_path` for every library the caller may see, in one query.
+///
+/// `MediaFolders` resolves each scanned folder through the root that owns it, so the whole
+/// visible set of roots is needed at once. `list_library_roots_by_library_ids` returns them
+/// grouped per library; flattening that grouping reproduces the map the per-library loop built,
+/// because a root belongs to exactly one library and only its display path is kept. Libraries
+/// without roots contribute no row, and asking for no library at all skips the query.
+async fn emby_library_root_paths(
+    database: &Database,
+    library_ids: &[String],
+) -> Result<HashMap<String, String>, StorageError> {
+    let roots = database
+        .list_library_roots_by_library_ids(library_ids)
+        .await?;
+    Ok(roots
+        .into_values()
+        .flatten()
+        .map(|root| (root.id, root.display_path))
+        .collect())
 }
 
 #[derive(Deserialize, Default)]
@@ -5532,5 +5549,97 @@ mod tests {
         let filter = catalog_filter_from_emby(&query);
         assert_eq!(filter.is_played, Some(false));
         assert_eq!(filter.min_date_last_saved, Some(1_700_000_000));
+    }
+}
+
+/// Media folder root lookups, checked with the test-only statement counter.
+#[cfg(test)]
+mod media_folder_root_tests {
+    use std::collections::HashMap;
+
+    use super::emby_library_root_paths;
+    use crate::storage::{Database, NewLibraryRoot, test_database};
+
+    async fn insert_library(database: &Database, id: &str) {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(id)
+            .bind(id)
+            .execute(database.pool())
+            .await
+            .expect("library row");
+    }
+
+    async fn insert_root(
+        database: &Database,
+        root_id: &str,
+        library_id: &str,
+        canonical_path: &str,
+        display_path: &str,
+    ) {
+        database
+            .insert_library_root(NewLibraryRoot {
+                id: root_id,
+                library_id,
+                canonical_path,
+                display_path,
+                is_available: true,
+                is_writable: true,
+            })
+            .await
+            .expect("library root row");
+    }
+
+    #[tokio::test]
+    async fn media_folder_roots_keep_per_library_results_in_one_query()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        for library_id in ["library-a", "library-b", "library-c"] {
+            insert_library(&database, library_id).await;
+        }
+        insert_root(&database, "root-a1", "library-a", "/mnt/a1", "/srv/a1").await;
+        insert_root(&database, "root-a2", "library-a", "/mnt/a2", "/srv/a2").await;
+        insert_root(&database, "root-b1", "library-b", "/mnt/b1", "/srv/b1").await;
+        let library_ids = [
+            "library-a",
+            "library-b",
+            "library-c",
+            "library-missing-from-the-table",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+
+        // What the request path used to do: one query per library, merged into one map.
+        database.reset_query_count();
+        let mut per_library = HashMap::new();
+        for library_id in &library_ids {
+            for root in database.list_library_roots(library_id).await? {
+                per_library.insert(root.id, root.display_path);
+            }
+        }
+        assert_eq!(database.query_count(), library_ids.len());
+
+        database.reset_query_count();
+        let batched = emby_library_root_paths(&database, &library_ids).await?;
+        assert_eq!(database.query_count(), 1);
+
+        assert_eq!(per_library.len(), 3);
+        assert_eq!(batched, per_library);
+        assert_eq!(batched.get("root-a1").map(String::as_str), Some("/srv/a1"));
+        assert_eq!(batched.get("root-a2").map(String::as_str), Some("/srv/a2"));
+        assert_eq!(batched.get("root-b1").map(String::as_str), Some("/srv/b1"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_folder_roots_skip_the_query_when_no_library_is_in_scope()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+
+        database.reset_query_count();
+        let batched = emby_library_root_paths(&database, &[]).await?;
+
+        assert!(batched.is_empty());
+        assert_eq!(database.query_count(), 0);
+        Ok(())
     }
 }
