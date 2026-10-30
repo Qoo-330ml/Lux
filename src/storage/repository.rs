@@ -6500,6 +6500,7 @@ mod stored_row_decoding_tests {
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, database) = test_database().await?;
         database
+            .notifications()
             .create_notification_destination(NewNotificationDestination {
                 id: "destination-a",
                 name: "Webhook",
@@ -6514,6 +6515,7 @@ mod stored_row_decoding_tests {
             .await?;
 
         let destination = database
+            .notifications()
             .find_notification_destination("destination-a")
             .await?
             .expect("destination should exist");
@@ -6539,7 +6541,10 @@ mod stored_row_decoding_tests {
         .execute(database.pool())
         .await?;
 
-        let deliveries = database.list_ready_notification_deliveries(10).await?;
+        let deliveries = database
+            .notifications()
+            .list_ready_notification_deliveries(10)
+            .await?;
         assert_eq!(deliveries.len(), 1);
         let delivery = &deliveries[0];
         assert_eq!(delivery.id, "delivery-a");
