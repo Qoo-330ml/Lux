@@ -1009,10 +1009,7 @@ impl AppState {
             thumbnails: self.thumbnails().cloned(),
         };
         crate::application::admin_scan_jobs::resume_shutdown_interrupted_first_scans(
-            database,
-            &scan_jobs,
-            workers,
-            crate::application::admin_scan_jobs::FIRST_SCAN_RESUME_LIMIT,
+            database, &scan_jobs, workers,
         )
         .await
         .map_err(|error| error.to_string())

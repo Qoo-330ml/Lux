@@ -280,17 +280,24 @@ async fn interrupted_first_scan(
 
 /// Runs the startup recovery through the same state `main` builds.
 async fn resume_interrupted_first_scans(
-    fixture: &InterruptedFirstScan,
+    config: &Config,
+    database: &Database,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    let database = fixture.database.clone();
+    let database = database.clone();
     let state = AppState::ready(
-        fixture.config.clone(),
+        config.clone(),
         database.clone(),
         SetupService::new(database.clone())?,
         WebAuthService::new(database.clone())?,
         EmbyAuthService::new(database)?,
     );
     Ok(state.resume_shutdown_interrupted_first_scans().await?)
+}
+
+async fn resume_fixture_first_scans(
+    fixture: &InterruptedFirstScan,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    resume_interrupted_first_scans(&fixture.config, &fixture.database).await
 }
 
 async fn scan_job_ids(database: &Database, library_id: LibraryId) -> Vec<String> {
@@ -343,7 +350,7 @@ async fn startup_resumes_first_scans_interrupted_by_shutdown()
         ("CANCELLED".to_owned(), Some("SERVER_SHUTDOWN".to_owned()))
     );
 
-    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 1);
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 1);
 
     let jobs = scan_job_ids(&fixture.database, fixture.library_id).await;
     assert_eq!(jobs.len(), 2, "exactly one replacement scan job: {jobs:?}");
@@ -368,7 +375,7 @@ async fn startup_resumes_first_scans_interrupted_by_shutdown()
             .await?;
     assert!(last_scan_at.is_some(), "the resumed scan must be recorded");
 
-    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
         scan_job_ids(&fixture.database, fixture.library_id)
             .await
@@ -387,7 +394,7 @@ async fn startup_skips_first_scans_of_libraries_that_were_scanned()
         .execute(fixture.database.pool())
         .await?;
 
-    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
         scan_job_ids(&fixture.database, fixture.library_id).await,
         vec![fixture.cancelled_job_id.clone()]
@@ -404,7 +411,7 @@ async fn startup_skips_scans_cancelled_for_a_real_failure() -> Result<(), Box<dy
         .execute(fixture.database.pool())
         .await?;
 
-    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
         scan_job_ids(&fixture.database, fixture.library_id).await,
         vec![fixture.cancelled_job_id.clone()]
@@ -421,7 +428,7 @@ async fn startup_skips_first_scans_of_disabled_libraries() -> Result<(), Box<dyn
         .execute(fixture.database.pool())
         .await?;
 
-    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
         scan_job_ids(&fixture.database, fixture.library_id).await,
         vec![fixture.cancelled_job_id.clone()]
@@ -435,7 +442,7 @@ async fn startup_skips_first_scans_of_libraries_without_a_root()
     // `start_library_scan` itself accepts a rootless library, so the recovery predicate has to
     // reject it: scanning nothing would only write `last_scan_at` for an unusable library.
     let fixture = interrupted_first_scan(false).await?;
-    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     assert_eq!(
         scan_job_ids(&fixture.database, fixture.library_id).await,
         vec![fixture.cancelled_job_id.clone()]
@@ -456,12 +463,60 @@ async fn startup_does_not_queue_a_second_scan_while_one_is_active()
     .execute(fixture.database.pool())
     .await?;
 
-    assert_eq!(resume_interrupted_first_scans(&fixture).await?, 0);
+    assert_eq!(resume_fixture_first_scans(&fixture).await?, 0);
     let jobs = scan_job_ids(&fixture.database, fixture.library_id).await;
     assert_eq!(jobs.len(), 2, "no third job: {jobs:?}");
     assert_eq!(
         scan_job_status(&fixture.database, "active-scan").await,
         "PENDING"
     );
+    Ok(())
+}
+
+#[tokio::test]
+async fn startup_resumes_more_interrupted_first_scans_than_a_single_batch()
+-> Result<(), Box<dyn std::error::Error>> {
+    // More libraries than one storage page holds: the recovery has to page instead of dropping the
+    // rest silently.
+    const LIBRARY_COUNT: usize = 33;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    SetupService::new(database.clone())?
+        .complete("Admin", "Admin", "correct password")
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let jobs = ScanJobService::new(database.clone());
+    let mut library_ids = Vec::with_capacity(LIBRARY_COUNT);
+    for index in 0..LIBRARY_COUNT {
+        let library = libraries
+            .create_library(&format!("Movies {index:02}"), LibraryKind::Movie, false)
+            .await?;
+        let root_path = temp_dir.path().join(format!("movies-{index:02}"));
+        tokio::fs::create_dir_all(&root_path).await?;
+        libraries
+            .add_root(library.id, root_path.to_str().ok_or("non-UTF-8 root path")?)
+            .await?;
+        jobs.create_movie_scan_job(library.id).await?;
+        library_ids.push(library.id);
+    }
+    database.cancel_incomplete_jobs_for_shutdown().await?;
+
+    assert_eq!(
+        resume_interrupted_first_scans(&config, &database).await?,
+        LIBRARY_COUNT
+    );
+
+    for library_id in library_ids {
+        let jobs = scan_job_ids(&database, library_id).await;
+        assert_eq!(
+            jobs.len(),
+            2,
+            "library {library_id} should have the cancelled job plus one replacement: {jobs:?}"
+        );
+    }
     Ok(())
 }
