@@ -753,24 +753,48 @@ impl AppState {
         self
     }
 
+    /// Replaces the STRM playback resolver; only valid for a ready state.
+    ///
+    /// A state built through `Default` carries no services, so the override would be lost; debug
+    /// builds fail loudly instead of silently ignoring it, release builds keep the handle unchanged.
     #[doc(hidden)]
     pub fn with_strm_playback_resolver(mut self, resolver: StrmPlaybackResolver) -> Self {
+        debug_assert!(
+            self.ready.is_some(),
+            "with_strm_playback_resolver called on a state that is not ready"
+        );
         if let Some(ready) = self.ready_services_mut() {
             ready.strm_playback = Some(resolver);
         }
         self
     }
 
+    /// Replaces the embedded-subtitle executable; only valid for a ready state.
+    ///
+    /// A state built through `Default` carries no services, so the override would be lost; debug
+    /// builds fail loudly instead of silently ignoring it, release builds keep the handle unchanged.
     #[doc(hidden)]
     pub fn with_embedded_subtitle_executable(mut self, executable: PathBuf) -> Self {
+        debug_assert!(
+            self.ready.is_some(),
+            "with_embedded_subtitle_executable called on a state that is not ready"
+        );
         if let Some(ready) = self.ready_services_mut() {
             ready.embedded_subtitle = EmbeddedSubtitleService::with_executable(executable);
         }
         self
     }
 
+    /// Replaces the HLS executable; only valid for a ready state.
+    ///
+    /// A state built through `Default` carries no services, so the override would be lost; debug
+    /// builds fail loudly instead of silently ignoring it, release builds keep the handle unchanged.
     #[doc(hidden)]
     pub fn with_hls_executable(mut self, executable: PathBuf) -> Self {
+        debug_assert!(
+            self.ready.is_some(),
+            "with_hls_executable called on a state that is not ready"
+        );
         if let Some(ready) = self.ready_services_mut() {
             // The service shares its HLS manager and start locks through `Arc`, so rebuilding it
             // from a clone keeps every other holder on the same instance.
@@ -2002,6 +2026,7 @@ async fn lux_get_person_image_inner(
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
     use std::time::Duration;
 
     use super::{
@@ -2447,6 +2472,16 @@ mod tests {
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
         state.shutdown_background_workers().await;
         Ok(())
+    }
+
+    /// The startup builders must not silently ignore a call on a not-ready state.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(
+        expected = "with_embedded_subtitle_executable called on a state that is not ready"
+    )]
+    fn startup_builders_reject_a_state_that_is_not_ready() {
+        let _ = AppState::default().with_embedded_subtitle_executable(PathBuf::from("/bin/true"));
     }
 
     /// A clone of the state must share one `ReadyServices`, not copy the services.
