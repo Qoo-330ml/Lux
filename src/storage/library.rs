@@ -514,8 +514,6 @@ impl Database {
             .map_err(self.sqlx_err())?;
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
-        // A new library is immediately visible to every principal that may see it.
-        self.auth_cache().invalidate_libraries();
         Ok(())
     }
 
@@ -990,7 +988,9 @@ impl Database {
             == 1;
         transaction.commit().await.map_err(self.sqlx_err())?;
         if deleted {
-            self.auth_cache().invalidate_libraries();
+            // `has_user_library_access` also requires the library to exist, so every user that
+            // could see this library now gets a different answer.
+            self.access_changes.invalidate_all();
         }
         Ok(deleted)
     }
@@ -1000,6 +1000,9 @@ impl Database {
         library_id: &str,
         settings: LibrarySettingsUpdate<'_>,
     ) -> Result<bool, StorageError> {
+        // `has_user_library_access` requires an enabled library, so a toggle here can revoke or
+        // grant playback for every user that selected it.
+        let visibility_changed = settings.is_enabled.is_some();
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
 
         let active_library = self
@@ -1275,8 +1278,9 @@ impl Database {
         }
 
         transaction.commit().await.map_err(self.sqlx_err())?;
-        // The enabled flag and the name decide which libraries a principal can see.
-        self.auth_cache().invalidate_libraries();
+        if visibility_changed {
+            self.access_changes.invalidate_all();
+        }
         Ok(true)
     }
 

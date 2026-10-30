@@ -646,7 +646,9 @@ impl Database {
         .map_err(self.sqlx_err())?;
 
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(user_id);
+        // The preset replaces `library_access_mode` and every `user_library_access` row above.
+        self.access_changes.invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         Ok(true)
     }
 
@@ -1302,7 +1304,7 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         // The cached principal carries the display name, so a profile edit is visible next request.
-        self.auth_cache().invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         self.find_user_by_id(user_id).await
     }
 
@@ -1472,7 +1474,7 @@ impl Database {
         transaction.commit().await.map_err(self.sqlx_err())?;
         // Disabling, demoting or re-flagging a user must invalidate the cached principal and
         // access context before the next request is served.
-        self.auth_cache().invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         Ok(self
             .find_user_by_id(user_id)
             .await?
@@ -1515,7 +1517,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(user_id);
+        self.access_changes.invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         Ok(true)
     }
 
@@ -1637,7 +1640,8 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(user_id);
+        self.access_changes.invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         Ok(Some(hls_session_ids))
     }
 
@@ -1656,7 +1660,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         if result.rows_affected() == 1 {
-            self.auth_cache().invalidate_user(user_id);
+            self.auth_cache().invalidate_users();
             return Ok(true);
         }
         Ok(false)
@@ -1670,7 +1674,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         if result.rows_affected() == 1 {
-            self.auth_cache().invalidate_user(user_id);
+            self.auth_cache().invalidate_users();
             return Ok(true);
         }
         Ok(false)
@@ -1699,8 +1703,8 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        for user_id in &rows {
-            self.auth_cache().invalidate_user(user_id);
+        if !rows.is_empty() {
+            self.auth_cache().invalidate_users();
         }
         Ok(rows)
     }
@@ -1779,7 +1783,8 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(target_user_id);
+        self.access_changes.invalidate_user(target_user_id);
+        self.auth_cache().invalidate_users();
         Ok(())
     }
 
@@ -2589,7 +2594,7 @@ impl Database {
             // Admin-side revocation must be visible to the next request, not only after the
             // principal cache TTL expired.
             self.auth_cache().invalidate_credentials();
-            self.auth_cache().invalidate_user(user_id);
+            self.auth_cache().invalidate_users();
         }
         Ok(revoked)
     }
@@ -2619,7 +2624,7 @@ impl Database {
             .rows_affected();
         if revoked > 0 {
             self.auth_cache().invalidate_credentials();
-            self.auth_cache().invalidate_user(user_id);
+            self.auth_cache().invalidate_users();
         }
         Ok(revoked)
     }
@@ -2656,7 +2661,8 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(user_id);
+        self.access_changes.invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         Ok(())
     }
 
@@ -2708,7 +2714,8 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(user_id);
+        self.access_changes.invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         Ok(())
     }
 
@@ -2763,7 +2770,8 @@ impl Database {
             }
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(user_id);
+        self.access_changes.invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         Ok(true)
     }
 
@@ -3716,7 +3724,9 @@ impl Database {
         }
 
         transaction.commit().await.map_err(self.sqlx_err())?;
-        self.auth_cache().invalidate_user(target_user_id);
+        // Both the library access group and the content group change what the target user may see.
+        self.access_changes.invalidate_user(target_user_id);
+        self.auth_cache().invalidate_users();
         Ok(UserPermissionCopyResult::Updated)
     }
 
@@ -3944,8 +3954,10 @@ impl Database {
             }
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
-        // Parental-control policy is part of the cached access context.
-        self.auth_cache().invalidate_user(user_id);
+        // The new policy changes which items this user may see, so a cached "allowed" answer for
+        // the same item is no longer trustworthy.
+        self.access_changes.invalidate_user(user_id);
+        self.auth_cache().invalidate_users();
         let Some(updated) = self.user_content_restrictions(user_id).await? else {
             return Ok(UserContentRestrictionsCasResult::UserUnavailable);
         };

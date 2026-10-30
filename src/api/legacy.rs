@@ -2088,7 +2088,9 @@ async fn lux_set_person_favorite(
         .await
     {
         Ok(()) => {
-            state.user_events.publish(UserEventScope::Favorites);
+            state
+                .user_events
+                .publish_for_user(UserEventScope::Favorites, &user.id.to_string());
             StatusCode::NO_CONTENT.into_response()
         }
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),

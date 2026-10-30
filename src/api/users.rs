@@ -2158,7 +2158,10 @@ pub(super) async fn auth_update_account_preferences(
                 let home = state.home();
                 home.invalidate();
             }
-            state.user_events.publish_home_coalesced().await;
+            state
+                .user_events
+                .publish_home_coalesced_for(&user.id.to_string())
+                .await;
             Json(preferences).into_response()
         }
         Err(error) => account_preferences_error(&headers, error),
@@ -2269,7 +2272,10 @@ pub(super) async fn auth_update_settings(
             let home = state.home();
             home.invalidate();
         }
-        state.user_events.publish_home_coalesced().await;
+        state
+            .user_events
+            .publish_home_coalesced_for(&user.id.to_string())
+            .await;
     }
     let libraries = state.libraries();
     let (use_admin_library_order, library_order_forced) = match libraries
@@ -2521,7 +2527,10 @@ pub(super) async fn auth_update_library_order(
                 let home = state.home();
                 home.invalidate();
             }
-            state.user_events.publish_home_coalesced().await;
+            state
+                .user_events
+                .publish_home_coalesced_for(&user.id.to_string())
+                .await;
             user_library_order_response(library_order, preferences_version)
         }
         Err(error) => account_preferences_error(&headers, error),

@@ -14,7 +14,7 @@ use crate::{
         users::{UserRecord, UserStore, UserStoreError},
     },
     domain::ids::UserId,
-    storage::{Database, StorageError, UserAccessBlacklistIpRuleQuery},
+    storage::{AuthCacheEpochSnapshot, Database, StorageError, UserAccessBlacklistIpRuleQuery},
 };
 
 use super::cache::ExpiringCache;
@@ -66,6 +66,8 @@ pub(crate) enum PrincipalResolution {
 /// the cache means no rule change can ever be served stale.
 struct CachedWebPrincipal {
     session: AuthenticatedSession,
+    /// Captured before the session row was read; a hit is only served while it is still current.
+    snapshot: AuthCacheEpochSnapshot,
 }
 
 #[derive(Clone)]
@@ -311,12 +313,15 @@ impl WebAuthService {
         token_hash: &[u8],
     ) -> Result<Option<Arc<CachedWebPrincipal>>, WebAuthError> {
         let epochs = self.database.auth_cache();
-        if let Some(entry) = self.principal_cache.lookup(token_hash, Instant::now())
-            && epochs.principal_is_current(entry.snapshot(), entry.user_id())
-        {
-            return Ok(Some(entry.value()));
+        if let Some(entry) = self.principal_cache.lookup(token_hash, Instant::now()) {
+            let principal = entry.value();
+            if epochs.principal_is_current(principal.snapshot) {
+                return Ok(Some(principal));
+            }
         }
-        let fence = epochs.write_fence();
+        // Capture the epochs before reading: if anything invalidates them while the queries below
+        // run, the snapshot is stale and the value is not cached.
+        let snapshot = epochs.principal_snapshot();
         let Some(stored) = self.database.find_web_session(token_hash).await? else {
             return Ok(None);
         };
@@ -324,22 +329,17 @@ impl WebAuthService {
             return Ok(None);
         }
         let session = authenticated_session_from_stored(stored)?;
-        let user_id = session.user.id.to_string();
-        let principal = Arc::new(CachedWebPrincipal { session });
-        // Store only when no invalidation raced the read.
-        if epochs.fence_is_current(fence) {
-            let snapshot = epochs.snapshot(&user_id);
+        if epochs.principal_is_current(snapshot) {
             self.principal_cache.store(
                 token_hash.to_vec(),
-                user_id,
-                snapshot,
                 CachedWebPrincipal {
-                    session: principal.session.clone(),
+                    session: session.clone(),
+                    snapshot,
                 },
                 Instant::now(),
             );
         }
-        Ok(Some(principal))
+        Ok(Some(Arc::new(CachedWebPrincipal { session, snapshot })))
     }
 
     /// Reads the enabled access rules that apply to a user (including global rules).

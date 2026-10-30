@@ -969,7 +969,15 @@ pub(super) async fn lux_list_library_items(
         }
     }
     match catalog
-        .list_library_items_in_scope(principal, &library_id, &filter, parent_scope, offset, limit)
+        .list_library_items_in_scope_with_projection(
+            principal,
+            &library_id,
+            &filter,
+            parent_scope,
+            offset,
+            limit,
+            projection,
+        )
         .await
     {
         Ok(page) => {
