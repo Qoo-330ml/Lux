@@ -237,6 +237,71 @@ struct MovieNfoWritebackRow {
     source: WritebackSourceRow,
 }
 
+/// Row of the three thumbnail-source pages: the preferred local file of an item plus the library
+/// strategy and scraper the thumbnail worker needs.
+#[derive(Debug, sqlx::FromRow)]
+struct ThumbnailSourceRow {
+    item_id: String,
+    item_type: String,
+    root_path: String,
+    relative_path: String,
+    library_media_strategy_json: Option<String>,
+    scraper_id: Option<String>,
+}
+
+impl From<ThumbnailSourceRow> for StoredThumbnailSource {
+    fn from(row: ThumbnailSourceRow) -> Self {
+        Self {
+            item_id: row.item_id,
+            item_type: row.item_type,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+            library_media_strategy_json: row.library_media_strategy_json,
+            scraper_id: row.scraper_id,
+        }
+    }
+}
+
+/// Row of the STRM source pages (`list_strm_media_sources_for_library_page`,
+/// `find_strm_media_source_for_library` and the incremental-scan twin): one STRM source with the
+/// probe and screenshot flags the API reports. The three flags stay 0/1 integers here and become
+/// `bool` in [`StoredStrmMediaSource`], exactly as the previous `row.get::<i64, _>() != 0` did.
+#[derive(Debug, sqlx::FromRow)]
+struct StrmMediaSourceRow {
+    source_id: String,
+    item_id: String,
+    poster_fallback_required: i64,
+    has_media_info: i64,
+    external_url: Option<String>,
+    root_path: String,
+    relative_path: String,
+    thumbnail_path: Option<String>,
+    has_strm_thumbnail: i64,
+}
+
+impl From<StrmMediaSourceRow> for StoredStrmMediaSource {
+    fn from(row: StrmMediaSourceRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            item_id: row.item_id,
+            poster_fallback_required: row.poster_fallback_required != 0,
+            has_media_info: row.has_media_info != 0,
+            external_url: row.external_url,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+            thumbnail_path: row.thumbnail_path,
+            has_strm_thumbnail: row.has_strm_thumbnail != 0,
+        }
+    }
+}
+
+/// Row of `list_strm_media_source_counts_for_libraries`: one library and its STRM source count.
+#[derive(Debug, sqlx::FromRow)]
+struct StrmSourceCountRow {
+    id: String,
+    total_count: i64,
+}
+
 /// Row of `find_danmaku_source_for_item` and `find_registered_danmaku_source_for_item`: the media
 /// source a danmaku track would be written for, with the owning item and its series titles.
 #[derive(Debug, sqlx::FromRow)]
@@ -4312,7 +4377,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
-        self.query(
+        self.query_as::<ThumbnailSourceRow>(
             "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
@@ -4330,18 +4395,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredThumbnailSource {
-                    item_id: row.get("item_id"),
-                    item_type: row.get("item_type"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                    library_media_strategy_json: row.get("library_media_strategy_json"),
-                    scraper_id: row.get("scraper_id"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredThumbnailSource::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -4351,7 +4405,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
-        self.query(sqlx::AssertSqlSafe(
+        self.query_as::<ThumbnailSourceRow>(sqlx::AssertSqlSafe(
             "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
@@ -4372,18 +4426,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredThumbnailSource {
-                    item_id: row.get("item_id"),
-                    item_type: row.get("item_type"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                    library_media_strategy_json: row.get("library_media_strategy_json"),
-                    scraper_id: row.get("scraper_id"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredThumbnailSource::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -4393,7 +4436,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredThumbnailSource>, StorageError> {
-        self.query(
+        self.query_as::<ThumbnailSourceRow>(
             "SELECT t.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM scan_job_targets t
@@ -4422,18 +4465,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredThumbnailSource {
-                    item_id: row.get("item_id"),
-                    item_type: row.get("item_type"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                    library_media_strategy_json: row.get("library_media_strategy_json"),
-                    scraper_id: row.get("scraper_id"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredThumbnailSource::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -4444,7 +4476,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
         let rows = if let Some(after_source_id) = after_source_id {
-            self.query(
+            self.query_as::<StrmMediaSourceRow>(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -4487,7 +4519,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            self.query(
+            self.query_as::<StrmMediaSourceRow>(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -4529,22 +4561,8 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         };
-        rows.map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredStrmMediaSource {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
-                    has_media_info: row.get::<i64, _>("has_media_info") != 0,
-                    external_url: row.get("external_url"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                    thumbnail_path: row.get("thumbnail_path"),
-                    has_strm_thumbnail: row.get::<i64, _>("has_strm_thumbnail") != 0,
-                })
-                .collect()
-        })
-        .map_err(self.sqlx_err())
+        rows.map(|rows| rows.into_iter().map(StoredStrmMediaSource::from).collect())
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_strm_media_source_for_library(
@@ -4552,7 +4570,7 @@ impl Database {
         library_id: &str,
         source_id: &str,
     ) -> Result<Option<StoredStrmMediaSource>, StorageError> {
-        self.query(
+        self.query_as::<StrmMediaSourceRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                     mi.poster_fallback_required,
                     CASE WHEN EXISTS (
@@ -4593,19 +4611,7 @@ impl Database {
         .bind(source_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredStrmMediaSource {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
-                has_media_info: row.get::<i64, _>("has_media_info") != 0,
-                external_url: row.get("external_url"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-                thumbnail_path: row.get("thumbnail_path"),
-                has_strm_thumbnail: row.get::<i64, _>("has_strm_thumbnail") != 0,
-            })
-        })
+        .map(|row| row.map(StoredStrmMediaSource::from))
         .map_err(self.sqlx_err())
     }
 
@@ -4621,7 +4627,7 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", chunk.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            let mut query = self.query_as::<StrmSourceCountRow>(sqlx::AssertSqlSafe(format!(
                 "SELECT l.id, COUNT(fe.id) AS total_count
                  FROM libraries l
                  LEFT JOIN media_items mi
@@ -4637,7 +4643,7 @@ impl Database {
                 query = query.bind(library_id);
             }
             for row in query.fetch_all(&self.pool).await.map_err(self.sqlx_err())? {
-                counts.insert(row.get("id"), row.get("total_count"));
+                counts.insert(row.id, row.total_count);
             }
         }
         Ok(counts)
@@ -4650,7 +4656,7 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredStrmMediaSource>, StorageError> {
         let rows = if let Some(after_source_id) = after_source_id {
-            self.query(sqlx::AssertSqlSafe(
+            self.query_as::<StrmMediaSourceRow>(sqlx::AssertSqlSafe(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -4695,7 +4701,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         } else {
-            self.query(sqlx::AssertSqlSafe(
+            self.query_as::<StrmMediaSourceRow>(sqlx::AssertSqlSafe(
                 "SELECT ms.id AS source_id, ms.item_id, ms.external_url,
                         mi.poster_fallback_required,
                         CASE WHEN EXISTS (
@@ -4739,22 +4745,8 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         };
-        rows.map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredStrmMediaSource {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    poster_fallback_required: row.get::<i64, _>("poster_fallback_required") != 0,
-                    has_media_info: row.get::<i64, _>("has_media_info") != 0,
-                    external_url: row.get("external_url"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                    thumbnail_path: row.get("thumbnail_path"),
-                    has_strm_thumbnail: row.get::<i64, _>("has_strm_thumbnail") != 0,
-                })
-                .collect()
-        })
-        .map_err(self.sqlx_err())
+        rows.map(|rows| rows.into_iter().map(StoredStrmMediaSource::from).collect())
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_strm_media_sources_for_incremental_scan(
@@ -11556,6 +11548,102 @@ mod tests {
         assert_eq!(items[0].relative_path.as_deref(), Some("Show/E02.mkv"));
         assert_eq!(items[0].series_title.as_deref(), Some("Show"));
         assert_eq!(items[0].episode_number, Some(2));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn strm_and_thumbnail_rows_decode_their_pages() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::storage::test_database;
+
+        let (_temp, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind, scraper_id, media_strategy_json)
+             VALUES ('flag-lib', 'Flag', 'MOVIE', 'tmdb', '{\"poster\":true}')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, poster_fallback_required,
+                 identification_status, has_available_source
+             ) VALUES ('flag-movie', 'flag-lib', 'MOVIE', 'Flag Movie', 'flag movie', 1,
+                       'LOCAL_CONFIRMED', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('flag-root', 'flag-lib', '/media', '/media', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing
+             ) VALUES
+                 ('flag-strm-entry', 'flag-root', 'Movie.strm', 'FILE', 1, 1, 'g1', 0),
+                 ('flag-local-entry', 'flag-root', 'Movie.mkv', 'FILE', 1, 1, 'g1', 0)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, external_url, is_default,
+                 probe_status
+             ) VALUES
+                 ('flag-strm-source', 'flag-movie', 'STRM_URL', 'flag-strm-entry',
+                  'https://example.invalid/movie', 1, 'NOT_CONFIGURED'),
+                 ('flag-local-source', 'flag-movie', 'LOCAL_FILE', 'flag-local-entry',
+                  NULL, 0, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let strm = database
+            .list_strm_media_sources_for_library_page("flag-lib", None, 10)
+            .await?;
+        assert_eq!(strm.len(), 1);
+        assert_eq!(strm[0].source_id, "flag-strm-source");
+        assert_eq!(strm[0].item_id, "flag-movie");
+        assert!(strm[0].poster_fallback_required);
+        assert!(!strm[0].has_media_info);
+        assert!(!strm[0].has_strm_thumbnail);
+        assert_eq!(
+            strm[0].external_url.as_deref(),
+            Some("https://example.invalid/movie")
+        );
+        assert_eq!(strm[0].root_path, "/media");
+        assert_eq!(strm[0].relative_path, "Movie.strm");
+        assert_eq!(strm[0].thumbnail_path, None);
+
+        let one = database
+            .find_strm_media_source_for_library("flag-lib", "flag-strm-source")
+            .await?
+            .expect("STRM source");
+        assert_eq!(one.source_id, "flag-strm-source");
+        assert!(one.poster_fallback_required);
+
+        let thumbnails = database
+            .list_local_thumbnail_sources_for_library_page("flag-lib", 10, 0)
+            .await?;
+        assert_eq!(thumbnails.len(), 1);
+        assert_eq!(thumbnails[0].item_id, "flag-movie");
+        assert_eq!(thumbnails[0].item_type, "MOVIE");
+        assert_eq!(thumbnails[0].root_path, "/media");
+        assert_eq!(thumbnails[0].relative_path, "Movie.mkv");
+        assert_eq!(
+            thumbnails[0].library_media_strategy_json.as_deref(),
+            Some("{\"poster\":true}")
+        );
+        assert_eq!(thumbnails[0].scraper_id.as_deref(), Some("tmdb"));
+
+        let counts = database
+            .list_strm_media_source_counts_for_libraries(&["flag-lib".to_owned()])
+            .await?;
+        assert_eq!(counts.get("flag-lib"), Some(&1));
         Ok(())
     }
 
