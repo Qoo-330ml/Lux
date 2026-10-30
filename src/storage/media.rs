@@ -128,21 +128,88 @@ fn movie_parent_folder_id_from_cache(
     Ok(parent_folder_id)
 }
 
-fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
-    let scraper_id = row.get::<Option<String>, _>("scraper_id");
-    let series_scraper_id = row
-        .get::<Option<String>, _>("series_metadata_scraper_id")
-        .or_else(|| scraper_id.clone());
-    let series_provider = first_provider_id(
-        row.get("series_provider_ids_json"),
-        None,
-        series_scraper_id.as_deref(),
-    );
+/// Row of the two item-metadata batch readers (`list_media_item_metadata_by_ids` and
+/// `list_active_media_item_metadata_with_libraries`): both select the same projection, so one
+/// struct decodes it and [`stored_media_metadata`] turns it into [`StoredMediaMetadata`].
+#[derive(sqlx::FromRow)]
+struct MediaMetadataRow {
+    item_id: String,
+    library_id: String,
+    item_type: String,
+    title: String,
+    original_title: Option<String>,
+    overview: Option<String>,
+    production_year: Option<i64>,
+    premiere_date: Option<String>,
+    last_air_date: Option<String>,
+    status: Option<String>,
+    original_language: Option<String>,
+    rating: Option<f64>,
+    provider_ids_json: Option<String>,
+    metadata_scraper_id: Option<String>,
+    identification_status: String,
+    metadata_provenance_json: Option<String>,
+    locked_fields_json: Option<String>,
+    nfo_metadata_json: Option<String>,
+    metadata_fingerprint: Option<Vec<u8>>,
+    nfo_collection_reference_key: Option<String>,
+    series_id: Option<String>,
+    collection_movie_provider: Option<String>,
+    collection_movie_provider_id: Option<String>,
+    collection_provider: Option<String>,
+    collection_provider_id: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    series_title: Option<String>,
+    series_production_year: Option<i64>,
+    series_provider_ids_json: Option<String>,
+    series_metadata_scraper_id: Option<String>,
+    scraper_id: Option<String>,
+}
+
+fn stored_media_metadata(row: MediaMetadataRow) -> StoredMediaMetadata {
+    let MediaMetadataRow {
+        item_id: _,
+        library_id,
+        item_type,
+        title,
+        original_title,
+        overview,
+        production_year,
+        premiere_date,
+        last_air_date,
+        status,
+        original_language,
+        rating,
+        provider_ids_json,
+        metadata_scraper_id,
+        identification_status,
+        metadata_provenance_json,
+        locked_fields_json,
+        nfo_metadata_json,
+        metadata_fingerprint,
+        nfo_collection_reference_key,
+        series_id,
+        collection_movie_provider,
+        collection_movie_provider_id,
+        collection_provider,
+        collection_provider_id,
+        season_number,
+        episode_number,
+        series_title,
+        series_production_year,
+        series_provider_ids_json,
+        series_metadata_scraper_id,
+        scraper_id,
+    } = row;
+    let series_scraper_id = series_metadata_scraper_id.or_else(|| scraper_id.clone());
+    let series_provider =
+        first_provider_id(series_provider_ids_json, None, series_scraper_id.as_deref());
     let collection_reference_identity_key = match (
-        row.get::<Option<String>, _>("collection_movie_provider"),
-        row.get::<Option<String>, _>("collection_movie_provider_id"),
-        row.get::<Option<String>, _>("collection_provider"),
-        row.get::<Option<String>, _>("collection_provider_id"),
+        collection_movie_provider,
+        collection_movie_provider_id,
+        collection_provider,
+        collection_provider_id,
     ) {
         (Some(movie_provider), Some(movie_id), Some(collection_provider), Some(collection_id)) => {
             Some(global_movie_collection_reference_identity_key(
@@ -155,34 +222,34 @@ fn stored_media_metadata(row: sqlx::any::AnyRow) -> StoredMediaMetadata {
         _ => None,
     };
     StoredMediaMetadata {
-        library_id: row.get("library_id"),
-        item_type: row.get("item_type"),
-        title: row.get("title"),
-        original_title: row.get("original_title"),
-        overview: row.get("overview"),
-        production_year: row.get("production_year"),
-        premiere_date: row.get("premiere_date"),
-        last_air_date: row.get("last_air_date"),
-        status: row.get("status"),
-        original_language: row.get("original_language"),
-        rating: row.get("rating"),
-        provider_ids_json: row.get("provider_ids_json"),
-        metadata_scraper_id: row.get("metadata_scraper_id"),
-        identification_status: row.get("identification_status"),
+        library_id,
+        item_type,
+        title,
+        original_title,
+        overview,
+        production_year,
+        premiere_date,
+        last_air_date,
+        status,
+        original_language,
+        rating,
+        provider_ids_json,
+        metadata_scraper_id,
+        identification_status,
         scraper_id,
-        provenance_json: row.get("metadata_provenance_json"),
-        locked_fields_json: row.get("locked_fields_json"),
-        nfo_metadata_json: row.get("nfo_metadata_json"),
-        metadata_fingerprint: row.get("metadata_fingerprint"),
-        nfo_collection_reference_key: row.get("nfo_collection_reference_key"),
+        provenance_json: metadata_provenance_json,
+        locked_fields_json,
+        nfo_metadata_json,
+        metadata_fingerprint,
+        nfo_collection_reference_key,
         collection_reference_identity_key,
-        series_item_id: row.get("series_id"),
-        series_title: row.get("series_title"),
-        series_production_year: row.get("series_production_year"),
+        series_item_id: series_id,
+        series_title,
+        series_production_year,
         series_provider_name: series_provider.as_ref().map(|(name, _)| name.clone()),
         series_provider_id: series_provider.map(|(_, id)| id),
-        season_number: row.get("season_number"),
-        episode_number: row.get("episode_number"),
+        season_number,
+        episode_number,
     }
 }
 
@@ -305,6 +372,12 @@ struct PrefetchedMovieItemRow {
     parent_id: Option<String>,
     provider_ids_json: Option<String>,
     removed_at: Option<i64>,
+}
+
+/// Row of `find_item_scraper_role`.
+#[derive(sqlx::FromRow)]
+struct ScraperRoleRow {
+    role: String,
 }
 
 /// Row of `list_hierarchy_ids_in_transaction`.
@@ -3169,7 +3242,7 @@ impl Database {
         item_id: &str,
         scraper_id: &str,
     ) -> Result<Option<String>, StorageError> {
-        self.query(
+        self.query_as::<ScraperRoleRow>(
             "SELECT library_scrapers.role AS role
              FROM library_scrapers
              JOIN media_items ON media_items.library_id = library_scrapers.library_id
@@ -3180,7 +3253,7 @@ impl Database {
         .bind(scraper_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(|row| row.get::<String, _>("role")))
+        .map(|row| row.map(|row| row.role))
         .map_err(self.sqlx_err())
     }
 
@@ -3232,7 +3305,7 @@ impl Database {
                  LEFT JOIN libraries ON libraries.id = mi.library_id
                  WHERE mi.id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<MediaMetadataRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -3241,7 +3314,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let item_id = row.get::<String, _>("item_id");
+                let item_id = row.item_id.clone();
                 metadata.insert(item_id, stored_media_metadata(row));
             }
         }
@@ -3288,7 +3361,7 @@ impl Database {
                  LEFT JOIN media_items series ON series.id = mi.series_id
                  WHERE mi.id IN ({placeholders}) AND mi.removed_at IS NULL"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<MediaMetadataRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -3297,8 +3370,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let item_id = row.get::<String, _>("item_id");
-                let library_id = row.get::<String, _>("library_id");
+                let item_id = row.item_id.clone();
+                let library_id = row.library_id.clone();
                 metadata.insert(item_id, (library_id, stored_media_metadata(row)));
             }
         }
