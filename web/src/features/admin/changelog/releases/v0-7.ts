@@ -2,6 +2,34 @@ import type { ChangelogRelease } from "../types";
 
 export const changelogReleases07: ChangelogRelease[] = [
   {
+    version: "0.7.3",
+    date: "2026-10-31",
+    sections: [
+      { kind: "added", items: [
+        "安装向导与业务路由分离：第一个管理员存在之前只挂载安装向导、健康检查与 Emby 的三个公开发现路由（System/Ping、System/Info/Public 报 StartupWizardCompleted:false、Users/Public 空列表），业务路由不注册，按未知路径返回 Lux JSON 404 / Emby 裸 404。",
+        "装完自动重启并等待恢复：POST /setup/complete 在 201 写出后自己请求重启，响应体新增 restarting；Web 显示「正在重启 Lux」，每秒探测 setup/status、每次探测 3 秒超时，断开后 60 秒仍无恢复则提示检查日志并给出刷新按钮，端口始终没关闭时按 10 秒兜底离开等待页；只有真正的 Lux 状态响应才算恢复。",
+        "被打断的首次扫描自动续跑：安装后的重启会以 SERVER_SHUTDOWN 取消首扫；新进程会挑出「最近一次扫描被关停取消、库仍启用、从未成功扫描、有可用媒体根、无活动扫描」的库自动排队，排队前实测根路径（单根 5 秒上限、同一挂载只探测一次、并发上限 4）；单次启动最多处理 512 个候选库并在日志写明剩余数，同一库被打断 3 次则停止自动补扫。",
+        "审计事件记录更多上下文：媒体库创建/更新记录名称、根路径与封面，扫描开始记录媒体库与任务类型，取消扫描/STRM 探测/章节/元数据匹配/人物索引重建都记录所属媒体库与取消前后的状态。",
+        "系统日志可读化：审计事件类型与目标类型映射为中文名，未知类型显示原始代码；媒体库目标与 libraryId 解析成库名；元数据按标签/值成行展示。",
+        "运营与通知后台重新排版：运营页改为统计卡、分段标签、带状态栏的运行卡片与控制台式日志；通知页改为双栏工作区，含目标卡片与投递时间线。",
+        "播放计划返回有序直放候选（LUX-872）：candidates 依次给出 proxy（带播放专用短期 api_key 的标准 Emby 流入口）、lux（签名入口）、origin（HTTP(S) .strm 目标），旧的 url/proxyUrl/rangeUrl 再保留一个版本；Web 按服务端顺序尝试。",
+        "Emby 播放令牌绑定单个条目：令牌形如 luxpb_{条目}_{随机串}，路由层不查库就把 Items、Users/Items、Videos 限制在该条目上。",
+        "API 类型绑定试点：scripts/generate-api-types.sh 从 Rust 结构体生成 Web DTO，条目图片、元数据、弹幕信息等试点类型改由生成文件再导出；类型漂移检查失败时会指出新增或改名的文件。",
+      ] },
+      { kind: "changed", items: [
+        "启动修复按版本只跑一次：startup_repair:<name> 记录完成后跳过，失败或无事可做时释放标记留待下次，并发启动不会双跑，崩溃遗留的标记一小时后过期。",
+        "PostgreSQL 占位符改写按语句缓存：静态 SQL 的 ? → $n 改写做记忆化，真实形态约 4.7 倍；分片改用乘法散列避免热点。",
+        "MediaFolders 的库根查询合并成一次批量；生命周期清理跳过已完成的声明；播放信息面板的客户端统计采样在页面隐藏时暂停。",
+      ] },
+      { kind: "fixed", items: [
+        "硬件编码器自检：QSV 像 VAAPI 一样上传 NV12 帧，自检改用 yuv420p 帧探测，失败时给出真实原因。",
+        "阻塞调用移出 Tokio worker：设备与符号链接探测改在阻塞线程执行并在开始服务请求前解析完成，插件归档 stat 与批处理 walker 的根 canonicalize 也不再占用核心线程。",
+        "播放器的 keydown 监听每次挂载只绑定一次。",
+        "安装后的冒烟脚本会等安装重启后的恢复，代理演练同样等待首扫完成，不再把旧任务当成恢复结果。",
+      ] },
+    ],
+  },
+  {
     version: "0.7.2",
     date: "2026-10-30",
     sections: [
