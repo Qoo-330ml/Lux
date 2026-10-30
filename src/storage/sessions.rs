@@ -218,7 +218,10 @@ impl Database {
             .bind(offset)
             .fetch_all(&self.pool)
             .await
-            .map(|rows| rows.into_iter().map(stored_playback_session).collect())
+            .map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_playback_session)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())?;
         Ok((sessions, total_count))
     }
@@ -811,7 +814,10 @@ impl Database {
         statement
             .fetch_all(&self.pool)
             .await
-            .map(|rows| rows.into_iter().map(stored_playback_session).collect())
+            .map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_playback_session)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())
     }
 
@@ -833,7 +839,9 @@ impl Database {
         .bind(play_session_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_playback_session))
+        .map_err(self.sqlx_err())?
+        .map(stored_playback_session)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -853,7 +861,9 @@ impl Database {
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_playback_session))
+        .map_err(self.sqlx_err())?
+        .map(stored_playback_session)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -923,7 +933,8 @@ impl Database {
             .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_playback_session)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         if sessions.len() == 1 {
             Ok(sessions.into_iter().next())
         } else {
@@ -955,7 +966,9 @@ impl Database {
         .bind(PLAYBACK_SESSION_STALE_AFTER_SECONDS)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_playback_session))
+        .map_err(self.sqlx_err())?
+        .map(stored_playback_session)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -1322,7 +1335,9 @@ impl Database {
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_web_playback_session))
+        .map_err(self.sqlx_err())?
+        .map(stored_web_playback_session)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -1351,7 +1366,10 @@ impl Database {
         statement
             .fetch_all(&self.pool)
             .await
-            .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
+            .map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_web_playback_session)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())
     }
 
@@ -1381,7 +1399,10 @@ impl Database {
         .bind(MAX_SESSIONS_PER_SOURCE)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_web_playback_session).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_web_playback_session)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -1404,7 +1425,11 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let sessions = rows.into_iter().map(stored_web_playback_session).collect();
+        let sessions = rows
+            .into_iter()
+            .map(stored_web_playback_session)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         self.stop_selected_web_playback_sessions(sessions, now, "expires_at < ?", now)
             .await
     }
@@ -1430,7 +1455,11 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let sessions = rows.into_iter().map(stored_web_playback_session).collect();
+        let sessions = rows
+            .into_iter()
+            .map(stored_web_playback_session)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         self.stop_selected_web_playback_sessions(
             sessions,
             now,

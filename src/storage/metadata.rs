@@ -920,7 +920,9 @@ impl Database {
         .bind(capability.trim())
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_item_metadata_completeness))
+        .map_err(self.sqlx_err())?
+        .map(stored_item_metadata_completeness)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -983,10 +985,10 @@ impl Database {
             .await
         }
         .map_err(self.sqlx_err())?;
-        Ok(rows
-            .into_iter()
+        rows.into_iter()
             .map(stored_item_metadata_completeness)
-            .collect())
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())
     }
 }
 
@@ -1424,7 +1426,10 @@ impl Database {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_metadata_candidate)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -1499,7 +1504,10 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         };
-        rows.map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
+        rows.map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_metadata_candidate)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())
     }
 
@@ -1527,7 +1535,11 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let total = rows.first().map(|row| row.get("total_count")).unwrap_or(0);
-        let candidates = rows.into_iter().map(stored_metadata_candidate).collect();
+        let candidates = rows
+            .into_iter()
+            .map(stored_metadata_candidate)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok((candidates, total))
     }
 
@@ -1573,7 +1585,11 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let total = rows.first().map(|row| row.get("total_count")).unwrap_or(0);
-        let candidates = rows.into_iter().map(stored_metadata_candidate).collect();
+        let candidates = rows
+            .into_iter()
+            .map(stored_metadata_candidate)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok((candidates, total))
     }
 
@@ -1596,7 +1612,9 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_metadata_candidate))
+        .map_err(self.sqlx_err())?
+        .map(stored_metadata_candidate)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -1618,7 +1636,9 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_metadata_candidate))
+        .map_err(self.sqlx_err())?
+        .map(stored_metadata_candidate)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -1660,7 +1680,10 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_metadata_candidate).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_metadata_candidate)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 

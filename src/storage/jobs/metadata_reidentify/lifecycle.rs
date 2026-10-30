@@ -162,7 +162,9 @@ impl Database {
         .bind(job_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_metadata_reidentify_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_metadata_reidentify_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -241,12 +243,11 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         };
-        rows.map(|rows| {
-            rows.into_iter()
-                .map(stored_metadata_reidentify_job)
-                .collect()
-        })
-        .map_err(self.sqlx_err())
+        rows.map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_metadata_reidentify_job)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_metadata_reidentify_jobs_for_activity(
@@ -264,11 +265,10 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_metadata_reidentify_job)
-                .collect()
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_metadata_reidentify_job)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -651,11 +651,10 @@ impl Database {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_metadata_reidentify_item)
-                .collect()
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_metadata_reidentify_item)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 

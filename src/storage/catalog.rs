@@ -4179,7 +4179,9 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_danmaku_match_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_danmaku_match_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -4218,7 +4220,10 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         };
-        rows.map(|rows| rows.into_iter().map(stored_danmaku_match_job).collect())
+        rows.map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_danmaku_match_job)
+            .collect::<Result<Vec<_>, _>>()
             .map_err(self.sqlx_err())
     }
 
@@ -9176,7 +9181,10 @@ impl Database {
         .bind(item_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_item_image).collect())
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_item_image)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -9212,7 +9220,7 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let image = stored_item_image(row);
+                let image = stored_item_image(row).map_err(self.sqlx_err())?;
                 images_by_item
                     .entry(image.item_id.clone())
                     .or_default()
@@ -9456,7 +9464,9 @@ impl Database {
         .bind(image_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_item_image))
+        .map_err(self.sqlx_err())?
+        .map(stored_item_image)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
