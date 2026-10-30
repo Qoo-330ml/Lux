@@ -5,9 +5,10 @@ import { readFileSync } from "node:fs";
 import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { SetupPage } from "../src/features/auth/SetupPage";
 import { api } from "../src/lib/api/client";
+import { queryKeys } from "../src/lib/api/query-keys";
 import { chooseLuxOptionByValue, luxOptions } from "./lux-select-helpers";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
@@ -125,6 +126,138 @@ describe("SetupPage database restart", () => {
       libraryKind: "HOMEVIDEOS",
       libraryRoot: "/media/home-videos",
     }));
+  });
+});
+
+function setInputValue(target: HTMLElement, selector: string, value: string) {
+  const input = target.querySelector<HTMLInputElement>(selector)!;
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(input, value);
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.dispatchEvent(new Event("change", { bubbles: true }));
+}
+
+const restartingUser = { id: "admin", usernameNormalized: "admin" };
+
+describe("SetupPage setup-complete restart", () => {
+  let container: HTMLDivElement;
+  let root: Root;
+  let queryClient: QueryClient;
+
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.spyOn(api, "setupDatabaseStatus").mockResolvedValue({
+      configured: true,
+      currentBackend: "SQLITE",
+      restartRequired: false,
+    });
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  });
+
+  afterEach(() => {
+    act(() => root.unmount());
+    queryClient.clear();
+    container.remove();
+    vi.restoreAllMocks();
+    vi.useRealTimers();
+  });
+
+  // Fake timers keep the 1 s probe cadence and the 10 s fallback deterministic:
+  // every assertion below is expressed as "after N seconds of probe ticks".
+  async function advance(ms: number) {
+    await act(async () => { await vi.advanceTimersByTimeAsync(ms); });
+  }
+
+  async function renderSetupPage() {
+    await act(async () => {
+      root.render(
+        <MemoryRouter initialEntries={["/setup"]}>
+          <QueryClientProvider client={queryClient}>
+            <Routes>
+              <Route path="/setup" element={<SetupPage />} />
+              <Route path="/login" element={<div>登录页占位</div>} />
+            </Routes>
+          </QueryClientProvider>
+        </MemoryRouter>,
+      );
+    });
+    await advance(10);
+  }
+
+  async function submitAdminForm() {
+    await act(async () => {
+      setInputValue(container, "#setup-username", "admin");
+      setInputValue(container, "#setup-password", "correct password");
+    });
+    await act(async () => {
+      container.querySelector<HTMLButtonElement>("button[type='submit']")!.click();
+    });
+    await advance(10);
+  }
+
+  it("shows the restart screen instead of caching initialization when the server reports a restart", async () => {
+    const setup = vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+    const status = vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    expect(setup).toHaveBeenCalledOnce();
+    expect(container.textContent).toContain("正在重启 Lux");
+    expect(container.querySelector("[aria-busy='true']")).not.toBeNull();
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+
+    // setup/status answers initialized:true as soon as the administrator row
+    // exists, i.e. before the restart, so one successful probe proves nothing.
+    await advance(1000);
+    expect(status).toHaveBeenCalled();
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+    expect(container.textContent).not.toContain("登录页占位");
+  });
+
+  it("only treats the service as ready after a failed probe is followed by a successful one", async () => {
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+    vi.spyOn(api, "setupStatus")
+      .mockResolvedValueOnce({ initialized: true })
+      .mockResolvedValueOnce({ initialized: true })
+      .mockRejectedValueOnce(new TypeError("Failed to fetch"))
+      .mockResolvedValue({ initialized: true });
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    // Two probes answer fine while the old process is still serving.
+    await advance(2000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+    expect(container.textContent).not.toContain("登录页占位");
+
+    // Third probe fails: the port is closed, so the disconnect is observed.
+    await advance(1000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+    expect(container.textContent).toContain("正在重启 Lux");
+
+    // Fourth probe succeeds: the restarted process is serving again.
+    await advance(1000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
+    expect(container.textContent).toContain("登录页占位");
+  });
+
+  it("falls back to the login page when no disconnect is observed within ten seconds", async () => {
+    vi.spyOn(api, "setup").mockResolvedValue({ user: restartingUser, restarting: true });
+    vi.spyOn(api, "setupStatus").mockResolvedValue({ initialized: true });
+
+    await renderSetupPage();
+    await submitAdminForm();
+
+    await advance(9000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toBeUndefined();
+    expect(container.textContent).not.toContain("登录页占位");
+
+    await advance(1000);
+    expect(queryClient.getQueryData(queryKeys.setup)).toEqual({ initialized: true });
+    expect(container.textContent).toContain("登录页占位");
   });
 });
 
