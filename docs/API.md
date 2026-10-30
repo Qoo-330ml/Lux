@@ -17,9 +17,9 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/setup/status`：返回 `initialized`。
 - `GET /api/v1/setup/database`：返回数据库选择状态；首次选择 PostgreSQL 后，`restartRequired` 为 `true`。
 - `POST /api/v1/setup/database/restart`：仅在首次初始化、数据库配置已保存且当前进程仍使用其他后端时可用。返回 202 后，Lux 优雅关闭并在同一容器进程内重新启动；页面应等待服务恢复。该接口不接受数据库凭据，也不用于已初始化实例的在线切换。
-- `POST /api/v1/setup/complete`：仅在没有用户时创建首个管理员；成功返回 201，重复或并发失败返回 `SETUP_ALREADY_COMPLETED`。
+- `POST /api/v1/setup/complete`：仅在没有用户时创建首个管理员；成功返回 201，重复或并发失败返回 `SETUP_ALREADY_COMPLETED`。201 响应体带可选布尔字段 `restarting`：`true` 表示管理员落库后已经排期重启进程（延迟约 250 ms 发出重启请求，HTTP 层先优雅排空在途请求再重新执行自身），`false` 表示当前进程没有重启句柄（嵌入式或测试构造的状态），此时 setup 本身仍然成功、需要由部署方重启；旧客户端可以忽略该字段。错误响应（含 4xx/5xx）不携带该字段。
 
-请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。
+请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。首个媒体库的第一轮 `RECONCILE_LIBRARY` 扫描会被上述重启取消（`CANCELLED` + `SERVER_SHUTDOWN`），新进程启动时若该库仍未成功扫描过（`libraries.last_scan_at` 为空）会自动重新排队一次扫描，客户端不需要补触发；`201` 里的 `scanJob` 因此可能被这次重启取消，管理页能看到“取消 → 新任务”的链路。
 
 ## Web 会话
 

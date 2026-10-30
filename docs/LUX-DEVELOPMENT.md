@@ -19046,6 +19046,47 @@ FTS/内容限制/collection 一致性回归全绿、故障注入后可恢复。
 
 项目所有者已于 2026-10-27 确认：进入 P3/W3（LUX-867–869）；`on` 保持默认关闭，收益复测另行安排。
 
+#### LUX-875：setup 完成后重启进程与首次扫描恢复（方案 B 第 ② 步后端）
+
+范围（设计见 `docs/SETUP-RESTART-DESIGN.md`，`docs/APP-STATE-NEXT.md` 方案 B 第 ② 步）：让
+`POST /api/v1/setup/complete` 在管理员落库后自己排期一次进程重启，从而离开 setup 模式；重启会取消
+setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“为被关停打断的首次扫描重新排队一次”。
+本步**不拆 Router**、不改 `ReadyServices`/`require_ready!`/路由注册（那是第 ③ 步），也不改 `web/**`
+（前端为 C3）。
+
+- C1 重启排期：`CoreState` 新增 `setup_restart_delay`（默认 250 ms，`#[doc(hidden)]
+  with_setup_restart_delay` 可注入），`setup_complete` 在响应构造完成后 `spawn`“延迟 → `request_restart()`”，
+  201 响应体新增 `restarting: boolean`。延迟不是送达保证：`axum::serve` 的优雅关停会排空在途请求。
+- C1b 幂等与部分成功：无重启句柄 → 仍返回 201 且 `restarting: false`；重复/并发 setup → 409
+  `SETUP_ALREADY_COMPLETED` 且不再排期；管理员已建但首个媒体库步骤失败（5xx/4xx）仍排期重启，避免
+  进程停在一个“setup 已关闭”的半状态。
+- C2 首次扫描恢复：采用方案 (b)，无 schema 变更。判据是 `scan_jobs` 里 `job_type='RECONCILE_LIBRARY'`
+  + `status='CANCELLED'` + `error='SERVER_SHUTDOWN'` 且库仍启用、`last_scan_at IS NULL`、有 root、无活动
+  扫描；`storage::list_shutdown_interrupted_first_scan_library_ids`（SQL 留在 storage）与
+  `application::admin_scan_jobs::resume_shutdown_interrupted_first_scans`（复用 setup 用的
+  `start_library_scan`，单次启动最多 32 个库）实现，`AppState::resume_shutdown_interrupted_first_scans`
+  由 `main` 在 `resume_interrupted_metadata_scraping` 之后以后台任务调用。
+- C4 文档：本条目、`docs/API.md` 的 `restarting` 与首次扫描恢复说明、设计文档状态改为“后端已实施”。
+
+验收（2026-11-04，本机 `uname -m` = `arm64`）：
+
+- [x] `cargo test --locked --test api_web web_auth::` 9/9：新增“201 之前 `watch` 仍是 `Running`、之后变
+      `Restart`”（注入 200 ms）、“无句柄保持 201 与完整 body（键集合逐字固定，`restarting: false`）”、
+      “重复 setup 409 且不再触发 `watch`”、“管理员已建后首库失败仍重启”、“`rootPath` 不可用被更早拒绝
+      且不重启、随后修正请求正常完成”。
+- [x] `cargo test --locked --test scanner shutdown_jobs::` 7/7：恢复用例（取消记录 → 新任务 → 扫描
+      完成写入 `last_scan_at` → 再次启动不再排队）与 5 个反向用例（已扫描 / 真实失败 / 库停用 / 无 root /
+      已有活动扫描）。
+- [x] `cargo test --locked --lib storage::`、`cargo test --locked --lib api::` 通过；`cargo build --locked`、
+      `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+      `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（本步无迁移、无新增
+      `DatabaseBackend::` 分支）。
+- [ ] 未验证：真实 `exec` 之后服务恢复的端到端流程（Docker 与裸进程各一次）。需要手动执行：启动实例 →
+      Web 完成初始化 → 观察进程 PID 变化与 `setup/status` 先断开后恢复 → 管理员登录 → 首库扫描自动
+      重新排队并跑完。CI 不覆盖该路径，因为重启会把测试进程自身 `exec` 掉。
+
+依赖：`docs/APP-STATE-NEXT.md` 方案 B 第 ① 步（路由保持单一、setup/ready 双状态）已完成。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：
