@@ -4131,8 +4131,6 @@ impl ImageLevel {
         Self::ALL.into_iter().find(|level| level.key() == value)
     }
 
-    // Wired into the image writers by LUX-843.
-    #[allow(dead_code)]
     pub(crate) fn from_item_type(item_type: &str) -> Option<Self> {
         match item_type {
             "MOVIE" => Some(Self::Movie),
@@ -4384,7 +4382,6 @@ impl ImageSelectionPolicy {
     }
 
     /// Episode image semantics: scraper still, local screenshot, or nothing.
-    #[allow(dead_code)] // consumed by the thumbnail writers in LUX-843d
     pub(crate) fn episode_image_policy(self) -> EpisodeImagePolicy {
         let level = &self.levels[ImageLevel::Episode.index()];
         level.episode_image_policy.unwrap_or_else(|| {

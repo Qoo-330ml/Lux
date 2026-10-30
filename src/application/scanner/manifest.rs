@@ -987,7 +987,6 @@ pub(super) enum FollowedSymlink {
     File(NewScanManifestEntry),
     // Constructed once directory links are entered; kept here so the resolver
     // owns the whole decision instead of scattering it across call sites.
-    #[allow(dead_code)]
     Directory(NewScanManifestEntry),
 }
 
