@@ -1226,16 +1226,19 @@ impl CatalogService {
                     query.limit.saturating_add(1)
                 };
                 self.database
-                    .list_catalog_rows_from_read_model(&crate::storage::ReadModelPageQuery {
-                        library_id: &query.library_ids[0],
-                        item_types: query.item_types,
-                        excluded_item_types: query.excluded_item_types,
-                        sort,
-                        descending: query.descending,
-                        offset: query.offset,
-                        limit: fetch_limit,
-                        include_total: query.include_total,
-                    })
+                    .list_catalog_rows_from_read_model(
+                        &crate::storage::ReadModelPageQuery {
+                            library_id: &query.library_ids[0],
+                            item_types: query.item_types,
+                            excluded_item_types: query.excluded_item_types,
+                            sort,
+                            descending: query.descending,
+                            offset: query.offset,
+                            limit: fetch_limit,
+                            include_total: query.include_total,
+                        },
+                        request.projection.row_projection(),
+                    )
                     .await?
             }
             _ => {
@@ -6031,6 +6034,198 @@ mod tests {
             .list_recently_added(unconfigured_principal, 0, 1)
             .await?;
         assert_eq!(unrestricted_page.total, 5);
+        Ok(())
+    }
+
+    /// The library grid asks for the card projection, which has no `mediaSources`. The projection
+    /// has to reach the derived read-model page too: the read-model source query then stops
+    /// joining `media_streams` and stops reading `details_json`, while the full projection keeps
+    /// both. Both pages are served from the same `catalog_items` rows.
+    #[tokio::test]
+    async fn library_card_page_uses_the_summary_projection_on_the_read_model()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{access::AccessPrincipal, libraries::LibraryService},
+            auth::users::UserStore,
+            config::Config,
+            library::LibraryKind,
+            storage::Database,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "summary-read-model-viewer",
+                "Summary Read Model Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Summary read model", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('summary-read-model-root', ?, '/summary', '/summary', 1, 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+             ) VALUES ('summary-read-model-fe', 'summary-read-model-root', 'Summary.mkv',
+                       'FILE', 1, 1, 1, 1, X'00', 'g1', 'NEW')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, overview, added_at,
+                 runtime_ticks, identification_status, has_available_source
+             ) VALUES ('summary-read-model-item', ?, 'MOVIE', 'Summary Read Model',
+                       'summary read model', 'Grid overview', 10, 7200000000,
+                       'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+                 size, bitrate, duration_ticks, is_default, probe_status
+             ) VALUES ('summary-read-model-source', 'summary-read-model-item', 'LOCAL_FILE',
+                       'summary-read-model-fe', '1080p', 'mkv', 1000, 8000000,
+                       7200000000, 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_streams (
+                 id, media_source_id, stream_index, stream_type, codec, details_json,
+                 is_default
+             ) VALUES ('summary-read-model-video', 'summary-read-model-source', 0, 'VIDEO',
+                       'h264', '{\"Width\":\"1920\"}', 1),
+                      ('summary-read-model-audio', 'summary-read-model-source', 1, 'AUDIO',
+                       'aac', '{\"Channels\":\"2\"}', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+             VALUES ('summary-read-model-poster', 'summary-read-model-item', 'POSTER', 0,
+                     '/summary/poster.jpg')",
+        )
+        .execute(database.pool())
+        .await?;
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        // The `on` switch only serves the derived page once the consumer watermark exists.
+        database
+            .advance_catalog_consumer(
+                &crate::application::catalog_read_model::catalog_items_consumer(),
+                0,
+            )
+            .await?;
+        // Only the derived row is renamed, so a page that renders "Derived title" proves it was
+        // served by the read model and not by the authoritative fallback.
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived title'
+             WHERE item_id = 'summary-read-model-item'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::On);
+        let principal = AccessPrincipal::new(user.id, false);
+        let filter = super::CatalogFilter {
+            sort_by: super::CatalogSort::Name,
+            include_total: false,
+            ..super::CatalogFilter::default()
+        };
+
+        let card_page = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Card,
+            )
+            .await?;
+        assert_eq!(card_page.items.len(), 1);
+        let card_item = &card_page.items[0];
+        assert_eq!(card_item.id, "summary-read-model-item");
+        assert_eq!(
+            card_item.title, "Derived title",
+            "the card page must be served by the read model"
+        );
+        assert_eq!(
+            card_item.poster_image_tag.as_deref(),
+            Some("summary-read-model-poster")
+        );
+        let card_source = card_item
+            .media_sources
+            .first()
+            .ok_or("the read-model card page lost the media source")?;
+        assert_eq!(card_source.duration_ticks, Some(7_200_000_000));
+        assert!(card_source.is_default);
+        assert!(
+            card_source.streams.is_empty(),
+            "the read-model card page must not read media streams"
+        );
+
+        let full_page = catalog
+            .list_library_items_in_scope(principal, &library_id, &filter, None, 0, 10)
+            .await?;
+        assert_eq!(full_page.items.len(), 1);
+        let full_item = &full_page.items[0];
+        assert_eq!(full_item.id, card_item.id);
+        assert_eq!(
+            full_item.title, "Derived title",
+            "the full page must be served by the read model"
+        );
+        assert_eq!(full_item.overview, card_item.overview);
+        assert_eq!(full_item.poster_image_tag, card_item.poster_image_tag);
+        assert_eq!(full_item.media_sources.len(), card_item.media_sources.len());
+        let full_source = &full_item.media_sources[0];
+        assert_eq!(full_source.id, card_source.id);
+        assert_eq!(full_source.duration_ticks, card_source.duration_ticks);
+        assert_eq!(full_source.is_default, card_source.is_default);
+        assert_eq!(
+            full_source
+                .streams
+                .iter()
+                .map(|stream| (stream.index, stream.codec.as_deref()))
+                .collect::<Vec<_>>(),
+            [(0, Some("h264")), (1, Some("aac"))],
+            "the read-model full page keeps the streams"
+        );
+        assert_eq!(
+            full_source.streams[0]
+                .details
+                .get("Width")
+                .and_then(serde_json::Value::as_str),
+            Some("1920"),
+            "the read-model full page keeps details_json"
+        );
         Ok(())
     }
 }

@@ -1,5 +1,6 @@
 //! Read-model fan-out primitives: append-only outbox plus per-consumer watermarks.
 
+use super::catalog::{catalog_stream_columns, catalog_stream_join, catalog_stream_order};
 use super::*;
 
 /// Outbox kind for `catalog_items` maintenance events; the search consumer owns `search`.
@@ -848,12 +849,16 @@ struct ReadModelSourceRow {
 
 impl Database {
     /// Builds the legacy row shape from `catalog_items` plus one batched source/stream query.
+    ///
+    /// The projection decides whether that second query joins `media_streams`: a grid/card page
+    /// asks for [`CatalogRowProjection::Summary`] and never reads stream rows or `details_json`.
     pub(crate) async fn list_catalog_rows_from_read_model(
         &self,
         page: &ReadModelPageQuery<'_>,
+        projection: CatalogRowProjection,
     ) -> Result<(Vec<StoredCatalogRow>, i64), StorageError> {
         let (ids, total) = self.shadow_catalog_library_page(page).await?;
-        let rows = self.read_model_rows_for_ids(&ids).await?;
+        let rows = self.read_model_rows_for_ids(&ids, projection).await?;
         Ok((rows, total))
     }
 
@@ -862,7 +867,8 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        self.read_model_rows_for_ids(&[item_id.to_owned()]).await
+        self.read_model_rows_for_ids(&[item_id.to_owned()], CatalogRowProjection::Full)
+            .await
     }
 
     /// Same as [`Self::read_model_rows_for_ids`] but keeps the requested id order, which derived
@@ -871,7 +877,9 @@ impl Database {
         &self,
         ids: &[String],
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
-        let mut rows = self.read_model_rows_for_ids(ids).await?;
+        let mut rows = self
+            .read_model_rows_for_ids(ids, CatalogRowProjection::Full)
+            .await?;
         let position = ids
             .iter()
             .enumerate()
@@ -889,6 +897,7 @@ impl Database {
     async fn read_model_rows_for_ids(
         &self,
         ids: &[String],
+        projection: CatalogRowProjection,
     ) -> Result<Vec<StoredCatalogRow>, StorageError> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -916,6 +925,12 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
+        // Same stream columns, join and tie-breaker as the authoritative list queries: the summary
+        // projection binds them to NULL, so this statement never touches `media_streams` and never
+        // reads `details_json`.
+        let stream_columns = catalog_stream_columns(projection);
+        let stream_join = catalog_stream_join(projection);
+        let stream_order = catalog_stream_order(projection);
         let source_query = format!(
             "SELECT ms.item_id,
                     (SELECT fe.relative_path FROM filesystem_entries fe
@@ -923,18 +938,15 @@ impl Database {
                     ms.id AS source_id, ms.source_kind, ms.container, ms.size,
                     ms.external_url, ms.edition_name, ms.quality_label, ms.bitrate,
                     ms.duration_ticks, ms.is_default, ms.probe_status,
-                    mt.id AS stream_id, mt.stream_index, mt.stream_type, mt.codec,
-                    mt.language, mt.title AS stream_title, mt.details_json AS stream_details_json,
-                    mt.is_external AS stream_is_external, mt.is_default AS stream_is_default,
-                    mt.is_forced AS stream_is_forced
+                    {stream_columns}
              FROM media_sources ms
-             LEFT JOIN media_streams mt ON mt.media_source_id = ms.id
+             {stream_join}
              WHERE ms.item_id IN ({placeholders})
                AND EXISTS (
                    SELECT 1 FROM filesystem_entries fe
                    WHERE fe.id = ms.filesystem_entry_id AND fe.is_missing = 0
                )
-             ORDER BY ms.item_id, ms.id, mt.stream_index"
+             ORDER BY ms.item_id, ms.id{stream_order}"
         );
         let mut statement = self.query_as::<ReadModelSourceRow>(sqlx::AssertSqlSafe(source_query));
         for id in ids {
