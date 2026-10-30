@@ -237,6 +237,74 @@ struct MovieNfoWritebackRow {
     source: WritebackSourceRow,
 }
 
+/// Row of `find_danmaku_source_for_item` and `find_registered_danmaku_source_for_item`: the media
+/// source a danmaku track would be written for, with the owning item and its series titles.
+#[derive(Debug, sqlx::FromRow)]
+struct DanmakuSourceRow {
+    source_id: String,
+    root_path: String,
+    relative_path: String,
+    item_type: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    title: Option<String>,
+    original_title: Option<String>,
+    series_title: Option<String>,
+    series_original_title: Option<String>,
+}
+
+impl From<DanmakuSourceRow> for StoredDanmakuSource {
+    fn from(row: DanmakuSourceRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+            item_type: row.item_type,
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+            title: row.title,
+            original_title: row.original_title,
+            series_title: row.series_title,
+            series_original_title: row.series_original_title,
+        }
+    }
+}
+
+/// Row of `list_pending_danmaku_match_items`: one queued job item plus whatever the source lookup
+/// still knows about it. Every source column is `Option` because the item may already be detached.
+#[derive(Debug, sqlx::FromRow)]
+struct DanmakuMatchItemRow {
+    id: String,
+    media_source_id: String,
+    root_path: Option<String>,
+    relative_path: Option<String>,
+    item_type: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    title: Option<String>,
+    original_title: Option<String>,
+    series_title: Option<String>,
+    series_original_title: Option<String>,
+}
+
+impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
+    fn from(row: DanmakuMatchItemRow) -> Self {
+        Self {
+            id: row.id,
+            media_source_id: row.media_source_id,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+            item_type: row.item_type,
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+            title: row.title,
+            original_title: row.original_title,
+            series_title: row.series_title,
+            series_original_title: row.series_original_title,
+        }
+    }
+}
+
 impl MovieNfoWritebackRow {
     fn into_parts(
         self,
@@ -3646,7 +3714,7 @@ impl Database {
     ) -> Result<Option<StoredDanmakuSource>, StorageError> {
         let row = match source_id {
             Some(source_id) => {
-                self.query(
+                self.query_as::<DanmakuSourceRow>(
                     "SELECT ms.id AS source_id, ms.item_id,
                             mi.item_type, mi.season_number, mi.episode_number,
                             mi.title, mi.original_title,
@@ -3669,7 +3737,7 @@ impl Database {
                 .await
             }
             None => {
-                self.query(
+                self.query_as::<DanmakuSourceRow>(
                     "SELECT ms.id AS source_id, ms.item_id,
                             mi.item_type, mi.season_number, mi.episode_number,
                             mi.title, mi.original_title,
@@ -3692,18 +3760,7 @@ impl Database {
             }
         }
         .map_err(self.sqlx_err())?;
-        Ok(row.map(|row| StoredDanmakuSource {
-            source_id: row.get("source_id"),
-            root_path: row.get("root_path"),
-            relative_path: row.get("relative_path"),
-            item_type: row.get("item_type"),
-            season_number: row.get("season_number"),
-            episode_number: row.get("episode_number"),
-            title: row.get("title"),
-            original_title: row.get("original_title"),
-            series_title: row.get("series_title"),
-            series_original_title: row.get("series_original_title"),
-        }))
+        Ok(row.map(StoredDanmakuSource::from))
     }
 
     pub(crate) async fn find_registered_danmaku_source_for_item(
@@ -3713,7 +3770,7 @@ impl Database {
     ) -> Result<Option<StoredDanmakuSource>, StorageError> {
         let row = match source_id {
             Some(source_id) => {
-                self.query(
+                self.query_as::<DanmakuSourceRow>(
                     "SELECT ms.id AS source_id, ms.item_id,
                             mi.item_type, mi.season_number, mi.episode_number,
                             mi.title, mi.original_title,
@@ -3737,7 +3794,7 @@ impl Database {
                 .await
             }
             None => {
-                self.query(
+                self.query_as::<DanmakuSourceRow>(
                     "SELECT ms.id AS source_id, ms.item_id,
                             mi.item_type, mi.season_number, mi.episode_number,
                             mi.title, mi.original_title,
@@ -3761,18 +3818,7 @@ impl Database {
             }
         }
         .map_err(self.sqlx_err())?;
-        Ok(row.map(|row| StoredDanmakuSource {
-            source_id: row.get("source_id"),
-            root_path: row.get("root_path"),
-            relative_path: row.get("relative_path"),
-            item_type: row.get("item_type"),
-            season_number: row.get("season_number"),
-            episode_number: row.get("episode_number"),
-            title: row.get("title"),
-            original_title: row.get("original_title"),
-            series_title: row.get("series_title"),
-            series_original_title: row.get("series_original_title"),
-        }))
+        Ok(row.map(StoredDanmakuSource::from))
     }
 
     pub(crate) async fn upsert_danmaku_track(
@@ -4116,7 +4162,7 @@ impl Database {
         job_id: &str,
         limit: i64,
     ) -> Result<Vec<StoredDanmakuMatchItem>, StorageError> {
-        self.query(
+        self.query_as::<DanmakuMatchItemRow>(
             "SELECT ji.id, ji.media_source_id,
                     mi.item_type, mi.season_number, mi.episode_number,
                     mi.title, mi.original_title,
@@ -4140,23 +4186,7 @@ impl Database {
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredDanmakuMatchItem {
-                    id: row.get("id"),
-                    media_source_id: row.get("media_source_id"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                    item_type: row.get("item_type"),
-                    season_number: row.get("season_number"),
-                    episode_number: row.get("episode_number"),
-                    title: row.get("title"),
-                    original_title: row.get("original_title"),
-                    series_title: row.get("series_title"),
-                    series_original_title: row.get("series_original_title"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredDanmakuMatchItem::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -11430,6 +11460,102 @@ mod tests {
             source.map(|source| (source.source_id, source.relative_path)),
             Some(("path-source".to_owned(), "Movie.strm".to_owned()))
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn danmaku_rows_decode_the_item_and_series_titles()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::test_database;
+
+        let (_temp, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('dmg-lib', 'Dmg', 'SERIES')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, series_id, season_number,
+                 episode_number, identification_status, has_available_source
+             ) VALUES
+                 ('dmg-series', 'dmg-lib', 'SERIES', 'Show', 'Show', NULL, NULL, NULL,
+                  'LOCAL_CONFIRMED', 1),
+                 ('dmg-episode', 'dmg-lib', 'EPISODE', 'Episode', 'Episode', 'dmg-series', 1, 2,
+                  'LOCAL_CONFIRMED', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('dmg-root', 'dmg-lib', '/media', '/media', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing
+             ) VALUES ('dmg-entry', 'dmg-root', 'Show/E02.mkv', 'FILE', 1, 1, 'g1', 0)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, is_default, probe_status
+             ) VALUES ('dmg-source', 'dmg-episode', 'LOCAL_FILE', 'dmg-entry', 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO danmaku_tracks (
+                 id, media_source_id, relative_path, format, status
+             ) VALUES ('dmg-track', 'dmg-source', 'Show/E02.xml', 'XML', 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let source = database
+            .find_danmaku_source_for_item("dmg-episode", None)
+            .await?
+            .expect("danmaku source");
+        assert_eq!(source.source_id, "dmg-source");
+        assert_eq!(source.root_path, "/media");
+        assert_eq!(source.relative_path, "Show/E02.mkv");
+        assert_eq!(source.item_type.as_deref(), Some("EPISODE"));
+        assert_eq!(source.season_number, Some(1));
+        assert_eq!(source.episode_number, Some(2));
+        assert_eq!(source.title.as_deref(), Some("Episode"));
+        assert_eq!(source.series_title.as_deref(), Some("Show"));
+
+        let registered = database
+            .find_registered_danmaku_source_for_item("dmg-episode", Some("dmg-source"))
+            .await?
+            .expect("registered danmaku source");
+        assert_eq!(registered.source_id, "dmg-source");
+
+        sqlx::query(
+            "INSERT INTO danmaku_match_jobs (id, library_id, status, concurrency)
+             VALUES ('dmg-job', 'dmg-lib', 'PENDING', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO danmaku_match_job_items (id, job_id, media_source_id, status)
+             VALUES ('dmg-job:dmg-source', 'dmg-job', 'dmg-source', 'PENDING')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let items = database
+            .list_pending_danmaku_match_items("dmg-job", 10)
+            .await?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].id, "dmg-job:dmg-source");
+        assert_eq!(items[0].media_source_id, "dmg-source");
+        assert_eq!(items[0].root_path.as_deref(), Some("/media"));
+        assert_eq!(items[0].relative_path.as_deref(), Some("Show/E02.mkv"));
+        assert_eq!(items[0].series_title.as_deref(), Some("Show"));
+        assert_eq!(items[0].episode_number, Some(2));
         Ok(())
     }
 
