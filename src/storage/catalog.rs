@@ -151,6 +151,112 @@ impl From<CatalogListRow> for StoredCatalogRow {
     }
 }
 
+/// Row of every `StoredMediaSourcePath` select: one media source with the library root and the
+/// root-relative file path it resolves to.
+#[derive(Debug, sqlx::FromRow)]
+struct MediaSourcePathRow {
+    source_id: String,
+    item_id: String,
+    probe_status: String,
+    root_path: String,
+    relative_path: String,
+}
+
+impl From<MediaSourcePathRow> for StoredMediaSourcePath {
+    fn from(row: MediaSourcePathRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            item_id: row.item_id,
+            probe_status: row.probe_status,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
+/// The `media_sources`/`library_roots`/`filesystem_entries` columns of the writeback selects.
+///
+/// Both writeback queries `LEFT JOIN` the same preferred-source lookup, so an item without a
+/// usable source decodes with the whole group NULL. The join is all-or-nothing, which is why the
+/// conversion treats a partially NULL group as "no source" instead of panicking like the previous
+/// `row.get` call sites did.
+#[derive(Debug, sqlx::FromRow)]
+struct WritebackSourceRow {
+    source_id: Option<String>,
+    #[sqlx(rename = "source_item_id")]
+    item_id: Option<String>,
+    probe_status: Option<String>,
+    root_path: Option<String>,
+    relative_path: Option<String>,
+}
+
+impl WritebackSourceRow {
+    fn into_stored(self) -> Option<StoredMediaSourcePath> {
+        Some(StoredMediaSourcePath {
+            source_id: self.source_id?,
+            item_id: self.item_id?,
+            probe_status: self.probe_status?,
+            root_path: self.root_path?,
+            relative_path: self.relative_path?,
+        })
+    }
+}
+
+/// Row of `list_media_item_writeback_contexts_by_ids`: one item plus the source the NFO writer
+/// would touch.
+#[derive(Debug, sqlx::FromRow)]
+struct MediaWritebackContextRow {
+    item_id: String,
+    item_type: String,
+    #[sqlx(flatten)]
+    source: WritebackSourceRow,
+}
+
+impl MediaWritebackContextRow {
+    /// Splits the row into its map key and value without cloning the item id.
+    fn into_keyed_context(self) -> (String, StoredMediaWritebackContext) {
+        (
+            self.item_id,
+            StoredMediaWritebackContext {
+                item_type: self.item_type,
+                source: self.source.into_stored(),
+            },
+        )
+    }
+}
+
+/// Row of `find_movie_nfo_writeback_context`: the item kind, the movie-only sort fields and the
+/// source the NFO writer would touch.
+#[derive(Debug, sqlx::FromRow)]
+struct MovieNfoWritebackRow {
+    item_type: String,
+    season_number: Option<i64>,
+    sort_title: Option<String>,
+    added_at: Option<i64>,
+    #[sqlx(flatten)]
+    source: WritebackSourceRow,
+}
+
+impl MovieNfoWritebackRow {
+    fn into_parts(
+        self,
+    ) -> (
+        String,
+        Option<i64>,
+        Option<String>,
+        Option<i64>,
+        Option<StoredMediaSourcePath>,
+    ) {
+        (
+            self.item_type,
+            self.season_number,
+            self.sort_title,
+            self.added_at,
+            self.source.into_stored(),
+        )
+    }
+}
+
 fn user_library_access_filter(library_id_expression: &str, include_admin: bool) -> String {
     let active_library = format!(
         "EXISTS (
@@ -3338,7 +3444,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3355,17 +3461,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -3373,7 +3469,7 @@ impl Database {
         &self,
         absolute_path: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3396,13 +3492,7 @@ impl Database {
                     "multiple STRM sources match the absolute path".to_owned(),
                 ));
             }
-            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            }))
+            Ok(rows.into_iter().next().map(StoredMediaSourcePath::from))
         })
     }
 
@@ -3410,7 +3500,7 @@ impl Database {
         &self,
         external_path: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3433,13 +3523,7 @@ impl Database {
                     "multiple STRM sources match the external path suffix".to_owned(),
                 ));
             }
-            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            }))
+            Ok(rows.into_iter().next().map(StoredMediaSourcePath::from))
         })
     }
 
@@ -3447,7 +3531,7 @@ impl Database {
         &self,
         id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3471,13 +3555,7 @@ impl Database {
                     "multiple STRM sources match the Emby id".to_owned(),
                 ));
             }
-            Ok(rows.into_iter().next().map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            }))
+            Ok(rows.into_iter().next().map(StoredMediaSourcePath::from))
         })
     }
 
@@ -3487,7 +3565,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3505,17 +3583,7 @@ impl Database {
         .bind(offset.max(0))
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -3523,7 +3591,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(sqlx::AssertSqlSafe(
+        self.query_as::<MediaSourcePathRow>(sqlx::AssertSqlSafe(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3541,17 +3609,7 @@ impl Database {
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -3559,7 +3617,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(sqlx::AssertSqlSafe(
+        self.query_as::<MediaSourcePathRow>(sqlx::AssertSqlSafe(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -3577,17 +3635,7 @@ impl Database {
         .bind(scan_job_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -4768,7 +4816,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -4782,15 +4830,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            })
-        })
+        .map(|row| row.map(StoredMediaSourcePath::from))
         .map_err(self.sqlx_err())
     }
 
@@ -4842,7 +4882,8 @@ impl Database {
                  LEFT JOIN library_roots lr ON lr.id = fe.library_root_id
                  WHERE mi.id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<MediaWritebackContextRow>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -4851,22 +4892,8 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let source_id = row.try_get::<String, _>("source_id").ok();
-                let source = source_id.map(|source_id| StoredMediaSourcePath {
-                    source_id,
-                    item_id: row.get("source_item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                });
-                let item_id = row.get::<String, _>("item_id");
-                contexts.insert(
-                    item_id,
-                    StoredMediaWritebackContext {
-                        item_type: row.get("item_type"),
-                        source,
-                    },
-                );
+                let (item_id, context) = row.into_keyed_context();
+                contexts.insert(item_id, context);
             }
         }
         Ok(contexts)
@@ -4886,7 +4913,7 @@ impl Database {
         StorageError,
     > {
         let row = self
-            .query(
+            .query_as::<MovieNfoWritebackRow>(
                 "SELECT mi.item_type, mi.season_number,
                         CASE WHEN mi.item_type = 'MOVIE' AND mi.removed_at IS NULL
                              THEN mi.sort_title END AS sort_title,
@@ -4931,25 +4958,7 @@ impl Database {
             .fetch_optional(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(row.map(|row| {
-            let source =
-                row.try_get::<String, _>("source_id")
-                    .ok()
-                    .map(|source_id| StoredMediaSourcePath {
-                        source_id,
-                        item_id: row.get("source_item_id"),
-                        probe_status: row.get("probe_status"),
-                        root_path: row.get("root_path"),
-                        relative_path: row.get("relative_path"),
-                    });
-            (
-                row.get("item_type"),
-                row.get("season_number"),
-                row.get("sort_title"),
-                row.get("added_at"),
-                source,
-            )
-        }))
+        Ok(row.map(MovieNfoWritebackRow::into_parts))
     }
 
     pub(crate) async fn list_strm_source_paths_by_ids(
@@ -4972,7 +4981,7 @@ impl Database {
                    AND ms.id IN ({placeholders})
                  ORDER BY ms.item_id, ms.is_default DESC, ms.id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<MediaSourcePathRow>(sqlx::AssertSqlSafe(query));
             for source_id in source_ids {
                 statement = statement.bind(source_id);
             }
@@ -4982,13 +4991,7 @@ impl Database {
                     .await
                     .map_err(self.sqlx_err())?
                     .into_iter()
-                    .map(|row| StoredMediaSourcePath {
-                        source_id: row.get("source_id"),
-                        item_id: row.get("item_id"),
-                        probe_status: row.get("probe_status"),
-                        root_path: row.get("root_path"),
-                        relative_path: row.get("relative_path"),
-                    }),
+                    .map(StoredMediaSourcePath::from),
             );
         }
         Ok(paths)
@@ -5079,7 +5082,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Vec<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "WITH RECURSIVE descendants(id) AS (
                  SELECT id FROM media_items WHERE id = ?
                  UNION ALL
@@ -5099,17 +5102,7 @@ impl Database {
         .bind(item_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredMediaSourcePath {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    probe_status: row.get("probe_status"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredMediaSourcePath::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -5118,7 +5111,7 @@ impl Database {
         item_id: &str,
         source_id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, ms.item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
@@ -5133,15 +5126,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            })
-        })
+        .map(|row| row.map(StoredMediaSourcePath::from))
         .map_err(self.sqlx_err())
     }
 
@@ -5166,7 +5151,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredMediaSourcePath>, StorageError> {
-        self.query(
+        self.query_as::<MediaSourcePathRow>(
             "SELECT ms.id AS source_id, episode.id AS item_id, ms.probe_status,
                     lr.canonical_path AS root_path, fe.relative_path
              FROM media_items episode
@@ -5182,15 +5167,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredMediaSourcePath {
-                source_id: row.get("source_id"),
-                item_id: row.get("item_id"),
-                probe_status: row.get("probe_status"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-            })
-        })
+        .map(|row| row.map(StoredMediaSourcePath::from))
         .map_err(self.sqlx_err())
     }
 
@@ -11333,6 +11310,126 @@ mod tests {
         assert_eq!(rows[0].title, "List Movie");
         assert_eq!(rows[0].series_name, None);
         assert_eq!(rows[0].source_id, None);
+        Ok(())
+    }
+
+    /// Seeds one STRM item that resolves to `<root>/Movie.strm`.
+    async fn seed_media_source_fixture(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('path-lib', 'Path', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES ('path-movie', 'path-lib', 'MOVIE', 'Path Movie', 'path movie',
+                       'LOCAL_CONFIRMED', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('path-root', 'path-lib', '/media', '/media', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 last_seen_generation, is_missing
+             ) VALUES ('path-entry', 'path-root', 'Movie.strm', 'FILE', 1, 1, 'g1', 0)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, external_url, is_default,
+                 probe_status
+             ) VALUES ('path-source', 'path-movie', 'STRM_URL', 'path-entry',
+                       'https://example.invalid/movie', 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_source_path_row_decodes_the_library_page_and_the_strm_lookup()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::test_database;
+
+        let (_temp, database) = test_database().await?;
+        seed_media_source_fixture(&database).await?;
+
+        let page = database
+            .list_media_sources_for_library_page("path-lib", 10, 0)
+            .await?;
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].source_id, "path-source");
+        assert_eq!(page[0].item_id, "path-movie");
+        assert_eq!(page[0].probe_status, "READY");
+        assert_eq!(page[0].root_path, "/media");
+        assert_eq!(page[0].relative_path, "Movie.strm");
+
+        let by_path = database
+            .find_strm_source_by_absolute_path("/media/Movie.strm")
+            .await?;
+        assert_eq!(
+            by_path.map(|path| path.source_id),
+            Some("path-source".to_owned())
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn writeback_rows_decode_the_source_and_tolerate_an_item_without_one()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::test_database;
+
+        let (_temp, database) = test_database().await?;
+        seed_media_source_fixture(&database).await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES ('path-movie-no-source', 'path-lib', 'MOVIE', 'No Source', 'no source',
+                       'LOCAL_CONFIRMED', 1, 2)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let contexts = database
+            .list_media_item_writeback_contexts_by_ids(&[
+                "path-movie".to_owned(),
+                "path-movie-no-source".to_owned(),
+            ])
+            .await?;
+        let with_source = contexts.get("path-movie").expect("source item context");
+        assert_eq!(with_source.item_type, "MOVIE");
+        let source = with_source.source.as_ref().expect("writeback source");
+        assert_eq!(source.source_id, "path-source");
+        assert_eq!(source.item_id, "path-movie");
+        assert_eq!(source.relative_path, "Movie.strm");
+        let without_source = contexts
+            .get("path-movie-no-source")
+            .expect("sourceless item context");
+        assert!(without_source.source.is_none());
+
+        let (item_type, season_number, sort_title, added_at, source) = database
+            .find_movie_nfo_writeback_context("path-movie")
+            .await?
+            .expect("movie NFO context");
+        assert_eq!(item_type, "MOVIE");
+        assert_eq!(season_number, None);
+        assert_eq!(sort_title.as_deref(), Some("path movie"));
+        assert_eq!(added_at, Some(1));
+        assert_eq!(
+            source.map(|source| (source.source_id, source.relative_path)),
+            Some(("path-source".to_owned(), "Movie.strm".to_owned()))
+        );
         Ok(())
     }
 
