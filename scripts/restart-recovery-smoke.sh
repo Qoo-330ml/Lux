@@ -88,11 +88,13 @@ interrupted_job_id="$(lux_wait_for_active_scan_job "http://127.0.0.1:$PORT" "$li
 
 observed_processed=""
 observed_total=""
+interrupted_created_at=""
 for _ in $(seq 1 1200); do
     job="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/jobs/$interrupted_job_id")"
     status="$(jq -r '.job.status' <<<"$job")"
     processed="$(jq -r '.job.processedCount' <<<"$job")"
     total="$(jq -r '.job.totalCount' <<<"$job")"
+    interrupted_created_at="$(jq -r '.job.createdAt' <<<"$job")"
     if [[ "$status" == "RUNNING" && "$processed" -gt 0 && "$total" -gt 0 ]]; then
         observed_processed="$processed"
         observed_total="$total"
@@ -138,8 +140,14 @@ for _ in $(seq 1 2400); do
     jobs="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/jobs?page=1&pageSize=100")"
     interrupted_status="$(jq -r --arg id "$interrupted_job_id" \
         '.jobs[] | select(.id == $id) | .status' <<<"$jobs")"
+    # The recovery runs in a background task, so right after `/health/ready` the list may still only
+    # contain the jobs that existed before the restart (including an older cancelled one). A
+    # replacement can only be newer than the interrupted scan, so older rows are not candidates and
+    # the loop keeps polling for the row the recovery is about to insert.
     replacement_job_id="$(jq -r --arg id "$interrupted_job_id" --arg library "$library_id" \
-        '[.jobs[] | select(.libraryId == $library and .id != $id)]
+        --argjson created "$interrupted_created_at" \
+        '[.jobs[] | select(.libraryId == $library and .id != $id
+             and (.createdAt > $created or (.createdAt == $created and .id > $id)))]
          | sort_by([.createdAt, .id]) | last | .id // ""' <<<"$jobs")"
     if [[ -n "$replacement_job_id" && "$replacement_job_id" != "null" ]]; then
         replacement_status="$(jq -r --arg id "$replacement_job_id" \
