@@ -925,6 +925,11 @@ fn report_postgres_adaptation_uncached(case: &str, sql: &'static str, iterations
 #[ignore = "run explicitly to record the A2 PostgreSQL placeholder adaptation baseline"]
 fn postgres_placeholder_adaptation_benchmark() {
     for (case, sql, iterations) in adaptation_benchmark_cases() {
+        println!(
+            "adaptation_case={case} source_bytes={} placeholders={}",
+            sql.len(),
+            sql.matches('?').count()
+        );
         report_postgres_adaptation_uncached(case, sql, iterations);
         report_postgres_adaptation(case, sql, iterations);
     }
