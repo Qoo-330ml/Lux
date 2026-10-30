@@ -808,6 +808,24 @@ impl StrmProbeService {
         semaphore: Arc<Semaphore>,
         options: ProbeSourceOptions,
     ) -> SourceOutcome {
+        let relative_path = source.relative_path.clone();
+        let target_kind = source.external_url.as_deref().map_or("none", |target| {
+            target_kind_label(classify_strm_target(target).kind)
+        });
+        let started = Instant::now();
+        let mut outcome = self.probe_source_inner(source, semaphore, options).await;
+        outcome.relative_path = relative_path;
+        outcome.target_kind = target_kind;
+        outcome.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        outcome
+    }
+
+    async fn probe_source_inner(
+        &self,
+        source: StoredStrmMediaSource,
+        semaphore: Arc<Semaphore>,
+        options: ProbeSourceOptions,
+    ) -> SourceOutcome {
         let path = match safe_media_path(&source.root_path, &source.relative_path) {
             Ok(path) => path,
             Err(error) => {
@@ -856,7 +874,7 @@ impl StrmProbeService {
             return SourceOutcome::failed(
                 &source.source_id,
                 "FAILED",
-                "STRM source has no external URL".to_owned(),
+                "STRM file has no stored target; rescan the library to read it again".to_owned(),
             );
         };
         let url = match probe_target(&url, &source.root_path, &source.relative_path).await {
@@ -929,6 +947,7 @@ impl StrmProbeService {
     async fn record_probe_failure(
         &self,
         job: &StoredStrmProbeJob,
+        context: &ProbeLogContext,
         source_id: &str,
         status: &str,
         error: &str,
@@ -936,6 +955,9 @@ impl StrmProbeService {
         tracing::warn!(
             job_id = %job.id,
             source_id,
+            file = %context.relative_path,
+            target_kind = context.target_kind,
+            elapsed_ms = context.elapsed_ms,
             status,
             error,
             "STRM media probe failed"
@@ -956,9 +978,15 @@ impl StrmProbeService {
                 .await?;
             return Ok(0);
         }
+        let log_context = ProbeLogContext {
+            relative_path: outcome.relative_path.clone(),
+            target_kind: outcome.target_kind,
+            elapsed_ms: outcome.elapsed_ms,
+        };
         let Some(result) = outcome.result else {
             self.record_probe_failure(
                 job,
+                &log_context,
                 &outcome.source_id,
                 &outcome.failure_status,
                 &outcome.error,
@@ -1008,20 +1036,23 @@ impl StrmProbeService {
                     chapters: &[],
                 })
                 .await?;
-            if job.write_sidecars
-                && write_media_info_sidecar_with_context(
+            let sidecar_result = if job.write_sidecars {
+                write_media_info_sidecar_with_context(
                     &outcome.path,
                     &result.media,
                     outcome.sidecar_context,
                 )
                 .await
-                .is_err()
-            {
+            } else {
+                Ok(())
+            };
+            if let Err(error) = sidecar_result {
                 self.record_probe_failure(
                     job,
+                    &log_context,
                     &outcome.source_id,
                     "FAILED",
-                    "media info sidecar write failed",
+                    &format!("media info was saved but the mediainfo.json sidecar could not be written: {error}"),
                 )
                 .await?;
                 return Ok(1);
@@ -1031,9 +1062,10 @@ impl StrmProbeService {
             let Some(thumbnail) = result.thumbnail_jpeg.as_deref() else {
                 self.record_probe_failure(
                     job,
+                    &log_context,
                     &outcome.source_id,
                     "FAILED",
-                    "thumbnail output is missing",
+                    "plugin returned no thumbnail image although one was requested",
                 )
                 .await?;
                 return Ok(1);
@@ -1041,9 +1073,10 @@ impl StrmProbeService {
             if !is_valid_jpeg(thumbnail) {
                 self.record_probe_failure(
                     job,
+                    &log_context,
                     &outcome.source_id,
                     "FAILED",
-                    "thumbnail output is invalid",
+                    "plugin returned thumbnail data that is not a valid JPEG",
                 )
                 .await?;
                 return Ok(1);
@@ -1057,20 +1090,22 @@ impl StrmProbeService {
                 _ => {
                     self.record_probe_failure(
                         job,
-                        &outcome.source_id,
+                        &log_context,
+&outcome.source_id,
                         "FAILED",
-                        "STRM path has no valid thumbnail name",
+                        "no safe thumbnail path next to the STRM file (invalid name or outside the library root)",
                     )
                     .await?;
                     return Ok(1);
                 }
             };
-            if write_image_atomically(&target, thumbnail).await.is_err() {
+            if let Err(error) = write_image_atomically(&target, thumbnail).await {
                 self.record_probe_failure(
                     job,
+                    &log_context,
                     &outcome.source_id,
                     "FAILED",
-                    "thumbnail write failed",
+                    &format!("thumbnail could not be written next to the STRM file: {error}"),
                 )
                 .await?;
                 return Ok(1);
@@ -1087,17 +1122,19 @@ impl StrmProbeService {
                 dimensions.map(|(_, height)| height),
                 &content_tag,
             );
-            if self
+            if let Err(error) = self
                 .database
                 .insert_item_images_batch_at_indices(&[image_batch])
                 .await
-                .is_err()
             {
                 self.record_probe_failure(
                     job,
+                    &log_context,
                     &outcome.source_id,
                     "FAILED",
-                    "thumbnail registration failed",
+                    &format!(
+                        "thumbnail was written but could not be registered in the database: {error}"
+                    ),
                 )
                 .await?;
                 return Ok(1);
@@ -1584,6 +1621,55 @@ mod tests {
         database.close().await;
     }
 
+    #[tokio::test]
+    async fn failed_probe_outcome_names_the_file_target_kind_and_reason() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path().join("library");
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("library root");
+        tokio::fs::write(root.join("Movie.strm"), b"gone.mkv")
+            .await
+            .expect("strm file");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+
+        let outcome = service
+            .probe_source(
+                StoredStrmMediaSource {
+                    source_id: "source-1".to_owned(),
+                    item_id: "item-1".to_owned(),
+                    poster_fallback_required: false,
+                    has_media_info: false,
+                    external_url: Some("gone.mkv".to_owned()),
+                    root_path: root.to_string_lossy().into_owned(),
+                    relative_path: "Movie.strm".to_owned(),
+                    thumbnail_path: None,
+                    has_strm_thumbnail: false,
+                },
+                Arc::new(Semaphore::new(1)),
+                ProbeSourceOptions {
+                    include_ready: false,
+                    media_info_enabled: true,
+                    thumbnail_enabled: false,
+                    thumbnail_position_percent: 30,
+                    thumbnail_mode: ThumbnailScrapingMode::default(),
+                },
+            )
+            .await;
+
+        assert_eq!(outcome.relative_path, "Movie.strm");
+        assert_eq!(outcome.target_kind, "local_path");
+        assert_eq!(outcome.failure_status, "FAILED");
+        assert_eq!(outcome.error, "STRM local target is missing or not a file");
+        database.close().await;
+    }
+
     #[test]
     fn probe_progress_batches_updates_and_cancel_checks() {
         let start = Instant::now();
@@ -1666,6 +1752,9 @@ struct SourceOutcome {
     skipped: bool,
     failure_status: String,
     error: String,
+    relative_path: String,
+    target_kind: &'static str,
+    elapsed_ms: u64,
 }
 
 impl SourceOutcome {
@@ -1690,6 +1779,9 @@ impl SourceOutcome {
             thumbnail_needed,
             failure_status: String::new(),
             error: String::new(),
+            relative_path: String::new(),
+            target_kind: "unknown",
+            elapsed_ms: 0,
         }
     }
 
@@ -1706,6 +1798,9 @@ impl SourceOutcome {
             thumbnail_needed: false,
             failure_status: String::new(),
             error: String::new(),
+            relative_path: String::new(),
+            target_kind: "unknown",
+            elapsed_ms: 0,
         }
     }
 
@@ -1722,7 +1817,27 @@ impl SourceOutcome {
             thumbnail_needed: false,
             failure_status: status.to_owned(),
             error,
+            relative_path: String::new(),
+            target_kind: "unknown",
+            elapsed_ms: 0,
         }
+    }
+}
+
+struct ProbeLogContext {
+    relative_path: String,
+    target_kind: &'static str,
+    elapsed_ms: u64,
+}
+
+fn target_kind_label(kind: StrmTargetKind) -> &'static str {
+    match kind {
+        StrmTargetKind::Url => "http",
+        StrmTargetKind::Path => "local_path",
+        StrmTargetKind::Smb => "smb",
+        StrmTargetKind::Ftp => "ftp",
+        StrmTargetKind::Empty => "empty",
+        StrmTargetKind::Unsupported => "unsupported",
     }
 }
 
