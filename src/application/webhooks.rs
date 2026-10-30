@@ -281,6 +281,7 @@ impl WebhookService {
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
         if let Err(error) = self
             .database
+            .notifications()
             .create_notification_destination(NewNotificationDestination {
                 id: &id,
                 name,
@@ -308,6 +309,7 @@ impl WebhookService {
     ) -> Result<Vec<WebhookDestinationView>, WebhookError> {
         let destinations = self
             .database
+            .notifications()
             .list_notification_destinations(offset, limit)
             .await?;
         let secrets = self.read_secrets().await?;
@@ -334,6 +336,7 @@ impl WebhookService {
     ) -> Result<Vec<WebhookDeliveryView>, WebhookError> {
         Ok(self
             .database
+            .notifications()
             .list_notification_deliveries(offset, limit)
             .await?
             .into_iter()
@@ -342,7 +345,12 @@ impl WebhookService {
     }
 
     pub async fn retry_delivery(&self, id: &str) -> Result<(), WebhookError> {
-        if !self.database.retry_notification_delivery(id).await? {
+        if !self
+            .database
+            .notifications()
+            .retry_notification_delivery(id)
+            .await?
+        {
             return Err(WebhookError::NotFound);
         }
         Ok(())
@@ -409,6 +417,7 @@ impl WebhookService {
     ) -> Result<WebhookDestinationView, WebhookError> {
         let current = self
             .database
+            .notifications()
             .find_notification_destination(id)
             .await?
             .ok_or(WebhookError::NotFound)?;
@@ -446,6 +455,7 @@ impl WebhookService {
         let normalized_payload_format = payload_format.map(normalize_payload_format).transpose()?;
         let provider_config_json = provider_config.map(provider_config_json).transpose()?;
         self.database
+            .notifications()
             .update_notification_destination(
                 id,
                 UpdateNotificationDestination {
@@ -467,7 +477,12 @@ impl WebhookService {
     }
 
     pub async fn delete_destination(&self, id: &str) -> Result<(), WebhookError> {
-        if !self.database.delete_notification_destination(id).await? {
+        if !self
+            .database
+            .notifications()
+            .delete_notification_destination(id)
+            .await?
+        {
             return Err(WebhookError::NotFound);
         }
         self.set_secret(id, None).await
@@ -476,6 +491,7 @@ impl WebhookService {
     pub async fn rotate_secret(&self, id: &str) -> Result<String, WebhookError> {
         if self
             .database
+            .notifications()
             .find_notification_destination(id)
             .await?
             .is_none()
@@ -496,6 +512,7 @@ impl WebhookService {
     ) -> Result<Option<String>, WebhookError> {
         let destinations = self
             .database
+            .notifications()
             .list_enabled_notification_destinations()
             .await?;
         let mut destination_groups = BTreeMap::<WebhookPayloadFormat, Vec<String>>::new();
@@ -548,6 +565,7 @@ impl WebhookService {
             };
             let inserted = self
                 .database
+                .notifications()
                 .insert_notification_event_with_deliveries(
                     NewNotificationEvent {
                         id: &event_id,
@@ -570,6 +588,7 @@ impl WebhookService {
     pub async fn test_destination(&self, id: &str) -> Result<u16, WebhookError> {
         let destination = self
             .database
+            .notifications()
             .find_notification_destination(id)
             .await?
             .ok_or(WebhookError::NotFound)?;
@@ -650,6 +669,7 @@ impl WebhookService {
         for _ in 0..10 {
             match self
                 .database
+                .notifications()
                 .prune_notification_history(cutoff, HISTORY_RETENTION_BATCH_SIZE)
                 .await
             {
@@ -678,7 +698,11 @@ impl WebhookService {
     }
 
     pub async fn process_ready_deliveries(&self) -> Result<usize, WebhookError> {
-        let deliveries = self.database.list_ready_notification_deliveries(10).await?;
+        let deliveries = self
+            .database
+            .notifications()
+            .list_ready_notification_deliveries(10)
+            .await?;
         if deliveries.is_empty() {
             return Ok(0);
         }
@@ -687,6 +711,7 @@ impl WebhookService {
         for delivery in deliveries {
             if !self
                 .database
+                .notifications()
                 .claim_notification_delivery(&delivery.id, DELIVERY_LEASE_SECONDS)
                 .await?
             {
@@ -757,6 +782,7 @@ impl WebhookService {
         match result {
             Ok(status) => {
                 self.database
+                    .notifications()
                     .mark_notification_delivered(&delivery.id, i64::from(status))
                     .await?
             }
@@ -788,6 +814,7 @@ impl WebhookService {
                     .unwrap_or_default()
                     .max(retry_delay(delivery.attempt_count));
                 self.database
+                    .notifications()
                     .mark_notification_retry(
                         &delivery.id,
                         status,
@@ -914,7 +941,12 @@ impl WebhookService {
     }
 
     async fn view_by_id(&self, id: &str) -> Result<Option<WebhookDestinationView>, WebhookError> {
-        let Some(destination) = self.database.find_notification_destination(id).await? else {
+        let Some(destination) = self
+            .database
+            .notifications()
+            .find_notification_destination(id)
+            .await?
+        else {
             return Ok(None);
         };
         let secrets = self.read_secrets().await?;

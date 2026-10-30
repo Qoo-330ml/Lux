@@ -141,11 +141,10 @@ impl Database {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_person_index_rebuild_job)
-                .collect()
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_person_index_rebuild_job)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -162,7 +161,9 @@ impl Database {
         .bind(library_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_person_index_rebuild_job))
+        .map_err(self.sqlx_err())?
+        .map(stored_person_index_rebuild_job)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -625,7 +626,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
         {
-            let stored = stored_canonical_person(person);
+            let stored = stored_canonical_person(person).map_err(self.sqlx_err())?;
             transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(stored);
         }
@@ -692,7 +693,7 @@ impl Database {
             .fetch_one(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let stored = stored_canonical_person(person);
+        let stored = stored_canonical_person(person).map_err(self.sqlx_err())?;
         if stored.id != person_id {
             self.query("DELETE FROM people WHERE id = ?")
                 .bind(&person_id)
@@ -719,7 +720,9 @@ impl Database {
         .bind(provider_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_canonical_person))
+        .map_err(self.sqlx_err())?
+        .map(stored_canonical_person)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -951,11 +954,10 @@ impl Database {
         .bind(offset)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_person_match_candidate)
-                .collect()
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_person_match_candidate)
+        .collect::<Result<Vec<_>, _>>()
         .map_err(self.sqlx_err())
     }
 
@@ -973,7 +975,9 @@ impl Database {
         .bind(candidate_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_person_match_candidate))
+        .map_err(self.sqlx_err())?
+        .map(stored_person_match_candidate)
+        .transpose()
         .map_err(self.sqlx_err())
     }
 
@@ -1023,6 +1027,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
             .map(stored_person_match_candidate)
+            .transpose()
+            .map_err(self.sqlx_err())?
             .ok_or_else(|| {
                 StorageError::Conflict(format!("person match candidate '{candidate_id}' not found"))
             })?;
@@ -1140,6 +1146,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?
             .map(stored_person_match_candidate)
+            .transpose()
+            .map_err(self.sqlx_err())?
             .ok_or_else(|| {
                 StorageError::Conflict(format!("person match candidate '{candidate_id}' not found"))
             })?;
@@ -1455,7 +1463,7 @@ impl Database {
             .fetch_one(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        let stored = stored_canonical_person(row);
+        let stored = stored_canonical_person(row).map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(stored)
     }
@@ -1690,7 +1698,7 @@ impl Database {
             )));
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
-        Ok(stored_canonical_person(person))
+        stored_canonical_person(person).map_err(self.sqlx_err())
     }
 
     pub(crate) async fn attach_canonical_person_identities(
@@ -1787,7 +1795,7 @@ impl Database {
         }
 
         transaction.commit().await.map_err(self.sqlx_err())?;
-        Ok(stored_canonical_person(person))
+        stored_canonical_person(person).map_err(self.sqlx_err())
     }
 
     /// One page of item ids credited to a person, ordered by item id.
@@ -2012,7 +2020,8 @@ impl Database {
             .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok((rows, total))
     }
 
@@ -2168,7 +2177,8 @@ impl Database {
             .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok((rows, total))
     }
 
@@ -2241,7 +2251,8 @@ impl Database {
             .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok(rows)
     }
 
@@ -2308,7 +2319,8 @@ impl Database {
             .map_err(self.sqlx_err())?
             .into_iter()
             .map(stored_person_credit)
-            .collect();
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())?;
         Ok(rows)
     }
 
