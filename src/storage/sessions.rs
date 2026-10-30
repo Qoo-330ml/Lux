@@ -41,6 +41,142 @@ struct PlayedParentStateRow {
     is_played: i64,
 }
 
+/// Row of [`Database::find_web_playback_access_context`].
+#[derive(Debug, sqlx::FromRow)]
+struct WebPlaybackAccessContextRow {
+    user_id: String,
+    authorization_device_id: Option<String>,
+    authorization_client_name: Option<String>,
+}
+
+impl From<WebPlaybackAccessContextRow> for StoredWebPlaybackAccessContext {
+    fn from(row: WebPlaybackAccessContextRow) -> Self {
+        Self {
+            user_id: row.user_id,
+            device_id: row.authorization_device_id,
+            client_name: row.authorization_client_name,
+        }
+    }
+}
+
+/// Row of [`Database::find_emby_direct_playback_ticket`].
+#[derive(Debug, sqlx::FromRow)]
+struct EmbyDirectPlaybackTicketRow {
+    user_id: String,
+    play_session_id: String,
+    authorization_device_id: Option<String>,
+    authorization_client_name: Option<String>,
+    expires_at: i64,
+    revoked_at: Option<i64>,
+    created_at: i64,
+}
+
+impl From<EmbyDirectPlaybackTicketRow> for StoredEmbyDirectPlaybackTicket {
+    fn from(row: EmbyDirectPlaybackTicketRow) -> Self {
+        Self {
+            user_id: row.user_id,
+            play_session_id: row.play_session_id,
+            authorization_device_id: row.authorization_device_id,
+            authorization_client_name: row.authorization_client_name,
+            expires_at: row.expires_at,
+            revoked_at: row.revoked_at,
+            created_at: row.created_at,
+        }
+    }
+}
+
+/// Row of [`Database::transcoding_history_page`]; the two name columns come from `LEFT JOIN`s and
+/// stay optional.
+#[derive(Debug, sqlx::FromRow)]
+struct TranscodingHistoryRow {
+    id: String,
+    session_id: String,
+    user_id: String,
+    user_name: Option<String>,
+    item_id: String,
+    item_title: Option<String>,
+    item_type: Option<String>,
+    media_source_id: Option<String>,
+    tier: i64,
+    outcome: String,
+    started_at: i64,
+    finished_at: i64,
+    wall_seconds: i64,
+    encoded_seconds: Option<i64>,
+    average_speed: Option<f64>,
+    last_fps: Option<f64>,
+    output_bytes: Option<i64>,
+    failure_reason: Option<String>,
+}
+
+impl From<TranscodingHistoryRow> for StoredTranscodingHistory {
+    fn from(row: TranscodingHistoryRow) -> Self {
+        Self {
+            id: row.id,
+            session_id: row.session_id,
+            user_id: row.user_id,
+            user_name: row.user_name,
+            item_id: row.item_id,
+            item_title: row.item_title,
+            item_type: row.item_type,
+            media_source_id: row.media_source_id,
+            tier: row.tier,
+            outcome: row.outcome,
+            started_at: row.started_at,
+            finished_at: row.finished_at,
+            wall_seconds: row.wall_seconds,
+            encoded_seconds: row.encoded_seconds,
+            average_speed: row.average_speed,
+            last_fps: row.last_fps,
+            output_bytes: row.output_bytes,
+            failure_reason: row.failure_reason,
+        }
+    }
+}
+
+/// Row of [`Database::active_server_transcoding_sessions`]; the two name columns come from
+/// `LEFT JOIN`s and stay optional.
+#[derive(Debug, sqlx::FromRow)]
+struct TranscodingSessionRow {
+    session_id: String,
+    user_id: String,
+    user_name: Option<String>,
+    item_id: String,
+    item_title: Option<String>,
+    item_type: Option<String>,
+    tier: i64,
+    state: String,
+    expires_at: i64,
+    created_at: i64,
+    updated_at: i64,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    audio_bitrate: Option<i64>,
+    transcoding_container: Option<String>,
+}
+
+impl From<TranscodingSessionRow> for StoredTranscodingSessionRow {
+    fn from(row: TranscodingSessionRow) -> Self {
+        Self {
+            session_id: row.session_id,
+            user_id: row.user_id,
+            user_name: row.user_name,
+            item_id: row.item_id,
+            item_title: row.item_title,
+            item_type: row.item_type,
+            tier: row.tier,
+            state: row.state,
+            expires_at: row.expires_at,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            video_codec: row.video_codec,
+            audio_codec: row.audio_codec,
+            audio_bitrate: row.audio_bitrate,
+            transcoding_container: row.transcoding_container,
+        }
+    }
+}
+
 impl Database {
     pub(crate) async fn list_current_user_playback_sessions(
         &self,
@@ -881,7 +1017,7 @@ impl Database {
         &self,
         session_id: &str,
     ) -> Result<Option<StoredWebPlaybackAccessContext>, StorageError> {
-        self.query(
+        self.query_as::<WebPlaybackAccessContextRow>(
             "SELECT user_id, authorization_device_id, authorization_client_name
              FROM web_playback_sessions
              WHERE id = ? AND state = 'ACTIVE'",
@@ -889,13 +1025,7 @@ impl Database {
         .bind(session_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredWebPlaybackAccessContext {
-                user_id: row.get("user_id"),
-                device_id: row.get("authorization_device_id"),
-                client_name: row.get("authorization_client_name"),
-            })
-        })
+        .map(|row| row.map(StoredWebPlaybackAccessContext::from))
         .map_err(self.sqlx_err())
     }
 
@@ -950,7 +1080,7 @@ impl Database {
         user_id: &str,
         play_session_id: &str,
     ) -> Result<Option<StoredEmbyDirectPlaybackTicket>, StorageError> {
-        self.query(
+        self.query_as::<EmbyDirectPlaybackTicketRow>(
             "SELECT user_id, play_session_id, authorization_device_id,
                     authorization_client_name, expires_at, revoked_at, created_at
              FROM emby_direct_playback_tickets
@@ -960,17 +1090,7 @@ impl Database {
         .bind(play_session_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredEmbyDirectPlaybackTicket {
-                user_id: row.get("user_id"),
-                play_session_id: row.get("play_session_id"),
-                authorization_device_id: row.get("authorization_device_id"),
-                authorization_client_name: row.get("authorization_client_name"),
-                expires_at: row.get("expires_at"),
-                revoked_at: row.get("revoked_at"),
-                created_at: row.get("created_at"),
-            })
-        })
+        .map(|row| row.map(StoredEmbyDirectPlaybackTicket::from))
         .map_err(self.sqlx_err())
     }
 
@@ -1080,7 +1200,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let rows = self
-            .query(
+            .query_as::<TranscodingHistoryRow>(
                 "SELECT h.id, h.session_id, h.user_id, u.display_name AS user_name,
                         h.item_id, mi.title AS item_title, mi.item_type, h.media_source_id,
                         h.tier, h.outcome, h.started_at, h.finished_at, h.wall_seconds,
@@ -1099,26 +1219,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         Ok((
             rows.into_iter()
-                .map(|row| StoredTranscodingHistory {
-                    id: row.get("id"),
-                    session_id: row.get("session_id"),
-                    user_id: row.get("user_id"),
-                    user_name: row.get("user_name"),
-                    item_id: row.get("item_id"),
-                    item_title: row.get("item_title"),
-                    item_type: row.get("item_type"),
-                    media_source_id: row.get("media_source_id"),
-                    tier: row.get("tier"),
-                    outcome: row.get("outcome"),
-                    started_at: row.get("started_at"),
-                    finished_at: row.get("finished_at"),
-                    wall_seconds: row.get("wall_seconds"),
-                    encoded_seconds: row.get("encoded_seconds"),
-                    average_speed: row.get("average_speed"),
-                    last_fps: row.get("last_fps"),
-                    output_bytes: row.get("output_bytes"),
-                    failure_reason: row.get("failure_reason"),
-                })
+                .map(StoredTranscodingHistory::from)
                 .collect(),
             total,
         ))
@@ -1129,7 +1230,7 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<StoredTranscodingSessionRow>, StorageError> {
-        self.query(
+        self.query_as::<TranscodingSessionRow>(
             "SELECT w.id AS session_id, w.user_id, u.display_name AS user_name,
                     w.item_id, mi.title AS item_title, mi.item_type, w.tier, w.state,
                     w.expires_at, w.created_at, w.updated_at, w.video_codec, w.audio_codec,
@@ -1146,23 +1247,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredTranscodingSessionRow {
-                    session_id: row.get("session_id"),
-                    user_id: row.get("user_id"),
-                    user_name: row.get("user_name"),
-                    item_id: row.get("item_id"),
-                    item_title: row.get("item_title"),
-                    item_type: row.get("item_type"),
-                    tier: row.get("tier"),
-                    state: row.get("state"),
-                    expires_at: row.get("expires_at"),
-                    created_at: row.get("created_at"),
-                    updated_at: row.get("updated_at"),
-                    video_codec: row.get("video_codec"),
-                    audio_codec: row.get("audio_codec"),
-                    audio_bitrate: row.get("audio_bitrate"),
-                    transcoding_container: row.get("transcoding_container"),
-                })
+                .map(StoredTranscodingSessionRow::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -1578,11 +1663,155 @@ pub(crate) struct StoredTranscodingHistory {
 }
 
 #[cfg(test)]
-mod session_bound_tests {
-    use super::MAX_LISTED_PLAYBACK_SESSIONS;
+mod tests {
+    use super::*;
+    use crate::storage::test_database;
+    use sqlx::FromRow;
 
     #[test]
     fn session_listing_bound_is_small_enough_to_stay_cheap() {
         assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
+    }
+
+    /// Creates the user, library and movie that the transcoding readers join against.
+    async fn insert_transcoding_fixtures(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('library-a', 'Library A', 'MIXED')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO users (id, username_normalized, display_name, password_hash)
+             VALUES ('user-a', 'user-a', 'User A', 'hash')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('item-a', 'library-a', 'MOVIE', 'Movie A', 'movie a', 'LOCAL_CONFIRMED')",
+        )
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transcoding_history_page_decodes_named_row_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_transcoding_fixtures(&database).await?;
+        database
+            .insert_transcoding_history(NewTranscodingHistory {
+                id: "history-a",
+                session_id: "play-session-a",
+                user_id: "user-a",
+                item_id: "item-a",
+                media_source_id: Some("source-a"),
+                tier: 2,
+                outcome: "COMPLETED",
+                started_at: 100,
+                finished_at: 300,
+                wall_seconds: 200,
+                encoded_seconds: Some(180),
+                average_speed: Some(1.5),
+                last_fps: Some(24.0),
+                output_bytes: Some(4096),
+                failure_reason: None,
+                now: 300,
+            })
+            .await?;
+
+        let (rows, total) = database.transcoding_history_page(10, 0).await?;
+        assert_eq!(total, 1);
+        let row = rows
+            .first()
+            .ok_or("transcoding history row was not returned")?;
+        assert_eq!(row.id, "history-a");
+        assert_eq!(row.session_id, "play-session-a");
+        assert_eq!(row.user_id, "user-a");
+        assert_eq!(row.user_name.as_deref(), Some("User A"));
+        assert_eq!(row.item_id, "item-a");
+        assert_eq!(row.item_title.as_deref(), Some("Movie A"));
+        assert_eq!(row.item_type.as_deref(), Some("MOVIE"));
+        assert_eq!(row.media_source_id.as_deref(), Some("source-a"));
+        assert_eq!(row.tier, 2);
+        assert_eq!(row.outcome, "COMPLETED");
+        assert_eq!(row.started_at, 100);
+        assert_eq!(row.finished_at, 300);
+        assert_eq!(row.wall_seconds, 200);
+        assert_eq!(row.encoded_seconds, Some(180));
+        assert_eq!(row.average_speed, Some(1.5));
+        assert_eq!(row.last_fps, Some(24.0));
+        assert_eq!(row.output_bytes, Some(4096));
+        assert_eq!(row.failure_reason, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn active_server_transcoding_sessions_decodes_named_row_fields()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_transcoding_fixtures(&database).await?;
+        sqlx::query(
+            "INSERT INTO web_playback_sessions (
+                 id, user_id, item_id, media_source_id, play_session_id, tier, plan, state,
+                 temp_dir, is_admin, expires_at, last_heartbeat_at, last_sequence,
+                 video_codec, audio_codec, video_bitrate, audio_bitrate, transcoding_container,
+                 created_at, updated_at
+             ) VALUES (
+                 'session-a', 'user-a', 'item-a', NULL, 'play-a', 3, 'SERVER_HLS', 'ACTIVE',
+                 '/tmp/transcode', 0, 500, 150, 4,
+                 'h264', 'aac', 2000, 128, 'mkv',
+                 10, 20
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let rows = database.active_server_transcoding_sessions(10).await?;
+        let row = rows
+            .first()
+            .ok_or("transcoding session row was not returned")?;
+        assert_eq!(row.session_id, "session-a");
+        assert_eq!(row.user_id, "user-a");
+        assert_eq!(row.user_name.as_deref(), Some("User A"));
+        assert_eq!(row.item_id, "item-a");
+        assert_eq!(row.item_title.as_deref(), Some("Movie A"));
+        assert_eq!(row.item_type.as_deref(), Some("MOVIE"));
+        assert_eq!(row.tier, 3);
+        assert_eq!(row.state, "ACTIVE");
+        assert_eq!(row.expires_at, 500);
+        assert_eq!(row.created_at, 10);
+        assert_eq!(row.updated_at, 20);
+        assert_eq!(row.video_codec.as_deref(), Some("h264"));
+        assert_eq!(row.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(row.audio_bitrate, Some(128));
+        assert_eq!(row.transcoding_container.as_deref(), Some("mkv"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn transcoding_rows_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error =
+            TranscodingHistoryRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
+        let error =
+            TranscodingSessionRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
+        Ok(())
     }
 }
