@@ -439,6 +439,8 @@ impl PlaybackAccessCache {
         );
     }
 
+    /// The number of stored entries; only the capacity test needs to look inside.
+    #[cfg(test)]
     fn len(&self) -> usize {
         self.entries
             .lock()
@@ -615,9 +617,9 @@ mod tests {
                 .await?
         );
         let uncached_queries = fixture.database.query_count();
-        assert!(
-            uncached_queries > 0,
-            "the first playback check still has to read library access and content restrictions"
+        assert_eq!(
+            uncached_queries, 2,
+            "the first playback check reads library access and the content-restriction policy"
         );
 
         fixture.database.reset_query_count();
