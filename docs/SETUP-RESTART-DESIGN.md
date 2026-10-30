@@ -277,11 +277,81 @@ spawn 真实二进制，但只发 SIGTERM（`ShutdownReason::Shutdown`），与�
 
 ## 6. 设计问题 5：测试策略
 
-（待填）
+### 6.1 为什么测试里不会真的 `exec`
+
+`exec` 只存在于 bin 目标的 `main.rs:346-359`，调用点 `main.rs:284`。集成测试用
+`app_with_state(...)` 在进程内起 axum（`tests/api_web/web_auth.rs:24-33`），且默认**没有**重启句柄；
+只有显式 `.with_restart_handle(..)` 才注入我们自己的 `watch` 通道。因此“响应先于重启”可以在进程内
+完整断言，不需要替身框架。
+
+### 6.2 后端用例（目标组见 `docs/TEST-TARGETS.md`）
+
+| 用例 | 位置/命令 | 断言 |
+| --- | --- | --- |
+| `setup_complete_requests_a_restart_after_the_response` | `tests/api_web/web_auth.rs`，`cargo test --locked --test api_web web_auth::`（`docs/TEST-TARGETS.md:60`） | 注入 `with_restart_handle` + `with_setup_restart_delay(200ms)`，并在测试里持有 `watch::Receiver`：拿到 `201` + `restarting: true` 之后**立即**断言 `*rx.borrow() == Running`（响应已送达、重启尚未排上），再 `timeout(5s, rx.changed())` 断言变成 `Restart` |
+| `setup_complete_without_a_restart_handle_keeps_the_created_body` | 同上 | 201、`restarting: false`、`user`/`library`/`scanJob` 字段与今天逐字一致（防止“为了重启而改动响应形状”） |
+| `setup_complete_does_not_restart_when_the_admin_exists` | 同上 | 第二次 POST 得 409 `SETUP_ALREADY_COMPLETED`，并在 500 ms 后仍为 `Running` |
+| `setup_complete_restarts_even_when_the_first_library_is_rejected` | 同上 | 非法 `rootPath` → 4xx，但随后仍观察到 `Restart`（对应 §4.2 的部分成功策略） |
+| `startup_resumes_first_scans_interrupted_by_shutdown` | `tests/scanner/shutdown_jobs.rs`，`cargo test --locked --test scanner shutdown_jobs::`（`docs/TEST-TARGETS.md:91`） | 建库 + 加根 + 建扫描任务 → `cancel_incomplete_jobs_for_shutdown()` → 跑恢复流程 → 该库出现新的 `PENDING/RUNNING` 任务，`libraries.last_scan_at` 仍为 `NULL` |
+| 恢复流程的反向用例 | 同上 | ① `last_scan_at` 已写 → 不恢复；② 任务 `error != 'SERVER_SHUTDOWN'`（真实失败）→ 不恢复；③ 库已停用 → 不恢复；④ 库没有 root → 不恢复（这一条正是 SQL 里 `EXISTS(library_roots)` 的作用，`start_library_scan` 本身不拒绝零 root 的库，见 `src/application/scanner/jobs/lifecycle.rs:910`）；⑤ 连跑两次 → 只产生一个活动任务（第二次走 `AlreadyActive` 跳过） |
+| `restart_handle` 一次性 | `src/application/restart.rs:33-45`（已有） | 复用现有单元测试，不新增 |
+
+**为什么 200 ms 的时序断言不会 flaky**：201 是本地 reqwest 往返（毫秒级以内），200 ms 是三个数量级
+以上的余量；上界用 5 s 超时。若阶段 2 实测发现 CI 抖动，可把注入延迟提到 500 ms，或改用
+`tokio::time::pause()/advance()`（但暂停时钟下 `tokio` 会在空闲时自动推进，断言顺序反而不可控，
+故不默认使用）。
+
+**默认延迟不拖慢现有测试**：只有注入了重启句柄的用例才会 spawn 延迟任务；现有所有
+`setup/complete` 用例（`tests/api_web/web_auth.rs:58`、`tests/library/libraries_api.rs:113`、
+`tests/storage/database_setup_api.rs:78` 等）都没有句柄，走 `restarting: false` 分支，零等待。
+
+### 6.3 前端用例
+
+`web/tests/setup-page.test.tsx`（现有 mock 风格见 `:69-90`）：
+
+1. `setup` mock 返回 `{ user, restarting: true }` → 完成初始化后出现“正在重启 Lux”与 `aria-busy`，
+   且**没有**立即跳转登录；
+2. 让 `setupStatus` 的第一次调用 reject（模拟端口关闭）、第二次 resolve `{ initialized: true }` →
+   最终进入登录页；
+3. `restarting` 缺省（旧后端）→ 行为与今天一致（直接跳转）。
+
+命令：`pnpm --dir web exec vitest run tests/setup-page.test.tsx`，另跑 `pnpm --dir web test`、
+`pnpm --dir web build`（`AGENTS.md` 的 Web 门禁）。
+
+### 6.4 不做的自动化
+
+“真正 `exec` 后服务重新可用”的端到端验证不进 CI：`tests/shutdown.rs:59` 已经有“spawn 真实二进制 +
+发信号”的夹具，但重启会把测试进程自身 `exec` 掉，需要额外的子进程隔离与端口/配置注入。阶段 2 在
+本机手动验证一次（Docker 与裸进程各一次），并在 `docs/LUX-DEVELOPMENT.md` 的任务条目里记录。
 
 ## 7. 设计问题 6：回滚
 
-（待填）
+### 7.1 提交切分（每步可单独回退）
+
+| 提交 | 内容 | 单独回退后的状态 |
+| --- | --- | --- |
+| C1 | `setup_complete` 排期重启 + `restarting` 字段 + `CoreState.setup_restart_delay`（含注入辅助） | setup 不再重启，其余不变；响应里少一个可选字段（旧前端本来就不读）。恢复流程 C2 失去生产者，但只会对“任何被重启打断的首次扫描”生效，无害 |
+| C2 | `scan_jobs` 恢复查询 + `resume_shutdown_interrupted_first_scans` + `main.rs` 接线 | setup 创建的库在重启后不会被自动扫描（回到今天的行为）；重启行为不受影响 |
+| C3 | 前端重启引导 + `setup()` 返回类型 | 后端照样重启；旧界面在 201 后立刻跳登录，可能失败一次让用户重试 → 降级可用 |
+| C4 | `docs/SETUP-RESTART-DESIGN.md`、`docs/LUX-DEVELOPMENT.md` 任务条目 | 纯文档 |
+
+### 7.2 与方案 A 的隔离
+
+- 三个代码提交都**不触碰** `ReadyServices`（`src/api/legacy.rs:259` 起的 `AppState`）、
+  `require_ready!`（`src/api/mod.rs:51`）与路由注册（`src/api/users.rs:3122` 的 `api_routes`），
+  因此方案 A 的步骤 1+2（已合并）不受回滚影响。
+- **无 schema 变更**：推荐方案 (b) 不新增表/列（这正是它相对 (a1)/(c) 的额外优势），回退代码后数据库
+  不需要修复或迁移；`scan_jobs` 里的取消记录本来就属于“被关停打断”的既有语义。
+- **回滚边界是第 ③ 步之前**：如果第 ③ 步（Router 拆分）已经合并，单独回退 C1 会让进程永远停在
+  setup 模式（ready 路由没挂载），此时必须同时回退第 ③ 步。因此第 ③ 步应在本文档验证通过、稳定一个
+  发布周期后再动。
+
+### 7.3 线上救火（不回退代码）
+
+- 最轻的开关是“延迟注入”的公开形态：阶段 2 可决定是否把它接到 `Config`（例如
+  `LUX_SETUP_RESTART_DELAY_MS`，默认 250）。**建议先不加环境变量**（项目惯例是不为假设需求加配置），
+  真的出现“重启过早”问题时，把 C1 里延迟常量调大即可，仍只是一个常量改动。
+- 若首次扫描恢复出现异常（重复扫描/扫描风暴），单独回退 C2 即可止血，不影响 setup 流程本身。
 
 ## 8. 时序与数据流
 
