@@ -255,6 +255,13 @@ impl Database {
                 .map_err(self.sqlx_err())?
                 .rows_affected();
         }
+        if restored > 0 {
+            // Items became visible again, so their derived rows (read model, search index,
+            // collection membership) are stale. The signal is sent from the one place every scan
+            // path reaches; the caller commits immediately after, and a consumer that wakes inside
+            // that window simply finds nothing and looks again on the next signal or fallback.
+            self.signal_outbox_consumers();
+        }
         Ok(restored)
     }
 
