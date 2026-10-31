@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::{
+    auth::cache::ExpiringCache,
     domain::{
         content_restrictions::{
             ContentRestrictionClassification, ContentRestrictionPolicy,
@@ -15,7 +16,7 @@ use crate::{
     },
     storage::{
         AccessChangeEpochs, AccessEpoch, Database, GLOBAL_COLLECTION_LIBRARY_ID, StorageError,
-        StoredPlaybackSource,
+        StoredPlaybackSource, UserContentRestrictions,
     },
 };
 
@@ -66,23 +67,42 @@ impl AccessPrincipal {
     }
 }
 
+/// The per-user parental-control policy, resolved once per cache window.
+///
+/// Only the policy is cached. Library access is still checked per request: the access layer must
+/// never answer from a value that a database write outside the storage API could have invalidated,
+/// and library access rows are exactly such an input (the frozen end-to-end tests change them with
+/// direct SQL). Per-item certification rows are likewise read per item, so a rescan is visible
+/// immediately.
+#[derive(Clone)]
+struct CachedRestrictionPolicy {
+    restrictions: Option<UserContentRestrictions>,
+    /// Captured before the policy row was read; a hit is only served while it is still current.
+    epoch: AccessEpoch,
+}
+
 /// Answers the access questions that every request asks.
 ///
-/// The service is also the home of the one access cache in the application: the playback progress
-/// path re-asks "may this user view this item" every ~10 s for the whole session, so
-/// [`Self::can_view_item_cached`] and [`Self::can_view_item_in_library_cached`] may reuse an
-/// earlier "allowed" answer for up to [`PLAYBACK_ACCESS_CACHE_TTL`]. Those two entry points are
-/// **only** for the playback progress handlers: every other endpoint must use the uncached checks so
-/// an administrative change is visible on its very next request.
+/// The service is also the home of the access caches in the application, both guarded by the change
+/// epochs stored next to the writes (`crate::storage::AccessChangeEpochs`):
 ///
-/// Denials are never cached, so a newly granted permission takes effect immediately. Denied-by-
-/// permission writes are invalidated by the change epochs stored next to the writes
-/// (`crate::storage::AccessChangeEpochs`); anything that does not go through one of those writes
-/// (an item's content-restriction index being rebuilt, for example) can lag until the TTL expires.
+/// * the playback progress path re-asks "may this user view this item" every ~10 s for the whole
+///   session, so [`Self::can_view_item_cached`] and [`Self::can_view_item_in_library_cached`] may
+///   reuse an earlier "allowed" answer for up to [`PLAYBACK_ACCESS_CACHE_TTL`]. Those two entry
+///   points are **only** for the playback progress handlers: every other endpoint must use the
+///   uncached checks so an administrative change is visible on its very next request;
+/// * the per-user parental-control policy is cached for [`crate::auth::cache::CACHE_TTL`] because
+///   every item check reads it. Library access, item certifications and administrator visibility
+///   are still read per request.
+///
+/// Denials are never cached by the playback cache, so a newly granted permission takes effect
+/// immediately. Anything that does not go through one of the epoch-bumping writes (an item's
+/// content-restriction index being rebuilt, for example) can lag until the TTL expires.
 #[derive(Clone)]
 pub struct MediaAccessService {
     database: Database,
     playback_access_cache: PlaybackAccessCache,
+    restriction_cache: Arc<ExpiringCache<CachedRestrictionPolicy>>,
 }
 
 impl MediaAccessService {
@@ -90,7 +110,45 @@ impl MediaAccessService {
         Self {
             database,
             playback_access_cache: PlaybackAccessCache::new(),
+            restriction_cache: Arc::new(ExpiringCache::default()),
         }
+    }
+
+    /// Reads the user's parental-control policy, reusing it while its epochs are unchanged.
+    ///
+    /// The epoch is captured *before* the policy row is read; when it moved while the query ran the
+    /// policy is returned but not cached, so a stale answer can never be stored.
+    async fn restriction_policy(
+        &self,
+        user_id: UserId,
+    ) -> Result<Arc<CachedRestrictionPolicy>, AccessError> {
+        let user_id = user_id.to_string();
+        let epochs = self.database.access_changes();
+        if let Some(entry) = self
+            .restriction_cache
+            .lookup(user_id.as_bytes(), Instant::now())
+        {
+            let policy = entry.value();
+            if policy.epoch == epochs.snapshot(&user_id) {
+                return Ok(policy);
+            }
+        }
+        let epoch = epochs.snapshot(&user_id);
+        let restrictions = self.database.user_content_restrictions(&user_id).await?;
+        if epochs.snapshot(&user_id) == epoch {
+            self.restriction_cache.store(
+                user_id.clone().into_bytes(),
+                CachedRestrictionPolicy {
+                    restrictions: restrictions.clone(),
+                    epoch,
+                },
+                Instant::now(),
+            );
+        }
+        Ok(Arc::new(CachedRestrictionPolicy {
+            restrictions,
+            epoch,
+        }))
     }
 
     pub async fn can_view_library(
@@ -222,8 +280,11 @@ impl MediaAccessService {
         if principal.is_admin {
             return Ok(true);
         }
-        let user_id = principal.user_id_string();
-        let Some(restrictions) = self.database.user_content_restrictions(&user_id).await? else {
+        let Some(user_id) = principal.user_id else {
+            return Ok(true);
+        };
+        let policy = self.restriction_policy(user_id).await?;
+        let Some(restrictions) = policy.restrictions.as_ref() else {
             return Ok(true);
         };
         let policy = ContentRestrictionPolicy {
@@ -1066,6 +1127,14 @@ mod tests {
         let principal = AccessPrincipal::new(user.id, false);
         assert!(access.can_view_item(principal, "policy-episode").await?);
 
+        database.reset_query_count();
+        assert!(access.can_view_item(principal, "policy-episode").await?);
+        assert_eq!(
+            database.query_count(),
+            2,
+            "a warm policy cache re-reads only the item library and the library access, not the policy"
+        );
+
         let initial = database
             .compare_and_swap_user_content_restrictions(
                 &user_id,
@@ -1214,6 +1283,154 @@ mod tests {
         Ok(())
     }
 
+    async fn library_fixture() -> Result<
+        (
+            Database,
+            MediaAccessService,
+            AccessPrincipal,
+            String,
+            (String, String),
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        Box::leak(Box::new(directory));
+        let user = UserStore::new(database.clone())?
+            .create_user("access-cache-viewer", "Viewer", "test password", false)
+            .await?;
+        let libraries = LibraryService::new(database.clone());
+        let first = libraries
+            .create_library("Access cache A", LibraryKind::Movie, false)
+            .await?;
+        let second = libraries
+            .create_library("Access cache B", LibraryKind::Movie, false)
+            .await?;
+        let service = MediaAccessService::new(database.clone());
+        Ok((
+            database,
+            service,
+            AccessPrincipal::new(user.id, false),
+            user.id.to_string(),
+            (first.id.to_string(), second.id.to_string()),
+        ))
+    }
+
+    #[tokio::test]
+    async fn library_access_changes_apply_to_the_very_next_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, access, principal, user_id, (first, second)) = library_fixture().await?;
+
+        // A fresh user sees every enabled library; a selection then narrows the set.
+        assert_eq!(access.accessible_library_ids(principal).await?.len(), 2);
+        database
+            .set_user_library_access(&user_id, &first, true)
+            .await?;
+        assert_eq!(
+            access.accessible_library_ids(principal).await?,
+            vec![first.clone()]
+        );
+
+        database
+            .set_user_library_access(&user_id, &second, true)
+            .await?;
+        let refreshed = access.accessible_library_ids(principal).await?;
+        assert!(
+            refreshed.contains(&second),
+            "granting a library must be visible to the very next request"
+        );
+
+        // Revoking it again is equally immediate.
+        database
+            .set_user_library_access(&user_id, &second, false)
+            .await?;
+        assert!(
+            !access
+                .accessible_library_ids(principal)
+                .await?
+                .contains(&second)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_access_changes_deny_the_very_next_item_check()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, access, principal, user_id, (first, second)) = library_fixture().await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES ('access-cache-movie', ?, 'MOVIE', 'Cached', 'cached', 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&first)
+        .execute(database.pool())
+        .await?;
+        // A selection keeps the user in SELECTED mode, so revoking one library below narrows the
+        // set instead of falling back to "all enabled libraries".
+        database
+            .set_user_library_access(&user_id, &second, true)
+            .await?;
+        database
+            .set_user_library_access(&user_id, &first, true)
+            .await?;
+        assert!(
+            access
+                .can_view_item(principal, "access-cache-movie")
+                .await?
+        );
+
+        // Revoking the library must deny the item on the very next check, cache or not.
+        database
+            .set_user_library_access(&user_id, &first, false)
+            .await?;
+        assert!(
+            !access
+                .can_view_item(principal, "access-cache-movie")
+                .await?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn library_disable_denies_the_very_next_request() -> Result<(), Box<dyn std::error::Error>>
+    {
+        use crate::storage::LibrarySettingsUpdate;
+
+        let (database, access, principal, _user_id, (first, _second)) = library_fixture().await?;
+        assert!(access.can_view_library(principal, &first).await?);
+
+        database
+            .update_library_settings(
+                &first,
+                LibrarySettingsUpdate {
+                    name: None,
+                    kind: None,
+                    is_enabled: Some(false),
+                    realtime_watch_enabled: None,
+                    realtime_metadata_auto_match_enabled: None,
+                    reconciliation_schedule: None,
+                    metadata_schedule: None,
+                    scan_concurrency: None,
+                    probe_concurrency: None,
+                    scraper_id: None,
+                    scrapers: None,
+                    chapter_source_id: None,
+                    media_strategy_json: None,
+                },
+            )
+            .await?;
+        assert!(
+            !access.can_view_library(principal, &first).await?,
+            "disabling a library must deny access on the very next request"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn resolved_library_access_check_skips_the_item_lookup()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -1245,23 +1462,29 @@ mod tests {
 
         let access = MediaAccessService::new(database.clone());
         let principal = AccessPrincipal::new(user.id, false);
+        // The first call fills the access context; the counts below measure the steady state.
+        assert!(
+            access
+                .can_view_item_in_library(principal, "resolved-movie", Some(&library_id))
+                .await?
+        );
         database.reset_query_count();
         assert!(
             access
                 .can_view_item_in_library(principal, "resolved-movie", Some(&library_id))
                 .await?
         );
-        let resolved_queries = database.query_count();
-        assert!(
-            resolved_queries > 0,
-            "the resolved-library check still enforces library access and content restrictions"
+        assert_eq!(
+            database.query_count(),
+            1,
+            "a warm policy cache checks library access but does not re-read the policy"
         );
 
         database.reset_query_count();
         assert!(access.can_view_item(principal, "resolved-movie").await?);
         assert_eq!(
             database.query_count(),
-            resolved_queries + 1,
+            2,
             "can_view_item re-resolves the item library; the resolved variant must not"
         );
 

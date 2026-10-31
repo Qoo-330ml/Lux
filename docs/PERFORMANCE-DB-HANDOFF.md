@@ -88,11 +88,19 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 | W1 | SQLite 使用默认 `synchronous=FULL`。WAL 模式下 NORMAL 不会损坏数据库，只可能在断电时丢最后几次提交 | `src/storage/repository.rs` 的连接 `after_connect`（约 1162 行，只设了 `foreign_keys`、`journal_mode=WAL`、`busy_timeout`、`journal_size_limit`）；删除任务已临时用 NORMAL（`library_deletion.rs`） | 对小事务多的播放写路径收益最大，机械盘上尤其明显 | **必须在 NAS 上做 A/B**；文档里的 A/B 只测了批量扫描（批量提交已把 fsync 压到很少），不代表小事务 |
 | W2 | 读写共用一个 8 连接池；已有 `BEGIN IMMEDIATE` 与 50 ms 重试补丁 | `SQLITE_DATABASE_POOL_MAX_CONNECTIONS = 8`（`repository.rs` 约 390 行）；`begin_metadata_write_transaction`（约 1305 行）；`storage/users.rs` 的 `SQLITE_USER_UPDATE_RETRY_*` | 拆成"1 个写连接 + N 个只读连接"，可去掉 `SQLITE_BUSY_SNAPSHOT` 的补丁 | 需要先有统一的访问层入口；`Database` 拆分试点结论是不全面推广，见第九节 |
 | W3 | UPDATE 几乎没有"值未变则不写"保护：312 条里只有 21 条带 `IS NOT` 之类的保护 | `media_items` 18 条、`media_sources` 14 条、`filesystem_entries` 15 条 | 重扫、元数据回写这类大概率无变化的路径加保护条件 | SQLite 的 ON CONFLICT 即使值相同也会写页并触发触发器 |
-| W4 | `media_items` 写放大：约 18 个索引、6 个触发器 | `migrations/` | 用 dbstat 或查询计划找出无人使用的索引，逐个删除 | 需要实测；删索引要走迁移，且 PG 迁移要配对（`scripts/check-migration-parity.py`） |
+| W4 | `media_items` 写放大：约 18 个索引、6 个触发器 | `migrations/` | 用 dbstat 或查询计划找出无人使用的索引，逐个删除 | 需要实测；删索引要走迁移，且 PG 迁移要配对（`scripts/check-migration-parity.py`）。**已实施**：`389cd8ba` 删除 2 个左前缀冗余索引（0242 / PG 0244），修好 3 个被 catalog 修复路径吞掉的索引，另 3 个被复活的索引待所有者决定；实际是 17 个索引（新建库 20 个）、13 个触发器；证据脚本 `scripts/audit-media-items-indexes.py`，结论与待 NAS 实测项见 `docs/INDEX-AUDIT.md` |
 | W5 | `user_series_next` 先 DELETE 再 INSERT | `src/storage/user_series_next.rs` | 改成单条 UPSERT，找不到下一集时才 DELETE | 与 P2 同一处 |
 
 **进度写合并（会改变可见行为，必须先确认）**：位置 upsert 在内存里合并，每 30 秒或状态变化时落盘。代价：崩溃最多丢约
 30 秒进度；其他设备的"继续观看"位置晚到几十秒。
+
+**状态：已实施。** `src/application/playback_progress.rs` 是有界的内存合并层，键为
+`(user_id, play_session_id)`。普通 tick 只更新内存；状态变化（开始/暂停/恢复/停止）、可能翻转
+`is_played` 的 tick、跨恢复阈值的 tick 仍然立即写；超过 30 秒（`PLAYBACK_PROGRESS_FLUSH_WINDOW`）、
+条目上限、周期后台 flush 与 shutdown drain 落盘。handler 通过该层读 `previous_session`，
+`list_playback_sessions` 与管理端仪表盘列表叠加未落盘值。失败写保留重试；会话在此期间被停止时丢弃
+合并项而不复活会话。因此 `user_item_state` 与 `playback_sessions` 的位置最多落后一个窗口，读取方
+若绕过该层直接读库（含集成测试里的直接 SQL 断言）会看到落盘前的值。
 
 ## 6. 后台任务唤醒
 

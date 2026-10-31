@@ -513,7 +513,8 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         }
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(())
     }
 
     pub(crate) async fn person_index_item_state_matches_snapshot(

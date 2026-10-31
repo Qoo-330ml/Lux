@@ -1410,8 +1410,9 @@ pub(super) async fn handle_emby_playback_event(
         .map(str::to_owned);
     let requested_previous_session =
         if let Some(play_session_id) = requested_play_session_id.as_deref() {
-            match database
-                .find_playback_session(&user.id.to_string(), play_session_id)
+            match state
+                .playback_progress()
+                .find_session(&user.id.to_string(), play_session_id)
                 .await
             {
                 Ok(session) => session,
@@ -1601,8 +1602,9 @@ pub(super) async fn handle_emby_playback_event(
     {
         requested_previous_session
     } else {
-        match database
-            .find_playback_session(&user.id.to_string(), &play_session_id)
+        match state
+            .playback_progress()
+            .find_session(&user.id.to_string(), &play_session_id)
             .await
         {
             Ok(session) => session,
@@ -1737,8 +1739,9 @@ pub(super) async fn handle_emby_playback_event(
             .as_ref()
             .and_then(|session| session.remote_ip.as_deref())
     });
-    match database
-        .record_playback_event(NewPlaybackEvent {
+    match state
+        .playback_progress()
+        .record(NewPlaybackEvent {
             user_id: &user_id,
             item_id: &internal_item_id,
             media_source_id: media_source_id.as_deref(),
@@ -2199,8 +2202,9 @@ pub(super) async fn emby_sessions(
         Some(_) => return StatusCode::BAD_REQUEST.into_response(),
         None => None,
     };
-    let sessions = match database
-        .list_playback_sessions(
+    let sessions = match state
+        .playback_progress()
+        .list_sessions(
             (!auth_principal.is_admin()).then_some(user_id.as_str()),
             active_within_seconds,
         )
@@ -4487,8 +4491,9 @@ pub(super) async fn lux_web_playback_event(
     if claim == WebPlaybackEventClaim::Accepted {
         let database = state.database();
         let user_id = user.id.to_string();
-        let previous_session = match database
-            .find_playback_session(&user_id, &session.play_session_id)
+        let previous_session = match state
+            .playback_progress()
+            .find_session(&user_id, &session.play_session_id)
             .await
         {
             Ok(session) => session,
@@ -4517,8 +4522,9 @@ pub(super) async fn lux_web_playback_event(
             Ok(value) => value,
             Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
         };
-        let effects = match database
-            .record_playback_event(NewPlaybackEvent {
+        let effects = match state
+            .playback_progress()
+            .record(NewPlaybackEvent {
                 user_id: &session.user_id,
                 item_id: &session.item_id,
                 media_source_id: session.media_source_id.as_deref(),
@@ -4819,8 +4825,9 @@ pub(super) async fn lux_post_progress(
     let user_id = user.id.to_string();
     let play_session_id = format!("lux-web:{user_id}:{item_id}");
     let playback_state = request.state;
-    let previous_session = match database
-        .find_playback_session(&user_id, &play_session_id)
+    let previous_session = match state
+        .playback_progress()
+        .find_session(&user_id, &play_session_id)
         .await
     {
         Ok(session) => session,
@@ -4845,8 +4852,9 @@ pub(super) async fn lux_post_progress(
             .as_ref()
             .and_then(|session| session.remote_ip.as_deref())
     });
-    match database
-        .record_playback_event(NewPlaybackEvent {
+    match state
+        .playback_progress()
+        .record(NewPlaybackEvent {
             user_id: &user_id,
             item_id: &item_id,
             media_source_id: None,
