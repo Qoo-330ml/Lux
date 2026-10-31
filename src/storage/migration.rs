@@ -383,10 +383,9 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             "CREATE UNIQUE INDEX idx_media_items_identity_key
              ON media_items(identity_key)
              WHERE identity_key IS NOT NULL",
-            "CREATE INDEX idx_media_items_parent_removed
-             ON media_items(parent_id, removed_at)",
-            "CREATE INDEX idx_media_items_series_removed
-             ON media_items(series_id, removed_at)",
+            // idx_media_items_parent_removed and idx_media_items_series_removed are not recreated:
+            // migration 0242 drops them because they are left prefixes of the *_available indexes
+            // below, and this rebuild must not resurrect them (docs/INDEX-AUDIT.md).
             "CREATE INDEX idx_media_items_library_type_visible
              ON media_items(library_id, item_type, id)
              WHERE removed_at IS NULL",
@@ -414,6 +413,24 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
              WHERE removed_at IS NULL",
             "CREATE INDEX idx_media_items_updated_at
              ON media_items(updated_at, id)",
+            // The rebuild used to omit the indexes added by 0168 and 0215, so a database that went
+            // through this repair lost them while a database that only ran the migrations kept
+            // them. Both are read-path indexes the audit depends on (docs/INDEX-AUDIT.md).
+            "CREATE INDEX IF NOT EXISTS idx_media_items_removed_at
+             ON media_items(removed_at)
+             WHERE removed_at IS NOT NULL",
+            "CREATE INDEX idx_media_items_series_episode_latest
+             ON media_items(series_id, added_at)
+             WHERE item_type = 'EPISODE'
+               AND removed_at IS NULL
+               AND has_available_source = 1
+               AND series_id IS NOT NULL",
+            "CREATE INDEX idx_media_items_parent_episode_latest
+             ON media_items(parent_id, added_at)
+             WHERE item_type = 'EPISODE'
+               AND removed_at IS NULL
+               AND has_available_source = 1
+               AND parent_id IS NOT NULL",
             "CREATE INDEX idx_media_items_library_name_sort
              ON media_items(library_id, LOWER(title), id)
              WHERE removed_at IS NULL",

@@ -1079,11 +1079,14 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
             "media_streams"
         ]
     );
+    // Migration 0242 drops the narrow (parent_id, removed_at)/(series_id, removed_at) indexes
+    // because the wider *_available indexes answer the same predicates (docs/INDEX-AUDIT.md), so
+    // the rebuild this test covers must leave the wider pair behind instead.
     let indexes: Vec<String> = sqlx::query_scalar(
         "SELECT name FROM sqlite_master
          WHERE type = 'index' AND name IN (
-             'idx_media_items_parent_removed',
-             'idx_media_items_series_removed'
+             'idx_media_items_parent_available',
+             'idx_media_items_series_available'
          )
          ORDER BY name",
     )
@@ -1092,8 +1095,8 @@ async fn media_catalog_migration_creates_expected_tables() -> Result<(), Box<dyn
     assert_eq!(
         indexes,
         [
-            "idx_media_items_parent_removed",
-            "idx_media_items_series_removed"
+            "idx_media_items_parent_available",
+            "idx_media_items_series_available"
         ]
     );
     Ok(())
