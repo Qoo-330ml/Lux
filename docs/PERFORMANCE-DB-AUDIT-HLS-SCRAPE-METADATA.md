@@ -97,8 +97,10 @@
 1. **语句计数**：`Database::query_count()` 已存在（`src/storage/repository.rs:1911`，`reset_query_count` 在 `:1882`），
    但目前只在测试里用（`src/application/reidentify.rs:3540` 一带有先例）。交接第 8 节建议的"每请求计数中间件"落地前，
    可以先用 `cargo test` 里已有的 `query_count` 断言给单个用例定基线（例如"一次分片请求的语句数与写提交数"）。
-2. **写提交计数**：临时把 `begin_metadata_write_transaction` / `begin_playback_admission_transaction`
-   （`repository.rs:1479`、`:1492`）里加一个 `AtomicUsize`，只在本地分支使用，不提交。
+2. **写提交计数**：`Database` 已在 `begin_metadata_write_transaction` 里内置 `#[cfg(test)]` 计数器
+   （`metadata_write_transaction_count()` / `reset_metadata_write_transaction_count()`，`src/storage/repository.rs`），
+   只编译进测试目标，release 无开销。测试里用"reset → 执行一次操作 → 断言提交数"给单次操作定基线。
+   `begin_playback_admission_transaction` / `begin_scan_write_transaction` 仍未计数。
 3. **查询计划**：在数据副本上 `ANALYZE` 后跑 `EXPLAIN QUERY PLAN`，判断是否走索引、是否 `USE TEMP B-TREE FOR ORDER BY`。
    第 6 节的缺索引结论都可以用这一条验证。
 4. **写放大**：`PRAGMA page_count` / `dbstat` 差值，以及 `catalog_outbox`/`search_outbox` 的行增量。

@@ -30,9 +30,9 @@ use crate::{
     },
     observability::resources::ResourceMetrics,
     storage::{
-        Database, MetadataCapabilityResult, MetadataImageUnavailable, NewMetadataCandidate,
-        SelectedMetadataUpdate, StorageError, StoredMediaMetadata, StoredMetadataCandidate,
-        StoredMetadataCapabilityAttempt,
+        Database, MetadataCapabilityResult, MetadataCapabilityWrite, MetadataImageUnavailable,
+        NewMetadataCandidate, SelectedMetadataUpdate, StorageError, StoredMediaMetadata,
+        StoredMetadataCandidate, StoredMetadataCapabilityAttempt,
     },
 };
 
@@ -828,6 +828,11 @@ impl MetadataCandidateService {
             results.truncate(2);
         }
         let mut pending_candidates = Vec::with_capacity(results.len());
+        // One transaction for the whole loop (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`
+        // S1): each candidate used to commit its own capability rows. A failure while resolving a
+        // later candidate still commits what the earlier ones produced, so the flush runs before
+        // the error leaves this function.
+        let mut capability_writes = Vec::with_capacity(results.len());
         for (result_index, (result, precomputed_score)) in results.into_iter().enumerate() {
             let Some((provider, provider_id)) = scraper.selected_provider_entry(&result) else {
                 continue;
@@ -914,16 +919,21 @@ impl MetadataCandidateService {
             } else if let Some(bundle) = bundle.as_ref() {
                 Some(bundle.metadata.clone())
             } else if plan.needs_metadata {
-                Some(
-                    scraper
-                        .get_generic(crate::application::scraper::ScraperGetRequest::new(
-                            item_type,
-                            provider_id.clone(),
-                            "zh-CN",
-                        ))
-                        .await
-                        .map_err(MetadataCandidateError::Scraper)?,
-                )
+                match scraper
+                    .get_generic(crate::application::scraper::ScraperGetRequest::new(
+                        item_type,
+                        provider_id.clone(),
+                        "zh-CN",
+                    ))
+                    .await
+                {
+                    Ok(details) => Some(details),
+                    Err(error) => {
+                        self.record_capability_writes(item_id, &capability_writes)
+                            .await?;
+                        return Err(MetadataCandidateError::Scraper(error));
+                    }
+                }
             } else {
                 None
             };
@@ -1102,35 +1112,26 @@ impl MetadataCandidateService {
                     transient_capability_failures.push(capability);
                 }
             }
-            self.database
-                .record_metadata_capability_results(
-                    item_id,
-                    scraper.provider_key(),
-                    &provider_id,
-                    &capability_results,
+            if !capability_results.is_empty() || !transient_capability_failures.is_empty() {
+                capability_writes.push(MetadataCapabilityWrite {
+                    provider: scraper.provider_key().to_owned(),
+                    provider_id: provider_id.clone(),
+                    results: capability_results,
+                    transient_failures: transient_capability_failures,
                     now,
-                )
-                .await
-                .map_err(MetadataCandidateError::Storage)?;
-            if !transient_capability_failures.is_empty() {
-                self.database
-                    .record_metadata_capability_failures(
-                        item_id,
-                        scraper.provider_key(),
-                        &provider_id,
-                        &transient_capability_failures,
-                        now,
-                    )
-                    .await
-                    .map_err(MetadataCandidateError::Storage)?;
+                });
             }
             if plan.needs_images
                 && images_response
                     .as_ref()
                     .is_some_and(|response| response.images.is_empty())
+                && let Err(error) = self
+                    .record_explicitly_unavailable_images(item_id, scraper, &provider_id)
+                    .await
             {
-                self.record_explicitly_unavailable_images(item_id, scraper, &provider_id)
+                self.record_capability_writes(item_id, &capability_writes)
                     .await?;
+                return Err(error);
             }
             let actors = generic_candidate_actors(&credits.cast);
             let mut provider_ids = details
@@ -1227,10 +1228,28 @@ impl MetadataCandidateService {
                 expires_at,
             ));
         }
+        self.record_capability_writes(item_id, &capability_writes)
+            .await?;
         self.store_candidates(item_id, current, pending_candidates)
             .await?;
         self.list_pending_after_search(item_id, current, reuse_current_snapshot, automatic_match)
             .await
+    }
+
+    /// Commits every candidate's capability rows in one transaction.
+    ///
+    /// The candidate loop collects `(provider, provider_id)` writes and calls this once, so a
+    /// manual search of 20 results costs one metadata write transaction instead of one per
+    /// result (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S1).
+    async fn record_capability_writes(
+        &self,
+        item_id: &str,
+        writes: &[MetadataCapabilityWrite<'_>],
+    ) -> Result<(), MetadataCandidateError> {
+        self.database
+            .record_metadata_capability_writes(item_id, writes)
+            .await
+            .map_err(MetadataCandidateError::Storage)
     }
 
     async fn reuse_unexpired_automatic_candidates(
@@ -5195,7 +5214,7 @@ mod tests {
         ScraperExternalIdsResponse, ScraperFuture, ScraperGetRequest, ScraperImage,
         ScraperImageRequest, ScraperImagesResponse, ScraperItemType, ScraperMetadata,
         ScraperMetadataBundle, ScraperProvider, ScraperSearchRequest, ScraperSearchResponse,
-        ScraperTrailersResponse,
+        ScraperSearchResult, ScraperTrailersResponse,
     };
     use crate::application::thumbnail_policy::ThumbnailScrapingMode;
     use crate::storage::{Database, StoredMediaMetadata, StoredMetadataCapabilityAttempt};
@@ -5472,6 +5491,149 @@ mod tests {
         ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
             Box::pin(std::future::ready(Ok(ScraperTrailersResponse::default())))
         }
+    }
+
+    /// Search results for every resolution step, so the candidate loop runs to completion.
+    struct ManyCandidateAdapter {
+        candidates: usize,
+    }
+
+    impl ScraperAdapter for ManyCandidateAdapter {
+        fn provider_key(&self) -> &str {
+            "tmdb"
+        }
+
+        fn search(
+            &self,
+            _request: ScraperSearchRequest,
+        ) -> ScraperFuture<'_, Result<ScraperSearchResponse, ScraperError>> {
+            let items = (0..self.candidates)
+                .map(|index| ScraperSearchResult {
+                    item_type: Some("Movie".to_owned()),
+                    title: Some(format!("Example {index}")),
+                    original_title: Some(format!("Example {index}")),
+                    provider_ids: BTreeMap::from([("tmdb".to_owned(), format!("movie-{index}"))]),
+                    ..ScraperSearchResult::default()
+                })
+                .collect();
+            Box::pin(std::future::ready(Ok(ScraperSearchResponse { items })))
+        }
+
+        fn get(
+            &self,
+            request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadata, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperMetadata {
+                title: Some(request.provider_id),
+                ..ScraperMetadata::default()
+            })))
+        }
+
+        fn bundle(
+            &self,
+            request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperMetadataBundle, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperMetadataBundle {
+                metadata: ScraperMetadata {
+                    title: Some(format!("Bundle {}", request.provider_id)),
+                    ..ScraperMetadata::default()
+                },
+                // A non-empty image list keeps the search on the normal path; the empty-list
+                // `NO_IMAGE` fallback still commits per candidate (out of S1's scope).
+                images: ScraperImagesResponse {
+                    images: vec![ScraperImage {
+                        image_type: "POSTER".to_owned(),
+                        url: "https://images.example.test/poster.jpg".to_owned(),
+                        ..ScraperImage::default()
+                    }],
+                    original_language_mode: false,
+                },
+                ..ScraperMetadataBundle::default()
+            })))
+        }
+
+        fn images(
+            &self,
+            _request: ScraperImageRequest,
+        ) -> ScraperFuture<'_, Result<ScraperImagesResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperImagesResponse::default())))
+        }
+
+        fn credits(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperCreditsResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperCreditsResponse::default())))
+        }
+
+        fn external_ids(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperExternalIdsResponse, ScraperError>> {
+            Box::pin(std::future::ready(
+                Ok(ScraperExternalIdsResponse::default()),
+            ))
+        }
+
+        fn trailers(
+            &self,
+            _request: ScraperGetRequest,
+        ) -> ScraperFuture<'_, Result<ScraperTrailersResponse, ScraperError>> {
+            Box::pin(std::future::ready(Ok(ScraperTrailersResponse::default())))
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_commits_capability_rows_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                    id, library_id, item_type, title, sort_title, identification_status
+                 ) VALUES ('candidate-search-item', ?, 'MOVIE', 'Example', 'example', 'LOCAL_CONFIRMED')",
+        )
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let service = MetadataCandidateService::new(database.clone());
+
+        database.reset_metadata_write_transaction_count();
+        let page = service
+            .search_and_store(
+                "candidate-search-item",
+                "Example",
+                None,
+                &ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 20 }),
+            )
+            .await?;
+
+        assert_eq!(page.items.len(), 20);
+        // One transaction for the capability rows of all 20 candidates, one for the candidates
+        // themselves (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S1).
+        assert_eq!(
+            database.metadata_write_transaction_count(),
+            2,
+            "a 20-candidate manual search must not commit once per candidate"
+        );
+        let capability_rows: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM metadata_capability_attempts
+             WHERE item_id = 'candidate-search-item'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(capability_rows, 60);
+        database.close().await;
+        Ok(())
     }
 
     #[tokio::test]

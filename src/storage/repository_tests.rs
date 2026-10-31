@@ -12204,6 +12204,101 @@ async fn metadata_capability_batches_preserve_status_and_retry_backoff() {
 }
 
 #[tokio::test]
+async fn capability_writes_for_a_whole_search_commit_once() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('capability-search-item', ?, 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    // A manual candidate search resolves up to 20 results; each used to commit its own
+    // transaction (20 candidates + up to 20 retry writes).
+    let writes = (0..20)
+        .map(|index| MetadataCapabilityWrite {
+            provider: "tmdb".to_owned(),
+            provider_id: format!("movie-{index}"),
+            results: vec![
+                MetadataCapabilityResult {
+                    capability: "CREDITS",
+                    has_data: true,
+                },
+                MetadataCapabilityResult {
+                    capability: "EXTERNAL_IDS",
+                    has_data: false,
+                },
+            ],
+            transient_failures: if index == 0 {
+                vec!["TRAILERS"]
+            } else {
+                Vec::new()
+            },
+            now: 1_000,
+        })
+        .collect::<Vec<_>>();
+
+    database.reset_query_count();
+    database.reset_metadata_write_transaction_count();
+    database
+        .record_metadata_capability_writes("capability-search-item", &writes)
+        .await
+        .expect("batched capability writes");
+    assert_eq!(
+        database.metadata_write_transaction_count(),
+        1,
+        "the whole candidate search must commit its capability rows once"
+    );
+    // 20 multi-row upserts, plus the retry read and retry upsert of the one transient failure.
+    assert_eq!(database.query_count(), 22);
+
+    let available: Vec<(String, String)> = sqlx::query_as(
+        "SELECT provider_id, status FROM metadata_capability_attempts
+         WHERE item_id = 'capability-search-item' AND capability = 'CREDITS'
+         ORDER BY provider_id",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("capability rows");
+    assert_eq!(available.len(), 20);
+    assert!(available.iter().all(|(_, status)| status == "AVAILABLE"));
+
+    let failed: Vec<(String, i64, Option<i64>)> = sqlx::query_as(
+        "SELECT provider_id, attempt_count, next_retry_at FROM metadata_capability_attempts
+         WHERE item_id = 'capability-search-item' AND status = 'FAILED'",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("failed capability rows");
+    assert_eq!(failed, vec![("movie-0".to_owned(), 1, Some(1_300))]);
+
+    database.reset_metadata_write_transaction_count();
+    database
+        .record_metadata_capability_writes("capability-search-item", &[])
+        .await
+        .expect("empty capability batch");
+    assert_eq!(
+        database.metadata_write_transaction_count(),
+        0,
+        "a search without capability work must not open a transaction"
+    );
+
+    database.close().await;
+}
+
+#[tokio::test]
 async fn unavailable_metadata_image_batch_uses_one_statement_and_preserves_attempt_count() {
     type MetadataImageAttemptRow = (String, String, i64, i64, Option<i64>, Option<String>, i64);
 
@@ -12420,7 +12515,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        query_count: Arc::new(AtomicUsize::new(0)),
+        test_counts: Arc::new(TestCounts::default()),
     };
     let jobs = database
         .list_metadata_reidentify_jobs(None, 0, 1)
@@ -15024,7 +15119,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        query_count: Arc::new(AtomicUsize::new(0)),
+        test_counts: Arc::new(TestCounts::default()),
     };
     assert!(database.probe_write().await.is_err());
     database.close().await;
@@ -15098,7 +15193,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        query_count: Arc::new(AtomicUsize::new(0)),
+        test_counts: Arc::new(TestCounts::default()),
     };
 
     assert_eq!(
@@ -15234,7 +15329,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        query_count: Arc::new(AtomicUsize::new(0)),
+        test_counts: Arc::new(TestCounts::default()),
     };
 
     let claimed = database
@@ -19113,7 +19208,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        query_count: Arc::new(AtomicUsize::new(0)),
+        test_counts: Arc::new(TestCounts::default()),
     };
     database.reset_query_count();
 
@@ -19209,7 +19304,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        query_count: Arc::new(AtomicUsize::new(0)),
+        test_counts: Arc::new(TestCounts::default()),
     };
     database.reset_query_count();
 
@@ -19717,7 +19812,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        query_count: Arc::new(AtomicUsize::new(0)),
+        test_counts: Arc::new(TestCounts::default()),
     };
 
     let reconciled = database

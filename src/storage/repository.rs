@@ -763,8 +763,20 @@ pub struct Database {
     /// falls back to a slow poll. Keeping it on the instance (rather than in a process-wide static)
     /// means two databases - and two workers in parallel tests - never steal each other's wake-ups.
     mail_outbox_appended: Arc<tokio::sync::Notify>,
+    /// Test-only statement and commit counters (see `TestCounts`).
+    ///
+    /// One `Arc` holds both counters so the test build keeps `Database` the same size as the
+    /// production build.
     #[cfg(test)]
-    query_count: Arc<AtomicUsize>,
+    test_counts: Arc<TestCounts>,
+}
+
+/// Statement and commit counters that only the test build compiles in.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct TestCounts {
+    queries: AtomicUsize,
+    metadata_write_transactions: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -1419,7 +1431,7 @@ impl Database {
             outbox_signals: Arc::new(OutboxSignals::default()),
             mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
-            query_count: Arc::new(AtomicUsize::new(0)),
+            test_counts: Arc::new(TestCounts::default()),
         })
     }
 
@@ -1479,6 +1491,10 @@ impl Database {
     async fn begin_metadata_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        #[cfg(test)]
+        self.test_counts
+            .metadata_write_transactions
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let transaction = if self.backend == DatabaseBackend::Sqlite {
             self.pool.begin_with("BEGIN IMMEDIATE").await
         } else {
@@ -1880,7 +1896,7 @@ impl Database {
 
     #[cfg(test)]
     pub(crate) fn reset_query_count(&self) {
-        self.query_count.store(0, AtomicOrdering::Relaxed);
+        self.test_counts.queries.store(0, AtomicOrdering::Relaxed);
     }
 
     /// The invalidation epochs of the in-process authentication and access caches.
@@ -1909,7 +1925,24 @@ impl Database {
 
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
-        self.query_count.load(AtomicOrdering::Relaxed)
+        self.test_counts.queries.load(AtomicOrdering::Relaxed)
+    }
+
+    /// Counts the metadata write transactions (and therefore the commits) opened since the last
+    /// reset. The audit's write-amplification findings are stated in commits, not statements
+    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2.2).
+    #[cfg(test)]
+    pub(crate) fn metadata_write_transaction_count(&self) -> usize {
+        self.test_counts
+            .metadata_write_transactions
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_metadata_write_transaction_count(&self) {
+        self.test_counts
+            .metadata_write_transactions
+            .store(0, AtomicOrdering::Relaxed);
     }
 
     /// The change counters that the playback access cache stamps its entries with.
@@ -1971,7 +2004,9 @@ impl Database {
         sql: impl AdaptSqlText,
     ) -> sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments> {
         #[cfg(test)]
-        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
+        self.test_counts
+            .queries
+            .fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query(adapt_sql_for_backend(self.backend, sql))
     }
 
@@ -1983,7 +2018,9 @@ impl Database {
         O: for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
     {
         #[cfg(test)]
-        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
+        self.test_counts
+            .queries
+            .fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_as(adapt_sql_for_backend(self.backend, sql))
     }
 
@@ -1995,7 +2032,9 @@ impl Database {
         (O,): for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
     {
         #[cfg(test)]
-        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
+        self.test_counts
+            .queries
+            .fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
 }
@@ -4083,6 +4122,19 @@ pub(crate) struct StoredItemMetadataCompleteness {
 pub(crate) struct MetadataCapabilityResult<'a> {
     pub(crate) capability: &'a str,
     pub(crate) has_data: bool,
+}
+
+/// One provider identity's capability writes, collected by the candidate search loop.
+///
+/// The search loop resolves up to 20 candidates; each used to commit its own transaction. The
+/// application layer now collects one entry per candidate and writes them together
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S1).
+pub(crate) struct MetadataCapabilityWrite<'a> {
+    pub(crate) provider: String,
+    pub(crate) provider_id: String,
+    pub(crate) results: Vec<MetadataCapabilityResult<'a>>,
+    pub(crate) transient_failures: Vec<&'a str>,
+    pub(crate) now: i64,
 }
 
 #[derive(Debug)]
