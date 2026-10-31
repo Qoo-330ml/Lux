@@ -83,8 +83,9 @@ python3 scripts/run-scan-write-bench.py --fixture-dir /tmp/lux-fixture --files 6
     --work-dir /tmp/lux-w4-after
 ```
 
-它报告一次全库扫描的墙钟、WAL 增长与数据库增长。**必须先跑 before 再做改动**；本轮只有索引数量
-变化（少 2 个、新建库多回 3 个），单次扫描的差异预计落在噪声内，所以本文件不给数字，只给方法和
+它报告一次全库扫描的墙钟、WAL 增长与数据库增长。**必须先跑 before 再做改动**。本轮的索引数量变化是：
+升级库少 2 个；新建库少 2 个、同时多回 3 个原本缺失的（第 6.2 节）。单次扫描的差异预计落在噪声内，
+所以本文件不给数字，只给方法和
 判定标准：在 NAS 上如果 before/after 的 WAL 字节差 < 5%，说明这批索引不是写放大的主项，应该转去
 看第 7 节的触发器和交接清单 W3（UPDATE 保护）。
 
@@ -104,13 +105,14 @@ cargo test --locked --test storage index_audit::
 
 ## 3. 索引清单与结论
 
-「生效于」一列区分两种库：**迁移链** = 从迁移建库（升级安装接近这个集合）；**新建库** =
-`Database::connect` 之后（会经过第 6 节的 catalog 修复）。列「使用方」给出函数名，行号已过期。
+下表是**只跑迁移链**（升级安装接近这个集合）时的 17 个索引。「使用方」用函数名给出，行号已过期
+（`docs/TEST-TARGETS.md` 的同一约定）。**新建库**（`Database::connect` 之后，会经过第 6 节的 catalog
+修复）在此之上多出 3 个复活索引，见表格后面单列的那 3 行。
 
 | 索引（列 / 谓词） | 使用方 | 结论 |
 |---|---|---|
 | `idx_media_items_identity_key` UNIQUE `(identity_key)` WHERE NOT NULL | `ensure_global_generated_media_item`、`update_local_provider_ids_for_identity_if_empty`、全局合集同步按 provider id 找工作 | 保留（唯一性，不能删） |
-| `idx_media_items_library_sort` `(library_id, sort_title, id)` | `list_catalog_rows` 的默认目录分页、`list_resume_items_with_next_episode` 等按 `sort_title` 排序的分页 | 保留（默认排序） |
+| `idx_media_items_library_sort` `(library_id, sort_title, id)` | `list_catalog_rows` 的默认目录分页（`ORDER BY mi.sort_title, mi.id`）、不带 `library_id` 过滤的目录过滤查询 | 保留（默认排序） |
 | `idx_media_items_library_name_sort` `(library_id, LOWER(title), id)` WHERE `removed_at IS NULL` | `CatalogSort::Name`（`catalog_item_order`） | 保留（排序专用） |
 | `idx_media_items_library_sortname_sort` `(library_id, LOWER(sort_title), id)` WHERE `removed_at IS NULL` | `CatalogSort::SortName`（`catalog_item_order`） | 保留（排序专用） |
 | `idx_media_items_library_added_sort` `(library_id, added_at DESC, LOWER(title), id)` WHERE `removed_at IS NULL` | `CatalogSort::DateCreated`（`catalog_item_order`）、`count_catalog_items` | 保留（排序专用） |
