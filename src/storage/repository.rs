@@ -766,11 +766,6 @@ pub struct Database {
     mail_outbox_appended: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
-    /// Commits are the metric the write-path performance work records
-    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2), so tests count the transactions
-    /// that a path opens directly instead of inferring them from statement counts.
-    #[cfg(test)]
-    metadata_write_transactions: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -1426,8 +1421,6 @@ impl Database {
             mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
-            #[cfg(test)]
-            metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1488,8 +1481,7 @@ impl Database {
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
         #[cfg(test)]
-        self.metadata_write_transactions
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        metadata_write_transaction_counter(&self.path).fetch_add(1, AtomicOrdering::Relaxed);
         let transaction = if self.backend == DatabaseBackend::Sqlite {
             self.pool.begin_with("BEGIN IMMEDIATE").await
         } else {
@@ -1930,14 +1922,12 @@ impl Database {
     /// transaction leaves this number flat while the number of actors grows.
     #[cfg(test)]
     pub(crate) fn metadata_write_transaction_count(&self) -> usize {
-        self.metadata_write_transactions
-            .load(AtomicOrdering::Relaxed)
+        metadata_write_transaction_counter(&self.path).load(AtomicOrdering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn reset_metadata_write_transaction_count(&self) {
-        self.metadata_write_transactions
-            .store(0, AtomicOrdering::Relaxed);
+        metadata_write_transaction_counter(&self.path).store(0, AtomicOrdering::Relaxed);
     }
 
     /// The change counters that the playback access cache stamps its entries with.
@@ -2026,6 +2016,29 @@ impl Database {
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
+}
+
+/// Per-database metadata write transaction counter for the write-path tests.
+///
+/// Commit counts are the metric the write-path performance work records
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2). The counter is keyed by the database
+/// path instead of living on [`Database`]: a test-only field would grow `Database`, and `Database`
+/// is embedded by value in `ReadyAppState`, which in test builds would tip the `AppMode` variant
+/// size lint.
+#[cfg(test)]
+fn metadata_write_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
+    static COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+        std::sync::OnceLock::new();
+    let counters = COUNTERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut counters = match counters.lock() {
+        Ok(counters) => counters,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Arc::clone(
+        counters
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+    )
 }
 
 fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {

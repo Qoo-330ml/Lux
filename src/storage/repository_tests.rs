@@ -12421,7 +12421,6 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-        metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
         .list_metadata_reidentify_jobs(None, 0, 1)
@@ -15026,7 +15025,6 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-        metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
     database.close().await;
@@ -15101,7 +15099,6 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-        metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
     };
 
     assert_eq!(
@@ -15238,7 +15235,6 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-        metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
     };
 
     let claimed = database
@@ -19118,7 +19114,6 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-        metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
 
@@ -19215,7 +19210,6 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-        metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
 
@@ -19724,7 +19718,6 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-        metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
     };
 
     let reconciled = database
