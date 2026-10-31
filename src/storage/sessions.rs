@@ -375,23 +375,14 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        let active_playback_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM (
-                     SELECT play_session_id FROM playback_admissions
-                     WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at > ?
-                     UNION
-                     SELECT play_session_id FROM playback_sessions
-                     WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED') AND last_event_at > ?
-                 ) active_playbacks",
-            )
-            .bind(user_id)
-            .bind(stale_before)
-            .bind(user_id)
-            .bind(stale_before)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
+        // The count above already reports whether this play session was part of the active set, so
+        // the upsert adds exactly one row when it was not and none when it was. Recounting after the
+        // write would restate the same union and cost another scan inside the write transaction.
+        let active_playback_count = if session_is_active {
+            active_count
+        } else {
+            active_count.saturating_add(1)
+        };
         transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(PlaybackAdmissionResult {
             decision: PlaybackAdmissionDecision::Admitted,
@@ -1792,6 +1783,45 @@ mod tests {
     #[test]
     fn session_listing_bound_is_small_enough_to_stay_cheap() {
         assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
+    }
+
+    /// The reservation already knows whether the play session held an admission, so the total it
+    /// reports after the upsert is that count plus the row it just wrote. A second `UNION` scan
+    /// would only restate it.
+    #[tokio::test]
+    async fn playback_admission_derives_the_new_total_without_a_second_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO users (
+                 id, username_normalized, display_name, password_hash,
+                 can_play, max_simultaneous_playbacks
+             ) VALUES ('admission-user', 'admission-user', 'Admission', 'hash', 1, 2)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        let reserved = database
+            .reserve_playback_admission("admission-user", "play-session-a", 1_000)
+            .await?
+            .ok_or("the admission user must exist")?;
+        assert_eq!(reserved.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(reserved.active_playback_count, 1);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "one policy read, the stale reclaim, the active count and the upsert"
+        );
+
+        // Reserving the session that already holds an admission must not raise the total.
+        let renewed = database
+            .reserve_playback_admission("admission-user", "play-session-a", 1_001)
+            .await?
+            .ok_or("the admission user must exist")?;
+        assert_eq!(renewed.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(renewed.active_playback_count, 1);
+        Ok(())
     }
 
     /// Creates the user, library and movie that the transcoding readers join against.
