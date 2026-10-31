@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     fmt,
     sync::{
-        Arc,
+        Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -15,7 +15,7 @@ use crate::application::{
     catalog::{CatalogError, CatalogItem, CatalogPage, CatalogService},
     libraries::{LibraryService, LibraryServiceError, LibraryView},
 };
-use crate::storage::UserContentRestrictions;
+use crate::storage::{AccessEpoch, UserContentRestrictions};
 
 const HOME_USER_CACHE_TTL: Duration = Duration::from_secs(15);
 const HOME_REFRESH_DEBOUNCE: Duration = Duration::from_secs(2);
@@ -77,13 +77,24 @@ struct HomeCacheEntry {
 }
 
 struct CachedSnapshot {
+    /// Directory-level generation the snapshot was built under; any scan, metadata or library
+    /// change moves it and therefore invalidates every user.
     generation: u64,
+    /// The owning user's own generation; only that user's state changes move it.
+    user_generation: u64,
+    /// Permission counters the snapshot was built under, so a revoked library or a tightened
+    /// policy invalidates the cached home without a dedicated call site.
+    access_epoch: AccessEpoch,
     refreshed_at: Instant,
-    snapshot: Arc<CachedHomeSnapshot>,
+    snapshot: Arc<HomeSnapshot>,
 }
 
-struct CachedHomeSnapshot {
-    recommended: Vec<CatalogItem>,
+impl CachedSnapshot {
+    fn matches(&self, generation: u64, user_generation: u64, access_epoch: AccessEpoch) -> bool {
+        self.generation == generation
+            && self.user_generation == user_generation
+            && self.access_epoch == access_epoch
+    }
 }
 
 #[derive(Default)]
@@ -96,7 +107,11 @@ struct ScanInvalidationState {
 struct HomeServiceInner {
     catalog: CatalogService,
     libraries: LibraryService,
+    /// Directory-level generation: scans, metadata edits and library lifecycle changes.
     generation: AtomicU64,
+    /// Per-user generations for state only that user can see (progress, played, favorites,
+    /// preferences). Never held across an await, so a plain mutex keeps invalidation synchronous.
+    user_generations: StdMutex<HashMap<String, u64>>,
     entries: Mutex<HashMap<HomeCacheKey, Arc<HomeCacheEntry>>>,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
@@ -120,6 +135,7 @@ impl HomeService {
             catalog,
             libraries,
             generation: AtomicU64::new(0),
+            user_generations: StdMutex::new(HashMap::new()),
             entries: Mutex::new(HashMap::new()),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
@@ -149,6 +165,10 @@ impl HomeService {
         service
     }
 
+    /// Returns the user's home snapshot, serving it from the per-user cache when possible.
+    ///
+    /// Every rail lives in the same cached snapshot as the recommendations, so a cache hit runs no
+    /// SQL for the rails at all.
     pub(crate) async fn snapshot(
         &self,
         principal: AccessPrincipal,
@@ -167,105 +187,8 @@ impl HomeService {
             elapsed_ms = stage_started.elapsed().as_millis(),
             "home snapshot stage"
         );
-        let stage_started = std::time::Instant::now();
-        let recommended = self
-            .cached_snapshot_with_policy(principal, &library_ids, content_restrictions.clone())
-            .await?
-            .recommended
-            .clone();
-        tracing::debug!(
-            stage = "recommended",
-            elapsed_ms = stage_started.elapsed().as_millis(),
-            "home snapshot stage"
-        );
-        let user_id = principal.user_id_string();
-        let stage_started = std::time::Instant::now();
-        let (continue_watching, recently_added, latest_groups, views) = tokio::try_join!(
-            async {
-                let started = std::time::Instant::now();
-                let result = self
-                    .inner
-                    .catalog
-                    .list_home_continue_watching_for_library_ids(
-                        &library_ids,
-                        &user_id,
-                        content_restrictions.as_ref(),
-                        0,
-                        10,
-                    )
-                    .await;
-                tracing::debug!(
-                    stage = "continue_watching",
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "home section"
-                );
-                result.map_err(HomeError::Catalog)
-            },
-            async {
-                let started = std::time::Instant::now();
-                let result = self
-                    .inner
-                    .catalog
-                    .list_recently_added_for_library_ids(
-                        &library_ids,
-                        content_restrictions.as_ref(),
-                        0,
-                        12,
-                    )
-                    .await;
-                tracing::debug!(
-                    stage = "recently_added",
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "home section"
-                );
-                result.map_err(HomeError::Catalog)
-            },
-            async {
-                let started = std::time::Instant::now();
-                let result = self
-                    .inner
-                    .catalog
-                    .list_recently_added_by_library_ids(
-                        &library_ids,
-                        content_restrictions.as_ref(),
-                        12,
-                    )
-                    .await;
-                tracing::debug!(
-                    stage = "latest_by_library",
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "home section"
-                );
-                result.map_err(HomeError::Catalog)
-            },
-            async {
-                let started = std::time::Instant::now();
-                let result = self.inner.libraries.list_libraries().await;
-                tracing::debug!(
-                    stage = "libraries",
-                    elapsed_ms = started.elapsed().as_millis(),
-                    "home section"
-                );
-                result.map_err(HomeError::Libraries)
-            },
-        )?;
-        tracing::debug!(
-            stage = "sections",
-            elapsed_ms = stage_started.elapsed().as_millis(),
-            "home snapshot stage"
-        );
-        let views = self
-            .inner
-            .libraries
-            .order_views_for_user(&user_id, principal.is_admin, &library_ids, views)
-            .await?;
-        Ok(Arc::new(HomeSnapshot {
-            continue_watching,
-            recently_added,
-            recommended,
-            latest_groups,
-            views,
-        }))
+        self.cached_home_snapshot(principal, &library_ids, content_restrictions)
+            .await
     }
 
     pub(crate) async fn carousel(
@@ -281,7 +204,7 @@ impl HomeService {
             .content_restrictions_for_principal(principal)
             .await?;
         Ok(self
-            .cached_snapshot_with_policy(principal, &library_ids, content_restrictions)
+            .cached_home_snapshot(principal, &library_ids, content_restrictions)
             .await?
             .recommended
             .clone())
@@ -292,24 +215,27 @@ impl HomeService {
         &self,
         principal: AccessPrincipal,
         library_ids: &[String],
-    ) -> Result<Arc<CachedHomeSnapshot>, HomeError> {
+    ) -> Result<Arc<HomeSnapshot>, HomeError> {
         let content_restrictions = self
             .inner
             .catalog
             .content_restrictions_for_principal(principal)
             .await?;
-        self.cached_snapshot_with_policy(principal, library_ids, content_restrictions)
+        self.cached_home_snapshot(principal, library_ids, content_restrictions)
             .await
     }
 
-    async fn cached_snapshot_with_policy(
+    /// Returns the cached home snapshot for this principal, building it under the entry lock when
+    /// any of the directory generation, the user's own generation or the permission epoch moved.
+    async fn cached_home_snapshot(
         &self,
         principal: AccessPrincipal,
         library_ids: &[String],
         content_restrictions: Option<UserContentRestrictions>,
-    ) -> Result<Arc<CachedHomeSnapshot>, HomeError> {
+    ) -> Result<Arc<HomeSnapshot>, HomeError> {
+        let user_id = principal.user_id_string();
         let key = HomeCacheKey {
-            user_id: principal.user_id_string(),
+            user_id: user_id.clone(),
             is_admin: principal.is_admin,
             library_ids: library_ids.to_vec(),
             content_restriction_version: content_restrictions
@@ -321,44 +247,42 @@ impl HomeService {
             .await;
         loop {
             let generation = self.inner.generation.load(Ordering::Acquire);
+            let user_generation = self.user_generation(&user_id);
+            let access_epoch = self.access_epoch(&user_id);
+            if let Some(snapshot) = self
+                .cached_value(&entry, generation, user_generation, access_epoch)
+                .await
             {
-                let cached = entry.value.lock().await;
-                if let Some(cached) = cached.as_ref()
-                    && cached.generation == generation
-                {
-                    if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
-                        self.schedule_refresh();
-                    }
-                    return Ok(cached.snapshot.clone());
-                }
+                return Ok(snapshot);
             }
 
             let _compute_guard = entry.compute_lock.lock().await;
             let generation = self.inner.generation.load(Ordering::Acquire);
             let scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
+            let user_generation = self.user_generation(&user_id);
+            let access_epoch = self.access_epoch(&user_id);
+            if let Some(snapshot) = self
+                .cached_value(&entry, generation, user_generation, access_epoch)
+                .await
             {
-                let cached = entry.value.lock().await;
-                if let Some(cached) = cached.as_ref()
-                    && cached.generation == generation
-                {
-                    if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
-                        self.schedule_refresh();
-                    }
-                    return Ok(cached.snapshot.clone());
-                }
+                return Ok(snapshot);
             }
 
             let snapshot = Arc::new(
-                self.build_cached_snapshot(principal, library_ids, content_restrictions.as_ref())
+                self.build_home_snapshot(principal, library_ids, content_restrictions.as_ref())
                     .await?,
             );
             if self.inner.generation.load(Ordering::Acquire) != generation
                 || self.inner.scan_refresh_epoch.load(Ordering::Acquire) != scan_refresh_epoch
+                || self.user_generation(&user_id) != user_generation
+                || self.access_epoch(&user_id) != access_epoch
             {
                 continue;
             }
             *entry.value.lock().await = Some(CachedSnapshot {
                 generation,
+                user_generation,
+                access_epoch,
                 refreshed_at: Instant::now(),
                 snapshot: snapshot.clone(),
             });
@@ -366,11 +290,67 @@ impl HomeService {
         }
     }
 
-    pub(crate) fn invalidate(&self) {
-        Self::invalidate_now(&self.inner);
+    /// Returns the cached snapshot when it still matches every generation, scheduling a background
+    /// refresh once it is older than the TTL so the TTL is only a fallback for missed
+    /// invalidations rather than the normal refresh path.
+    async fn cached_value(
+        &self,
+        entry: &HomeCacheEntry,
+        generation: u64,
+        user_generation: u64,
+        access_epoch: AccessEpoch,
+    ) -> Option<Arc<HomeSnapshot>> {
+        let cached = entry.value.lock().await;
+        let cached = cached.as_ref()?;
+        if !cached.matches(generation, user_generation, access_epoch) {
+            return None;
+        }
+        if cached.refreshed_at.elapsed() >= HOME_USER_CACHE_TTL {
+            self.schedule_refresh();
+        }
+        Some(cached.snapshot.clone())
     }
 
-    fn invalidate_now(inner: &Arc<HomeServiceInner>) {
+    fn user_generation(&self, user_id: &str) -> u64 {
+        self.inner
+            .user_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(user_id)
+            .copied()
+            .unwrap_or_default()
+    }
+
+    fn access_epoch(&self, user_id: &str) -> AccessEpoch {
+        self.inner.catalog.access_change_epochs().snapshot(user_id)
+    }
+
+    /// Directory-level invalidation for changes every user can see: scans, metadata edits, media
+    /// merges and deletions, library lifecycle and server-wide settings.
+    ///
+    /// This is the conservative default: when a change cannot be proven to be private to one user,
+    /// classify it here so no cached home keeps a stale rail.
+    pub(crate) fn invalidate_directory(&self) {
+        Self::invalidate_directory_now(&self.inner);
+    }
+
+    /// User-level invalidation for state only the owning user can see: playback progress, played
+    /// and favorite flags, account preferences and library order.
+    ///
+    /// Only this user's cached snapshots become stale. Other users keep their caches and the global
+    /// library page cache is left alone; the affected entry is rebuilt lazily on that user's next
+    /// home request, so no background recompute is scheduled either.
+    pub(crate) fn invalidate_user(&self, user_id: &str) {
+        let mut generations = self
+            .inner
+            .user_generations
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let generation = generations.entry(user_id.to_owned()).or_insert(0);
+        *generation = generation.wrapping_add(1);
+    }
+
+    fn invalidate_directory_now(inner: &Arc<HomeServiceInner>) {
         // The generation and catalog cache are invalidated synchronously so a
         // snapshot requested immediately after a change cannot reuse stale data.
         // Only the refresh-worker wakeup is coalesced for a short burst.
@@ -512,6 +492,7 @@ impl HomeService {
             .collect::<Vec<_>>();
         let mut refreshed_all = true;
         for entry in entries {
+            let user_id = entry.principal.user_id_string();
             let compute_guard = if force {
                 Some(entry.compute_lock.lock().await)
             } else {
@@ -524,6 +505,8 @@ impl HomeService {
                 continue;
             };
             let entry_generation = self.inner.generation.load(Ordering::Acquire);
+            let entry_user_generation = self.user_generation(&user_id);
+            let entry_access_epoch = self.access_epoch(&user_id);
             let entry_scan_refresh_epoch = self.inner.scan_refresh_epoch.load(Ordering::Acquire);
             if force
                 && (entry_generation != generation
@@ -535,7 +518,7 @@ impl HomeService {
             let cached = entry.value.lock().await;
             if !force
                 && cached.as_ref().is_some_and(|cached| {
-                    cached.generation == entry_generation
+                    cached.matches(entry_generation, entry_user_generation, entry_access_epoch)
                         && cached.refreshed_at.elapsed() < HOME_USER_CACHE_TTL
                 })
             {
@@ -544,7 +527,7 @@ impl HomeService {
             drop(cached);
             let notified = self.inner.invalidation_notify.notified();
             let result = tokio::select! {
-                result = self.build_cached_snapshot(
+                result = self.build_home_snapshot(
                     entry.principal,
                     &entry.library_ids,
                     entry.content_restrictions.as_ref(),
@@ -555,10 +538,14 @@ impl HomeService {
                 Some(Ok(snapshot))
                     if self.inner.generation.load(Ordering::Acquire) == entry_generation
                         && self.inner.scan_refresh_epoch.load(Ordering::Acquire)
-                            == entry_scan_refresh_epoch =>
+                            == entry_scan_refresh_epoch
+                        && self.user_generation(&user_id) == entry_user_generation
+                        && self.access_epoch(&user_id) == entry_access_epoch =>
                 {
                     *entry.value.lock().await = Some(CachedSnapshot {
                         generation: entry_generation,
+                        user_generation: entry_user_generation,
+                        access_epoch: entry_access_epoch,
                         refreshed_at: Instant::now(),
                         snapshot: Arc::new(snapshot),
                     });
@@ -578,24 +565,121 @@ impl HomeService {
             && self.inner.scan_refresh_epoch.load(Ordering::Acquire) == scan_refresh_epoch
     }
 
-    async fn build_cached_snapshot(
+    /// Builds every rail the cached snapshot serves. It runs in the background refresh worker or
+    /// under the entry's compute lock, never inline on a cache hit.
+    async fn build_home_snapshot(
         &self,
         principal: AccessPrincipal,
         accessible_library_ids: &[String],
         content_restrictions: Option<&UserContentRestrictions>,
-    ) -> Result<CachedHomeSnapshot, HomeError> {
+    ) -> Result<HomeSnapshot, HomeError> {
         let user_id = principal.user_id_string();
-        let recommended = self
+        let stage_started = Instant::now();
+        let (recommended, continue_watching, recently_added, latest_groups, views) = tokio::try_join!(
+            async {
+                let started = Instant::now();
+                let result = self
+                    .inner
+                    .catalog
+                    .list_recommended_for_library_ids_with_policy(
+                        accessible_library_ids,
+                        &user_id,
+                        content_restrictions,
+                        7,
+                    )
+                    .await;
+                tracing::debug!(
+                    stage = "recommended",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Catalog)
+            },
+            async {
+                let started = Instant::now();
+                let result = self
+                    .inner
+                    .catalog
+                    .list_home_continue_watching_for_library_ids(
+                        accessible_library_ids,
+                        &user_id,
+                        content_restrictions,
+                        0,
+                        10,
+                    )
+                    .await;
+                tracing::debug!(
+                    stage = "continue_watching",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Catalog)
+            },
+            async {
+                let started = Instant::now();
+                let result = self
+                    .inner
+                    .catalog
+                    .list_recently_added_for_library_ids(
+                        accessible_library_ids,
+                        content_restrictions,
+                        0,
+                        12,
+                    )
+                    .await;
+                tracing::debug!(
+                    stage = "recently_added",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Catalog)
+            },
+            async {
+                let started = Instant::now();
+                let result = self
+                    .inner
+                    .catalog
+                    .list_recently_added_by_library_ids(
+                        accessible_library_ids,
+                        content_restrictions,
+                        12,
+                    )
+                    .await;
+                tracing::debug!(
+                    stage = "latest_by_library",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Catalog)
+            },
+            async {
+                let started = Instant::now();
+                let result = self.inner.libraries.list_libraries().await;
+                tracing::debug!(
+                    stage = "libraries",
+                    elapsed_ms = started.elapsed().as_millis(),
+                    "home section"
+                );
+                result.map_err(HomeError::Libraries)
+            },
+        )?;
+        tracing::debug!(
+            stage = "sections",
+            elapsed_ms = stage_started.elapsed().as_millis(),
+            "home snapshot stage"
+        );
+        let views = self
             .inner
-            .catalog
-            .list_recommended_for_library_ids_with_policy(
-                accessible_library_ids,
-                &user_id,
-                content_restrictions,
-                7,
-            )
+            .libraries
+            .order_views_for_user(&user_id, principal.is_admin, accessible_library_ids, views)
             .await?;
-        Ok(CachedHomeSnapshot { recommended })
+        Ok(HomeSnapshot {
+            continue_watching,
+            recently_added,
+            recommended,
+            latest_groups,
+            views,
+        })
     }
 }
 
@@ -712,7 +796,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalidation_rebuilds_carousel_snapshot_before_returning_it() {
+    async fn directory_invalidation_rebuilds_cached_snapshot_before_returning_it() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let config = Config {
             http_addr: "127.0.0.1:8097".parse().expect("test address"),
@@ -730,13 +814,291 @@ mod tests {
             .cached_snapshot(principal, &[])
             .await
             .expect("first user snapshot");
-        home.invalidate();
+        home.invalidate_directory();
         let refreshed = home
             .cached_snapshot(principal, &[])
             .await
             .expect("invalidated user snapshot");
 
         assert!(!std::ptr::eq(first.as_ref(), refreshed.as_ref()));
+    }
+
+    #[tokio::test]
+    async fn directory_invalidation_invalidates_every_user() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+        let first_user = AccessPrincipal::new(UserId::new(), false);
+        let second_user = AccessPrincipal::new(UserId::new(), false);
+
+        let first_user_before = home
+            .cached_snapshot(first_user, &[])
+            .await
+            .expect("first user snapshot");
+        let second_user_before = home
+            .cached_snapshot(second_user, &[])
+            .await
+            .expect("second user snapshot");
+
+        home.invalidate_directory();
+
+        let first_user_after = home
+            .cached_snapshot(first_user, &[])
+            .await
+            .expect("first user snapshot after directory change");
+        let second_user_after = home
+            .cached_snapshot(second_user, &[])
+            .await
+            .expect("second user snapshot after directory change");
+
+        assert!(!std::ptr::eq(
+            first_user_before.as_ref(),
+            first_user_after.as_ref()
+        ));
+        assert!(!std::ptr::eq(
+            second_user_before.as_ref(),
+            second_user_after.as_ref()
+        ));
+    }
+
+    #[tokio::test]
+    async fn user_invalidation_only_invalidates_that_user() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database),
+        );
+        let first_user = AccessPrincipal::new(UserId::new(), false);
+        let second_user = AccessPrincipal::new(UserId::new(), false);
+        let first_user_id = first_user.user_id_string();
+
+        let first_user_before = home
+            .cached_snapshot(first_user, &[])
+            .await
+            .expect("first user snapshot");
+        let second_user_before = home
+            .cached_snapshot(second_user, &[])
+            .await
+            .expect("second user snapshot");
+
+        home.invalidate_user(&first_user_id);
+
+        assert_eq!(
+            home.inner.generation.load(Ordering::Acquire),
+            0,
+            "a per-user change must not move the directory generation"
+        );
+        let first_user_after = home
+            .cached_snapshot(first_user, &[])
+            .await
+            .expect("first user snapshot after own change");
+        let second_user_after = home
+            .cached_snapshot(second_user, &[])
+            .await
+            .expect("second user snapshot after another user's change");
+
+        assert!(!std::ptr::eq(
+            first_user_before.as_ref(),
+            first_user_after.as_ref()
+        ));
+        assert!(
+            std::ptr::eq(second_user_before.as_ref(), second_user_after.as_ref()),
+            "another user's state change must keep this user's cached home snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn rails_on_a_cache_hit_run_no_sql() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database.clone()),
+        );
+        // The administrator principal reads no content restrictions, so a cache hit performs no
+        // query at all: every rail comes from the cached snapshot.
+        let principal = AccessPrincipal::new(UserId::new(), true);
+
+        let first = home
+            .snapshot(principal, Vec::new())
+            .await
+            .expect("initial home snapshot");
+        database.reset_query_count();
+        let cached = home
+            .snapshot(principal, Vec::new())
+            .await
+            .expect("cached home snapshot");
+
+        assert!(std::ptr::eq(first.as_ref(), cached.as_ref()));
+        assert_eq!(
+            database.query_count(),
+            0,
+            "a home cache hit must not query the rails again"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_access_change_invalidates_that_users_home_cache() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let user = UserStore::new(database.clone())
+            .expect("user store")
+            .create_user(
+                "home-access-cache-viewer",
+                "Home Access Cache Viewer",
+                "test password",
+                false,
+            )
+            .await
+            .expect("regular user");
+        let other = UserStore::new(database.clone())
+            .expect("user store")
+            .create_user(
+                "home-access-cache-other",
+                "Home Access Cache Other",
+                "test password",
+                false,
+            )
+            .await
+            .expect("regular user");
+        let library = LibraryService::new(database.clone())
+            .create_library("Access Cache", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database.clone()),
+        );
+        let principal = AccessPrincipal::new(user.id, false);
+        let other_principal = AccessPrincipal::new(other.id, false);
+        let library_ids = vec![library_id.clone()];
+
+        let before = home
+            .cached_snapshot(principal, &library_ids)
+            .await
+            .expect("initial home snapshot");
+        let other_before = home
+            .cached_snapshot(other_principal, &library_ids)
+            .await
+            .expect("other user home snapshot");
+
+        // The permission write bumps the storage-level counters the access cache already uses, so
+        // the home cache must treat the cached snapshot as stale without an extra call site.
+        database
+            .set_user_library_access(&user.id.to_string(), &library_id, false)
+            .await
+            .expect("library access write");
+
+        let after = home
+            .cached_snapshot(principal, &library_ids)
+            .await
+            .expect("home snapshot after access change");
+        let other_after = home
+            .cached_snapshot(other_principal, &library_ids)
+            .await
+            .expect("other user home snapshot after access change");
+
+        assert!(!std::ptr::eq(before.as_ref(), after.as_ref()));
+        assert!(
+            std::ptr::eq(other_before.as_ref(), other_after.as_ref()),
+            "one user's library access change must not invalidate another user's home cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn library_deletion_invalidates_every_home_cache() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let user_store = UserStore::new(database.clone()).expect("user store");
+        let first = user_store
+            .create_user(
+                "home-deletion-cache-first",
+                "Home Deletion Cache First",
+                "test password",
+                false,
+            )
+            .await
+            .expect("first user");
+        let second = user_store
+            .create_user(
+                "home-deletion-cache-second",
+                "Home Deletion Cache Second",
+                "test password",
+                false,
+            )
+            .await
+            .expect("second user");
+        let library = LibraryService::new(database.clone())
+            .create_library("Deleted Cache", LibraryKind::Movie, false)
+            .await
+            .expect("library");
+        let library_id = library.id.to_string();
+        let access = MediaAccessService::new(database.clone());
+        let home = HomeService::new(
+            CatalogService::new(database.clone(), access),
+            LibraryService::new(database.clone()),
+        );
+        let first_user = AccessPrincipal::new(first.id, false);
+        let second_user = AccessPrincipal::new(second.id, false);
+        let library_ids = vec![library_id.clone()];
+
+        let first_before = home
+            .cached_snapshot(first_user, &library_ids)
+            .await
+            .expect("first user snapshot");
+        let second_before = home
+            .cached_snapshot(second_user, &library_ids)
+            .await
+            .expect("second user snapshot");
+
+        // Deleting a library moves the global access epoch: every user's visible libraries change.
+        assert!(
+            database
+                .delete_library(&library_id)
+                .await
+                .expect("delete library")
+        );
+
+        let first_after = home
+            .cached_snapshot(first_user, &library_ids)
+            .await
+            .expect("first user snapshot after deletion");
+        let second_after = home
+            .cached_snapshot(second_user, &library_ids)
+            .await
+            .expect("second user snapshot after deletion");
+
+        assert!(!std::ptr::eq(first_before.as_ref(), first_after.as_ref()));
+        assert!(!std::ptr::eq(second_before.as_ref(), second_after.as_ref()));
     }
 
     #[tokio::test]
@@ -825,8 +1187,8 @@ mod tests {
             LibraryService::new(database),
         );
 
-        home.invalidate();
-        home.invalidate();
+        home.invalidate_directory();
+        home.invalidate_directory();
 
         assert_eq!(home.inner.generation.load(Ordering::Acquire), 2);
         assert_eq!(
@@ -857,7 +1219,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn continue_watching_is_read_fresh_when_carousel_is_cached() {
+    async fn playback_progress_only_invalidates_the_playing_users_home_cache() {
         let temp_dir = tempfile::tempdir().expect("temporary directory should be available");
         let config = Config {
             http_addr: "127.0.0.1:8097".parse().expect("test address"),
@@ -869,6 +1231,16 @@ mod tests {
             .complete("Admin", "Admin", "correct password")
             .await
             .expect("admin user");
+        let other_user = UserStore::new(database.clone())
+            .expect("user store")
+            .create_user(
+                "home-progress-other",
+                "Home Progress Other",
+                "test password",
+                false,
+            )
+            .await
+            .expect("regular user");
         let access = MediaAccessService::new(database.clone());
         let libraries = LibraryService::new(database.clone());
         let library = libraries
@@ -917,16 +1289,19 @@ mod tests {
             CatalogService::new(database.clone(), access.clone()),
             libraries,
         );
-        let principal = AccessPrincipal::new(admin.id, true);
-        let library_ids = access
-            .accessible_library_ids(principal)
+        let playing = AccessPrincipal::new(admin.id, true);
+        let other = AccessPrincipal::new(other_user.id, false);
+        let library_ids = vec![library.id.to_string()];
+        let playing_before = home
+            .snapshot(playing, library_ids.clone())
             .await
-            .expect("accessible libraries");
-        let first = home
-            .snapshot(principal, library_ids.clone())
+            .expect("initial playing user snapshot");
+        let other_before = home
+            .snapshot(other, library_ids.clone())
             .await
-            .expect("initial home snapshot");
-        assert!(first.continue_watching.items.is_empty());
+            .expect("initial other user snapshot");
+        assert!(playing_before.continue_watching.items.is_empty());
+        assert!(other_before.continue_watching.items.is_empty());
 
         let user_id = admin.id.to_string();
         database
@@ -952,12 +1327,27 @@ mod tests {
             })
             .await
             .expect("playback state");
+        // What the progress handlers do once the write commits: invalidate the playing user only.
+        home.invalidate_user(&user_id);
 
-        let second = home
-            .snapshot(principal, library_ids)
+        let playing_after = home
+            .snapshot(playing, library_ids.clone())
             .await
-            .expect("fresh home snapshot");
-        assert_eq!(second.continue_watching.items[0].id, item_id);
+            .expect("fresh playing user snapshot");
+        let other_after = home
+            .snapshot(other, library_ids)
+            .await
+            .expect("other user snapshot after another user's playback");
+
+        assert_eq!(playing_after.continue_watching.items[0].id, item_id);
+        assert!(!std::ptr::eq(
+            playing_before.as_ref(),
+            playing_after.as_ref()
+        ));
+        assert!(
+            std::ptr::eq(other_before.as_ref(), other_after.as_ref()),
+            "one user's playback must not invalidate another user's cached home"
+        );
     }
 
     #[tokio::test]

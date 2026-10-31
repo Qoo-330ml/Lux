@@ -3222,7 +3222,7 @@ impl MetadataSelectionService {
             ));
         }
         if let Some(home) = &self.home {
-            home.invalidate();
+            home.invalidate_directory();
         }
         Ok(MetadataSelectionReport {
             item_id: item_id.to_owned(),

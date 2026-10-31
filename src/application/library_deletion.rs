@@ -223,7 +223,7 @@ impl LibraryDeletionService {
         {
             Ok(Some(true)) => {
                 if let Some(home) = &self.home {
-                    home.invalidate();
+                    home.invalidate_directory();
                 }
                 tracing::info!(
                     job_id,

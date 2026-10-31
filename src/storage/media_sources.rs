@@ -4,10 +4,13 @@ use super::*;
 
 impl Database {
     pub(crate) async fn restore_media_item(&self, item_id: &str) -> Result<(), StorageError> {
+        // "Restore" runs for every existing item a rescan rediscovers; an item that is not
+        // removed is already in the desired state, and the update would only add a catalog
+        // outbox row.
         self.query(
             "UPDATE media_items
              SET removed_at = NULL, updated_at = unixepoch()
-             WHERE id = ?",
+             WHERE id = ? AND removed_at IS NOT NULL",
         )
         .bind(item_id)
         .execute(&self.pool)
@@ -354,14 +357,19 @@ impl Database {
         strm_target_kind: Option<&str>,
         strm_target: Option<&str>,
     ) -> Result<(), StorageError> {
+        // Every unchanged `.strm` file of every scan passes through here, and the parsed target
+        // rarely changes: skip the write (and its catalog outbox row) when it did not.
         self.query(
             "UPDATE media_sources
              SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
-             WHERE filesystem_entry_id = ?",
+             WHERE filesystem_entry_id = ?
+               AND (external_url IS DISTINCT FROM ? OR strm_target_kind IS DISTINCT FROM ?)",
         )
         .bind(strm_target)
         .bind(strm_target_kind)
         .bind(filesystem_entry_id)
+        .bind(strm_target)
+        .bind(strm_target_kind)
         .execute(&self.pool)
         .await
         .map(|_| ())
@@ -374,14 +382,18 @@ impl Database {
         edition_name: Option<&str>,
         quality_label: Option<&str>,
     ) -> Result<(), StorageError> {
+        // Rescans re-derive the same labels from the same file name.
         self.query(
             "UPDATE media_sources
              SET edition_name = ?, quality_label = ?, updated_at = unixepoch()
-             WHERE filesystem_entry_id = ?",
+             WHERE filesystem_entry_id = ?
+               AND (edition_name IS DISTINCT FROM ? OR quality_label IS DISTINCT FROM ?)",
         )
         .bind(edition_name)
         .bind(quality_label)
         .bind(filesystem_entry_id)
+        .bind(edition_name)
+        .bind(quality_label)
         .execute(&self.pool)
         .await
         .map(|_| ())

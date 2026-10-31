@@ -840,13 +840,13 @@ pub use repository::{
 
 #[allow(unused_imports)]
 pub(crate) use repository::{
-    AdminUserSortField, AdminUserStatusFilter, CATALOG_ITEMS_INCREMENTAL_CONSUMER,
-    CATALOG_OUTBOX_KIND, CatalogFilterQuery, CatalogSort, ChapterDetectionOutcomeUpdate,
-    ChapterDetectionSourceStateUpdate, DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS,
-    DEFAULT_MAINTENANCE_INTERVAL_SECONDS, DEFAULT_PLAYED_PERCENT, DashboardStats,
-    DatabasePoolSnapshot, DevicePairingRedeemResult, EmbyMigrationHandledItemBatch,
-    EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch, EmbyMigrationItemPageBatch,
-    EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
+    AdminUserSortField, AdminUserStatusFilter, AuthCacheEpochSnapshot, AuthCacheEpochs,
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND, CatalogFilterQuery, CatalogSort,
+    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
+    DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
+    DEFAULT_PLAYED_PERCENT, DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult,
+    EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
+    EmbyMigrationItemPageBatch, EmbyMigrationJobProgress, EmbyMigrationPersonFavoriteBatch,
     EmbyMigrationPersonFavoriteStateBatch, EmbyMigrationUserItemStateBatch,
     EmbyMigrationUserItemStateFields, ExternalSubtitleUpdate, FilesystemEntryMove,
     FilesystemEntryUpdate, ItemImageBatchInsert, ItemImageInsert, ItemImageMetadata,
@@ -872,12 +872,13 @@ pub(crate) use repository::{
     NewStoredUser, NewStrmProbeJob, NewTranscodingHistory, NewUserAccessBlacklistRule,
     NewUserAccountPreferences, NewUserActivityEvent, NewUserContentRestrictions,
     NewUserDeviceObservation, NewUserInvitation, NewWebPlaybackEvent, NewWebPlaybackSession,
-    PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, ReadModelPageQuery,
-    ReadModelSort, RecentByLibraryReadModelQuery, RecentReadModelQuery, ReconciliationBatchCommit,
-    ReconciliationBatchCommitResult, ResumeItemsQuery, ResumePointerQuery, SEARCH_REINDEX_CONSUMER,
-    SEARCH_REINDEX_KIND, ScanFingerprintMigrationCommit, ScanManifestRemovalCandidateQuery,
-    SelectedMetadataUpdate, StoredAccessTokenDevice, StoredActivityEvent, StoredAdminUserListItem,
-    StoredCanonicalPerson, StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,
+    PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, PlaybackEventEffects,
+    ReadModelPageQuery, ReadModelSort, RecentByLibraryReadModelQuery, RecentReadModelQuery,
+    ReconciliationBatchCommit, ReconciliationBatchCommitResult, ResumeItemsQuery,
+    ResumePointerQuery, SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_KIND,
+    ScanFingerprintMigrationCommit, ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate,
+    StoredAccessTokenDevice, StoredActivityEvent, StoredAdminUserListItem, StoredCanonicalPerson,
+    StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,
     StoredCatalogItemCounts, StoredCatalogRow, StoredChapterDetectionItem,
     StoredChapterDetectionJob, StoredChapterDetectionSource, StoredChapterDetectionSourceState,
     StoredCollectionRefresh, StoredDanmakuMatchItem, StoredDanmakuMatchJob, StoredDanmakuSource,
@@ -902,12 +903,12 @@ pub(crate) use repository::{
     StoredPersonIdentityMove, StoredPersonIndexRebuildJob, StoredPersonMatchCandidate,
     StoredPipelineStageActivity, StoredPipelineStageKind, StoredPipelineStatusCounts,
     StoredPlaybackDurations, StoredPlaybackHistoryEvent, StoredPlaybackSession,
-    StoredPlaybackSource, StoredReconciliationScanEntry, StoredScanFingerprintMigrationCandidate,
-    StoredScanFingerprintMigrationCursor, StoredScanJob, StoredScanJobCounts,
-    StoredScanJobMetadataPage, StoredScanJobMetadataSources, StoredScanJobPath,
-    StoredScanJobRetryState, StoredScanLocalMetadataBackfillPage, StoredScanLocalMetadataBatch,
-    StoredScanLocalMetadataSource, StoredScanManifest, StoredScanManifestDelta,
-    StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
+    StoredPlaybackSource, StoredReconciliationScanEntry, StoredRouteTokenPrincipal,
+    StoredScanFingerprintMigrationCandidate, StoredScanFingerprintMigrationCursor, StoredScanJob,
+    StoredScanJobCounts, StoredScanJobMetadataPage, StoredScanJobMetadataSources,
+    StoredScanJobPath, StoredScanJobRetryState, StoredScanLocalMetadataBackfillPage,
+    StoredScanLocalMetadataBatch, StoredScanLocalMetadataSource, StoredScanManifest,
+    StoredScanManifestDelta, StoredScanManifestDiffCandidate, StoredScanManifestDirectory,
     StoredScanManifestFilesystemBaseline, StoredScanManifestPostprocessingRoot,
     StoredScanManifestPostprocessingState, StoredScanManifestRemovalCandidate,
     StoredScheduledTaskConfig, StoredScheduledTaskPlan, StoredScheduledTaskPlanLibrary,
@@ -923,7 +924,8 @@ pub(crate) use repository::{
     UserContentRestrictions, UserContentRestrictionsCasResult, UserDevicePageQuery,
     UserInvitationCreateResult, UserInvitationPage, UserInvitationResendResult,
     UserInvitationStatus, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
-    is_lite_manifest_discovery, movie_parent_folder_identity, recommendation_batch_key_at,
+    is_lite_manifest_discovery, movie_parent_folder_identity, playback_reached_played_threshold,
+    recommendation_batch_key_at,
 };
 
 /// Opens a throwaway SQLite database for unit tests.
@@ -938,3 +940,7 @@ pub(crate) async fn test_database()
     .await?;
     Ok((temp_dir, database))
 }
+
+#[cfg(test)]
+#[path = "redundant_write_tests.rs"]
+mod redundant_write_tests;

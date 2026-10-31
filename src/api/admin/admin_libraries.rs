@@ -899,7 +899,7 @@ pub(crate) async fn admin_delete_library(
     libraries.notify_library_changed();
     {
         let home = state.home();
-        home.invalidate();
+        home.invalidate_directory();
     }
     record_audit_event(
         &state,

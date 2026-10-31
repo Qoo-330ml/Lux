@@ -36,7 +36,7 @@ pub(crate) async fn set_library_access(
         .set_user_library_access(user_id, library_id, can_view)
         .await
         .map_err(|_| SetLibraryAccessError::Storage)?;
-    admin_cache::invalidate_home(home);
+    admin_cache::invalidate_home_for_user(home, user_id);
     Ok(())
 }
 
@@ -100,6 +100,6 @@ pub(crate) async fn replace_library_access(
     if !updated {
         return Err(ReplaceLibraryAccessError::UserNotFound);
     }
-    admin_cache::invalidate_home(home);
+    admin_cache::invalidate_home_for_user(home, user_id);
     Ok((mode.to_owned(), selected_ids))
 }

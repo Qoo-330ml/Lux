@@ -36,6 +36,18 @@ pub(crate) struct ResumePointerQuery<'a> {
 /// Every path that needs the threshold resolves it through this one definition: the pointer
 /// candidate query, the resume list, and the per-event crossing check in
 /// [`Database::record_playback_event`].
+/// Statement that resolves the resume threshold of one item.
+///
+/// Shared by the transaction and the pool readers so both answer with the same setting and
+/// default.
+fn resume_threshold_sql() -> String {
+    format!(
+        "SELECT CASE WHEN EXISTS (
+             SELECT 1 FROM media_items WHERE id = ? AND item_type = 'EPISODE'
+         ) THEN ({RESUME_MINIMUM_TICKS_SQL}) END"
+    )
+}
+
 pub(super) const RESUME_MINIMUM_TICKS_SQL: &str = "COALESCE(
     (SELECT CAST(value AS BIGINT) FROM server_settings WHERE key = 'resume_min_ticks'),
     1200000000
@@ -488,14 +500,26 @@ impl Database {
         transaction: &mut sqlx::Transaction<'_, Any>,
         item_id: &str,
     ) -> Result<Option<i64>, StorageError> {
-        let sql = format!(
-            "SELECT CASE WHEN EXISTS (
-                 SELECT 1 FROM media_items WHERE id = ? AND item_type = 'EPISODE'
-             ) THEN ({RESUME_MINIMUM_TICKS_SQL}) END"
-        );
-        self.query_scalar::<Option<i64>>(sqlx::AssertSqlSafe(sql))
+        self.query_scalar::<Option<i64>>(sqlx::AssertSqlSafe(resume_threshold_sql()))
             .bind(item_id)
             .fetch_one(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())
+    }
+
+    /// Resolves the same threshold outside a transaction.
+    ///
+    /// The playback progress coalescer decides whether a plain progress tick may stay in memory
+    /// before it opens the event transaction, and it needs the identical value: a tick that moves
+    /// the position across the threshold adds the item to, or removes it from, continue-watching,
+    /// so it must be written immediately.
+    pub(crate) async fn resume_threshold_for_item(
+        &self,
+        item_id: &str,
+    ) -> Result<Option<i64>, StorageError> {
+        self.query_scalar::<Option<i64>>(sqlx::AssertSqlSafe(resume_threshold_sql()))
+            .bind(item_id)
+            .fetch_one(&self.pool)
             .await
             .map_err(self.sqlx_err())
     }

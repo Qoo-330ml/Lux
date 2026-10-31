@@ -2156,7 +2156,7 @@ pub(super) async fn auth_update_account_preferences(
                 .retain(|library_id| accessible_library_ids.contains(library_id));
             {
                 let home = state.home();
-                home.invalidate();
+                home.invalidate_user(&user.id.to_string());
             }
             state
                 .user_events
@@ -2256,7 +2256,11 @@ pub(super) async fn auth_update_settings(
         )
         .await
         {
-            Ok(updated) => preferences = updated,
+            Ok(updated) => {
+                preferences = updated;
+                // The auto-played threshold decides which items continue watching keeps.
+                state.home().invalidate_user(&user.id.to_string());
+            }
             Err(error) => return account_preferences_error(&headers, error),
         }
     }
@@ -2270,7 +2274,7 @@ pub(super) async fn auth_update_settings(
         }
         {
             let home = state.home();
-            home.invalidate();
+            home.invalidate_user(&user.id.to_string());
         }
         state
             .user_events
@@ -2525,7 +2529,7 @@ pub(super) async fn auth_update_library_order(
             let preferences_version = updated.version;
             {
                 let home = state.home();
-                home.invalidate();
+                home.invalidate_user(&user.id.to_string());
             }
             state
                 .user_events
