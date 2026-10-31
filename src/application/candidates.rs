@@ -583,6 +583,32 @@ impl MetadataCandidateService {
         .await
     }
 
+    /// Manual candidate search on the caller's snapshot of the item.
+    ///
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S3: the manual entry point already read
+    /// the item (to reject `VIDEO` items), so the search must not read it a second time.
+    pub(crate) async fn search_and_store_for_current(
+        &self,
+        item_id: &str,
+        query: &str,
+        year: Option<i32>,
+        scraper: &ScraperProvider,
+        current: &StoredMediaMetadata,
+    ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
+        self.search_and_store_with_mode(
+            item_id,
+            query,
+            year,
+            scraper,
+            CandidateSearchOptions {
+                mode: CandidateSearchMode::Manual,
+                plan: MetadataRequestPlan::full(),
+                current: Some(current),
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn search_and_store_for_automatic_match_with_plan(
         &self,
         item_id: &str,
@@ -2445,6 +2471,11 @@ struct MetadataSelectionOptions<'a> {
     supplemental: bool,
     preserve_identity: bool,
     image_policy: Option<ImageSelectionPolicy>,
+    /// The caller's snapshot of the item, when it can prove nothing rewrote the row since.
+    ///
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M8: selection re-read the same
+    /// `media_items` row (wide projection, NFO cache columns) the caller already held.
+    current: Option<&'a StoredMediaMetadata>,
 }
 
 #[derive(Clone)]
@@ -2850,6 +2881,7 @@ impl MetadataSelectionService {
                 supplemental: false,
                 preserve_identity: false,
                 image_policy: None,
+                current: None,
             },
         )
         .await
@@ -2870,6 +2902,7 @@ impl MetadataSelectionService {
             scraper_id,
             supplemental,
             None,
+            None,
         )
         .await
     }
@@ -2882,6 +2915,7 @@ impl MetadataSelectionService {
         scraper_id: Option<&str>,
         supplemental: bool,
         image_policy: Option<ImageSelectionPolicy>,
+        current: Option<&StoredMediaMetadata>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -2893,6 +2927,7 @@ impl MetadataSelectionService {
                 supplemental,
                 preserve_identity: false,
                 image_policy,
+                current,
             },
         )
         .await
@@ -2906,6 +2941,7 @@ impl MetadataSelectionService {
         scraper_id: Option<&str>,
         supplemental: bool,
         image_policy: Option<ImageSelectionPolicy>,
+        current: Option<&StoredMediaMetadata>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -2917,6 +2953,7 @@ impl MetadataSelectionService {
                 supplemental,
                 preserve_identity: false,
                 image_policy,
+                current,
             },
         )
         .await
@@ -2938,6 +2975,7 @@ impl MetadataSelectionService {
                 supplemental: false,
                 preserve_identity: false,
                 image_policy: None,
+                current: None,
             },
         )
         .await
@@ -2989,6 +3027,7 @@ impl MetadataSelectionService {
         candidate_id: &str,
         scraper_id: &str,
         image_policy: Option<ImageSelectionPolicy>,
+        current: Option<&StoredMediaMetadata>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -3000,6 +3039,7 @@ impl MetadataSelectionService {
                 supplemental: false,
                 preserve_identity: true,
                 image_policy,
+                current,
             },
         )
         .await
@@ -3012,11 +3052,18 @@ impl MetadataSelectionService {
         mode: MetadataSelectionMode,
         options: MetadataSelectionOptions<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
-        let current = self
-            .database
-            .find_media_item_metadata(item_id)
-            .await?
-            .ok_or(MetadataSelectionError::ItemNotFound)?;
+        let fetched_current;
+        let current = match options.current {
+            Some(current) => current,
+            None => {
+                fetched_current = self
+                    .database
+                    .find_media_item_metadata(item_id)
+                    .await?
+                    .ok_or(MetadataSelectionError::ItemNotFound)?;
+                &fetched_current
+            }
+        };
         let candidate = self
             .database
             .find_metadata_candidate(item_id, candidate_id)
@@ -5198,13 +5245,14 @@ mod tests {
         ACTOR_METADATA_FETCH_CONCURRENCY, ArtworkOverwrite, COMPLETENESS_PLAN_ITEM_CONCURRENCY,
         EpisodeImagePolicy, FillMissingRequestPlan, ImageLevel, ImageSelectionPolicy,
         MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
-        MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles, candidate_actor_credits,
-        candidate_actors, candidate_payload, capability_needs_request, completeness_capabilities,
-        credits_need_actor_relation_check, default_image_selection_policy, enrich_actor_metadata,
-        filtered_candidate_images, generic_candidate_actors, generic_candidate_images,
-        image_attempt_identities, local_metadata_completeness_plan, merge_actor_values,
-        merge_supplemental_movie_nfo, metadata_completeness_fingerprint, metadata_match_score,
-        metadata_request_plan, metadata_request_plan_has_work, parse_image_selection_policy,
+        MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles,
+        candidate_actor_credits, candidate_actors, candidate_payload, capability_needs_request,
+        completeness_capabilities, credits_need_actor_relation_check,
+        default_image_selection_policy, enrich_actor_metadata, filtered_candidate_images,
+        generic_candidate_actors, generic_candidate_images, image_attempt_identities,
+        local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
+        metadata_completeness_fingerprint, metadata_match_score, metadata_request_plan,
+        metadata_request_plan_has_work, parse_image_selection_policy,
         replace_provider_id_with_candidate, run_bounded_completeness_plan_tasks,
         selected_scraper_provider_id,
     };
@@ -5583,12 +5631,26 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn manual_candidate_search_commits_capability_rows_once()
-    -> Result<(), Box<dyn std::error::Error>> {
-        use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+    /// Runs one fill-missing selection on a fresh library and reports its statement count and the
+    /// title stored afterwards.
+    ///
+    /// A fresh fixture per run keeps the comparison honest: the first selection writes the NFO
+    /// projection, which would change the second selection's statement shape.
+    async fn selection_statement_count(
+        use_snapshot: bool,
+    ) -> Result<(usize, String), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+            storage::NewMetadataCandidate,
+        };
 
         let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Movies");
+        let movie_dir = root.join("Example Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"movie").await?;
         let config = Config {
             http_addr: "127.0.0.1:8097".parse()?,
             config_dir: directory.path().join("config"),
@@ -5597,20 +5659,173 @@ mod tests {
         let library = LibraryService::new(database.clone())
             .create_library("Movies", LibraryKind::Movie, false)
             .await?;
-        sqlx::query(
-            "INSERT INTO media_items (
-                    id, library_id, item_type, title, sort_title, identification_status
-                 ) VALUES ('candidate-search-item', ?, 'MOVIE', 'Example', 'example', 'LOCAL_CONFIRMED')",
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        sqlx::query("UPDATE media_items SET title = 'Database Title' WHERE id = ?")
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        let candidate_json =
+            json!({"providerIds": {"tmdb": "movie-9"}, "metadataFetched": true, "images": {}})
+                .to_string();
+        database
+            .insert_metadata_candidates(&[NewMetadataCandidate {
+                id: "snapshot-candidate",
+                item_id: &item_id,
+                provider: "tmdb",
+                provider_id: "movie-9",
+                candidate_json: &candidate_json,
+                score: 90.0,
+                expires_at: None,
+            }])
+            .await?;
+        let service = MetadataSelectionService::with_config_dir(
+            database.clone(),
+            ImageWriteService::new_with_config_dir(database.clone(), config.config_dir.clone())?,
+            config.config_dir.clone(),
+        );
+        let snapshot = if use_snapshot {
+            let mut snapshot = database
+                .find_media_item_metadata(&item_id)
+                .await?
+                .ok_or("item metadata missing")?;
+            snapshot.title = "Snapshot Title".to_owned();
+            Some(snapshot)
+        } else {
+            None
+        };
+
+        database.reset_query_count();
+        service
+            .select_with_scraper_and_policy(
+                &item_id,
+                "snapshot-candidate",
+                MetadataSelectionMode::FillMissing,
+                None,
+                false,
+                None,
+                snapshot.as_ref(),
+            )
+            .await?;
+        let statements = database.query_count();
+        let title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+        database.close().await;
+        Ok((statements, title))
+    }
+
+    #[tokio::test]
+    async fn selection_reuses_the_callers_item_snapshot() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (with_snapshot, snapshot_title) = selection_statement_count(true).await?;
+        let (without_snapshot, database_title) = selection_statement_count(false).await?;
+
+        assert_eq!(
+            snapshot_title, "Snapshot Title",
+            "the selection must use the caller's snapshot instead of re-reading the row"
+        );
+        assert_eq!(database_title, "Database Title");
+        assert_eq!(
+            with_snapshot + 1,
+            without_snapshot,
+            "a snapshot selection must save exactly the media_items re-read"
+        );
+        Ok(())
+    }
+
+    /// A scanned movie library with one unconfirmed item, plus the config directory.
+    async fn candidate_search_fixture()
+    -> Result<(Database, String, tempfile::TempDir), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Movies");
+        let movie_dir = root.join("Example Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Example.Movie.2020.mkv"), b"movie").await?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        Ok((database, item_id, directory))
+    }
+
+    /// Runs one manual 20-candidate search and reports its statement count and stored scores.
+    async fn manual_search_statements(
+        use_snapshot: bool,
+    ) -> Result<(usize, Vec<(String, f64)>), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
+        let service = MetadataCandidateService::new(database.clone());
+        let adapter = ManyCandidateAdapter { candidates: 20 };
+        let scraper = ScraperProvider::from_adapter(adapter);
+
+        database.reset_metadata_write_transaction_count();
+        database.reset_query_count();
+        let page = if use_snapshot {
+            let current = database
+                .find_media_item_metadata(&item_id)
+                .await?
+                .ok_or("item metadata missing")?;
+            database.reset_query_count();
+            service
+                .search_and_store_for_current(&item_id, "Example", None, &scraper, &current)
+                .await?
+        } else {
+            service
+                .search_and_store(&item_id, "Example", None, &scraper)
+                .await?
+        };
+        let statements = database.query_count();
+        assert_eq!(page.items.len(), 20);
+        let scores: Vec<(String, f64)> = sqlx::query_as(
+            "SELECT provider_id, score FROM metadata_candidates
+             WHERE item_id = ? ORDER BY provider_id",
         )
-        .bind(library.id.to_string())
-        .execute(database.pool())
+        .bind(&item_id)
+        .fetch_all(database.pool())
         .await?;
+        database.close().await;
+        Ok((statements, scores))
+    }
+
+    #[tokio::test]
+    async fn manual_candidate_search_commits_capability_rows_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = candidate_search_fixture().await?;
         let service = MetadataCandidateService::new(database.clone());
 
         database.reset_metadata_write_transaction_count();
         let page = service
             .search_and_store(
-                "candidate-search-item",
+                &item_id,
                 "Example",
                 None,
                 &ScraperProvider::from_adapter(ManyCandidateAdapter { candidates: 20 }),
@@ -5627,12 +5842,31 @@ mod tests {
         );
         let capability_rows: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM metadata_capability_attempts
-             WHERE item_id = 'candidate-search-item'",
+             WHERE item_id = ?",
         )
+        .bind(&item_id)
         .fetch_one(database.pool())
         .await?;
         assert_eq!(capability_rows, 60);
         database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn manual_search_with_the_callers_snapshot_skips_item_reads()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (with_snapshot, snapshot_scores) = manual_search_statements(true).await?;
+        let (without_snapshot, database_scores) = manual_search_statements(false).await?;
+
+        // The same rows, so the caller's snapshot changed nothing observable.
+        assert_eq!(snapshot_scores, database_scores);
+        // S3: the public entry point reads the item and then re-reads it for the returned page;
+        // the snapshot entry point does neither.
+        assert_eq!(
+            with_snapshot + 2,
+            without_snapshot,
+            "passing the caller's snapshot must save the item read and the page re-read"
+        );
         Ok(())
     }
 

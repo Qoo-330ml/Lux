@@ -742,12 +742,15 @@ enum RefreshItemOutcome {
     NeedsReview(i64),
 }
 
-struct RefreshItemOptions {
+struct RefreshItemOptions<'a> {
     scraper_id: Option<String>,
     supplemental: bool,
     preserve_identity: bool,
     request_plan: Option<MetadataRequestPlan>,
     image_policy: Option<ImageSelectionPolicy>,
+    /// The item snapshot to reuse for the selection step, when the caller can prove nothing
+    /// rewrote the row since it was read (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M8).
+    current: Option<&'a crate::storage::StoredMediaMetadata>,
 }
 
 impl Drop for MetadataJobOwnerGuard {
@@ -1129,13 +1132,16 @@ impl MetadataReidentifyService {
         query: &str,
         year: Option<i32>,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
-        let kind = self
+        // The search needs the item's type and metadata; read the wide row once and hand it to
+        // the candidate search instead of reading kind and metadata separately
+        // (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S3).
+        let current = self
             .database
-            .find_media_item_kind(item_id)
+            .find_media_item_metadata(item_id)
             .await
             .map_err(MetadataCandidateError::Storage)?
             .ok_or(MetadataCandidateError::ItemNotFound)?;
-        if kind.item_type == "VIDEO" {
+        if current.item_type == "VIDEO" {
             return Err(MetadataCandidateError::Scraper(
                 ScraperError::UnsupportedCapability("metadata.search".to_owned()),
             ));
@@ -1145,7 +1151,7 @@ impl MetadataReidentifyService {
             .await
             .map_err(MetadataCandidateError::Scraper)?
             .unwrap_or_default();
-        self.search_item_candidates_with_scrapers(item_id, query, year, &scrapers)
+        self.search_item_candidates_with_scrapers(item_id, query, year, &scrapers, &current)
             .await
     }
 
@@ -1155,6 +1161,7 @@ impl MetadataReidentifyService {
         query: &str,
         year: Option<i32>,
         scrapers: &[ResolvedScraper],
+        current: &crate::storage::StoredMediaMetadata,
     ) -> Result<MetadataCandidatePage, MetadataCandidateError> {
         let mut last_page = None;
         let mut last_scraper_error = None;
@@ -1172,7 +1179,7 @@ impl MetadataReidentifyService {
             attempted = true;
             match self
                 .candidates
-                .search_and_store(item_id, query, year, &scraper.provider)
+                .search_and_store_for_current(item_id, query, year, &scraper.provider, current)
                 .await
             {
                 Ok(page) if !page.items.is_empty() => {
@@ -2059,6 +2066,10 @@ impl MetadataReidentifyService {
         });
         let mut last_recoverable_error = None;
         let mut saw_needs_review = false;
+        // The item row is unmodified until the first attempt reaches selection, because a failed
+        // attempt may already have written the NFO projection. Only the first primary attempt may
+        // therefore reuse the caller's snapshot instead of reading the row again.
+        let mut current_snapshot = Some(item);
         let should_refresh_primary = !already_confirmed
             || request_plan.is_none_or(|plan| !metadata_request_plan_is_complete(plan));
         if should_refresh_primary {
@@ -2086,6 +2097,7 @@ impl MetadataReidentifyService {
                             preserve_identity: false,
                             request_plan,
                             image_policy: request_plan.and_then(|plan| plan.image_policy),
+                            current: current_snapshot.take(),
                         },
                     )
                     .await
@@ -2167,6 +2179,7 @@ impl MetadataReidentifyService {
                                 preserve_identity: true,
                                 request_plan: Some(fallback_plan),
                                 image_policy: fallback_plan.image_policy,
+                                current: Some(&current),
                             },
                         )
                         .await
@@ -2223,6 +2236,9 @@ impl MetadataReidentifyService {
                             preserve_identity: false,
                             request_plan: supplemental_plan,
                             image_policy: supplemental_plan.and_then(|plan| plan.image_policy),
+                            // Supplemental attempts run after earlier writers, so `item` is stale
+                            // here; the selection must re-read the row.
+                            current: None,
                         },
                     )
                     .await
@@ -2256,7 +2272,7 @@ impl MetadataReidentifyService {
         item: &crate::storage::StoredMediaMetadata,
         mode: MetadataRefreshMode,
         provider: &ScraperProvider,
-        options: RefreshItemOptions,
+        options: RefreshItemOptions<'_>,
     ) -> Result<RefreshItemOutcome, MetadataReidentifyError> {
         let page = if matches!(mode, MetadataRefreshMode::FillMissing)
             || options.supplemental
@@ -2337,6 +2353,7 @@ impl MetadataReidentifyService {
                     &candidate.id,
                     options.scraper_id.as_deref().unwrap_or_default(),
                     options.image_policy,
+                    options.current,
                 )
                 .await
         } else if needs_review {
@@ -2348,6 +2365,7 @@ impl MetadataReidentifyService {
                     options.scraper_id.as_deref(),
                     options.supplemental,
                     options.image_policy,
+                    options.current,
                 )
                 .await
         } else {
@@ -2359,6 +2377,7 @@ impl MetadataReidentifyService {
                     options.scraper_id.as_deref(),
                     options.supplemental,
                     options.image_policy,
+                    options.current,
                 )
                 .await
         }
@@ -3890,7 +3909,7 @@ mod tests {
         let primary = RoleRecordingAdapter::with_search_failure("primary", Arc::clone(&calls));
         let backup = RoleRecordingAdapter::new("backup", Arc::clone(&calls));
         let service = super::MetadataReidentifyService::new(
-            database,
+            database.clone(),
             super::ScraperProvider::from_adapter(primary.clone()),
         );
         let scrapers = vec![
@@ -3906,8 +3925,18 @@ mod tests {
             },
         ];
 
+        let current = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("item metadata missing")?;
         let page = service
-            .search_item_candidates_with_scrapers(&item_id, "Example Movie", Some(2020), &scrapers)
+            .search_item_candidates_with_scrapers(
+                &item_id,
+                "Example Movie",
+                Some(2020),
+                &scrapers,
+                &current,
+            )
             .await?;
 
         assert!(page.items.iter().any(|item| item.provider == "backup"));
