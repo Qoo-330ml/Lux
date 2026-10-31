@@ -233,13 +233,14 @@ async fn run_catalog_items_incremental_worker(
             return;
         }
         let mut worked = false;
-        let mut purge_failed = false;
         if !legacy_search_purged {
             match purge_legacy_search_rows(&database).await {
                 Ok(true) => legacy_search_purged = true,
                 // More rows left: keep going on this pass instead of sleeping a full fallback.
                 Ok(false) => worked = true,
-                Err(()) => purge_failed = true,
+                // Unreadable table: fall through to the ordinary wait, so a persistent failure
+                // backs off instead of spinning.
+                Err(()) => {}
             }
         }
         // Only trust derived rows once the full rebuild watermark exists: the consumer must never
@@ -284,10 +285,7 @@ async fn run_catalog_items_incremental_worker(
                         stats_dirty = false;
                         last_stats_refresh = std::time::Instant::now();
                     }
-                    Err(error) => {
-                        tracing::warn!(%error, "catalog item stats refresh failed");
-                        purge_failed = true;
-                    }
+                    Err(error) => tracing::warn!(%error, "catalog item stats refresh failed"),
                 }
             } else if !worked {
                 wait = wait.min(CATALOG_ITEMS_STATS_REFRESH_INTERVAL - elapsed);
@@ -295,10 +293,6 @@ async fn run_catalog_items_incremental_worker(
         }
         if worked {
             continue;
-        }
-        if purge_failed && wait == fallback {
-            // An unreadable queue would otherwise spin; back off like any other failure.
-            wait = fallback;
         }
         tokio::select! {
             () = signals.notified_catalog_items() => {}
