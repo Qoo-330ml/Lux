@@ -79,6 +79,9 @@
 > 第 9 项值得单独强调：扫描指纹迁移是一次性数据迁移，但实现成"没有候选就 10 s 后再看一次"的常驻轮询，
 > 迁移完成后仍然每 10 s 醒来一次并按库查询状态。这是"一次性任务被写成常驻轮询"的典型形态。
 
+> **表内第 5、6、7、9、11、12、14、15 行已于任务 B 收敛**（第 1–4 行属于任务 A），收敛后的周期与
+> 关停路径见 §2.5。本节保留改造前的快照，作为后续对比的基线。
+
 ### 2.2 空闲时不唤睡的常驻循环（事件驱动 / 连接驱动 / 工作驱动）
 
 | # | 文件:行 | 用途 | 唤醒方式 | 空闲唤醒 | 空闲时 DB/磁盘 | 关停方式 | 事件驱动化 |
@@ -102,16 +105,16 @@ LAN 发现与邮件 worker。
 
 **没有被排空（handle 丢弃、只能靠进程退出）的常驻循环**有 8 个：
 
-| 循环 | 位置 | 影响 |
-| --- | --- | --- |
-| 本地元数据 outbox | `scanner/jobs/local_metadata.rs:1570` | 优雅停机的 `cancel_incomplete_jobs_for_shutdown` 之后仍可能再 claim 一个新批次 |
-| `catalog_items` 增量消费 | `catalog_read_model.rs:157` | 停机瞬间可能正在写读模型 |
-| 搜索重建索引 | `catalog_read_model.rs:225` | 同上 |
-| Web 播放会话回收 | `playback/session.rs:237` | 停机瞬间可能正在停 HLS |
-| 用户清理 | `user_cleanup.rs:31` | 停机瞬间可能正在删数据 |
-| 登录背景图刷新 | `plugins.rs:250` | 停机瞬间可能在读插件 |
-| 游离状态重挂 | `watch_state_archive.rs:496` | 停机瞬间可能在写观看状态 |
-| 库根目录监听刷新 | `watch.rs:226`（`spawn()` 的 `JoinHandle` 被丢弃） | `notify` crate 的每个根目录监听线程在停机后随进程退出 |
+| 循环 | 位置 | 影响 | 任务 B 后 |
+| --- | --- | --- | --- |
+| 本地元数据 outbox | `scanner/jobs/local_metadata.rs:1570` | 优雅停机的 `cancel_incomplete_jobs_for_shutdown` 之后仍可能再 claim 一个新批次 | 仍缺失（任务 A 范围） |
+| `catalog_items` 增量消费 | `catalog_read_model.rs:157` | 停机瞬间可能正在写读模型 | 仍缺失（任务 A 范围） |
+| 搜索重建索引 | `catalog_read_model.rs:225` | 同上 | 仍缺失（任务 A 范围） |
+| Web 播放会话回收 | `playback/session.rs:237` | 停机瞬间可能正在停 HLS | **已接入**：`WebPlaybackSessionService::shutdown`（`BackgroundLoop`），排在 `shutdown_background_workers_checked` |
+| 用户清理 | `user_cleanup.rs:31` | 停机瞬间可能正在删数据 | **已接入**：`UserCleanupWorker`，同上 |
+| 登录背景图刷新 | `plugins.rs:250` | 停机瞬间可能在读插件 | **已接入**：`PluginService::shutdown`，同上 |
+| 游离状态重挂 | `watch_state_archive.rs:496` | 停机瞬间可能在写观看状态 | **已接入**：`DetachedStateReconcileWorker`，`main.rs` 在其它后台 worker 排空后 `await` |
+| 库根目录监听刷新 | `watch.rs:226`（`spawn()` 的 `JoinHandle` 被丢弃） | `notify` crate 的每个根目录监听线程在停机后随进程退出 | **已接入**：`LibraryWatchService::spawn_managed` + `shutdown`（`BackgroundLoop`）；`spawn()` 仍返回 `JoinHandle` 供冻结测试 `abort()` |
 
 这不是本任务的修复范围（属于后续"统一调度/关停"设计），但记录在此：**空闲唤醒最密集的 4 个循环
 （250 ms / 1 s / 1 s / 5 s）全部属于"无 `watch` 信号、无 shutdown"的那一类**。
@@ -121,7 +124,36 @@ LAN 发现与邮件 worker。
 - 常驻后台循环：**27 个**（§2.1 的 18 个周期性 + §2.2 的 9 个事件/工作驱动）。
 - 其中空闲时会周期性唤醒的：**15 个**（§2.1 第 1–15 项；第 17–18 项是天级，第 16 项是刻钟级，
   都不构成空闲功耗问题）。
-- 这 15 个里关停路径缺失的：**8 个**（§2.3 表格）。
+- 这 15 个里关停路径缺失的：**8 个**（§2.3 表格）。任务 B 之后只剩 3 个（本地元数据 outbox、
+  `catalog_items` 增量消费、搜索重建索引），全部属于任务 A 的范围。
+
+### 2.5 任务 B 收敛后的周期与关停（已实施）
+
+任务 B 只处理上表第 5、6、7、9、11、12、14、15 行（第 1–4 行留给任务 A），原则是"**进程内写入立即
+唤醒，低频兜底只服务外部写入/漏通知**"，并把纯参数调整与关停接入分开提交。
+
+| # | 文件 | 改造前空闲周期 | 改造后空闲周期 | 空闲唤醒/分（前 → 后） | 唤醒方式 | 关停 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 5 | `application/playback/session.rs` | 5 s 固定 tick | 睡到"最近会话到期时间"，无会话时 `WEB_PLAYBACK_IDLE_FALLBACK` = **60 s** | 12 → **1** | 会话创建时 `Notify`；有会话时按 `expires_at` / `last_heartbeat_at + 90 s` 精确定时 | `WebPlaybackSessionService::shutdown`（`BackgroundLoop`） |
+| 6 | `application/webhooks.rs` | 5 s | `DELIVERY_POLL_INTERVAL` = **30 s**；有投递动作后的下一轮仍 5 s（`DELIVERY_RETRY_INTERVAL`） | 12 → **2** | `publish()` 提交投递行后 `notify_one` | 已有 `BackgroundLoop` |
+| 7 | `application/mail_worker.rs` | 5 s | `MAIL_QUEUE_POLL_INTERVAL` = **30 s**；`Deferred` 后仍 5 s（`MAIL_QUEUE_RETRY_INTERVAL`） | 12 → **2** | 五个入队路径（注册/注册重发/邀请/邀请重发/改邮箱）提交后 `notify_mail_outbox_appended()` | 已有（`main.rs` 显式 `shutdown`） |
+| 9 | `application/scan_fingerprint_migration.rs` | 10 s（迁移完成后仍继续） | 所有库都有 `completed_at` 后转休眠：`LIBRARY_LIST_FALLBACK_INTERVAL` = **600 s** | 6 → **0.1** | 只剩库列表兜底（一次性迁移，新库扫描直接写 v2 指纹） | 已有（`ShutdownReason` `watch`） |
+| 11 | `application/watch.rs` | 30 s | `LIBRARY_ROOT_REFRESH_INTERVAL` = **300 s** | 2 → **0.2** | 已有 `LibraryChangeNotifier` 事件（库/根目录变更） | `LibraryWatchService::spawn_managed` + `shutdown` |
+| 12 | `application/user_cleanup.rs` | 60 s | `USER_CLEANUP_INTERVAL` = **3600 s** | 1 → **0.017** | 纯定时（保留期是天级） | `UserCleanupWorker::shutdown` |
+| 14 | `application/plugins.rs` | 300 s | 300 s（不变） | 0.2 → **0.2** | 已有 `login_background_refresh_notify` | `PluginService::shutdown` |
+| 15 | `storage/watch_state_archive.rs` | 300 s | 300 s（不变） | 0.2 → **0.2** | 纯定时（保持） | `DetachedStateReconcileWorker::shutdown` |
+
+八项合计：**45.4 → 5.7 次/分（−87 %）**，空闲查询也按同样比例下降（第 5 项从每 5 s 2 条查询变成每
+60 s 2 条；第 9 项从每 10 s 一条库列表查询变成每 600 s 一条）。
+
+新鲜度说明（判据是"进程内写入的新鲜度不变或更好"）：
+
+- 邮件、webhook：入队即 `notify`，延迟从"最多 5 s"变成"约一个调度周期"，只有重试节奏保持原样。
+- 播放会话：回收由"到期时间"驱动，不再有固定 tick 带来的 0–5 s 抖动；上界是"到期时刻 + 一次唤醒"，
+  即不晚于改造前，唯一额外风险是"某条会话行没通知到"（当前没有这种写入路径）。
+- 扫描指纹迁移：一次性迁移完成前行为不变（10 s）；完成后每 10 分钟看一次库列表。
+- 用户清理：保留期语义不变（仍按 `retention_days`、`deletion_purge_at` 等阈值判定），只是探测频率从
+  分钟级降到小时级。
 
 ---
 
@@ -358,6 +390,9 @@ per-process idle wakeups——本机 `powermetrics` 需要 root，而 `sudo` 需
 
 **A 类全部实施后：空闲唤醒 ≈ 476 → 约 60 次/分（−87 %），空闲查询 ≈ 980 → 约 130 条/分（−87 %）。**
 且 A1–A3 是纯参数/通知改动，不改变任何数据语义。
+
+> **实施状态**：A4–A7 以及 A5 涉及的邮件/webhook 循环已由任务 B 实施，周期与关停见 §2.5
+> （这八项合计 45.4 → 5.7 次/分）。A1–A3 属于任务 A 的范围，本文不改。
 
 ### B 类：需要设计
 

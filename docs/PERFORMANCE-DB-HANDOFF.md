@@ -116,6 +116,14 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 - 文档里的 A 类零风险调整（预计 476 → 约 60 次/分）：outbox 兜底改 5 到 10 s、catalog/搜索改 5 s 或写侧 Notify、
   合集同步改 5 s、播放会话回收和邮件/webhook 改事件驱动。**这些会改变读模型、搜索、合集的新鲜度语义，需要先确认。**
 - 另有 8 个后台循环没有保存 `JoinHandle`，关停时不能被 drain。
+- **已实施（后续任务 B）**：其余 8 个空闲周期循环收敛完成，明细与前后对比见
+  `docs/BACKGROUND-TASKS-AUDIT.md` §2.5。要点：Web 播放会话回收改为按最近到期时间睡眠（无会话时
+  60 s 兜底）、webhook 与邮件改为入队 `Notify` + 30 s 兜底（重试仍 5 s）、扫描指纹迁移在全部库完成后
+  转入 600 s 库列表兜底、用户清理 60 s → 3600 s、库根目录刷新 30 s → 300 s；游离状态重挂保持 300 s。
+  这八项合计空闲唤醒 45.4 → 5.7 次/分。关停方面新增 `UserCleanupWorker`、`LibraryWatchService`、
+  `DetachedStateReconcileWorker`、`WebPlaybackSessionService` 与 `PluginService` 的 drain 路径，
+  §2.3 里剩下的 3 个未接入关停的循环属于任务 A 的范围。读模型、搜索、合集三项的新鲜度语义
+  （A1–A3）本任务未动。
 
 ## 7. 其他线索（未验证或已评估后决定不做）
 

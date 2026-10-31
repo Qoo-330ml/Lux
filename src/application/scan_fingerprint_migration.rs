@@ -24,9 +24,9 @@ const LIBRARY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 /// fingerprints. The loop therefore drops to this slow re-read of the library list, which is the
 /// only thing that can notice a library that appeared afterwards.
 ///
-/// No library-change signal is wired into this worker: [`crate::application::libraries::
-/// LibraryChangeNotifier::subscribe`] is crate-internal and this loop starts from the `main.rs`
-/// binary, so the documented fallback is used instead.
+/// No library-change signal is wired into this worker: the library change notifier's `subscribe`
+/// is crate-internal and this loop starts from the `main.rs` binary, so the documented slow
+/// library-list fallback is used instead.
 const LIBRARY_LIST_FALLBACK_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
 
