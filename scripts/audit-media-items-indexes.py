@@ -23,7 +23,7 @@ Only the Python standard library is used. The query plans are SQLite plans from 
 on this machine; they are not NAS/x86_64 timings, and PostgreSQL plans are not covered here.
 
     python3 scripts/audit-media-items-indexes.py
-    python3 scripts/audit-media-items-indexes.py --simulate-drop idx_media_items_parent_removed
+    python3 scripts/audit-media-items-indexes.py --simulate-drop idx_media_items_parent_available
 """
 
 from __future__ import annotations
