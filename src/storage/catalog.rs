@@ -8980,6 +8980,18 @@ impl Database {
     ) -> Result<bool, StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let finished = self
+            .finish_metadata_image_attempt_in_transaction(&mut transaction, update)
+            .await?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(finished)
+    }
+
+    async fn finish_metadata_image_attempt_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        update: MetadataImageAttemptUpdate<'_>,
+    ) -> Result<bool, StorageError> {
         let result = self
             .query(
                 "UPDATE metadata_image_attempts
@@ -8995,10 +9007,9 @@ impl Database {
             .bind(update.item_id)
             .bind(update.image_type)
             .bind(update.candidate_key)
-            .execute(&mut *transaction)
+            .execute(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -9153,6 +9164,39 @@ impl Database {
         transaction.commit().await.map_err(self.sqlx_err())
     }
 
+    /// Upserts the image row and completes the download attempt that produced it together.
+    ///
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M5 方案 1: the row and the attempt
+    /// finish used to be two commits on the metadata write lock, and a failure in between left
+    /// the image indexed while its attempt stayed `RUNNING` until the lease expired.
+    pub(crate) async fn upsert_item_image_at_index_and_finish_attempt(
+        &self,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        local_path: &std::path::Path,
+        metadata: ItemImageMetadata<'_>,
+        update: MetadataImageAttemptUpdate<'_>,
+    ) -> Result<String, StorageError> {
+        let id = Uuid::now_v7().to_string();
+        let _write_guard = self.acquire_metadata_write_lock().await;
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.write_item_image_at_index_in_transaction(
+            &mut transaction,
+            &id,
+            item_id,
+            image_type,
+            image_index,
+            local_path,
+            metadata,
+        )
+        .await?;
+        self.finish_metadata_image_attempt_in_transaction(&mut transaction, update)
+            .await?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(id)
+    }
+
     pub(crate) async fn upsert_item_image_at_index(
         &self,
         item_id: &str,
@@ -9164,6 +9208,30 @@ impl Database {
         let id = Uuid::now_v7().to_string();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        self.write_item_image_at_index_in_transaction(
+            &mut transaction,
+            &id,
+            item_id,
+            image_type,
+            image_index,
+            local_path,
+            metadata,
+        )
+        .await?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(id)
+    }
+
+    async fn write_item_image_at_index_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        id: &str,
+        item_id: &str,
+        image_type: &str,
+        image_index: i64,
+        local_path: &std::path::Path,
+        metadata: ItemImageMetadata<'_>,
+    ) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO item_images (
                 id, item_id, image_type, image_index, local_path, width, height,
@@ -9180,7 +9248,7 @@ impl Database {
                 source_url = excluded.source_url,
                 updated_at = unixepoch()",
         )
-        .bind(&id)
+        .bind(id)
         .bind(item_id)
         .bind(image_type)
         .bind(image_index)
@@ -9191,11 +9259,10 @@ impl Database {
         .bind(metadata.content_tag)
         .bind(metadata.source)
         .bind(metadata.source_url)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())?;
-        Ok(id)
+        Ok(())
     }
 
     pub(crate) async fn list_item_image_candidates(

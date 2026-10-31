@@ -299,6 +299,18 @@ pub struct ImageWriteService {
     resources: Option<ResourceMetrics>,
 }
 
+/// The download attempt whose finish joins the image-row write.
+///
+/// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M5 方案 1: the successful path used to
+/// commit `item_images` and then `metadata_image_attempts`, so a crash between them left the
+/// image indexed while the attempt stayed `RUNNING` until `claimed_until` expired.
+#[derive(Clone, Copy)]
+struct ImageAttemptWrite<'a> {
+    item_id: &'a str,
+    image_type: &'a str,
+    candidate_key: &'a str,
+}
+
 impl ImageWriteService {
     pub fn new(database: Database) -> Result<Self, ImageWriteError> {
         Self::with_proxy_config(database, ImageDownloadConfig::default(), None, None)
@@ -547,23 +559,16 @@ impl ImageWriteService {
                 source,
                 image_index,
                 true,
+                Some(ImageAttemptWrite {
+                    item_id,
+                    image_type: normalized_type,
+                    candidate_key: &candidate_key,
+                }),
             )
             .await;
         match result {
-            Ok(report) => {
-                self.database
-                    .finish_metadata_image_attempt(MetadataImageAttemptUpdate {
-                        item_id,
-                        image_type: normalized_type,
-                        candidate_key: &candidate_key,
-                        status: "AVAILABLE",
-                        next_retry_at: None,
-                        error_code: None,
-                        now: current_unix_timestamp(),
-                    })
-                    .await?;
-                Ok(Some(report))
-            }
+            // The image row and the attempt finish already committed together.
+            Ok(report) => Ok(Some(report)),
             Err(error) => {
                 self.record_image_attempt_failure(item_id, normalized_type, &candidate_key, &error)
                     .await?;
@@ -1067,6 +1072,10 @@ impl ImageWriteService {
             .await
     }
 
+    /// Downloads, writes and indexes one image.
+    ///
+    /// `attempt` is the claim an attempt-scoped caller already holds: the image row and that
+    /// attempt's `AVAILABLE` finish then commit in one transaction.
     async fn download_item_image_impl(
         &self,
         item_id: &str,
@@ -1075,6 +1084,7 @@ impl ImageWriteService {
         source: &str,
         image_index: i64,
         reuse_existing_path: bool,
+        attempt: Option<ImageAttemptWrite<'_>>,
     ) -> Result<ImageWriteReport, ImageWriteError> {
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
@@ -1223,23 +1233,47 @@ impl ImageWriteService {
                 ImageWriteError::InvalidConfiguration("image hash worker stopped".to_owned())
             })?;
         let dimensions = read_image_dimensions(&target).await;
-        let id = self
-            .database
-            .upsert_item_image_at_index(
-                item_id,
-                image_type,
-                image_index,
-                &target,
-                ItemImageMetadata {
-                    file_size,
-                    width: dimensions.map(|(width, _)| width),
-                    height: dimensions.map(|(_, height)| height),
-                    content_tag: &content_tag,
-                    source,
-                    source_url: Some(image_url),
-                },
-            )
-            .await?;
+        let image_metadata = ItemImageMetadata {
+            file_size,
+            width: dimensions.map(|(width, _)| width),
+            height: dimensions.map(|(_, height)| height),
+            content_tag: &content_tag,
+            source,
+            source_url: Some(image_url),
+        };
+        let id = match attempt {
+            Some(attempt) => {
+                self.database
+                    .upsert_item_image_at_index_and_finish_attempt(
+                        item_id,
+                        image_type,
+                        image_index,
+                        &target,
+                        image_metadata,
+                        MetadataImageAttemptUpdate {
+                            item_id: attempt.item_id,
+                            image_type: attempt.image_type,
+                            candidate_key: attempt.candidate_key,
+                            status: "AVAILABLE",
+                            next_retry_at: None,
+                            error_code: None,
+                            now: current_unix_timestamp(),
+                        },
+                    )
+                    .await?
+            }
+            None => {
+                self.database
+                    .upsert_item_image_at_index(
+                        item_id,
+                        image_type,
+                        image_index,
+                        &target,
+                        image_metadata,
+                    )
+                    .await?
+            }
+        };
         if let Some(resources) = &self.resources {
             resources.record_metadata_stage("image_write", write_started.elapsed());
             resources.record_metadata_image_bytes(size);
@@ -1402,7 +1436,7 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        self.download_item_image_impl(item_id, image_type, image_url, source, 0, false)
+        self.download_item_image_impl(item_id, image_type, image_url, source, 0, false, None)
             .await
     }
 
@@ -3197,8 +3231,8 @@ fn image_download_retry_delay(retry_count: u32) -> Duration {
 mod tests {
     use super::{
         IMAGE_GLOBAL_CONCURRENCY, IMAGE_RESOLUTION_CACHE_CAPACITY, IMAGE_RETRY_BASE_DELAY,
-        IMAGE_RETRY_MAX_DELAY, ImageError, ImagePermitPool, ImageResolutionCache,
-        ImageResolutionKey, ImageService, ImageWriteError,
+        IMAGE_RETRY_MAX_DELAY, ImageDownloadConfig, ImageError, ImagePermitPool,
+        ImageResolutionCache, ImageResolutionKey, ImageService, ImageWriteError, ImageWriteService,
         background_image_content_tag_and_dimensions_from_bytes, canonical_image_stems,
         ensure_public_image_host, global_image_download_permits, global_image_write_permits,
         image_attempt_failure, image_content_tag_and_dimensions_from_bytes,
@@ -3502,6 +3536,201 @@ mod tests {
             image_id: id.to_owned(),
             content_tag: Some(content_tag.to_owned()),
         }
+    }
+
+    const TEST_PNG_1X1: &[u8] = &[
+        0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44,
+        0x52, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f,
+        0x15, 0xc4, 0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00,
+        0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49,
+        0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
+    ];
+
+    /// Serves `body` with `content_type` for every request until the test drops its handle.
+    async fn spawn_image_stub(
+        content_type: &'static str,
+        body: &'static [u8],
+    ) -> std::net::SocketAddr {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("image stub listener");
+        let address = listener.local_addr().expect("image stub address");
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    return;
+                };
+                tokio::spawn(async move {
+                    let mut request = [0_u8; 2048];
+                    let _ = stream.read(&mut request).await;
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(body).await;
+                    let _ = stream.shutdown().await;
+                });
+            }
+        });
+        address
+    }
+
+    /// A scanned movie library plus the database a download attempt needs.
+    async fn image_download_fixture()
+    -> Result<(Database, String, tempfile::TempDir), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let root = directory.path().join("Movies");
+        let movie_dir = root.join("Image Movie (2020)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Image.Movie.2020.mkv"), b"movie").await?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        libraries
+            .add_root(library.id, root.to_str().ok_or("non-UTF8 media root")?)
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        Ok((database, item_id, directory))
+    }
+
+    #[tokio::test]
+    async fn image_row_and_attempt_finish_commit_in_one_transaction()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = image_download_fixture().await?;
+        let address = spawn_image_stub("image/png", TEST_PNG_1X1).await;
+        let service = ImageWriteService::with_config(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+        )?;
+
+        database.reset_metadata_write_transaction_count();
+        let report = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "POSTER",
+                &format!("http://{address}/poster.png"),
+                "SCRAPER",
+                0,
+                true,
+            )
+            .await?
+            .expect("claimed image download");
+
+        assert_eq!(report.content_type, "image/png");
+        // M5 方案 1: claim, then one transaction for the image row and the attempt finish.
+        assert_eq!(
+            database.metadata_write_transaction_count(),
+            2,
+            "the image row and its attempt finish must share one commit"
+        );
+        let attempts: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT status, claimed_until, error_code FROM metadata_image_attempts
+             WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0].0, "AVAILABLE");
+        assert_eq!(
+            attempts[0].1, None,
+            "a finished attempt must not keep its claim"
+        );
+        assert_eq!(attempts[0].2, None);
+        let images: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(images, 1);
+        database.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_image_download_releases_its_claim() -> Result<(), Box<dyn std::error::Error>> {
+        let (database, item_id, _directory) = image_download_fixture().await?;
+        let address = spawn_image_stub("text/plain", b"not an image").await;
+        let service = ImageWriteService::with_config(
+            database.clone(),
+            ImageDownloadConfig {
+                max_bytes: 1024 * 1024,
+                allow_loopback_http: true,
+                direct_connection_only: true,
+                ..ImageDownloadConfig::default()
+            },
+        )?;
+
+        database.reset_metadata_write_transaction_count();
+        let error = service
+            .download_item_image_attempt_at_index(
+                &item_id,
+                "POSTER",
+                &format!("http://{address}/poster.txt"),
+                "SCRAPER",
+                0,
+                true,
+            )
+            .await
+            .expect_err("an unsupported content type must fail the download");
+        assert!(matches!(
+            error,
+            ImageWriteError::UnsupportedContentType { .. }
+        ));
+        // The claim transaction plus the failure finish; no transaction may be left open.
+        assert_eq!(database.metadata_write_transaction_count(), 2);
+        let attempts: Vec<(String, Option<i64>, Option<String>)> = sqlx::query_as(
+            "SELECT status, claimed_until, error_code FROM metadata_image_attempts
+             WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_all(database.pool())
+        .await?;
+        assert_eq!(attempts.len(), 1);
+        assert_ne!(
+            attempts[0].0, "RUNNING",
+            "a failed download must not leave the attempt claimed"
+        );
+        assert_eq!(
+            attempts[0].1, None,
+            "a failed download must not leave the claim behind"
+        );
+        assert!(attempts[0].2.is_some());
+        let images: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(images, 0);
+        database.close().await;
+        Ok(())
     }
 
     #[tokio::test]
