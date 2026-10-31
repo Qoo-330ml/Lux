@@ -12,7 +12,7 @@
 
 PostgreSQL 的 `media_search` 派生索引不再在写语句里同步维护：迁移 `0239_search_reindex_outbox.sql`
 把 `media_items` / `item_aliases` 的刷新触发器换成语句级入队触发器，只向
-`catalog_outbox(kind='search')` 追加，由 `search_reindex@1` 消费者重建。Lux/Emby API、DTO 与数据库对外
+`catalog_outbox(kind='search')` 追加，由 `search_reindex@1` 消费者重建（迁移 `0243`/`0245` 之后改为独立的 `search_outbox` 表与 `search_reindex@2` 消费者，见下方“search_outbox 拆表”）。Lux/Emby API、DTO 与数据库对外
 模型不变；差异只在“写入后到消费者运行之间”的索引可见性：搜索请求进入匹配前仍会做一次有界排空
 （每请求最多 200 条），读己之写保持；后台 worker 每拍 500 条处理扫描积压。升级时为没有 `media_search`
 行的条目补一次入队，不会留下永久未索引的尾巴。SQLite 侧行为不变。
@@ -1328,7 +1328,7 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 
 | 维度 | SQLite | PostgreSQL |
 | --- | --- | --- |
-| 写入路径 | 触发器只向 `catalog_outbox(kind='search')` 追加；消费者 `search_reindex@1` 批量重建 `media_search`（FTS5） | 行级触发器（`0219` 已按列过滤）在写事务内维护 `media_search` 表 |
+| 写入路径 | 触发器只向 `search_outbox` 追加（`0243` 之前是 `catalog_outbox(kind='search')`）；消费者 `search_reindex@2` 批量重建 `media_search`（FTS5） | 行级触发器（`0219` 已按列过滤）在写事务内维护 `media_search` 表 |
 | 一致性 | 搜索请求前有界排空（200 条/请求）+ 后台 worker（1 s、500 条/批）；队列缺口时全量重建 | 同步写入，无滞后 |
 | 滞后 | 最坏约 1 秒；`FTS 空页 → LIKE 回退` 保证不会返回空结果 | 无 |
 | 行号映射 | `media_search_map` 由消费者按批取号，条目删除后清理映射 | 无（`item_id` 直接是主键） |
@@ -1381,3 +1381,21 @@ SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在
 | JSON gzip/ETag（W5） | 移除 `CompressionLayer`/`json_response_etag` 两个 layer | 无数据影响；客户端立即回到整包传输 |
 | 符号链接媒体源（0.7.1） | 把 `LUX_SYMLINK_POLICY` 设为 `none` 只停用目录链接；文件链接按目标识别是固定的，完全回到旧行为需重新部署 0.7.0 二进制 | 迁移 `0239`/`0241` 只加 `is_symlink`、`resolved_path` 两列，旧二进制可忽略；链接布局若已入库，重扫会按策略不再发现这些路径，条目按缺失处理，目标文件不受影响 |
 | 迁移配对清单（W6） | 删除 `docs/migration-map.json` 即跳过校验 | 无运行期影响 |
+
+## search_outbox 拆表（outbox 无限重排修复）
+
+迁移 `0243_search_outbox_split.sql`（SQLite）/ `0245_search_outbox_split.sql`（PostgreSQL）把搜索重建事件从
+`catalog_outbox(kind='search')` 拆到独立的 `search_outbox`，消费者改名 `search_reindex@2`。Lux/Emby API、
+DTO 与对外数据模型不变。
+
+- **原因**：两种事件共用一个 id 序列，消费者水位与“队列是否有洞”的判断落在不同坐标上，误报缺口后每一拍都
+  全量重排 `media_items`，把 `catalog_outbox` 写到数十 GB。拆表后每条流的序列只属于一个消费者。
+- **升级**：迁移重建 6 个搜索触发器（PostgreSQL 为 3 个语句级函数）指向 `search_outbox`，删除旧水位
+  `search_reindex@1`，并把所有条目入队一次，因此不会丢搜索更新。`catalog_outbox` 里遗留的 `search` 行由后台
+  worker 分批（每拍至多 10 × 2,000 行）删除，迁移本身不删。
+- **缺口修复语义**：检测到缺口后只做一次全量重排（每消费者 5 分钟冷却；队列待处理行数超过 2,000,000 时拒绝重排并记
+  ERROR），并立刻把水位推到最旧事件之前，同一个洞不会被再次检测。
+- **回退**：SQLite 旧二进制启动时会按旧常量重建触发器，回到 `catalog_outbox`，水位从零重放，可安全清空
+  `search_outbox`。**PostgreSQL 旧二进制不会重建函数**，触发器仍写 `search_outbox` 而旧消费者读
+  `catalog_outbox`，回退后全文索引会停止更新；PostgreSQL 请向前发布修复版本而不是回退。
+- 已膨胀部署的清理步骤见 `docs/RUNBOOK-OUTBOX-BLOAT.md`。

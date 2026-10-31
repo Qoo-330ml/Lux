@@ -18959,6 +18959,10 @@ FTS/内容限制/collection 一致性回归全绿、故障注入后可恢复。
   `src/storage/migration.rs` 里的遗留库修复常量（首次连接会按常量重建全部触发器），两处都已改为入队。
   迁移同时为“没有行号映射的条目”补一条入队事件，升级不会留下永久未索引的尾巴。
 - 内容限制失效在 LUX-8xx 已入队（`0208`），本轮未改。provider 索引**保留同步**，见下。
+- **修订（2026-10-31，outbox 无限重排）**：上面“搜索与读模型共用 `catalog_outbox`”的设计有缺陷——LUX-863 的缺口定义
+  `applied_seq + 1 < 最小 outbox id` 只在单一事件流内成立，W4 把 `search` 并进同一序列后每拍误报缺口。现已拆为 `search_outbox`
+  （SQLite `0243` / PostgreSQL `0245`），消费者 `search_reindex@2`；缺口修复改为每消费者 5 分钟冷却一次全量重排、超 200 万待处理行拒绝、
+  修复后水位对齐；读取按 kind 过滤；trim 每批执行。运维清理步骤见 `docs/RUNBOOK-OUTBOX-BLOAT.md`。
 - 数字（本机 arm64；`scripts/run-scan-write-bench.py`，6,000 个真实文件的整库扫描）：
 
   | 配置 | 扫描墙钟 | 排队排空 | WAL 累计 | WAL 峰值 | FTS 行 |

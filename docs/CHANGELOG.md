@@ -8,7 +8,18 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ## [Unreleased]
 
-（暂无记录；下一个版本从这里开始累积）
+### Fixed
+
+- **`catalog_outbox` 无限重排撑满磁盘**：搜索事件与读模型事件共用一个 outbox 表和一个 id 序列，缺口判定拿单一 kind 的
+  `MIN(id)` 去比混合序列的水位，每一拍都误报缺口并把全部条目重新入队（一晚上 6.97 亿行、89 GB，撑满 `/vol1`，PostgreSQL
+  写失败、全站 503）。现在：
+  - 搜索事件拆到独立的 `search_outbox`（迁移 `0243` / `0245`），消费者改名 `search_reindex@2`，升级时自动把全部条目入队一次；
+  - 批量读取按 kind 过滤，走 `(kind, id)` 索引；
+  - 缺口修复只做一次全量重排：每消费者 5 分钟冷却，队列超过 200 万待处理行时拒绝并记 ERROR，修复后水位立即对齐；
+  - 回收（trim）改为每处理一批就执行，不再要求队列先被排空；
+  - 旧版本留在 `catalog_outbox` 里的 `search` 行由后台分批清理。
+  已经膨胀的部署按 `docs/RUNBOOK-OUTBOX-BLOAT.md` 回收空间（`TRUNCATE` 后读模型由一次全量重排重新收敛）；PostgreSQL 不要回退到旧二进制，见
+  `docs/COMPATIBILITY.md` 的“search_outbox 拆表”。
 
 ## [0.7.3] - 2026-10-31
 
