@@ -109,6 +109,10 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   DANMAKU_MATCH_STARTED: "开始弹幕匹配",
   DANMAKU_MATCH_CANCEL_REQUESTED: "取消弹幕匹配",
   DANMAKU_MATCH_RETRIED: "重试弹幕匹配",
+  PLAYBACK_STARTED: "开始播放",
+  PLAYBACK_PAUSED: "暂停播放",
+  PLAYBACK_STOPPED: "停止播放",
+  PLAYBACK_PROGRESS: "播放进度",
   ADMIN_API_KEY_REVOKED: "吊销管理 API 密钥",
   ADMIN_API_KEY_ROTATED: "轮换管理 API 密钥",
   COLLECTION_REFRESHED: "刷新合集",
@@ -885,7 +889,8 @@ function LogRow({ log, libraryNames }: { log: AdminAuditEvent; libraryNames: Rea
   const level = auditLevel(log);
   const metadataRows = formatAuditMetadata(log.metadata ?? {}, libraryNames);
   const targetName = log.targetType === "library" && log.targetId ? libraryNames.get(log.targetId) ?? log.targetId : log.targetId;
-  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{targetName ? ` · ${targetName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
+  const deviceName = typeof log.metadata?.deviceName === "string" ? log.metadata.deviceName : "";
+  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{targetName ? ` · ${targetName === log.targetId ? shortenLogTarget(targetName) : targetName}` : ""}{deviceName ? ` · 设备 ${deviceName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
 }
 
 const AUDIT_METADATA_LABELS: Record<string, string> = {
@@ -912,9 +917,25 @@ const AUDIT_METADATA_LABELS: Record<string, string> = {
   failed: "失败",
   skipped: "跳过",
   elapsedMs: "耗时（毫秒）",
+  client: "客户端",
+  clientVersion: "客户端版本",
+  deviceName: "设备名",
+  deviceType: "设备类型",
+  state: "状态",
+  remoteIp: "IP地址",
+};
+
+const PLAYBACK_STATE_LABELS: Record<string, string> = {
+  PLAYING: "播放中",
+  PAUSED: "已暂停",
+  STOPPED: "已停止",
 };
 
 type AuditMetadataRow = { key: string; label: string; value: string };
+
+function shortenLogTarget(value: string) {
+  return value.length > 16 ? `${value.slice(0, 8)}…` : value;
+}
 
 function formatAuditMetadata(metadata: Record<string, unknown>, libraryNames: ReadonlyMap<string, string>): AuditMetadataRow[] {
   return Object.entries(metadata).map(([key, value]) => ({
@@ -926,6 +947,7 @@ function formatAuditMetadata(metadata: Record<string, unknown>, libraryNames: Re
 
 function formatAuditMetadataValue(key: string, value: unknown, libraryNames: ReadonlyMap<string, string>): string {
   if (key === "libraryId" && typeof value === "string") return libraryNames.get(value) ?? value;
+  if (key === "state" && typeof value === "string") return PLAYBACK_STATE_LABELS[value] ?? value;
   if (typeof value === "boolean") return value ? "是" : "否";
   if (Array.isArray(value)) return value.map(String).join("、");
   if (value !== null && typeof value === "object") return JSON.stringify(value);
@@ -1192,6 +1214,7 @@ function formatTargetType(targetType: string) {
     plugin: "插件",
     scheduled_task: "注册任务",
     item: "媒体条目",
+    media_item: "媒体条目",
     items: "媒体条目",
     media_items: "媒体条目",
     metadata_items: "媒体条目",
@@ -1223,7 +1246,7 @@ function formatTargetType(targetType: string) {
 
 function auditLevel(log: AdminAuditEvent) {
   if (/FAILED|ERROR|DENIED/.test(log.eventType)) return "ERROR";
-  if (/CANCEL|DISABLED|REJECTED|REVOKED|STOPPED|DELETED|PURGED|UNINSTALLED|UNDONE/.test(log.eventType)) return "WARN";
+  if (/CANCEL|DISABLED|REJECTED|REVOKED|DELETED|PURGED|UNINSTALLED|UNDONE/.test(log.eventType)) return "WARN";
   return "INFO";
 }
 

@@ -1016,6 +1016,49 @@ describe("AdminOperationsPage", () => {
     ]);
   });
 
+  it("reads playback activity events as plain language with device details", async () => {
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [
+      {
+        id: "event-start",
+        actorUsername: "nanzi",
+        eventType: "PLAYBACK_STARTED",
+        targetType: "media_item",
+        targetId: "01a0ef34-1572-7130-93b2-aaa0ebbf6098",
+        metadata: { client: "Lux", deviceName: "Web", deviceType: "Web", state: "PLAYING", remoteIp: "10.0.0.2" },
+        createdAt: "2026-10-31T05:13:00.000Z",
+      },
+      {
+        id: "event-stop",
+        actorUsername: "nanzi",
+        eventType: "PLAYBACK_STOPPED",
+        targetType: "media_item",
+        targetId: "01a0ef34-14dc-7352-90ad-d74dd4a71e40",
+        metadata: { state: "STOPPED" },
+        createdAt: "2026-10-31T05:13:00.000Z",
+      },
+    ] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.textContent).toContain("已注册任务"));
+    });
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(3)')?.click());
+    const rows = [...container.querySelectorAll<HTMLElement>(".lux-operations-log-row")];
+    expect(rows[0].querySelector("strong")?.textContent).toBe("开始播放");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("媒体条目");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("设备 Web");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).not.toContain("01a0ef34-1572-7130-93b2-aaa0ebbf6098");
+    expect(rows[1].querySelector("strong")?.textContent).toBe("停止播放");
+    expect(rows[1].querySelector(".lux-operations-log-level")?.textContent).toBe("INFO");
+
+    act(() => rows[0].querySelector<HTMLButtonElement>('button[aria-label="展开日志详情"]')?.click());
+    const details = [...rows[0].querySelectorAll("li")].map((item) => item.textContent);
+    expect(details).toEqual(["客户端Lux", "设备名Web", "设备类型Web", "状态播放中", "IP地址10.0.0.2"]);
+  });
+
   it("exports a selected UTC log date range from the system log tab", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
