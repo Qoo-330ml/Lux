@@ -299,6 +299,15 @@ pub struct ImageWriteService {
     resources: Option<ResourceMetrics>,
 }
 
+/// How the download writes its target path and whether an attempt owns the write.
+#[derive(Clone, Copy)]
+struct ImageTargetWrite<'a> {
+    /// Keep an existing file instead of picking a new variant path.
+    reuse_existing_path: bool,
+    /// The claimed attempt whose finish joins the image-row write, when one owns this download.
+    attempt: Option<ImageAttemptWrite<'a>>,
+}
+
 /// The download attempt whose finish joins the image-row write.
 ///
 /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M5 方案 1: the successful path used to
@@ -558,12 +567,14 @@ impl ImageWriteService {
                 image_url,
                 source,
                 image_index,
-                true,
-                Some(ImageAttemptWrite {
-                    item_id,
-                    image_type: normalized_type,
-                    candidate_key: &candidate_key,
-                }),
+                ImageTargetWrite {
+                    reuse_existing_path: true,
+                    attempt: Some(ImageAttemptWrite {
+                        item_id,
+                        image_type: normalized_type,
+                        candidate_key: &candidate_key,
+                    }),
+                },
             )
             .await;
         match result {
@@ -1074,7 +1085,7 @@ impl ImageWriteService {
 
     /// Downloads, writes and indexes one image.
     ///
-    /// `attempt` is the claim an attempt-scoped caller already holds: the image row and that
+    /// `write.attempt` is the claim an attempt-scoped caller already holds: the image row and that
     /// attempt's `AVAILABLE` finish then commit in one transaction.
     async fn download_item_image_impl(
         &self,
@@ -1083,9 +1094,12 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
         image_index: i64,
-        reuse_existing_path: bool,
-        attempt: Option<ImageAttemptWrite<'_>>,
+        write: ImageTargetWrite<'_>,
     ) -> Result<ImageWriteReport, ImageWriteError> {
+        let ImageTargetWrite {
+            reuse_existing_path,
+            attempt,
+        } = write;
         let image_type = normalize_image_type(image_type)
             .ok_or_else(|| ImageWriteError::InvalidImageType(image_type.to_owned()))?;
         let url = Url::parse(image_url)
@@ -1249,15 +1263,17 @@ impl ImageWriteService {
                         image_type,
                         image_index,
                         &target,
-                        image_metadata,
-                        MetadataImageAttemptUpdate {
-                            item_id: attempt.item_id,
-                            image_type: attempt.image_type,
-                            candidate_key: attempt.candidate_key,
-                            status: "AVAILABLE",
-                            next_retry_at: None,
-                            error_code: None,
-                            now: current_unix_timestamp(),
+                        crate::storage::ItemImageAttemptCommit {
+                            metadata: image_metadata,
+                            update: MetadataImageAttemptUpdate {
+                                item_id: attempt.item_id,
+                                image_type: attempt.image_type,
+                                candidate_key: attempt.candidate_key,
+                                status: "AVAILABLE",
+                                next_retry_at: None,
+                                error_code: None,
+                                now: current_unix_timestamp(),
+                            },
                         },
                     )
                     .await?
@@ -1436,8 +1452,18 @@ impl ImageWriteService {
         image_url: &str,
         source: &str,
     ) -> Result<ImageWriteReport, ImageWriteError> {
-        self.download_item_image_impl(item_id, image_type, image_url, source, 0, false, None)
-            .await
+        self.download_item_image_impl(
+            item_id,
+            image_type,
+            image_url,
+            source,
+            0,
+            ImageTargetWrite {
+                reuse_existing_path: false,
+                attempt: None,
+            },
+        )
+        .await
     }
 
     async fn writeback_paths(

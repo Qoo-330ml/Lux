@@ -769,6 +769,15 @@ fn catalog_item_order(sort_by: CatalogSort, descending: bool) -> &'static str {
     }
 }
 
+/// The `item_images` row identity an upsert writes.
+struct ItemImageRowWrite<'a> {
+    id: &'a str,
+    item_id: &'a str,
+    image_type: &'a str,
+    image_index: i64,
+    local_path: &'a std::path::Path,
+}
+
 impl Database {
     pub(crate) async fn ensure_thumbnail_scraper_retry(
         &self,
@@ -9175,23 +9184,24 @@ impl Database {
         image_type: &str,
         image_index: i64,
         local_path: &std::path::Path,
-        metadata: ItemImageMetadata<'_>,
-        update: MetadataImageAttemptUpdate<'_>,
+        commit: ItemImageAttemptCommit<'_>,
     ) -> Result<String, StorageError> {
         let id = Uuid::now_v7().to_string();
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.write_item_image_at_index_in_transaction(
             &mut transaction,
-            &id,
-            item_id,
-            image_type,
-            image_index,
-            local_path,
-            metadata,
+            ItemImageRowWrite {
+                id: &id,
+                item_id,
+                image_type,
+                image_index,
+                local_path,
+            },
+            commit.metadata,
         )
         .await?;
-        self.finish_metadata_image_attempt_in_transaction(&mut transaction, update)
+        self.finish_metadata_image_attempt_in_transaction(&mut transaction, commit.update)
             .await?;
         transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(id)
@@ -9210,11 +9220,13 @@ impl Database {
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.write_item_image_at_index_in_transaction(
             &mut transaction,
-            &id,
-            item_id,
-            image_type,
-            image_index,
-            local_path,
+            ItemImageRowWrite {
+                id: &id,
+                item_id,
+                image_type,
+                image_index,
+                local_path,
+            },
             metadata,
         )
         .await?;
@@ -9225,11 +9237,7 @@ impl Database {
     async fn write_item_image_at_index_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
-        id: &str,
-        item_id: &str,
-        image_type: &str,
-        image_index: i64,
-        local_path: &std::path::Path,
+        row: ItemImageRowWrite<'_>,
         metadata: ItemImageMetadata<'_>,
     ) -> Result<(), StorageError> {
         self.query(
@@ -9248,11 +9256,11 @@ impl Database {
                 source_url = excluded.source_url,
                 updated_at = unixepoch()",
         )
-        .bind(id)
-        .bind(item_id)
-        .bind(image_type)
-        .bind(image_index)
-        .bind(local_path.to_string_lossy().as_ref())
+        .bind(row.id)
+        .bind(row.item_id)
+        .bind(row.image_type)
+        .bind(row.image_index)
+        .bind(row.local_path.to_string_lossy().as_ref())
         .bind(metadata.width)
         .bind(metadata.height)
         .bind(metadata.file_size)

@@ -24,7 +24,7 @@ use crate::{
             FillMissingRequestPlan, ImageSelectionPolicy, MetadataCandidateError,
             MetadataCandidatePage, MetadataCandidateService, MetadataCandidateView,
             MetadataRequestPlan, MetadataSelectionError, MetadataSelectionMode,
-            MetadataSelectionService, has_selected_provider_id,
+            MetadataSelectionService, SelectionInputs, has_selected_provider_id,
         },
         notification_template::bounded_display_text,
         scraper::{ResolvedScraper, ScraperError, ScraperProvider, ScraperResolver},
@@ -2346,14 +2346,17 @@ impl MetadataReidentifyService {
                 MetadataRefreshMode::Reidentify => return Ok(RefreshItemOutcome::Confirmed(0)),
             }
         };
+        let inputs = SelectionInputs {
+            image_policy: options.image_policy,
+            current: options.current,
+        };
         if options.preserve_identity {
             selection
                 .select_fallback_with_scraper_and_policy(
                     item_id,
                     &candidate.id,
                     options.scraper_id.as_deref().unwrap_or_default(),
-                    options.image_policy,
-                    options.current,
+                    inputs,
                 )
                 .await
         } else if needs_review {
@@ -2364,8 +2367,7 @@ impl MetadataReidentifyService {
                     selection_mode,
                     options.scraper_id.as_deref(),
                     options.supplemental,
-                    options.image_policy,
-                    options.current,
+                    inputs,
                 )
                 .await
         } else {
@@ -2376,8 +2378,7 @@ impl MetadataReidentifyService {
                     selection_mode,
                     options.scraper_id.as_deref(),
                     options.supplemental,
-                    options.image_policy,
-                    options.current,
+                    inputs,
                 )
                 .await
         }

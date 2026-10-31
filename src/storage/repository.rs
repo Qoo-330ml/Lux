@@ -4805,6 +4805,12 @@ pub(crate) struct ItemImageBatchInsert {
     pub(crate) clear_poster_fallback: bool,
 }
 
+/// The image row and the attempt completion that must commit together.
+pub(crate) struct ItemImageAttemptCommit<'a> {
+    pub(crate) metadata: ItemImageMetadata<'a>,
+    pub(crate) update: MetadataImageAttemptUpdate<'a>,
+}
+
 pub(crate) struct MetadataImageAttemptUpdate<'a> {
     pub(crate) item_id: &'a str,
     pub(crate) image_type: &'a str,

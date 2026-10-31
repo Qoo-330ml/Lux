@@ -2465,6 +2465,18 @@ pub struct MetadataSelectionReport {
     pub actor_count: usize,
 }
 
+/// Optional selection inputs a caller may already hold.
+///
+/// Bundles the two optional arguments of the `select_*` entry points so they stay within the
+/// argument-count budget.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct SelectionInputs<'a> {
+    pub(crate) image_policy: Option<ImageSelectionPolicy>,
+    /// The caller's item snapshot, when nothing has rewritten the row since it was read
+    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` M8).
+    pub(crate) current: Option<&'a StoredMediaMetadata>,
+}
+
 struct MetadataSelectionOptions<'a> {
     keep_pending: bool,
     scraper_id: Option<&'a str>,
@@ -2901,8 +2913,7 @@ impl MetadataSelectionService {
             mode,
             scraper_id,
             supplemental,
-            None,
-            None,
+            SelectionInputs::default(),
         )
         .await
     }
@@ -2914,8 +2925,7 @@ impl MetadataSelectionService {
         mode: MetadataSelectionMode,
         scraper_id: Option<&str>,
         supplemental: bool,
-        image_policy: Option<ImageSelectionPolicy>,
-        current: Option<&StoredMediaMetadata>,
+        inputs: SelectionInputs<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -2926,8 +2936,8 @@ impl MetadataSelectionService {
                 scraper_id,
                 supplemental,
                 preserve_identity: false,
-                image_policy,
-                current,
+                image_policy: inputs.image_policy,
+                current: inputs.current,
             },
         )
         .await
@@ -2940,8 +2950,7 @@ impl MetadataSelectionService {
         mode: MetadataSelectionMode,
         scraper_id: Option<&str>,
         supplemental: bool,
-        image_policy: Option<ImageSelectionPolicy>,
-        current: Option<&StoredMediaMetadata>,
+        inputs: SelectionInputs<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -2952,8 +2961,8 @@ impl MetadataSelectionService {
                 scraper_id,
                 supplemental,
                 preserve_identity: false,
-                image_policy,
-                current,
+                image_policy: inputs.image_policy,
+                current: inputs.current,
             },
         )
         .await
@@ -3026,8 +3035,7 @@ impl MetadataSelectionService {
         item_id: &str,
         candidate_id: &str,
         scraper_id: &str,
-        image_policy: Option<ImageSelectionPolicy>,
-        current: Option<&StoredMediaMetadata>,
+        inputs: SelectionInputs<'_>,
     ) -> Result<MetadataSelectionReport, MetadataSelectionError> {
         self.select_internal(
             item_id,
@@ -3038,8 +3046,8 @@ impl MetadataSelectionService {
                 scraper_id: Some(scraper_id),
                 supplemental: false,
                 preserve_identity: true,
-                image_policy,
-                current,
+                image_policy: inputs.image_policy,
+                current: inputs.current,
             },
         )
         .await
@@ -3077,7 +3085,7 @@ impl MetadataSelectionService {
         let mut payload = candidate_payload(&candidate)?;
         let collection_reference = (current.item_type == "MOVIE")
             .then(|| {
-                let current_provider_ids = current_provider_ids(&current);
+                let current_provider_ids = current_provider_ids(current);
                 let (movie_provider, movie_provider_id) = if options.preserve_identity {
                     Some((
                         candidate.provider.as_str(),
@@ -3130,7 +3138,7 @@ impl MetadataSelectionService {
             payload.actors = payload.movie_nfo.actors.clone();
             payload.end_date = payload.movie_nfo.last_air_date.clone();
             if options.supplemental {
-                preserve_supplemental_scalar_values(&mut payload, &current);
+                preserve_supplemental_scalar_values(&mut payload, current);
             }
         }
         let image_source = options.scraper_id.unwrap_or(candidate.provider.as_str());
@@ -3138,7 +3146,7 @@ impl MetadataSelectionService {
             Some(image_policy) => image_policy,
             None => self.image_selection_policy(item_id).await?,
         };
-        let mut state = metadata_state(&current);
+        let mut state = metadata_state(current);
         let metadata_candidate = MetadataCandidate {
             source: MetadataSource::ScraperLocalized,
             metadata: payload.metadata.clone(),
@@ -3207,7 +3215,7 @@ impl MetadataSelectionService {
         };
         self.resources
             .record_metadata_stage("nfo_write", nfo_started.elapsed());
-        let mut provider_ids = current_provider_ids(&current);
+        let mut provider_ids = current_provider_ids(current);
         if options.supplemental || options.preserve_identity {
             for (provider, provider_id) in &movie_nfo.provider_ids {
                 insert_provider_id_if_missing(&mut provider_ids, provider, provider_id);
@@ -3259,7 +3267,7 @@ impl MetadataSelectionService {
             keep_pending: options.keep_pending,
         };
         let nfo_details_json = matches!(current.item_type.as_str(), "MOVIE" | "SERIES")
-            .then(|| selected_nfo_details(&current, &movie_nfo))
+            .then(|| selected_nfo_details(current, &movie_nfo))
             .map(|details| {
                 serde_json::to_string(&details)
                     .map_err(|error| MetadataSelectionError::InvalidCandidate(error.to_string()))
@@ -5246,8 +5254,8 @@ mod tests {
         EpisodeImagePolicy, FillMissingRequestPlan, ImageLevel, ImageSelectionPolicy,
         MAX_ACTOR_DETAIL_FETCHES, MetadataCandidateService, MetadataRequestPlan,
         MetadataSelectionMode, MetadataSelectionService, SCRAPER_IMAGE_TYPES, ScraperRoles,
-        candidate_actor_credits, candidate_actors, candidate_payload, capability_needs_request,
-        completeness_capabilities, credits_need_actor_relation_check,
+        SelectionInputs, candidate_actor_credits, candidate_actors, candidate_payload,
+        capability_needs_request, completeness_capabilities, credits_need_actor_relation_check,
         default_image_selection_policy, enrich_actor_metadata, filtered_candidate_images,
         generic_candidate_actors, generic_candidate_images, image_attempt_identities,
         local_metadata_completeness_plan, merge_actor_values, merge_supplemental_movie_nfo,
@@ -5711,8 +5719,10 @@ mod tests {
                 MetadataSelectionMode::FillMissing,
                 None,
                 false,
-                None,
-                snapshot.as_ref(),
+                SelectionInputs {
+                    image_policy: None,
+                    current: snapshot.as_ref(),
+                },
             )
             .await?;
         let statements = database.query_count();
