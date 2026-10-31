@@ -545,6 +545,16 @@ struct CatalogSearchPageBindings<'a> {
 /// canonical sort title and the alias subquery share the same pattern.
 const SEARCH_LIKE_BINDS: usize = 4;
 
+/// Server-side upper bound for one search page. Both HTTP front ends validate their own, smaller
+/// bounds (100 for the Lux API, `EMBY_MAX_PAGE_LIMIT` for Emby), so this cap never changes a
+/// request that is already valid; it keeps the storage entry point bounded for any future caller.
+pub(super) const SEARCH_MAX_PAGE_LIMIT: i64 = 1_000;
+
+/// Keeps a count-only request (`limit = 0`) at zero rows instead of turning it into a page.
+pub(super) fn clamped_search_page_limit(limit: i64) -> i64 {
+    limit.clamp(0, SEARCH_MAX_PAGE_LIMIT)
+}
+
 fn postgres_recent_catalog_rows_by_library_query(
     library_count: usize,
     content_restriction_predicate: &str,
@@ -1518,7 +1528,7 @@ impl Database {
             search.content_restrictions,
         );
         let fts_query = format!(
-            "SELECT mi.id FROM media_search
+            "SELECT mi.id, mi.sort_title AS sort_title FROM media_search
              JOIN media_items mi ON mi.id = media_search.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
@@ -1528,10 +1538,13 @@ impl Database {
         );
         // Complete-token searches are served by FTS alone. The LIKE branch remains
         // available for partial searches, but is avoided when FTS already has a page.
+        //
+        // The page orders by the `sort_title` this match query already read instead of joining
+        // `media_items` again: the join only repeated a row lookup per match (tens of thousands
+        // when a common token matches most of the library) to re-read a column that was in hand.
         let fts_page_query = format!(
             "SELECT matches.id{total_projection} FROM ({fts_query}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         let fts_page = self
             .fetch_catalog_search_page(
@@ -1553,7 +1566,7 @@ impl Database {
         }
 
         let like_query_sql = format!(
-            "SELECT mi.id FROM media_items mi
+            "SELECT mi.id, mi.sort_title AS sort_title FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE (mi.title LIKE ? ESCAPE '!' OR COALESCE(mi.original_title, '') LIKE ? ESCAPE '!'
@@ -1564,10 +1577,11 @@ impl Database {
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
         );
+        // `sort_title` is part of both UNION branches so the union still merges rows by item id:
+        // one item id always carries one sort title.
         let like_page_query = format!(
             "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         if offset == 0 {
             return self
@@ -1590,8 +1604,7 @@ impl Database {
         let union_query = format!("{fts_query} UNION {like_query_sql}");
         let union_page_query = format!(
             "SELECT matches.id{total_projection} FROM ({union_query}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         self.fetch_catalog_search_page(
             &union_page_query,
@@ -1650,8 +1663,10 @@ impl Database {
             &mut content_restriction_binds,
             search.content_restrictions,
         );
+        // Same shape as the SQLite branch: order by the `sort_title` the match query already read
+        // instead of joining `media_items` a second time for it.
         let like_query_sql = format!(
-            "SELECT mi.id FROM media_search ms
+            "SELECT mi.id, mi.sort_title AS sort_title FROM media_search ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
@@ -1663,8 +1678,7 @@ impl Database {
         );
         let page_query = format!(
             "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         self.fetch_catalog_search_page(
             &page_query,
@@ -1729,7 +1743,7 @@ impl Database {
             }
         }
         let rows = statement
-            .bind(bindings.limit)
+            .bind(clamped_search_page_limit(bindings.limit))
             .bind(bindings.offset)
             .fetch_all(&self.pool)
             .await

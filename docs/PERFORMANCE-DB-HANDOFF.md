@@ -147,7 +147,7 @@ CPU **0.39 → 0.08 s/分（−79 %）**，空闲仍零写入（方法与口径�
 | 管理员批量操作的 N+1 | `user_account_preferences`、`user_permission_copy`、`user_presets` 的循环逐个查。第一轮评估后**决定不改**：循环体是读后写，需要保留每用户事务和错误隔离。若要降到常数，需新增 `storage/users.rs` 的批量读接口（`find_users_by_ids` 与偏好版本批量读） |
 | 旧身份键修复逐集查询 | `repair_legacy_identity_keys`（`src/application/scanner/library.rs` 约 426 行）首次执行 5 万条语句、约 3.4 秒，在后台跑不阻塞监听，已有完成标记，只在首次升级时付一次。可考虑批量化 |
 | HLS 转码、刮削、元数据写入的数据库行为 | 第二轮**没有覆盖**，值得单独审计 |
-| 搜索 | 文档记录搜索 CPU 21 ms，成本在"匹配 5.6 万行 + 计算总数 + 排序"那条查询，不在 DTO 装配 |
+| 搜索 | 文档记录搜索 CPU 21 ms，成本在"匹配 5.6 万行 + 计算总数 + 排序"那条查询，不在 DTO 装配。**2026-10-31 已分析并实施 LUX-876**：`EXPLAIN` 与分步测量显示主要成本是 66k 个 FTS 候选行的回表（约 62 ms），总数只占 5%（11k 命中）到 19%（61k 命中）；已去掉取页查询里多余的第二次 `JOIN media_items`（61k 形状 −18%），详见 `docs/PERFORMANCE-SEARCH-ANALYSIS.md` |
 
 ## 8. 建议的推进顺序
 

@@ -19128,6 +19128,38 @@ setup 启动的首轮 `RECONCILE_LIBRARY` 扫描，因此启动流程新增“�
 
 依赖：`docs/APP-STATE-NEXT.md` 方案 B 第 ① 步（路由保持单一、setup/ready 双状态）已完成。
 
+#### LUX-876：搜索取页查询去掉冗余回表（交接清单第 7 节搜索线索）
+
+范围：只改 `src/storage/catalog.rs` 的搜索取页 SQL 与一个上界检查，不改公共模型、不新增依赖、
+不新增迁移、不改返回的结果、顺序或总数。分析与取舍见 `docs/PERFORMANCE-SEARCH-ANALYSIS.md`。
+
+- `search_catalog_item_ids`（SQLite）的 `fts_query`、`like_query_sql` 投影 `mi.sort_title`，
+  `fts_page_query`、`like_page_query`、`union_page_query` 改为 `ORDER BY matches.sort_title,
+  matches.id`，删掉只为取该列而做的第二次 `JOIN media_items`；`search_catalog_item_ids_postgres`
+  的 LIKE 分支同步同一形状（静态核对，本机无 PG 实机）。匹配集的 id 唯一且 `sort_title` 是其函数，
+  因此顺序、`UNION` 去重与总数都不变。
+- `SEARCH_MAX_PAGE_LIMIT = 1_000` + `clamped_search_page_limit`，在 `fetch_catalog_search_page`
+  绑定时生效；对现有调用方是空操作（Lux 上限 100、Emby 上限 1000 已在 `api` 层校验），只是把
+  “列表必须有服务端上界”落到存储层，`limit = 0` 的 count-only 语义保持不变。
+- 结论记录：交接清单里“成本在计算总数”只对命中集很大的形状成立。66k 夹具上 `COUNT(*) OVER()`
+  在 11k 命中时占 5.4 ms（约 5%）、61k 命中时占 31.5 ms（约 19%）；主要成本是 66k 个 FTS 候选行的
+  回表（约 62 ms）。本次改动对 61k 命中形状 −17.8%（交替 20 轮中位数），对 Lux 自己的
+  `MOVIE/SERIES` 形状 −4.9%（噪声边缘）。
+- 未做（写在分析文档里）：FTS/派生表复制过滤列、连接级 PRAGMA、trigram、近似/延后总数，均需要
+  迁移、全局取舍或改变 `total` 语义。
+
+验收（2026-10-31，本机 `uname -m` = `arm64`）：
+
+- [x] `cargo test --locked --lib search` 21/21（含新增 `search_page_keeps_sort_title_order_and_total_across_pages`、
+      `search_page_union_keeps_like_only_matches_sorted_and_counted_once`、
+      `search_page_limit_is_clamped_to_the_server_upper_bound`；三个测试在改动前即为绿）。
+- [x] `cargo test --locked --test emby search::` 3/3。
+- [x] `cargo fmt --all -- --check`、`cargo clippy --locked --all-targets --all-features -- -D warnings`、
+      `scripts/check-migration-parity.py`、`scripts/check-backend-branches.py` 通过（无迁移、无新增
+      `DatabaseBackend::` 分支）。
+- [ ] 未验证：PostgreSQL 实机（形状已对齐，没有 PG 环境）；NAS/x86_64 上的绝对收益（本机 arm64、
+      测量期间同机有其它 worktree 的编译/测试负载）。
+
 ## 31. 参考资料
 
 实施时优先核对官方资料，不依赖博客复制协议：

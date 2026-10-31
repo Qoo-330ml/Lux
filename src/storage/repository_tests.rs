@@ -34032,6 +34032,190 @@ async fn search_pages_past_the_end_still_report_the_real_total()
     Ok(())
 }
 
+/// Inserts a searchable movie and lets the FTS consumer pick it up.
+async fn insert_searchable_movie(
+    database: &Database,
+    library_id: &str,
+    id: &'static str,
+    title: &'static str,
+    sort_title: &'static str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(id)
+    .bind(library_id)
+    .bind(title)
+    .bind(sort_title)
+    .execute(database.pool())
+    .await?;
+    Ok(())
+}
+
+async fn search_movie_page(
+    database: &Database,
+    query: &str,
+    like_query: &str,
+    offset: i64,
+    limit: i64,
+    include_total: bool,
+) -> Result<(Vec<String>, i64), Box<dyn std::error::Error>> {
+    let page = database
+        .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+            query,
+            like_query,
+            item_types: &["MOVIE".to_owned()],
+            library_ids: None,
+            offset,
+            limit,
+            content_restrictions: None,
+            include_total,
+        })
+        .await?;
+    Ok(page)
+}
+
+/// Locks the observable contract of the search page query (result order, total, and the
+/// `include_total = false` shortcut) so a query rewrite cannot silently change it.
+#[tokio::test]
+async fn search_page_keeps_sort_title_order_and_total_across_pages()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    for (id, title, sort_title) in [
+        ("zebra-foxtrot", "Zebra Foxtrot", "zebra foxtrot"),
+        ("zebra-bravo-b", "Zebra Bravo B", "zebra bravo"),
+        ("zebra-alpha", "Zebra Alpha", "zebra alpha"),
+        ("zebra-bravo-a", "Zebra Bravo A", "zebra bravo"),
+        ("zebra-delta", "Zebra Delta", "zebra delta"),
+        ("zebra-charlie", "Zebra Charlie", "zebra charlie"),
+        ("zebra-echo", "Zebra Echo", "zebra echo"),
+    ] {
+        insert_searchable_movie(&database, &library_id, id, title, sort_title).await?;
+    }
+    drain_search_index(&database).await;
+
+    let expected = [
+        "zebra-alpha",
+        "zebra-bravo-a",
+        "zebra-bravo-b",
+        "zebra-charlie",
+        "zebra-delta",
+        "zebra-echo",
+        "zebra-foxtrot",
+    ];
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 10, true).await?;
+    assert_eq!(ids, expected, "sort title, then id, across the whole page");
+    assert_eq!(total, 7);
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 3, true).await?;
+    assert_eq!(ids, expected[..3]);
+    assert_eq!(total, 7, "every page reports the same total");
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 3, 3, true).await?;
+    assert_eq!(ids, expected[3..6]);
+    assert_eq!(total, 7);
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 6, 3, true).await?;
+    assert_eq!(ids, expected[6..]);
+    assert_eq!(total, 7);
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 20, 3, true).await?;
+    assert!(ids.is_empty());
+    assert_eq!(total, 7, "a page past the end still reports the real total");
+
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 7, false).await?;
+    assert_eq!(ids, expected, "skipping the count must not change the page");
+    assert_eq!(total, 0, "count=false reports no total");
+    Ok(())
+}
+
+/// Locks the partial-match path: `Zebra` matches one FTS token and four LIKE rows, so the
+/// `UNION` branch that runs for a page past the FTS matches must deduplicate the overlap and keep
+/// the `sort_title, id` order.
+#[tokio::test]
+async fn search_page_union_keeps_like_only_matches_sorted_and_counted_once()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    for (id, title, sort_title) in [
+        ("solaris-alias", "Solaris", "solaris"),
+        ("zebra-one", "Zebra One", "zebra one"),
+        ("zebrax-three", "Zebrax Three", "zebrax three"),
+        ("zebrax-two", "Zebrax Two", "zebrax two"),
+    ] {
+        insert_searchable_movie(&database, &library_id, id, title, sort_title).await?;
+    }
+    // Matches the LIKE alias branch only: "Zebrax" is not the FTS token "Zebra".
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('alias-solaris', 'solaris-alias', 'Zebrax Alias', 'zebrax alias')",
+    )
+    .execute(database.pool())
+    .await?;
+    drain_search_index(&database).await;
+
+    let ordered = ["solaris-alias", "zebra-one", "zebrax-three", "zebrax-two"];
+    // A complete token is served by FTS alone, so the partial matches stay out of the page.
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 0, 10, true).await?;
+    assert_eq!(ids, ["zebra-one"]);
+    assert_eq!(total, 1);
+
+    // No FTS token matches, so the LIKE branch serves the page: ordered by sort title, then id.
+    let (ids, total) = search_movie_page(&database, "Zebr", "%Zebr%", 0, 10, true).await?;
+    assert_eq!(
+        ids, ordered,
+        "LIKE pages are ordered by sort title, then id"
+    );
+    assert_eq!(total, 4);
+
+    let (ids, total) = search_movie_page(&database, "Zebr", "%Zebr%", 0, 2, true).await?;
+    assert_eq!(ids, ordered[..2]);
+    assert_eq!(total, 4);
+
+    // Only `zebra-one` is an FTS match, so this page is served by the FTS/LIKE union.
+    let (ids, total) = search_movie_page(&database, "Zebra", "%Zebra%", 1, 2, true).await?;
+    assert_eq!(
+        ids,
+        ordered[1..3],
+        "the overlap is deduplicated, not doubled"
+    );
+    assert_eq!(total, 4, "the union counts each match once");
+    Ok(())
+}
+
+#[test]
+fn search_page_limit_is_clamped_to_the_server_upper_bound() {
+    use super::catalog::{SEARCH_MAX_PAGE_LIMIT, clamped_search_page_limit};
+
+    assert_eq!(clamped_search_page_limit(0), 0, "count-only stays 0");
+    assert_eq!(clamped_search_page_limit(-5), 0);
+    assert_eq!(clamped_search_page_limit(24), 24);
+    assert_eq!(clamped_search_page_limit(SEARCH_MAX_PAGE_LIMIT), 1_000);
+    assert_eq!(
+        clamped_search_page_limit(SEARCH_MAX_PAGE_LIMIT + 1),
+        SEARCH_MAX_PAGE_LIMIT
+    );
+    assert_eq!(clamped_search_page_limit(i64::MAX), SEARCH_MAX_PAGE_LIMIT);
+}
+
 #[tokio::test]
 async fn catalog_children_page_over_items_not_joined_source_rows()
 -> Result<(), Box<dyn std::error::Error>> {
