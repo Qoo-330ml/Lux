@@ -184,3 +184,75 @@ cargo test --locked --lib notification
 1. 把 `StoredNotificationDestinationRow`/`StoredNotificationDeliveryRow` 与两个 `stored_notification_*` 转换函数移入 `notifications.rs`（已确认仅本域使用），完成该域的可见性收紧。
 2. 若继续推广：给 5 个通知 DTO 一并迁入做好准备（会牵动 `src/application/webhooks.rs` 的构造点）。
 3. 若决定推广：在 `docs/LUX-DEVELOPMENT.md` 中把"新存储代码优先写成域仓库对象"作为约定落地（本次未改该文件），再按 5 节的排序逐域灰度。
+
+## 9. 第二轮 W2 评估：SQLite 读写池拆分（结论：本轮不实现）
+
+范围：`src/storage/repository.rs` 的 `Database` 连接池与 `after_connect`；受影响调用方为
+`src/storage/**`、`src/application/**`、`src/auth/**`、`src/api/**` 与 `tests/**`。
+任务给出的中止条件：如果评估发现会破坏事务语义或需要大范围改调用点，则不强行实现，只提交结论。
+
+### 9.1 现状（2026 年第二轮，符号定位）
+
+- **只有一个池**：`Database::pool`（`AnyPool`，8 连接，`database_pool_options`），
+  `after_connect` 只设置 PRAGMA。`LUX_DB_MAX_CONNECTIONS` 可调整连接数。
+- **不存在统一访问层**：`Database::query` / `query_as` / `query_scalar` 只做方言改写与计数，
+  返回的 statement 与 executor 无关；池是在每个调用点选的（`&self.pool`、`&mut *transaction`、
+  `database.pool()`）。因此"`query`/`query_as` 走读池"在 `Database` 层无法实现。
+- **事务入口没有收敛**：具名 helper 只有 3 个（`begin_metadata_write_transaction`、
+  `begin_playback_admission_transaction`、`begin_scan_write_transaction`，SQLite 都是
+  `BEGIN IMMEDIATE`）；生产代码里另有 **78 处**直接 `self.pool.begin()` / `begin_with()`。
+  "所有事务入口 `begin_*` 走写池"这个前提在现有代码里不成立。
+- **直接使用池的生产代码**（`src/`，排除 `repository_tests.rs`、`*_benchmarks.rs`、`tests.rs` 等测试模块）：
+  `self.pool` 出现 **859 处**，按语句窗口估算 **256 处写**（`.execute(`）、**523 处读**（`.fetch_*`）、
+  **80 处开事务**；`database.pool()` 另有 **649 处**（`application`、`api`、`auth`、`storage`）。
+- **冻结测试直接依赖 `pool()`**：`tests/**` 有 **2626 处** `database.pool()`，既有夹具写入、断言读，
+  也有长持有事务/连接：
+  - `tests/storage/storage.rs`：`database.pool().begin()` 后在一个事务里灌夹具；
+  - `tests/performance.rs`：`database.pool().acquire()` 在整个扫描基准期间持有连接；
+  - `tests/postgres_database.rs`：`database.pool().begin()`；
+  - `src/storage/repository_tests.rs` 的 `user_updates_wait_for_a_concurrent_sqlite_writer`
+    （未冻结，同形态）用 `database.pool().acquire()` 持有 `BEGIN EXCLUSIVE` 阻塞写者。
+
+### 9.2 最小侵入方案为什么走不通
+
+尝试过的最小形态是：`Database` 持有 `write_pool`（1 连接）+ `read_pool`（N 连接），`pool()` 保持现有语义，
+`query*` 默认走读池，具名 `begin_*` 走写池。逐条受阻：
+
+1. **`query*` 无法判断读写。** 256 处写和 523 处读共用同一组 `Database::query*` 构造语句，池由调用点给出。
+   要让写走写池、读走读池，必须逐个改这 779 处调用点（新增 `query_read*` 之类的只读入口），
+   这正是任务定义的"大范围改调用点"。
+2. **`pool()` 是公开且被冻结测试依赖的逃生口。** 2626 处 `database.pool()` 无法修改：
+   - 若 `pool()` 返回 1 连接写池：`tests/performance.rs` 在扫描基准期间长期持有唯一写连接，
+     所有 `Database` 写入会等满 10 s `acquire_timeout` 后失败；`tests/storage/storage.rs`
+     持有事务时同理。这不是行为不变，而是直接让冻结测试失败。
+   - 若 `pool()` 返回读池：冻结测试的夹具写入落到被当作只读的池，单写者假设被破坏；如果读池还以只读方式
+     打开（`mode=ro` 或 `PRAGMA query_only`），这些写入会直接报错。
+3. **事务语义会被拆散。** 除 78 处直接 `begin()` 外，还有大量"先 `fetch` 再 `execute`"的读写混合事务
+   （`BEGIN IMMEDIATE` 正是为 `SQLITE_BUSY_SNAPSHOT` 存在）。只要有一个事务入口漏改到读池，
+   就有两个池同时写同一文件，`SQLITE_BUSY_SNAPSHOT` 与锁竞争回归；`src/storage/users.rs` 的
+   `SQLITE_USER_UPDATE_RETRY_DELAY`（50 ms）/ `SQLITE_USER_UPDATE_RETRY_WINDOW`（5 s）补丁也就不能删。
+4. **读池不是零成本。** 长读事务会挡住 WAL checkpoint；`Database::close` 现在只关一个池并执行
+   `PRAGMA wal_checkpoint(TRUNCATE)`（要求没有读者），拆开后要设计写池→读池的关停顺序与失败处理。
+5. **测试与 PostgreSQL 路径要先改语义。** `Database::connect` 只用文件库，`:memory:` 目前只在测试里
+   以裸池形式存在（`repository_tests.rs`、`tests/storage/storage.rs`、
+   `tests/auth_users/account_preferences_migration.rs`），因此本轮不受影响；但若以后给 `Database`
+   加 `:memory:` 路径，双池会各建一个独立内存库，读池读到空库。PostgreSQL 的 `test_configuration`
+   与 `begin_scan_write_transaction` 的 `SET LOCAL synchronous_commit = off` 也假设单一池。
+
+### 9.3 结论与后续建议
+
+本轮**不实现**读写池拆分，保持"单池 + `BEGIN IMMEDIATE` + 有界重试"的现状。判断依据符合任务的中止条件：
+需要改约 779 处生产调用点，且必须改动 `pool()` 的既有语义与 2626 处冻结测试引用，属于会破坏事务语义与
+可见行为的改动。W1 的 `synchronous` 可配置已经落地（`LUX_SQLITE_SYNCHRONOUS`，默认仍 `FULL`），
+它是本轮写入侧可交付的部分。
+
+如果以后要做，建议顺序（需要所有者确认并单独立项）：
+
+1. 先加**只读入口**（`Database::query_read*` 或 `read_pool()`），只允许 `.fetch_*`；用检查脚本保证
+   不出现 `.execute(`。
+2. 按域灰度：从 `catalog` 的列表/详情读取（`fetch_catalog_rows_internal`、`list_catalog_rows` 一族）开始，
+   写路径与事务继续留在单池。
+3. 把 78 处直接 `begin()`/`begin_with()` 收敛到具名 helper，确认事务全走写池。
+4. 只有前 3 步完成后，才把写池降到 1 连接，并删除 `users.rs` 的 SQLite 重试常量；届时还要为冻结测试
+   的 `database.pool()` 保留双池可用性，或先取得所有者同意调整测试策略。
+5. WAL 下的 checkpoint 与关停顺序（`Database::close`）要一并设计，避免长读事务饿死 truncate。

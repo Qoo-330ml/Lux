@@ -1,7 +1,7 @@
 # 性能与数据库优化交接清单
 
 日期：2026-10-30。基线：`test` 分支，包含第一轮结构与代码质量优化的全部已合并成果。
-状态：**本文件列出的条目全部尚未实施**（除"第九节"明确标注的）。本文件只记录问题、证据、建议和约束，
+状态：**本文件列出的条目除第五节 W1（已实现可配置项）与 W2（评估后不实现）外均尚未实施**（另见"第九节"的已合并成果）。本文件只记录问题、证据、建议和约束，
 不改变产品规格；实施前仍需按 `CLAUDE.md` 在 `docs/LUX-DEVELOPMENT.md` 登记 `LUX-*` 任务。
 
 ## 0. 先读这个
@@ -85,8 +85,8 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 
 | # | 问题 | 位置 | 建议 | 注意 |
 |---|---|---|---|---|
-| W1 | SQLite 使用默认 `synchronous=FULL`。WAL 模式下 NORMAL 不会损坏数据库，只可能在断电时丢最后几次提交 | `src/storage/repository.rs` 的连接 `after_connect`（约 1162 行，只设了 `foreign_keys`、`journal_mode=WAL`、`busy_timeout`、`journal_size_limit`）；删除任务已临时用 NORMAL（`library_deletion.rs`） | 对小事务多的播放写路径收益最大，机械盘上尤其明显 | **必须在 NAS 上做 A/B**；文档里的 A/B 只测了批量扫描（批量提交已把 fsync 压到很少），不代表小事务 |
-| W2 | 读写共用一个 8 连接池；已有 `BEGIN IMMEDIATE` 与 50 ms 重试补丁 | `SQLITE_DATABASE_POOL_MAX_CONNECTIONS = 8`（`repository.rs` 约 390 行）；`begin_metadata_write_transaction`（约 1305 行）；`storage/users.rs` 的 `SQLITE_USER_UPDATE_RETRY_*` | 拆成"1 个写连接 + N 个只读连接"，可去掉 `SQLITE_BUSY_SNAPSHOT` 的补丁 | 需要先有统一的访问层入口；`Database` 拆分试点结论是不全面推广，见第九节 |
+| W1 | SQLite 使用默认 `synchronous=FULL`。WAL 模式下 NORMAL 不会损坏数据库，只可能在断电时丢最后几次提交 | `src/storage/repository.rs` 的连接 `after_connect`（约 1162 行，只设了 `foreign_keys`、`journal_mode=WAL`、`busy_timeout`、`journal_size_limit`）；删除任务已临时用 NORMAL（`library_deletion.rs`） | 对小事务多的播放写路径收益最大，机械盘上尤其明显 | **必须在 NAS 上做 A/B**；文档里的 A/B 只测了批量扫描（批量提交已把 fsync 压到很少），不代表小事务<br>**已实施（第二轮）**：`LUX_SQLITE_SYNCHRONOUS=full\|normal` 已在 `after_connect` 生效，默认仍 `FULL`；提交 `9e548e37`，A/B 方法见 `docs/DEPLOYMENT.md`；NAS A/B 与断电证据未做，默认切换待所有者决定 |
+| W2 | 读写共用一个 8 连接池；已有 `BEGIN IMMEDIATE` 与 50 ms 重试补丁 | `SQLITE_DATABASE_POOL_MAX_CONNECTIONS = 8`（`repository.rs` 约 390 行）；`begin_metadata_write_transaction`（约 1305 行）；`storage/users.rs` 的 `SQLITE_USER_UPDATE_RETRY_*` | 拆成"1 个写连接 + N 个只读连接"，可去掉 `SQLITE_BUSY_SNAPSHOT` 的补丁 | 需要先有统一的访问层入口；`Database` 拆分试点结论是不全面推广，见第九节<br>**已实施（第二轮）**：评估后不实现；779 处生产读/写调用点仍自行选池、78 处直接 `begin()`、冻结测试 2626 处 `database.pool()`，拆池会改 `pool()` 语义与事务边界。结论见 `docs/DATABASE-SPLIT.md` 第 9 节，提交 `bc7ba181` |
 | W3 | UPDATE 几乎没有"值未变则不写"保护：312 条里只有 21 条带 `IS NOT` 之类的保护 | `media_items` 18 条、`media_sources` 14 条、`filesystem_entries` 15 条 | 重扫、元数据回写这类大概率无变化的路径加保护条件 | SQLite 的 ON CONFLICT 即使值相同也会写页并触发触发器 |
 | W4 | `media_items` 写放大：约 18 个索引、6 个触发器 | `migrations/` | 用 dbstat 或查询计划找出无人使用的索引，逐个删除 | 需要实测；删索引要走迁移，且 PG 迁移要配对（`scripts/check-migration-parity.py`）。**已实施**：`389cd8ba` 删除 2 个左前缀冗余索引（0242 / PG 0244），修好 3 个被 catalog 修复路径吞掉的索引，另 3 个被复活的索引待所有者决定；实际是 17 个索引（新建库 20 个）、13 个触发器；证据脚本 `scripts/audit-media-items-indexes.py`，结论与待 NAS 实测项见 `docs/INDEX-AUDIT.md` |
 | W5 | `user_series_next` 先 DELETE 再 INSERT | `src/storage/user_series_next.rs` | 改成单条 UPSERT，找不到下一集时才 DELETE | 与 P2 同一处 |
