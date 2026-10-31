@@ -113,6 +113,7 @@ mod migration;
 mod notifications;
 #[path = "people.rs"]
 mod people;
+pub(crate) use people::CanonicalPersonBatch;
 #[path = "sessions.rs"]
 mod sessions;
 #[path = "user_mail_flows.rs"]
@@ -1479,6 +1480,8 @@ impl Database {
     async fn begin_metadata_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        #[cfg(test)]
+        metadata_write_transaction_counter(&self.path).fetch_add(1, AtomicOrdering::Relaxed);
         let transaction = if self.backend == DatabaseBackend::Sqlite {
             self.pool.begin_with("BEGIN IMMEDIATE").await
         } else {
@@ -1912,6 +1915,21 @@ impl Database {
         self.query_count.load(AtomicOrdering::Relaxed)
     }
 
+    /// How many metadata write transactions this database started (test-only).
+    ///
+    /// Write-path batches are judged by commit count, not statement count (see
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2): a path that keeps a page in one
+    /// transaction leaves this number flat while the number of actors grows.
+    #[cfg(test)]
+    pub(crate) fn metadata_write_transaction_count(&self) -> usize {
+        metadata_write_transaction_counter(&self.path).load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_metadata_write_transaction_count(&self) {
+        metadata_write_transaction_counter(&self.path).store(0, AtomicOrdering::Relaxed);
+    }
+
     /// The change counters that the playback access cache stamps its entries with.
     ///
     /// The permission writes in this module bump these counters; the cache only reads them.
@@ -1998,6 +2016,29 @@ impl Database {
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
+}
+
+/// Per-database metadata write transaction counter for the write-path tests.
+///
+/// Commit counts are the metric the write-path performance work records
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2). The counter is keyed by the database
+/// path instead of living on [`Database`]: a test-only field would grow `Database`, and `Database`
+/// is embedded by value in `ReadyAppState`, which in test builds would tip the `AppMode` variant
+/// size lint.
+#[cfg(test)]
+fn metadata_write_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
+    static COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+        std::sync::OnceLock::new();
+    let counters = COUNTERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut counters = match counters.lock() {
+        Ok(counters) => counters,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Arc::clone(
+        counters
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+    )
 }
 
 fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {

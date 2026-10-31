@@ -2028,6 +2028,323 @@ mod tests {
         Ok(())
     }
 
+    fn credited_actor(
+        id: &str,
+        name: &str,
+        character: Option<&str>,
+        order: Option<i32>,
+        extra_identities: &[(&str, &str)],
+    ) -> ActorCredit {
+        ActorCredit {
+            id: id.to_owned(),
+            provider: Some("tmdb".to_owned()),
+            identities: extra_identities
+                .iter()
+                .map(|(provider, id)| PersonIdentity {
+                    provider: (*provider).to_owned(),
+                    id: (*id).to_owned(),
+                })
+                .collect(),
+            name: name.to_owned(),
+            character: character.map(str::to_owned),
+            order,
+            profile_url: None,
+            person: None,
+        }
+    }
+
+    async fn insert_test_movie(
+        database: &Database,
+        library_id: &str,
+        item_id: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .bind(library_id)
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    /// M2: one page of actors must commit once, not once per actor.
+    ///
+    /// The metric is the commit count (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2):
+    /// `persist_item_actors` replaces the credits in its own transaction, so a page of N actors
+    /// costs one actor transaction plus that one, whatever N is.
+    #[tokio::test]
+    async fn persist_item_actors_keeps_one_actor_transaction_per_page()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        insert_test_movie(&database, &library.id.to_string(), "item-one-actor").await?;
+        insert_test_movie(&database, &library.id.to_string(), "item-full-cast").await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+
+        database.reset_metadata_write_transaction_count();
+        service
+            .persist_item_actors(
+                "item-one-actor",
+                "tmdb",
+                &[credited_actor("1", "单独演员", Some("角色"), Some(0), &[])],
+            )
+            .await?;
+        let single_actor_commits = database.metadata_write_transaction_count();
+        assert_eq!(
+            single_actor_commits, 2,
+            "an actor page commits once and the credit replacement commits once"
+        );
+
+        let cast = (0..12)
+            .map(|index| {
+                credited_actor(
+                    &(100 + index).to_string(),
+                    &format!("批量演员{index}"),
+                    Some("角色"),
+                    Some(index),
+                    &[],
+                )
+            })
+            .collect::<Vec<_>>();
+        database.reset_metadata_write_transaction_count();
+        let stored = service
+            .persist_item_actors("item-full-cast", "tmdb", &cast)
+            .await?;
+        assert_eq!(stored, cast.len());
+        assert_eq!(
+            database.metadata_write_transaction_count(),
+            single_actor_commits,
+            "the actor page write count must not grow with the number of actors"
+        );
+
+        // Re-scraping the same cast resolves every identity from the preload, so the page does not
+        // open a transaction at all: only the credit replacement commits.
+        database.reset_metadata_write_transaction_count();
+        service
+            .persist_item_actors("item-full-cast", "tmdb", &cast)
+            .await?;
+        assert_eq!(database.metadata_write_transaction_count(), 1);
+        Ok(())
+    }
+
+    /// M2: batching the page must not change any stored actor field.
+    #[tokio::test]
+    async fn persist_item_actors_stores_every_cast_field_unchanged()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        insert_test_movie(&database, &library.id.to_string(), "item-cast-fields").await?;
+        let service = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+        let known = database
+            .resolve_or_create_canonical_person(
+                "演员甲",
+                "tmdb",
+                "1",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"method":"provider-id"}"#,
+            )
+            .await?;
+
+        service
+            .persist_item_actors(
+                "item-cast-fields",
+                "tmdb",
+                &[
+                    credited_actor("1", "演员甲", Some("角色甲"), Some(0), &[("douban", "11")]),
+                    credited_actor("2", "演员乙", Some("角色乙"), Some(1), &[]),
+                    ActorCredit {
+                        id: String::new(),
+                        provider: None,
+                        identities: Vec::new(),
+                        name: "演员丙".to_owned(),
+                        character: None,
+                        order: None,
+                        profile_url: None,
+                        person: None,
+                    },
+                ],
+            )
+            .await?;
+
+        let second = database
+            .find_canonical_person_by_identity("tmdb", "2")
+            .await?
+            .ok_or("missing canonical person for the second actor")?;
+        let relation = super::read_relation(
+            &library_item_directory(&config.config_dir, "item-cast-fields")?.join("people.json"),
+        )
+        .await?
+        .ok_or("missing people relation")?;
+        assert_eq!(
+            relation.actors,
+            vec![
+                super::StoredActor {
+                    id: Some("11".to_owned()),
+                    name: "演员甲".to_owned(),
+                    provider: "douban".to_owned(),
+                    person_key: Some(known.id.clone()),
+                    lux_person_id: Some(known.id.clone()),
+                    identities: vec![
+                        PersonIdentity {
+                            provider: "douban".to_owned(),
+                            id: "11".to_owned(),
+                        },
+                        PersonIdentity {
+                            provider: "tmdb".to_owned(),
+                            id: "1".to_owned(),
+                        },
+                    ],
+                    character: Some("角色甲".to_owned()),
+                    order: Some(0),
+                    image_file: None,
+                    // No profile URL was supplied, so the actor still owes a profile image.
+                    pending_assets: vec![super::PENDING_PROFILE_IMAGE.to_owned()],
+                    person: None,
+                },
+                super::StoredActor {
+                    id: Some("2".to_owned()),
+                    name: "演员乙".to_owned(),
+                    provider: "tmdb".to_owned(),
+                    person_key: Some(second.id.clone()),
+                    lux_person_id: Some(second.id.clone()),
+                    identities: vec![PersonIdentity {
+                        provider: "tmdb".to_owned(),
+                        id: "2".to_owned(),
+                    }],
+                    character: Some("角色乙".to_owned()),
+                    order: Some(1),
+                    image_file: None,
+                    pending_assets: vec![super::PENDING_PROFILE_IMAGE.to_owned()],
+                    person: None,
+                },
+                super::StoredActor {
+                    id: None,
+                    name: "演员丙".to_owned(),
+                    provider: String::new(),
+                    person_key: None,
+                    lux_person_id: None,
+                    identities: Vec::new(),
+                    character: None,
+                    order: None,
+                    image_file: None,
+                    pending_assets: Vec::new(),
+                    person: None,
+                },
+            ]
+        );
+        // The identity that was not attached yet goes through the batched attach.
+        let bridged = database
+            .find_canonical_person_by_identity("douban", "11")
+            .await?
+            .ok_or("missing attached identity")?;
+        assert_eq!(bridged.id, known.id);
+        Ok(())
+    }
+
+    /// A failed write inside the page batch may only undo its own statements.
+    #[tokio::test]
+    async fn canonical_person_batch_rolls_back_only_the_failed_write()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let config_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: config_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let owner = database
+            .resolve_or_create_canonical_person(
+                "演员甲",
+                "tmdb",
+                "1",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"method":"provider-id"}"#,
+            )
+            .await?;
+        let other = database
+            .resolve_or_create_canonical_person(
+                "演员乙",
+                "tmdb",
+                "2",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"method":"provider-id"}"#,
+            )
+            .await?;
+
+        let mut batch = database.begin_canonical_person_batch().await?;
+        let created = batch
+            .resolve_or_create(
+                "演员丙",
+                "tmdb",
+                "3",
+                "PROVIDER_ID",
+                Some(1.0),
+                r#"{"method":"provider-id"}"#,
+            )
+            .await?;
+        // `tmdb:1` already belongs to `owner`, so the attach has to fail; the identity it inserts
+        // before noticing (`tmdb:4`) must be rolled back with it.
+        let error = batch
+            .attach_identities(
+                &other.id,
+                &[
+                    ("tmdb".to_owned(), "1".to_owned()),
+                    ("tmdb".to_owned(), "4".to_owned()),
+                ],
+                "SAME_SOURCE_ID_SET",
+                Some(0.99),
+                r#"{"method":"same-source-id-set"}"#,
+            )
+            .await
+            .expect_err("attaching an identity owned by another person must fail");
+        assert!(matches!(error, crate::storage::StorageError::Conflict(_)));
+        batch.commit().await?;
+
+        assert!(
+            database
+                .find_canonical_person_by_identity("tmdb", "3")
+                .await?
+                .is_some_and(|person| person.id == created.id),
+            "the actor resolved before the failure must survive the page commit"
+        );
+        assert!(
+            database
+                .find_canonical_person_by_identity("tmdb", "4")
+                .await?
+                .is_none(),
+            "the failed attach must not leave an identity behind"
+        );
+        assert_eq!(
+            database
+                .find_canonical_person_by_identity("tmdb", "1")
+                .await?
+                .map(|person| person.id),
+            Some(owner.id)
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn identity_move_updates_person_manifest_and_keeps_event_history()
     -> Result<(), Box<dyn std::error::Error>> {

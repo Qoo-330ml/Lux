@@ -557,6 +557,35 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `people.rs:642-658`），合并成一个大事务后仍然是单写者，但事务变长，会拉长其他写者的等待；
   需要确认最坏情况（100 演员、新库）的事务时长可接受。
 - **是否值得做**：**高**。建议先做方案 2（语义不变、风险低），再评估方案 1。
+- **审计口径更正（实施时复核）**：本节"即使演员已经存在也开事务"的说法与当前代码不符。`relations.rs` 的
+  `find_canonical_people_by_identities` 预加载（`relations.rs:504` 一带）已经把整页的身份映射一次读出来，演员的
+  身份全部命中时循环内**不发任何语句**（`mapped_person` 直接命中，`identities_to_attach` 为空）。真正的提交放大是
+  **新演员**：每人 `resolve_or_create_canonical_person`（1 次）+ `attach_canonical_person_identities`（1 次，即使
+  该身份刚由前者插入，也因为"未预加载命中"而再走一遍 `ON CONFLICT DO NOTHING` 的幂等写），即 2N 次；稳态
+  （整页演员都已存在）原本只有片尾 `replace_person_credits_*` 的 1 次提交。下面的前后数字按这个口径重测。
+- **已实施（方案 2）**：提交 `df1bd290`。
+  - 存储层新增 `CanonicalPersonBatch`（`src/storage/people.rs`）：`Database::begin_canonical_person_batch()` 开
+    **一个** `BEGIN IMMEDIATE`（PG 上是普通 `BEGIN`），`resolve_or_create_canonical_person` /
+    `attach_canonical_person_identities` / `enqueue_person_match_candidate` 与两处页内读（规范化名匹配、
+    match candidate 回读）都拆出 `_in_transaction` 变体，SQL 仍全部留在 `storage`。
+  - `relations.rs` 的演员循环改为：预加载身份映射 → 若整页有任一演员需要写（未映射身份，或需要记录歧义桥接
+    候选）就开一个页事务 → 循环解析 → **先提交整页，再上报失败**（保持"逐演员提交"时可观察的失败语义：失败前
+    已解析成功的演员仍然落库），失败演员自己的语句由 savepoint 回滚。
+  - 每次调用自带一个 savepoint（`SAVEPOINT` / 成功 `RELEASE` / 失败 `ROLLBACK TO … RELEASE`），因此"单个存储
+    调用要么全写要么全不写"与原来的"每次调用一个事务"完全一致；页内两处读也带 savepoint，这样 PG 上一条失败的
+    读语句不会把整页事务变成 aborted。SQLite 与 PG 用同一套语句，没有新增后端分支。
+  - 度量（§2.1 静态口径 + 测试里的提交计数）：
+    - 提交数（`persist_item_actors`，实测）：1 个新演员 **3 → 2**；12 个新演员 **25 → 2**（= 2N+1 → 2，其中 1 次是
+      片尾 `replace_person_credits_*`）；100 演员的新演员条目按 2N+1 推算 **201 → 2**。稳态（演员都已存在）
+      **1 → 1**：整页没有待写演员时不开事务，行为与改造前相同。
+    - 语句数：每个新演员 9 → 13（两个写调用各多 `SAVEPOINT` + `RELEASE` 两条，纯解析层、无 I/O、无提交）；
+      稳态页 0 → 0。
+  - 测试：`persist_item_actors_keeps_one_actor_transaction_per_page`（提交数不随演员数增长、稳态不开事务）、
+    `persist_item_actors_stores_every_cast_field_unchanged`（`people.json` 的 actors 逐字段对比）、
+    `canonical_person_batch_rolls_back_only_the_failed_write`（savepoint 只回滚失败调用，页内已解析的演员保留）。
+  - 剩余风险：事务窗口从"每演员一个短事务"变成"整页一个事务"，最坏 100 个新演员期间一直占着 SQLite 写者位
+    （含极少数歧义桥接分支里的快照文件写）。若 NAS 实测发现写者等待变长，可在页内按小批（例如 16 演员）分段提交，
+    提交数仍是 O(演员数/16)。
 
 ### M3 元数据选中无条件 `UPDATE media_items`（已读代码确认）
 
