@@ -2066,9 +2066,9 @@ impl MetadataReidentifyService {
         });
         let mut last_recoverable_error = None;
         let mut saw_needs_review = false;
-        // The item row is unmodified until the first attempt reaches selection, because a failed
-        // attempt may already have written the NFO projection. Only the first primary attempt may
-        // therefore reuse the caller's snapshot instead of reading the row again.
+        // Nothing rewrites the item row until an attempt reaches selection, but a failed or
+        // needs-review attempt may already have rewritten the NFO projection, so the caller's
+        // snapshot is only reusable for the first primary attempt.
         let mut current_snapshot = Some(item);
         let should_refresh_primary = !already_confirmed
             || request_plan.is_none_or(|plan| !metadata_request_plan_is_complete(plan));
