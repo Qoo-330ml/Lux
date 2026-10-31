@@ -2268,6 +2268,13 @@ impl MetadataReidentifyService {
         }
         if !matches!(mode, MetadataRefreshMode::Reidentify) {
             if let Some(selection) = self.selection.as_ref() {
+                // The caller's `item` predates the primary attempts, which may have rewritten the
+                // row, so the first fallback reads it. A fallback attempt that misses before
+                // selection writes nothing, so the next backup reuses that snapshot instead of
+                // re-reading the same row (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S2).
+                // Any other outcome -- a selection, or an error raised after a partial write --
+                // invalidates the snapshot and forces the next backup to re-read.
+                let mut reusable_snapshot: Option<crate::storage::StoredMediaMetadata> = None;
                 for scraper in scrapers.iter().filter(|scraper| {
                     matches!(
                         scraper.role,
@@ -2275,11 +2282,16 @@ impl MetadataReidentifyService {
                             | crate::library::LibraryScraperRole::Both
                     )
                 }) {
-                    let current = self
-                        .database
-                        .find_media_item_metadata(item_id)
-                        .await?
-                        .ok_or_else(|| MetadataReidentifyError::ItemNotFound(item_id.to_owned()))?;
+                    let current = match reusable_snapshot.take() {
+                        Some(current) => current,
+                        None => self
+                            .database
+                            .find_media_item_metadata(item_id)
+                            .await?
+                            .ok_or_else(|| {
+                                MetadataReidentifyError::ItemNotFound(item_id.to_owned())
+                            })?,
+                    };
                     let fallback_plan = selection
                         .fallback_request_plan_for_current(item_id, &current)
                         .await
@@ -2287,7 +2299,7 @@ impl MetadataReidentifyService {
                     if metadata_request_plan_is_complete(fallback_plan) {
                         break;
                     }
-                    match self
+                    let outcome = self
                         .refresh_item(
                             item_id,
                             &current,
@@ -2302,8 +2314,16 @@ impl MetadataReidentifyService {
                                 current: Some(&current),
                             },
                         )
-                        .await
-                    {
+                        .await;
+                    let row_untouched = matches!(
+                        outcome,
+                        Err(MetadataReidentifyError::NoCandidate)
+                            | Err(MetadataReidentifyError::LowConfidence)
+                    );
+                    if row_untouched {
+                        reusable_snapshot = Some(current);
+                    }
+                    match outcome {
                         Ok(
                             RefreshItemOutcome::Confirmed(count)
                             | RefreshItemOutcome::NeedsReview(count),
@@ -4676,6 +4696,119 @@ mod tests {
             .filter(|call| call.starts_with("backup:"))
             .collect::<Vec<_>>();
         assert_eq!(backup_calls, ["backup:search", "backup:images"]);
+        Ok(())
+    }
+
+    /// S2: a backup attempt that misses before selection writes nothing, so the next backup reuses
+    /// the snapshot instead of re-reading the same item row.
+    #[tokio::test]
+    async fn backup_attempts_reuse_the_item_snapshot_until_an_attempt_can_write()
+    -> Result<(), Box<dyn Error>> {
+        let (_temp_dir, config, database, item_id) = role_test_fixture().await?;
+        sqlx::query(
+            "UPDATE media_items SET
+                original_title = 'Example Movie', overview = 'Existing overview',
+                production_year = 2020, premiere_date = '2020-01-01',
+                original_language = 'en', rating = 8.0,
+                provider_ids_json = ?, metadata_scraper_id = 'primary',
+                identification_status = 'ONLINE_CONFIRMED'
+             WHERE id = ?",
+        )
+        .bind(serde_json::json!({ "primary": "primary-1", "imdb": "tt-example" }).to_string())
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let primary = RoleRecordingAdapter::with_get_failure("primary", Arc::clone(&calls));
+        let first_backup =
+            RoleRecordingAdapter::with_match("backup-one", Arc::clone(&calls), false);
+        let second_backup =
+            RoleRecordingAdapter::with_match("backup-two", Arc::clone(&calls), false);
+        let service = super::MetadataReidentifyService::with_selection(
+            database.clone(),
+            super::ScraperProvider::from_adapter(primary.clone()),
+            Some(MetadataSelectionService::with_config_dir(
+                database.clone(),
+                ImageWriteService::new(database.clone())?,
+                config.config_dir,
+            )),
+        );
+        let item = database
+            .find_media_item_metadata(&item_id)
+            .await?
+            .ok_or("fixture movie is missing")?;
+        let scrapers = vec![
+            super::ResolvedScraper {
+                scraper_id: "primary".to_owned(),
+                role: LibraryScraperRole::Primary,
+                provider: super::ScraperProvider::from_adapter(primary),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup-one".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(first_backup),
+            },
+            super::ResolvedScraper {
+                scraper_id: "backup-two".to_owned(),
+                role: LibraryScraperRole::Backup,
+                provider: super::ScraperProvider::from_adapter(second_backup),
+            },
+        ];
+        let before = media_item_identity_rows(&database, std::slice::from_ref(&item_id)).await?;
+
+        database.reset_query_count();
+        let outcome = service
+            .refresh_with_scraper_roles(
+                "metadata-test-job",
+                &item_id,
+                &item,
+                super::MetadataRefreshMode::FullRefresh,
+                &scrapers,
+                None,
+            )
+            .await?;
+        let statements = database.query_count();
+
+        assert!(
+            matches!(outcome, super::RefreshItemOutcome::Confirmed(0)),
+            "outcome: {}",
+            match outcome {
+                super::RefreshItemOutcome::Confirmed(count) => format!("confirmed {count}"),
+                super::RefreshItemOutcome::NeedsReview(count) => format!("review {count}"),
+            }
+        );
+        let calls = calls
+            .lock()
+            .expect("role scraper call list should not be poisoned")
+            .clone();
+        let providers = calls
+            .iter()
+            .map(|call| call.split(':').next().unwrap_or_default())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            providers,
+            [
+                "primary",
+                "backup-one",
+                "backup-one",
+                "backup-two",
+                "backup-two"
+            ],
+            "the fallback loop tries each backup once, in order"
+        );
+        assert_eq!(
+            media_item_identity_rows(&database, std::slice::from_ref(&item_id)).await?,
+            before,
+            "a pre-selection miss must not rewrite the item row"
+        );
+        // Before the snapshot was reused the same loop cost 17 statements: the second backup
+        // re-read the item row it was about to plan against (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`
+        // S2). One item read remains for the first backup, which runs after the primary attempts.
+        assert_eq!(
+            statements, 16,
+            "one fallback-loop statement is the item read; the second backup reuses it"
+        );
         Ok(())
     }
 
