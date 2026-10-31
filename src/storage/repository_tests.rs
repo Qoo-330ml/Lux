@@ -36017,6 +36017,23 @@ async fn sqlite_synchronous_level_reaches_the_connection_pragma()
             applied, expected,
             "every pooled connection must apply the configured synchronous level"
         );
+        // The synchronous pragma shares one script with the other connection pragmas, so the
+        // neighbours prove the configured string still runs as a whole.
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(foreign_keys, 1, "foreign keys stay enabled");
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(
+            busy_timeout, 5000,
+            "the busy timeout survives the new pragma"
+        );
     }
     Ok(())
 }
