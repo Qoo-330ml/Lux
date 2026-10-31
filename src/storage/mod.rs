@@ -940,3 +940,7 @@ pub(crate) async fn test_database()
     .await?;
     Ok((temp_dir, database))
 }
+
+#[cfg(test)]
+#[path = "redundant_write_tests.rs"]
+mod redundant_write_tests;
