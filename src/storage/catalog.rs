@@ -2403,7 +2403,7 @@ impl Database {
              ORDER BY added_at DESC, sort_title, id
              LIMIT ? OFFSET ?"
         );
-        let mut list_statement = self.query(sqlx::AssertSqlSafe(list_query));
+        let mut list_statement = self.query_scalar::<String>(sqlx::AssertSqlSafe(list_query));
         for library_id in library_ids {
             list_statement = list_statement.bind(library_id);
         }
@@ -2439,7 +2439,7 @@ impl Database {
                 .map_err(self.sqlx_err())
         };
         let (total, rows) = tokio::try_join!(count_future, list_future)?;
-        Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
+        Ok((rows, total))
     }
 
     #[cfg(test)]
@@ -2777,7 +2777,7 @@ impl Database {
                AND parent.removed_at IS NULL
              GROUP BY parent.id"
         );
-        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query_as::<(String, i64)>(sqlx::AssertSqlSafe(query));
         for bind in content_restriction_binds {
             statement = match bind {
                 CatalogBind::Text(value) => statement.bind(value),
@@ -2791,11 +2791,7 @@ impl Database {
         statement
             .fetch_all(&self.pool)
             .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| (row.get("id"), row.get("episode_count")))
-                    .collect()
-            })
+            .map(|rows| rows.into_iter().collect())
             .map_err(self.sqlx_err())
     }
 
@@ -2998,7 +2994,9 @@ impl Database {
              ORDER BY mi.season_number, mi.episode_number, mi.sort_title, mi.id
              LIMIT ? OFFSET ?"
         );
-        let mut list_statement = self.query(sqlx::AssertSqlSafe(list_sql)).bind(series_id);
+        let mut list_statement = self
+            .query_scalar::<String>(sqlx::AssertSqlSafe(list_sql))
+            .bind(series_id);
         if let Some(season_id) = season_id {
             list_statement = list_statement.bind(season_id);
         }
@@ -3015,7 +3013,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok((rows.into_iter().map(|row| row.get("id")).collect(), total))
+        Ok((rows, total))
     }
 
     pub(crate) async fn list_resume_items_with_total(
@@ -13505,6 +13503,78 @@ mod web_session_row_decoding_tests {
                 "unexpected decode error: {error}"
             );
         }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the single-column ID pages and the per-parent episode counts.
+#[cfg(test)]
+mod catalog_id_projection_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn id_pages_and_episode_counts_decode_their_scalar_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES ('ids-lib', 'IDs', 'SERIES');
+                 INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('ids-root', 'ids-lib', '/ids', '/ids', 1, 1);
+                 INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES
+                     ('ids-file-1', 'ids-root', 'S01E01.mkv', 'FILE', 10, 10, 'gen'),
+                     ('ids-file-2', 'ids-root', 'S01E02.mkv', 'FILE', 10, 10, 'gen');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source, season_number, episode_number
+                 ) VALUES
+                     ('ids-series', 'ids-lib', 'SERIES', 'Series', 'series',
+                      'LOCAL_CONFIRMED', 1, NULL, NULL),
+                     ('ids-season', 'ids-lib', 'SEASON', 'Season 1', 'season 1',
+                      'LOCAL_CONFIRMED', 1, 1, NULL),
+                     ('ids-episode-1', 'ids-lib', 'EPISODE', 'Episode 1', 'episode 1',
+                      'LOCAL_CONFIRMED', 1, 1, 1),
+                     ('ids-episode-2', 'ids-lib', 'EPISODE', 'Episode 2', 'episode 2',
+                      'LOCAL_CONFIRMED', 1, 1, 2);
+                 UPDATE media_items
+                 SET series_id = 'ids-series', season_number = 1
+                 WHERE id = 'ids-season';
+                 UPDATE media_items
+                 SET series_id = 'ids-series', parent_id = 'ids-season'
+                 WHERE id IN ('ids-episode-1', 'ids-episode-2');
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default
+                 ) VALUES
+                     ('ids-source-1', 'ids-episode-1', 'LOCAL_FILE', 'ids-file-1', 1),
+                     ('ids-source-2', 'ids-episode-2', 'LOCAL_FILE', 'ids-file-2', 1)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let counts = database
+            .list_episode_counts(&["ids-series".to_owned(), "ids-season".to_owned()], None)
+            .await?;
+        assert_eq!(counts.get("ids-series"), Some(&2));
+        assert_eq!(counts.get("ids-season"), Some(&2));
+
+        let (episode_ids, total) = database
+            .list_series_episode_ids("ids-series", None, None, 0, 10)
+            .await?;
+        assert_eq!(total, 2);
+        assert_eq!(
+            episode_ids,
+            vec!["ids-episode-1".to_owned(), "ids-episode-2".to_owned()]
+        );
+
+        let (recent_ids, recent_total) = database
+            .list_recent_catalog_item_ids(&["ids-lib".to_owned()], 0, 10, true, None)
+            .await?;
+        assert!(recent_total >= 1);
+        assert!(recent_ids.contains(&"ids-series".to_owned()));
         Ok(())
     }
 }
