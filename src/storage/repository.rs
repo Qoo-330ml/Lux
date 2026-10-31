@@ -4139,7 +4139,8 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) cancel_requested: bool,
     pub(crate) library_id: Option<String>,
     pub(crate) job_scope: String,
-    pub(crate) pending_count: i64,
+    /// `None` when the caller did not ask for the pending aggregation.
+    pub(crate) pending_count: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -4180,7 +4181,7 @@ struct StoredMetadataReidentifyJobRow {
     cancel_requested: i64,
     library_id: Option<String>,
     job_scope: String,
-    pending_count: i64,
+    pending_count: Option<i64>,
 }
 
 fn stored_metadata_reidentify_job(
@@ -7570,7 +7571,7 @@ mod stored_row_decoding_tests {
         assert_eq!(job.library_id.as_deref(), Some("reid-lib"));
         assert_eq!(job.total_count, 1);
         assert_eq!(job.processed_count, 0);
-        assert_eq!(job.pending_count, 0);
+        assert_eq!(job.pending_count, Some(0));
         assert!(!job.cancel_requested);
         assert_eq!(job.error, None);
         assert_eq!(job.started_at, None);

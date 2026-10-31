@@ -114,6 +114,18 @@ pub(crate) struct MetadataReidentifyListQuery {
     pub(crate) page: Option<i64>,
     pub(crate) page_size: Option<i64>,
     pub(crate) status: Option<String>,
+    /// Opt-in for the `job_items ⋈ metadata_candidates` pending aggregation (S6). Accepts
+    /// `?includePending=1`, `true`, `yes` or `on`; every other value keeps the list cheap.
+    pub(crate) include_pending: Option<String>,
+}
+
+fn query_flag(value: Option<&str>) -> bool {
+    matches!(
+        value
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("1" | "true" | "yes" | "on")
+    )
 }
 
 #[derive(Deserialize)]
@@ -407,8 +419,9 @@ pub(crate) async fn admin_list_metadata_reidentify(
         .into_response();
     }
     let database = state.database();
+    let include_pending = query_flag(query.include_pending.as_deref());
     match database
-        .list_metadata_reidentify_jobs(status.as_deref(), offset, limit)
+        .list_metadata_reidentify_jobs(status.as_deref(), offset, limit, include_pending)
         .await
     {
         Ok(jobs) => Json(json!({
@@ -1234,6 +1247,10 @@ pub(crate) fn metadata_reidentify_job_json(
     })
 }
 
+/// Summary row of a metadata job.
+///
+/// `pendingCount` is `null` unless the list request opted into the pending aggregation with
+/// `includePending=1`; job details always carry the number.
 pub(crate) fn metadata_reidentify_job_summary_json(
     job: &crate::storage::StoredMetadataReidentifyJob,
 ) -> Value {

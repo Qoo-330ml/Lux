@@ -2,6 +2,81 @@ use super::*;
 
 const AUTOMATIC_FILL_MISSING_DISPATCH_PAGE_MAX: i64 = 100;
 
+/// Metadata job page without the pending aggregation: `pending_count` stays `NULL`.
+const METADATA_REIDENTIFY_JOBS_PAGE_SQL: &str = "SELECT id, status, processed_count, total_count,
+            error, created_at, updated_at, started_at, finished_at, mode,
+            cancel_requested, library_id, job_scope,
+            CAST(NULL AS BIGINT) AS pending_count
+     FROM metadata_reidentify_jobs
+     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
+
+/// [`METADATA_REIDENTIFY_JOBS_PAGE_SQL`] narrowed to one status.
+const METADATA_REIDENTIFY_JOBS_PAGE_BY_STATUS_SQL: &str =
+    "SELECT id, status, processed_count, total_count,
+            error, created_at, updated_at, started_at, finished_at, mode,
+            cancel_requested, library_id, job_scope,
+            CAST(NULL AS BIGINT) AS pending_count
+     FROM metadata_reidentify_jobs
+     WHERE status = ?
+     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?";
+
+/// Metadata job page that also aggregates the pending candidates of the selected jobs.
+const METADATA_REIDENTIFY_JOBS_PAGE_WITH_PENDING_SQL: &str = "WITH selected_jobs AS (
+         SELECT id, status, processed_count, total_count, error,
+                created_at, updated_at, started_at, finished_at, mode,
+                cancel_requested, library_id, job_scope
+         FROM metadata_reidentify_jobs
+         ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+     ), pending_counts AS (
+         SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
+         FROM metadata_reidentify_job_items job_items
+         JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+         JOIN metadata_candidates candidates
+           ON candidates.item_id = job_items.item_id
+          AND candidates.status = 'PENDING'
+         GROUP BY job_items.job_id
+     )
+     SELECT selected_jobs.id, selected_jobs.status,
+            selected_jobs.processed_count, selected_jobs.total_count,
+            selected_jobs.error, selected_jobs.created_at,
+            selected_jobs.updated_at, selected_jobs.started_at,
+            selected_jobs.finished_at, selected_jobs.mode,
+            selected_jobs.cancel_requested, selected_jobs.library_id,
+            selected_jobs.job_scope,
+            COALESCE(pending_counts.pending_count, 0) AS pending_count
+     FROM selected_jobs
+     LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
+     ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC";
+
+/// [`METADATA_REIDENTIFY_JOBS_PAGE_WITH_PENDING_SQL`] narrowed to one status.
+const METADATA_REIDENTIFY_JOBS_PAGE_BY_STATUS_WITH_PENDING_SQL: &str = "WITH selected_jobs AS (
+         SELECT id, status, processed_count, total_count, error,
+                created_at, updated_at, started_at, finished_at, mode,
+                cancel_requested, library_id, job_scope
+         FROM metadata_reidentify_jobs
+         WHERE status = ?
+         ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
+     ), pending_counts AS (
+         SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
+         FROM metadata_reidentify_job_items job_items
+         JOIN selected_jobs ON selected_jobs.id = job_items.job_id
+         JOIN metadata_candidates candidates
+           ON candidates.item_id = job_items.item_id
+          AND candidates.status = 'PENDING'
+         GROUP BY job_items.job_id
+     )
+     SELECT selected_jobs.id, selected_jobs.status,
+            selected_jobs.processed_count, selected_jobs.total_count,
+            selected_jobs.error, selected_jobs.created_at,
+            selected_jobs.updated_at, selected_jobs.started_at,
+            selected_jobs.finished_at, selected_jobs.mode,
+            selected_jobs.cancel_requested, selected_jobs.library_id,
+            selected_jobs.job_scope,
+            COALESCE(pending_counts.pending_count, 0) AS pending_count
+     FROM selected_jobs
+     LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
+     ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC";
+
 impl Database {
     pub(crate) async fn create_metadata_reidentify_job(
         &self,
@@ -168,80 +243,50 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Lists one page of metadata jobs.
+    ///
+    /// `include_pending` gates the `job_items ⋈ metadata_candidates` aggregation (see S6 of
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`). Without it the page reports a `NULL`
+    /// `pending_count` and never reads the candidate table; the aggregation only runs when a
+    /// caller explicitly asks for the pending number.
     pub(crate) async fn list_metadata_reidentify_jobs(
         &self,
         status: Option<&str>,
         offset: i64,
         limit: i64,
+        include_pending: bool,
     ) -> Result<Vec<StoredMetadataReidentifyJob>, StorageError> {
-        let rows = if let Some(status) = status {
-            self.query(
-                "WITH selected_jobs AS (
-                     SELECT id, status, processed_count, total_count, error,
-                            created_at, updated_at, started_at, finished_at, mode,
-                            cancel_requested, library_id, job_scope
-                     FROM metadata_reidentify_jobs
-                     WHERE status = ?
-                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
-                 ), pending_counts AS (
-                     SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
-                     FROM metadata_reidentify_job_items job_items
-                     JOIN selected_jobs ON selected_jobs.id = job_items.job_id
-                     JOIN metadata_candidates candidates
-                       ON candidates.item_id = job_items.item_id
-                      AND candidates.status = 'PENDING'
-                     GROUP BY job_items.job_id
-                 )
-                 SELECT selected_jobs.id, selected_jobs.status,
-                        selected_jobs.processed_count, selected_jobs.total_count,
-                        selected_jobs.error, selected_jobs.created_at,
-                        selected_jobs.updated_at, selected_jobs.started_at,
-                        selected_jobs.finished_at, selected_jobs.mode,
-                        selected_jobs.cancel_requested, selected_jobs.library_id,
-                        selected_jobs.job_scope,
-                        COALESCE(pending_counts.pending_count, 0) AS pending_count
-                 FROM selected_jobs
-                 LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
-                 ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC",
-            )
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            self.query(
-                "WITH selected_jobs AS (
-                     SELECT id, status, processed_count, total_count, error,
-                            created_at, updated_at, started_at, finished_at, mode,
-                            cancel_requested, library_id, job_scope
-                     FROM metadata_reidentify_jobs
-                     ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?
-                 ), pending_counts AS (
-                     SELECT job_items.job_id, COUNT(DISTINCT candidates.item_id) AS pending_count
-                     FROM metadata_reidentify_job_items job_items
-                     JOIN selected_jobs ON selected_jobs.id = job_items.job_id
-                     JOIN metadata_candidates candidates
-                       ON candidates.item_id = job_items.item_id
-                      AND candidates.status = 'PENDING'
-                     GROUP BY job_items.job_id
-                 )
-                 SELECT selected_jobs.id, selected_jobs.status,
-                        selected_jobs.processed_count, selected_jobs.total_count,
-                        selected_jobs.error, selected_jobs.created_at,
-                        selected_jobs.updated_at, selected_jobs.started_at,
-                        selected_jobs.finished_at, selected_jobs.mode,
-                        selected_jobs.cancel_requested, selected_jobs.library_id,
-                        selected_jobs.job_scope,
-                        COALESCE(pending_counts.pending_count, 0) AS pending_count
-                 FROM selected_jobs
-                 LEFT JOIN pending_counts ON pending_counts.job_id = selected_jobs.id
-                 ORDER BY selected_jobs.created_at DESC, selected_jobs.id DESC",
-            )
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
+        let rows = match (include_pending, status) {
+            (false, None) => {
+                self.query(METADATA_REIDENTIFY_JOBS_PAGE_SQL)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+            (false, Some(status)) => {
+                self.query(METADATA_REIDENTIFY_JOBS_PAGE_BY_STATUS_SQL)
+                    .bind(status)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+            (true, None) => {
+                self.query(METADATA_REIDENTIFY_JOBS_PAGE_WITH_PENDING_SQL)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&self.pool)
+                    .await
+            }
+            (true, Some(status)) => {
+                self.query(METADATA_REIDENTIFY_JOBS_PAGE_BY_STATUS_WITH_PENDING_SQL)
+                    .bind(status)
+                    .bind(limit)
+                    .bind(offset)
+                    .fetch_all(&self.pool)
+                    .await
+            }
         };
         rows.map_err(self.sqlx_err())?
             .into_iter()
@@ -257,7 +302,8 @@ impl Database {
         self.query(
             "SELECT id, status, processed_count, total_count, error,
                     created_at, updated_at, started_at, finished_at, mode,
-                    cancel_requested, library_id, job_scope, 0 AS pending_count
+                    cancel_requested, library_id, job_scope,
+                    CAST(NULL AS BIGINT) AS pending_count
              FROM metadata_reidentify_jobs
              WHERE status IN ('QUEUED', 'RUNNING')
              ORDER BY created_at DESC, id DESC LIMIT ?",
