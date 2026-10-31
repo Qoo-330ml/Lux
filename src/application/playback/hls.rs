@@ -1557,6 +1557,16 @@ impl HlsManager {
             .map(Some)
     }
 
+    /// Total bytes written by one session, from the quota cache shared with admission.
+    ///
+    /// The cache is refreshed at most every [`SESSION_QUOTA_CACHE_TTL`], so the admin panel's two
+    /// second poll does not walk the session directory on every tick; its `directoryBytes` may lag
+    /// by up to that interval.
+    pub(crate) async fn session_bytes_cached(&self, session_id: &str) -> Option<u64> {
+        let process = self.processes.read().await.get(session_id).cloned()?;
+        self.cached_session_bytes(&process).await.ok()
+    }
+
     async fn cached_session_bytes(&self, process: &HlsProcess) -> Result<u64, HlsError> {
         let limit = self.runtime_snapshot().session_quota_bytes;
         let mut quota = process.quota.lock().await;
@@ -2835,6 +2845,54 @@ mod tests {
         assert!(
             !manager.processes.read().await.contains_key("new-session"),
             "a refused session must not be registered"
+        );
+    }
+
+    /// The admin panel polls every two seconds; its session size must come from the quota cache
+    /// shared with admission, not from a directory walk on every tick.
+    #[tokio::test]
+    async fn cached_session_bytes_reuses_the_five_second_quota_cache() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let config_dir = temp_dir.path().join("config");
+        let manager =
+            super::HlsManager::new_for_tests(config_dir.clone(), "/usr/bin/false".to_owned());
+        let session_directory = config_dir.join("web-playback/polled");
+        std::fs::create_dir_all(&session_directory).expect("session directory");
+        std::fs::write(session_directory.join("segment_000000.ts"), vec![0_u8; 100])
+            .expect("segment");
+        manager.processes.write().await.insert(
+            "polled".to_owned(),
+            Arc::new(fake_process(session_directory.clone(), None)),
+        );
+
+        let first = manager
+            .session_bytes_cached("polled")
+            .await
+            .expect("first poll measures the directory");
+        assert_eq!(first, 100);
+        assert!(
+            manager.session_bytes_cached("absent").await.is_none(),
+            "a session without a running process reports no size"
+        );
+
+        // A second poll inside the TTL reuses the cached total, so the panel may show a value up
+        // to five seconds old instead of walking the session directory again.
+        std::fs::write(session_directory.join("segment_000001.ts"), vec![0_u8; 50])
+            .expect("segment");
+        let second = manager
+            .session_bytes_cached("polled")
+            .await
+            .expect("second poll reuses the cache");
+        assert_eq!(
+            second, first,
+            "the cached total is reused until the five second TTL expires"
+        );
+
+        // The fresh measurement used when a session ends is unchanged.
+        assert_eq!(
+            manager.session_bytes("polled").await.expect("fresh probe"),
+            Some(150),
+            "the shutdown snapshot still measures the directory"
         );
     }
 
