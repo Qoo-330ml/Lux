@@ -234,9 +234,30 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   硬删除（`src/storage/users.rs:1514`，`playback_admissions` 有 `ON DELETE CASCADE` 外键）时，原来返回
   "用户不存在"（404），现在会在 UPSERT 处撞外键失败（503）；两者都是错误响应，且窗口只有一条语句的间隔。测试：
   `storage::repository::sessions::tests::playback_admission_reuses_the_policy_the_caller_already_read`。
-- **未做（第 2 条）**：`trusted_proxy_cidrs` 的进程内缓存按任务边界另行处理（涉及 `src/api/legacy.rs`）。
-- **单请求汇总（不含第 2 条）**：一个 HLS 清单/分片 GET 的存储层语句数 **10 → 7**，写提交仍是 1 次
-  （`BEGIN IMMEDIATE` + `COMMIT`，H1 主体未做）。
+- **已实施（第 2 条，2026-11-01，提交 `dd813d7e` + `c13a458c`）**：`trusted_proxy_cidrs` 的解析结果按状态实例缓存。
+  `AccessChangeEpochs` 增加一个 `trusted_proxy_cidrs` 计数器（`src/storage/access_changes.rs`），
+  `Database::set_trusted_proxy_cidrs_json` 在提交之后置位；解析后的规范化列表放在 `CoreState`
+  （`src/api/legacy.rs` 的 `TrustedProxyCidrCache`），条目按「库的 `server_id` + 读取前快照的 epoch」匹配，
+  两个库/两个 `AppState` 不会共享条目，也没有全局 `static`。读侧先取 epoch 再决定是否查库，回填前再比对
+  一次 epoch：写入返回后发起的读一定 miss 并读到新值；读取跨过写入的那一次不回填（避免覆盖新值）；解析
+  失败（JSON 非法、库不可读）不缓存，仍然每次 fail-closed。
+  **带转发链的受保护请求：`server_settings` 读 1 → 0（每个进程/库组合首次读之后），该请求的存储层语句数
+  7 → 6（反代部署下 100% 命中；无转发链的请求本来就不读设置，不变）**；另外每请求省一次 `serde_json`
+  反序列化 + CIDR 规范化。解析语义未变：缓存里存的就是 `read_trusted_proxy_cidrs` 的返回值（已规范化的
+  字符串），容器网关仍按请求合并且原始 `X-Forwarded-For` 仍只经 `resolve_client_ip_from_trusted_proxies`
+  从右往左逐跳判定。
+  测试：`api::legacy::tests::access_ip_reads_the_trusted_proxy_settings_once_for_repeated_requests`（两个请求 =
+  1 条语句）、`api::legacy::tests::access_ip_sees_a_trusted_proxy_change_on_the_next_request`（写后下一次读
+  立刻看到新值，含非法 JSON）、`api::legacy::tests::trusted_proxy_settings_cache_is_scoped_to_one_state_and_
+  database`（多 Database/AppState 实例互不串扰）、
+  `storage::repository::access_changes::tests::trusted_proxy_cache_only_serves_the_epoch_and_database_it_was_
+  stored_for`。
+  **写侧边界（重要）**：失效只发生在 `set_trusted_proxy_cidrs_json` 这一个写入口。集成测试原先用裸 SQL 改
+  `server_settings.trusted_proxy_cidrs`（绕过写入口），缓存看不到变化；已改为调用
+  `Database::set_trusted_proxy_cidrs_json`（该方法为此从 `pub(crate)` 升为 `pub`，`emby_auth` 里"删掉设置"
+  的用例改成写 `"[]"`，解析结果等价）。任何新增写路径都必须同样走这个函数，否则缓存会一直用旧值。
+- **单请求汇总（含第 2 条）**：一个 HLS 清单/分片 GET 的存储层语句数 **10 → 6**（反代部署、带转发链；
+  缺第 2 条时为 10 → 7），写提交仍是 1 次（`BEGIN IMMEDIATE` + `COMMIT`，H1 主体未做）。
 
 ### H3 HLS 启动路径重复读设置与 session 行（已读代码确认）
 

@@ -28,7 +28,7 @@ use uuid::Uuid;
 
 #[path = "access_changes.rs"]
 mod access_changes;
-pub(crate) use access_changes::{AccessChangeEpochs, AccessEpoch};
+pub(crate) use access_changes::{AccessChangeEpochs, AccessEpoch, TrustedProxyCidrCache};
 #[path = "auth_cache.rs"]
 mod auth_cache;
 pub(crate) use auth_cache::{AuthCacheEpochSnapshot, AuthCacheEpochs};
