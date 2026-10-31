@@ -1027,7 +1027,7 @@ describe("AdminOperationsPage", () => {
         eventType: "PLAYBACK_STARTED",
         targetType: "media_item",
         targetId: "01a0ef34-1572-7130-93b2-aaa0ebbf6098",
-        metadata: { client: "Lux", deviceName: "Web", deviceType: "Web", state: "PLAYING", remoteIp: "10.0.0.2" },
+        metadata: { client: "Lux", deviceName: "Web", deviceType: "Web", state: "PLAYING", remoteIp: "10.0.0.2", itemTitle: "流浪地球" },
         createdAt: "2026-10-31T05:13:00.000Z",
       },
       {
@@ -1049,6 +1049,7 @@ describe("AdminOperationsPage", () => {
     const rows = [...container.querySelectorAll<HTMLElement>(".lux-operations-log-row")];
     expect(rows[0].querySelector("strong")?.textContent).toBe("开始播放");
     expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("媒体条目");
+    expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("流浪地球");
     expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).toContain("设备 Web");
     expect(rows[0].querySelector(".lux-operations-log-copy p")?.textContent).not.toContain("01a0ef34-1572-7130-93b2-aaa0ebbf6098");
     expect(rows[1].querySelector("strong")?.textContent).toBe("停止播放");
@@ -1056,7 +1057,7 @@ describe("AdminOperationsPage", () => {
 
     act(() => rows[0].querySelector<HTMLButtonElement>('button[aria-label="展开日志详情"]')?.click());
     const details = [...rows[0].querySelectorAll("li")].map((item) => item.textContent);
-    expect(details).toEqual(["客户端Lux", "设备名Web", "设备类型Web", "状态播放中", "IP地址10.0.0.2"]);
+    expect(details).toEqual(["客户端Lux", "设备名Web", "设备类型Web", "状态播放中", "IP地址10.0.0.2", "条目名称流浪地球"]);
   });
 
   it("exports a selected UTC log date range from the system log tab", async () => {

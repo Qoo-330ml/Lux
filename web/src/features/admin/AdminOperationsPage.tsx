@@ -890,7 +890,9 @@ function LogRow({ log, libraryNames }: { log: AdminAuditEvent; libraryNames: Rea
   const metadataRows = formatAuditMetadata(log.metadata ?? {}, libraryNames);
   const targetName = log.targetType === "library" && log.targetId ? libraryNames.get(log.targetId) ?? log.targetId : log.targetId;
   const deviceName = typeof log.metadata?.deviceName === "string" ? log.metadata.deviceName : "";
-  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{targetName ? ` · ${targetName === log.targetId ? shortenLogTarget(targetName) : targetName}` : ""}{deviceName ? ` · 设备 ${deviceName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
+  const itemTitle = typeof log.metadata?.itemTitle === "string" ? log.metadata.itemTitle : "";
+  const displayTarget = itemTitle || (targetName === log.targetId ? shortenLogTarget(targetName ?? "") : targetName);
+  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{displayTarget ? ` · ${displayTarget}` : ""}{deviceName ? ` · 设备 ${deviceName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
 }
 
 const AUDIT_METADATA_LABELS: Record<string, string> = {
@@ -917,6 +919,7 @@ const AUDIT_METADATA_LABELS: Record<string, string> = {
   failed: "失败",
   skipped: "跳过",
   elapsedMs: "耗时（毫秒）",
+  itemTitle: "条目名称",
   client: "客户端",
   clientVersion: "客户端版本",
   deviceName: "设备名",
