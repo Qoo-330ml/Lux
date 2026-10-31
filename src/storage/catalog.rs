@@ -1528,7 +1528,7 @@ impl Database {
             search.content_restrictions,
         );
         let fts_query = format!(
-            "SELECT mi.id FROM media_search
+            "SELECT mi.id, mi.sort_title AS sort_title FROM media_search
              JOIN media_items mi ON mi.id = media_search.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
@@ -1538,10 +1538,13 @@ impl Database {
         );
         // Complete-token searches are served by FTS alone. The LIKE branch remains
         // available for partial searches, but is avoided when FTS already has a page.
+        //
+        // The page orders by the `sort_title` this match query already read instead of joining
+        // `media_items` again: the join only repeated a row lookup per match (tens of thousands
+        // when a common token matches most of the library) to re-read a column that was in hand.
         let fts_page_query = format!(
             "SELECT matches.id{total_projection} FROM ({fts_query}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         let fts_page = self
             .fetch_catalog_search_page(
@@ -1563,7 +1566,7 @@ impl Database {
         }
 
         let like_query_sql = format!(
-            "SELECT mi.id FROM media_items mi
+            "SELECT mi.id, mi.sort_title AS sort_title FROM media_items mi
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
              WHERE (mi.title LIKE ? ESCAPE '!' OR COALESCE(mi.original_title, '') LIKE ? ESCAPE '!'
@@ -1574,10 +1577,11 @@ impl Database {
                {item_type_filter}{CATALOG_VISIBLE_PREDICATE}{}{content_restriction_predicate}",
             library_filter.as_deref().unwrap_or_default(),
         );
+        // `sort_title` is part of both UNION branches so the union still merges rows by item id:
+        // one item id always carries one sort title.
         let like_page_query = format!(
             "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         if offset == 0 {
             return self
@@ -1600,8 +1604,7 @@ impl Database {
         let union_query = format!("{fts_query} UNION {like_query_sql}");
         let union_page_query = format!(
             "SELECT matches.id{total_projection} FROM ({union_query}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         self.fetch_catalog_search_page(
             &union_page_query,
@@ -1660,8 +1663,10 @@ impl Database {
             &mut content_restriction_binds,
             search.content_restrictions,
         );
+        // Same shape as the SQLite branch: order by the `sort_title` the match query already read
+        // instead of joining `media_items` a second time for it.
         let like_query_sql = format!(
-            "SELECT mi.id FROM media_search ms
+            "SELECT mi.id, mi.sort_title AS sort_title FROM media_search ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id
                                AND l.is_enabled = 1 AND l.system_kind IS NULL
@@ -1673,8 +1678,7 @@ impl Database {
         );
         let page_query = format!(
             "SELECT matches.id{total_projection} FROM ({like_query_sql}) matches
-             JOIN media_items mi ON mi.id = matches.id
-             ORDER BY mi.sort_title, mi.id LIMIT ? OFFSET ?"
+             ORDER BY matches.sort_title, matches.id LIMIT ? OFFSET ?"
         );
         self.fetch_catalog_search_page(
             &page_query,
