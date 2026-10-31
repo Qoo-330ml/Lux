@@ -18307,8 +18307,8 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
 
     let now = 1_000_i64;
     let (first, second) = tokio::join!(
-        database.reserve_playback_admission(user_id, "admission-session-a", now),
-        database.reserve_playback_admission(user_id, "admission-session-b", now),
+        database.reserve_playback_admission(user_id, "admission-session-a", now, None),
+        database.reserve_playback_admission(user_id, "admission-session-b", now, None),
     );
     let first = first?.expect("user exists");
     let second = second?.expect("user exists");
@@ -18325,7 +18325,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     assert_eq!(denied.active_playback_count, 1);
 
     let renewal = database
-        .reserve_playback_admission(user_id, accepted_session, now + 1)
+        .reserve_playback_admission(user_id, accepted_session, now + 1, None)
         .await?
         .expect("user exists");
     assert_eq!(renewal.decision, PlaybackAdmissionDecision::Admitted);
@@ -18342,7 +18342,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     );
 
     let retry = database
-        .reserve_playback_admission(user_id, "admission-session-c", now + 3)
+        .reserve_playback_admission(user_id, "admission-session-c", now + 3, None)
         .await?
         .expect("user exists");
     assert_eq!(retry.decision, PlaybackAdmissionDecision::Admitted);
@@ -18362,7 +18362,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         .await?;
     for session_id in ["admission-session-d", "admission-session-e"] {
         let unlimited = database
-            .reserve_playback_admission(user_id, session_id, now + 4)
+            .reserve_playback_admission(user_id, session_id, now + 4, None)
             .await?
             .expect("user exists");
         assert_eq!(unlimited.decision, PlaybackAdmissionDecision::Admitted);
@@ -18385,14 +18385,14 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         "admission-session-e",
     ] {
         let existing = database
-            .reserve_playback_admission(user_id, session_id, now + 5)
+            .reserve_playback_admission(user_id, session_id, now + 5, None)
             .await?
             .expect("user exists");
         assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
         assert_eq!(existing.active_playback_count, 3);
     }
     let new_session = database
-        .reserve_playback_admission(user_id, "admission-session-f", now + 6)
+        .reserve_playback_admission(user_id, "admission-session-f", now + 6, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18414,7 +18414,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         )
         .await?;
     let disabled = database
-        .reserve_playback_admission(user_id, "admission-session-g", now + 7)
+        .reserve_playback_admission(user_id, "admission-session-g", now + 7, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18591,8 +18591,8 @@ async fn exercise_user_management_concurrency_storage_contract(
         )
         .await?;
     let (admission_a, admission_b) = tokio::join!(
-        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000),
-        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000),
+        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000, None),
+        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000, None),
     );
     let admission_a = admission_a?.ok_or("playback user disappeared")?;
     let admission_b = admission_b?.ok_or("playback user disappeared")?;
@@ -18760,13 +18760,13 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
         .fetch_one(database.pool())
         .await?;
     let existing = database
-        .reserve_playback_admission(user_id, "legacy-play-session", now)
+        .reserve_playback_admission(user_id, "legacy-play-session", now, None)
         .await?
         .expect("user exists");
     assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
     assert_eq!(existing.active_playback_count, 1);
     let denied = database
-        .reserve_playback_admission(user_id, "new-play-session", now)
+        .reserve_playback_admission(user_id, "new-play-session", now, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18802,12 +18802,12 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             .await?
     );
     let stale_admission = database
-        .reserve_playback_admission(user_id, "stale-play-session", now + 2)
+        .reserve_playback_admission(user_id, "stale-play-session", now + 2, None)
         .await?
         .expect("user exists");
     assert_eq!(stale_admission.active_playback_count, 1);
     let after_stale = database
-        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92)
+        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92, None)
         .await?
         .expect("user exists");
     assert_eq!(after_stale.decision, PlaybackAdmissionDecision::Admitted);
@@ -36354,7 +36354,7 @@ async fn playback_event_renews_the_admission_in_its_own_transaction()
         .fetch_one(database.pool())
         .await?;
     database
-        .reserve_playback_admission(&user_id, "progress-admission-session", now)
+        .reserve_playback_admission(&user_id, "progress-admission-session", now, None)
         .await?
         .expect("user exists");
     let stale_stamp = now.saturating_sub(40);
