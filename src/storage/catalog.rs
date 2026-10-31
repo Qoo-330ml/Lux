@@ -8483,8 +8483,8 @@ impl Database {
     ) -> Result<Option<(String, Option<Vec<u8>>, i64, i64)>, StorageError> {
         self.query_as::<(String, Option<Vec<u8>>, i64, i64)>(
             "SELECT json, fingerprint, bytes, updated_at
-             FROM media_item_nfo_cache
-             WHERE item_id = ?",
+                 FROM media_item_nfo_cache
+                 WHERE item_id = ?",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
