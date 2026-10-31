@@ -529,6 +529,69 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of `find_web_session`: the session token hashes plus the enabled user's authorization
+/// flags. The five 0/1 flag columns become `bool` in [`StoredWebSession::from`].
+#[derive(Debug, sqlx::FromRow)]
+struct WebSessionRow {
+    csrf_token_hash: Vec<u8>,
+    device_id: Option<String>,
+    user_id: String,
+    username_normalized: String,
+    display_name: String,
+    has_password: i64,
+    is_disabled: i64,
+    is_admin: i64,
+    can_manage_server: i64,
+    can_remote_access: i64,
+    can_download: i64,
+    last_login_at: Option<i64>,
+    last_activity_at: Option<i64>,
+}
+
+impl From<WebSessionRow> for StoredWebSession {
+    fn from(row: WebSessionRow) -> Self {
+        Self {
+            csrf_token_hash: row.csrf_token_hash,
+            device_id: row.device_id,
+            user_id: row.user_id,
+            username_normalized: row.username_normalized,
+            display_name: row.display_name,
+            has_password: row.has_password != 0,
+            is_disabled: row.is_disabled != 0,
+            is_admin: row.is_admin != 0,
+            can_manage_server: row.can_manage_server != 0,
+            can_remote_access: row.can_remote_access != 0,
+            can_download: row.can_download != 0,
+            last_login_at: row.last_login_at,
+            last_activity_at: row.last_activity_at,
+        }
+    }
+}
+
+/// Row of the two web-session summary pages: one active session and whether it is the caller's.
+#[derive(Debug, sqlx::FromRow)]
+struct WebSessionSummaryRow {
+    id: String,
+    created_at: i64,
+    updated_at: i64,
+    expires_at: i64,
+    last_seen_at: Option<i64>,
+    is_current: i64,
+}
+
+impl From<WebSessionSummaryRow> for StoredWebSessionSummary {
+    fn from(row: WebSessionSummaryRow) -> Self {
+        Self {
+            id: row.id,
+            created_at: row.created_at,
+            updated_at: row.updated_at,
+            expires_at: row.expires_at,
+            last_seen_at: row.last_seen_at,
+            is_current: row.is_current != 0,
+        }
+    }
+}
+
 /// Row of `list_item_image_candidates`: one stored image plus the library root it resolves under.
 #[derive(Debug, sqlx::FromRow)]
 struct ItemImageCandidateRow {
@@ -10000,7 +10063,7 @@ impl Database {
         &self,
         session_token_hash: &[u8],
     ) -> Result<Option<StoredWebSession>, StorageError> {
-        self.query(
+        self.query_as::<WebSessionRow>(
             "SELECT ws.csrf_token_hash, ws.device_id, u.id AS user_id,
                     u.username_normalized, u.display_name, u.has_password,
                     u.is_disabled, u.is_admin, u.can_manage_server,
@@ -10019,23 +10082,7 @@ impl Database {
         .bind(session_token_hash)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredWebSession {
-                csrf_token_hash: row.get("csrf_token_hash"),
-                device_id: row.get("device_id"),
-                user_id: row.get("user_id"),
-                username_normalized: row.get("username_normalized"),
-                display_name: row.get("display_name"),
-                has_password: row.get::<i64, _>("has_password") != 0,
-                is_disabled: row.get::<i64, _>("is_disabled") != 0,
-                is_admin: row.get::<i64, _>("is_admin") != 0,
-                can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-                can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-                can_download: row.get::<i64, _>("can_download") != 0,
-                last_login_at: row.get("last_login_at"),
-                last_activity_at: row.get("last_activity_at"),
-            })
-        })
+        .map(|row| row.map(StoredWebSession::from))
         .map_err(self.sqlx_err())
     }
 
@@ -10096,7 +10143,7 @@ impl Database {
         user_id: &str,
         current_session_token_hash: &[u8],
     ) -> Result<Vec<StoredWebSessionSummary>, StorageError> {
-        self.query(
+        self.query_as::<WebSessionSummaryRow>(
             "SELECT id, created_at, updated_at, expires_at, last_seen_at,
                     session_token_hash = ? AS is_current
              FROM web_sessions
@@ -10109,14 +10156,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredWebSessionSummary {
-                    id: row.get("id"),
-                    created_at: row.get("created_at"),
-                    updated_at: row.get("updated_at"),
-                    expires_at: row.get("expires_at"),
-                    last_seen_at: row.get("last_seen_at"),
-                    is_current: row.get::<i64, _>("is_current") != 0,
-                })
+                .map(StoredWebSessionSummary::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -10141,7 +10181,7 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         let sessions = self
-            .query(
+            .query_as::<WebSessionSummaryRow>(
                 "SELECT id, created_at, updated_at, expires_at, last_seen_at,
                         session_token_hash = ? AS is_current
                  FROM web_sessions
@@ -10157,14 +10197,7 @@ impl Database {
             .await
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| StoredWebSessionSummary {
-                        id: row.get("id"),
-                        created_at: row.get("created_at"),
-                        updated_at: row.get("updated_at"),
-                        expires_at: row.get("expires_at"),
-                        last_seen_at: row.get("last_seen_at"),
-                        is_current: row.get::<i64, _>("is_current") != 0,
-                    })
+                    .map(StoredWebSessionSummary::from)
                     .collect()
             })
             .map_err(self.sqlx_err())?;
@@ -13373,6 +13406,98 @@ mod item_image_row_decoding_tests {
             ItemImagePathConflictRow::from_row(&row).expect_err("conflict columns must not decode"),
             CatalogImageTagRow::from_row(&row).expect_err("image tag columns must not decode"),
             LibraryPosterRow::from_row(&row).expect_err("library poster columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the web session projection and the two session summary pages.
+#[cfg(test)]
+mod web_session_row_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn web_session_rows_decode_authorization_flags_and_summaries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .insert_user("ws-user", "ws", "WS", "hash", false, true)
+            .await?;
+        database
+            .query(
+                "INSERT INTO web_sessions (
+                     id, user_id, session_token_hash, csrf_token_hash, device_id,
+                     updated_at, expires_at, last_seen_at
+                 ) VALUES
+                     ('ws-first', 'ws-user', X'01', X'02', 'device-a', 200,
+                      unixepoch() + 3600, 150),
+                     ('ws-second', 'ws-user', X'03', X'04', NULL, 100,
+                      unixepoch() + 3600, NULL)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let session = database
+            .find_web_session(b"\x01")
+            .await?
+            .expect("web session");
+        assert_eq!(session.csrf_token_hash, b"\x02");
+        assert_eq!(session.device_id.as_deref(), Some("device-a"));
+        assert_eq!(session.user_id, "ws-user");
+        assert_eq!(session.username_normalized, "ws");
+        assert_eq!(session.display_name, "WS");
+        assert!(session.has_password);
+        assert!(!session.is_admin);
+        assert!(!session.is_disabled);
+        assert_eq!(session.last_login_at, None);
+        assert_eq!(session.last_activity_at, None);
+        assert!(database.find_web_session(b"\x09").await?.is_none());
+
+        let summaries = database
+            .list_web_session_summaries("ws-user", b"\x01")
+            .await?;
+        assert_eq!(
+            summaries
+                .iter()
+                .map(|summary| (summary.id.as_str(), summary.is_current))
+                .collect::<Vec<_>>(),
+            [("ws-first", true), ("ws-second", false)]
+        );
+        let first = &summaries[0];
+        assert!(first.created_at > 0);
+        assert_eq!(first.updated_at, 200);
+        assert_eq!(first.last_seen_at, Some(150));
+        assert_eq!(summaries[1].last_seen_at, None);
+
+        let (page, total) = database
+            .list_web_session_summaries_page("ws-user", b"\x01", 1, 0)
+            .await?;
+        assert_eq!(total, 2);
+        assert_eq!(page.len(), 1);
+        assert_eq!(page[0].id, "ws-first");
+        assert!(page[0].is_current);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn web_session_row_structs_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let errors = [
+            WebSessionRow::from_row(&row).expect_err("web session columns must not decode"),
+            WebSessionSummaryRow::from_row(&row)
+                .expect_err("session summary columns must not decode"),
         ];
         for error in errors {
             assert!(
