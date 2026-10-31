@@ -365,7 +365,7 @@ pub(crate) async fn submit_public_user_registration(
         .map_err(|_| UserRegistrationError::StorageUnavailable)?;
 
     if result == UserRegistrationCreateResult::Created {
-        crate::application::mail_worker::notify_mail_outbox_appended();
+        database.notify_mail_outbox_appended();
     }
     match result {
         UserRegistrationCreateResult::Created
@@ -416,7 +416,7 @@ pub(crate) async fn resend_public_user_registration_email(
         .queue_user_registration_resend(&recipient_email, idempotency_key, now)
         .await
         .map_err(|_| UserRegistrationError::StorageUnavailable)?;
-    crate::application::mail_worker::notify_mail_outbox_appended();
+    database.notify_mail_outbox_appended();
     Ok(())
 }
 

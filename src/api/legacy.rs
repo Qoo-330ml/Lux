@@ -656,9 +656,12 @@ impl AppState {
         if let Some(worker) = self.identity_merge_worker() {
             worker.shutdown().await;
         }
-        crate::application::probe::shutdown_probe_runtime()
+        // A failed probe drain must not leave the workers below running: it is reported after they
+        // were stopped, so the database is never closed under an active worker.
+        let probe_shutdown_error = crate::application::probe::shutdown_probe_runtime()
             .await
-            .map_err(|error| error.to_string())?;
+            .err()
+            .map(|error| error.to_string());
         if let Some(metadata_reidentify) = self.metadata_reidentify() {
             metadata_reidentify.shutdown().await;
         }
@@ -693,7 +696,10 @@ impl AppState {
         if let Some(library_watch) = self.library_watch() {
             library_watch.shutdown().await;
         }
-        Ok(())
+        match probe_shutdown_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 
     /// Overrides the concurrent SSE stream budget (tests use a small value).

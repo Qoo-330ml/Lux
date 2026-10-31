@@ -286,7 +286,7 @@ pub(crate) async fn create_user_invitation(
         .map_err(UserInvitationError::Storage)?;
     match result {
         UserInvitationCreateResult::Created => {
-            crate::application::mail_worker::notify_mail_outbox_appended();
+            database.notify_mail_outbox_appended();
         }
         UserInvitationCreateResult::AlreadyPending => {
             return Err(UserInvitationError::AlreadyPending);
@@ -382,7 +382,7 @@ pub(crate) async fn queue_user_invitation_resend(
         .await
     {
         Ok(UserInvitationResendResult::Queued) => {
-            crate::application::mail_worker::notify_mail_outbox_appended();
+            database.notify_mail_outbox_appended();
             Ok(())
         }
         Ok(UserInvitationResendResult::NotResendable) => Err(UserInvitationError::NotRevocable),

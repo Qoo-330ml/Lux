@@ -733,6 +733,13 @@ pub struct Database {
     access_changes: Arc<AccessChangeEpochs>,
     /// Invalidation epochs for the cached request principals (credentials, access rules, users).
     auth_cache: Arc<AuthCacheEpochs>,
+    /// "A mail outbox row was committed" signal, owned by this database instance.
+    ///
+    /// The mail rows are appended inside storage transactions by several user flows, so the queue
+    /// itself publishes this signal once a row is committed; the delivery worker waits on it and
+    /// falls back to a slow poll. Keeping it on the instance (rather than in a process-wide static)
+    /// means two databases - and two workers in parallel tests - never steal each other's wake-ups.
+    mail_outbox_appended: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -1386,6 +1393,7 @@ impl Database {
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             access_changes: Arc::new(AccessChangeEpochs::default()),
             auth_cache: Arc::new(AuthCacheEpochs::default()),
+            mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -1847,6 +1855,22 @@ impl Database {
     /// still current; storage writes bump them after committing.
     pub(crate) fn auth_cache(&self) -> &AuthCacheEpochs {
         &self.auth_cache
+    }
+
+    /// The wake-up signal of the mail outbox queue this database owns.
+    ///
+    /// The delivery worker waits on it; every path that appends a mail row signals it through
+    /// [`Self::notify_mail_outbox_appended`].
+    pub(crate) fn mail_outbox_appended(&self) -> Arc<tokio::sync::Notify> {
+        Arc::clone(&self.mail_outbox_appended)
+    }
+
+    /// Wakes the mail delivery worker after a mail outbox row was committed.
+    ///
+    /// Call this from every path that enqueues mail; without it the row is only picked up by the
+    /// worker's idle fallback.
+    pub(crate) fn notify_mail_outbox_appended(&self) {
+        self.mail_outbox_appended.notify_one();
     }
 
     #[cfg(test)]

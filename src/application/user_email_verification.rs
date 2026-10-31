@@ -201,7 +201,7 @@ async fn request_user_email_change_with_expected_pending(
         .map_err(|_| UserEmailVerificationError::StorageUnavailable)?
     {
         UserEmailChangeCreateResult::Created => {
-            crate::application::mail_worker::notify_mail_outbox_appended();
+            database.notify_mail_outbox_appended();
             Ok(Some(PendingUserEmailChange {
                 challenge_id,
                 pending_email,

@@ -17,9 +17,21 @@ use crate::{
 /// three orders of magnitude. The previous one-minute period woke an idle server 1 440 times a day
 /// and ran three queries per wake to find nothing to purge.
 pub(crate) const USER_CLEANUP_INTERVAL: Duration = Duration::from_secs(3_600);
+/// The first sweep still runs shortly after startup instead of an hour later: a restart must not
+/// postpone retention work that was already due.
+pub(crate) const USER_CLEANUP_FIRST_DELAY: Duration = Duration::from_secs(60);
+/// One pass drains an arbitrary backlog (the batches are small), so a server that was off for a
+/// month does not need a month of hourly passes to catch up. The cap keeps a pathological backlog
+/// from holding the pass - and the shutdown signal - for an unbounded time.
+const USER_CLEANUP_MAX_BATCHES_PER_PASS: usize = 200;
 const USER_CLEANUP_BATCH_SIZE: i64 = 50;
 const USER_ACTIVITY_RETENTION_BATCH_SIZE: i64 = 1_000;
 const SECONDS_PER_DAY: i64 = 86_400;
+
+/// True when a bounded delete filled its batch, i.e. more rows are waiting for the next one.
+fn batch_was_full(deleted: u64, batch_size: i64) -> bool {
+    deleted >= u64::try_from(batch_size.max(1)).unwrap_or(u64::MAX)
+}
 
 async fn purge_expired_user_activity_batch(
     database: &Database,
@@ -49,13 +61,21 @@ impl UserCleanupWorker {
         avatars: UserAvatarService,
         config_dir: Option<PathBuf>,
     ) -> Self {
-        Self::start_with_interval(database, avatars, config_dir, USER_CLEANUP_INTERVAL)
+        Self::start_with_timings(
+            database,
+            avatars,
+            config_dir,
+            USER_CLEANUP_FIRST_DELAY,
+            USER_CLEANUP_INTERVAL,
+        )
     }
 
-    pub(crate) fn start_with_interval(
+    /// Starts with explicit timings; tests use a short delay so a pass runs immediately.
+    pub(crate) fn start_with_timings(
         database: Database,
         avatars: UserAvatarService,
         config_dir: Option<PathBuf>,
+        first_delay: Duration,
         interval: Duration,
     ) -> Self {
         let worker = match tokio::runtime::Handle::try_current() {
@@ -64,7 +84,15 @@ impl UserCleanupWorker {
                 let avatars = avatars.clone();
                 let config_dir = config_dir.clone();
                 async move {
-                    run_user_cleanup_worker(database, avatars, config_dir, interval, shutdown).await
+                    run_user_cleanup_worker(
+                        database,
+                        avatars,
+                        config_dir,
+                        first_delay,
+                        interval,
+                        shutdown,
+                    )
+                    .await
                 }
             })),
             // Without a runtime (checkout-style construction in tests) there is nothing to stop.
@@ -87,16 +115,18 @@ async fn run_user_cleanup_worker(
     database: Database,
     avatars: UserAvatarService,
     config_dir: Option<PathBuf>,
+    first_delay: Duration,
     interval: Duration,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
+    if wait_or_shutdown(&mut shutdown, first_delay).await {
+        return;
+    }
     loop {
-        // Retention is day-level, so the first sweep waits one full interval instead of running at
-        // startup: a restart must not pay for an extra purge.
+        run_user_cleanup_pass(&database, &avatars, config_dir.as_deref()).await;
         if wait_or_shutdown(&mut shutdown, interval).await {
             return;
         }
-        run_user_cleanup_pass(&database, &avatars, config_dir.as_deref()).await;
     }
 }
 
@@ -110,59 +140,177 @@ async fn run_user_cleanup_pass(
         .unwrap_or_default()
         .as_secs()
         .min(i64::MAX as u64) as i64;
-    let deleted_user_ids = match database
-        .purge_expired_deleted_users(now, USER_CLEANUP_BATCH_SIZE)
-        .await
-    {
-        Ok(user_ids) => user_ids,
-        Err(error) => {
-            tracing::warn!(%error, "failed to purge expired user accounts");
+    drain_expired_users(database, avatars, now).await;
+    drain_expired_user_activity(database, now).await;
+    drain_expired_session_history(database, now).await;
+    drain_expired_emby_direct_playback_tickets(database, now).await;
+    drain_expired_account_records(database, now).await;
+    drain_expired_playback_history(config_dir, database, now).await;
+}
+
+/// Lets other tasks (and the shutdown signal) run between batches of one pass.
+async fn yield_between_batches() {
+    tokio::task::yield_now().await;
+}
+
+async fn drain_expired_users(database: &Database, avatars: &UserAvatarService, now: i64) {
+    for _ in 0..USER_CLEANUP_MAX_BATCHES_PER_PASS {
+        let deleted_user_ids = match database
+            .purge_expired_deleted_users(now, USER_CLEANUP_BATCH_SIZE)
+            .await
+        {
+            Ok(user_ids) => user_ids,
+            Err(error) => {
+                tracing::warn!(%error, "failed to purge expired user accounts");
+                return;
+            }
+        };
+        let filled = batch_was_full(
+            u64::try_from(deleted_user_ids.len()).unwrap_or(u64::MAX),
+            USER_CLEANUP_BATCH_SIZE,
+        );
+        for user_id in deleted_user_ids {
+            let Ok(user_id) = user_id.parse::<UserId>() else {
+                tracing::warn!("purged user has an invalid ID; avatar cleanup was skipped");
+                continue;
+            };
+            if let Err(error) = avatars.remove(user_id).await {
+                tracing::warn!(%error, "failed to remove avatar for a purged user");
+            }
+        }
+        if !filled {
             return;
         }
-    };
+        yield_between_batches().await;
+    }
+}
 
-    for user_id in deleted_user_ids {
-        let Ok(user_id) = user_id.parse::<UserId>() else {
-            tracing::warn!("purged user has an invalid ID; avatar cleanup was skipped");
-            continue;
-        };
-        if let Err(error) = avatars.remove(user_id).await {
-            tracing::warn!(%error, "failed to remove avatar for a purged user");
+async fn drain_expired_user_activity(database: &Database, now: i64) {
+    for _ in 0..USER_CLEANUP_MAX_BATCHES_PER_PASS {
+        match purge_expired_user_activity_batch(database, now).await {
+            Ok(deleted) => {
+                if !batch_was_full(deleted, USER_ACTIVITY_RETENTION_BATCH_SIZE) {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to purge expired user activity events");
+                return;
+            }
         }
+        yield_between_batches().await;
     }
+}
 
-    if let Err(error) = purge_expired_user_activity_batch(database, now).await {
-        tracing::warn!(%error, "failed to purge expired user activity events");
-    }
-    if let Err(error) = database
-        .purge_expired_session_history(now, USER_CLEANUP_BATCH_SIZE)
-        .await
-    {
-        tracing::warn!(%error, "failed to purge expired session and playback history");
-    }
-    if let Err(error) = database
-        .delete_expired_emby_direct_playback_tickets(now, USER_CLEANUP_BATCH_SIZE)
-        .await
-    {
-        tracing::warn!(%error, "failed to purge expired Emby direct-play tickets");
-    }
-    if let Err(error) = database
-        .purge_expired_account_records(now, USER_CLEANUP_BATCH_SIZE)
-        .await
-    {
-        tracing::warn!(%error, "failed to purge expired account records");
-    }
-    if let Some(config_dir) = config_dir
-        && let Err(error) =
-            crate::application::playback_history_retention::archive_playback_history(
-                config_dir,
-                database,
-                now,
-                USER_CLEANUP_BATCH_SIZE,
-            )
+async fn drain_expired_session_history(database: &Database, now: i64) {
+    for _ in 0..USER_CLEANUP_MAX_BATCHES_PER_PASS {
+        match database
+            .purge_expired_session_history(now, USER_CLEANUP_BATCH_SIZE)
             .await
-    {
-        tracing::warn!(%error, "failed to archive expired playback history");
+        {
+            Ok(purge) => {
+                let filled = [
+                    purge.web_sessions,
+                    purge.access_tokens,
+                    purge.web_playback_sessions,
+                    purge.playback_sessions,
+                    purge.playback_admissions,
+                ]
+                .into_iter()
+                .any(|deleted| batch_was_full(deleted, USER_CLEANUP_BATCH_SIZE));
+                if !filled {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to purge expired session and playback history");
+                return;
+            }
+        }
+        yield_between_batches().await;
+    }
+}
+
+async fn drain_expired_emby_direct_playback_tickets(database: &Database, now: i64) {
+    for _ in 0..USER_CLEANUP_MAX_BATCHES_PER_PASS {
+        match database
+            .delete_expired_emby_direct_playback_tickets(now, USER_CLEANUP_BATCH_SIZE)
+            .await
+        {
+            Ok(deleted) => {
+                if !batch_was_full(deleted, USER_CLEANUP_BATCH_SIZE) {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to purge expired Emby direct-play tickets");
+                return;
+            }
+        }
+        yield_between_batches().await;
+    }
+}
+
+async fn drain_expired_account_records(database: &Database, now: i64) {
+    for _ in 0..USER_CLEANUP_MAX_BATCHES_PER_PASS {
+        match database
+            .purge_expired_account_records(now, USER_CLEANUP_BATCH_SIZE)
+            .await
+        {
+            Ok(purge) => {
+                let filled = [
+                    purge.user_invitations,
+                    purge.mail_outbox,
+                    purge.mail_challenges,
+                    purge.user_devices,
+                    purge.media_merge_records,
+                    purge.user_registration_requests,
+                    purge.emby_migration_jobs,
+                    purge.metadata_candidates,
+                ]
+                .into_iter()
+                .any(|deleted| batch_was_full(deleted, USER_CLEANUP_BATCH_SIZE));
+                if !filled {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to purge expired account records");
+                return;
+            }
+        }
+        yield_between_batches().await;
+    }
+}
+
+async fn drain_expired_playback_history(
+    config_dir: Option<&std::path::Path>,
+    database: &Database,
+    now: i64,
+) {
+    let Some(config_dir) = config_dir else {
+        return;
+    };
+    for _ in 0..USER_CLEANUP_MAX_BATCHES_PER_PASS {
+        match crate::application::playback_history_retention::archive_playback_history(
+            config_dir,
+            database,
+            now,
+            USER_CLEANUP_BATCH_SIZE,
+        )
+        .await
+        {
+            Ok(archived) => {
+                if !batch_was_full(archived, USER_CLEANUP_BATCH_SIZE) {
+                    return;
+                }
+            }
+            Err(error) => {
+                tracing::warn!(%error, "failed to archive expired playback history");
+                return;
+            }
+        }
+        yield_between_batches().await;
     }
 }
 
@@ -264,6 +412,83 @@ mod tests {
         .await
     }
 
+    /// The production cadence is "one short delay after startup, then hourly".
+    #[test]
+    fn the_first_sweep_runs_soon_and_later_sweeps_are_hourly() {
+        assert_eq!(USER_CLEANUP_FIRST_DELAY, Duration::from_secs(60));
+        assert_eq!(USER_CLEANUP_INTERVAL, Duration::from_secs(3_600));
+    }
+
+    /// One pass must drain a backlog larger than a single batch: with the old single-batch pass the
+    /// hourly cadence would clear 50 rows an hour.
+    #[tokio::test]
+    async fn one_pass_clears_a_backlog_larger_than_one_batch()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database, avatars, _config_dir) = worker_fixture().await?;
+        let backlog = 120_usize;
+        assert!(
+            backlog > usize::try_from(USER_CLEANUP_BATCH_SIZE).unwrap_or(50),
+            "the fixture must exceed one batch"
+        );
+        let now = std::time::SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs() as i64;
+        for index in 0..backlog {
+            let user_id = format!("backlog-user-{index}");
+            database
+                .insert_user(&user_id, &user_id, "Backlog User", "hash", false, true)
+                .await?;
+            // Both markers are already due, so every row is purgeable in this pass.
+            sqlx::query("UPDATE users SET deleted_at = ?, deletion_purge_at = 0 WHERE id = ?")
+                .bind(now - SECONDS_PER_DAY)
+                .bind(&user_id)
+                .execute(database.pool())
+                .await?;
+        }
+
+        run_user_cleanup_pass(&database, &avatars, None).await;
+
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM users WHERE deleted_at IS NOT NULL")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            remaining, 0,
+            "a single pass must drain the whole backlog, not one batch"
+        );
+        Ok(())
+    }
+
+    /// The first sweep must not wait a full hour after startup.
+    #[tokio::test]
+    async fn the_first_sweep_runs_after_the_short_startup_delay()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database, avatars, config_dir) = worker_fixture().await?;
+        let worker = UserCleanupWorker::start_with_timings(
+            database.clone(),
+            avatars,
+            config_dir,
+            Duration::from_millis(20),
+            Duration::from_secs(3_600),
+        );
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if expired_event_count(&database).await? == 0 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the first sweep must run after the short startup delay, not the hourly interval"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        tokio::time::timeout(Duration::from_secs(1), worker.shutdown())
+            .await
+            .expect("shutdown must stop the worker");
+        Ok(())
+    }
+
     /// The worker must stay asleep until its period elapses: an idle server used to wake it every
     /// minute, and one iteration must not happen before the (now hourly) interval.
     #[tokio::test]
@@ -292,10 +517,11 @@ mod tests {
     async fn worker_sweeps_retention_once_the_interval_elapses()
     -> Result<(), Box<dyn std::error::Error>> {
         let (_temp_dir, database, avatars, config_dir) = worker_fixture().await?;
-        let worker = UserCleanupWorker::start_with_interval(
+        let worker = UserCleanupWorker::start_with_timings(
             database.clone(),
             avatars,
             config_dir,
+            Duration::from_millis(20),
             Duration::from_millis(50),
         );
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
