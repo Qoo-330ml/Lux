@@ -529,6 +529,55 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of `count_catalog_root_items_by_library`: the root MOVIE/SERIES counts of one library.
+#[derive(Debug, sqlx::FromRow)]
+struct LibraryCatalogCountRow {
+    library_id: String,
+    movie_count: i64,
+    series_count: i64,
+    item_count: i64,
+}
+
+/// Row of `count_catalog_item_types`: the five catalog counts of one filtered catalog.
+#[derive(Debug, sqlx::FromRow)]
+struct CatalogItemTypeCountRow {
+    movie_count: i64,
+    series_count: i64,
+    episode_count: i64,
+    box_set_count: i64,
+    item_count: i64,
+}
+
+impl From<CatalogItemTypeCountRow> for StoredCatalogItemCounts {
+    fn from(row: CatalogItemTypeCountRow) -> Self {
+        Self {
+            movie_count: row.movie_count,
+            series_count: row.series_count,
+            episode_count: row.episode_count,
+            box_set_count: row.box_set_count,
+            item_count: row.item_count,
+        }
+    }
+}
+
+/// Row of `dashboard_stats`: the three dashboard counters.
+#[derive(Debug, sqlx::FromRow)]
+struct DashboardStatsRow {
+    movie_count: i64,
+    series_count: i64,
+    user_count: i64,
+}
+
+impl From<DashboardStatsRow> for DashboardStats {
+    fn from(row: DashboardStatsRow) -> Self {
+        Self {
+            movie_count: row.movie_count,
+            series_count: row.series_count,
+            user_count: row.user_count,
+        }
+    }
+}
+
 impl MovieNfoWritebackRow {
     fn into_parts(
         self,
@@ -1295,7 +1344,7 @@ impl Database {
                {CATALOG_VISIBLE_PREDICATE}
              GROUP BY mi.library_id"
         );
-        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query_as::<LibraryCatalogCountRow>(sqlx::AssertSqlSafe(query));
         for library_id in library_ids {
             statement = statement.bind(library_id);
         }
@@ -1306,11 +1355,11 @@ impl Database {
                 rows.into_iter()
                     .map(|row| {
                         (
-                            row.get::<String, _>("library_id"),
+                            row.library_id,
                             StoredCatalogItemCounts {
-                                movie_count: row.get("movie_count"),
-                                series_count: row.get("series_count"),
-                                item_count: row.get("item_count"),
+                                movie_count: row.movie_count,
+                                series_count: row.series_count,
+                                item_count: row.item_count,
                                 ..StoredCatalogItemCounts::default()
                             },
                         )
@@ -1402,7 +1451,7 @@ impl Database {
                {visible_collection_predicate}
                {favorite_filter}"
         );
-        let mut statement = self.query(sqlx::AssertSqlSafe(query));
+        let mut statement = self.query_as::<CatalogItemTypeCountRow>(sqlx::AssertSqlSafe(query));
         for library_id in library_ids {
             statement = statement.bind(library_id);
         }
@@ -1429,13 +1478,7 @@ impl Database {
         statement
             .fetch_one(&self.pool)
             .await
-            .map(|row| StoredCatalogItemCounts {
-                movie_count: row.get("movie_count"),
-                series_count: row.get("series_count"),
-                episode_count: row.get("episode_count"),
-                box_set_count: row.get("box_set_count"),
-                item_count: row.get("item_count"),
-            })
+            .map(StoredCatalogItemCounts::from)
             .map_err(self.sqlx_err())
     }
 
@@ -1524,7 +1567,7 @@ impl Database {
             }
         }
         let stats = self
-            .query(
+            .query_as::<DashboardStatsRow>(
                 "SELECT
                     COUNT(CASE WHEN mi.item_type = 'MOVIE' THEN 1 END) AS movie_count,
                     COUNT(CASE WHEN mi.item_type = 'SERIES' THEN 1 END) AS series_count,
@@ -1535,11 +1578,7 @@ impl Database {
             )
             .fetch_one(&self.pool)
             .await
-            .map(|row| DashboardStats {
-                movie_count: row.get("movie_count"),
-                series_count: row.get("series_count"),
-                user_count: row.get("user_count"),
-            })
+            .map(DashboardStats::from)
             .map_err(self.sqlx_err())?;
         *self.dashboard_stats_cache.lock().await = Some(CachedDashboardStats {
             computed_at: now,
@@ -12356,6 +12395,90 @@ mod thumbnail_row_decoding_tests {
         let errors = [
             ThumbnailScraperRetryRow::from_row(&row).expect_err("retry columns must not decode"),
             ThumbnailSourceRow::from_row(&row).expect_err("thumbnail source columns must decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the catalog count projections and the dashboard counters.
+#[cfg(test)]
+mod catalog_count_row_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn catalog_count_and_dashboard_rows_decode_their_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind, is_enabled)
+                 VALUES ('count-lib', 'Count', 'MOVIE', 1);
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('count-movie', 'count-lib', 'MOVIE', 'Movie', 'movie',
+                      'LOCAL_CONFIRMED', 1),
+                     ('count-series', 'count-lib', 'SERIES', 'Series', 'series',
+                      'LOCAL_CONFIRMED', 1),
+                     ('count-episode', 'count-lib', 'EPISODE', 'Episode', 'episode',
+                      'LOCAL_CONFIRMED', 1),
+                     ('count-box-set', 'count-lib', 'BOX_SET', 'Box set', 'box set',
+                      'LOCAL_CONFIRMED', 1),
+                     ('count-folder', 'count-lib', 'FOLDER', 'Folder', 'folder',
+                      'LOCAL_CONFIRMED', 1)",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .insert_user("count-user", "count", "Count", "hash", true, false)
+            .await?;
+
+        let root_counts = database
+            .count_catalog_root_items_by_library(&["count-lib".to_owned()])
+            .await?;
+        let counts = root_counts.get("count-lib").expect("root counts");
+        assert_eq!(counts.movie_count, 1);
+        assert_eq!(counts.series_count, 1);
+        assert_eq!(counts.item_count, 2);
+        assert_eq!(counts.episode_count, 0);
+
+        let item_counts = database
+            .count_catalog_item_types(&["count-lib".to_owned()], "count-user", None, None)
+            .await?;
+        assert_eq!(item_counts.movie_count, 1);
+        assert_eq!(item_counts.series_count, 1);
+        assert_eq!(item_counts.episode_count, 1);
+        assert_eq!(item_counts.box_set_count, 1);
+        assert_eq!(item_counts.item_count, 4);
+
+        let stats = database.dashboard_stats().await?;
+        assert_eq!(stats.movie_count, 1);
+        assert_eq!(stats.series_count, 1);
+        assert_eq!(stats.user_count, 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn catalog_count_row_structs_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let errors = [
+            LibraryCatalogCountRow::from_row(&row).expect_err("count columns must not decode"),
+            CatalogItemTypeCountRow::from_row(&row)
+                .expect_err("item count columns must not decode"),
+            DashboardStatsRow::from_row(&row).expect_err("dashboard columns must not decode"),
         ];
         for error in errors {
             assert!(
