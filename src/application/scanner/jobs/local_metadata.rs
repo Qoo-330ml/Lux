@@ -28,6 +28,13 @@ pub(in crate::application::scanner) const SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBA
 pub(in crate::application::scanner) const SCAN_LOCAL_METADATA_OUTBOX_ERROR_RETRY: Duration =
     Duration::from_secs(1);
 
+/// How long shutdown waits for the NFO batches that are already in flight.
+///
+/// A batch is bounded (at most [`SCAN_LOCAL_METADATA_BACKFILL_PAGE_SIZE`] sources), so this is a
+/// safety valve for a stuck filesystem read, not the normal path.
+pub(in crate::application::scanner) const SCAN_LOCAL_METADATA_SHUTDOWN_DRAIN_TIMEOUT: Duration =
+    Duration::from_secs(10);
+
 pub(in crate::application::scanner) const SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS: i64 = 30;
 
 pub(in crate::application::scanner) const MAX_SCAN_LOCAL_METADATA_SOURCE_IDS: usize = 256;
@@ -914,7 +921,7 @@ async fn run_scan_local_metadata_outbox_worker(
     let mut nfo_tasks = JoinSet::new();
     loop {
         if *shutdown.borrow() {
-            return;
+            break;
         }
         if nfo_tasks.len() >= MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT {
             if let Some(Err(error)) = nfo_tasks.join_next().await {
@@ -961,13 +968,13 @@ async fn run_scan_local_metadata_outbox_worker(
                         )
                         .await
                         {
-                            return;
+                            break;
                         }
                     }
                     Err(error) => {
                         tracing::warn!(%error, "local metadata backfill claim failed; retrying");
                         if sleep_or_shutdown(&mut shutdown, context.error_retry).await {
-                            return;
+                            break;
                         }
                     }
                 }
@@ -975,7 +982,40 @@ async fn run_scan_local_metadata_outbox_worker(
             Err(error) => {
                 tracing::warn!(%error, "local metadata outbox claim failed; retrying");
                 if sleep_or_shutdown(&mut shutdown, context.error_retry).await {
-                    return;
+                    break;
+                }
+            }
+        }
+    }
+    // Shutdown, a stop request or a persistent claim failure ends the loop; the batches already
+    // handed to NFO tasks are finished rather than aborted, so they either complete or record their
+    // own retry instead of being left RUNNING by a dropped `JoinSet`.
+    drain_outbox_nfo_tasks(&mut nfo_tasks, SCAN_LOCAL_METADATA_SHUTDOWN_DRAIN_TIMEOUT).await;
+}
+
+/// Waits for the in-flight NFO batches, giving up after `timeout` so a stuck batch cannot hang the
+/// process shutdown. A timed-out task is aborted and its batch is requeued on the next start.
+async fn drain_outbox_nfo_tasks(nfo_tasks: &mut JoinSet<String>, timeout: Duration) {
+    if nfo_tasks.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        tokio::select! {
+            () = tokio::time::sleep_until(deadline) => {
+                tracing::warn!(
+                    remaining = nfo_tasks.len(),
+                    "local metadata NFO batches did not finish before shutdown; abandoning them"
+                );
+                return;
+            }
+            result = nfo_tasks.join_next() => {
+                match result {
+                    None => return,
+                    Some(Err(error)) => {
+                        tracing::error!(%error, "local metadata NFO worker task panicked");
+                    }
+                    Some(Ok(_)) => {}
                 }
             }
         }
@@ -1570,11 +1610,27 @@ impl ScanJobService {
     }
 
     pub async fn start_local_metadata_outbox_worker(&self) -> Result<(), ScanJobError> {
+        // After the shutdown drain this is a permanent no-op: a scan that is still finishing its
+        // postprocessing must not bring the worker back while the database is closing.
+        if self
+            .local_metadata_outbox_worker_shutting_down
+            .load(Ordering::Acquire)
+        {
+            return Ok(());
+        }
         if self
             .local_metadata_outbox_worker_started
             .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
             .is_err()
         {
+            return Ok(());
+        }
+        if self
+            .local_metadata_outbox_worker_shutting_down
+            .load(Ordering::Acquire)
+        {
+            self.local_metadata_outbox_worker_started
+                .store(false, Ordering::Release);
             return Ok(());
         }
         if let Err(error) = self
@@ -1681,7 +1737,13 @@ impl ScanJobService {
     }
 
     /// Stops the outbox worker and waits for the loop to finish its current batch.
+    ///
+    /// Sets [`Self::local_metadata_outbox_worker_shutting_down`] first, so a concurrent start (a
+    /// scan finishing its postprocessing) can neither spawn a worker behind the drain nor take the
+    /// single-flight flag back from it.
     pub async fn shutdown_local_metadata_outbox_worker(&self) {
+        self.local_metadata_outbox_worker_shutting_down
+            .store(true, Ordering::Release);
         let worker = {
             let mut worker = self.local_metadata_outbox_worker.lock().await;
             worker.take()
@@ -1831,6 +1893,78 @@ mod outbox_worker_tests {
         shutdown.send_replace(true);
         timeout(Duration::from_secs(2), task).await??;
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn starting_the_worker_after_shutdown_is_a_no_op()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        let media_root = tempfile::tempdir()?;
+        let root = root_id(&database, media_root.path()).await?;
+        let jobs = ScanJobService::new(database.clone());
+        jobs.start_local_metadata_outbox_worker().await?;
+        jobs.shutdown_local_metadata_outbox_worker().await;
+
+        // A scan finishing its postprocessing calls this again after the drain; it must not bring
+        // the worker back while the database is closing.
+        jobs.start_local_metadata_outbox_worker().await?;
+        assert!(
+            jobs.local_metadata_outbox_worker.lock().await.is_none(),
+            "shutdown must be permanent"
+        );
+        assert!(
+            !jobs
+                .local_metadata_outbox_worker_started
+                .load(std::sync::atomic::Ordering::Acquire),
+            "the single-flight flag must stay released"
+        );
+
+        // Nothing claims the queued batch, even though it is notified.
+        queue_batch(&database, &root, 7).await?;
+        jobs.notify_local_metadata_outbox_worker();
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(
+            statuses(&database, &root).await?,
+            vec!["PENDING".to_owned()],
+            "no worker may claim batches after the shutdown drain"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_the_in_flight_nfo_batches() {
+        let mut nfo_tasks = JoinSet::new();
+        let finished = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        for index in 0..3 {
+            let finished = Arc::clone(&finished);
+            nfo_tasks.spawn(async move {
+                sleep(Duration::from_millis(80)).await;
+                finished.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                index.to_string()
+            });
+        }
+        drain_outbox_nfo_tasks(&mut nfo_tasks, Duration::from_secs(5)).await;
+        assert!(nfo_tasks.is_empty(), "the drain must wait for every batch");
+        assert_eq!(
+            finished.load(std::sync::atomic::Ordering::SeqCst),
+            3,
+            "the drain must not abort the batches that are already running"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_drain_gives_up_after_its_timeout() {
+        let mut nfo_tasks = JoinSet::new();
+        nfo_tasks.spawn(async {
+            sleep(Duration::from_secs(30)).await;
+            "stuck".to_owned()
+        });
+        let started = std::time::Instant::now();
+        drain_outbox_nfo_tasks(&mut nfo_tasks, Duration::from_millis(50)).await;
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "a stuck batch must not hang the shutdown"
+        );
     }
 
     #[tokio::test]

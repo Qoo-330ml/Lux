@@ -35,6 +35,7 @@ impl ScanJobService {
             metadata_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_metadata_image_notifications: Arc::new(Mutex::new(HashMap::new())),
             local_metadata_outbox_worker_started: Arc::new(AtomicBool::new(false)),
+            local_metadata_outbox_worker_shutting_down: Arc::new(AtomicBool::new(false)),
             local_metadata_outbox_worker: Arc::new(tokio::sync::Mutex::new(None)),
             local_metadata_outbox_notify: Arc::new(Notify::new()),
             lite_manifest_discovery: Arc::new(Mutex::new(HashMap::new())),
