@@ -164,6 +164,12 @@ const CATALOG_ITEMS_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
 /// that gap bounded without waking the process while it is idle.
 const OUTBOX_IDLE_FALLBACK: Duration = Duration::from_secs(10);
 
+/// How long a consumer waits after a step failed before trying again.
+///
+/// A failed pass is local (a locked table, a busy database), so it is retried far sooner than the
+/// idle fallback; a backlog must not sit still for ten seconds because one batch failed.
+const OUTBOX_STEP_ERROR_RETRY: Duration = Duration::from_secs(1);
+
 /// The two derived-data consumer loops (`catalog_items` and the search index).
 ///
 /// Both stop on [`Self::shutdown`], which the application calls while draining its background
@@ -233,22 +239,26 @@ async fn run_catalog_items_incremental_worker(
             return;
         }
         let mut worked = false;
+        let mut failed = false;
         if !legacy_search_purged {
             match purge_legacy_search_rows(&database).await {
                 Ok(true) => legacy_search_purged = true,
                 // More rows left: keep going on this pass instead of sleeping a full fallback.
                 Ok(false) => worked = true,
-                // Unreadable table: fall through to the ordinary wait, so a persistent failure
-                // backs off instead of spinning.
-                Err(()) => {}
+                // Unreadable table: retry after the short error delay instead of spinning.
+                Err(()) => failed = true,
             }
         }
         // Only trust derived rows once the full rebuild watermark exists: the consumer must never
         // mix incremental rows into a half-built table.
-        let rebuilt = matches!(
-            database.catalog_consumer(&catalog_items_consumer()).await,
-            Ok(Some(_))
-        );
+        let rebuilt = match database.catalog_consumer(&catalog_items_consumer()).await {
+            Ok(state) => state.is_some(),
+            Err(error) => {
+                tracing::warn!(%error, "catalog read model watermark read failed");
+                failed = true;
+                false
+            }
+        };
         if rebuilt {
             loop {
                 if *shutdown.borrow() {
@@ -263,6 +273,7 @@ async fn run_catalog_items_incremental_worker(
                     }
                     Err(error) => {
                         tracing::warn!(%error, "catalog read model incremental apply failed");
+                        failed = true;
                         let _ = database
                             .record_catalog_consumer_error(
                                 CATALOG_ITEMS_INCREMENTAL_CONSUMER,
@@ -285,7 +296,10 @@ async fn run_catalog_items_incremental_worker(
                         stats_dirty = false;
                         last_stats_refresh = std::time::Instant::now();
                     }
-                    Err(error) => tracing::warn!(%error, "catalog item stats refresh failed"),
+                    Err(error) => {
+                        tracing::warn!(%error, "catalog item stats refresh failed");
+                        failed = true;
+                    }
                 }
             } else if !worked {
                 wait = wait.min(CATALOG_ITEMS_STATS_REFRESH_INTERVAL - elapsed);
@@ -293,6 +307,9 @@ async fn run_catalog_items_incremental_worker(
         }
         if worked {
             continue;
+        }
+        if failed {
+            wait = wait.min(OUTBOX_STEP_ERROR_RETRY);
         }
         tokio::select! {
             () = signals.notified_catalog_items() => {}
@@ -320,6 +337,7 @@ async fn run_search_reindex_worker(
             return;
         }
         let mut worked = false;
+        let mut failed = false;
         loop {
             if *shutdown.borrow() {
                 return;
@@ -332,6 +350,7 @@ async fn run_search_reindex_worker(
                 }
                 Err(error) => {
                     tracing::warn!(%error, "search reindex failed");
+                    failed = true;
                     let _ = database
                         .record_catalog_consumer_error(SEARCH_REINDEX_CONSUMER, &error.to_string())
                         .await;
@@ -342,9 +361,14 @@ async fn run_search_reindex_worker(
         if worked {
             continue;
         }
+        let wait = if failed {
+            fallback.min(OUTBOX_STEP_ERROR_RETRY)
+        } else {
+            fallback
+        };
         tokio::select! {
             () = signals.notified_search_reindex() => {}
-            () = tokio::time::sleep(fallback) => {}
+            () = tokio::time::sleep(wait) => {}
             changed = shutdown.changed() => {
                 if changed.is_err() || *shutdown.borrow() {
                     return;
@@ -665,6 +689,64 @@ mod tests {
         for worker in [catalog, search] {
             tokio::time::timeout(Duration::from_secs(2), worker).await??;
         }
+        Ok(())
+    }
+
+    /// A backlog must not sit still for the idle fallback because one step failed: a failed step is
+    /// retried after the short error delay.
+    #[tokio::test]
+    async fn a_failed_catalog_step_is_retried_without_the_idle_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        database
+            .advance_catalog_consumer(&catalog_items_consumer(), 0)
+            .await?;
+        // Break the stream the consumer drains, so every pass fails.
+        sqlx::query("ALTER TABLE catalog_outbox RENAME TO catalog_outbox_offline")
+            .execute(database.pool())
+            .await?;
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let worker = tokio::spawn(run_catalog_items_incremental_worker(
+            database.clone(),
+            shutdown,
+            LONG_FALLBACK,
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = database.query_count();
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let worked = database.query_count().saturating_sub(before);
+        assert!(
+            worked > 0,
+            "a failed step must be retried after ~1 s, not after the 60 s fallback"
+        );
+        shutdown_sender.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), worker).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failed_search_step_is_retried_without_the_idle_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        sqlx::query("ALTER TABLE search_outbox RENAME TO search_outbox_offline")
+            .execute(database.pool())
+            .await?;
+        let (shutdown_sender, shutdown) = watch::channel(false);
+        let worker = tokio::spawn(run_search_reindex_worker(
+            database.clone(),
+            shutdown,
+            LONG_FALLBACK,
+        ));
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let before = database.query_count();
+        tokio::time::sleep(Duration::from_millis(2_200)).await;
+        let worked = database.query_count().saturating_sub(before);
+        assert!(
+            worked > 0,
+            "a failed step must be retried after ~1 s, not after the 60 s fallback"
+        );
+        shutdown_sender.send_replace(true);
+        tokio::time::timeout(Duration::from_secs(2), worker).await??;
         Ok(())
     }
 
