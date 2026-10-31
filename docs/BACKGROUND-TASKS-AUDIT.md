@@ -135,7 +135,7 @@ LAN 发现与邮件 worker。
 | # | 文件 | 改造前空闲周期 | 改造后空闲周期 | 空闲唤醒/分（前 → 后） | 唤醒方式 | 关停 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 5 | `application/playback/session.rs` | 5 s 固定 tick | 睡到"最近会话到期时间"，无会话时 `WEB_PLAYBACK_IDLE_FALLBACK` = **60 s** | 12 → **1** | 会话创建时 `Notify`；有会话时按 `expires_at` / `last_heartbeat_at + 90 s` 精确定时 | `WebPlaybackSessionService::shutdown`（`BackgroundLoop`） |
-| 6 | `application/webhooks.rs` | 5 s | `DELIVERY_POLL_INTERVAL` = **30 s**；有投递动作后的下一轮仍 5 s（`DELIVERY_RETRY_INTERVAL`） | 12 → **2** | `publish()` 提交投递行后 `notify_one` | 已有 `BackgroundLoop` |
+| 6 | `application/webhooks.rs` | 5 s | `DELIVERY_POLL_INTERVAL` = **30 s**；最后一次投递尝试后 60 s 内仍按 5 s 轮询（`DELIVERY_RETRY_INTERVAL` + `DELIVERY_RETRY_WINDOW`），待投递队列非空时连续排空不等待 | 12 → **2** | `publish()` 提交投递行后 `notify_one` | 已有 `BackgroundLoop` |
 | 7 | `application/mail_worker.rs` | 5 s | `MAIL_QUEUE_POLL_INTERVAL` = **30 s**；`Deferred` 后仍 5 s（`MAIL_QUEUE_RETRY_INTERVAL`） | 12 → **2** | 五个入队路径（注册/注册重发/邀请/邀请重发/改邮箱）提交后 `notify_mail_outbox_appended()` | 已有（`main.rs` 显式 `shutdown`） |
 | 9 | `application/scan_fingerprint_migration.rs` | 10 s（迁移完成后仍继续） | 所有库都有 `completed_at` 后转休眠：`LIBRARY_LIST_FALLBACK_INTERVAL` = **600 s** | 6 → **0.1** | 只剩库列表兜底（一次性迁移，新库扫描直接写 v2 指纹） | 已有（`ShutdownReason` `watch`） |
 | 11 | `application/watch.rs` | 30 s | `LIBRARY_ROOT_REFRESH_INTERVAL` = **300 s** | 2 → **0.2** | 已有 `LibraryChangeNotifier` 事件（库/根目录变更） | `LibraryWatchService::spawn_managed` + `shutdown` |
