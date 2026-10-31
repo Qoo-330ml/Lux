@@ -984,13 +984,19 @@ async fn search_reindex_queue_defers_fts_writes_until_drained() {
     .expect("media item");
 
     // The write path only appends; the FTS row appears after the consumer runs.
-    let queued: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search' AND item_id = 'queued-item'",
-    )
-    .fetch_one(database.pool())
-    .await
-    .expect("queued event");
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM search_outbox WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("queued event");
     assert_eq!(queued, 1);
+    // The search stream has its own table, so it can never share a sequence with catalog events.
+    let leaked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search'")
+            .fetch_one(database.pool())
+            .await
+            .expect("search rows in the catalog outbox");
+    assert_eq!(leaked, 0);
     let before: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'queued-item'")
             .fetch_one(database.pool())
@@ -1035,16 +1041,15 @@ async fn search_reindex_queue_defers_fts_writes_until_drained() {
     );
     // Applied events are reclaimed; a fresh event survives until it is applied too.
     let trimmed = database
-        .trim_catalog_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_KIND, 100)
+        .trim_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_OUTBOX, 100)
         .await
         .expect("trim outbox");
     assert!(trimmed >= 2);
-    let queued_after_trim: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search' AND item_id = 'queued-item'",
-    )
-    .fetch_one(database.pool())
-    .await
-    .expect("outbox after trim");
+    let queued_after_trim: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM search_outbox WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("outbox after trim");
     assert_eq!(queued_after_trim, 0);
 
     let remaining: i64 =
@@ -1093,7 +1098,7 @@ async fn search_reindex_detects_a_queue_gap_and_reindexes_everything() {
 
     // Simulate a queue trimmed past the watermark without the consumer applying it: the oldest
     // remaining event is no longer the one the consumer expects, so everything must be re-queued.
-    sqlx::query("DELETE FROM catalog_outbox WHERE id = 1")
+    sqlx::query("DELETE FROM search_outbox WHERE id = 1")
         .execute(database.pool())
         .await
         .expect("lose the first event");
@@ -22440,11 +22445,18 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
 -> Result<(), Box<dyn std::error::Error>> {
     use crate::storage::test_database;
 
+    const ITEM_UPSERT: OutboxStream = OutboxStream {
+        table: "catalog_outbox",
+        kind: "item_upsert",
+    };
+    const ITEM_DELETE: OutboxStream = OutboxStream {
+        table: "catalog_outbox",
+        kind: "item_delete",
+    };
+
     let (_temp, database) = test_database().await?;
     assert_eq!(
-        database
-            .catalog_outbox_gap("catalog_items", "item_upsert")
-            .await?,
+        database.outbox_gap("catalog_items", ITEM_UPSERT).await?,
         None
     );
 
@@ -22459,7 +22471,7 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
         .await?;
     assert_eq!((first, second, third), (1, 2, 3));
 
-    let page = database.read_catalog_outbox_after(0, 2).await?;
+    let page = database.read_outbox_after(ITEM_UPSERT, 0, 2).await?;
     assert_eq!(page.len(), 2);
     assert_eq!(page[0].id, 1);
     assert_eq!(page[0].kind, "item_upsert");
@@ -22467,7 +22479,15 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
     assert_eq!(page[0].library_id.as_deref(), Some("lib"));
     assert_eq!(page[1].id, 2);
     assert_eq!(page[1].item_id, "item-b");
-    let rest = database.read_catalog_outbox_after(2, 10).await?;
+    // Reads are scoped to one kind: the delete event at id 3 is invisible to the upsert stream, so
+    // a consumer never spends its batch (or its watermark) on another kind's events.
+    assert!(
+        database
+            .read_outbox_after(ITEM_UPSERT, 2, 10)
+            .await?
+            .is_empty()
+    );
+    let rest = database.read_outbox_after(ITEM_DELETE, 0, 10).await?;
     assert_eq!(rest.len(), 1);
     assert_eq!(rest[0].id, 3);
     assert_eq!(rest[0].library_id, None);
@@ -22522,9 +22542,7 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
         .advance_catalog_consumer("stale_consumer", 1)
         .await?;
     assert_eq!(
-        database
-            .catalog_outbox_gap("stale_consumer", "item_upsert")
-            .await?,
+        database.outbox_gap("stale_consumer", ITEM_UPSERT).await?,
         None,
         "the remaining sequence follows the watermark"
     );
@@ -22536,11 +22554,210 @@ async fn catalog_outbox_appends_reads_and_advances_idempotently()
         .append_catalog_outbox("item_upsert", "item-d", None)
         .await?;
     assert_eq!(
-        database
-            .catalog_outbox_gap("stale_consumer", "item_upsert")
-            .await?,
+        database.outbox_gap("stale_consumer", ITEM_UPSERT).await?,
         Some((1, 4))
     );
+    Ok(())
+}
+
+/// Seeds `count` movies so the triggers queue events and the full re-queue has items to copy.
+async fn seed_outbox_movies(
+    database: &Database,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+
+    let library = LibraryService::new(database.clone())
+        .create_library("Outbox", LibraryKind::Movie, false)
+        .await?;
+    for index in 0..count {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(format!("outbox-movie-{index}"))
+        .bind(library.id.to_string())
+        .bind(format!("Outbox {index}"))
+        .bind(format!("outbox {index}"))
+        .execute(database.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn outbox_rows(database: &Database, table: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+        .fetch_one(database.pool())
+        .await
+}
+
+#[tokio::test]
+async fn outbox_gap_repair_requeues_once_and_closes_the_hole()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    seed_outbox_movies(&database, 3).await?;
+    while database.drain_catalog_items_incremental(500).await? > 0 {}
+
+    // A hole below the oldest remaining catalog event: the watermark points at events that are gone.
+    sqlx::query("UPDATE catalog_consumers SET applied_seq = 0 WHERE name = ?")
+        .bind(CATALOG_ITEMS_INCREMENTAL_CONSUMER)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM catalog_outbox WHERE id <= (SELECT MAX(id) - 1 FROM catalog_outbox)")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        database
+            .outbox_gap(CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX)
+            .await?
+            .is_some()
+    );
+
+    // The first drain repairs the hole with exactly one full re-queue ...
+    let before = outbox_rows(&database, "catalog_outbox").await?;
+    database.drain_catalog_items_incremental(500).await?;
+    let after_first = outbox_rows(&database, "catalog_outbox").await?;
+    assert_eq!(after_first - before, 3, "one row per media item");
+    assert!(
+        database
+            .outbox_gap(CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX)
+            .await?
+            .is_none(),
+        "the repair closes the hole instead of re-detecting it on every tick"
+    );
+    // ... and later drains must not repeat it.
+    for _ in 0..3 {
+        database.drain_catalog_items_incremental(500).await?;
+    }
+    assert_eq!(outbox_rows(&database, "catalog_outbox").await?, after_first);
+
+    // A second hole right after the repair is closed without another full re-queue.
+    while database.drain_catalog_items_incremental(500).await? > 0 {}
+    let burned = database
+        .append_catalog_outbox(CATALOG_OUTBOX.kind, "burned", None)
+        .await?;
+    let kept = database
+        .append_catalog_outbox(CATALOG_OUTBOX.kind, "kept", None)
+        .await?;
+    sqlx::query("DELETE FROM catalog_outbox WHERE id = ?")
+        .bind(burned)
+        .execute(database.pool())
+        .await?;
+    let before_cooldown = outbox_rows(&database, "catalog_outbox").await?;
+    database.drain_catalog_items_incremental(500).await?;
+    assert_eq!(
+        outbox_rows(&database, "catalog_outbox").await?,
+        before_cooldown,
+        "the cooldown suppresses a second full re-queue"
+    );
+    let applied = database
+        .catalog_consumer(CATALOG_ITEMS_INCREMENTAL_CONSUMER)
+        .await?
+        .map(|state| state.applied_seq)
+        .unwrap_or(0);
+    assert!(applied >= kept, "the watermark moves past the hole");
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_full_requeue_is_refused_over_capacity() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for index in 0..3 {
+        database
+            .append_catalog_outbox(CATALOG_OUTBOX.kind, &format!("item-{index}"), None)
+            .await?;
+    }
+    assert_eq!(
+        database
+            .full_requeue_decision("consumer", CATALOG_OUTBOX, 3)
+            .await?,
+        FullRequeue::Allowed
+    );
+    assert_eq!(
+        database
+            .full_requeue_decision("consumer", CATALOG_OUTBOX, 2)
+            .await?,
+        FullRequeue::OverCapacity,
+        "a queue that is already this long must not be multiplied by a full re-queue"
+    );
+    database.record_full_requeue("consumer").await?;
+    assert_eq!(
+        database
+            .full_requeue_decision("consumer", CATALOG_OUTBOX, 3)
+            .await?,
+        FullRequeue::CoolingDown
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_search_rows_are_purged_from_the_catalog_outbox_in_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for index in 0..5 {
+        database
+            .append_catalog_outbox("search", &format!("legacy-{index}"), None)
+            .await?;
+    }
+    for index in 0..2 {
+        database
+            .append_catalog_outbox(CATALOG_OUTBOX.kind, &format!("keep-{index}"), None)
+            .await?;
+    }
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 2);
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 2);
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 1);
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 0);
+    assert_eq!(outbox_rows(&database, "catalog_outbox").await?, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_outbox_migration_requeues_every_item_and_resets_the_old_watermark()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    seed_outbox_movies(&database, 4).await?;
+    sqlx::query("DELETE FROM search_outbox")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO catalog_consumers (name, applied_seq) VALUES ('search_reindex@1', 239066206)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', 'stale')")
+        .execute(database.pool())
+        .await?;
+
+    // The migration is written to be re-runnable, so an upgrade over live data can be replayed.
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0243_search_outbox_split.sql"
+    ))
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(outbox_rows(&database, "search_outbox").await?, 4);
+    let old_watermark: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM catalog_consumers WHERE name = 'search_reindex@1'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        old_watermark, 0,
+        "the old coordinate must not survive the split"
+    );
+    assert_eq!(database.drain_search_reindex(100).await?, 4);
     Ok(())
 }
 

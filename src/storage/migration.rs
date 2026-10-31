@@ -464,30 +464,30 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
              )
              WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
-                INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', NEW.id);
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.id);
             END",
             "CREATE TRIGGER media_items_search_au AFTER UPDATE OF title, sort_title, original_title ON media_items
              WHEN OLD.title IS NOT NEW.title
                OR OLD.sort_title IS NOT NEW.sort_title
                OR OLD.original_title IS NOT NEW.original_title
              BEGIN
-                INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', NEW.id);
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.id);
             END",
             "CREATE TRIGGER media_items_search_ad AFTER DELETE ON media_items BEGIN
-                INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', OLD.id);
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', OLD.id);
             END",
             "CREATE TRIGGER item_aliases_search_ai AFTER INSERT ON item_aliases BEGIN
-                INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', NEW.item_id);
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.item_id);
             END",
             "CREATE TRIGGER item_aliases_search_au AFTER UPDATE OF alias, alias_normalized, item_id ON item_aliases
              WHEN OLD.alias IS NOT NEW.alias OR OLD.alias_normalized IS NOT NEW.alias_normalized OR OLD.item_id IS NOT NEW.item_id
              BEGIN
-                INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', NEW.item_id);
-                INSERT INTO catalog_outbox (kind, item_id)
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.item_id);
+                INSERT INTO search_outbox (kind, item_id)
                 SELECT 'search', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
              END",
             "CREATE TRIGGER item_aliases_search_ad AFTER DELETE ON item_aliases BEGIN
-                INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', OLD.item_id);
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', OLD.item_id);
             END",
             "CREATE TRIGGER media_item_provider_ids_ai
              AFTER INSERT ON media_items

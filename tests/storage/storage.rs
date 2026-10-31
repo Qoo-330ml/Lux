@@ -2517,7 +2517,7 @@ fn sqlite_media_search_triggers_skip_only_ascii_case_equivalent_sort_titles() {
     );
     assert_eq!(
         legacy_rebuild
-            .matches("INSERT INTO catalog_outbox (kind, item_id) VALUES ('search'")
+            .matches("INSERT INTO search_outbox (kind, item_id) VALUES ('search'")
             .count(),
         6,
         "every search trigger in the legacy rebuild enqueues instead of writing the FTS index"

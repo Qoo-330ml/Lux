@@ -3,8 +3,33 @@
 use super::catalog::{catalog_stream_columns, catalog_stream_join, catalog_stream_order};
 use super::*;
 
-/// Outbox kind for `catalog_items` maintenance events; the search consumer owns `search`.
-pub(crate) const CATALOG_OUTBOX_KIND: &str = "catalog";
+/// One independent event stream: its own table (and therefore its own id sequence) plus the kind it
+/// carries. Streams never share a sequence, so a consumer's watermark and the "is there a hole"
+/// check are always expressed in the coordinates of the one stream it reads.
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) struct OutboxStream {
+    pub(crate) table: &'static str,
+    pub(crate) kind: &'static str,
+}
+
+/// `catalog_items` maintenance events.
+pub(crate) const CATALOG_OUTBOX: OutboxStream = OutboxStream {
+    table: "catalog_outbox",
+    kind: "catalog",
+};
+
+/// Search reindex events. Before migration `0243` these shared `catalog_outbox`.
+pub(crate) const SEARCH_OUTBOX: OutboxStream = OutboxStream {
+    table: "search_outbox",
+    kind: "search",
+};
+
+/// A full re-queue copies every item into the stream, so it is rate limited per consumer.
+const FULL_REQUEUE_COOLDOWN_SECONDS: i64 = 300;
+
+/// A stream already holding more pending rows than this is not multiplied by another full re-queue:
+/// the consumer is far behind and adding one row per item only deepens the backlog.
+pub(crate) const OUTBOX_MAX_PENDING_ROWS: i64 = 2_000_000;
 
 /// Versioned consumer name for incremental `catalog_items` maintenance. A change to the derived row
 /// shape bumps `READ_MODEL_SCHEMA_VERSION` instead, which forces a full rebuild.
@@ -48,19 +73,25 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    /// Reads at most `limit` events after `after_seq`, oldest first.
-    pub(crate) async fn read_catalog_outbox_after(
+    /// Reads at most `limit` events of the stream's kind after `after_seq`, oldest first.
+    ///
+    /// The kind is part of the predicate (served by the `(kind, id)` index), so a batch never
+    /// contains rows the consumer would discard.
+    pub(crate) async fn read_outbox_after(
         &self,
+        stream: OutboxStream,
         after_seq: i64,
         limit: i64,
     ) -> Result<Vec<CatalogOutboxEntry>, StorageError> {
-        self.query_as(
+        self.query_as(sqlx::AssertSqlSafe(format!(
             "SELECT id, kind, item_id, library_id
-             FROM catalog_outbox
-             WHERE id > ?
+             FROM {table}
+             WHERE kind = ? AND id > ?
              ORDER BY id
              LIMIT ?",
-        )
+            table = stream.table
+        )))
+        .bind(stream.kind)
         .bind(after_seq)
         .bind(limit.clamp(1, 5_000))
         .fetch_all(&self.pool)
@@ -126,15 +157,15 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    /// Drops the already-applied events of one `kind`, oldest first and bounded so a long backlog
+    /// Drops the already-applied events of one stream, oldest first and bounded so a long backlog
     /// never turns into one huge delete.
     ///
-    /// The delete is scoped by `kind` so the search and catalog consumers can drain the shared queue
-    /// independently: trimming one kind never removes events the other consumer still needs.
-    pub(crate) async fn trim_catalog_outbox(
+    /// Callers run this after every applied batch, not only once the queue is empty: a consumer that
+    /// is permanently behind would otherwise never reclaim anything.
+    pub(crate) async fn trim_outbox(
         &self,
         consumer: &str,
-        kind: &str,
+        stream: OutboxStream,
         limit: i64,
     ) -> Result<i64, StorageError> {
         let applied_seq = self
@@ -145,15 +176,16 @@ impl Database {
         if applied_seq <= 0 {
             return Ok(0);
         }
-        self.query(
-            "DELETE FROM catalog_outbox
+        self.query(sqlx::AssertSqlSafe(format!(
+            "DELETE FROM {table}
              WHERE kind = ?
                AND id IN (
-                   SELECT id FROM catalog_outbox WHERE kind = ? AND id <= ? ORDER BY id LIMIT ?
+                   SELECT id FROM {table} WHERE kind = ? AND id <= ? ORDER BY id LIMIT ?
                )",
-        )
-        .bind(kind)
-        .bind(kind)
+            table = stream.table
+        )))
+        .bind(stream.kind)
+        .bind(stream.kind)
         .bind(applied_seq)
         .bind(limit.clamp(1, 10_000))
         .execute(&self.pool)
@@ -162,23 +194,44 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    /// Detects that the queue was trimmed past a consumer's watermark.
+    /// Removes `search` rows that older builds appended to `catalog_outbox` (the stream moved to
+    /// `search_outbox`). Nothing reads them any more; deleting in bounded batches keeps an upgrade
+    /// over a large backlog from turning into one huge statement.
+    pub(crate) async fn purge_legacy_search_outbox(&self, limit: i64) -> Result<i64, StorageError> {
+        self.query(
+            "DELETE FROM catalog_outbox
+             WHERE id IN (
+                 SELECT id FROM catalog_outbox WHERE kind = 'search' ORDER BY id LIMIT ?
+             )",
+        )
+        .bind(limit.clamp(1, 10_000))
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() as i64)
+        .map_err(self.sqlx_err())
+    }
+
+    /// Detects that the stream was trimmed past a consumer's watermark.
     ///
     /// Returns `(applied_seq, oldest_remaining_seq)` when the next expected sequence is gone, so the
-    /// caller can schedule a full rebuild instead of silently skipping derived rows.
-    pub(crate) async fn catalog_outbox_gap(
+    /// caller can schedule a full rebuild instead of silently skipping derived rows. Both numbers are
+    /// ids of the same stream, which is what makes the comparison meaningful.
+    pub(crate) async fn outbox_gap(
         &self,
-        name: &str,
-        kind: &str,
+        consumer: &str,
+        stream: OutboxStream,
     ) -> Result<Option<(i64, i64)>, StorageError> {
         let applied_seq = self
-            .catalog_consumer(name)
+            .catalog_consumer(consumer)
             .await?
             .map(|state| state.applied_seq)
             .unwrap_or(0);
         let oldest = self
-            .query_scalar::<Option<i64>>("SELECT MIN(id) FROM catalog_outbox WHERE kind = ?")
-            .bind(kind)
+            .query_scalar::<Option<i64>>(sqlx::AssertSqlSafe(format!(
+                "SELECT MIN(id) FROM {table} WHERE kind = ?",
+                table = stream.table
+            )))
+            .bind(stream.kind)
             .fetch_optional(&self.pool)
             .await
             .map_err(self.sqlx_err())?
@@ -187,6 +240,139 @@ impl Database {
             (oldest > applied_seq.saturating_add(1)).then_some((applied_seq, oldest))
         }))
     }
+
+    /// Decides whether a detected gap may be answered with a full re-queue.
+    pub(crate) async fn full_requeue_decision(
+        &self,
+        consumer: &str,
+        stream: OutboxStream,
+        max_pending: i64,
+    ) -> Result<FullRequeue, StorageError> {
+        let cooling_down: i64 = self
+            .query_scalar(
+                "SELECT COUNT(*) FROM catalog_consumers
+                 WHERE name = ? AND updated_at > unixepoch() - ?",
+            )
+            .bind(full_requeue_marker(consumer))
+            .bind(FULL_REQUEUE_COOLDOWN_SECONDS)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if cooling_down > 0 {
+            return Ok(FullRequeue::CoolingDown);
+        }
+        // Bounded count: stop looking after `max_pending + 1` rows so a runaway table is cheap to judge.
+        let pending: i64 = self
+            .query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM (
+                     SELECT 1 FROM {table} WHERE kind = ? LIMIT ?
+                 ) AS bounded",
+                table = stream.table
+            )))
+            .bind(stream.kind)
+            .bind(max_pending.saturating_add(1))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(if pending > max_pending {
+            FullRequeue::OverCapacity
+        } else {
+            FullRequeue::Allowed
+        })
+    }
+
+    /// Stamps the time of a full re-queue; the stamp lives in `catalog_consumers` under a derived
+    /// name so no schema change is needed and the cooldown survives a restart.
+    pub(crate) async fn record_full_requeue(&self, consumer: &str) -> Result<(), StorageError> {
+        self.query(
+            "INSERT INTO catalog_consumers (name, applied_seq)
+             VALUES (?, 1)
+             ON CONFLICT(name) DO UPDATE SET
+                 applied_seq = catalog_consumers.applied_seq + 1,
+                 updated_at = unixepoch()",
+        )
+        .bind(full_requeue_marker(consumer))
+        .execute(&self.pool)
+        .await
+        .map(|_| ())
+        .map_err(self.sqlx_err())
+    }
+
+    /// Answers a detected gap exactly once.
+    ///
+    /// A full re-queue covers any events that were lost, but it is only issued when the consumer is
+    /// not in its cooldown and the stream is not already over capacity. Either way the watermark
+    /// is moved to just below the oldest remaining event, so the same hole is never detected again:
+    /// re-detecting it every tick is what turned one repair into an unbounded write loop.
+    pub(crate) async fn repair_outbox_gap(
+        &self,
+        consumer: &str,
+        stream: OutboxStream,
+    ) -> Result<(), StorageError> {
+        let Some((applied_seq, oldest_remaining)) = self.outbox_gap(consumer, stream).await? else {
+            return Ok(());
+        };
+        match self
+            .full_requeue_decision(consumer, stream, OUTBOX_MAX_PENDING_ROWS)
+            .await?
+        {
+            FullRequeue::Allowed => {
+                let requeued = self.enqueue_full_outbox(stream).await?;
+                self.record_full_requeue(consumer).await?;
+                tracing::warn!(
+                    consumer,
+                    applied_seq,
+                    oldest_remaining,
+                    requeued,
+                    "outbox gap; re-queued every item once"
+                );
+            }
+            FullRequeue::CoolingDown => tracing::warn!(
+                consumer,
+                applied_seq,
+                oldest_remaining,
+                "outbox gap inside the re-queue cooldown; closing it without another full re-queue"
+            ),
+            FullRequeue::OverCapacity => tracing::error!(
+                consumer,
+                applied_seq,
+                oldest_remaining,
+                max_pending = OUTBOX_MAX_PENDING_ROWS,
+                "outbox gap on an over-capacity queue; refusing a full re-queue"
+            ),
+        }
+        self.advance_catalog_consumer(consumer, oldest_remaining.saturating_sub(1))
+            .await
+    }
+
+    /// Queues every authoritative item once into the stream.
+    pub(crate) async fn enqueue_full_outbox(
+        &self,
+        stream: OutboxStream,
+    ) -> Result<i64, StorageError> {
+        self.query(sqlx::AssertSqlSafe(format!(
+            "INSERT INTO {table} (kind, item_id)
+             SELECT '{kind}', id FROM media_items",
+            table = stream.table,
+            kind = stream.kind
+        )))
+        .execute(&self.pool)
+        .await
+        .map(|result| result.rows_affected() as i64)
+        .map_err(self.sqlx_err())
+    }
+}
+
+/// Outcome of [`Database::full_requeue_decision`].
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum FullRequeue {
+    Allowed,
+    CoolingDown,
+    OverCapacity,
+}
+
+fn full_requeue_marker(consumer: &str) -> String {
+    format!("{consumer}#requeue")
 }
 
 #[derive(Debug, Clone, Eq, PartialEq)]
@@ -306,48 +492,27 @@ impl Database {
             .map_err(self.sqlx_err())
     }
 
-    /// Queues every authoritative item once; used after a detected queue gap so the derived table
-    /// cannot stay permanently stale.
-    pub(crate) async fn enqueue_full_catalog_items(&self) -> Result<i64, StorageError> {
-        self.query(
-            "INSERT INTO catalog_outbox (kind, item_id)
-             SELECT 'catalog', id FROM media_items",
-        )
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() as i64)
-        .map_err(self.sqlx_err())
-    }
-
     /// Applies at most `batch` queued `kind = 'catalog'` events, oldest first, and returns how many
     /// distinct items were refreshed. Callers drain until it returns zero.
     pub(crate) async fn drain_catalog_items_incremental(
         &self,
         batch: i64,
     ) -> Result<usize, StorageError> {
-        if let Some((applied_seq, oldest_remaining)) = self
-            .catalog_outbox_gap(CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND)
-            .await?
-        {
-            tracing::warn!(
-                applied_seq,
-                oldest_remaining,
-                "catalog read model queue gap; re-queueing every item"
-            );
-            self.enqueue_full_catalog_items().await?;
-        }
+        self.repair_outbox_gap(CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX)
+            .await?;
         let applied_seq = self
             .catalog_consumer(CATALOG_ITEMS_INCREMENTAL_CONSUMER)
             .await?
             .map(|state| state.applied_seq)
             .unwrap_or(0);
-        let entries = self.read_catalog_outbox_after(applied_seq, batch).await?;
+        let entries = self
+            .read_outbox_after(CATALOG_OUTBOX, applied_seq, batch)
+            .await?;
         let Some(last_seq) = entries.last().map(|entry| entry.id) else {
             return Ok(0);
         };
         let mut item_ids = entries
             .into_iter()
-            .filter(|entry| entry.kind == CATALOG_OUTBOX_KIND)
             .map(|entry| entry.item_id)
             .collect::<Vec<_>>();
         item_ids.sort_unstable();

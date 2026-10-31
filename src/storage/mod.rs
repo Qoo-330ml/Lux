@@ -841,7 +841,7 @@ pub use repository::{
 #[allow(unused_imports)]
 pub(crate) use repository::{
     AdminUserSortField, AdminUserStatusFilter, AuthCacheEpochSnapshot, AuthCacheEpochs,
-    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND, CatalogFilterQuery, CatalogSort,
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, CatalogFilterQuery, CatalogSort,
     ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
     DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
     DEFAULT_PLAYED_PERCENT, DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult,
@@ -872,10 +872,10 @@ pub(crate) use repository::{
     NewStoredUser, NewStrmProbeJob, NewTranscodingHistory, NewUserAccessBlacklistRule,
     NewUserAccountPreferences, NewUserActivityEvent, NewUserContentRestrictions,
     NewUserDeviceObservation, NewUserInvitation, NewWebPlaybackEvent, NewWebPlaybackSession,
-    PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore, PlaybackEventEffects,
-    ReadModelPageQuery, ReadModelSort, RecentByLibraryReadModelQuery, RecentReadModelQuery,
-    ReconciliationBatchCommit, ReconciliationBatchCommitResult, ResumeItemsQuery,
-    ResumePointerQuery, SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_KIND,
+    OutboxStream, PLAYBACK_SESSION_STALE_AFTER_SECONDS, PersonMatchCandidateRestore,
+    PlaybackEventEffects, ReadModelPageQuery, ReadModelSort, RecentByLibraryReadModelQuery,
+    RecentReadModelQuery, ReconciliationBatchCommit, ReconciliationBatchCommitResult,
+    ResumeItemsQuery, ResumePointerQuery, SEARCH_OUTBOX, SEARCH_REINDEX_CONSUMER,
     ScanFingerprintMigrationCommit, ScanManifestRemovalCandidateQuery, SelectedMetadataUpdate,
     StoredAccessTokenDevice, StoredActivityEvent, StoredAdminUserListItem, StoredCanonicalPerson,
     StoredCanonicalPersonMatch, StoredCatalogDetail, StoredCatalogImageTag,

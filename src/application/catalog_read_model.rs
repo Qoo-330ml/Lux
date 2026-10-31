@@ -7,8 +7,8 @@
 use std::time::Duration;
 
 use crate::storage::{
-    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX_KIND, Database, SEARCH_REINDEX_CONSUMER,
-    SEARCH_REINDEX_KIND, StorageError,
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, Database, SEARCH_OUTBOX,
+    SEARCH_REINDEX_CONSUMER, StorageError,
 };
 
 /// Bumped whenever the derived row shape or its inputs change, so a read model written by an older
@@ -150,6 +150,10 @@ const SEARCH_REINDEX_TRIM_BATCH: i64 = 2_000;
 const CATALOG_ITEMS_INCREMENTAL_INTERVAL: Duration = Duration::from_secs(1);
 const CATALOG_ITEMS_INCREMENTAL_BATCH: i64 = 500;
 const CATALOG_ITEMS_TRIM_BATCH: i64 = 2_000;
+/// Rows of the retired shared search stream still sitting in `catalog_outbox` are deleted in bounded
+/// batches, a few batches per tick, until none are left.
+const LEGACY_SEARCH_PURGE_BATCH: i64 = 2_000;
+const LEGACY_SEARCH_PURGE_BATCHES_PER_TICK: usize = 10;
 /// Counters are recomputed at most this often: the grouping scans the whole derived table, while a
 /// stale count is only cosmetic for a few seconds.
 const CATALOG_ITEMS_STATS_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
@@ -161,9 +165,13 @@ pub(crate) fn spawn_catalog_items_incremental_worker(database: Database) {
         let mut ticker = tokio::time::interval(CATALOG_ITEMS_INCREMENTAL_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut stats_dirty = false;
+        let mut legacy_search_purged = false;
         let mut last_stats_refresh = std::time::Instant::now();
         loop {
             ticker.tick().await;
+            if !legacy_search_purged {
+                legacy_search_purged = purge_legacy_search_rows(&database).await;
+            }
             // Only trust derived rows once the full rebuild watermark exists: the consumer must
             // never mix incremental rows into a half-built table.
             let rebuilt = matches!(
@@ -174,25 +182,8 @@ pub(crate) fn spawn_catalog_items_incremental_worker(database: Database) {
                 continue;
             }
             loop {
-                match database
-                    .drain_catalog_items_incremental(CATALOG_ITEMS_INCREMENTAL_BATCH)
-                    .await
-                {
-                    Ok(0) => match database
-                        .trim_catalog_outbox(
-                            CATALOG_ITEMS_INCREMENTAL_CONSUMER,
-                            CATALOG_OUTBOX_KIND,
-                            CATALOG_ITEMS_TRIM_BATCH,
-                        )
-                        .await
-                    {
-                        Ok(0) => break,
-                        Ok(trimmed) => tracing::debug!(trimmed, "catalog outbox trimmed"),
-                        Err(error) => {
-                            tracing::warn!(%error, "catalog outbox trim failed");
-                            break;
-                        }
-                    },
+                match catalog_items_step(&database).await {
+                    Ok(0) => break,
                     Ok(items) => {
                         stats_dirty = true;
                         tracing::debug!(items, "catalog read model applied");
@@ -231,25 +222,8 @@ pub(crate) fn spawn_search_reindex_worker(database: Database) {
         loop {
             ticker.tick().await;
             loop {
-                match database.drain_search_reindex(SEARCH_REINDEX_BATCH).await {
-                    Ok(0) => {
-                        // Everything queued has been applied; reclaim the rows we no longer need.
-                        match database
-                            .trim_catalog_outbox(
-                                SEARCH_REINDEX_CONSUMER,
-                                SEARCH_REINDEX_KIND,
-                                SEARCH_REINDEX_TRIM_BATCH,
-                            )
-                            .await
-                        {
-                            Ok(0) => break,
-                            Ok(trimmed) => tracing::debug!(trimmed, "catalog outbox trimmed"),
-                            Err(error) => {
-                                tracing::warn!(%error, "catalog outbox trim failed");
-                                break;
-                            }
-                        }
-                    }
+                match search_reindex_step(&database).await {
+                    Ok(0) => break,
                     Ok(items) => tracing::debug!(items, "search reindex applied"),
                     Err(error) => {
                         tracing::warn!(%error, "search reindex failed");
@@ -265,6 +239,71 @@ pub(crate) fn spawn_search_reindex_worker(database: Database) {
             }
         }
     });
+}
+
+/// One bounded unit of catalog consumer work: apply a batch, then reclaim the rows it applied.
+///
+/// The trim runs on every step instead of only once the queue is empty. A consumer that is
+/// permanently behind never sees an empty queue, so tying the trim to "drained" meant a backlog
+/// could only ever grow.
+pub(crate) async fn catalog_items_step(database: &Database) -> Result<usize, StorageError> {
+    let items = database
+        .drain_catalog_items_incremental(CATALOG_ITEMS_INCREMENTAL_BATCH)
+        .await?;
+    trim_applied(
+        database,
+        CATALOG_ITEMS_INCREMENTAL_CONSUMER,
+        CATALOG_OUTBOX,
+        CATALOG_ITEMS_TRIM_BATCH,
+    )
+    .await;
+    Ok(items)
+}
+
+/// One bounded unit of search consumer work; see [`catalog_items_step`].
+pub(crate) async fn search_reindex_step(database: &Database) -> Result<usize, StorageError> {
+    let items = database.drain_search_reindex(SEARCH_REINDEX_BATCH).await?;
+    trim_applied(
+        database,
+        SEARCH_REINDEX_CONSUMER,
+        SEARCH_OUTBOX,
+        SEARCH_REINDEX_TRIM_BATCH,
+    )
+    .await;
+    Ok(items)
+}
+
+/// Reclaims applied rows. A failed trim only delays reclamation, so it never fails the step.
+async fn trim_applied(
+    database: &Database,
+    consumer: &str,
+    stream: crate::storage::OutboxStream,
+    batch: i64,
+) {
+    match database.trim_outbox(consumer, stream, batch).await {
+        Ok(0) => {}
+        Ok(trimmed) => tracing::debug!(trimmed, table = stream.table, "outbox trimmed"),
+        Err(error) => tracing::warn!(%error, table = stream.table, "outbox trim failed"),
+    }
+}
+
+/// Deletes a few batches of retired `search` rows from `catalog_outbox`; returns true once none
+/// are left (or the table cannot be read, which the next tick will report anyway).
+async fn purge_legacy_search_rows(database: &Database) -> bool {
+    for _ in 0..LEGACY_SEARCH_PURGE_BATCHES_PER_TICK {
+        match database
+            .purge_legacy_search_outbox(LEGACY_SEARCH_PURGE_BATCH)
+            .await
+        {
+            Ok(0) => return true,
+            Ok(purged) => tracing::debug!(purged, "legacy search outbox rows purged"),
+            Err(error) => {
+                tracing::warn!(%error, "legacy search outbox purge failed");
+                return false;
+            }
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -368,6 +407,33 @@ mod tests {
                 .is_some(),
             "rebuild must record the watermark under the version-scoped name"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn consumer_steps_reclaim_applied_rows_while_a_backlog_remains()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        for (table, kind) in [("catalog_outbox", "catalog"), ("search_outbox", "search")] {
+            // Three batches' worth of events for items that need not exist.
+            sqlx::query(sqlx::AssertSqlSafe(format!(
+                "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 1200)
+                 INSERT INTO {table} (kind, item_id) SELECT '{kind}', 'backlog-' || i FROM n"
+            )))
+            .execute(database.pool())
+            .await?;
+        }
+
+        // One step applies one batch and reclaims it, even though the queue is nowhere near empty.
+        assert_eq!(catalog_items_step(&database).await?, 500);
+        assert_eq!(search_reindex_step(&database).await?, 500);
+        for table in ["catalog_outbox", "search_outbox"] {
+            let remaining: i64 =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                    .fetch_one(database.pool())
+                    .await?;
+            assert_eq!(remaining, 700, "{table} keeps only the unapplied events");
+        }
         Ok(())
     }
 }

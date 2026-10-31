@@ -1,6 +1,7 @@
 //! Search reindex consumer (W4).
 //!
-//! Authoritative writes only append `kind = 'search'` rows to `catalog_outbox`; this module turns
+//! Authoritative writes only append rows to `search_outbox` (a stream of its own since migration
+//! `0243`, so it never shares an id sequence with the catalog read-model events); this module turns
 //! them into FTS updates in batches. The write path therefore costs one cheap insert per item
 //! instead of maintaining `media_search` (including a `group_concat` alias subquery) inside the
 //! caller's transaction.
@@ -11,10 +12,9 @@
 use super::*;
 
 /// Versioned consumer name so a rewrite of the reindex logic can start from a fresh watermark.
-pub(crate) const SEARCH_REINDEX_CONSUMER: &str = "search_reindex@1";
-
-/// Outbox kind owned by this consumer; the catalog read model uses `catalog`.
-pub(crate) const SEARCH_REINDEX_KIND: &str = "search";
+/// `@2` follows the move to `search_outbox`: the `@1` watermark was a position in the old shared
+/// sequence and means nothing in the new table.
+pub(crate) const SEARCH_REINDEX_CONSUMER: &str = "search_reindex@2";
 
 impl Database {
     /// Applies at most `batch` queued events, oldest first, and returns how many items were
@@ -23,31 +23,23 @@ impl Database {
     /// Public so integration tests can exercise the consumer on both backends; application code
     /// reaches it through the search request path and the background worker.
     pub async fn drain_search_reindex(&self, batch: i64) -> Result<usize, StorageError> {
-        // A trimmed or lost queue means events were skipped; re-enqueue everything rather than
-        // leaving the index permanently missing rows.
-        if let Some((applied_seq, oldest_remaining)) = self
-            .catalog_outbox_gap(SEARCH_REINDEX_CONSUMER, SEARCH_REINDEX_KIND)
-            .await?
-        {
-            tracing::warn!(
-                applied_seq,
-                oldest_remaining,
-                "search reindex queue gap; scheduling a full reindex"
-            );
-            self.enqueue_full_search_reindex().await?;
-        }
+        // A trimmed or lost queue means events were skipped; re-enqueue everything (once, rate
+        // limited) rather than leaving the index permanently missing rows.
+        self.repair_outbox_gap(SEARCH_REINDEX_CONSUMER, SEARCH_OUTBOX)
+            .await?;
         let applied_seq = self
             .catalog_consumer(SEARCH_REINDEX_CONSUMER)
             .await?
             .map(|state| state.applied_seq)
             .unwrap_or(0);
-        let entries = self.read_catalog_outbox_after(applied_seq, batch).await?;
+        let entries = self
+            .read_outbox_after(SEARCH_OUTBOX, applied_seq, batch)
+            .await?;
         let Some(last_seq) = entries.last().map(|entry| entry.id) else {
             return Ok(0);
         };
         let mut item_ids = entries
             .into_iter()
-            .filter(|entry| entry.kind == "search")
             .map(|entry| entry.item_id)
             .collect::<Vec<_>>();
         item_ids.sort_unstable();
@@ -58,18 +50,6 @@ impl Database {
         self.advance_catalog_consumer(SEARCH_REINDEX_CONSUMER, last_seq)
             .await?;
         Ok(item_ids.len())
-    }
-
-    /// Queues every item once; used after a detected queue gap so the index cannot stay incomplete.
-    pub(crate) async fn enqueue_full_search_reindex(&self) -> Result<i64, StorageError> {
-        self.query(
-            "INSERT INTO catalog_outbox (kind, item_id)
-             SELECT 'search', id FROM media_items",
-        )
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() as i64)
-        .map_err(self.sqlx_err())
     }
 
     /// Rewrites the search rows for `item_ids` from the authoritative tables in one transaction.

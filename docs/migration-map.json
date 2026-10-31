@@ -874,6 +874,11 @@
       "name": "drop_redundant_media_items_indexes",
       "sqlite": 242,
       "postgres": 244
+    },
+    {
+      "name": "search_outbox_split",
+      "sqlite": 243,
+      "postgres": 245
     }
   ],
   "sqlite_only": [
@@ -1226,7 +1231,7 @@
     }
   ],
   "ordering": {
-    "shared_names": 175,
+    "shared_names": 176,
     "rank_mismatches": 84,
     "note": "Migration histories evolved with different SQLite-only/PostgreSQL-only interleaving, so the shared names are not in the same relative order. New migrations must keep a pair adjacent in both directories, which keeps this count from growing."
   }

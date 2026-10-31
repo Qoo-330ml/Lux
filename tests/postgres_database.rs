@@ -533,7 +533,7 @@ async fn postgres_search_reindex_moves_to_the_outbox_consumer()
 
     async fn queue_len(database: &Database) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM catalog_outbox
+            "SELECT COUNT(*) FROM search_outbox
              WHERE kind = 'search' AND item_id = 'search-item'",
         )
         .fetch_one(database.pool())
@@ -4738,6 +4738,83 @@ async fn postgres_removes_personal_image_preference_without_changing_other_prefe
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_search_outbox_gap_repair_is_bounded_and_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    async fn rows(database: &Database, table: &str) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(database.pool())
+            .await
+    }
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('gap-library', 'Gap', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for item_id in ["gap-a", "gap-b", "gap-c"] {
+        sqlx::query(
+            "INSERT INTO media_items
+                (id, library_id, item_type, title, sort_title, identification_status)
+             VALUES ($1, 'gap-library', 'MOVIE', $1, $1, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+    // The catalog stream and the search stream are separate tables with separate sequences.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search'")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    while database.drain_search_reindex(100).await? > 0 {}
+
+    // Rewind the watermark and drop all but the newest event: a hole below the oldest remaining row.
+    sqlx::query("UPDATE catalog_consumers SET applied_seq = 0 WHERE name = 'search_reindex@2'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM search_outbox WHERE id < (SELECT MAX(id) FROM search_outbox)")
+        .execute(database.pool())
+        .await?;
+
+    let before = rows(&database, "search_outbox").await?;
+    database.drain_search_reindex(100).await?;
+    let after_first = rows(&database, "search_outbox").await?;
+    assert_eq!(after_first - before, 3, "exactly one full re-queue");
+    for _ in 0..3 {
+        database.drain_search_reindex(100).await?;
+    }
+    assert_eq!(
+        rows(&database, "search_outbox").await?,
+        after_first,
+        "later drains must not repeat the re-queue"
+    );
+
+    // A second hole inside the cooldown is closed without another full re-queue.
+    sqlx::query("UPDATE catalog_consumers SET applied_seq = 0 WHERE name = 'search_reindex@2'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM search_outbox WHERE id < (SELECT MAX(id) FROM search_outbox)")
+        .execute(database.pool())
+        .await?;
+    let before_cooldown = rows(&database, "search_outbox").await?;
+    database.drain_search_reindex(100).await?;
+    assert_eq!(rows(&database, "search_outbox").await?, before_cooldown);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_media_item_update_triggers_are_column_specific()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -4750,7 +4827,7 @@ async fn postgres_media_item_update_triggers_are_column_specific()
 
     async fn search_enqueue_count(database: &Database) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar(
-            "SELECT COUNT(*) FROM catalog_outbox
+            "SELECT COUNT(*) FROM search_outbox
              WHERE kind = 'search' AND item_id = 'trigger-item'",
         )
         .fetch_one(database.pool())

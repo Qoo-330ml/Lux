@@ -132,6 +132,7 @@ def reset_catalog(database: pathlib.Path) -> None:
             "DELETE FROM media_items",
             "DELETE FROM libraries WHERE system_kind IS NULL",
             "DELETE FROM catalog_outbox",
+            "DELETE FROM search_outbox",
             "DELETE FROM catalog_consumers",
             "DELETE FROM catalog_items",
             "DELETE FROM catalog_item_stats",
@@ -262,7 +263,9 @@ def wait_for_outbox(database: pathlib.Path, timeout: float) -> float:
     while time.monotonic() < deadline:
         connection = sqlite3.connect(f"file:{database}?mode=ro", uri=True, timeout=5)
         try:
-            pending = connection.execute("SELECT COUNT(*) FROM catalog_outbox").fetchone()[0]
+            pending = connection.execute(
+                "SELECT (SELECT COUNT(*) FROM catalog_outbox) + (SELECT COUNT(*) FROM search_outbox)"
+            ).fetchone()[0]
         finally:
             connection.close()
         if pending == 0:
@@ -347,7 +350,9 @@ def main() -> int:
             "SELECT COUNT(*) FROM media_items WHERE library_id = ?", (library_id,)
         ).fetchone()[0]
         fts_rows = connection.execute("SELECT COUNT(*) FROM media_search").fetchone()[0]
-        queued = connection.execute("SELECT COUNT(*) FROM catalog_outbox").fetchone()[0]
+        queued = connection.execute(
+            "SELECT (SELECT COUNT(*) FROM catalog_outbox) + (SELECT COUNT(*) FROM search_outbox)"
+        ).fetchone()[0]
         applied = connection.execute(
             "SELECT applied_seq FROM catalog_consumers WHERE name LIKE 'search_reindex%'"
         ).fetchone()
