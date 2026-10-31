@@ -565,6 +565,20 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
     let accepted = event("event-1", 1, "PLAYING", 500).send().await?;
     assert_eq!(accepted.status(), reqwest::StatusCode::OK);
     assert_eq!(accepted.json::<Value>().await?["accepted"], true);
+    let item_title: String = sqlx::query_scalar("SELECT title FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let started_metadata: String = sqlx::query_scalar(
+        "SELECT metadata_json FROM user_activity_events
+         WHERE event_type = 'PLAYBACK_STARTED' AND target_id = ?
+         ORDER BY occurred_at DESC LIMIT 1",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    let started_metadata: Value = serde_json::from_str(&started_metadata)?;
+    assert_eq!(started_metadata["itemTitle"], json!(item_title));
     assert_eq!(webhook_service.process_ready_deliveries().await?, 1);
     let started: Value = serde_json::from_slice(
         &receiver

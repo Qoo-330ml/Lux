@@ -115,11 +115,17 @@ pub(crate) async fn record_activity_event(
     user_id: &str,
     event_type: &str,
     target_id: Option<&str>,
-    metadata: Value,
+    mut metadata: Value,
 ) {
     let Some(database) = database else {
         return;
     };
+    if let Some(item_id) = target_id
+        && let Some(object) = metadata.as_object_mut()
+        && let Ok(Some(item)) = database.find_media_item_metadata(item_id).await
+    {
+        object.insert("itemTitle".to_owned(), json!(item.title));
+    }
     let metadata_json = match serde_json::to_string(&metadata) {
         Ok(metadata_json) => metadata_json,
         Err(_) => return,
