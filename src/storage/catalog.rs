@@ -372,8 +372,32 @@ impl From<MediaItemKindRow> for StoredMediaItemKind {
     }
 }
 
-/// Row of the three thumbnail-source pages: the preferred local file of an item plus the library
-/// strategy and scraper the thumbnail worker needs.
+/// Row of `find_thumbnail_scraper_retry` and `claim_due_thumbnail_scraper_retries`: the retry
+/// state of one item. `attempt_count` stays the stored integer and is bounded in
+/// [`StoredThumbnailScraperRetry::from`].
+#[derive(Debug, sqlx::FromRow)]
+struct ThumbnailScraperRetryRow {
+    item_id: String,
+    status: String,
+    attempt_count: i64,
+    first_attempt_at: i64,
+    next_retry_at: Option<i64>,
+}
+
+impl From<ThumbnailScraperRetryRow> for StoredThumbnailScraperRetry {
+    fn from(row: ThumbnailScraperRetryRow) -> Self {
+        Self {
+            item_id: row.item_id,
+            status: row.status,
+            attempt_count: u32::try_from(row.attempt_count.max(0)).unwrap_or(u32::MAX),
+            first_attempt_at: row.first_attempt_at,
+            next_retry_at: row.next_retry_at,
+        }
+    }
+}
+
+/// Row of the three thumbnail-source pages and of `find_local_thumbnail_source`: the preferred
+/// local file of an item plus the library strategy and scraper the thumbnail worker needs.
 #[derive(Debug, sqlx::FromRow)]
 struct ThumbnailSourceRow {
     item_id: String,
@@ -870,23 +894,14 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredThumbnailScraperRetry>, StorageError> {
-        self.query(
+        self.query_as::<ThumbnailScraperRetryRow>(
             "SELECT item_id, status, attempt_count, first_attempt_at, next_retry_at
              FROM thumbnail_scraper_retries WHERE item_id = ?",
         )
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredThumbnailScraperRetry {
-                item_id: row.get("item_id"),
-                status: row.get("status"),
-                attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
-                    .unwrap_or(u32::MAX),
-                first_attempt_at: row.get("first_attempt_at"),
-                next_retry_at: row.get("next_retry_at"),
-            })
-        })
+        .map(|row| row.map(StoredThumbnailScraperRetry::from))
         .map_err(self.sqlx_err())
     }
 
@@ -899,7 +914,7 @@ impl Database {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let rows = self
-            .query(
+            .query_as::<ThumbnailScraperRetryRow>(
                 "SELECT item_id, status, attempt_count, first_attempt_at, next_retry_at
                  FROM thumbnail_scraper_retries
                  WHERE (status = 'PENDING' AND next_retry_at <= ?)
@@ -918,7 +933,7 @@ impl Database {
             let placeholders = std::iter::repeat_n("?", rows.len())
                 .collect::<Vec<_>>()
                 .join(", ");
-            let mut update = self.query(sqlx::AssertSqlSafe(format!(
+            let mut update = self.query_scalar::<String>(sqlx::AssertSqlSafe(format!(
                 "UPDATE thumbnail_scraper_retries
                  SET status = 'RUNNING', claimed_until = ?, updated_at = ?
                  WHERE item_id IN ({placeholders}) AND (
@@ -929,7 +944,7 @@ impl Database {
             )));
             update = update.bind(claimed_until).bind(now);
             for row in &rows {
-                update = update.bind(row.get::<String, _>("item_id"));
+                update = update.bind(&row.item_id);
             }
             let claimed_ids = update
                 .bind(now)
@@ -938,20 +953,13 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?
                 .into_iter()
-                .map(|row| row.get::<String, _>("item_id"))
                 .collect::<std::collections::HashSet<_>>();
             // RETURNING has no ordering guarantee; retain the original due-time order.
             for row in rows {
-                let item_id: String = row.get("item_id");
-                if claimed_ids.contains(&item_id) {
-                    claimed.push(StoredThumbnailScraperRetry {
-                        item_id,
-                        status: "RUNNING".to_owned(),
-                        attempt_count: u32::try_from(row.get::<i64, _>("attempt_count").max(0))
-                            .unwrap_or(u32::MAX),
-                        first_attempt_at: row.get("first_attempt_at"),
-                        next_retry_at: row.get("next_retry_at"),
-                    });
+                if claimed_ids.contains(&row.item_id) {
+                    let mut retry = StoredThumbnailScraperRetry::from(row);
+                    retry.status = "RUNNING".to_owned();
+                    claimed.push(retry);
                 }
             }
         }
@@ -1009,7 +1017,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<StoredThumbnailSource>, StorageError> {
-        self.query(
+        self.query_as::<ThumbnailSourceRow>(
             "SELECT ms.item_id, mi.item_type, lr.canonical_path AS root_path, fe.relative_path,
                     l.media_strategy_json AS library_media_strategy_json, l.scraper_id
              FROM media_sources ms
@@ -1025,16 +1033,7 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| {
-            row.map(|row| StoredThumbnailSource {
-                item_id: row.get("item_id"),
-                item_type: row.get("item_type"),
-                root_path: row.get("root_path"),
-                relative_path: row.get("relative_path"),
-                library_media_strategy_json: row.get("library_media_strategy_json"),
-                scraper_id: row.get("scraper_id"),
-            })
-        })
+        .map(|row| row.map(StoredThumbnailSource::from))
         .map_err(self.sqlx_err())
     }
 
@@ -12262,6 +12261,108 @@ mod tests {
             matches!(error, sqlx::Error::ColumnNotFound(_)),
             "unexpected decode error: {error}"
         );
+        Ok(())
+    }
+}
+
+/// Decoding tests for the thumbnail retry queue and the local thumbnail source projection.
+#[cfg(test)]
+mod thumbnail_row_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn thumbnail_retry_and_source_rows_decode_their_queries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind, scraper_id, media_strategy_json)
+                 VALUES ('thumb-lib', 'Thumb', 'MOVIE', 'scraper-a', '{\"preferLocal\":true}');
+                 INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('thumb-root', 'thumb-lib', '/thumb', '/thumb', 1, 1);
+                 INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES ('thumb-file', 'thumb-root', 'Movies/movie.mkv', 'FILE', 10, 10, 'gen');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES (
+                     'thumb-item', 'thumb-lib', 'MOVIE', 'Movie', 'movie', 'LOCAL_CONFIRMED', 1
+                 );
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default
+                 ) VALUES ('thumb-source', 'thumb-item', 'LOCAL_FILE', 'thumb-file', 1)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let source = database
+            .find_local_thumbnail_source("thumb-item")
+            .await?
+            .expect("local thumbnail source");
+        assert_eq!(source.item_id, "thumb-item");
+        assert_eq!(source.item_type, "MOVIE");
+        assert_eq!(source.root_path, "/thumb");
+        assert_eq!(source.relative_path, "Movies/movie.mkv");
+        assert_eq!(
+            source.library_media_strategy_json.as_deref(),
+            Some("{\"preferLocal\":true}")
+        );
+        assert_eq!(source.scraper_id.as_deref(), Some("scraper-a"));
+        assert!(
+            database
+                .find_local_thumbnail_source("missing")
+                .await?
+                .is_none()
+        );
+
+        assert!(
+            database
+                .ensure_thumbnail_scraper_retry("thumb-item", 100, 200)
+                .await?
+        );
+        let retry = database
+            .find_thumbnail_scraper_retry("thumb-item")
+            .await?
+            .expect("retry row");
+        assert_eq!(retry.status, "PENDING");
+        assert_eq!(retry.attempt_count, 1);
+        assert_eq!(retry.first_attempt_at, 100);
+        assert_eq!(retry.next_retry_at, Some(200));
+
+        let claimed = database
+            .claim_due_thumbnail_scraper_retries(200, 300, 10)
+            .await?;
+        assert_eq!(claimed.len(), 1);
+        assert_eq!(claimed[0].item_id, "thumb-item");
+        assert_eq!(claimed[0].status, "RUNNING");
+        assert_eq!(claimed[0].attempt_count, 1);
+        assert_eq!(claimed[0].first_attempt_at, 100);
+        assert_eq!(claimed[0].next_retry_at, Some(200));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn thumbnail_row_structs_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let errors = [
+            ThumbnailScraperRetryRow::from_row(&row).expect_err("retry columns must not decode"),
+            ThumbnailSourceRow::from_row(&row).expect_err("thumbnail source columns must decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
         Ok(())
     }
 }
