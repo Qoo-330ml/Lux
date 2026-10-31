@@ -332,6 +332,22 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   缓解：聚合写入放在 `for` 之后、错误返回之前，并保留 `?` 之前的部分写入（把写事务放在错误处理之外）。
 - **是否值得做**：**高**。这是刮削路径最常见的用户操作。
 
+- **已实施：提交 `e2c94757`**。`search_and_store_with_mode` 的候选循环只把
+  `(provider, provider_id)` 的能力结果/瞬时失败收集到 `Vec<MetadataCapabilityWrite>`，循环结束后调用一次
+  `Database::record_metadata_capability_writes`（`src/storage/metadata.rs`，单写锁 + 单事务，按候选顺序先写
+  results 再写 retry 行，`attempt_count` 的递增基数与逐候选写入时相同）。逐候选入口
+  `record_metadata_capability_results` / `_failures` 保持原语义，降为 `#[cfg(test)]`（只给存储测试用）。
+  - 20 候选手动搜索（每候选 3 项能力）：`metadata_capability_attempts` 写入事务 **20–40 → 1**；
+    整次搜索的元数据写事务 **21 → 2**（能力表 1 + 候选 upsert 1），用第 2.2 节新增的
+    `Database::metadata_write_transaction_count()` 断言。
+  - 语句数不变（每候选 1 条多行 upsert，共 20 条；无瞬时失败时），减少的是提交/`BEGIN IMMEDIATE` 次数。
+  - 失败语义按上面"缓解"执行：循环内的 `?` 改为先 flush 已收集的能力写入、再返回错误，因此"后续候选让整个搜索报错"时
+    已抓到的能力行仍然落库（与改造前一致）。
+  - 测试：`application::candidates::tests::manual_candidate_search_commits_capability_rows_once`、
+    `storage::repository::repository_tests::capability_writes_for_a_whole_search_commit_once`。
+  - 未覆盖：`mark_metadata_images_unavailable`（响应里没有图片时的 `NO_IMAGE` 兜底）仍在循环内，每个这种候选
+    各 1 次提交；TMDb 正常返回图片时不触发，留给后续批次。
+
 ### S2 备份 scraper 循环内重复读条目元数据（已读代码确认）
 
 - **位置**：`src/application/reidentify.rs:2144-2150`（`for scraper in scrapers.iter().filter(backup/both)` 内
