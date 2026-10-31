@@ -529,6 +529,109 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of `list_chapter_detection_sources_page`: one eligible episode source plus whatever the
+/// per-plugin detection state already records. Every `state_*` column comes from a `LEFT JOIN`, so
+/// a source without a state row decodes with `state_status = None` and the other state columns
+/// unconsumed.
+#[derive(Debug, sqlx::FromRow)]
+struct ChapterDetectionSourceRow {
+    source_id: String,
+    item_id: String,
+    season_id: String,
+    fingerprint: Option<Vec<u8>>,
+    relative_path: String,
+    size: i64,
+    modified_at: i64,
+    device: Option<i64>,
+    inode: Option<i64>,
+    duration_ticks: Option<i64>,
+    provider_ids_json: Option<String>,
+    series_provider_ids_json: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+    state_status: Option<String>,
+    state_input_fingerprint: Option<Vec<u8>>,
+    state_last_checked_at: Option<i64>,
+    state_next_retry_at: Option<i64>,
+    state_intro_fingerprint: Option<Vec<u8>>,
+    state_credits_fingerprint: Option<Vec<u8>>,
+}
+
+impl From<ChapterDetectionSourceRow> for StoredChapterDetectionSource {
+    fn from(row: ChapterDetectionSourceRow) -> Self {
+        // The state table declares input_fingerprint/status/last_checked_at NOT NULL; the
+        // defaults only cover a row whose pointer columns are inconsistent with that schema.
+        let state = row
+            .state_status
+            .map(|status| StoredChapterDetectionSourceState {
+                input_fingerprint: row.state_input_fingerprint.unwrap_or_default(),
+                status,
+                last_checked_at: row.state_last_checked_at.unwrap_or_default(),
+                next_retry_at: row.state_next_retry_at,
+                intro_fingerprint: row.state_intro_fingerprint,
+                credits_fingerprint: row.state_credits_fingerprint,
+            });
+        Self {
+            source_id: row.source_id,
+            item_id: row.item_id,
+            season_id: row.season_id,
+            fingerprint: row.fingerprint,
+            relative_path: row.relative_path,
+            size: row.size,
+            modified_at: row.modified_at,
+            device: row.device,
+            inode: row.inode,
+            duration_ticks: row.duration_ticks,
+            provider_ids_json: row.provider_ids_json,
+            series_provider_ids_json: row.series_provider_ids_json,
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+            state,
+        }
+    }
+}
+
+/// Row of `list_pending_chapter_detection_items`: one queued detection item plus the source, item
+/// and file facts the worker re-checks before running.
+#[derive(Debug, sqlx::FromRow)]
+struct ChapterDetectionItemRow {
+    source_id: String,
+    season_id: String,
+    source_fingerprint: Option<Vec<u8>>,
+    input_fingerprint: Vec<u8>,
+    is_context: i64,
+    intro_fingerprint: Option<Vec<u8>>,
+    credits_fingerprint: Option<Vec<u8>>,
+    duration_ticks: Option<i64>,
+    root_path: String,
+    relative_path: String,
+    provider_ids_json: Option<String>,
+    series_provider_ids_json: Option<String>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+}
+
+impl From<ChapterDetectionItemRow> for StoredChapterDetectionItem {
+    fn from(row: ChapterDetectionItemRow) -> Self {
+        Self {
+            source_id: row.source_id,
+            season_id: row.season_id,
+            source_fingerprint: row.source_fingerprint,
+            input_fingerprint: row.input_fingerprint,
+            is_context: row.is_context != 0,
+            intro_fingerprint: row.intro_fingerprint,
+            credits_fingerprint: row.credits_fingerprint,
+            duration_ticks: row.duration_ticks,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+            provider_ids_json: row.provider_ids_json,
+            series_provider_ids_json: row.series_provider_ids_json,
+            season_number: row.season_number,
+            episode_number: row.episode_number,
+        }
+    }
+}
+
 /// Row of `list_series_metadata_sources_page` and its incremental-scan twin: one episode source
 /// with the series/season identity and the file path the metadata worker needs.
 #[derive(Debug, sqlx::FromRow)]
@@ -5838,7 +5941,7 @@ impl Database {
         let limit = limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE);
         let rows = if require_fingerprint {
             let mut query = self
-                .query(sqlx::AssertSqlSafe(query_with_fingerprint))
+                .query_as::<ChapterDetectionSourceRow>(sqlx::AssertSqlSafe(query_with_fingerprint))
                 .bind(plugin_id)
                 .bind(library_id);
             for source_kind in supported_media_source_kinds {
@@ -5852,7 +5955,9 @@ impl Database {
                 .await
         } else {
             let mut query = self
-                .query(sqlx::AssertSqlSafe(query_without_fingerprint))
+                .query_as::<ChapterDetectionSourceRow>(sqlx::AssertSqlSafe(
+                    query_without_fingerprint,
+                ))
                 .bind(plugin_id)
                 .bind(library_id);
             for source_kind in supported_media_source_kinds {
@@ -5867,32 +5972,7 @@ impl Database {
         };
         rows.map_err(self.sqlx_err()).map(|rows| {
             rows.into_iter()
-                .map(|row| StoredChapterDetectionSource {
-                    source_id: row.get("source_id"),
-                    item_id: row.get("item_id"),
-                    season_id: row.get("season_id"),
-                    fingerprint: row.get("fingerprint"),
-                    relative_path: row.get("relative_path"),
-                    size: row.get("size"),
-                    modified_at: row.get("modified_at"),
-                    device: row.get("device"),
-                    inode: row.get("inode"),
-                    duration_ticks: row.get("duration_ticks"),
-                    provider_ids_json: row.get("provider_ids_json"),
-                    series_provider_ids_json: row.get("series_provider_ids_json"),
-                    season_number: row.get("season_number"),
-                    episode_number: row.get("episode_number"),
-                    state: row.get::<Option<String>, _>("state_status").map(|status| {
-                        StoredChapterDetectionSourceState {
-                            input_fingerprint: row.get("state_input_fingerprint"),
-                            status,
-                            last_checked_at: row.get("state_last_checked_at"),
-                            next_retry_at: row.get("state_next_retry_at"),
-                            intro_fingerprint: row.get("state_intro_fingerprint"),
-                            credits_fingerprint: row.get("state_credits_fingerprint"),
-                        }
-                    }),
-                })
+                .map(StoredChapterDetectionSource::from)
                 .collect()
         })
     }
@@ -5942,23 +6022,16 @@ impl Database {
                ))
              GROUP BY season.id"
         );
-        let mut statement = self.query(sqlx::AssertSqlSafe(query)).bind(library_id);
+        let mut statement = self
+            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(query))
+            .bind(library_id);
         for source_kind in supported_media_source_kinds {
             statement = statement.bind(source_kind);
         }
         statement
             .fetch_all(&self.pool)
             .await
-            .map(|rows| {
-                rows.into_iter()
-                    .map(|row| {
-                        (
-                            row.get::<String, _>("season_id"),
-                            row.get::<i64, _>("source_count"),
-                        )
-                    })
-                    .collect()
-            })
+            .map(|rows| rows.into_iter().collect())
             .map_err(self.sqlx_err())
     }
 
@@ -6328,7 +6401,9 @@ impl Database {
              ORDER BY cdi.season_id, cdi.source_id
              LIMIT ?"
         );
-        let mut query = self.query(sqlx::AssertSqlSafe(query)).bind(job_id);
+        let mut query = self
+            .query_as::<ChapterDetectionItemRow>(sqlx::AssertSqlSafe(query))
+            .bind(job_id);
         for source_kind in supported_media_source_kinds {
             query = query.bind(source_kind);
         }
@@ -6338,22 +6413,7 @@ impl Database {
             .await
             .map(|rows| {
                 rows.into_iter()
-                    .map(|row| StoredChapterDetectionItem {
-                        source_id: row.get("source_id"),
-                        season_id: row.get("season_id"),
-                        source_fingerprint: row.get("source_fingerprint"),
-                        input_fingerprint: row.get("input_fingerprint"),
-                        is_context: row.get::<i64, _>("is_context") != 0,
-                        intro_fingerprint: row.get("intro_fingerprint"),
-                        credits_fingerprint: row.get("credits_fingerprint"),
-                        duration_ticks: row.get("duration_ticks"),
-                        root_path: row.get("root_path"),
-                        relative_path: row.get("relative_path"),
-                        provider_ids_json: row.get("provider_ids_json"),
-                        series_provider_ids_json: row.get("series_provider_ids_json"),
-                        season_number: row.get("season_number"),
-                        episode_number: row.get("episode_number"),
-                    })
+                    .map(StoredChapterDetectionItem::from)
                     .collect()
             })
             .map_err(self.sqlx_err())
@@ -12698,6 +12758,152 @@ mod series_metadata_source_row_decoding_tests {
             matches!(error, sqlx::Error::ColumnNotFound(_)),
             "unexpected decode error: {error}"
         );
+        Ok(())
+    }
+}
+
+/// Decoding tests for the chapter-detection source and pending-item projections.
+#[cfg(test)]
+mod chapter_detection_row_decoding_tests {
+    use super::*;
+
+    async fn insert_detection_fixture(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind)
+                 VALUES ('cd-lib', 'Detection', 'SERIES');
+                 INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('cd-root', 'cd-lib', '/cd', '/cd', 1, 1);
+                 INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation, fingerprint
+                 ) VALUES (
+                     'cd-file', 'cd-root', 'S01E01.mkv', 'FILE', 10, 10, 'gen', X'01'
+                 );
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('cd-series', 'cd-lib', 'SERIES', 'Series', 'series',
+                      'LOCAL_CONFIRMED', 1),
+                     ('cd-season', 'cd-lib', 'SEASON', 'Season 1', 'season 1',
+                      'LOCAL_CONFIRMED', 1),
+                     ('cd-episode', 'cd-lib', 'EPISODE', 'Episode 1', 'episode 1',
+                      'LOCAL_CONFIRMED', 1);
+                 UPDATE media_items
+                 SET series_id = 'cd-series', season_number = 1
+                 WHERE id = 'cd-season';
+                 UPDATE media_items
+                 SET series_id = 'cd-series', parent_id = 'cd-season', season_number = 1,
+                     episode_number = 1
+                 WHERE id = 'cd-episode';
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, duration_ticks, is_default
+                 ) VALUES (
+                     'cd-source', 'cd-episode', 'LOCAL_FILE', 'cd-file', 36000000000, 1
+                 );
+                 INSERT INTO chapter_detection_source_states (
+                     source_id, plugin_id, input_fingerprint, status, last_checked_at,
+                     next_retry_at, intro_fingerprint
+                 ) VALUES (
+                     'cd-source', 'plugin-a', X'02', 'FOUND', 500, 600, X'03'
+                 );
+                 INSERT INTO chapter_detection_jobs (
+                     id, library_id, plugin_id, status, concurrency, intro_window_seconds,
+                     credits_window_seconds, match_threshold, total_count
+                 ) VALUES ('cd-job', 'cd-lib', 'plugin-a', 'PENDING', 2, 15, 15, 0.5, 1);
+                 INSERT INTO chapter_detection_job_items (
+                     job_id, source_id, item_id, season_id, source_fingerprint, status,
+                     input_fingerprint, is_context
+                 ) VALUES (
+                     'cd-job', 'cd-source', 'cd-episode', 'cd-season', X'01', 'PENDING',
+                     X'02', 1
+                 )",
+            )
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chapter_detection_rows_decode_sources_items_and_states()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        insert_detection_fixture(&database).await?;
+
+        let sources = database
+            .list_chapter_detection_sources_page(
+                "cd-lib",
+                "plugin-a",
+                None,
+                10,
+                true,
+                &["LOCAL_FILE".to_owned()],
+            )
+            .await?;
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.source_id, "cd-source");
+        assert_eq!(source.item_id, "cd-episode");
+        assert_eq!(source.season_id, "cd-season");
+        assert_eq!(source.fingerprint.as_deref(), Some(&b"\x01"[..]));
+        assert_eq!(source.relative_path, "S01E01.mkv");
+        assert_eq!(source.size, 10);
+        assert_eq!(source.modified_at, 10);
+        assert_eq!(source.duration_ticks, Some(36_000_000_000));
+        assert_eq!(source.season_number, Some(1));
+        assert_eq!(source.episode_number, Some(1));
+        let state = source.state.as_ref().expect("detection state");
+        assert_eq!(state.input_fingerprint, b"\x02");
+        assert_eq!(state.status, "FOUND");
+        assert_eq!(state.last_checked_at, 500);
+        assert_eq!(state.next_retry_at, Some(600));
+        assert_eq!(state.intro_fingerprint.as_deref(), Some(&b"\x03"[..]));
+
+        let items = database
+            .list_pending_chapter_detection_items("cd-job", 10, &["LOCAL_FILE".to_owned()])
+            .await?;
+        assert_eq!(items.len(), 1);
+        let item = &items[0];
+        assert_eq!(item.source_id, "cd-source");
+        assert_eq!(item.season_id, "cd-season");
+        assert_eq!(item.source_fingerprint.as_deref(), Some(&b"\x01"[..]));
+        assert_eq!(item.input_fingerprint, b"\x02");
+        assert!(item.is_context);
+        assert_eq!(item.intro_fingerprint.as_deref(), Some(&b"\x03"[..]));
+        assert_eq!(item.credits_fingerprint, None);
+        assert_eq!(item.duration_ticks, Some(36_000_000_000));
+        assert_eq!(item.root_path, "/cd");
+        assert_eq!(item.relative_path, "S01E01.mkv");
+        assert_eq!(item.season_number, Some(1));
+        assert_eq!(item.episode_number, Some(1));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn chapter_detection_row_structs_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let errors = [
+            ChapterDetectionSourceRow::from_row(&row)
+                .expect_err("detection source columns must not decode"),
+            ChapterDetectionItemRow::from_row(&row)
+                .expect_err("detection item columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
         Ok(())
     }
 }
