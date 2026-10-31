@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -119,6 +119,23 @@ impl ReadModelMode {
             "off" => Self::Off,
             "shadow" => Self::Shadow,
             _ => Self::On,
+        }
+    }
+
+    /// Compact form for the shared atomic the library page cache keeps next to its owner.
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Shadow => 1,
+            Self::On => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            2 => Self::On,
+            1 => Self::Shadow,
+            _ => Self::Off,
         }
     }
 }
@@ -278,6 +295,11 @@ struct LibraryPageCache {
     access: MediaAccessService,
     search_flights: Arc<SearchFlightRegistry>,
     read_model_ready: Arc<AtomicBool>,
+    /// The owner's read-model switch, as registered by [`CatalogService::with_read_model_mode`].
+    ///
+    /// The cache is shared through an `Arc`, so the last call wins for every handle of the same
+    /// service tree — which is what the app wiring does once at startup.
+    read_model_mode: AtomicU8,
 }
 
 impl LibraryPageCache {
@@ -297,6 +319,7 @@ impl LibraryPageCache {
             access,
             search_flights,
             read_model_ready,
+            read_model_mode: AtomicU8::new(ReadModelMode::Off.as_u8()),
         });
         let worker_cache = Arc::downgrade(&cache);
         tokio::spawn(async move {
@@ -326,10 +349,28 @@ impl LibraryPageCache {
             library_page_cache: self.clone(),
             search_flights: self.search_flights.clone(),
             recommendation_compute_lock: Arc::new(Mutex::new(())),
-            read_model_mode: ReadModelMode::Off,
+            read_model_mode: self.refresh_read_model_mode(),
             read_model_ready: self.read_model_ready.clone(),
         };
         self.refresh_entries(&service).await;
+    }
+
+    fn set_read_model_mode(&self, mode: ReadModelMode) {
+        self.read_model_mode.store(mode.as_u8(), Ordering::Release);
+    }
+
+    /// The read-model mode the warm-up runs with.
+    ///
+    /// `on` and `off` are taken as-is so a warm page has the same source as the request path that
+    /// will read it. `shadow` is deliberately downgraded to `off`: shadow serves exactly the
+    /// authoritative page `off` serves, and only adds the comparison query plus the mismatch log.
+    /// A warm-up result is never compared by anyone, so running shadow here would pay a second
+    /// page query per warmed entry for a log line about a page that is then thrown away.
+    fn refresh_read_model_mode(&self) -> ReadModelMode {
+        match ReadModelMode::from_u8(self.read_model_mode.load(Ordering::Acquire)) {
+            ReadModelMode::Shadow => ReadModelMode::Off,
+            mode => mode,
+        }
     }
 
     async fn entry(
@@ -486,8 +527,13 @@ pub struct CatalogItemCounts {
 }
 
 impl CatalogService {
+    /// Switch the read model for this service *and* for its library page warm-up.
+    ///
+    /// The cache owns the warm-up service and is shared through an `Arc`, so this is the single
+    /// place that keeps the request path and the background refresh on the same source.
     pub fn with_read_model_mode(mut self, mode: ReadModelMode) -> Self {
         self.read_model_mode = mode;
+        self.library_page_cache.set_read_model_mode(mode);
         self
     }
 
@@ -3459,8 +3505,7 @@ mod tests {
 
     use crate::{
         application::access::AccessPrincipal,
-        application::recommendations::daily_recommendation_items,
-        storage::Database,
+        application::recommendations::daily_recommendation_items, storage::Database,
     };
 
     use super::{
@@ -6366,7 +6411,8 @@ mod tests {
     #[tokio::test]
     async fn library_page_refresh_uses_the_configured_read_model_mode()
     -> Result<(), Box<dyn std::error::Error>> {
-        let (_directory, database, principal, library_id) = read_model_library_page_fixture().await?;
+        let (_directory, database, principal, library_id) =
+            read_model_library_page_fixture().await?;
         let catalog = super::CatalogService::new(
             database.clone(),
             crate::application::access::MediaAccessService::new(database.clone()),
@@ -6392,9 +6438,11 @@ mod tests {
         );
 
         // Rename both sources so the refreshed page names the source it was read from.
-        sqlx::query("UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'")
-            .execute(database.pool())
-            .await?;
+        sqlx::query(
+            "UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
         sqlx::query(
             "UPDATE catalog_items SET title = 'Derived v2'
              WHERE item_id = 'refresh-mode-item'",
@@ -6419,6 +6467,75 @@ mod tests {
         assert_eq!(
             refreshed.items[0].title, "Derived v2",
             "the background refresh must keep reading the read model when the service runs with mode=on"
+        );
+        Ok(())
+    }
+
+    /// `shadow` serves the authoritative page, so the warm-up keeps that same source; running the
+    /// comparison there would add a second page query per warmed entry for a log nobody reads.
+    #[tokio::test]
+    async fn library_page_refresh_skips_the_shadow_comparison()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, principal, library_id) =
+            read_model_library_page_fixture().await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::Shadow);
+        let cache = catalog.library_page_cache.clone();
+        assert_eq!(
+            cache.refresh_read_model_mode(),
+            super::ReadModelMode::Off,
+            "the warm-up must not pay the shadow comparison query"
+        );
+        let filter = refresh_mode_filter();
+
+        let seeded = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            seeded.items[0].title, "Authoritative title",
+            "shadow serves the authoritative page"
+        );
+
+        sqlx::query(
+            "UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived v2'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        catalog.invalidate_library_pages();
+        cache.refresh_all().await;
+
+        let refreshed = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            refreshed.items[0].title, "Authoritative v2",
+            "a shadow warm-up keeps the authoritative page and skips the comparison"
         );
         Ok(())
     }
