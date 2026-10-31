@@ -225,18 +225,19 @@ cargo test --locked --lib notification
    - 若 `pool()` 返回 1 连接写池：`tests/performance.rs` 在扫描基准期间长期持有唯一写连接，
      所有 `Database` 写入会等满 10 s `acquire_timeout` 后失败；`tests/storage/storage.rs`
      持有事务时同理。这不是行为不变，而是直接让冻结测试失败。
-   - 若 `pool()` 返回读池：冻结测试的夹具写入落到第二个池，单写者假设被破坏；`:memory:` 场景会读到空库。
+   - 若 `pool()` 返回读池：冻结测试的夹具写入落到被当作只读的池，单写者假设被破坏；如果读池还以只读方式
+     打开（`mode=ro` 或 `PRAGMA query_only`），这些写入会直接报错。
 3. **事务语义会被拆散。** 除 78 处直接 `begin()` 外，还有大量"先 `fetch` 再 `execute`"的读写混合事务
    （`BEGIN IMMEDIATE` 正是为 `SQLITE_BUSY_SNAPSHOT` 存在）。只要有一个事务入口漏改到读池，
    就有两个池同时写同一文件，`SQLITE_BUSY_SNAPSHOT` 与锁竞争回归；`src/storage/users.rs` 的
    `SQLITE_USER_UPDATE_RETRY_DELAY`（50 ms）/ `SQLITE_USER_UPDATE_RETRY_WINDOW`（5 s）补丁也就不能删。
 4. **读池不是零成本。** 长读事务会挡住 WAL checkpoint；`Database::close` 现在只关一个池并执行
    `PRAGMA wal_checkpoint(TRUNCATE)`（要求没有读者），拆开后要设计写池→读池的关停顺序与失败处理。
-5. **测试与 PostgreSQL 路径要先改语义。** `Database::connect` 只用文件库，但 `:memory:` 在测试里
+5. **测试与 PostgreSQL 路径要先改语义。** `Database::connect` 只用文件库，`:memory:` 目前只在测试里
    以裸池形式存在（`repository_tests.rs`、`tests/storage/storage.rs`、
-   `tests/auth_users/account_preferences_migration.rs`），双池在 `:memory:` 下必然读到空库；
-   PostgreSQL 的 `test_configuration` 与 `begin_scan_write_transaction` 的
-   `SET LOCAL synchronous_commit = off` 也假设单一池。
+   `tests/auth_users/account_preferences_migration.rs`），因此本轮不受影响；但若以后给 `Database`
+   加 `:memory:` 路径，双池会各建一个独立内存库，读池读到空库。PostgreSQL 的 `test_configuration`
+   与 `begin_scan_write_transaction` 的 `SET LOCAL synchronous_commit = off` 也假设单一池。
 
 ### 9.3 结论与后续建议
 
