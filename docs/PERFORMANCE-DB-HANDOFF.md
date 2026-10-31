@@ -89,7 +89,7 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 | W2 | 读写共用一个 8 连接池；已有 `BEGIN IMMEDIATE` 与 50 ms 重试补丁 | `SQLITE_DATABASE_POOL_MAX_CONNECTIONS = 8`（`repository.rs` 约 390 行）；`begin_metadata_write_transaction`（约 1305 行）；`storage/users.rs` 的 `SQLITE_USER_UPDATE_RETRY_*` | 拆成"1 个写连接 + N 个只读连接"，可去掉 `SQLITE_BUSY_SNAPSHOT` 的补丁 | 需要先有统一的访问层入口；`Database` 拆分试点结论是不全面推广，见第九节 |
 | W3 | UPDATE 几乎没有"值未变则不写"保护：312 条里只有 21 条带 `IS NOT` 之类的保护 | `media_items` 18 条、`media_sources` 14 条、`filesystem_entries` 15 条 | 重扫、元数据回写这类大概率无变化的路径加保护条件 | SQLite 的 ON CONFLICT 即使值相同也会写页并触发触发器 |
 | W4 | `media_items` 写放大：约 18 个索引、6 个触发器 | `migrations/` | 用 dbstat 或查询计划找出无人使用的索引，逐个删除 | 需要实测；删索引要走迁移，且 PG 迁移要配对（`scripts/check-migration-parity.py`） |
-| W5 | `user_series_next` 先 DELETE 再 INSERT | `src/storage/user_series_next.rs` | 改成单条 UPSERT，找不到下一集时才 DELETE | 与 P2 同一处 |
+| W5 | `user_series_next` 先 DELETE 再 INSERT | `src/storage/user_series_next.rs` | 改成单条 UPSERT，找不到下一集时才 DELETE | 与 P2 同一处。已实施（提交 `97fcf4ab` 测试、`388b66cc` 实现）：刷新改为「先读候选，再一条 `INSERT … ON CONFLICT(user_id, series_id) DO UPDATE … WHERE 值有变化`（`IS DISTINCT FROM`，SQLite/PG 同写法）」，只有候选为空才 DELETE；`rebuild_user_series_next` 也移进一个事务、只写有变化的行、只删候选集里没有的行（原来是事务外全表 `DELETE` 再重插，整表存在空窗）。无 schema 变更、无迁移。PG 只做静态核对（本机无 PostgreSQL）。代价：每条刷新多一次候选读取（2 条语句变 3 条），`rebuild` 多一次候选集计算。 |
 
 **进度写合并（会改变可见行为，必须先确认）**：位置 upsert 在内存里合并，每 30 秒或状态变化时落盘。代价：崩溃最多丢约
 30 秒进度；其他设备的"继续观看"位置晚到几十秒。
