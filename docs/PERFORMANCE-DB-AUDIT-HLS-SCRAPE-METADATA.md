@@ -1,6 +1,6 @@
 # HLS 转码 / 刮削（TMDb）/ 元数据写入的数据库行为审计
 
-日期：2026-11-06。基线：`test` 分支（含第三轮任务 A 的合并成果）。
+日期：2026-10-31。基线：`test` 分支（含第三轮任务 A 的合并成果）。
 范围：`src/` 内 HLS 转码、刮削（TMDb）、元数据写入三条路径的 SQL 行为。**只读审计，本文件不修改任何 `src` 代码。**
 来源：交接清单 `docs/PERFORMANCE-DB-HANDOFF.md` 第 7 节最后一条「HLS 转码、刮削、元数据写入的数据库行为：第二轮没有覆盖，值得单独审计」。
 
@@ -16,7 +16,7 @@
 **本文件没有任何运行时数字。** 所有"每次 X 条语句"是静态计数（对着代码数 `query/query_as/query_scalar/execute/begin`），
 不是采样结果；所有"每次播放 N 次提交"里，分片间隔取自代码常量（`HLS_SEGMENT_DURATION_TICKS = 4 s`，
 `src/application/playback/hls.rs:36`），清单刷新次数按 hls.js / Emby 客户端的标准行为**推测**。
-行号是 2026-11-06 的快照，后续重构会偏移，请用函数名重新定位。
+行号是 2026-10-31 的快照，后续重构会偏移，请用函数名重新定位。
 
 **简写约定**：为节省表格宽度，正文里的短路径按下表解析；`metadata.rs:` 一律指 `src/application/metadata.rs`，
 `src/storage/metadata.rs` 始终写全路径。
