@@ -141,6 +141,7 @@ impl From<TranscodingHistoryRow> for StoredTranscodingHistory {
 #[derive(Debug, sqlx::FromRow)]
 struct TranscodingSessionRow {
     session_id: String,
+    play_session_id: String,
     user_id: String,
     user_name: Option<String>,
     item_id: String,
@@ -161,6 +162,7 @@ impl From<TranscodingSessionRow> for StoredTranscodingSessionRow {
     fn from(row: TranscodingSessionRow) -> Self {
         Self {
             session_id: row.session_id,
+            play_session_id: row.play_session_id,
             user_id: row.user_id,
             user_name: row.user_name,
             item_id: row.item_id,
@@ -1337,13 +1339,15 @@ impl Database {
 
     /// Inserts one finished-transcode row; a session id is recorded at most once.
     ///
-    /// Rows older than [`TRANSCODING_HISTORY_RETENTION_SECONDS`] are dropped on the same call so
-    /// the table stays bounded without a background worker.
+    /// Rows older than [`TRANSCODING_HISTORY_RETENTION_SECONDS`] are dropped in the same
+    /// transaction so the table stays bounded without a background worker, and a stop pays one
+    /// commit instead of two.
     pub(crate) async fn insert_transcoding_history(
         &self,
         entry: NewTranscodingHistory<'_>,
     ) -> Result<(), StorageError> {
         let now = entry.now;
+        let mut transaction = self.begin_transcoding_history_transaction().await?;
         self.query(
             "INSERT INTO transcoding_history (
                  id, session_id, user_id, item_id, media_source_id, tier, outcome,
@@ -1368,18 +1372,22 @@ impl Database {
         .bind(entry.output_bytes)
         .bind(entry.failure_reason)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        let _ = self
+        if let Err(error) = self
             .query(
                 "DELETE FROM transcoding_history
                  WHERE finished_at < ?",
             )
             .bind(now.saturating_sub(TRANSCODING_HISTORY_RETENTION_SECONDS))
-            .execute(&self.pool)
-            .await;
-        Ok(())
+            .execute(&mut *transaction)
+            .await
+        {
+            // The prune is best effort; it must not cost the history row its commit.
+            tracing::warn!(%error, "failed to prune expired transcoding history rows");
+        }
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// One page of finished transcodes, newest first, with item title and user name.
@@ -1425,7 +1433,8 @@ impl Database {
         limit: i64,
     ) -> Result<Vec<StoredTranscodingSessionRow>, StorageError> {
         self.query_as::<TranscodingSessionRow>(
-            "SELECT w.id AS session_id, w.user_id, u.display_name AS user_name,
+            "SELECT w.id AS session_id, w.play_session_id, w.user_id,
+                    u.display_name AS user_name,
                     w.item_id, mi.title AS item_title, mi.item_type, w.tier, w.state,
                     w.expires_at, w.created_at, w.updated_at, w.video_codec, w.audio_codec,
                     w.audio_bitrate, w.transcoding_container
@@ -1836,6 +1845,7 @@ impl Database {
 
 pub(crate) struct StoredTranscodingSessionRow {
     pub(crate) session_id: String,
+    pub(crate) play_session_id: String,
     pub(crate) user_id: String,
     pub(crate) user_name: Option<String>,
     pub(crate) item_id: String,
@@ -2058,6 +2068,71 @@ mod tests {
         Ok(())
     }
 
+    /// The finished-transcode write and its retention prune share one commit.
+    ///
+    /// Every stop used to pay two autocommits, i.e. two fsyncs on `synchronous=FULL`; the write
+    /// path is judged by commit count, not by statement count
+    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2).
+    #[tokio::test]
+    async fn transcoding_history_write_and_prune_commit_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        insert_transcoding_fixtures(&database).await?;
+        sqlx::query(
+            "INSERT INTO transcoding_history (
+                 id, session_id, user_id, item_id, media_source_id, tier, outcome,
+                 started_at, finished_at, wall_seconds, encoded_seconds, average_speed,
+                 last_fps, output_bytes, failure_reason, created_at
+             ) VALUES ('history-old', 'play-session-old', 'user-a', 'item-a', NULL, 2,
+                       'COMPLETED', 1, 1, 1, NULL, NULL, NULL, NULL, NULL, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let now = TRANSCODING_HISTORY_RETENTION_SECONDS + 60;
+        database.reset_query_count();
+        database.reset_transcoding_history_transaction_count();
+        database
+            .insert_transcoding_history(NewTranscodingHistory {
+                id: "history-new",
+                session_id: "play-session-new",
+                user_id: "user-a",
+                item_id: "item-a",
+                media_source_id: None,
+                tier: 2,
+                outcome: "COMPLETED",
+                started_at: 1,
+                finished_at: now,
+                wall_seconds: 1,
+                encoded_seconds: None,
+                average_speed: None,
+                last_fps: None,
+                output_bytes: None,
+                failure_reason: None,
+                now,
+            })
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            2,
+            "the history insert and the retention delete"
+        );
+        assert_eq!(
+            database.transcoding_history_transaction_count(),
+            1,
+            "both statements must commit once instead of twice"
+        );
+
+        let (rows, total) = database.transcoding_history_page(10, 0).await?;
+        assert_eq!(total, 1, "the expired row was pruned");
+        assert_eq!(
+            rows.first().map(|row| row.id.as_str()),
+            Some("history-new"),
+            "the new row survives the same commit"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn active_server_transcoding_sessions_decodes_named_row_fields()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -2084,6 +2159,7 @@ mod tests {
             .first()
             .ok_or("transcoding session row was not returned")?;
         assert_eq!(row.session_id, "session-a");
+        assert_eq!(row.play_session_id, "play-a");
         assert_eq!(row.user_id, "user-a");
         assert_eq!(row.user_name.as_deref(), Some("User A"));
         assert_eq!(row.item_id, "item-a");

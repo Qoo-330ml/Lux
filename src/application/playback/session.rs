@@ -16,9 +16,10 @@ use uuid::Uuid;
 use crate::storage::{
     Database, NewAuditEvent, NewEmbyDirectPlaybackTicket, NewTranscodingHistory,
     NewUserActivityEvent, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult,
-    StorageError, StoredEmbyDirectPlaybackTicket, StoredWebPlaybackAccessContext,
-    StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
-    UserPlaybackPolicy, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    StorageError, StoredEmbyDirectPlaybackTicket, StoredTranscodingSessionRow,
+    StoredWebPlaybackAccessContext, StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery,
+    UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy, WebPlaybackEventClaim,
+    WebPlaybackTranscodingDetails,
 };
 
 use crate::application::transcoding::TranscodingSettings;
@@ -159,6 +160,22 @@ pub(crate) struct WebPlaybackStats {
     /// Measured from the newest closed segment, because the HLS muxer reports no bitrate.
     pub(crate) latest_segment_bitrate_kbps: Option<f64>,
     /// Total bytes written by this session, from the quota cache when it is fresh.
+    pub(crate) directory_bytes: Option<u64>,
+}
+
+/// One active server-side transcode as the admin panel renders it.
+///
+/// The stored columns come from the listing query the caller's poll already ran; everything else
+/// is the in-memory FFmpeg snapshot, so a poll costs one statement no matter how many sessions
+/// are running.
+pub(crate) struct LiveTranscodingSession {
+    pub(crate) row: StoredTranscodingSessionRow,
+    /// `false` once the row's deadline passed before the reaper collected it: the panel reports
+    /// the row without live progress instead of resurrecting an already expired session.
+    pub(crate) live: bool,
+    pub(crate) progress: Option<HlsProgressSnapshot>,
+    pub(crate) latest_segment_bitrate_kbps: Option<f64>,
+    /// Total bytes from the session's quota cache; it may lag [`super::hls`]'s five second TTL.
     pub(crate) directory_bytes: Option<u64>,
 }
 
@@ -1497,6 +1514,42 @@ impl WebPlaybackSessionService {
             latest_segment_bitrate_kbps,
             directory_bytes,
         })
+    }
+
+    /// Active server-side transcodes with their live FFmpeg snapshot, for the admin page.
+    ///
+    /// The panel polls every two seconds, so the answer is built from the single listing query
+    /// plus in-memory state: no per-session read of the row the listing already returned.
+    pub(crate) async fn live_transcoding_sessions(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<LiveTranscodingSession>, WebPlaybackSessionError> {
+        let rows = self
+            .database
+            .active_server_transcoding_sessions(limit)
+            .await?;
+        let now = unix_timestamp();
+        let mut sessions = Vec::with_capacity(rows.len());
+        for row in rows {
+            let live = row.expires_at > now;
+            let (progress, latest_segment_bitrate_kbps, directory_bytes) = if live {
+                (
+                    self.hls.progress(&row.session_id).await,
+                    self.hls.latest_segment_bitrate_kbps(&row.session_id).await,
+                    self.hls.session_bytes_cached(&row.session_id).await,
+                )
+            } else {
+                (None, None, None)
+            };
+            sessions.push(LiveTranscodingSession {
+                row,
+                live,
+                progress,
+                latest_segment_bitrate_kbps,
+                directory_bytes,
+            });
+        }
+        Ok(sessions)
     }
 
     pub(crate) async fn heartbeat(
@@ -3270,6 +3323,101 @@ mod tests {
                 .await
                 .expect_err("only the owner's live session exposes statistics");
             assert!(matches!(error, super::WebPlaybackSessionError::NotFound));
+        }
+        Ok(())
+    }
+
+    /// The admin panel polls this listing every two seconds, so its statement count must not grow
+    /// with the session count: the rows already carry every stored column the panel renders and
+    /// the rest of the answer is the in-memory FFmpeg snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn admin_transcoding_listing_costs_one_statement_regardless_of_session_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+        let owner_id = owner.id.to_string();
+        let now = unix_timestamp();
+        for (session_id, expires_at) in [
+            ("admin-live-a", now + 900),
+            ("admin-live-b", now + 900),
+            // The reaper may not have collected this one yet; the panel still lists the row but
+            // must not report live progress for it.
+            ("admin-expired", now - 1),
+        ] {
+            let play_session_id = format!("lux-web:{session_id}");
+            service
+                .database
+                .insert_web_playback_session(NewWebPlaybackSession {
+                    id: session_id,
+                    user_id: &owner_id,
+                    item_id: &item_id,
+                    media_source_id: None,
+                    play_session_id: &play_session_id,
+                    tier: i64::from(ServerTier::Remux.number()),
+                    plan: "SERVER_HLS",
+                    temp_dir: None,
+                    is_admin: false,
+                    expires_at,
+                    now,
+                })
+                .await?;
+        }
+
+        database.reset_query_count();
+        let listing = service.live_transcoding_sessions(24).await?;
+        assert_eq!(
+            database.query_count(),
+            1,
+            "one poll is one statement: the listing rows carry the session columns the panel \
+             shows and the FFmpeg snapshot lives in memory"
+        );
+        assert_eq!(listing.len(), 3, "all three active rows are listed");
+        assert_eq!(
+            listing.iter().filter(|session| session.live).count(),
+            2,
+            "only the rows inside their deadline have a live snapshot"
+        );
+        for session in &listing {
+            assert_eq!(
+                session.row.play_session_id,
+                format!("lux-web:{}", session.row.session_id),
+                "the stored play session id comes from the listing row"
+            );
+            assert!(session.progress.is_none(), "no FFmpeg was started here");
+            assert!(
+                session.directory_bytes.is_none(),
+                "no session directory exists"
+            );
+            assert_eq!(session.row.item_title.as_deref(), Some("Playback"));
+            assert_eq!(session.row.user_name.as_deref(), Some("Owner"));
         }
         Ok(())
     }

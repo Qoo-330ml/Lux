@@ -1503,6 +1503,19 @@ impl Database {
         transaction.map_err(self.sqlx_err())
     }
 
+    /// Starts the write transaction that records one finished transcode.
+    ///
+    /// The history insert and its retention prune commit together so a stop pays one commit
+    /// instead of two. The transaction opens deferred: its first statement is already a write, so
+    /// there is no read-then-upgrade risk on SQLite.
+    pub(crate) async fn begin_transcoding_history_transaction(
+        &self,
+    ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        #[cfg(test)]
+        transcoding_history_transaction_counter(&self.path).fetch_add(1, AtomicOrdering::Relaxed);
+        self.pool.begin().await.map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn begin_scan_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
@@ -1930,6 +1943,17 @@ impl Database {
         metadata_write_transaction_counter(&self.path).store(0, AtomicOrdering::Relaxed);
     }
 
+    /// How many finished-transcode write transactions this database started (test-only).
+    #[cfg(test)]
+    pub(crate) fn transcoding_history_transaction_count(&self) -> usize {
+        transcoding_history_transaction_counter(&self.path).load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_transcoding_history_transaction_count(&self) {
+        transcoding_history_transaction_counter(&self.path).store(0, AtomicOrdering::Relaxed);
+    }
+
     /// The change counters that the playback access cache stamps its entries with.
     ///
     /// The permission writes in this module bump these counters; the cache only reads them.
@@ -2027,8 +2051,21 @@ impl Database {
 /// size lint.
 #[cfg(test)]
 fn metadata_write_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
-    static COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
-        std::sync::OnceLock::new();
+    write_transaction_counter(path, "metadata")
+}
+
+#[cfg(test)]
+fn transcoding_history_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
+    write_transaction_counter(path, "transcoding_history")
+}
+
+#[cfg(test)]
+type WriteTransactionCounters =
+    std::sync::Mutex<HashMap<(PathBuf, &'static str), Arc<AtomicUsize>>>;
+
+#[cfg(test)]
+fn write_transaction_counter(path: &Path, kind: &'static str) -> Arc<AtomicUsize> {
+    static COUNTERS: std::sync::OnceLock<WriteTransactionCounters> = std::sync::OnceLock::new();
     let counters = COUNTERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
     let mut counters = match counters.lock() {
         Ok(counters) => counters,
@@ -2036,7 +2073,7 @@ fn metadata_write_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
     };
     Arc::clone(
         counters
-            .entry(path.to_path_buf())
+            .entry((path.to_path_buf(), kind))
             .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
     )
 }
