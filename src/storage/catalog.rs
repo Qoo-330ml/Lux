@@ -545,6 +545,16 @@ struct CatalogSearchPageBindings<'a> {
 /// canonical sort title and the alias subquery share the same pattern.
 const SEARCH_LIKE_BINDS: usize = 4;
 
+/// Server-side upper bound for one search page. Both HTTP front ends validate their own, smaller
+/// bounds (100 for the Lux API, `EMBY_MAX_PAGE_LIMIT` for Emby), so this cap never changes a
+/// request that is already valid; it keeps the storage entry point bounded for any future caller.
+pub(super) const SEARCH_MAX_PAGE_LIMIT: i64 = 1_000;
+
+/// Keeps a count-only request (`limit = 0`) at zero rows instead of turning it into a page.
+pub(super) fn clamped_search_page_limit(limit: i64) -> i64 {
+    limit.clamp(0, SEARCH_MAX_PAGE_LIMIT)
+}
+
 fn postgres_recent_catalog_rows_by_library_query(
     library_count: usize,
     content_restriction_predicate: &str,
@@ -1729,7 +1739,7 @@ impl Database {
             }
         }
         let rows = statement
-            .bind(bindings.limit)
+            .bind(clamped_search_page_limit(bindings.limit))
             .bind(bindings.offset)
             .fetch_all(&self.pool)
             .await
