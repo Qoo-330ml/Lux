@@ -36,7 +36,14 @@ const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
 const MAX_DELIVERY_ATTEMPTS: i64 = 8;
 const MAX_RETRY_DELAY_SECONDS: i64 = 7_200;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
-const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(5);
+/// Idle fallback for the delivery worker. Every in-process producer wakes it through
+/// [`WebhookService::delivery_notify`] as soon as a delivery row is committed, so this only covers a
+/// row written by a path that cannot notify (there is none today) and it can be slow.
+const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
+/// Retry cadence while an endpoint keeps failing. A failed attempt schedules the next one seconds
+/// later, so the worker stays on the old 5 s cadence until the queue drains instead of stretching
+/// every retry to the idle fallback.
+const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
 const HISTORY_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const HISTORY_RETENTION_SECONDS: i64 = 30 * 86_400;
 const HISTORY_RETENTION_BATCH_SIZE: i64 = 500;
@@ -150,6 +157,8 @@ pub struct WebhookService {
     server_id: String,
     plugins: Option<PluginService>,
     worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
+    /// Wakes the delivery worker as soon as [`Self::publish`] commits a delivery row.
+    delivery_notify: Arc<tokio::sync::Notify>,
 }
 
 async fn run_webhook_delivery_worker(
@@ -165,23 +174,35 @@ async fn run_webhook_delivery_worker(
             service.prune_history().await;
             last_retention_sweep = Some(Instant::now());
         }
-        match service.process_ready_deliveries().await {
+        let wait = match service.process_ready_deliveries().await {
             Ok(0) => {
-                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
-                    .await
+                if super::background_loop::wait_for_wake_or_shutdown(
+                    &mut shutdown,
+                    &service.delivery_notify,
+                    DELIVERY_POLL_INTERVAL,
+                )
+                .await
                 {
                     return;
                 }
+                continue;
             }
-            Ok(_) => {}
+            // Attempts were made; a requeued delivery is due in seconds, so stay on the short
+            // cadence until the ready queue actually drains.
+            Ok(_) => DELIVERY_RETRY_INTERVAL,
             Err(error) => {
                 tracing::error!(%error, "webhook delivery worker iteration failed");
-                if super::background_loop::wait_or_shutdown(&mut shutdown, DELIVERY_POLL_INTERVAL)
-                    .await
-                {
-                    return;
-                }
+                DELIVERY_POLL_INTERVAL
             }
+        };
+        if super::background_loop::wait_for_wake_or_shutdown(
+            &mut shutdown,
+            &service.delivery_notify,
+            wait,
+        )
+        .await
+        {
+            return;
         }
     }
 }
@@ -196,6 +217,7 @@ impl WebhookService {
             server_id,
             plugins: None,
             worker: Arc::new(tokio::sync::Mutex::new(None)),
+            delivery_notify: Arc::new(tokio::sync::Notify::new()),
         })
     }
 
@@ -578,8 +600,12 @@ impl WebhookService {
                     &destination_ids,
                 )
                 .await?;
-            if inserted && first_event_id.is_none() {
-                first_event_id = Some(event_id);
+            if inserted {
+                // Wake the delivery worker now instead of waiting for the idle fallback.
+                self.delivery_notify.notify_one();
+                if first_event_id.is_none() {
+                    first_event_id = Some(event_id);
+                }
             }
         }
         Ok(first_event_id)
@@ -1815,6 +1841,92 @@ mod tests {
     use serde_json::json;
     use std::time::{Duration, SystemTime};
     use url::Url;
+
+    /// The idle fallback must stay well above the old 5 s poll: the worker is woken by `publish`,
+    /// so the periodic wake only exists for a row no in-process publisher announced.
+    #[test]
+    fn the_idle_delivery_fallback_stays_at_least_thirty_seconds() {
+        assert!(
+            super::DELIVERY_POLL_INTERVAL >= Duration::from_secs(30),
+            "the idle delivery fallback must be at least 30 s"
+        );
+        assert!(
+            super::DELIVERY_RETRY_INTERVAL <= Duration::from_secs(5),
+            "a failing endpoint must keep the old retry cadence"
+        );
+    }
+
+    fn test_config_dir(temp_dir: &tempfile::TempDir) -> std::path::PathBuf {
+        temp_dir.path().join("config")
+    }
+
+    async fn test_database(
+        temp_dir: &tempfile::TempDir,
+    ) -> Result<crate::storage::Database, Box<dyn std::error::Error>> {
+        Ok(crate::storage::Database::connect(&crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: test_config_dir(temp_dir),
+        })
+        .await?)
+    }
+
+    /// A published event must reach the worker immediately: waiting for the idle fallback would
+    /// leave a notification unsent for up to 30 s, which is worse than the old 5 s poll.
+    #[tokio::test]
+    async fn publishing_an_event_wakes_the_delivery_worker()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        // A closed local port keeps the delivery attempt short: the worker records the failed
+        // attempt, which is what the test observes.
+        service
+            .create_destination("wake", "http://127.0.0.1:1/webhook", true, true, &[], None)
+            .await?;
+        service.spawn_worker().await;
+        let published = service
+            .publish(
+                WebhookEventType::JobFailed,
+                "wake-test",
+                super::unix_now(),
+                json!({"test": true}),
+            )
+            .await?;
+        assert!(published.is_some(), "the event must be recorded");
+
+        let started = std::time::Instant::now();
+        loop {
+            let attempted = service
+                .list_deliveries(0, 10)
+                .await?
+                .iter()
+                .any(|delivery| delivery.attempt_count >= 1);
+            if attempted {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(2),
+                "the worker must be woken by the enqueue, not by the idle fallback"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        service.shutdown().await;
+        Ok(())
+    }
+
+    /// Shutdown must not wait for the idle fallback.
+    #[tokio::test]
+    async fn shutdown_stops_the_delivery_worker_within_the_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        service.spawn_worker().await;
+        tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop an idle delivery worker");
+        Ok(())
+    }
 
     #[test]
     fn retry_after_accepts_seconds_and_caps_long_delays() {

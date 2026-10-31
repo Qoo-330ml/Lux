@@ -125,6 +125,26 @@ pub(crate) async fn wait_or_shutdown(
     }
 }
 
+/// Sleeps for `duration` or until `notify` fires, returning `true` when shutdown was requested.
+///
+/// This is the "event first, slow fallback second" wait: the loop is woken by the producer that
+/// enqueued work, and the periodic wake only exists for rows written by a path (or a process) that
+/// cannot notify.
+pub(crate) async fn wait_for_wake_or_shutdown(
+    shutdown: &mut watch::Receiver<bool>,
+    notify: &tokio::sync::Notify,
+    duration: Duration,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    tokio::select! {
+        () = tokio::time::sleep(duration) => *shutdown.borrow(),
+        () = notify.notified() => *shutdown.borrow(),
+        result = shutdown.changed() => result.is_err() || *shutdown.borrow(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::{

@@ -59,18 +59,14 @@ impl UserCleanupWorker {
         interval: Duration,
     ) -> Self {
         let worker = match tokio::runtime::Handle::try_current() {
-            Ok(_) => Some(BackgroundLoop::spawn(
-                "user_cleanup",
-                move |shutdown| {
-                    let database = database.clone();
-                    let avatars = avatars.clone();
-                    let config_dir = config_dir.clone();
-                    async move {
-                        run_user_cleanup_worker(database, avatars, config_dir, interval, shutdown)
-                            .await
-                    }
-                },
-            )),
+            Ok(_) => Some(BackgroundLoop::spawn("user_cleanup", move |shutdown| {
+                let database = database.clone();
+                let avatars = avatars.clone();
+                let config_dir = config_dir.clone();
+                async move {
+                    run_user_cleanup_worker(database, avatars, config_dir, interval, shutdown).await
+                }
+            })),
             // Without a runtime (checkout-style construction in tests) there is nothing to stop.
             Err(_) => None,
         };
@@ -230,7 +226,12 @@ mod tests {
 
     /// Builds a database, one expired activity row and the worker dependencies.
     async fn worker_fixture() -> Result<
-        (tempfile::TempDir, Database, UserAvatarService, Option<PathBuf>),
+        (
+            tempfile::TempDir,
+            Database,
+            UserAvatarService,
+            Option<PathBuf>,
+        ),
         Box<dyn std::error::Error>,
     > {
         let temp_dir = tempfile::tempdir()?;
