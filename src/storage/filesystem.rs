@@ -394,7 +394,11 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        self.restore_media_items_for_filesystem_entries(&mut transaction, &[update.id.to_owned()])
+        let restored = self
+            .restore_media_items_for_filesystem_entries_counted(
+                &mut transaction,
+                &[update.id.to_owned()],
+            )
             .await?;
         self.reset_media_probe_for_filesystem_entry_in_transaction(
             &mut transaction,
@@ -415,7 +419,13 @@ impl Database {
             .await
             .map_err(self.sqlx_err())?;
         }
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        // The reset above is not an outbox producer, but a restored item and a changed STRM
+        // target both queue rows for the read model and the search index.
+        self.signal_outbox_consumers_if_changed(
+            restored.max(u64::from(strm_target_kind.is_some())),
+        );
+        Ok(())
     }
 
     /// Marks an unchanged incremental file as seen and updates its STRM target
@@ -443,27 +453,32 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        self.restore_media_items_for_filesystem_entries(&mut transaction, &[id.to_owned()])
+        let mut changed = self
+            .restore_media_items_for_filesystem_entries_counted(&mut transaction, &[id.to_owned()])
             .await?;
         if strm_target_kind.is_some() {
             // The file is unchanged, so the parsed STRM target usually is too; skipping the
             // redundant row avoids a media source write and its catalog outbox row per scan.
-            self.query(
-                "UPDATE media_sources
-                 SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
-                 WHERE filesystem_entry_id = ?
-                   AND (external_url IS DISTINCT FROM ? OR strm_target_kind IS DISTINCT FROM ?)",
-            )
-            .bind(strm_target)
-            .bind(strm_target_kind)
-            .bind(id)
-            .bind(strm_target)
-            .bind(strm_target_kind)
-            .execute(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
+            changed += self
+                .query(
+                    "UPDATE media_sources
+                     SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
+                     WHERE filesystem_entry_id = ?
+                       AND (external_url IS DISTINCT FROM ? OR strm_target_kind IS DISTINCT FROM ?)",
+                )
+                .bind(strm_target)
+                .bind(strm_target_kind)
+                .bind(id)
+                .bind(strm_target)
+                .bind(strm_target_kind)
+                .execute(&mut *transaction)
+                .await
+                .map_err(self.sqlx_err())?
+                .rows_affected();
         }
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        self.signal_outbox_consumers_if_changed(changed);
+        Ok(())
     }
 
     pub(crate) async fn mark_missing_filesystem_entries(

@@ -963,6 +963,7 @@ impl Database {
         let _refresh_guard = acquire_write_lock(
             &self.recommendation_stats_refresh_lock,
             "recommendation_stats",
+            self.outbox_signals(),
         )
         .await;
         let now = current_unix_timestamp();
@@ -3570,7 +3571,7 @@ impl Database {
         .bind(item.provider_ids_json)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -3588,7 +3589,7 @@ impl Database {
         .bind(item_id)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -3628,7 +3629,7 @@ impl Database {
         .bind(identity_key)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -5291,7 +5292,10 @@ impl Database {
         let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.save_media_probe_in_transaction(&mut transaction, &update)
             .await?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        // A probe result changes source columns the read model and the search index derive.
+        self.signal_outbox_consumers();
+        Ok(())
     }
 
     pub(crate) async fn save_media_probe_for_scan_file_change(
@@ -5401,6 +5405,7 @@ impl Database {
             return Ok(false);
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.signal_outbox_consumers();
         Ok(true)
     }
 
@@ -6335,7 +6340,7 @@ impl Database {
         .bind(item.identity_key)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -6369,7 +6374,7 @@ impl Database {
         .bind(item_id)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -6389,7 +6394,7 @@ impl Database {
         .bind(source_id)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 
@@ -6402,7 +6407,7 @@ impl Database {
         .bind(source_id)
         .execute(&self.pool)
         .await
-        .map(|_| ())
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())
     }
 

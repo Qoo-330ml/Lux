@@ -32,6 +32,9 @@ pub(crate) use access_changes::{AccessChangeEpochs, AccessEpoch};
 #[path = "auth_cache.rs"]
 mod auth_cache;
 pub(crate) use auth_cache::{AuthCacheEpochSnapshot, AuthCacheEpochs};
+#[path = "outbox_signals.rs"]
+mod outbox_signals;
+pub(crate) use outbox_signals::OutboxSignals;
 #[path = "catalog.rs"]
 mod catalog;
 #[path = "database_cleanup.rs"]
@@ -561,10 +564,12 @@ const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::fro
 /// The caller location is captured at acquisition so a long hold names the code path without
 /// logging SQL text, identifiers, or user data.
 pub(crate) struct WriteLockGuard {
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _guard: Option<tokio::sync::OwnedMutexGuard<()>>,
     operation: &'static str,
     caller: &'static std::panic::Location<'static>,
     acquired_at: Instant,
+    /// Signalled when the guarded write finishes, so the outbox consumers see the committed rows.
+    outbox_signals: Arc<OutboxSignals>,
 }
 
 /// How long one writer may hold a process-wide write lock before the hold is reported.
@@ -572,6 +577,11 @@ const WRITE_LOCK_HOLD_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 
 impl Drop for WriteLockGuard {
     fn drop(&mut self) {
+        // The guard outlives the caller's transaction, so this runs after the commit: every write
+        // that goes through `acquire_metadata_write_lock` wakes the derived-data consumers without
+        // each write site having to remember to. On PostgreSQL there is no shared lock (the guard
+        // carries none) but the drop still signals.
+        self.outbox_signals.notify_writers();
         let held = self.acquired_at.elapsed();
         if held >= WRITE_LOCK_HOLD_LOG_THRESHOLD {
             tracing::warn!(
@@ -589,13 +599,15 @@ async fn acquire_write_lock_after(
     operation: &'static str,
     threshold: Duration,
     caller: &'static std::panic::Location<'static>,
+    outbox_signals: Arc<OutboxSignals>,
 ) -> WriteLockGuard {
     match tokio::time::timeout(threshold, lock.clone().lock_owned()).await {
         Ok(guard) => WriteLockGuard {
-            _guard: guard,
+            _guard: Some(guard),
             operation,
             caller,
             acquired_at: Instant::now(),
+            outbox_signals,
         },
         Err(_) => {
             let started = Instant::now();
@@ -613,10 +625,11 @@ async fn acquire_write_lock_after(
                 "database write lock acquired after waiting"
             );
             WriteLockGuard {
-                _guard: guard,
+                _guard: Some(guard),
                 operation,
                 caller,
                 acquired_at: started,
+                outbox_signals,
             }
         }
     }
@@ -627,11 +640,19 @@ async fn acquire_write_lock_after(
 fn acquire_write_lock(
     lock: &Arc<AsyncMutex<()>>,
     operation: &'static str,
+    outbox_signals: Arc<OutboxSignals>,
 ) -> impl std::future::Future<Output = WriteLockGuard> {
     let caller = std::panic::Location::caller();
     let lock = lock.clone();
     async move {
-        acquire_write_lock_after(&lock, operation, WRITE_LOCK_WAIT_LOG_THRESHOLD, caller).await
+        acquire_write_lock_after(
+            &lock,
+            operation,
+            WRITE_LOCK_WAIT_LOG_THRESHOLD,
+            caller,
+            outbox_signals,
+        )
+        .await
     }
 }
 
@@ -732,6 +753,8 @@ pub struct Database {
     access_changes: Arc<AccessChangeEpochs>,
     /// Invalidation epochs for the cached request principals (credentials, access rules, users).
     auth_cache: Arc<AuthCacheEpochs>,
+    /// Wake-up handles for the background outbox consumers of derived data.
+    outbox_signals: Arc<OutboxSignals>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -1385,6 +1408,7 @@ impl Database {
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
             access_changes: Arc::new(AccessChangeEpochs::default()),
             auth_cache: Arc::new(AuthCacheEpochs::default()),
+            outbox_signals: Arc::new(OutboxSignals::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -1409,6 +1433,7 @@ impl Database {
         let caller = std::panic::Location::caller();
         let backend = self.backend;
         let lock = self.metadata_write_lock.clone();
+        let outbox_signals = Arc::clone(&self.outbox_signals);
         async move {
             if backend == DatabaseBackend::Sqlite {
                 Some(
@@ -1417,11 +1442,20 @@ impl Database {
                         "metadata_write",
                         WRITE_LOCK_WAIT_LOG_THRESHOLD,
                         caller,
+                        outbox_signals,
                     )
                     .await,
                 )
             } else {
-                None
+                // PostgreSQL needs no shared lock, but the guard still carries the outbox signal:
+                // dropping it after the commit is what wakes the derived-data consumers.
+                Some(WriteLockGuard {
+                    _guard: None,
+                    operation: "metadata_write",
+                    caller,
+                    acquired_at: Instant::now(),
+                    outbox_signals,
+                })
             }
         }
     }
@@ -1858,6 +1892,33 @@ impl Database {
     /// The permission writes in this module bump these counters; the cache only reads them.
     pub(crate) fn access_changes(&self) -> &AccessChangeEpochs {
         &self.access_changes
+    }
+
+    /// The wake-up handles that the background outbox consumers wait on.
+    ///
+    /// Returned as an owned `Arc` so a consumer task can hold it without borrowing the database.
+    pub(crate) fn outbox_signals(&self) -> Arc<OutboxSignals> {
+        Arc::clone(&self.outbox_signals)
+    }
+
+    /// Tells the derived-data consumers that an authoritative write committed.
+    ///
+    /// The storage write functions outside the metadata write lock call this after their commit;
+    /// writes that hold the lock signal through [`WriteLockGuard`] automatically. Signalling is
+    /// coarse by design (see [`OutboxSignals`]): a consumer that wakes and finds an empty queue
+    /// costs one bounded pass, a missed signal would leave derived data stale until the fallback.
+    pub(crate) fn signal_outbox_consumers(&self) {
+        self.outbox_signals.notify_writers();
+    }
+
+    /// Signals the derived-data consumers only when a write changed at least one row.
+    ///
+    /// Rescans re-derive the same values for most files; those writes change nothing and therefore
+    /// queue no outbox row, so they must not cost the consumers a wake-up.
+    pub(crate) fn signal_outbox_consumers_if_changed(&self, changed: u64) {
+        if changed > 0 {
+            self.signal_outbox_consumers();
+        }
     }
 
     /// Maps an sqlx failure onto a storage error that names the database it came from.
