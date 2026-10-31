@@ -19,7 +19,34 @@ const START_DELAY: Duration = Duration::from_secs(60);
 const FILE_INTERVAL: Duration = Duration::from_millis(50);
 const IDLE_INTERVAL: Duration = Duration::from_secs(10);
 const LIBRARY_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
+/// Once every library reported a completion marker the loop has no per-library work left: the
+/// migration is a one-time upgrade, and a library created later is scanned straight to v2
+/// fingerprints. The loop therefore drops to this slow re-read of the library list, which is the
+/// only thing that can notice a library that appeared afterwards.
+///
+/// No library-change signal is wired into this worker: [`crate::application::libraries::
+/// LibraryChangeNotifier::subscribe`] is crate-internal and this loop starts from the `main.rs`
+/// binary, so the documented fallback is used instead.
+const LIBRARY_LIST_FALLBACK_INTERVAL: Duration = Duration::from_secs(600);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(60 * 60);
+
+/// The waits of the migration loop. A struct so tests can drive the loop at a test pace.
+#[derive(Clone, Copy)]
+struct ScanFingerprintMigrationTimings {
+    start_delay: Duration,
+    file_interval: Duration,
+    idle_interval: Duration,
+    library_refresh_interval: Duration,
+    dormant_interval: Duration,
+}
+
+const TIMINGS: ScanFingerprintMigrationTimings = ScanFingerprintMigrationTimings {
+    start_delay: START_DELAY,
+    file_interval: FILE_INTERVAL,
+    idle_interval: IDLE_INTERVAL,
+    library_refresh_interval: LIBRARY_REFRESH_INTERVAL,
+    dormant_interval: LIBRARY_LIST_FALLBACK_INTERVAL,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct FileStatSnapshot {
@@ -39,8 +66,16 @@ pub fn start(database: Database, shutdown: watch::Receiver<ShutdownReason>) {
     tokio::spawn(run(database, shutdown));
 }
 
-async fn run(database: Database, mut shutdown: watch::Receiver<ShutdownReason>) {
-    if wait_or_shutdown(START_DELAY, &mut shutdown).await {
+async fn run(database: Database, shutdown: watch::Receiver<ShutdownReason>) {
+    run_with_timings(database, shutdown, TIMINGS).await
+}
+
+async fn run_with_timings(
+    database: Database,
+    mut shutdown: watch::Receiver<ShutdownReason>,
+    timings: ScanFingerprintMigrationTimings,
+) {
+    if wait_or_shutdown(timings.start_delay, &mut shutdown).await {
         return;
     }
 
@@ -54,7 +89,7 @@ async fn run(database: Database, mut shutdown: watch::Receiver<ShutdownReason>) 
 
         if library_ids.is_empty()
             || library_list_refreshed_at.is_none_or(|refreshed_at: Instant| {
-                refreshed_at.elapsed() >= LIBRARY_REFRESH_INTERVAL
+                refreshed_at.elapsed() >= timings.library_refresh_interval
             })
         {
             match database.list_scan_fingerprint_migration_library_ids().await {
@@ -64,7 +99,7 @@ async fn run(database: Database, mut shutdown: watch::Receiver<ShutdownReason>) 
                 }
                 Err(error) => {
                     warn!(%error, "scan fingerprint migration could not list libraries");
-                    if wait_or_shutdown(IDLE_INTERVAL, &mut shutdown).await {
+                    if wait_or_shutdown(timings.idle_interval, &mut shutdown).await {
                         return;
                     }
                     continue;
@@ -72,7 +107,10 @@ async fn run(database: Database, mut shutdown: watch::Receiver<ShutdownReason>) 
             }
         }
         if library_ids.is_empty() {
-            if wait_or_shutdown(IDLE_INTERVAL, &mut shutdown).await {
+            // Nothing to migrate. The migration is a one-time upgrade, so this is the dormant
+            // state: only the slow library-list fallback can change it.
+            library_list_refreshed_at = None;
+            if wait_or_shutdown(timings.dormant_interval, &mut shutdown).await {
                 return;
             }
             continue;
@@ -80,6 +118,9 @@ async fn run(database: Database, mut shutdown: watch::Receiver<ShutdownReason>) 
 
         let start_index = next_library_index % library_ids.len();
         let mut did_work = false;
+        // Set to false as soon as one library is not finished, so a loop that did nothing only
+        // drops to the dormant fallback when every library really reported a completion marker.
+        let mut all_completed = true;
         for offset in 0..library_ids.len() {
             if *shutdown.borrow() != ShutdownReason::Running {
                 return;
@@ -92,12 +133,14 @@ async fn run(database: Database, mut shutdown: watch::Receiver<ShutdownReason>) 
                 Ok(cursor) => cursor,
                 Err(error) => {
                     warn!(%error, library_id, "scan fingerprint migration state unavailable");
+                    all_completed = false;
                     continue;
                 }
             };
             if cursor.completed_at.is_some() {
                 continue;
             }
+            all_completed = false;
 
             match database.find_active_scan_job_for_library(library_id).await {
                 Ok(Some(_)) => continue,
@@ -251,16 +294,17 @@ async fn run(database: Database, mut shutdown: watch::Receiver<ShutdownReason>) 
             break;
         }
 
-        if wait_or_shutdown(
-            if did_work {
-                FILE_INTERVAL
-            } else {
-                IDLE_INTERVAL
-            },
-            &mut shutdown,
-        )
-        .await
-        {
+        let wait = if did_work {
+            timings.file_interval
+        } else if all_completed {
+            // Every library is migrated: forget the cached list so the next pass re-reads it, and
+            // sleep until the slow fallback instead of waking on the idle interval.
+            library_list_refreshed_at = None;
+            timings.dormant_interval
+        } else {
+            timings.idle_interval
+        };
+        if wait_or_shutdown(wait, &mut shutdown).await {
             return;
         }
     }
@@ -419,5 +463,182 @@ async fn wait_or_shutdown(
     tokio::select! {
         _ = sleep(duration) => false,
         changed = shutdown.changed() => changed.is_err() || *shutdown.borrow() != ShutdownReason::Running,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use super::*;
+    use crate::{application::libraries::LibraryService, config::Config, library::LibraryKind};
+
+    /// Test-only copy of the production timings with a short dormant interval.
+    fn test_timings() -> super::ScanFingerprintMigrationTimings {
+        super::ScanFingerprintMigrationTimings {
+            start_delay: Duration::ZERO,
+            file_interval: Duration::from_millis(5),
+            idle_interval: Duration::from_millis(20),
+            library_refresh_interval: Duration::from_millis(20),
+            dormant_interval: Duration::from_secs(5),
+        }
+    }
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        })
+        .await?;
+        Ok((temp_dir, database))
+    }
+
+    async fn wait_for_queries(database: &Database, at_least: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while database.query_count() < at_least {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the migration loop must run its first pass"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// With every library migrated (here: no libraries at all) the loop must stop looking at the
+    /// library list between dormant passes instead of re-reading it on the idle interval.
+    #[tokio::test]
+    async fn a_fully_migrated_server_goes_dormant() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (shutdown_sender, shutdown_receiver) = watch::channel(ShutdownReason::Running);
+        let task = tokio::spawn(run_with_timings(
+            database.clone(),
+            shutdown_receiver,
+            test_timings(),
+        ));
+        wait_for_queries(&database, 1).await;
+        database.reset_query_count();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            database.query_count(),
+            0,
+            "a fully migrated server must not query libraries again before the dormant fallback"
+        );
+        shutdown_sender.send_replace(ShutdownReason::Shutdown);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the dormant loop must stop on shutdown")?;
+        Ok(())
+    }
+
+    /// A finished library stops costing a per-library query per idle tick.
+    #[tokio::test]
+    async fn a_completed_library_stops_being_queried() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Migrated", LibraryKind::Movie, false)
+            .await?;
+        let (shutdown_sender, shutdown_receiver) = watch::channel(ShutdownReason::Running);
+        let task = tokio::spawn(run_with_timings(
+            database.clone(),
+            shutdown_receiver,
+            test_timings(),
+        ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let completed_at: Option<i64> = sqlx::query_scalar(
+                "SELECT completed_at FROM scan_fingerprint_migration_state WHERE library_id = ?",
+            )
+            .bind(library.id.to_string())
+            .fetch_optional(database.pool())
+            .await?
+            .flatten();
+            if completed_at.is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the loop must complete a library with nothing left to migrate"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        // The completion marker is written by the pass that read the library, so one more idle
+        // round runs before the loop notices every library is finished.
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        database.reset_query_count();
+        tokio::time::sleep(Duration::from_millis(400)).await;
+        assert_eq!(
+            database.query_count(),
+            0,
+            "a completed library must not be re-queried on the idle interval"
+        );
+        shutdown_sender.send_replace(ShutdownReason::Shutdown);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the dormant loop must stop on shutdown")?;
+        Ok(())
+    }
+
+    /// A library created after the loop went dormant is still picked up by the slow fallback.
+    #[tokio::test]
+    async fn a_library_created_while_dormant_is_eventually_migrated()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (shutdown_sender, shutdown_receiver) = watch::channel(ShutdownReason::Running);
+        let mut timings = test_timings();
+        timings.dormant_interval = Duration::from_millis(200);
+        let task = tokio::spawn(run_with_timings(
+            database.clone(),
+            shutdown_receiver,
+            timings,
+        ));
+        wait_for_queries(&database, 1).await;
+        // Wait until the loop has gone dormant at least once.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let library = LibraryService::new(database.clone())
+            .create_library("Late", LibraryKind::Movie, false)
+            .await?;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let rows: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM scan_fingerprint_migration_state WHERE library_id = ?",
+            )
+            .bind(library.id.to_string())
+            .fetch_one(database.pool())
+            .await?;
+            if rows == 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the slow library-list fallback must notice a newly created library"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        shutdown_sender.send_replace(ShutdownReason::Shutdown);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("the loop must stop on shutdown")?;
+        Ok(())
+    }
+
+    /// Shutdown while dormant must not wait for the dormant interval.
+    #[tokio::test]
+    async fn shutdown_stops_a_dormant_loop_promptly() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let (shutdown_sender, shutdown_receiver) = watch::channel(ShutdownReason::Running);
+        let mut timings = test_timings();
+        timings.dormant_interval = Duration::from_secs(600);
+        let task = tokio::spawn(run_with_timings(
+            database.clone(),
+            shutdown_receiver,
+            timings,
+        ));
+        wait_for_queries(&database, 1).await;
+        shutdown_sender.send_replace(ShutdownReason::Shutdown);
+        tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must interrupt the dormant wait")?;
+        Ok(())
     }
 }
