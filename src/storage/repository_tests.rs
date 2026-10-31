@@ -35439,8 +35439,8 @@ async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer
         .await?;
     assert_eq!(
         database.query_count(),
-        8,
-        "the flip event and its container sync cost three reads and five writes"
+        9,
+        "the flip event and its container sync cost four reads and five writes"
     );
     assert_eq!(
         progress_pointer(&database, &user_id).await?,
@@ -35564,11 +35564,15 @@ async fn playback_progress_state_changes_refresh_the_resume_pointer()
     );
     assert_eq!(
         database.query_count(),
-        4,
-        "a pause writes the session, the item state, and the pointer in one transaction"
+        5,
+        "a pause reads the hierarchy and the next-episode candidate, then writes the session, the \
+         item state, and the pointer in one transaction"
     );
     let after_pause = progress_pointer_log(&database).await?;
-    assert!(after_pause.len() > after_start.len());
+    assert_eq!(
+        after_pause, after_start,
+        "a pause that recomputes the same pointer must not write it"
+    );
 
     let stopped = database
         .record_playback_event(playback_progress_event(
@@ -35584,13 +35588,66 @@ async fn playback_progress_state_changes_refresh_the_resume_pointer()
         stopped.container_scope.is_some(),
         "stopping refreshes the resume pointer"
     );
-    assert!(progress_pointer_log(&database).await?.len() > after_pause.len());
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        after_start,
+        "a stop at the same position must not rewrite the pointer either"
+    );
+
+    // A state change that also moves the position does write the pointer, in place.
+    let resumed = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "PLAYING",
+            2_000_000_000,
+            Some(("STOPPED", 1_800_000_000)),
+        ))
+        .await?;
+    assert!(resumed.container_scope.is_some());
+    assert!(progress_pointer_log(&database).await?.len() > after_start.len());
     assert_eq!(
         progress_pointer(&database, &user_id).await?,
-        Some(("progress-episode-1".to_owned(), 1_800_000_000)),
+        Some(("progress-episode-1".to_owned(), 2_000_000_000)),
         "the in-progress episode stays the resume pointer"
     );
     Ok(())
+}
+
+/// SQLite row id of one pointer row.
+///
+/// An UPSERT keeps the row id of the row it updates, while a delete-then-insert rebuild mints a
+/// new one, so this is how the tests tell the two apart.
+async fn resume_pointer_rowid(
+    database: &Database,
+    user_id: &str,
+    series_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(
+        sqlx::query_scalar(
+            "SELECT rowid FROM user_series_next WHERE user_id = ? AND series_id = ?",
+        )
+        .bind(user_id)
+        .bind(series_id)
+        .fetch_one(database.pool())
+        .await?,
+    )
+}
+
+/// Write stamp of one pointer row; it only moves when the refresh actually writes.
+async fn resume_pointer_updated_at(
+    database: &Database,
+    user_id: &str,
+    series_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT updated_at FROM user_series_next WHERE user_id = ? AND series_id = ?",
+    )
+    .bind(user_id)
+    .bind(series_id)
+    .fetch_one(database.pool())
+    .await?)
 }
 
 #[tokio::test]
@@ -35618,16 +35675,41 @@ async fn resume_pointer_refresh_upserts_instead_of_deleting_the_row()
         .await?;
     assert_eq!(
         database.query_count(),
-        2,
-        "one hierarchy read and one pointer upsert"
+        3,
+        "one hierarchy read, one candidate read, and one pointer write"
     );
     assert_eq!(
         progress_pointer(&database, &user_id).await?,
         Some(("progress-episode-2".to_owned(), 1_800_000_000))
     );
+    let rowid = resume_pointer_rowid(&database, &user_id, "progress-series").await?;
+    let stamp = resume_pointer_updated_at(&database, &user_id, "progress-series").await?;
 
-    // A second refresh must update the row in place: a delete would open the empty-pointer window
-    // the UPSERT exists to avoid.
+    // A refresh that recomputes the same pointer must not write at all: an UPSERT that rewrites an
+    // identical row still dirties a page and fires the row triggers.
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned()],
+        "an unchanged refresh must leave the pointer row untouched"
+    );
+    assert_eq!(
+        resume_pointer_updated_at(&database, &user_id, "progress-series").await?,
+        stamp,
+        "an unchanged refresh must not restamp the row"
+    );
+
+    // A changed pointer updates the row in place: a delete and insert would mint a new row id and
+    // open the empty-pointer window the UPSERT exists to avoid.
+    sqlx::query(
+        "UPDATE user_item_state SET position_ticks = 1900000000
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
     database
         .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
         .await?;
@@ -35635,6 +35717,15 @@ async fn resume_pointer_refresh_upserts_instead_of_deleting_the_row()
         progress_pointer_log(&database).await?,
         vec!["INSERT".to_owned(), "UPDATE".to_owned()],
         "the refresh must never delete a pointer row while a next episode exists"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series").await?,
+        rowid,
+        "a changed pointer keeps the identity of the row it updates"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_900_000_000))
     );
 
     sqlx::query(
@@ -35664,6 +35755,170 @@ async fn resume_pointer_refresh_upserts_instead_of_deleting_the_row()
             "DELETE".to_owned()
         ],
         "the pointer is deleted only once the series has no next episode"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_pointer_refresh_keeps_the_previous_row_visible_until_it_commits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+         VALUES (?, 'progress-episode-1', 1, 1, 10)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played, last_played_at)
+         VALUES (?, 'progress-episode-2', 1800000000, 0, 20)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    let rowid = resume_pointer_rowid(&database, &user_id, "progress-series").await?;
+
+    // Publish a new position from inside an open transaction, the way a playback write joins one.
+    sqlx::query(
+        "UPDATE user_item_state SET position_ticks = 1900000000
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    let mut transaction = database.pool().begin().await?;
+    database
+        .refresh_user_series_next_for_item_in(&mut transaction, &user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_800_000_000)),
+        "a reader on another connection sees the previous pointer, never a missing one"
+    );
+    transaction.commit().await?;
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_900_000_000)),
+        "the refresh becomes visible as one committed change"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series").await?,
+        rowid,
+        "the refresh updates the existing row instead of rebuilding it"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "UPDATE".to_owned()],
+        "the refresh never deletes a pointer row while a next episode exists"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_series_next_rebuild_only_writes_the_pointers_that_changed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+             title, sort_title, identification_status, has_available_source, runtime_ticks
+         ) VALUES
+             ('progress-series-b', 'progress-lib', 'SERIES', NULL, NULL, NULL, NULL,
+              'Series B', 'series b', 'LOCAL_CONFIRMED', 1, NULL),
+             ('progress-episode-b1', 'progress-lib', 'EPISODE', NULL, 'progress-series-b',
+              1, 1, 'Episode B1', 'episode b1', 'LOCAL_CONFIRMED', 1, ?),
+             ('progress-episode-b2', 'progress-lib', 'EPISODE', NULL, 'progress-series-b',
+              1, 2, 'Episode B2', 'episode b2', 'LOCAL_CONFIRMED', 1, ?)",
+    )
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES
+             (?, 'progress-episode-1', 0, 1, 1, 10),
+             (?, 'progress-episode-2', 1800000000, 0, 0, 20),
+             (?, 'progress-episode-b1', 0, 1, 1, 40),
+             (?, 'progress-episode-b2', 0, 0, 0, 50)",
+    )
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(database.rebuild_user_series_next().await?, 2);
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "INSERT".to_owned()],
+        "the first rebuild inserts one pointer per series"
+    );
+    let rowid = resume_pointer_rowid(&database, &user_id, "progress-series-b").await?;
+    let stamp = resume_pointer_updated_at(&database, &user_id, "progress-series-b").await?;
+
+    // The rebuild recomputes every pointer, but must only write the ones whose value changed.
+    assert_eq!(
+        database.rebuild_user_series_next().await?,
+        0,
+        "a rebuild without state changes writes nothing"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "INSERT".to_owned()],
+        "an unchanged rebuild must not delete and reinsert the pointers"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series-b").await?,
+        rowid,
+        "an unchanged rebuild keeps the row identity"
+    );
+    assert_eq!(
+        resume_pointer_updated_at(&database, &user_id, "progress-series-b").await?,
+        stamp,
+        "an unchanged rebuild must not restamp the row"
+    );
+
+    // Watching the last episode of series A drops its pointer and leaves the other series alone.
+    sqlx::query(
+        "UPDATE user_item_state SET is_played = 1, position_ticks = 0
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES (?, 'progress-episode-3', 0, 1, 1, 30)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.rebuild_user_series_next().await?, 0);
+    assert!(
+        progress_pointer(&database, &user_id).await?.is_none(),
+        "a finished series has no next pointer"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec![
+            "INSERT".to_owned(),
+            "INSERT".to_owned(),
+            "DELETE".to_owned()
+        ],
+        "the rebuild deletes only the pointer whose series has no next episode"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series-b").await?,
+        rowid,
+        "the untouched series keeps its pointer row"
     );
     Ok(())
 }
