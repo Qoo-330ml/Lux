@@ -4,7 +4,7 @@ use std::{
     path::Path,
     sync::{
         Arc,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -119,6 +119,23 @@ impl ReadModelMode {
             "off" => Self::Off,
             "shadow" => Self::Shadow,
             _ => Self::On,
+        }
+    }
+
+    /// Compact form for the shared atomic the library page cache keeps next to its owner.
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Off => 0,
+            Self::Shadow => 1,
+            Self::On => 2,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            2 => Self::On,
+            1 => Self::Shadow,
+            _ => Self::Off,
         }
     }
 }
@@ -272,6 +289,17 @@ struct LibraryPageCache {
     entries: Mutex<HashMap<LibraryPageCacheKey, Arc<LibraryPageCacheEntry>>>,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
+    /// The warm-up runs on its own [`CatalogService`], so the cache keeps the pieces it needs to
+    /// build that service with the owner's current configuration.
+    database: Database,
+    access: MediaAccessService,
+    search_flights: Arc<SearchFlightRegistry>,
+    read_model_ready: Arc<AtomicBool>,
+    /// The owner's read-model switch, as registered by [`CatalogService::with_read_model_mode`].
+    ///
+    /// The cache is shared through an `Arc`, so the last call wins for every handle of the same
+    /// service tree — which is what the app wiring does once at startup.
+    read_model_mode: AtomicU8,
 }
 
 impl LibraryPageCache {
@@ -287,6 +315,11 @@ impl LibraryPageCache {
             entries: Mutex::new(HashMap::new()),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
+            database,
+            access,
+            search_flights,
+            read_model_ready,
+            read_model_mode: AtomicU8::new(ReadModelMode::Off.as_u8()),
         });
         let worker_cache = Arc::downgrade(&cache);
         tokio::spawn(async move {
@@ -299,19 +332,45 @@ impl LibraryPageCache {
                     break;
                 };
                 cache.refresh_pending.store(false, Ordering::Release);
-                let service = CatalogService {
-                    database: database.clone(),
-                    access: access.clone(),
-                    library_page_cache: cache.clone(),
-                    search_flights: search_flights.clone(),
-                    recommendation_compute_lock: Arc::new(Mutex::new(())),
-                    read_model_mode: ReadModelMode::Off,
-                    read_model_ready: read_model_ready.clone(),
-                };
-                cache.refresh_entries(&service).await;
+                cache.refresh_all().await;
             }
         });
         cache
+    }
+
+    /// Recompute the hot entries with a service built from the cache's own configuration.
+    ///
+    /// The worker used to build that service inline, which is how its read-model mode drifted
+    /// away from the owning service's (see `refresh_read_model_mode`).
+    async fn refresh_all(self: &Arc<Self>) {
+        let service = CatalogService {
+            database: self.database.clone(),
+            access: self.access.clone(),
+            library_page_cache: self.clone(),
+            search_flights: self.search_flights.clone(),
+            recommendation_compute_lock: Arc::new(Mutex::new(())),
+            read_model_mode: self.refresh_read_model_mode(),
+            read_model_ready: self.read_model_ready.clone(),
+        };
+        self.refresh_entries(&service).await;
+    }
+
+    fn set_read_model_mode(&self, mode: ReadModelMode) {
+        self.read_model_mode.store(mode.as_u8(), Ordering::Release);
+    }
+
+    /// The read-model mode the warm-up runs with.
+    ///
+    /// `on` and `off` are taken as-is so a warm page has the same source as the request path that
+    /// will read it. `shadow` is deliberately downgraded to `off`: shadow serves exactly the
+    /// authoritative page `off` serves, and only adds the comparison query plus the mismatch log.
+    /// A warm-up result is never compared by anyone, so running shadow here would pay a second
+    /// page query per warmed entry for a log line about a page that is then thrown away.
+    fn refresh_read_model_mode(&self) -> ReadModelMode {
+        match ReadModelMode::from_u8(self.read_model_mode.load(Ordering::Acquire)) {
+            ReadModelMode::Shadow => ReadModelMode::Off,
+            mode => mode,
+        }
     }
 
     async fn entry(
@@ -468,8 +527,13 @@ pub struct CatalogItemCounts {
 }
 
 impl CatalogService {
+    /// Switch the read model for this service *and* for its library page warm-up.
+    ///
+    /// The cache owns the warm-up service and is shared through an `Arc`, so this is the single
+    /// place that keeps the request path and the background refresh on the same source.
     pub fn with_read_model_mode(mut self, mode: ReadModelMode) -> Self {
         self.read_model_mode = mode;
+        self.library_page_cache.set_read_model_mode(mode);
         self
     }
 
@@ -3439,7 +3503,10 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::application::recommendations::daily_recommendation_items;
+    use crate::{
+        application::access::AccessPrincipal,
+        application::recommendations::daily_recommendation_items, storage::Database,
+    };
 
     use super::{
         CatalogItem, CatalogSource, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle,
@@ -6233,6 +6300,242 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("1920"),
             "the read-model full page keeps details_json"
+        );
+        Ok(())
+    }
+
+    /// One movie in one library with a built read model and the consumer watermark advanced.
+    ///
+    /// The authoritative row and the derived row carry different titles, so a page that renders
+    /// one of them names the source it was read from.
+    async fn read_model_library_page_fixture()
+    -> Result<(tempfile::TempDir, Database, AccessPrincipal, String), Box<dyn std::error::Error>>
+    {
+        use crate::{
+            application::libraries::LibraryService, auth::users::UserStore, config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "refresh-mode-viewer",
+                "Refresh Mode Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Refresh mode", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('refresh-mode-root', ?, '/refresh', '/refresh', 1, 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+             ) VALUES ('refresh-mode-fe', 'refresh-mode-root', 'Refresh.mkv', 'FILE', 1, 1,
+                       1, 1, X'00', 'g1', 'NEW')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, added_at, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES ('refresh-mode-item', ?, 'MOVIE', 'Authoritative title', 'refresh mode',
+                       10, 7200000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+                 size, bitrate, duration_ticks, is_default, probe_status
+             ) VALUES ('refresh-mode-source', 'refresh-mode-item', 'LOCAL_FILE',
+                       'refresh-mode-fe', '1080p', 'mkv', 1000, 8000000, 7200000000, 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        // The `on` switch only serves the derived page once the consumer watermark exists.
+        database
+            .advance_catalog_consumer(
+                &crate::application::catalog_read_model::catalog_items_consumer(),
+                0,
+            )
+            .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived title'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        Ok((
+            directory,
+            database,
+            AccessPrincipal::new(user.id, false),
+            library_id,
+        ))
+    }
+
+    fn refresh_mode_filter() -> super::CatalogFilter {
+        super::CatalogFilter {
+            sort_by: super::CatalogSort::Name,
+            include_total: false,
+            ..super::CatalogFilter::default()
+        }
+    }
+
+    /// The library page cache warms pages from a service of its own. That service has to run with
+    /// the mode its owner was configured with, otherwise `LUX_READ_MODEL_MODE=on` serves the
+    /// derived page on the request path and then quietly replaces it with the authoritative page
+    /// on the next background refresh.
+    #[tokio::test]
+    async fn library_page_refresh_uses_the_configured_read_model_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, principal, library_id) =
+            read_model_library_page_fixture().await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::On);
+        let cache = catalog.library_page_cache.clone();
+        let filter = refresh_mode_filter();
+
+        let seeded = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            seeded.items[0].title, "Derived title",
+            "the request path must serve the read-model page"
+        );
+
+        // Rename both sources so the refreshed page names the source it was read from.
+        sqlx::query(
+            "UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived v2'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        catalog.invalidate_library_pages();
+        cache.refresh_all().await;
+
+        let refreshed = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            refreshed.items[0].title, "Derived v2",
+            "the background refresh must keep reading the read model when the service runs with mode=on"
+        );
+        Ok(())
+    }
+
+    /// `shadow` serves the authoritative page, so the warm-up keeps that same source; running the
+    /// comparison there would add a second page query per warmed entry for a log nobody reads.
+    #[tokio::test]
+    async fn library_page_refresh_skips_the_shadow_comparison()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, principal, library_id) =
+            read_model_library_page_fixture().await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::Shadow);
+        let cache = catalog.library_page_cache.clone();
+        assert_eq!(
+            cache.refresh_read_model_mode(),
+            super::ReadModelMode::Off,
+            "the warm-up must not pay the shadow comparison query"
+        );
+        let filter = refresh_mode_filter();
+
+        let seeded = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            seeded.items[0].title, "Authoritative title",
+            "shadow serves the authoritative page"
+        );
+
+        sqlx::query(
+            "UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived v2'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        catalog.invalidate_library_pages();
+        cache.refresh_all().await;
+
+        let refreshed = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            refreshed.items[0].title, "Authoritative v2",
+            "a shadow warm-up keeps the authoritative page and skips the comparison"
         );
         Ok(())
     }
