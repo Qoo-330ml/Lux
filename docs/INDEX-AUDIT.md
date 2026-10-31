@@ -115,8 +115,8 @@ cargo test --locked --test storage index_audit::
 | `idx_media_items_library_added_sort` `(library_id, added_at DESC, LOWER(title), id)` WHERE `removed_at IS NULL` | `CatalogSort::DateCreated`（`catalog_item_order`）、`count_catalog_items` | 保留（排序专用） |
 | `idx_media_items_library_type_visible` `(library_id, item_type, id)` WHERE `removed_at IS NULL` | `count_catalog_root_items_by_library` | 保留 |
 | `idx_media_items_people_visible` `(library_id, id)` WHERE `removed_at IS NULL` | `list_person_index_item_ids`（需要按 `id` 顺序增量扫描）；`CatalogSort::PremiereDate`/`Rating` 也拿它做 `library_id` 驱动 | 保留 |
-| `idx_media_items_parent_available` `(parent_id, removed_at, has_available_source)` | `count_catalog_children`、`sync_played_container_states_for_scope`、`list_resume_items_with_next_episode` | 保留（删掉 `parent_removed` 后的唯一 parent 索引；具体计划在版本间有差异，见 §5） |
-| `idx_media_items_series_available` `(series_id, removed_at, has_available_source)` | `list_series_episode_ids`、`write_user_series_next_pointer` | 保留（删掉 `series_removed` 后的唯一 series 索引） |
+| `idx_media_items_parent_available` `(parent_id, removed_at, has_available_source)` | `count_catalog_children`、`sync_played_container_states_for_scope`、首页最近添加里 `child.parent_id = mi.id` 的 OR 分支、`media_merge` 的季/集计数 | 保留（删掉 `parent_removed` 后的唯一 parent 索引；具体计划在版本间有差异，见 §5） |
+| `idx_media_items_series_available` `(series_id, removed_at, has_available_source)` | `list_series_episode_ids`、`write_user_series_next_pointer`、首页最近添加的 `series_id` 分支 | 保留（删掉 `series_removed` 后的唯一 series 索引） |
 | `idx_media_items_parent_episode_latest` `(parent_id, added_at)` WHERE EPISODE + 可用 | 首页最近添加的 `MAX(added_at)` parent 分支 | 保留；**新建库原本缺失**，本轮补进重建清单 |
 | `idx_media_items_series_episode_latest` `(series_id, added_at)` WHERE EPISODE + 可用 | 首页最近添加的 `MAX(added_at)` series 分支 | 保留；**新建库原本缺失**，本轮补进重建清单 |
 | `idx_media_items_home_unavailable_series` `(library_id, added_at DESC, sort_title, id)` WHERE `removed_at IS NULL AND item_type = 'SERIES' AND has_available_source = 0` | `sqlite_recent_catalog_rows_by_library_query` 的 `unavailable_series` 分支 | 保留（谓词与查询完全对齐） |
