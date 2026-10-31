@@ -109,6 +109,26 @@ pub(crate) fn admin_event_scope_for_audit(event_type: &str) -> AdminEventScope {
     AdminEventScope::All
 }
 
+/// Human-readable item name for activity logs. Episodes read as
+/// "Series S01E03 Title" so the log says which episode was played.
+fn playback_item_display_title(
+    item_type: &str,
+    title: &str,
+    series_title: Option<&str>,
+    season_number: Option<i64>,
+    episode_number: Option<i64>,
+) -> String {
+    let Some(series_title) = series_title.filter(|_| item_type == "EPISODE") else {
+        return title.to_owned();
+    };
+    match (season_number, episode_number) {
+        (Some(season), Some(episode)) => {
+            format!("{series_title} S{season:02}E{episode:02} {title}")
+        }
+        _ => format!("{series_title} · {title}"),
+    }
+}
+
 pub(crate) async fn record_activity_event(
     database: Option<&Database>,
     admin_events: &AdminEventHub,
@@ -124,7 +144,14 @@ pub(crate) async fn record_activity_event(
         && let Some(object) = metadata.as_object_mut()
         && let Ok(Some(item)) = database.find_media_item_metadata(item_id).await
     {
-        object.insert("itemTitle".to_owned(), json!(item.title));
+        let title = playback_item_display_title(
+            &item.item_type,
+            &item.title,
+            item.series_title.as_deref(),
+            item.season_number,
+            item.episode_number,
+        );
+        object.insert("itemTitle".to_owned(), json!(title));
     }
     let metadata_json = match serde_json::to_string(&metadata) {
         Ok(metadata_json) => metadata_json,
@@ -653,5 +680,46 @@ mod failed_authentication_activity_tests {
             Ok(AdminEventScope::Dashboard)
         ));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod playback_item_title_tests {
+    use super::*;
+
+    #[test]
+    fn episodes_show_series_season_episode_and_title() {
+        assert_eq!(
+            playback_item_display_title("EPISODE", "开端", Some("Show"), Some(1), Some(3)),
+            "Show S01E03 开端"
+        );
+        assert_eq!(
+            playback_item_display_title("EPISODE", "Long", Some("Show"), Some(12), Some(120)),
+            "Show S12E120 Long"
+        );
+    }
+
+    #[test]
+    fn episodes_without_numbers_fall_back_to_series_and_title() {
+        assert_eq!(
+            playback_item_display_title("EPISODE", "Pilot", Some("Show"), None, Some(1)),
+            "Show · Pilot"
+        );
+        assert_eq!(
+            playback_item_display_title("EPISODE", "Pilot", None, Some(1), Some(1)),
+            "Pilot"
+        );
+    }
+
+    #[test]
+    fn other_items_keep_their_own_title() {
+        assert_eq!(
+            playback_item_display_title("MOVIE", "Film", None, None, None),
+            "Film"
+        );
+        assert_eq!(
+            playback_item_display_title("SERIES", "Show", None, None, None),
+            "Show"
+        );
     }
 }
