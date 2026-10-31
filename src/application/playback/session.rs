@@ -125,6 +125,17 @@ pub struct SignedResource {
     pub signature: String,
 }
 
+/// A signed playback resource request that passed authorization.
+///
+/// `session` is the row authorization already read, and `policy` is the playback policy the same
+/// request read to check the HLS tier. Admission reuses that snapshot instead of reading the
+/// `users` row a second time; direct-play resources carry none because authorization does not read
+/// one for them.
+pub(crate) struct AuthorizedWebPlaybackResource {
+    pub(crate) session: StoredWebPlaybackSession,
+    pub(crate) policy: Option<UserPlaybackPolicy>,
+}
+
 /// One session's stored plan plus whatever the running FFmpeg has reported so far.
 #[derive(Debug)]
 pub(crate) struct WebPlaybackStats {
@@ -338,14 +349,25 @@ impl WebPlaybackSessionService {
             .await?)
     }
 
+    /// Reserves one admission slot for the request that is about to read a playback resource.
+    ///
+    /// `known_policy` is the policy an earlier step of the same request already read; passing it
+    /// keeps the admission from reading the same `users` row twice (see
+    /// [`Database::reserve_playback_admission_with_policy`]).
     pub(crate) async fn admit_playback_session(
         &self,
         user_id: &str,
         play_session_id: &str,
+        known_policy: Option<&UserPlaybackPolicy>,
     ) -> Result<Option<PlaybackAdmissionResult>, WebPlaybackSessionError> {
         Ok(self
             .database
-            .reserve_playback_admission(user_id, play_session_id, unix_timestamp())
+            .reserve_playback_admission_with_policy(
+                user_id,
+                play_session_id,
+                unix_timestamp(),
+                known_policy,
+            )
             .await?)
     }
 
@@ -894,7 +916,7 @@ impl WebPlaybackSessionService {
         expires_at: i64,
         signature: &str,
         client_ip: Option<IpAddr>,
-    ) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
+    ) -> Result<AuthorizedWebPlaybackResource, WebPlaybackSessionError> {
         self.verify_resource_signature(session_id, resource, expires_at, signature)?;
         let now = unix_timestamp();
         let Some((session, access)) = self
@@ -917,6 +939,7 @@ impl WebPlaybackSessionService {
             self.enforce_playback_access_rules(&session, &access, client_ip)
                 .await?;
         }
+        let mut policy = None;
         if session.plan == "SERVER_HLS" {
             let stored = self
                 .database
@@ -933,8 +956,9 @@ impl WebPlaybackSessionService {
                 }
                 return Err(WebPlaybackSessionError::PlaybackPolicyDenied);
             }
+            policy = Some(stored);
         }
-        Ok(session)
+        Ok(AuthorizedWebPlaybackResource { session, policy })
     }
 
     async fn enforce_playback_access_rules(
@@ -2006,7 +2030,10 @@ mod tests {
         },
         config::Config,
         library::LibraryKind,
-        storage::{NewWebPlaybackSession, UserPlaybackPolicy, WebPlaybackEventClaim},
+        storage::{
+            NewWebPlaybackSession, PlaybackAdmissionDecision, UserPlaybackPolicy,
+            WebPlaybackEventClaim,
+        },
     };
     use uuid::Uuid;
 
@@ -2534,14 +2561,34 @@ mod tests {
             .sign("resource-session", resource, expires_at)
             .ok_or("the resource signature was not produced")?;
         database.reset_query_count();
-        let session = service
+        let authorized = service
             .authorize_resource_with_ip("resource-session", resource, expires_at, &signature, None)
             .await?;
-        assert_eq!(session.user_id, owner_id);
+        assert_eq!(authorized.session.user_id, owner_id);
         assert_eq!(
             database.query_count(),
             4,
             "the session row, the device/client blacklist match, the IP rules and the policy"
+        );
+
+        // Admission reuses the policy this request already read instead of reading `users` again.
+        let session = authorized.session;
+        let policy = authorized.policy;
+        assert!(
+            policy.is_some(),
+            "a server-side HLS request authorizes with a playback policy"
+        );
+        database.reset_query_count();
+        let admitted = service
+            .admit_playback_session(&session.user_id, &session.play_session_id, policy.as_ref())
+            .await?
+            .ok_or("the admission must be recorded")?;
+        assert_eq!(admitted.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(admitted.active_playback_count, 1);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "the stale reclaim, the active count and the upsert"
         );
         Ok(())
     }

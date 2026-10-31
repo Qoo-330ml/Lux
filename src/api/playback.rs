@@ -7,11 +7,12 @@ pub(super) use resume_visibility::emby_hide_from_resume;
 use crate::application::playback::{
     decision::ServerTier,
     hls::{HlsSegmentContainer, HlsStartOptions},
-    session::{CreatedWebPlaybackSession, WebPlaybackPlan},
+    session::{AuthorizedWebPlaybackResource, CreatedWebPlaybackSession, WebPlaybackPlan},
 };
 use crate::storage::{
     MAX_PLAYBACK_SESSION_WINDOW_SECONDS, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
-    PlaybackAdmissionResult, StoredWebPlaybackSession, WebPlaybackTranscodingDetails,
+    PlaybackAdmissionResult, StoredWebPlaybackSession, UserPlaybackPolicy,
+    WebPlaybackTranscodingDetails,
 };
 
 /// Resolves the privilege snapshot for a signed playback resource.
@@ -2751,7 +2752,7 @@ async fn authorize_web_playback_resource(
     resource: &str,
     expires_at: i64,
     signature: &str,
-) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
+) -> Result<AuthorizedWebPlaybackResource, WebPlaybackSessionError> {
     service.verify_resource_signature(session_id, resource, expires_at, signature)?;
     let client_ip = super::request_access_ip(headers, state)
         .await
@@ -3399,13 +3400,17 @@ async fn serve_emby_transcoding_asset(
         Ok(client_ip) => client_ip,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let session = match service
+    let authorized = match service
         .authorize_resource_with_ip(session_id, &resource, expires_at, signature, client_ip)
         .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return emby_playback_session_error_status(error).into_response(),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "SERVER_HLS"
         || emby_internal_id(public_item_id) != session.item_id
         || query
@@ -3472,7 +3477,9 @@ async fn serve_emby_transcoding_asset(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         if method == Method::GET
             && response.status().is_success()
-            && let Err(response) = admit_web_playback_request(headers, service, &session).await
+            && let Err(response) =
+                admit_web_playback_request(headers, service, &session, admission_policy.as_ref())
+                    .await
         {
             return response;
         }
@@ -3518,7 +3525,8 @@ async fn serve_emby_transcoding_asset(
         .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
     if method == Method::GET
         && response.status().is_success()
-        && let Err(response) = admit_web_playback_request(headers, service, &session).await
+        && let Err(response) =
+            admit_web_playback_request(headers, service, &session, admission_policy.as_ref()).await
     {
         return response;
     }
@@ -3618,7 +3626,7 @@ pub(super) async fn admit_emby_direct_playback(
 ) -> Result<(), Response> {
     let service = state.web_playback();
     let result = service
-        .admit_playback_session(user_id, play_session_id)
+        .admit_playback_session(user_id, play_session_id, None)
         .await
         .map_err(|error| web_playback_error(headers, error))?
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
@@ -3632,9 +3640,10 @@ async fn admit_web_playback_request(
     headers: &HeaderMap,
     service: &crate::application::playback::session::WebPlaybackSessionService,
     session: &StoredWebPlaybackSession,
+    policy: Option<&UserPlaybackPolicy>,
 ) -> Result<(), Response> {
     let result = service
-        .admit_playback_session(&session.user_id, &session.play_session_id)
+        .admit_playback_session(&session.user_id, &session.play_session_id, policy)
         .await
         .map_err(|error| web_playback_error(headers, error))?
         .ok_or_else(|| StatusCode::NOT_FOUND.into_response())?;
@@ -4156,7 +4165,7 @@ pub(super) async fn lux_web_playback_direct(
     State(state): State<ReadyAppState>,
 ) -> Response {
     let service = state.web_playback();
-    let session = match authorize_web_playback_resource(
+    let authorized = match authorize_web_playback_resource(
         &headers,
         &state,
         service,
@@ -4167,14 +4176,19 @@ pub(super) async fn lux_web_playback_direct(
     )
     .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
     }
     if method == Method::GET
-        && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+        && let Err(response) =
+            admit_web_playback_request(&headers, service, &session, admission_policy.as_ref()).await
     {
         return response;
     }
@@ -4206,7 +4220,7 @@ pub(super) async fn lux_web_playback_range(
     State(state): State<ReadyAppState>,
 ) -> Response {
     let service = state.web_playback();
-    let session = match authorize_web_playback_resource(
+    let authorized = match authorize_web_playback_resource(
         &headers,
         &state,
         service,
@@ -4217,9 +4231,13 @@ pub(super) async fn lux_web_playback_range(
     )
     .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "DIRECT" {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -4256,7 +4274,9 @@ pub(super) async fn lux_web_playback_range(
         return StatusCode::NOT_IMPLEMENTED.into_response();
     }
     let resolver = require_service!(state.strm_playback);
-    if let Err(response) = admit_web_playback_request(&headers, service, &session).await {
+    if let Err(response) =
+        admit_web_playback_request(&headers, service, &session, admission_policy.as_ref()).await
+    {
         return response;
     }
     let user_agent = headers
@@ -4309,7 +4329,7 @@ pub(super) async fn lux_web_playback_hls(
 ) -> Response {
     let service = state.web_playback();
     let resource = format!("hls:{asset}");
-    let session = match authorize_web_playback_resource(
+    let authorized = match authorize_web_playback_resource(
         &headers,
         &state,
         service,
@@ -4320,9 +4340,13 @@ pub(super) async fn lux_web_playback_hls(
     )
     .await
     {
-        Ok(session) => session,
+        Ok(authorized) => authorized,
         Err(error) => return web_playback_error(&headers, error),
     };
+    let AuthorizedWebPlaybackResource {
+        session,
+        policy: admission_policy,
+    } = authorized;
     if session.plan != "SERVER_HLS" {
         return StatusCode::NOT_FOUND.into_response();
     }
@@ -4352,7 +4376,9 @@ pub(super) async fn lux_web_playback_hls(
             return StatusCode::BAD_GATEWAY.into_response();
         };
         if method == Method::GET
-            && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+            && let Err(response) =
+                admit_web_playback_request(&headers, service, &session, admission_policy.as_ref())
+                    .await
         {
             return response;
         }
@@ -4395,7 +4421,8 @@ pub(super) async fn lux_web_playback_hls(
         }
     };
     if method == Method::GET
-        && let Err(response) = admit_web_playback_request(&headers, service, &session).await
+        && let Err(response) =
+            admit_web_playback_request(&headers, service, &session, admission_policy.as_ref()).await
     {
         return response;
     }
