@@ -272,6 +272,12 @@ struct LibraryPageCache {
     entries: Mutex<HashMap<LibraryPageCacheKey, Arc<LibraryPageCacheEntry>>>,
     refresh_tx: mpsc::Sender<()>,
     refresh_pending: AtomicBool,
+    /// The warm-up runs on its own [`CatalogService`], so the cache keeps the pieces it needs to
+    /// build that service with the owner's current configuration.
+    database: Database,
+    access: MediaAccessService,
+    search_flights: Arc<SearchFlightRegistry>,
+    read_model_ready: Arc<AtomicBool>,
 }
 
 impl LibraryPageCache {
@@ -287,6 +293,10 @@ impl LibraryPageCache {
             entries: Mutex::new(HashMap::new()),
             refresh_tx,
             refresh_pending: AtomicBool::new(false),
+            database,
+            access,
+            search_flights,
+            read_model_ready,
         });
         let worker_cache = Arc::downgrade(&cache);
         tokio::spawn(async move {
@@ -299,19 +309,27 @@ impl LibraryPageCache {
                     break;
                 };
                 cache.refresh_pending.store(false, Ordering::Release);
-                let service = CatalogService {
-                    database: database.clone(),
-                    access: access.clone(),
-                    library_page_cache: cache.clone(),
-                    search_flights: search_flights.clone(),
-                    recommendation_compute_lock: Arc::new(Mutex::new(())),
-                    read_model_mode: ReadModelMode::Off,
-                    read_model_ready: read_model_ready.clone(),
-                };
-                cache.refresh_entries(&service).await;
+                cache.refresh_all().await;
             }
         });
         cache
+    }
+
+    /// Recompute the hot entries with a service built from the cache's own configuration.
+    ///
+    /// The worker used to build that service inline, which is how its read-model mode drifted
+    /// away from the owning service's (see `refresh_read_model_mode`).
+    async fn refresh_all(self: &Arc<Self>) {
+        let service = CatalogService {
+            database: self.database.clone(),
+            access: self.access.clone(),
+            library_page_cache: self.clone(),
+            search_flights: self.search_flights.clone(),
+            recommendation_compute_lock: Arc::new(Mutex::new(())),
+            read_model_mode: ReadModelMode::Off,
+            read_model_ready: self.read_model_ready.clone(),
+        };
+        self.refresh_entries(&service).await;
     }
 
     async fn entry(
