@@ -1086,6 +1086,50 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Reads one stored playback session together with the authorization device and client the
+    /// resource access-rule check needs.
+    ///
+    /// Both halves come from the same `web_playback_sessions` row, so serving an HLS manifest or
+    /// segment reads that row once instead of once for the session and once for its device/client.
+    pub(crate) async fn find_web_playback_session_with_access_context(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(StoredWebPlaybackSession, StoredWebPlaybackAccessContext)>, StorageError>
+    {
+        let Some(row) = self
+            .query(
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                        last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                        transcoding_container, created_at, updated_at,
+                        authorization_device_id, authorization_client_name
+                 FROM web_playback_sessions
+                 WHERE id = ?",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+        else {
+            return Ok(None);
+        };
+        let device_id: Option<String> =
+            sqlx::Row::try_get(&row, "authorization_device_id").map_err(self.sqlx_err())?;
+        let client_name: Option<String> =
+            sqlx::Row::try_get(&row, "authorization_client_name").map_err(self.sqlx_err())?;
+        let session = stored_web_playback_session(row).map_err(self.sqlx_err())?;
+        let access = StoredWebPlaybackAccessContext {
+            user_id: session.user_id.clone(),
+            device_id,
+            client_name,
+        };
+        Ok(Some((session, access)))
+    }
+
+    /// Kept for the storage contract test that pins the `ACTIVE`-only access-context projection;
+    /// resource authorization reads the same columns through
+    /// [`Self::find_web_playback_session_with_access_context`].
+    #[cfg(test)]
     pub(crate) async fn find_web_playback_access_context(
         &self,
         session_id: &str,

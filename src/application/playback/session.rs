@@ -16,9 +16,9 @@ use uuid::Uuid;
 use crate::storage::{
     Database, NewAuditEvent, NewEmbyDirectPlaybackTicket, NewTranscodingHistory,
     NewUserActivityEvent, NewWebPlaybackEvent, NewWebPlaybackSession, PlaybackAdmissionResult,
-    StorageError, StoredEmbyDirectPlaybackTicket, StoredWebPlaybackSession,
-    UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery, UserPlaybackPolicy,
-    WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
+    StorageError, StoredEmbyDirectPlaybackTicket, StoredWebPlaybackAccessContext,
+    StoredWebPlaybackSession, UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+    UserPlaybackPolicy, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
 };
 
 use crate::application::user_access_rules::{
@@ -897,7 +897,11 @@ impl WebPlaybackSessionService {
     ) -> Result<StoredWebPlaybackSession, WebPlaybackSessionError> {
         self.verify_resource_signature(session_id, resource, expires_at, signature)?;
         let now = unix_timestamp();
-        let Some(session) = self.database.find_web_playback_session(session_id).await? else {
+        let Some((session, access)) = self
+            .database
+            .find_web_playback_session_with_access_context(session_id)
+            .await?
+        else {
             return Err(WebPlaybackSessionError::NotFound);
         };
         if session.state != "ACTIVE" {
@@ -910,16 +914,16 @@ impl WebPlaybackSessionService {
         if session.play_session_id.starts_with("lux-web:")
             || session.play_session_id.starts_with("lux-emby:")
         {
-            self.enforce_playback_access_rules(&session, client_ip)
+            self.enforce_playback_access_rules(&session, &access, client_ip)
                 .await?;
         }
         if session.plan == "SERVER_HLS" {
-            let policy = self
+            let stored = self
                 .database
                 .get_user_playback_policy(&session.user_id)
                 .await?
                 .ok_or(WebPlaybackSessionError::NotFound)?;
-            if !playback_policy_allows_hls_tier(policy, session.tier) {
+            if !playback_policy_allows_hls_tier(stored, session.tier) {
                 if let Err(error) = self.stop(session_id, &session.user_id).await {
                     tracing::warn!(
                         session_id = %session.id,
@@ -936,23 +940,15 @@ impl WebPlaybackSessionService {
     async fn enforce_playback_access_rules(
         &self,
         session: &StoredWebPlaybackSession,
+        access: &StoredWebPlaybackAccessContext,
         client_ip: Option<IpAddr>,
     ) -> Result<(), WebPlaybackSessionError> {
-        let context = self
-            .database
-            .find_web_playback_access_context(&session.id)
-            .await?
-            .ok_or(WebPlaybackSessionError::NotActive)?;
-        if context.user_id != session.user_id {
-            return Err(WebPlaybackSessionError::AccessRulesUnavailable);
-        }
-
-        let device_id = context.device_id.as_deref().map(|value| {
+        let device_id = access.device_id.as_deref().map(|value| {
             normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Device, value)
                 .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
         });
         let device_id = device_id.transpose()?;
-        let client_name = context.client_name.as_deref().map(|value| {
+        let client_name = access.client_name.as_deref().map(|value| {
             normalize_user_access_blacklist_value(UserAccessBlacklistRuleType::Client, value)
                 .map_err(|_| WebPlaybackSessionError::AccessRulesUnavailable)
         });
@@ -2452,6 +2448,100 @@ mod tests {
                 .await?
                 .is_some(),
             "stopping one session must leave another session's token alone"
+        );
+        Ok(())
+    }
+
+    /// An HLS asset request authorizes one stored session row. The access-rule check needs the
+    /// session's authorization device and client, which are columns of that same row, so the
+    /// request must not read the row a second time for them.
+    #[tokio::test]
+    async fn hls_resource_authorization_reads_the_session_row_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let owner_id = owner.id.to_string();
+        database
+            .update_user_playback_policy(
+                &owner_id,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 2,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        let now = unix_timestamp();
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: "resource-session",
+                user_id: &owner_id,
+                item_id: &item_id,
+                media_source_id: None,
+                play_session_id: "lux-web:resource-session",
+                tier: i64::from(ServerTier::SoftwareTranscode.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at: now + 900,
+                now,
+            })
+            .await?;
+        assert!(
+            database
+                .set_web_playback_access_context(
+                    "resource-session",
+                    &owner_id,
+                    Some("browser-device-id"),
+                    Some("Lux Web"),
+                    now,
+                )
+                .await?
+        );
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+
+        let resource = "hls:index.m3u8";
+        let expires_at = now + 60;
+        let signature = service
+            .signer
+            .sign("resource-session", resource, expires_at)
+            .ok_or("the resource signature was not produced")?;
+        database.reset_query_count();
+        let session = service
+            .authorize_resource_with_ip("resource-session", resource, expires_at, &signature, None)
+            .await?;
+        assert_eq!(session.user_id, owner_id);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the session row, the device/client blacklist match, the IP rules and the policy"
         );
         Ok(())
     }
