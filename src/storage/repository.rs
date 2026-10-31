@@ -1298,8 +1298,12 @@ impl Database {
                 // The only interpolated value is the pragma keyword from `SqliteSynchronous`.
                 let after_connect_sql = after_connect_sql.clone();
                 Box::pin(async move {
+                    // Several settings are applied at once, and PostgreSQL rejects a
+                    // multi-statement string on the extended query protocol with
+                    // `cannot insert multiple commands into a prepared statement`. The
+                    // simple query path is the only one that accepts this batch.
                     connection
-                        .execute(sqlx::query(sqlx::AssertSqlSafe(after_connect_sql)))
+                        .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(after_connect_sql)))
                         .await?;
                     if backend == DatabaseBackend::Postgres {
                         connection.execute("SET application_name = 'lux'").await?;

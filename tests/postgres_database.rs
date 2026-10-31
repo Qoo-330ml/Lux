@@ -4961,3 +4961,54 @@ async fn postgres_home_index_and_statement_timestamp_defaults_exist()
     drop_postgres_test_database(&database_name).await?;
     Ok(())
 }
+
+/// The pooled connection setup applies several `SET` statements at once. PostgreSQL
+/// rejects a multi-statement string on the extended query protocol with
+/// `cannot insert multiple commands into a prepared statement`, which makes every
+/// `after_connect` fail and the pool time out before startup. This regression keeps the
+/// connection setup on the simple query protocol and asserts the settings actually land.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_pool_after_connect_applies_session_settings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+
+    let result = async {
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        let (time_zone, application_name, work_mem, jit): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT current_setting('TimeZone'), current_setting('application_name'),
+                        current_setting('work_mem'), current_setting('jit')",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(time_zone, "UTC");
+        assert_eq!(application_name, "lux");
+        assert_eq!(work_mem, "16MB");
+        assert_eq!(jit, "off");
+
+        let idle_in_transaction_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('idle_in_transaction_session_timeout')")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(idle_in_transaction_timeout, "1min");
+
+        let statement_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(statement_timeout, "30min");
+
+        database.close().await;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    drop_postgres_test_database(&database_name).await?;
+    result
+}
