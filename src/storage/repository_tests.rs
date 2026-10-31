@@ -12412,6 +12412,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -15013,6 +15014,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -15084,6 +15086,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -15217,6 +15220,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -19093,6 +19097,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -19186,6 +19191,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -19691,6 +19697,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -33524,7 +33531,7 @@ async fn emby_access_tokens_expire_and_renew_on_touch() -> Result<(), Box<dyn st
         .await?;
     assert!(
         database
-            .find_user_by_access_token(&token_hash)
+            .find_route_token_principal(&token_hash, false)
             .await?
             .is_some(),
         "a fresh token must resolve"
@@ -33542,7 +33549,7 @@ async fn emby_access_tokens_expire_and_renew_on_touch() -> Result<(), Box<dyn st
     .await?;
     assert!(
         database
-            .find_user_by_access_token(&token_hash)
+            .find_route_token_principal(&token_hash, false)
             .await?
             .is_none(),
         "expired tokens must not resolve"
