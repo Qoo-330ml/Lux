@@ -8305,7 +8305,8 @@ impl Database {
                  FROM media_item_nfo_cache
                  WHERE item_id IN ({placeholders}) AND fingerprint IS NOT NULL"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement =
+                self.query_as::<(String, Vec<u8>, i64, i64)>(sqlx::AssertSqlSafe(query));
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -8313,15 +8314,8 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(self.sqlx_err())?;
-            for row in rows {
-                validities.insert(
-                    row.get("item_id"),
-                    (
-                        row.get("fingerprint"),
-                        row.get("bytes"),
-                        row.get("updated_at"),
-                    ),
-                );
+            for (item_id, fingerprint, bytes, updated_at) in rows {
+                validities.insert(item_id, (fingerprint, bytes, updated_at));
             }
         }
         Ok(validities)
@@ -8332,24 +8326,15 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<(String, Option<Vec<u8>>, i64, i64)>, StorageError> {
-        let row = self
-            .query(
-                "SELECT json, fingerprint, bytes, updated_at
-                 FROM media_item_nfo_cache
-                 WHERE item_id = ?",
-            )
-            .bind(item_id)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(self.sqlx_err())?;
-        Ok(row.map(|row| {
-            (
-                row.get("json"),
-                row.get("fingerprint"),
-                row.get("bytes"),
-                row.get("updated_at"),
-            )
-        }))
+        self.query_as::<(String, Option<Vec<u8>>, i64, i64)>(
+            "SELECT json, fingerprint, bytes, updated_at
+             FROM media_item_nfo_cache
+             WHERE item_id = ?",
+        )
+        .bind(item_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
     }
 
     /// Batch snapshot lookup for list endpoints.
@@ -8371,7 +8356,9 @@ impl Database {
                  FROM media_item_nfo_cache
                  WHERE item_id IN ({placeholders})"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<(String, String, Option<Vec<u8>>, i64, i64)>(
+                sqlx::AssertSqlSafe(query),
+            );
             for item_id in chunk {
                 statement = statement.bind(item_id);
             }
@@ -8379,16 +8366,8 @@ impl Database {
                 .fetch_all(&self.pool)
                 .await
                 .map_err(self.sqlx_err())?;
-            for row in rows {
-                snapshots.insert(
-                    row.get("item_id"),
-                    (
-                        row.get("json"),
-                        row.get("fingerprint"),
-                        row.get("bytes"),
-                        row.get("updated_at"),
-                    ),
-                );
+            for (item_id, json, fingerprint, bytes, updated_at) in rows {
+                snapshots.insert(item_id, (json, fingerprint, bytes, updated_at));
             }
         }
         Ok(snapshots)
@@ -13062,6 +13041,68 @@ mod global_collection_row_decoding_tests {
                 "unexpected decode error: {error}"
             );
         }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the NFO cache projections (single and batched).
+#[cfg(test)]
+mod nfo_cache_row_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn nfo_cache_rows_decode_snapshots_and_validity_stamps()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES ('nfo-lib', 'NFO', 'MOVIE');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('nfo-item', 'nfo-lib', 'MOVIE', 'Item', 'item', 'LOCAL_CONFIRMED', 1),
+                     ('nfo-no-fingerprint', 'nfo-lib', 'MOVIE', 'No fingerprint',
+                      'no fingerprint', 'LOCAL_CONFIRMED', 1);
+                 INSERT INTO media_item_nfo_cache (
+                     item_id, fingerprint, json, bytes, updated_at
+                 ) VALUES
+                     ('nfo-item', X'01', '{\"a\":1}', 7, 100),
+                     ('nfo-no-fingerprint', NULL, '{}', 2, 200)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let snapshot = database
+            .media_item_nfo_snapshot("nfo-item")
+            .await?
+            .expect("single snapshot");
+        assert_eq!(snapshot.0, "{\"a\":1}");
+        assert_eq!(snapshot.1.as_deref(), Some(&b"\x01"[..]));
+        assert_eq!(snapshot.2, 7);
+        assert_eq!(snapshot.3, 100);
+        assert!(
+            database
+                .media_item_nfo_snapshot("nfo-missing")
+                .await?
+                .is_none()
+        );
+
+        let item_ids = vec!["nfo-item".to_owned(), "nfo-no-fingerprint".to_owned()];
+        let validities = database.media_item_nfo_validities_batch(&item_ids).await?;
+        assert_eq!(validities.len(), 1);
+        let validity = &validities["nfo-item"];
+        assert_eq!(validity.0, b"\x01");
+        assert_eq!(validity.1, 7);
+        assert_eq!(validity.2, 100);
+
+        let snapshots = database.media_item_nfo_snapshot_batch(&item_ids).await?;
+        assert_eq!(snapshots.len(), 2);
+        let cached = &snapshots["nfo-no-fingerprint"];
+        assert_eq!(cached.0, "{}");
+        assert_eq!(cached.1, None);
+        assert_eq!(cached.2, 2);
+        assert_eq!(cached.3, 200);
         Ok(())
     }
 }
