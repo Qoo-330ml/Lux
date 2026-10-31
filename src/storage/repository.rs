@@ -126,6 +126,7 @@ pub(crate) use user_series_next::ResumePointerQuery;
 mod users;
 #[path = "watch_state_archive.rs"]
 mod watch_state_archive;
+pub use watch_state_archive::DetachedStateReconcileWorker;
 
 // A media_sources row uses 11 bind values. Keep each backend's positive-index batches
 // below its parameter limit while allowing PostgreSQL fewer round trips per transaction.

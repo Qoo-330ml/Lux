@@ -193,7 +193,6 @@ async fn start_shared_workers(database: &Database) -> Result<(), BoxError> {
     database.spawn_task_history_retention();
     database.spawn_postgres_query_statistics_extension();
     database.spawn_database_maintenance();
-    database.spawn_detached_state_reconcile();
     database.spawn_query_statistics_refresh();
     let cancelled_jobs = database.cancel_incomplete_jobs_for_shutdown().await?;
     if cancelled_jobs > 0 {
@@ -285,6 +284,9 @@ async fn serve(
             Err(error) => error!(%error, "legacy media identity repair failed"),
         }
     });
+    // Started here rather than with the other shared workers so its stop handle can be awaited on
+    // shutdown; the reconciler waits a minute before its first pass, so nothing changes for it.
+    let detached_state_worker = database.spawn_detached_state_reconcile();
     let discovery = DiscoveryService::bind_with_database(discovery_config, &database).await?;
     let discovery_addr = discovery.local_addr()?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -323,6 +325,7 @@ async fn serve(
     if let Err(error) = shutdown_state.shutdown_background_workers_checked().await {
         return Err(std::io::Error::other(error).into());
     }
+    detached_state_worker.shutdown().await;
     match database.cancel_incomplete_jobs_for_shutdown().await {
         Ok(cancelled_jobs) if cancelled_jobs > 0 => {
             info!(
