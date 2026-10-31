@@ -13,8 +13,9 @@
    而新建库经 `Database::connect` 后是 **20 个**。原因见第 6 节：旧的 catalog 修复路径会重建
    `media_items` 并执行一份**硬编码索引清单**，那份清单既不等于迁移链，也会把已删除的索引写回来。
    交接清单里「约 18 个索引」是迁移链的数；真实新建库是 20 个。
-2. **触发器是 13 个，不是 6 个**：其中 3 个（含 2 个 `catalog_outbox` 入队与 1 个 provider 表同步）在每次
-   `media_items` 写入时都会动，`media_items_catalog_au` 更是**任意列的 UPDATE 都会触发**。见第 7 节。
+2. **触发器是 13 个，不是 6 个**：一次 INSERT 默认触发 4 个（`catalog` 入队、`search` 入队、provider id 同步、
+   内容限制队列），一次 UPDATE 至少触发 `media_items_catalog_au`，而它是**任意列 UPDATE 都会触发**、
+   最坏再写 5 行 `catalog_outbox`。见第 7 节。
 3. **本轮删除了 2 个有明确证据冗余的索引**（迁移 `0242` / PG `0244`）：
    `idx_media_items_parent_removed`、`idx_media_items_series_removed`。二者都是更宽的 `*_available`
    索引的严格左前缀（第 5 节有双向的查询计划证据）。
