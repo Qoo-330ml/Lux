@@ -49,6 +49,17 @@ const RESUME_PLAYED_PERCENT_SQL: &str = "COALESCE(
     95
 )";
 
+/// `WHERE` guard of the pointer UPSERT: only a pointer whose value really changed is written.
+///
+/// `IS DISTINCT FROM` compares equal NULLs as equal and is spelled identically by SQLite and
+/// PostgreSQL, where `IS NOT` between two expressions is SQLite-only syntax. `updated_at` is
+/// deliberately absent: it is the write marker, not part of the pointer value.
+const POINTER_CHANGED_PREDICATE: &str =
+    "user_series_next.next_item_id IS DISTINCT FROM excluded.next_item_id
+     OR user_series_next.position_ticks IS DISTINCT FROM excluded.position_ticks
+     OR user_series_next.played IS DISTINCT FROM excluded.played
+     OR user_series_next.last_played_at IS DISTINCT FROM excluded.last_played_at";
+
 fn placeholders(count: usize) -> String {
     std::iter::repeat_n("?", count)
         .collect::<Vec<_>>()
@@ -281,12 +292,13 @@ impl Database {
     /// episodes plus the first unplayed episode after the most recently completed one. The pointer
     /// is the highest episode number in that set, so the derived list returns the same item as the
     /// legacy aggregation.
+    ///
+    /// Both writes share one transaction and one candidate set: the UPSERT keeps a pointer row in
+    /// place unless its value changed, and only the series without a candidate row lose theirs, so
+    /// a rebuild never leaves the table empty while a next episode exists.
     pub(crate) async fn rebuild_user_series_next(&self) -> Result<u64, StorageError> {
-        self.query("DELETE FROM user_series_next")
-            .execute(&self.pool)
-            .await
-            .map_err(self.sqlx_err())?;
-        let statement_sql = format!(
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
+        let candidates = format!(
             "WITH in_progress AS (
                      SELECT us.user_id, mi.series_id, mi.id, mi.season_number,
                             mi.episode_number, us.position_ticks, us.last_played_at
@@ -367,38 +379,60 @@ impl Database {
                                          last_played_at DESC NULLS LAST, id DESC
                             ) AS resume_rank
                      FROM candidates
-                 )
-                 INSERT INTO user_series_next (
-                     user_id, series_id, next_item_id, position_ticks, played, last_played_at,
-                     updated_at
-                 )
-                 SELECT user_id, series_id, id, position_ticks, 0, last_played_at, unixepoch()
-                 FROM resume
-                 WHERE resume_rank = 1
-                 ON CONFLICT(user_id, series_id) DO UPDATE SET
-                     next_item_id = excluded.next_item_id,
-                     position_ticks = excluded.position_ticks,
-                     played = 0,
-                     last_played_at = excluded.last_played_at,
-                     updated_at = unixepoch()",
+                 )",
             runtime_ticks = resume_runtime_ticks_sql(),
             minimum_ticks = RESUME_MINIMUM_TICKS_SQL,
             played_percent = RESUME_PLAYED_PERCENT_SQL,
         );
-        let result = self
-            .query(sqlx::AssertSqlSafe(statement_sql))
-            .execute(&self.pool)
+        let upsert_sql = format!(
+            "{candidates}
+             INSERT INTO user_series_next (
+                 user_id, series_id, next_item_id, position_ticks, played, last_played_at,
+                 updated_at
+             )
+             SELECT user_id, series_id, id, position_ticks, 0, last_played_at, unixepoch()
+             FROM resume
+             WHERE resume_rank = 1
+             ON CONFLICT(user_id, series_id) DO UPDATE SET
+                 next_item_id = excluded.next_item_id,
+                 position_ticks = excluded.position_ticks,
+                 played = excluded.played,
+                 last_played_at = excluded.last_played_at,
+                 updated_at = unixepoch()
+             WHERE {POINTER_CHANGED_PREDICATE}"
+        );
+        let written = self
+            .query(sqlx::AssertSqlSafe(upsert_sql))
+            .execute(&mut *transaction)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        // Only the series that the candidate set no longer covers lose their pointer.
+        let delete_sql = format!(
+            "{candidates}
+             DELETE FROM user_series_next
+             WHERE NOT EXISTS (
+                 SELECT 1 FROM resume
+                 WHERE resume.resume_rank = 1
+                   AND resume.user_id = user_series_next.user_id
+                   AND resume.series_id = user_series_next.series_id
+             )"
+        );
+        self.query(sqlx::AssertSqlSafe(delete_sql))
+            .execute(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;
-        Ok(result.rows_affected())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        Ok(written)
     }
 }
 
 impl Database {
     /// Refreshes one user/series pointer after a playback state change.
     ///
-    /// The write is one UPSERT inside one transaction, so a concurrent reader sees either the
-    /// previous pointer or the refreshed one and never a series without a pointer.
+    /// The read and the write share one transaction and the write is a single UPSERT, so a
+    /// concurrent reader sees either the previous pointer or the refreshed one and never a series
+    /// without a pointer.
     pub(crate) async fn refresh_user_series_next_for_item(
         &self,
         user_id: &str,
@@ -468,16 +502,18 @@ impl Database {
 
     /// Rewrites one pointer in place.
     ///
-    /// The candidate query upserts the resume row in a single statement; only when it matches no
-    /// episode at all is the row deleted, so a refresh never leaves the series without a pointer
-    /// while a next episode still exists.
+    /// The candidate query resolves the next episode first and the pointer is then written by one
+    /// UPSERT guarded by [`POINTER_CHANGED_PREDICATE`], so a refresh that recomputes the same
+    /// pointer writes nothing and a changed one keeps its row. Only when the series has no
+    /// in-progress or unplayed episode left is the row deleted, so a refresh never leaves the
+    /// series without a pointer while a next episode still exists.
     async fn write_user_series_next_pointer(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
         user_id: &str,
         series_id: &str,
     ) -> Result<(), StorageError> {
-        let statement_sql = format!(
+        let candidate_sql = format!(
             "WITH in_progress AS (
                  SELECT mi.id, mi.season_number, mi.episode_number, us.position_ticks,
                         us.last_played_at
@@ -551,44 +587,54 @@ impl Database {
                         ) AS resume_rank
                  FROM candidates
              )
-             INSERT INTO user_series_next (
-                 user_id, series_id, next_item_id, position_ticks, played, last_played_at,
-                 updated_at
-             )
-             SELECT ?, ?, id, position_ticks, 0, last_played_at, unixepoch()
+             SELECT id, position_ticks, last_played_at
              FROM resume
-             WHERE resume_rank = 1
-             ON CONFLICT(user_id, series_id) DO UPDATE SET
-                 next_item_id = excluded.next_item_id,
-                 position_ticks = excluded.position_ticks,
-                 played = 0,
-                 last_played_at = excluded.last_played_at,
-                 updated_at = unixepoch()",
+             WHERE resume_rank = 1",
             runtime_ticks = resume_runtime_ticks_sql(),
             minimum_ticks = RESUME_MINIMUM_TICKS_SQL,
             played_percent = RESUME_PLAYED_PERCENT_SQL,
         );
-        let updated = self
-            .query(sqlx::AssertSqlSafe(statement_sql))
+        let candidate: Option<(String, i64, Option<i64>)> = self
+            .query_as(sqlx::AssertSqlSafe(candidate_sql))
             .bind(user_id)
             .bind(series_id)
             .bind(user_id)
             .bind(series_id)
             .bind(series_id)
             .bind(user_id)
-            .bind(user_id)
-            .bind(series_id)
-            .execute(&mut **transaction)
+            .fetch_optional(&mut **transaction)
             .await
-            .map_err(self.sqlx_err())?
-            .rows_affected();
-        if updated > 0 {
-            return Ok(());
-        }
-        // No in-progress or next episode is left for this series, so the pointer must go away.
-        self.query("DELETE FROM user_series_next WHERE user_id = ? AND series_id = ?")
+            .map_err(self.sqlx_err())?;
+        let Some((next_item_id, position_ticks, last_played_at)) = candidate else {
+            // No in-progress or next episode is left for this series, so the pointer goes away.
+            return self
+                .query("DELETE FROM user_series_next WHERE user_id = ? AND series_id = ?")
+                .bind(user_id)
+                .bind(series_id)
+                .execute(&mut **transaction)
+                .await
+                .map(|_| ())
+                .map_err(self.sqlx_err());
+        };
+        let upsert_sql = format!(
+            "INSERT INTO user_series_next (
+                 user_id, series_id, next_item_id, position_ticks, played, last_played_at,
+                 updated_at
+             ) VALUES (?, ?, ?, ?, 0, ?, unixepoch())
+             ON CONFLICT(user_id, series_id) DO UPDATE SET
+                 next_item_id = excluded.next_item_id,
+                 position_ticks = excluded.position_ticks,
+                 played = excluded.played,
+                 last_played_at = excluded.last_played_at,
+                 updated_at = unixepoch()
+             WHERE {POINTER_CHANGED_PREDICATE}"
+        );
+        self.query(sqlx::AssertSqlSafe(upsert_sql))
             .bind(user_id)
             .bind(series_id)
+            .bind(next_item_id)
+            .bind(position_ticks.max(0))
+            .bind(last_played_at)
             .execute(&mut **transaction)
             .await
             .map(|_| ())
