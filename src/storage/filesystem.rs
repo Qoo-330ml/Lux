@@ -12,7 +12,7 @@ impl Database {
         self.query(
             "UPDATE filesystem_entries
              SET is_missing = 1, updated_at = unixepoch()
-             WHERE library_root_id = ? AND relative_path = ?",
+             WHERE library_root_id = ? AND relative_path = ? AND is_missing = 0",
         )
         .bind(library_root_id)
         .bind(relative_path)
@@ -446,14 +446,19 @@ impl Database {
         self.restore_media_items_for_filesystem_entries(&mut transaction, &[id.to_owned()])
             .await?;
         if strm_target_kind.is_some() {
+            // The file is unchanged, so the parsed STRM target usually is too; skipping the
+            // redundant row avoids a media source write and its catalog outbox row per scan.
             self.query(
                 "UPDATE media_sources
                  SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
-                 WHERE filesystem_entry_id = ?",
+                 WHERE filesystem_entry_id = ?
+                   AND (external_url IS DISTINCT FROM ? OR strm_target_kind IS DISTINCT FROM ?)",
             )
             .bind(strm_target)
             .bind(strm_target_kind)
             .bind(id)
+            .bind(strm_target)
+            .bind(strm_target_kind)
             .execute(&mut *transaction)
             .await
             .map_err(self.sqlx_err())?;

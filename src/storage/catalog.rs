@@ -6413,6 +6413,8 @@ impl Database {
         target_scan_job_id: Option<&str>,
         target_source_id: Option<&str>,
     ) -> Result<(), StorageError> {
+        // Requeueing is idempotent: a source that is already pending without an error is what the
+        // probe job selects, so the row write (and its catalog outbox row) can be skipped.
         let result = if let Some(source_id) = target_source_id {
             self.query(
                 "UPDATE media_sources
@@ -6424,7 +6426,8 @@ impl Database {
                    )
                    AND filesystem_entry_id IN (
                        SELECT id FROM filesystem_entries WHERE is_missing = 0
-                   )",
+                   )
+                   AND (probe_status IS DISTINCT FROM 'PENDING' OR probe_error IS NOT NULL)",
             )
             .bind(source_id)
             .bind(library_id)
@@ -6442,6 +6445,7 @@ impl Database {
                      WHERE mi.library_id = ? AND mi.removed_at IS NULL
                        AND ms.source_kind = 'STRM_URL' AND fe.is_missing = 0
                        AND {}
+                       AND (ms.probe_status IS DISTINCT FROM 'PENDING' OR ms.probe_error IS NOT NULL)
                  )",
                 incremental_scan_scope_sql(self.backend)
             );
@@ -6461,6 +6465,7 @@ impl Database {
                      JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
                      WHERE mi.library_id = ? AND mi.removed_at IS NULL
                        AND ms.source_kind = 'STRM_URL' AND fe.is_missing = 0
+                       AND (ms.probe_status IS DISTINCT FROM 'PENDING' OR ms.probe_error IS NOT NULL)
                  )",
             )
             .bind(library_id)
@@ -7241,11 +7246,14 @@ impl Database {
             let Some((_, _, title, sort_title, overview)) = source_rows.first() else {
                 if let Some(work_item_id) = existing_work_ids.get(&key) {
                     self.query(
+                        // A resync of the same collection re-derives the same state for every
+                        // member; only the members whose availability actually changed are written.
                         "UPDATE media_items
                          SET has_available_source = 0,
                              removed_at = COALESCE(removed_at, unixepoch()),
                              updated_at = unixepoch()
-                         WHERE id = ?",
+                         WHERE id = ?
+                           AND (has_available_source IS DISTINCT FROM 0 OR removed_at IS NULL)",
                     )
                     .bind(work_item_id)
                     .execute(&mut *transaction)
@@ -7302,7 +7310,8 @@ impl Database {
             self.query(
                 "UPDATE media_items
                  SET has_available_source = 1, removed_at = NULL, updated_at = unixepoch()
-                 WHERE id = ?",
+                 WHERE id = ?
+                   AND (has_available_source IS DISTINCT FROM 1 OR removed_at IS NOT NULL)",
             )
             .bind(&work_item_id)
             .execute(&mut *transaction)
@@ -7478,12 +7487,23 @@ impl Database {
             None => (Uuid::now_v7().to_string(), false),
         };
         if already_exists {
+            // The work item of an unchanged collection member is re-derived on every resync of
+            // that collection; the condition covers every column the statement assigns.
             self.query(
                 "UPDATE media_items
                  SET library_id = ?, item_type = ?, title = ?, sort_title = ?, overview = ?,
                      production_year = NULL, identification_status = 'LOCAL_CONFIRMED',
                      has_available_source = ?, removed_at = NULL, updated_at = unixepoch()
-                 WHERE id = ?",
+                 WHERE id = ?
+                   AND (library_id IS DISTINCT FROM ?
+                        OR item_type IS DISTINCT FROM ?
+                        OR title IS DISTINCT FROM ?
+                        OR sort_title IS DISTINCT FROM ?
+                        OR overview IS DISTINCT FROM ?
+                        OR production_year IS NOT NULL
+                        OR identification_status IS DISTINCT FROM 'LOCAL_CONFIRMED'
+                        OR has_available_source IS DISTINCT FROM ?
+                        OR removed_at IS NOT NULL)",
             )
             .bind(GLOBAL_COLLECTION_LIBRARY_ID)
             .bind(item.item_type)
@@ -7492,6 +7512,12 @@ impl Database {
             .bind(item.overview)
             .bind(database_flag(item.has_available_source))
             .bind(&id)
+            .bind(GLOBAL_COLLECTION_LIBRARY_ID)
+            .bind(item.item_type)
+            .bind(item.title)
+            .bind(item.sort_title)
+            .bind(item.overview)
+            .bind(database_flag(item.has_available_source))
             .execute(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
@@ -8705,16 +8731,24 @@ impl Database {
     ) -> Result<(), StorageError> {
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        // The "NFO is still current" shortcut runs for every NFO file of every scan; when the
+        // fingerprint and collection reference are already stored, the row write (and its catalog
+        // outbox row) is pure noise.
         self.query(
             "UPDATE media_items
              SET metadata_fingerprint = ?,
                  nfo_collection_reference_key = COALESCE(?, nfo_collection_reference_key),
                  updated_at = unixepoch()
-             WHERE id = ?",
+             WHERE id = ?
+               AND (metadata_fingerprint IS DISTINCT FROM ?
+                    OR (? IS NOT NULL AND nfo_collection_reference_key IS DISTINCT FROM ?))",
         )
         .bind(metadata_fingerprint)
         .bind(nfo_collection_reference_key)
         .bind(item_id)
+        .bind(metadata_fingerprint)
+        .bind(nfo_collection_reference_key)
+        .bind(nfo_collection_reference_key)
         .execute(&mut *transaction)
         .await
         .map(|_| ())
@@ -8744,6 +8778,9 @@ impl Database {
             self.invalidate_content_restriction_index_in_transaction(&mut transaction, item_id)
                 .await?;
         }
+        // A scan re-runs this for every already current NFO file. The statement already keeps
+        // `updated_at` when nothing else changes, so it can skip the row write entirely: the write
+        // condition covers every column it assigns.
         self.query(
             "UPDATE media_items
              SET nfo_metadata_json = NULL,
@@ -8760,13 +8797,19 @@ impl Database {
                        OR metadata_fingerprint <> ? THEN unixepoch()
                      ELSE updated_at
                  END
-             WHERE id = ?",
+             WHERE id = ?
+               AND (nfo_metadata_json IS NOT NULL
+                    OR (nfo_metadata_fingerprint IS NOT NULL
+                        AND nfo_metadata_fingerprint IS DISTINCT FROM ?)
+                    OR metadata_fingerprint IS DISTINCT FROM ?)",
         )
         .bind(source_fingerprint)
         .bind(metadata_fingerprint)
         .bind(source_fingerprint)
         .bind(metadata_fingerprint)
         .bind(item_id)
+        .bind(source_fingerprint)
+        .bind(metadata_fingerprint)
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
