@@ -12300,8 +12300,10 @@ async fn unavailable_metadata_image_batch_uses_one_statement_and_preserves_attem
     database.close().await;
 }
 
-#[tokio::test]
-async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
+/// Job page fixture: two jobs with one item each, plus the indexes the page query and the pending
+/// aggregation seek. `metadata_candidates` is created only by the tests that need it, so the
+/// default page query cannot depend on it.
+async fn metadata_job_page_pool() -> AnyPool {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
         .max_connections(1)
@@ -12341,28 +12343,12 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
     .await
     .expect("create metadata job items table");
     sqlx::query(
-        "CREATE TABLE metadata_candidates (
-                item_id TEXT NOT NULL,
-                status TEXT NOT NULL
-            )",
-    )
-    .execute(&pool)
-    .await
-    .expect("create metadata candidates table");
-    sqlx::query(
         "CREATE INDEX idx_metadata_reidentify_items_status
              ON metadata_reidentify_job_items(job_id, status, item_id)",
     )
     .execute(&pool)
     .await
     .expect("create metadata job item index");
-    sqlx::query(
-        "CREATE INDEX idx_metadata_candidates_item
-             ON metadata_candidates(item_id, status)",
-    )
-    .execute(&pool)
-    .await
-    .expect("create metadata candidate index");
     for (id, created_at) in [("older", 1_i64), ("newer", 2_i64)] {
         sqlx::query(
             "INSERT INTO metadata_reidentify_jobs (
@@ -12390,16 +12376,39 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         .await
         .expect("insert metadata job item");
     }
+    pool
+}
+
+/// Adds the candidate table plus two PENDING candidates for `new-item` (distinct count 1).
+async fn metadata_job_page_candidates(pool: &AnyPool) {
+    sqlx::query(
+        "CREATE TABLE metadata_candidates (
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+    )
+    .execute(pool)
+    .await
+    .expect("create metadata candidates table");
+    sqlx::query(
+        "CREATE INDEX idx_metadata_candidates_item
+             ON metadata_candidates(item_id, status)",
+    )
+    .execute(pool)
+    .await
+    .expect("create metadata candidate index");
     sqlx::query(
         "INSERT INTO metadata_candidates (item_id, status)
              VALUES ('old-item', 'PENDING'), ('new-item', 'PENDING'),
                     ('new-item', 'PENDING')",
     )
-    .execute(&pool)
+    .execute(pool)
     .await
     .expect("insert metadata candidates");
+}
 
-    let database = Database {
+fn metadata_job_page_database(pool: AnyPool) -> Database {
+    Database {
         pool,
         log_store: LogStore::new(Path::new("unused-metadata-summary-test")),
         pool_max_connections: 1,
@@ -12421,15 +12430,66 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
-    };
+    }
+}
+
+#[tokio::test]
+async fn metadata_job_list_skips_the_pending_aggregation_unless_requested() {
+    let pool = metadata_job_page_pool().await;
+    let database = metadata_job_page_database(pool);
+    database.reset_query_count();
+    // The candidate table does not exist yet: a default page that joined it would fail here.
     let jobs = database
-        .list_metadata_reidentify_jobs(None, 0, 1)
+        .list_metadata_reidentify_jobs(None, 0, 1, false)
+        .await
+        .expect("the default page must not read metadata_candidates");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, "newer");
+    assert_eq!(jobs[0].pending_count, None);
+
+    let filtered = database
+        .list_metadata_reidentify_jobs(Some("QUEUED"), 0, 10, false)
+        .await
+        .expect("the filtered page must not read metadata_candidates");
+    assert_eq!(filtered.len(), 2);
+    assert!(filtered.iter().all(|job| job.pending_count.is_none()));
+
+    // The explicit request still aggregates, so it needs the candidate table.
+    assert!(
+        database
+            .list_metadata_reidentify_jobs(None, 0, 1, true)
+            .await
+            .is_err(),
+        "explicit pending requests must aggregate metadata_candidates"
+    );
+
+    metadata_job_page_candidates(database.pool()).await;
+    let jobs = database
+        .list_metadata_reidentify_jobs(None, 0, 1, true)
+        .await
+        .expect("explicit pending request");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, "newer");
+    assert_eq!(jobs[0].pending_count, Some(1));
+    database.close().await;
+}
+
+#[tokio::test]
+async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
+    let pool = metadata_job_page_pool().await;
+    metadata_job_page_candidates(&pool).await;
+    let database = metadata_job_page_database(pool);
+    database.reset_query_count();
+    let jobs = database
+        .list_metadata_reidentify_jobs(None, 0, 1, true)
         .await
         .expect("list metadata jobs");
+    assert_eq!(database.query_count(), 1);
 
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].id, "newer");
-    assert_eq!(jobs[0].pending_count, 1);
+    assert_eq!(jobs[0].pending_count, Some(1));
 
     let plan = sqlx::query(
         "EXPLAIN QUERY PLAN

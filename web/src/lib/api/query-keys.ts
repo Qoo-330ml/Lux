@@ -56,7 +56,8 @@ export const queryKeys = {
   adminScheduledTasks: (page = 1) => ["admin", "scheduled-tasks", page] as const,
   adminScheduledTaskPlans: (page = 1, taskType = "", search = "") =>
     ["admin", "scheduled-task-plans", page, taskType, search] as const,
-  adminMetadataJobs: (status?: string) => ["admin", "metadata-jobs", status ?? "all"] as const,
+  adminMetadataJobs: (status?: string, includePending = false) =>
+    ["admin", "metadata-jobs", status ?? "all", includePending ? "pending" : "base"] as const,
   adminStrmProbeJobs: (status?: string) => ["admin", "strm-probe-jobs", status ?? "all"] as const,
   adminChapterDetectionJobs: (status?: string) => ["admin", "chapter-detection-jobs", status ?? "all"] as const,
   adminDanmakuMatchJobs: (status?: string) => ["admin", "danmaku-match-jobs", status ?? "all"] as const,

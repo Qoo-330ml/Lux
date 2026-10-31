@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CalendarDays,
@@ -232,9 +232,18 @@ export function AdminOperationsPage() {
       : api.adminJobs(status || undefined),
     enabled: status !== "DEFERRED",
   });
+  // The pending aggregation only feeds the "低匹配 N 项" link on the runtime records rows, so it is
+  // requested only while that tab is on screen; the badge counts need no pending number.
+  const includePendingMetadataJobs = tab === "runs";
   const metadataJobs = useQuery({
-    queryKey: queryKeys.adminMetadataJobs(status),
-    queryFn: () => api.adminMetadataReidentifyJobs(metadataStatusFilter(status)),
+    queryKey: queryKeys.adminMetadataJobs(status, includePendingMetadataJobs),
+    queryFn: () =>
+      api.adminMetadataReidentifyJobs(metadataStatusFilter(status), {
+        includePending: includePendingMetadataJobs,
+      }),
+    // Switching to the runtime records keeps the rows already on screen while the pending
+    // counts arrive, instead of replacing them with a full loading state.
+    placeholderData: includePendingMetadataJobs ? keepPreviousData : undefined,
   });
   const strmJobs = useQuery({
     queryKey: queryKeys.adminStrmProbeJobs(status),
@@ -615,7 +624,7 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: A
     mutationFn: () => globalPlan ? api.runAdminScheduledTask({ ownerType: "GLOBAL", ownerId: "global", taskType: plan.taskType }) : api.runAdminScheduledTaskPlan(plan.id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
@@ -767,7 +776,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
     mutationFn: () => runRegisteredTask(task),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });

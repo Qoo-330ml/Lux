@@ -2702,7 +2702,8 @@ pub struct MetadataReidentifyJob {
     pub cancel_requested: bool,
     pub library_id: Option<String>,
     pub job_scope: String,
-    pub pending_count: i64,
+    /// `None` when the list was requested without pending counts; job details always fill it.
+    pub pending_count: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

@@ -435,6 +435,38 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `reidentify.rs:2705`，只是由聚合算出来），或对列表接口改成"只在请求带 `?includePending=1` 时算"。
 - **风险**：计数列需要与候选状态变更保持同步（`select/reject/expire` 三处）。
 - **是否值得做**：**中**（管理端，但与交接 §2 的 SSE 放大是同一类问题，值得一并处理）。
+- **已实施（提交 `4c20d3c8`（后端）+ `677a7508`、`6a7fc66c`（前端），2026-10-31，按所有者确认走"按需计算"，未加计数列）**：
+  项目所有者确认走"按需计算"，不做写侧维护的 `pending_count` 计数列（省掉 `select/reject/expire` 三处同步与迁移）。
+  - **改法（后端）**：`list_metadata_reidentify_jobs` 增加 `include_pending` 参数，四条页面语句固定为
+    "带/不带聚合 × 带/不带 `status` 过滤"；默认两条只扫 `metadata_reidentify_jobs`
+    （`pending_count` 取 `CAST(NULL AS BIGINT)`，SQLite 与 PostgreSQL 共用的两后端正字面量写法，无新增
+    `DatabaseBackend::` 分支，`?` 仍由 `adapt_sql_for_backend` 改写）。单作业详情
+    `find_metadata_reidentify_job` **保持聚合**（详情视图本来就展示这个数）。
+    `list_metadata_reidentify_jobs_for_activity` 也从 `0 AS pending_count` 改成 `NULL`（该字段在
+    `admin_task_activity` 里没有被消费）。HTTP：`GET /api/v1/admin/metadata/reidentify` 新增
+    `?includePending=1|true|yes|on` 开关，响应字段名不变，**未请求时 `pendingCount` 为 `null`**
+    （`StoredMetadataReidentifyJob`/`MetadataReidentifyJob.pending_count` 改为 `Option<i64>`）。
+  - **改法（前端）**：`AdminOperationsPage` 只在"运行记录"标签页（唯一渲染"低匹配 N 项"的视图）带
+    `includePending=1`，并把该选择编进查询键；切到该页时用 `keepPreviousData` 保留已有行，不退回整页加载态。
+    `useAdminEvents` 不再按固定 10 个键盲目失效，而是把每个 scope 的键对照查询缓存解析成**当前挂载页面实际订阅的
+    活跃查询**再逐个精确失效；没有观察者的页面留到它自己挂载时取数。
+  - **前后数字（静态口径 + `query_count` 断言，见第 2.2 节）**：
+    - 列表接口语句数：**1 → 1**（前后都是一条 SELECT，聚合是 CTE，不额外发语句），但默认页面的语句
+      **不再引用 `metadata_reidentify_job_items` / `metadata_candidates`**：聚合工作量
+      "选定页 ≤limit 个作业 × 每个作业的全部 `job_items` × 每行一次 `idx_metadata_candidates_item` 探测" **→ 0**。
+      断言方式：新建的表结构里**根本没有 `metadata_candidates` 表**，默认列表仍成功（`query_count() == 1`、
+      `pending_count == None`），显式请求在同库上则**必须**依赖该表（无表时返回错误）。
+    - 显式请求：语句数 **1 → 1**，数值与原来完全一致（同一 fixture：`Some(1)`；单作业详情同样 `Some(1)`）。
+    - 管理端 `jobs` 事件：每个 scope 从"固定 10 个键"变成"该视图像素上真正挂载的查询"。元数据作业运行、
+      停在"注册任务"/"日志"标签页时，`pendingCount` 的聚合**完全不进这条每秒路径**；只有切到"运行记录"
+      （真正展示该数字的视图）才会算。
+  - **风险**：
+    - `pendingCount` 未请求时是 `null` 而不是 `0`。本仓库唯一的消费者是 `AdminOperationsPage`（`?? 0` 兜底，
+      且只在展示时请求），没有外部契约依赖 `0`；若将来有消费者把"未计算"当"0 个待处理"，需要显式请求。
+    - SSE 失效范围收窄到活跃查询后，**未挂载页面**的缓存不再被每次事件标记为 stale，改为挂载时按
+      `staleTime`（默认 60 s）或该页面自己的 `refetchInterval` 刷新；已挂载页面的实时性不变（仍有 ≤1 次/秒）。
+    - 任务页自身仍订阅 8 个任务列表查询（标签徽标与"正在运行/失败记录"计数要用），所以 `jobs` 事件在该页面
+      仍然是 8 个请求/秒；要再往下压需要后端按作业种类拆分 scope 或提供轻量计数端点，**不在本任务范围**。
 
 ### S7 已确认正常、不需要改的部分
 
@@ -755,7 +787,7 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
    - M3：`UPDATE media_items` 加 `IS DISTINCT FROM` 式条件（需要先确认 `updated_at` 语义）。**已实施（提交 `ca9b9d6b`）**。
 2. **批次 2（需要所有者确认"可能改变可观察行为"）**
    - H1：分片路径改"renew 优先、失败回落 reserve"（并发上限最长滞后一个心跳周期）。
-   - S6：`pending_count` 改计数列或按需计算。
+   - S6：`pending_count` 改计数列或按需计算（所有者确认"按需计算"）。**已实施（提交 `4c20d3c8` + `677a7508`）**。
 3. **批次 3（要有实测支撑再做）**
    - S5/I1 索引迁移（先在一份库副本上 `EXPLAIN QUERY PLAN` 对比）。
    - S2/S3/S4 的读复用、M8/M9、H3/H4/H5/H6（顺手做）。

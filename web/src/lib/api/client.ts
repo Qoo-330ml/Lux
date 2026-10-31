@@ -1898,9 +1898,17 @@ export class LuxApiClient {
     );
   }
 
-  adminMetadataReidentifyJobs(status?: string) {
+  /**
+   * Lists metadata jobs.
+   *
+   * `includePending` opts into the server-side pending candidate aggregation: the default page
+   * leaves `pendingCount` null instead of joining job items with candidates (S6 of
+   * `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`).
+   */
+  adminMetadataReidentifyJobs(status?: string, options?: { includePending?: boolean }) {
     const params = new URLSearchParams({ page: "1", pageSize: "50" });
     if (status) params.set("status", status);
+    if (options?.includePending) params.set("includePending", "1");
     return this.request<{ jobs?: AdminMetadataReidentifyJob[] }>(
       `/api/v1/admin/metadata/reidentify?${params}`,
     );

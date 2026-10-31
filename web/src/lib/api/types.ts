@@ -1401,7 +1401,8 @@ export type AdminMetadataReidentifyJob = {
   mode: "REIDENTIFY" | "FILL_MISSING" | "FULL_REFRESH" | string;
   processedCount: number;
   totalCount: number;
-  pendingCount?: number;
+  /** `null` unless the list request asked for it with `includePending`; details always fill it. */
+  pendingCount?: number | null;
   error?: string | null;
   createdAt: string | number;
   updatedAt?: string | number;
