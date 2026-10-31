@@ -189,7 +189,56 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `active_playback_count` 全部不变。**准入事务内语句数 5 → 4**（策略读、陈旧名额回收、计数、UPSERT），
   提交次数仍是 1 次 `BEGIN IMMEDIATE` + 1 次 `COMMIT`。测试：
   `storage::repository::sessions::tests::playback_admission_derives_the_new_total_without_a_second_count`。
-  **主体（分片路径改"renew 优先"）未做**，仍等所有者确认并发上限的判定窗口（见本节"风险"）。
+  **主体（分片路径）见下一条**：所有者此后确认了"窗口内放行 + 每 30 秒重判"的折中方案；实现上最终做成
+  "窗口内只读判定"而不是推进戳记的续租，原因见下一条的返工说明。
+
+- **已实施（主体，返工后，2026-11-01，提交 `f17c493b`）**：分片与清单 GET 改成"只读判定 + 周期性完整准入"。
+  **初版（`63458f44`）已返工**：那一版用"每条请求一条 `UPDATE` 续租"实现，但续租每次把 `last_seen_at` 推进到 now，
+  分片 4 s 一个，30 秒窗口永远不会到期 —— 稳态下完整准入一次都不再运行，并发上限与 `can_play` 在整段播放里被冻结
+  （中途撤销 `can_play` 也不会被拒），比"滞后 30 秒"更弱。现在的语义如下。
+  - **调用点**：4 个 HLS 调用点改走新的 `admit_web_playback_hls_request`（`src/api/playback.rs:3483`/`:3536`
+    Emby 清单与分片，`:4424`/`:4474` Web 清单与分片）。会话创建、心跳、`/direct` 与 STRM range 仍走完整准入
+    `admit_web_playback_request`，这三条路径行为不变。
+  - **判定（`src/storage/sessions.rs`）**：
+    - `has_fresh_playback_admission`：一条
+      `SELECT 1 FROM playback_admissions WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE' AND last_seen_at > ?`，
+      **只读、零写入**（`?` 绑 `now - PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS`）。返回 true 时请求直接放行，
+      完全不碰写路径。
+    - 否则（行不存在 / 已 `RELEASED` / 已过期 / 窗口超过 30 秒）走 `reserve_playback_admission`：它把
+      `last_seen_at` 推进到本次请求时间，从而**开启下一个 30 秒窗口**。
+    - 具名常量 `Database::PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS = 30`（"多久必须重判一次"，不是"续租窗口"）。
+    - 心跳与播放事件继续用 `renew_existing_playback_admission`（90 秒陈旧窗口、会推进戳记）。完整准入每
+      ≤30 秒 + 一个分片间隔一次，远小于 90 秒，所以分片路径只读也不会让槽位掉出 active 集合。
+    - **`can_play` 撤销**：只读放行路径上若本次请求已读到的 `known_policy.can_play` 为假，立即改走完整准入，
+      得到与改造前完全相同的 `Denied(PlaybackDisabled)`（HTTP 403 + 原有提示文案），**不等窗口**。
+  - **语句数（`Database::query_count()` 实测，SQLite，沿用本次请求已读的策略行）**：
+    - 稳态分片/清单请求：准入部分 **4 → 1 条语句，零写入**（改造前：`BEGIN IMMEDIATE` + 陈旧名额回收 `UPDATE` +
+      UNION 计数 + UPSERT + `COMMIT`）。
+    - 周期重判请求：1 条只读判定 + 事务内 3 条 = **4 条、1 次显式写事务**；拒绝路径不进 UPSERT，是 3 条
+      （判定 + 陈旧回收 + 计数）；`can_play` 拒绝是 2 条（判定被跳过，策略否决在计数后立刻返回）。
+    - 单路播放（分片 4 s + 清单，约 30 次/分，每 32 秒重判一次）：显式写事务 **≈1800 → ≈113 次/小时**，
+      准入相关语句 **≈5400 → ≈2140 条/小时**（1800 条只读判定 + 3 条 × ≈113 次完整准入）。`synchronous=FULL`
+      下的 fsync 随之从"每个分片一次"降到"每 32 秒一次"。
+  - **滞后窗口**：稳态流里并发上限与 `can_play` 最多滞后 **30 秒 + 一个分片间隔**（HLS 4 s，即 ≤34 秒；窗口边界上
+    恰好有请求时就是 30 秒）。名额被回收（`RELEASED`/过期）后，**下一个分片请求**即回落完整准入，滞后 0 个请求。
+  - **SQLite/PostgreSQL**：只读判定两分支共用同一条语句（`MAX`/`GREATEST` 只出现在心跳续租里，走既有
+    `scalar_max_function()`），未新增 `DatabaseBackend::` 分支（`scripts/check-backend-branches.py` 通过）；
+    未动迁移（`scripts/check-migration-parity.py` 通过）。
+  - **测试**：`storage::repository::repository_tests::playback_admission_freshness_check_reads_and_never_writes`
+    （1 条语句、戳记不变、29 秒新鲜/30 秒回落、完整准入重开窗口、`RELEASED`/缺行回落、心跳仍覆盖 90 秒）；
+    `…::postgres_playback_admission_freshness_never_writes`（`#[ignore]`，本机无 PostgreSQL 实例，未运行）；
+    `application::playback::session::tests::hls_asset_requests_check_the_slot_without_writing_inside_the_interval`
+    （首个请求 4 条 → 之后 7 个 4 秒间隔的请求各 1 条只读且 `(admitted_at, last_seen_at)` 不变 → 跨过 30 秒的那个
+    请求恰好 1 次完整准入并把窗口重开到 `started + 32`，之后 29 秒只读、30 秒再次重判）；
+    `…::sustained_asset_requests_re_run_the_full_admission_every_interval`（2 分钟、31 个 4 秒请求 → 完整准入恰好在
+    `0/32/64/96` 秒发生 4 次、27 次零写入；把只读判定短路成"永远新鲜"时该用例失败，正是本次返工的回归测试）；
+    `…::a_revoked_can_play_refuses_the_next_asset_request`（撤销后 1 秒的下一个分片即 `Denied(PlaybackDisabled)`，
+    2 条语句、不写库）；`…::a_second_playback_is_refused_and_a_reclaimed_slot_falls_back`（创建路径
+    `check_playback_admission` 拒绝、第二路首个子片以完整准入拒绝、名额被回收后回落并被拒/重新准入）。
+    集成：`cargo test --locked --test playback`（33 passed / 2 ignored）。
+  - **剩余风险**：窗口内把上限改小不会立刻踢掉流内会话（与改造前"已在 active 集合的会话不会被拒"一致，只是判定
+    变稀，且现在最多稀疏 30–34 秒）；`/direct` 与 STRM 仍是每请求完整准入（不在本任务范围）；fsync 计数的 NAS
+    A/B 实测仍未做。
 
 ### H2 每请求读 6 次，含两处重复读与一次设置行读取（已读代码确认）
 

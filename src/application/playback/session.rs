@@ -137,6 +137,20 @@ pub(crate) struct AuthorizedWebPlaybackResource {
     pub(crate) policy: Option<UserPlaybackPolicy>,
 }
 
+/// The outcome of the admission an HLS segment or manifest request performs.
+///
+/// Steady-state assets only check the slot the stream already holds, so most requests carry no
+/// decision and write nothing. A decision appears when the periodic re-check ran the full
+/// admission instead.
+pub(crate) enum PlaybackAssetAdmission {
+    /// The slot was verified with a read; the limits were re-evaluated recently enough.
+    Fresh,
+    /// The full admission ran and produced a decision the caller has to enforce.
+    Evaluated(PlaybackAdmissionResult),
+    /// The full admission found no playback policy row for the session owner.
+    NotFound,
+}
+
 /// One session's stored plan plus whatever the running FFmpeg has reported so far.
 #[derive(Debug)]
 pub(crate) struct WebPlaybackStats {
@@ -376,6 +390,67 @@ impl WebPlaybackSessionService {
             .database
             .renew_existing_playback_admission(user_id, play_session_id, unix_timestamp())
             .await?)
+    }
+
+    /// Admits one HLS segment or manifest request by checking the slot the stream already holds.
+    ///
+    /// A stream requests an asset every few seconds. Re-running the full admission (stale reclaim,
+    /// active count, upsert inside a write transaction) for each of them is what this path avoids,
+    /// but skipping it *entirely* would freeze the concurrent limit and `can_play` for the whole
+    /// playback: nothing else would ever re-evaluate them. So the request only verifies — with one
+    /// read and no write — that the slot is active and was admitted less than
+    /// [`Database::PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS`] ago; the first request after that
+    /// interval runs the full admission, which re-opens the interval. See
+    /// [`Database::has_fresh_playback_admission`].
+    ///
+    /// `known_policy` is the policy the same request already read. A revoked `can_play` skips the
+    /// cheap path immediately instead of waiting for the interval to expire, so the denial comes
+    /// from the same full admission as before.
+    pub(crate) async fn admit_playback_asset_request(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        known_policy: Option<&UserPlaybackPolicy>,
+    ) -> Result<PlaybackAssetAdmission, WebPlaybackSessionError> {
+        self.admit_playback_asset_request_at(
+            user_id,
+            play_session_id,
+            unix_timestamp(),
+            known_policy,
+        )
+        .await
+    }
+
+    /// [`Self::admit_playback_asset_request`] with an explicit clock.
+    ///
+    /// The storage functions already take the timestamp, so passing it here keeps a streaming
+    /// session's periodic full admission deterministic in tests instead of tying it to wall time.
+    pub(crate) async fn admit_playback_asset_request_at(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+        known_policy: Option<&UserPlaybackPolicy>,
+    ) -> Result<PlaybackAssetAdmission, WebPlaybackSessionError> {
+        let play_allowed = known_policy.is_none_or(|policy| policy.can_play);
+        if play_allowed
+            && self
+                .database
+                .has_fresh_playback_admission(user_id, play_session_id, now)
+                .await?
+        {
+            return Ok(PlaybackAssetAdmission::Fresh);
+        }
+        Ok(
+            match self
+                .database
+                .reserve_playback_admission(user_id, play_session_id, now, known_policy)
+                .await?
+            {
+                Some(result) => PlaybackAssetAdmission::Evaluated(result),
+                None => PlaybackAssetAdmission::NotFound,
+            },
+        )
     }
 
     pub(crate) async fn release_playback_session_admission(
@@ -2018,7 +2093,7 @@ mod tests {
     use std::{os::unix::fs::PermissionsExt, path::Path, sync::Arc};
 
     use super::{
-        EMBY_DIRECT_STREAM_TTL_SECONDS, ResourceSigner, SessionStartLocks,
+        EMBY_DIRECT_STREAM_TTL_SECONDS, PlaybackAssetAdmission, ResourceSigner, SessionStartLocks,
         apply_server_capabilities, choose_plan_for_policy, emby_hls_start_key, unix_timestamp,
     };
     use crate::{
@@ -2040,8 +2115,8 @@ mod tests {
         config::Config,
         library::LibraryKind,
         storage::{
-            NewWebPlaybackSession, PlaybackAdmissionDecision, UserPlaybackPolicy,
-            WebPlaybackEventClaim,
+            NewWebPlaybackSession, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
+            UserPlaybackPolicy, WebPlaybackEventClaim,
         },
     };
     use uuid::Uuid;
@@ -2600,6 +2675,443 @@ mod tests {
             "the stale reclaim, the active count and the upsert"
         );
         Ok(())
+    }
+
+    /// One user, one service and the concurrent playback limit the test picks.
+    async fn asset_admission_fixture(
+        max_simultaneous_playbacks: i64,
+    ) -> Result<
+        (
+            tempfile::TempDir,
+            crate::storage::Database,
+            WebPlaybackSessionService,
+            String,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Owner", "Owner", "correct password").await?;
+        let user_id = user.id.to_string();
+        database
+            .update_user_playback_policy(
+                &user_id,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            )
+            .await?;
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+        Ok((temp_dir, database, service, user_id))
+    }
+
+    /// A streaming session requests an asset every few seconds. Inside the re-check interval the
+    /// admission must only *look*: one read, no write, and the stamp stays where the last full
+    /// admission put it — otherwise the interval would never expire.
+    #[tokio::test]
+    async fn hls_asset_requests_check_the_slot_without_writing_inside_the_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(2).await?;
+        let play_session_id = "asset-check-play-session";
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let started = 1_000_000_i64;
+
+        database.reset_query_count();
+        let first = service
+            .admit_playback_asset_request_at(&user_id, play_session_id, started, Some(&policy))
+            .await?;
+        let PlaybackAssetAdmission::Evaluated(result) = first else {
+            return Err("the first asset request must run the full admission".into());
+        };
+        assert_eq!(result.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(result.active_playback_count, 1);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the first request checks the slot, then runs the full admission"
+        );
+        assert_eq!(
+            asset_admission_row(&database, &user_id, play_session_id).await?,
+            (started, started),
+            "the full admission writes (admitted_at, last_seen_at) at the request time"
+        );
+
+        // Seven more segments, four seconds apart: all inside the interval, all write-free.
+        for segment in 1..=7 {
+            let now = started + segment * 4;
+            database.reset_query_count();
+            let outcome = service
+                .admit_playback_asset_request_at(&user_id, play_session_id, now, Some(&policy))
+                .await?;
+            assert!(
+                matches!(outcome, PlaybackAssetAdmission::Fresh),
+                "the segment at {now} is inside the interval"
+            );
+            assert_eq!(
+                database.query_count(),
+                1,
+                "the segment at {now} must be one read"
+            );
+            assert_eq!(
+                asset_admission_row(&database, &user_id, play_session_id).await?,
+                (started, started),
+                "the segment at {now} must not write the admission"
+            );
+        }
+
+        // The segment that crosses the thirty-second interval runs one full admission, which
+        // re-opens it.
+        database.reset_query_count();
+        let crossing = service
+            .admit_playback_asset_request_at(&user_id, play_session_id, started + 32, Some(&policy))
+            .await?;
+        assert!(
+            matches!(
+                crossing,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the segment crossing the interval re-evaluates the limits"
+        );
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the crossing request checks the slot, then runs the full admission"
+        );
+        assert_eq!(
+            asset_admission_row(&database, &user_id, play_session_id).await?,
+            (started, started + 32),
+            "the full admission re-opens the interval at its own request time; admitted_at stays \
+             because the slot was never reclaimed"
+        );
+
+        // The re-opened interval is exactly thirty seconds long: 29 s later the request is still
+        // write-free, 30 s later it re-evaluates again.
+        database.reset_query_count();
+        assert!(
+            matches!(
+                service
+                    .admit_playback_asset_request_at(
+                        &user_id,
+                        play_session_id,
+                        started + 61,
+                        Some(&policy)
+                    )
+                    .await?,
+                PlaybackAssetAdmission::Fresh
+            ),
+            "one second inside the re-opened interval is fresh"
+        );
+        assert_eq!(database.query_count(), 1);
+        database.reset_query_count();
+        assert!(
+            matches!(
+                service
+                    .admit_playback_asset_request_at(
+                        &user_id,
+                        play_session_id,
+                        started + 62,
+                        Some(&policy)
+                    )
+                    .await?,
+                PlaybackAssetAdmission::Evaluated(_)
+            ),
+            "the interval expires exactly thirty seconds after the full admission"
+        );
+        assert_eq!(database.query_count(), 4);
+        Ok(())
+    }
+
+    /// Regression test for the defect the first version had: with a renewal that advances the
+    /// stamp, no interval ever expires and the limits are never re-evaluated again. Sustained
+    /// asset requests must produce a periodic full admission.
+    #[tokio::test]
+    async fn sustained_asset_requests_re_run_the_full_admission_every_interval()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(2).await?;
+        let play_session_id = "asset-periodic-play-session";
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let started = 1_000_000_i64;
+
+        let mut full_admissions = Vec::new();
+        let mut write_free_requests = 0;
+        for step in 0..=30 {
+            let now = started + step * 4;
+            database.reset_query_count();
+            match service
+                .admit_playback_asset_request_at(&user_id, play_session_id, now, Some(&policy))
+                .await?
+            {
+                PlaybackAssetAdmission::Fresh => {
+                    write_free_requests += 1;
+                    assert_eq!(
+                        database.query_count(),
+                        1,
+                        "the write-free request at {now} is one read"
+                    );
+                }
+                PlaybackAssetAdmission::Evaluated(result) => {
+                    assert_eq!(result.decision, PlaybackAdmissionDecision::Admitted);
+                    full_admissions.push(now);
+                }
+                PlaybackAssetAdmission::NotFound => {
+                    return Err("the fixture user must exist".into());
+                }
+            }
+        }
+        assert_eq!(
+            full_admissions,
+            vec![started, started + 32, started + 64, started + 96],
+            "a two-minutes stream re-evaluates the limits every interval, not once"
+        );
+        assert_eq!(write_free_requests, 27);
+        for gap in full_admissions.windows(2).map(|pair| pair[1] - pair[0]) {
+            assert!(
+                (30..=34).contains(&gap),
+                "each interval is thirty seconds plus at most one segment ({gap} s)"
+            );
+        }
+        Ok(())
+    }
+
+    /// A revoked `can_play` is refused on the next asset request, not up to an interval later.
+    #[tokio::test]
+    async fn a_revoked_can_play_refuses_the_next_asset_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(2).await?;
+        let play_session_id = "asset-revoked-play-session";
+        let started = 1_000_000_i64;
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let admitted = service
+            .admit_playback_asset_request_at(&user_id, play_session_id, started, Some(&policy))
+            .await?;
+        assert!(
+            matches!(
+                admitted,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the stream starts admitted"
+        );
+
+        // The administrator revokes playback one second into the stream.
+        database
+            .update_user_playback_policy(
+                &user_id,
+                UserPlaybackPolicy {
+                    can_play: false,
+                    ..policy
+                },
+            )
+            .await?;
+        let revoked_policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        assert!(!revoked_policy.can_play);
+        database.reset_query_count();
+        let refused = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                play_session_id,
+                started + 1,
+                Some(&revoked_policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                refused,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision
+                        == PlaybackAdmissionDecision::Denied(
+                            PlaybackAdmissionDenialReason::PlaybackDisabled
+                        )
+            ),
+            "the revoked policy is refused on the next segment, one second after the admission"
+        );
+        assert_eq!(
+            database.query_count(),
+            2,
+            "the revocation is decided by the full admission (stale reclaim and active count)"
+        );
+        assert_eq!(
+            asset_admission_row(&database, &user_id, play_session_id).await?,
+            (started, started),
+            "a refusal writes nothing"
+        );
+        Ok(())
+    }
+
+    /// A user at the limit is refused when the second playback session is created and again at
+    /// that session's first asset request; a reclaimed slot is refused at its very next request.
+    #[tokio::test]
+    async fn a_second_playback_is_refused_and_a_reclaimed_slot_falls_back()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database, service, user_id) = asset_admission_fixture(1).await?;
+        // `check_playback_admission` (the creation path) reads the wall clock, so this timeline
+        // has to be the wall clock too.
+        let started = unix_timestamp();
+        let policy = database
+            .get_user_playback_policy(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        let admitted = service
+            .admit_playback_asset_request_at(&user_id, "first-play-session", started, Some(&policy))
+            .await?;
+        assert!(
+            matches!(
+                admitted,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the first playback takes the only slot"
+        );
+
+        // Session creation calls this before it writes the session row.
+        let creation_check = service
+            .check_playback_admission(&user_id)
+            .await?
+            .expect("the fixture user exists");
+        assert_eq!(
+            creation_check.decision,
+            PlaybackAdmissionDecision::Denied(PlaybackAdmissionDenialReason::ConcurrentLimit),
+            "the second playback is refused when its session is created"
+        );
+
+        // The refused playback never admitted, so its first asset request re-evaluates at once.
+        database.reset_query_count();
+        let refused = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "second-play-session",
+                started,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                refused,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision
+                        == PlaybackAdmissionDecision::Denied(
+                            PlaybackAdmissionDenialReason::ConcurrentLimit
+                        )
+            ),
+            "the second playback's first asset request is refused, not waved through"
+        );
+        assert_eq!(
+            database.query_count(),
+            3,
+            "there is no fresh slot, so the refusal costs the check plus the full admission"
+        );
+
+        // A slot that keeps streaming is refreshed by the full admission, so it stays inside the
+        // active set; once it is reclaimed, the next asset request falls back and is refused.
+        let re_admitted = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "first-play-session",
+                started + 32,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                re_admitted,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "the admitted stream re-evaluates its own slot and keeps it"
+        );
+        assert!(
+            database
+                .release_playback_admission(&user_id, "first-play-session", started + 33)
+                .await?
+        );
+        database.reset_query_count();
+        let reclaimed = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "first-play-session",
+                started + 34,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                reclaimed,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision == PlaybackAdmissionDecision::Admitted
+            ),
+            "a reclaimed slot falls back to the full admission, which re-admits below the limit"
+        );
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the fallback is the slot check plus the full admission"
+        );
+
+        // With another playback holding the slot, the same reclaim now refuses the request.
+        let second = service
+            .admit_playback_asset_request_at(
+                &user_id,
+                "third-play-session",
+                started + 35,
+                Some(&policy),
+            )
+            .await?;
+        assert!(
+            matches!(
+                second,
+                PlaybackAssetAdmission::Evaluated(ref result)
+                    if result.decision
+                        == PlaybackAdmissionDecision::Denied(
+                            PlaybackAdmissionDenialReason::ConcurrentLimit
+                        )
+            ),
+            "the limit is enforced again after the re-admission"
+        );
+        Ok(())
+    }
+
+    /// Reads `(admitted_at, last_seen_at)` so a test can prove a request wrote nothing.
+    async fn asset_admission_row(
+        database: &crate::storage::Database,
+        user_id: &str,
+        play_session_id: &str,
+    ) -> Result<(i64, i64), Box<dyn std::error::Error>> {
+        Ok(sqlx::query_as(
+            "SELECT admitted_at, last_seen_at FROM playback_admissions
+             WHERE user_id = ? AND play_session_id = ?",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .fetch_one(database.pool())
+        .await?)
     }
 
     #[cfg(unix)]
