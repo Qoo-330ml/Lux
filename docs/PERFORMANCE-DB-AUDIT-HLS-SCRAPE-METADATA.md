@@ -68,13 +68,13 @@
 | **M5** | 每张图片 3 个写事务（claim → 图片行 → finish），全部串行在元数据写锁上 | `src/application/images.rs:528`、`:549` | 每条目 ~3–8 张图 → ~10–24 次提交 | 图片是刮削写放大第二来源 | **中** |
 | **S5** | 过期 PENDING 候选清理缺 `(status, expires_at)` 索引 | `src/storage/database_cleanup.rs:929` | 每批清理 | 候选积压时变成排序大范围扫描 | **中（已实施 `80cd3a4b`）** |
 | **S6** | `jobs` SSE 事件每秒失效 10 个管理端查询键，其中"元数据任务列表"带 `pending_counts` 聚合 | `web/src/features/admin/useAdminEvents.ts:18`、`src/storage/jobs/metadata_reidentify/lifecycle.rs:186` | 任务运行时 ≤1 次/秒（页面打开时） | 管理端轮询放大；聚合按 job_items × candidates 规模增长 | **中** |
-| **H5** | 管理端转码页每 2 s 轮询，N 个会话 → 1+N 次查询 | `src/api/admin/admin_transcoding.rs:32`、`web/src/features/admin/AdminTranscodingPage.tsx:39` | 30 次/分 × (1+N) | 管理端观感端点，用户少 | **中** |
+| **H5** | 管理端转码页每 2 s 轮询，N 个会话 → 1+N 次查询 | `src/api/admin/admin_transcoding.rs:32`、`web/src/features/admin/AdminTranscodingPage.tsx:39` | 30 次/分 × (1+N) | 管理端观感端点，用户少 | **中（已实施 `f95b039b`）** |
 | **H3** | HLS 启动路径重复读转码设置与 session 行 | `src/application/playback/session.rs:1075`、`:1104` | 每次启动 1–3 次 | 启动本身已很重 | 低-中 |
 | **S2** | 备份 scraper 循环内重复读同一条 item 元数据 | `src/application/reidentify.rs:2144` | 每条目 1–2 次 | 纯可省的读 | 中 |
 | **S4** | 每条目解析一次 scraper 配置、读一次能力尝试表，作业内无跨条目复用 | `src/application/scraper.rs:1551`、`src/application/candidates.rs:2805` | 5 万条目作业 = 各 5 万次 | 键查索引，单次便宜 | 中 |
 | **M8** | `select_internal` 重复读调用方已持有的 item 元数据 | `src/application/candidates.rs:2996` | 每次选中 1 次 | 读便宜 | 低-中 |
-| **H4** | 会话 tier / temp_dir 更新没有"值未变则不写"保护 | `src/storage/sessions.rs:1339`、`:1601` | 每次启动/回退几次 | 与 M3 同类但频率低 | 低 |
-| **H6** | 停止转码时 `transcoding_history` 写 + 保留清理两条独立自动提交 | `src/storage/sessions.rs:1230`、`:1262` | 每次转码结束 | 每次多一次提交 | 低 |
+| **H4** | 会话 tier / temp_dir 更新没有"值未变则不写"保护 | `src/storage/sessions.rs:1339`、`:1601` | 每次启动/回退几次 | 与 M3 同类但频率低 | 低（本轮跳过，见 H4 条目） |
+| **H6** | 停止转码时 `transcoding_history` 写 + 保留清理两条独立自动提交 | `src/storage/sessions.rs:1230`、`:1262` | 每次转码结束 | 每次多一次提交 | 低（已实施 `f95b039b`） |
 | **H7** | `active_server_transcoding_sessions` 的 `ORDER BY updated_at` 无匹配索引 | `src/storage/sessions.rs:1311` | 管理端轮询 | 表内只有 ACTIVE 行 | 低（不建议做） |
 | **M6/S7/H8** | 已经是批量/有界/带保护的写入路径（正面记录） | 见各节 | — | 避免后续重复改造 | — |
 
@@ -339,6 +339,9 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 - **建议修法**：加 `WHERE id=? AND (tier IS NOT ? OR plan IS NOT ?)` 之类的保护，或者干脆只在实际变化时调用。
 - **风险**：`updated_at` 不再推进；管理端按 `updated_at DESC` 排序（H7）的语义会变，需要确认无人依赖。
 - **是否值得做**：**低**。
+- **未实施（2026-11-01，本轮跳过）**：任何"值未变则不 UPDATE"的保护都会让这次调用不再推进 `updated_at`，
+  而管理端列表按 `updated_at DESC` 排序（H7）、JSON 也直接展示 `updatedAt`。本任务要求"仅在不改变
+  `updated_at` 语义的前提下顺手做"，因此跳过；要做必须先确认这两个使用方。
 
 ### H5 管理端转码页 N+1 轮询（已读代码确认）
 
@@ -355,6 +358,22 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   或在展开行时再取。
 - **风险**：统计页显示的 `directoryBytes` 最多滞后 5 s。
 - **是否值得做**：**中**（成本低，收益主要在管理端）。
+- **已实施（2026-11-01，提交 `f95b039b`）**：新增
+  `WebPlaybackSessionService::live_transcoding_sessions`（`session.rs`），它一次取
+  `active_server_transcoding_sessions(24)` 返回的列表行（`StoredTranscodingSessionRow` 增加
+  `play_session_id` 列；`tier/state/expires_at/codecs/container/updated_at` 原本就带出），每行只读内存里的
+  `progress()`、`latest_segment_bitrate_kbps()` 与 `session_bytes_cached()`；管理端处理器
+  （`admin_transcoding.rs`）退化成纯 JSON 映射。`stats()` 保留给播放器面板
+  （`GET /api/v1/playback/sessions/{id}/stats` 仍要按 owner / `ACTIVE` / 未过期做鉴权），管理端轮询不再经过它。
+  `directoryBytes` 改走 `HlsManager::session_bytes_cached`（复用准入共用的
+  `SESSION_QUOTA_CACHE_TTL = 5 s` 配额缓存），会话结束写历史时仍用新鲜测量的 `session_bytes`。
+  已过期但 reaper 还没回收的行保持原报告：仍在列表里，`playSessionId` / `progress` 为空，`summary` 仍按 tier 计一次。
+  **一次轮询的语句数 1+N → 1**（N=3 时 4 → 1，N 增加不再放大）；**每会话每分钟的 `session_bytes` 目录求和
+  30 → ≤12**（5 s TTL；`latest_segment_bitrate_kbps` 那次只看文件名/元数据的同名扫描不在本次范围）。
+  行为变化只有本条目已声明可接受的 `directoryBytes` 最多滞后 5 s。
+  测试：`application::playback::session::tests::admin_transcoding_listing_costs_one_statement_regardless_of_session_count`、
+  `application::playback::hls::tests::cached_session_bytes_reuses_the_five_second_quota_cache`；集成用例
+  `web_playback::web_playback_stats_report_the_plan_and_live_transcode_progress` 保持绿。
 
 ### H6 `transcoding_history` 两次自动提交 + 管理端 COUNT（已读代码确认）
 
@@ -367,6 +386,15 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 - **建议修法**：把 DELETE 并进 INSERT 的同一事务（或移出到 `database_cleanup` 的后台清理）；COUNT 保持现状。
 - **风险**：无。
 - **是否值得做**：**低**。
+- **已实施（2026-11-01，提交 `f95b039b`）**：`insert_transcoding_history` 的 `INSERT` 与保留期 `DELETE`
+  放进 `Database::begin_transcoding_history_transaction`（`repository.rs`）的同一个事务：SQLite 用 deferred
+  `BEGIN`（首条语句本身就是写，没有读后升级 `SQLITE_BUSY_SNAPSHOT` 的风险），PostgreSQL 走普通 `BEGIN`，
+  两侧共用同一份 SQL。DELETE 失败只记警告、仍提交 INSERT，保留"清理是尽力而为"的既有语义；
+  `transcoding_history_page` 的 `COUNT(*)` 与双 `LEFT JOIN` 保持现状。
+  **每次转码结束的语句数 2 → 2、提交数 2 → 1**（`synchronous=FULL` 下少一次 fsync）。
+  测试：`storage::repository::sessions::tests::transcoding_history_write_and_prune_commit_once`
+  （提交数用 `#[cfg(test)]` 的 `reset_transcoding_history_transaction_count` /
+  `transcoding_history_transaction_count` 计数，与 `metadata_write_transaction_count` 同一套按库路径计数的机制）。
 
 ### H7 `ORDER BY updated_at` 无匹配索引（已读代码确认，建议不做）
 
@@ -912,7 +940,7 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
    - S6：`pending_count` 改计数列或按需计算（所有者确认"按需计算"）。**已实施（提交 `4c20d3c8` + `677a7508`）**。
 3. **批次 3（要有实测支撑再做）**
    - S5/I1 索引迁移（先在一份库副本上 `EXPLAIN QUERY PLAN` 对比）。**已实施（提交 `80cd3a4b`，两组迁移 0244/0246，测试里带前后计划断言）**。
-   - S2/S3/S4 的读复用、M8/M9、H3/H4/H5/H6（顺手做）。
+   - S2/S3/S4 的读复用、M8/M9、H3/H5/H6（顺手做）。**H5/H6 已实施（提交 `f95b039b`）；H4 按条目说明跳过。**
 4. **不做**
    - H7/I2（加索引反而增加高频更新表的写成本）、I3。
 
