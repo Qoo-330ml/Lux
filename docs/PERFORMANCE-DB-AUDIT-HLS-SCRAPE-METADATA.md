@@ -66,7 +66,7 @@
 | **M3** | 元数据选中无条件 `UPDATE media_items`（无"值未变则不写"） | `src/storage/metadata.rs:1742` | 每次选中/回填刷新 | 每次写触发 `catalog_outbox` 最多 5 行（见 `docs/INDEX-AUDIT.md` §7） | **中-高** |
 | **M1** | 应用选中候选的落库由 4 组独立事务组成，没有总事务 | `src/application/candidates.rs:2989` | 每条目 1 次 | 中途失败留下"图片/演员已写、候选仍 PENDING"的部分状态 | **中** |
 | **M5** | 每张图片 3 个写事务（claim → 图片行 → finish），全部串行在元数据写锁上 | `src/application/images.rs:528`、`:549` | 每条目 ~3–8 张图 → ~10–24 次提交 | 图片是刮削写放大第二来源 | **中** |
-| **S5** | 过期 PENDING 候选清理缺 `(status, expires_at)` 索引 | `src/storage/database_cleanup.rs:929` | 每批清理 | 候选积压时变成排序大范围扫描 | **中** |
+| **S5** | 过期 PENDING 候选清理缺 `(status, expires_at)` 索引 | `src/storage/database_cleanup.rs:929` | 每批清理 | 候选积压时变成排序大范围扫描 | **中（已实施 `80cd3a4b`）** |
 | **S6** | `jobs` SSE 事件每秒失效 10 个管理端查询键，其中"元数据任务列表"带 `pending_counts` 聚合 | `web/src/features/admin/useAdminEvents.ts:18`、`src/storage/jobs/metadata_reidentify/lifecycle.rs:186` | 任务运行时 ≤1 次/秒（页面打开时） | 管理端轮询放大；聚合按 job_items × candidates 规模增长 | **中** |
 | **H5** | 管理端转码页每 2 s 轮询，N 个会话 → 1+N 次查询 | `src/api/admin/admin_transcoding.rs:32`、`web/src/features/admin/AdminTranscodingPage.tsx:39` | 30 次/分 × (1+N) | 管理端观感端点，用户少 | **中** |
 | **H3** | HLS 启动路径重复读转码设置与 session 行 | `src/application/playback/session.rs:1075`、`:1104` | 每次启动 1–3 次 | 启动本身已很重 | 低-中 |
@@ -419,6 +419,25 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 - **建议修法**：与 I1 一起加 `(status, expires_at, id)` 部分索引。
 - **风险**：候选表多一个索引，写成本略增。
 - **是否值得做**：**中**（与 I1 一起，走迁移）。
+- **已实施（提交 `80cd3a4b`，2026-10-31）**：迁移 `migrations/0244_metadata_candidate_expiry_index.sql` +
+  `migrations-postgres/0246_metadata_candidate_expiry_index.sql`（配对名 `metadata_candidate_expiry_index`，
+  `docs/migration-map.json` 已记录；两后端同一条语句，查询文本不需要改）。测试
+  `src/storage/database_cleanup.rs::task_history_retention_tests::retention_expired_pending_cleanup_orders_by_the_pending_expiry_index`
+  在 1 200 行候选（其中 300 行 PENDING）的夹具上对 `prune_sql::METADATA_CANDIDATE_EXPIRED_PENDING` 跑
+  `EXPLAIN QUERY PLAN`：加索引前是
+  `SEARCH metadata_candidates USING INDEX idx_metadata_candidates_status (status=?)` + `USE TEMP B-TREE FOR ORDER BY`，
+  加索引后是 `SEARCH metadata_candidates USING COVERING INDEX idx_metadata_candidates_pending_expiry
+  (status=? AND expires_at>? AND expires_at<?)` + `CREATE BLOOM FILTER`，排序消失。
+  **前后数字**（第 2 节口径）：清理语句数 1 → 1，写提交数 1 → 1（每批一条 `DELETE`）；变的只是计划形状——
+  加索引前排序集 = 全部 PENDING 行（夹具 300 行，生产 = 积压量），加索引后只按索引序读到 `LIMIT` 窗口
+  （加上一小时宽限窗口内的行）。写入侧成本：候选写入路径语句/提交数不变（`INSERT … ON CONFLICT` 与状态 `UPDATE`
+  各一条），只多维护一个部分索引的条目，且索引是部分索引，状态离开 `PENDING` 即删除条目。
+  负向验证：拒绝/过期扫描（`status IN ('REJECTED','EXPIRED') ORDER BY created_at`）与按条目列候选
+  （`item_id, status`）的计划在加索引前后一致；按 `status='PENDING'` 的计数改读更小的部分索引。
+  空库迁移由 `tests/storage/index_audit.rs::migrations_run_from_an_empty_database_and_settle_the_audited_indexes`
+  与本次新测试（`Database::connect` 建空库后跑迁移）共同覆盖；行为不变由
+  `storage::repository::repository_tests::cleanup_removes_expired_pending_candidates_after_grace` 保证。
+  `python3 scripts/check-migration-parity.py`、`python3 scripts/check-backend-branches.py` 均通过。
 
 ### S6 `jobs` SSE 事件的管理端放大（已读代码确认 + 频率推测）
 
@@ -773,6 +792,10 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   （SQLite + PG 配对迁移，`scripts/check-migration-parity.py` 会校验）。
 - **风险**：多一个索引 = 候选表写成本略增（候选写入已经是批量，影响有限）。
 - **是否值得做**：**中**。
+- **已实施（提交 `80cd3a4b`，2026-10-31）**：按建议修法新增部分索引 `idx_metadata_candidates_pending_expiry`
+  （`(status, expires_at, id) WHERE status = 'PENDING'`），SQLite 侧是 `0244`、PostgreSQL 侧是配对的 `0246`。
+  计划与前后数字见 §S5 的「已实施」条目：排序消失，清理语句数 1 → 1、写提交数 1 → 1，写侧只多一个部分索引条目。
+  该索引是覆盖索引：`id` 作为第三列，`DELETE … WHERE id IN (SELECT id …)` 的子查询只读索引，不再回表。
 
 ### I2 `web_playback_sessions(state, plan, updated_at)`（已读代码确认，建议不做）
 
@@ -818,7 +841,7 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
    - H1：分片路径改"renew 优先、失败回落 reserve"（并发上限最长滞后一个心跳周期）。
    - S6：`pending_count` 改计数列或按需计算（所有者确认"按需计算"）。**已实施（提交 `4c20d3c8` + `677a7508`）**。
 3. **批次 3（要有实测支撑再做）**
-   - S5/I1 索引迁移（先在一份库副本上 `EXPLAIN QUERY PLAN` 对比）。
+   - S5/I1 索引迁移（先在一份库副本上 `EXPLAIN QUERY PLAN` 对比）。**已实施（提交 `80cd3a4b`，两组迁移 0244/0246，测试里带前后计划断言）**。
    - S2/S3/S4 的读复用、M8/M9、H3/H4/H5/H6（顺手做）。
 4. **不做**
    - H7/I2（加索引反而增加高频更新表的写成本）、I3。
