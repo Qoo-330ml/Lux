@@ -683,6 +683,10 @@ impl AppState {
         if let Some(web_playback) = self.web_playback() {
             web_playback.shutdown().await;
         }
+        // The login-background refresh reads plugin results, so it must stop before the plugins do.
+        if let Some(plugins) = self.plugins() {
+            plugins.shutdown().await;
+        }
         Ok(())
     }
 

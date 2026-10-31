@@ -154,6 +154,10 @@ pub struct PluginService {
     provider_cache: ProviderResponseCache,
     login_background_refresh_notify: Arc<Notify>,
     login_background_refresh_worker_started: Arc<AtomicBool>,
+    /// Stop handle of the login-background refresh loop; `None` before it starts (and in tests that
+    /// deliberately build a service without it).
+    login_background_refresh_worker:
+        Arc<std::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
     login_background_refresh_failures: Arc<Mutex<HashMap<String, LoginBackgroundRefreshFailure>>>,
     login_background_asset_upload_lock: Arc<Mutex<()>>,
 }
@@ -218,6 +222,7 @@ impl PluginService {
             )),
             login_background_refresh_notify: Arc::new(Notify::new()),
             login_background_refresh_worker_started: Arc::new(AtomicBool::new(false)),
+            login_background_refresh_worker: Arc::new(std::sync::Mutex::new(None)),
             login_background_refresh_failures: Arc::new(Mutex::new(HashMap::new())),
             login_background_asset_upload_lock: Arc::new(Mutex::new(())),
         }
@@ -236,9 +241,9 @@ impl PluginService {
     }
 
     fn start_login_background_refresh_worker(&self) {
-        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
-        };
+        }
         if self
             .login_background_refresh_worker_started
             .swap(true, Ordering::AcqRel)
@@ -247,17 +252,51 @@ impl PluginService {
         }
 
         let service = self.clone();
-        runtime.spawn(async move {
-            let mut interval = tokio::time::interval(LOGIN_BACKGROUND_REFRESH_INTERVAL);
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => service.refresh_selected_login_background(false).await,
-                    _ = service.login_background_refresh_notify.notified() => {
-                        service.refresh_selected_login_background(true).await;
+        let worker = crate::application::background_loop::BackgroundLoop::spawn(
+            "login_background_refresh",
+            move |mut shutdown| {
+                let service = service.clone();
+                async move {
+                    // The observable interval used to tick immediately, which is what keeps the
+                    // cached artwork of the selected plugin fresh after a restart.
+                    service.refresh_selected_login_background(false).await;
+                    loop {
+                        if *shutdown.borrow() {
+                            return;
+                        }
+                        tokio::select! {
+                            _ = tokio::time::sleep(LOGIN_BACKGROUND_REFRESH_INTERVAL) => {}
+                            _ = service.login_background_refresh_notify.notified() => {
+                                service.refresh_selected_login_background(true).await;
+                                continue;
+                            }
+                            changed = shutdown.changed() => {
+                                if changed.is_err() || *shutdown.borrow() {
+                                    return;
+                                }
+                                continue;
+                            }
+                        }
+                        service.refresh_selected_login_background(false).await;
                     }
                 }
-            }
-        });
+            },
+        );
+        if let Ok(mut slot) = self.login_background_refresh_worker.lock() {
+            *slot = Some(worker);
+        }
+    }
+
+    /// Stops the login-background refresh loop and waits for its current pass.
+    pub(crate) async fn shutdown(&self) {
+        let worker = self
+            .login_background_refresh_worker
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
     }
 
     pub(crate) fn request_login_background_refresh(&self) {
@@ -3840,6 +3879,29 @@ mod plugin_discovery_tests {
         application::libraries::LibraryService, config::Config, library::LibraryKind,
         storage::Database,
     };
+
+    /// The login-background refresh loop must be stoppable: its handle used to be dropped.
+    #[tokio::test]
+    async fn the_login_background_worker_stops_on_shutdown()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let root = tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: root.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = PluginService::new(database, config.config_dir.clone());
+        // The periodic wake is fifteen minutes away, so returning at all proves the stop signal
+        // reaches the loop.
+        assert!(
+            super::LOGIN_BACKGROUND_REFRESH_INTERVAL >= std::time::Duration::from_secs(300),
+            "the login background refresh must stay a slow fallback"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the login background worker");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn discovers_a_catalog_through_the_async_boundary() {
