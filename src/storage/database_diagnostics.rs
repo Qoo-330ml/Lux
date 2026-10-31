@@ -6,6 +6,74 @@ const MAX_DIAGNOSTIC_RELATIONS: i64 = 10_000;
 const MAX_POSTGRES_STATEMENTS: i64 = 20;
 const POSTGRES_STATEMENTS_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Row of the SQLite `dbstat` size aggregation.
+///
+/// `dbstat.name` is NULL for pages that belong to no table or index (freelist and overflow
+/// pages), which the previous lenient read collapsed into the empty object name; it stays
+/// optional here so the report is unchanged.
+#[derive(Debug, sqlx::FromRow)]
+struct SqliteDbstatObjectRow {
+    name: Option<String>,
+    bytes: i64,
+    payload_bytes: i64,
+    unused_bytes: i64,
+    pages: i64,
+}
+
+/// Row of the SQLite `sqlite_master` index listing.
+#[derive(Debug, sqlx::FromRow)]
+struct SqliteSchemaIndexRow {
+    name: String,
+    tbl_name: String,
+}
+
+/// Row of the PostgreSQL relation/table size listing.
+///
+/// The statistics columns come from a `LEFT JOIN pg_stat_user_tables`, so they are all nullable
+/// even though the relation itself always has a schema and a name.
+#[derive(Debug, sqlx::FromRow)]
+struct PostgresRelationSizeRow {
+    schema_name: String,
+    relation_name: String,
+    heap_bytes: i64,
+    toast_bytes: i64,
+    index_bytes: i64,
+    total_bytes: i64,
+    live_tuples: Option<i64>,
+    dead_tuples: Option<i64>,
+    last_analyze: Option<String>,
+    last_autoanalyze: Option<String>,
+    last_vacuum: Option<String>,
+    last_autovacuum: Option<String>,
+}
+
+/// Row of the PostgreSQL index size/usage listing.
+///
+/// `idx_scan` comes from a `LEFT JOIN pg_stat_user_indexes`, so a never-analyzed index reports
+/// NULL; the previous decoder defaulted it to 0 and this struct keeps that.
+#[derive(Debug, sqlx::FromRow)]
+struct PostgresIndexSizeRow {
+    schema_name: String,
+    table_name: String,
+    index_name: String,
+    index_bytes: i64,
+    index_scans: Option<i64>,
+    is_valid: bool,
+}
+
+/// Row of the PostgreSQL `pg_stat_statements` top-statement listing.
+#[derive(Debug, sqlx::FromRow)]
+struct PostgresStatementStatRow {
+    query_id: String,
+    calls: i64,
+    total_exec_time_ms: f64,
+    mean_exec_time_ms: f64,
+    max_exec_time_ms: f64,
+    rows: i64,
+    shared_blocks_hit: i64,
+    shared_blocks_read: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct DatabaseDiagnosticsSnapshot {
     pub collected_at: i64,
@@ -64,12 +132,16 @@ impl Database {
             .map(|metadata| metadata.len())
             .unwrap_or(0);
         let mut relations = Vec::new();
-        let tables = self.query(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?",
-        ).bind(MAX_DIAGNOSTIC_RELATIONS).fetch_all(&self.pool).await
+        let tables: Vec<String> = self
+            .query_scalar(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name LIMIT ?",
+            )
+            .bind(MAX_DIAGNOSTIC_RELATIONS)
+            .fetch_all(&self.pool)
+            .await
             .map_err(|source| self.diagnostics_error(source))?;
         let indexes = self
-            .query(
+            .query_as::<SqliteSchemaIndexRow>(
                 "SELECT name, tbl_name FROM sqlite_master
              WHERE type = 'index' AND tbl_name NOT LIKE 'sqlite_%'
              ORDER BY name LIMIT ?",
@@ -82,7 +154,7 @@ impl Database {
         let (dbstat_available, mut object_sizes) = if include_relation_sizes {
             let dbstat_rows = tokio::time::timeout(
                 Duration::from_secs(90),
-                self.query(
+                self.query_as::<SqliteDbstatObjectRow>(
                     "SELECT name, SUM(pgsize) AS bytes, SUM(payload) AS payload_bytes,
                         SUM(unused) AS unused_bytes, COUNT(*) AS pages
                  FROM dbstat GROUP BY name ORDER BY SUM(pgsize) DESC LIMIT ?",
@@ -95,13 +167,15 @@ impl Database {
                 Ok(Ok(rows)) => {
                     let mut sizes = HashMap::new();
                     for row in rows {
-                        let name: String = row.try_get("name").unwrap_or_default();
-                        sizes.insert(name, json!({
-                            "bytes": row.try_get::<i64, _>("bytes").unwrap_or_default(),
-                            "payloadBytes": row.try_get::<i64, _>("payload_bytes").unwrap_or_default(),
-                            "unusedBytes": row.try_get::<i64, _>("unused_bytes").unwrap_or_default(),
-                            "pages": row.try_get::<i64, _>("pages").unwrap_or_default(),
-                        }));
+                        sizes.insert(
+                            row.name.unwrap_or_default(),
+                            json!({
+                                "bytes": row.bytes,
+                                "payloadBytes": row.payload_bytes,
+                                "unusedBytes": row.unused_bytes,
+                                "pages": row.pages,
+                            }),
+                        );
                     }
                     (true, sizes)
                 }
@@ -114,15 +188,14 @@ impl Database {
         let mut index_details = Vec::new();
         let mut index_bytes_by_table = HashMap::<String, i64>::new();
         for row in indexes {
-            let name: String = row.try_get("name").unwrap_or_default();
-            let table_name: String = row.try_get("tbl_name").unwrap_or_default();
-            let size = object_sizes.remove(&name).unwrap_or(Value::Null);
+            let size = object_sizes.remove(&row.name).unwrap_or(Value::Null);
             let index_bytes = size["bytes"].as_i64().unwrap_or_default();
-            *index_bytes_by_table.entry(table_name.clone()).or_default() += index_bytes;
-            index_details.push(json!({ "name": name, "table": table_name, "size": size }));
+            *index_bytes_by_table
+                .entry(row.tbl_name.clone())
+                .or_default() += index_bytes;
+            index_details.push(json!({ "name": row.name, "table": row.tbl_name, "size": size }));
         }
-        for row in tables {
-            let name: String = row.try_get("name").unwrap_or_default();
+        for name in tables {
             let table_size = object_sizes.remove(&name).unwrap_or(Value::Null);
             let table_bytes = table_size["bytes"].as_i64();
             let index_bytes = index_bytes_by_table.get(&name).copied().unwrap_or_default();
@@ -197,7 +270,7 @@ impl Database {
             .await
             .map_err(|source| self.diagnostics_error(source))?;
         let relation_rows = self
-            .query(
+            .query_as::<PostgresRelationSizeRow>(
                 "SELECT ns.nspname::TEXT AS schema_name, cls.relname::TEXT AS relation_name,
                     pg_relation_size(cls.oid)::BIGINT AS heap_bytes,
                     CASE WHEN cls.reltoastrelid = 0 THEN 0
@@ -223,30 +296,28 @@ impl Database {
             .map_err(|source| self.diagnostics_error(source))?;
         let mut relations = Vec::new();
         for row in relation_rows {
-            let live_tuples = row.try_get::<Option<i64>, _>("live_tuples").ok().flatten();
-            let dead_tuples = row.try_get::<Option<i64>, _>("dead_tuples").ok().flatten();
             relations.push(json!({
-                "schema": row.try_get::<String, _>("schema_name").unwrap_or_default(),
-                "name": row.try_get::<String, _>("relation_name").unwrap_or_default(),
+                "schema": row.schema_name,
+                "name": row.relation_name,
                 "kind": "TABLE",
                 "size": {
-                    "heapBytes": row.try_get::<i64, _>("heap_bytes").unwrap_or_default(),
-                    "toastBytes": row.try_get::<i64, _>("toast_bytes").unwrap_or_default(),
-                    "indexBytes": row.try_get::<i64, _>("index_bytes").unwrap_or_default(),
-                    "totalBytes": row.try_get::<i64, _>("total_bytes").unwrap_or_default(),
+                    "heapBytes": row.heap_bytes,
+                    "toastBytes": row.toast_bytes,
+                    "indexBytes": row.index_bytes,
+                    "totalBytes": row.total_bytes,
                 },
-                "rowCountEstimate": live_tuples,
+                "rowCountEstimate": row.live_tuples,
                 "rowCountKind": "PG_STAT_ESTIMATE",
-                "liveTupleEstimate": live_tuples,
-                "deadTupleEstimate": dead_tuples,
-                "lastAnalyze": row.try_get::<Option<String>, _>("last_analyze").ok().flatten(),
-                "lastAutoAnalyze": row.try_get::<Option<String>, _>("last_autoanalyze").ok().flatten(),
-                "lastVacuum": row.try_get::<Option<String>, _>("last_vacuum").ok().flatten(),
-                "lastAutoVacuum": row.try_get::<Option<String>, _>("last_autovacuum").ok().flatten(),
+                "liveTupleEstimate": row.live_tuples,
+                "deadTupleEstimate": row.dead_tuples,
+                "lastAnalyze": row.last_analyze,
+                "lastAutoAnalyze": row.last_autoanalyze,
+                "lastVacuum": row.last_vacuum,
+                "lastAutoVacuum": row.last_autovacuum,
             }));
         }
         let index_rows = self
-            .query(
+            .query_as::<PostgresIndexSizeRow>(
                 "SELECT table_ns.nspname::TEXT AS schema_name,
                     table_cls.relname::TEXT AS table_name,
                     index_cls.relname::TEXT AS index_name,
@@ -268,12 +339,12 @@ impl Database {
         let mut indexes = Vec::new();
         for row in index_rows {
             indexes.push(json!({
-                "schema": row.try_get::<String, _>("schema_name").unwrap_or_default(),
-                "table": row.try_get::<String, _>("table_name").unwrap_or_default(),
-                "name": row.try_get::<String, _>("index_name").unwrap_or_default(),
-                "bytes": row.try_get::<i64, _>("index_bytes").unwrap_or_default(),
-                "scansEstimate": row.try_get::<i64, _>("index_scans").unwrap_or_default(),
-                "isValid": row.try_get::<bool, _>("is_valid").unwrap_or(false),
+                "schema": row.schema_name,
+                "table": row.table_name,
+                "name": row.index_name,
+                "bytes": row.index_bytes,
+                "scansEstimate": row.index_scans.unwrap_or_default(),
+                "isValid": row.is_valid,
             }));
         }
         let relations_truncated = relations.len() as i64 >= MAX_DIAGNOSTIC_RELATIONS;
@@ -333,7 +404,7 @@ impl Database {
 
         let statements = tokio::time::timeout(
             POSTGRES_STATEMENTS_TIMEOUT,
-            self.query(
+            self.query_as::<PostgresStatementStatRow>(
                 "SELECT queryid::TEXT AS query_id, calls::BIGINT AS calls,
                         total_exec_time::DOUBLE PRECISION AS total_exec_time_ms,
                         mean_exec_time::DOUBLE PRECISION AS mean_exec_time_ms,
@@ -369,17 +440,17 @@ impl Database {
             Ok(Ok(rows)) => rows,
         };
         let top_statements = rows
-            .iter()
+            .into_iter()
             .map(|row| {
                 json!({
-                    "queryId": row.try_get::<String, _>("query_id").unwrap_or_default(),
-                    "calls": row.try_get::<i64, _>("calls").unwrap_or_default(),
-                    "totalExecTimeMs": row.try_get::<f64, _>("total_exec_time_ms").unwrap_or_default(),
-                    "meanExecTimeMs": row.try_get::<f64, _>("mean_exec_time_ms").unwrap_or_default(),
-                    "maxExecTimeMs": row.try_get::<f64, _>("max_exec_time_ms").unwrap_or_default(),
-                    "rows": row.try_get::<i64, _>("rows").unwrap_or_default(),
-                    "sharedBlocksHit": row.try_get::<i64, _>("shared_blocks_hit").unwrap_or_default(),
-                    "sharedBlocksRead": row.try_get::<i64, _>("shared_blocks_read").unwrap_or_default(),
+                    "queryId": row.query_id,
+                    "calls": row.calls,
+                    "totalExecTimeMs": row.total_exec_time_ms,
+                    "meanExecTimeMs": row.mean_exec_time_ms,
+                    "maxExecTimeMs": row.max_exec_time_ms,
+                    "rows": row.rows,
+                    "sharedBlocksHit": row.shared_blocks_hit,
+                    "sharedBlocksRead": row.shared_blocks_read,
                 })
             })
             .collect::<Vec<_>>();
@@ -632,5 +703,114 @@ mod tests {
         .await
         .expect("drop test database");
         admin_pool.close().await;
+    }
+
+    /// The diagnostic projections are decoded through named row structs, so a projection that
+    /// drifts from its struct is a `ColumnNotFound` instead of a silently defaulted field.
+    #[tokio::test]
+    async fn diagnostic_row_structs_decode_their_columns_and_reject_a_missing_one() {
+        use sqlx::FromRow;
+
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+
+        let dbstat = sqlx::query(
+            "SELECT NULL AS name, 4096 AS bytes, 1024 AS payload_bytes,
+                    2048 AS unused_bytes, 3 AS pages",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("dbstat projection");
+        let dbstat = SqliteDbstatObjectRow::from_row(&dbstat).expect("dbstat row");
+        assert_eq!(dbstat.name, None);
+        assert_eq!(dbstat.bytes, 4096);
+        assert_eq!(dbstat.payload_bytes, 1024);
+        assert_eq!(dbstat.unused_bytes, 2048);
+        assert_eq!(dbstat.pages, 3);
+
+        let index = sqlx::query("SELECT 'idx_a' AS name, 'table_a' AS tbl_name")
+            .fetch_one(database.pool())
+            .await
+            .expect("index projection");
+        let index = SqliteSchemaIndexRow::from_row(&index).expect("index row");
+        assert_eq!(index.name, "idx_a");
+        assert_eq!(index.tbl_name, "table_a");
+
+        let relation = sqlx::query(
+            "SELECT 'public' AS schema_name, 'media_items' AS relation_name,
+                    4096 AS heap_bytes, 0 AS toast_bytes, 2048 AS index_bytes,
+                    6144 AS total_bytes, 12 AS live_tuples, 3 AS dead_tuples,
+                    '2026-01-01 00:00:00+00' AS last_analyze,
+                    NULL AS last_autoanalyze,
+                    '2026-01-02 00:00:00+00' AS last_vacuum,
+                    NULL AS last_autovacuum",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("relation projection");
+        let relation = PostgresRelationSizeRow::from_row(&relation).expect("relation row");
+        assert_eq!(relation.schema_name, "public");
+        assert_eq!(relation.relation_name, "media_items");
+        assert_eq!(relation.heap_bytes, 4096);
+        assert_eq!(relation.toast_bytes, 0);
+        assert_eq!(relation.index_bytes, 2048);
+        assert_eq!(relation.total_bytes, 6144);
+        assert_eq!(relation.live_tuples, Some(12));
+        assert_eq!(relation.dead_tuples, Some(3));
+        assert_eq!(
+            relation.last_analyze.as_deref(),
+            Some("2026-01-01 00:00:00+00")
+        );
+        assert_eq!(relation.last_autoanalyze, None);
+        assert_eq!(
+            relation.last_vacuum.as_deref(),
+            Some("2026-01-02 00:00:00+00")
+        );
+        assert_eq!(relation.last_autovacuum, None);
+
+        let statement = sqlx::query(
+            "SELECT '42' AS query_id, 7 AS calls,
+                    10.5 AS total_exec_time_ms, 1.5 AS mean_exec_time_ms,
+                    3.5 AS max_exec_time_ms, 90 AS rows,
+                    100 AS shared_blocks_hit, 20 AS shared_blocks_read",
+        )
+        .fetch_one(database.pool())
+        .await
+        .expect("statement projection");
+        let statement = PostgresStatementStatRow::from_row(&statement).expect("statement row");
+        assert_eq!(statement.query_id, "42");
+        assert_eq!(statement.calls, 7);
+        assert_eq!(statement.total_exec_time_ms, 10.5);
+        assert_eq!(statement.mean_exec_time_ms, 1.5);
+        assert_eq!(statement.max_exec_time_ms, 3.5);
+        assert_eq!(statement.rows, 90);
+        assert_eq!(statement.shared_blocks_hit, 100);
+        assert_eq!(statement.shared_blocks_read, 20);
+
+        let missing = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await
+            .expect("placeholder row");
+        let errors = [
+            SqliteDbstatObjectRow::from_row(&missing).expect_err("dbstat columns must not decode"),
+            SqliteSchemaIndexRow::from_row(&missing)
+                .expect_err("schema index columns must not decode"),
+            PostgresRelationSizeRow::from_row(&missing)
+                .expect_err("relation columns must not decode"),
+            PostgresIndexSizeRow::from_row(&missing).expect_err("index columns must not decode"),
+            PostgresStatementStatRow::from_row(&missing)
+                .expect_err("statement columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
+        database.close().await;
     }
 }

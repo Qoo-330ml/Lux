@@ -172,6 +172,20 @@ CPU **0.39 → 0.08 s/分（−79 %）**，空闲仍零写入（方法与口径�
   - B1（`Database` 拆分试点，`docs/DATABASE-SPLIT.md`）：结论是**不全面推广**，仅对新代码采用；仓库对象无法参与调用方事务，对 metadata/media/catalog 这类事务密集的域风险高。W2 如果要做，需要考虑这一点。
 - **未做、但和本文有关的第一轮遗留：**
   - B4 行解码：存储层按列名取值约 1500 → 546 处，未做完的主要是 `catalog.rs` 约 179 处、`jobs/scan/manifest/state.rs` 55、`database_diagnostics.rs` 34 等。属于 panic 面清理，不影响性能。
+    **已实施（`catalog.rs` 与 `database_diagnostics.rs`，2026-11-01）**：12 个原子提交（`81dbfac8`、`dee5e204`、
+    `a8fbbaa3`、`f01a9580`、`79f4d55c`、`32b82766`、`9c164945`、`fead4cbd`、`542ff8ee`、`75607db1`、
+    `1af34658`、`c77ee7b6`），按域改成具名 `#[derive(sqlx::FromRow)]` 行结构体或类型元组 + 集中转换：
+    缩略图重试队列与本地缩略图源、库/目录计数与仪表盘、媒体章节、系列元数据源、章节检测源与待处理项、
+    全局合集卡片/源/成员、NFO 缓存、内容限制分类、图片候选/冲突/标签/库海报、Web 会话。
+    生产代码（`#[cfg(test)]` 模块之外）按列名取值计数：`catalog.rs` **176 → 4**、`database_diagnostics.rs`
+    **34 → 0**（口径：`.get("…")` / `.try_get("…")` 字面量读取，基线 `3dcf3c18`）。剩下的 4 处：
+    `fetch_catalog_search_page` 里的 3 处 `id`/`total`（搜索路径本任务约定不动，且 `total` 列只在
+    `include_total` 时出现，单一结构体需要两种查询形状），以及 `#[cfg(test)] explain_filtered_catalog_rows`
+    里已用 `try_get` + 错误映射的 1 处。
+    查询文本、列顺序、绑定顺序和查询结果均不变；投影漂移由 `row.get` 的 panic 变成 `StorageError`。
+    验收：`cargo test --locked --lib storage::` 544 passed / 0 failed / 37 ignored，`cargo fmt --all -- --check`、
+    `cargo clippy --locked --all-targets --all-features -- -D warnings`、`scripts/check-backend-branches.py`、
+    `scripts/check-migration-parity.py` 全绿。PostgreSQL 实机仍未跑（见第 10 节）。
   - 方案 B（setup 与业务路由分离）仍在进行，与性能无关，但改动 `src/api` 的路由与 `AppState`，新会话如果也改 `src/api/**` 要注意冲突，先看 `docs/SETUP-READY-SPLIT-DESIGN.md` 与 `git log`。
 
 ## 10. 未验证项汇总
