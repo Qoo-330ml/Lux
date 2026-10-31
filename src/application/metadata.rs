@@ -4622,6 +4622,160 @@ mod tests {
         Ok(())
     }
 
+    /// M4: rescanning an unchanged NFO must not rewrite the derived collection reference.
+    ///
+    /// The reference row and the `collection_sync_outbox` generation are the observable side
+    /// effects; the old path always ran `DELETE` + `INSERT`, which reset the row's `updated_at`
+    /// and bumped the generation (one global collection re-derivation) per scanned movie.
+    #[tokio::test]
+    async fn rescanning_an_unchanged_nfo_does_not_rewrite_the_collection_reference()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::{
+            application::{libraries::LibraryService, scanner::LibraryScanner},
+            config::Config,
+            library::LibraryKind,
+        };
+
+        /// A `DELETE` + `INSERT` re-creates the row with `unixepoch()`, never with this stamp.
+        const WRITE_STAMP: i64 = 4_242_424;
+
+        let directory = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        };
+        let movie_dir = directory.path().join("Movies").join("Fly With You (2019)");
+        tokio::fs::create_dir_all(&movie_dir).await?;
+        tokio::fs::write(movie_dir.join("Fly.With.You.2019.mkv"), b"media").await?;
+        let nfo_path = movie_dir.join("movie.nfo");
+        tokio::fs::write(
+            &nfo_path,
+            "<movie><title>飞驰人生</title><year>2019</year><tmdbid>movie-599</tmdbid><set>飞驰人生</set><setid>tmdb:1281825</setid></movie>",
+        )
+        .await?;
+
+        let database = Database::connect(&config).await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Movies", LibraryKind::Movie, false)
+            .await?;
+        LibraryService::new(database.clone())
+            .add_root(
+                library.id,
+                directory
+                    .path()
+                    .join("Movies")
+                    .to_str()
+                    .ok_or("non-UTF8 root")?,
+            )
+            .await?;
+        LibraryScanner::new(database.clone())
+            .scan_movie_library(library.id)
+            .await?;
+        let item_id: String =
+            sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+                .fetch_one(database.pool())
+                .await?;
+        let enricher = MetadataEnricher::new(database.clone())
+            .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+        enricher.enrich_movie_library(library.id).await?;
+
+        // Pin every derived write target so a rewrite cannot hide behind equal values.
+        sqlx::query("UPDATE collection_item_references SET updated_at = ? WHERE item_id = ?")
+            .bind(WRITE_STAMP)
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        sqlx::query("UPDATE media_items SET updated_at = ? WHERE id = ?")
+            .bind(WRITE_STAMP)
+            .bind(&item_id)
+            .execute(database.pool())
+            .await?;
+        let catalog_outbox_before: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        let generation_before: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = '1281825'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+
+        let report = enricher.enrich_movie_library(library.id).await?;
+        assert_eq!(report.nfo_skipped, 1, "the unchanged NFO must be skipped");
+        let reference: (String, i64) = sqlx::query_as(
+            "SELECT collection_provider_id, updated_at
+             FROM collection_item_references WHERE item_id = ?",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(reference.0, "1281825");
+        assert_eq!(
+            reference.1, WRITE_STAMP,
+            "an unchanged NFO must not delete and re-insert the collection reference"
+        );
+        let item_stamp: i64 = sqlx::query_scalar("SELECT updated_at FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(
+            item_stamp, WRITE_STAMP,
+            "an unchanged NFO must not rewrite the media item"
+        );
+        let catalog_outbox_after: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE item_id = ?")
+                .bind(&item_id)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            catalog_outbox_after, catalog_outbox_before,
+            "an unchanged NFO must not queue catalog work"
+        );
+        let generation_after: i64 = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = '1281825'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            generation_after, generation_before,
+            "an unchanged NFO must not queue another collection sync"
+        );
+
+        // A real NFO change must still replace the reference and queue the new collection.
+        tokio::fs::write(
+            &nfo_path,
+            "<movie><title>飞驰人生</title><year>2019</year><tmdbid>movie-599</tmdbid><set>飞驰人生</set><setid>tmdb:1281826</setid></movie>",
+        )
+        .await?;
+        enricher.enrich_movie_library(library.id).await?;
+        let changed: (String, i64) = sqlx::query_as(
+            "SELECT collection_provider_id, updated_at
+             FROM collection_item_references WHERE item_id = ?",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(changed.0, "1281826");
+        assert_ne!(
+            changed.1, WRITE_STAMP,
+            "a changed NFO must still rewrite the collection reference"
+        );
+        let new_generation: Option<i64> = sqlx::query_scalar(
+            "SELECT generation FROM collection_sync_outbox
+             WHERE collection_provider = 'tmdb' AND collection_provider_id = '1281826'",
+        )
+        .fetch_optional(database.pool())
+        .await?;
+        assert!(
+            new_generation.is_some_and(|generation| generation >= 1),
+            "a changed NFO must still queue the new collection"
+        );
+        Ok(())
+    }
+
     #[tokio::test]
     async fn bounded_task_helper_caps_concurrency_and_preserves_input_order() {
         let active = Arc::new(std::sync::atomic::AtomicUsize::new(0));

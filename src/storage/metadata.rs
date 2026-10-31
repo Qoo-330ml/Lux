@@ -1740,6 +1740,16 @@ impl Database {
         // metadata transaction performs its updates.
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.query(
+            // Selecting a candidate repeatedly (a background refresh re-selects the same
+            // `keep_pending` candidate) stores the same values again. `media_items` carries the
+            // whole-row `media_items_catalog_au` trigger, so every redundant write queues up to
+            // five `catalog_outbox` rows and a read-model rebuild. The `WHERE` condition therefore
+            // covers every assigned column and leaves `updated_at` alone unless a value changes:
+            // it is the "last modification" stamp behind Emby `DateLastSaved` and the
+            // `MinDateLastSaved` incremental filter (`src/storage/repository.rs` catalog filter),
+            // both of which are only correct when an unchanged row keeps its stamp. The same guard
+            // already governs `update_media_item_metadata_in_transaction` and
+            // `sync_media_item_nfo_state` in `catalog.rs`.
             "UPDATE media_items
              SET title = ?, sort_title = ?, original_title = ?, overview = ?, production_year = ?,
                  premiere_date = COALESCE(?, premiere_date),
@@ -1755,10 +1765,33 @@ impl Database {
                  nfo_metadata_json = NULL,
                  nfo_metadata_fingerprint = COALESCE(?, nfo_metadata_fingerprint),
                  poster_fallback_required = ?, updated_at = unixepoch()
-             WHERE id = ? AND removed_at IS NULL",
+             WHERE id = ? AND removed_at IS NULL
+               AND (
+                   title IS DISTINCT FROM ?
+                   OR sort_title IS DISTINCT FROM ?
+                   OR original_title IS DISTINCT FROM ?
+                   OR overview IS DISTINCT FROM ?
+                   OR production_year IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND premiere_date IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND last_air_date IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND status IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND original_language IS DISTINCT FROM ?)
+                   OR (? = 1 AND rating IS DISTINCT FROM ?)
+                   OR (? IS NOT NULL AND rating_source IS DISTINCT FROM ?)
+                   OR provider_ids_json IS DISTINCT FROM ?
+                   OR (? IS NOT NULL AND metadata_scraper_id IS DISTINCT FROM ?)
+                   OR (CASE WHEN ? = 1 THEN 'PENDING' ELSE 'ONLINE_CONFIRMED' END)
+                      IS DISTINCT FROM identification_status
+                   OR metadata_fingerprint IS DISTINCT FROM ?
+                   OR metadata_provenance_json IS DISTINCT FROM ?
+                   OR locked_fields_json IS DISTINCT FROM ?
+                   OR nfo_metadata_json IS NOT NULL
+                   OR (? IS NOT NULL AND nfo_metadata_fingerprint IS DISTINCT FROM ?)
+                   OR poster_fallback_required IS DISTINCT FROM ?
+               )",
         )
         .bind(update.title)
-        .bind(sort_title)
+        .bind(&sort_title)
         .bind(update.original_title)
         .bind(update.overview)
         .bind(update.production_year)
@@ -1780,6 +1813,33 @@ impl Database {
         .bind(nfo_metadata_fingerprint)
         .bind(database_flag(update.poster_fallback_required))
         .bind(update.item_id)
+        .bind(update.title)
+        .bind(&sort_title)
+        .bind(update.original_title)
+        .bind(update.overview)
+        .bind(update.production_year)
+        .bind(update.premiere_date)
+        .bind(update.premiere_date)
+        .bind(update.last_air_date)
+        .bind(update.last_air_date)
+        .bind(update.status)
+        .bind(update.status)
+        .bind(update.original_language)
+        .bind(update.original_language)
+        .bind(database_flag(update.rating.is_some()))
+        .bind(update.rating.unwrap_or_default())
+        .bind(update.rating_source)
+        .bind(update.rating_source)
+        .bind(update.provider_ids_json)
+        .bind(update.metadata_scraper_id)
+        .bind(update.metadata_scraper_id)
+        .bind(database_flag(update.keep_pending))
+        .bind(update.metadata_fingerprint)
+        .bind(update.provenance_json)
+        .bind(update.locked_fields_json)
+        .bind(nfo_metadata_fingerprint)
+        .bind(nfo_metadata_fingerprint)
+        .bind(database_flag(update.poster_fallback_required))
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
