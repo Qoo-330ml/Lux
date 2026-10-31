@@ -40,10 +40,11 @@ const DELIVERY_LEASE_SECONDS: i64 = 60;
 /// [`WebhookService::delivery_notify`] as soon as a delivery row is committed, so this only covers a
 /// row written by a path that cannot notify (there is none today) and it can be slow.
 const DELIVERY_POLL_INTERVAL: Duration = Duration::from_secs(30);
-/// Retry cadence while an endpoint keeps failing. A failed attempt schedules the next one seconds
-/// later, so the worker stays on the old 5 s cadence until the queue drains instead of stretching
-/// every retry to the idle fallback.
+/// Retry cadence while a batch is still settling. A failed attempt schedules the next one seconds
+/// later, so the worker keeps the old 5 s cadence for this long after it last attempted a delivery
+/// instead of stretching every retry to the idle fallback.
 const DELIVERY_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+const DELIVERY_RETRY_WINDOW: Duration = Duration::from_secs(60);
 const HISTORY_RETENTION_INTERVAL: Duration = Duration::from_secs(60 * 60);
 const HISTORY_RETENTION_SECONDS: i64 = 30 * 86_400;
 const HISTORY_RETENTION_BATCH_SIZE: i64 = 500;
@@ -166,6 +167,9 @@ async fn run_webhook_delivery_worker(
     mut shutdown: tokio::sync::watch::Receiver<bool>,
 ) {
     let mut last_retention_sweep: Option<Instant> = None;
+    // Set after a pass that attempted deliveries: a requeued delivery is due seconds later, so the
+    // worker keeps the old short cadence for one window instead of sleeping through it.
+    let mut retry_window_until: Option<Instant> = None;
     loop {
         if *shutdown.borrow() {
             return;
@@ -176,20 +180,22 @@ async fn run_webhook_delivery_worker(
         }
         let wait = match service.process_ready_deliveries().await {
             Ok(0) => {
-                if super::background_loop::wait_for_wake_or_shutdown(
-                    &mut shutdown,
-                    &service.delivery_notify,
-                    DELIVERY_POLL_INTERVAL,
-                )
-                .await
-                {
-                    return;
+                let waiting_for_retry =
+                    retry_window_until.is_some_and(|until| Instant::now() < until);
+                if !waiting_for_retry {
+                    retry_window_until = None;
                 }
+                if waiting_for_retry {
+                    DELIVERY_RETRY_INTERVAL
+                } else {
+                    DELIVERY_POLL_INTERVAL
+                }
+            }
+            // A non-empty ready queue is drained without waiting, exactly like before.
+            Ok(_) => {
+                retry_window_until = Some(Instant::now() + DELIVERY_RETRY_WINDOW);
                 continue;
             }
-            // Attempts were made; a requeued delivery is due in seconds, so stay on the short
-            // cadence until the ready queue actually drains.
-            Ok(_) => DELIVERY_RETRY_INTERVAL,
             Err(error) => {
                 tracing::error!(%error, "webhook delivery worker iteration failed");
                 DELIVERY_POLL_INTERVAL
@@ -1909,6 +1915,49 @@ mod tests {
                 "the worker must be woken by the enqueue, not by the idle fallback"
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        service.shutdown().await;
+        Ok(())
+    }
+
+    /// A delivery that failed is requeued one second later: the worker must keep the old short
+    /// cadence for that window instead of sleeping through it on the idle fallback.
+    #[tokio::test]
+    async fn a_failed_delivery_is_retried_on_the_short_cadence()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        service
+            .create_destination("retry", "http://127.0.0.1:1/webhook", true, true, &[], None)
+            .await?;
+        service.spawn_worker().await;
+        service
+            .publish(
+                WebhookEventType::JobFailed,
+                "retry-test",
+                super::unix_now(),
+                json!({"test": true}),
+            )
+            .await?;
+
+        let started = std::time::Instant::now();
+        loop {
+            let attempts = service
+                .list_deliveries(0, 10)
+                .await?
+                .iter()
+                .map(|delivery| delivery.attempt_count)
+                .max()
+                .unwrap_or(0);
+            if attempts >= 2 {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "a requeued delivery must be retried on the short cadence, not the idle fallback"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
         }
         service.shutdown().await;
         Ok(())
