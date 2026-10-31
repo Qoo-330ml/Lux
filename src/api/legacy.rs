@@ -121,7 +121,7 @@ use crate::{
     storage::{
         DashboardStats, Database, ExternalSubtitleUpdate, NewPlaybackEvent,
         NewUserDeviceObservation, PersonListOptions, PersonSort, StorageError,
-        StoredPlaybackSession, WebPlaybackEventClaim,
+        StoredPlaybackSession, TrustedProxyCidrCache, WebPlaybackEventClaim,
     },
 };
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt, SeekFrom};
@@ -177,6 +177,12 @@ impl SseConnectionBudget {
 pub struct CoreState {
     admin_health_probe_cache: AdminHealthProbeCache,
     database: Option<Database>,
+    /// The parsed trusted-proxy CIDR list this process last read, keyed by database and epoch.
+    ///
+    /// The access-IP resolver needs the setting for every protected request that arrives with a
+    /// forwarded chain, while administrators change it rarely; the cached copy is dropped whenever
+    /// a write bumps `AccessChangeEpochs::trusted_proxy_cidrs_epoch`.
+    trusted_proxy_cidrs: TrustedProxyCidrCache,
     config_dir: Option<PathBuf>,
     database_selection_required: bool,
     restart_handle: Option<RestartHandle>,
@@ -952,6 +958,7 @@ impl AppState {
         let core = CoreState {
             admin_health_probe_cache: AdminHealthProbeCache::default(),
             database: Some(database.clone()),
+            trusted_proxy_cidrs: TrustedProxyCidrCache::default(),
             config_dir: Some(config_dir.clone()),
             database_selection_required: false,
             restart_handle: None,
@@ -1799,7 +1806,7 @@ async fn request_access_ip(
         .database
         .as_ref()
         .ok_or(AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
-    let trusted_proxy_values = crate::application::settings::read_trusted_proxy_cidrs(database)
+    let trusted_proxy_values = cached_trusted_proxy_cidrs(state, database)
         .await
         .map_err(|_| AccessIpResolutionError::TrustedProxySettingsUnavailable)?;
     let trusted_proxies = trusted_proxy_networks(
@@ -1813,6 +1820,41 @@ async fn request_access_ip(
     )
     .map(Some)
     .map_err(|_| AccessIpResolutionError::MalformedForwardedFor)
+}
+
+/// Reads the trusted-proxy CIDR setting through this process's cache.
+///
+/// The resolver consults the setting once per protected request that carries a forwarded chain,
+/// and reading it means one `server_settings` row, a `serde_json` parse and CIDR normalization.
+/// The parsed list is therefore cached on the state instance and stamped with the epoch the read
+/// started under (`AccessChangeEpochs::trusted_proxy_cidrs_epoch`):
+///
+/// * a write bumps the epoch after its commit, so a read that starts once the writer returned
+///   misses the cache and sees the new value - invalidation is immediate, not time based;
+/// * a read that overlaps a write never publishes its (possibly old) value, because the epoch it
+///   snapshotted no longer matches when it finishes;
+/// * a failed read is not cached, so a corrupt or unreadable setting keeps failing closed instead
+///   of being served from a previous value.
+///
+/// Only the normalized list is cached. Which addresses are treated as trusted proxies, and which
+/// forwarded hops are then accepted, is still decided per request by
+/// `resolve_client_ip_from_trusted_proxies`; raw forwarded values never bypass that step.
+async fn cached_trusted_proxy_cidrs(
+    state: &CoreState,
+    database: &Database,
+) -> Result<Vec<String>, ()> {
+    let epochs = database.access_changes();
+    let epoch = epochs.trusted_proxy_cidrs_epoch();
+    if let Some(values) = state.trusted_proxy_cidrs.get(database.server_id(), epoch) {
+        return Ok(values);
+    }
+    let values = crate::application::settings::read_trusted_proxy_cidrs(database).await?;
+    if epochs.trusted_proxy_cidrs_epoch() == epoch {
+        state
+            .trusted_proxy_cidrs
+            .insert(database.server_id(), epoch, values.clone());
+    }
+    Ok(values)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2733,6 +2775,122 @@ mod tests {
         assert_eq!(
             request_access_ip(&headers, &state).await,
             Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_reads_the_trusted_proxy_settings_once_for_repeated_requests()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        let state = AppState::default().with_database(database.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.66"));
+
+        database.reset_query_count();
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+
+        // One `server_settings` read for the first request, none for the second one.
+        assert_eq!(database.query_count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn access_ip_sees_a_trusted_proxy_change_on_the_next_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = access_ip_test_database().await?;
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        let state = AppState::default().with_database(database.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.66"));
+
+        // The configured range trusts the peer, so the forwarded address wins.
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+
+        database
+            .set_trusted_proxy_cidrs_json("[\"192.0.2.0/24\"]")
+            .await?;
+        database.reset_query_count();
+        // The peer is no longer trusted, so the raw forwarded value must be ignored again.
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("10.0.0.9".parse()?))
+        );
+        assert_eq!(database.query_count(), 1);
+
+        database
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+
+        // A stored value that cannot be parsed is never served from the cache either.
+        database.set_trusted_proxy_cidrs_json("not-json").await?;
+        assert_eq!(
+            request_access_ip(&headers, &state).await,
+            Err(AccessIpResolutionError::TrustedProxySettingsUnavailable)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trusted_proxy_settings_cache_is_scoped_to_one_state_and_database()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_a, database_a) = access_ip_test_database().await?;
+        let (_temp_b, database_b) = access_ip_test_database().await?;
+        database_a
+            .set_trusted_proxy_cidrs_json("[\"10.0.0.0/8\"]")
+            .await?;
+        database_b
+            .set_trusted_proxy_cidrs_json("[\"192.0.2.0/24\"]")
+            .await?;
+        let state_a = AppState::default().with_database(database_a.clone());
+        let state_b = AppState::default().with_database(database_b.clone());
+        let mut headers = HeaderMap::new();
+        headers.insert("x-lux-peer-ip", HeaderValue::from_static("10.0.0.9"));
+        headers.insert("x-forwarded-for", HeaderValue::from_static("192.0.2.66"));
+
+        assert_eq!(
+            request_access_ip(&headers, &state_a).await,
+            Ok(Some("192.0.2.66".parse()?))
+        );
+        assert_eq!(
+            request_access_ip(&headers, &state_b).await,
+            Ok(Some("10.0.0.9".parse()?))
+        );
+
+        // A write through one database must neither invalidate nor overwrite the other's entry.
+        database_a
+            .set_trusted_proxy_cidrs_json("[\"198.51.100.0/24\"]")
+            .await?;
+        database_b.reset_query_count();
+        assert_eq!(
+            request_access_ip(&headers, &state_b).await,
+            Ok(Some("10.0.0.9".parse()?))
+        );
+        assert_eq!(database_b.query_count(), 0);
+        assert_eq!(
+            request_access_ip(&headers, &state_a).await,
+            Ok(Some("10.0.0.9".parse()?))
         );
         Ok(())
     }
