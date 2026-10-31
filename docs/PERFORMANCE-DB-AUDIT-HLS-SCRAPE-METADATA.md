@@ -183,6 +183,13 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   在 `renew` 失败前会继续返回分片。按项目规则需要项目所有者确认。另一种更保守的方案是保留 `reserve` 但按
   `last_seen_at` 节流（≥30 s 才重算一次），滞后更短但仍有窗口。
 - **是否值得做**：**高**。收益最大、改动局部（4 个调用点 + 一个分支），且 `renew` 已经是现成函数。
+- **已实施（仅副产品，2026-06-11，提交 `58bf7d67`）**：删掉了 `reserve_playback_admission` 里重复的第二次计数。
+  第一次计数已经带回 `session_is_active`（该播放会话是否已在 active 集合里），UPSERT 只会在它为假时新增一行，
+  所以写入后的总数 = 第一次计数 + （`session_is_active` 为假时 1）。准入决策、拒绝原因、返回的
+  `active_playback_count` 全部不变。**准入事务内语句数 5 → 4**（策略读、陈旧名额回收、计数、UPSERT），
+  提交次数仍是 1 次 `BEGIN IMMEDIATE` + 1 次 `COMMIT`。测试：
+  `storage::repository::sessions::tests::playback_admission_derives_the_new_total_without_a_second_count`。
+  **主体（分片路径改"renew 优先"）未做**，仍等所有者确认并发上限的判定窗口（见本节"风险"）。
 
 ### H2 每请求读 6 次，含两处重复读与一次设置行读取（已读代码确认）
 
@@ -207,6 +214,27 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   3. 准入事务里的策略读改为复用第 6 步的结果（把 `UserPlaybackPolicy` 传进 `reserve_playback_admission`）。
 - **风险**：缓存失效必须即时（改可信代理、改播放策略）；第 1、3 条是纯重构无行为变化，第 2 条需要显式失效点。
 - **是否值得做**：**高**（与 H1 同批做，单请求从 ~11 条语句降到 ~3 条）。第 1、3 条可以先做，零行为变化。
+- **已实施（第 1 条，2026-06-11，提交 `0761ef3c`）**：新增
+  `Database::find_web_playback_session_with_access_context`，一条语句读出整行会话 + `authorization_device_id` /
+  `authorization_client_name`；`authorize_resource_with_ip` 改用它，`enforce_playback_access_rules` 改成接受
+  已读到的 `&StoredWebPlaybackAccessContext`。原来第二次读的 `state='ACTIVE'` 过滤已由第一次读之后的
+  `session.state != "ACTIVE"` 判断覆盖（返回同一个 `NotActive`），它的 `user_id` 一致性比较因为两半来自同一行而恒真。
+  旧的 `find_web_playback_access_context` 保留为 `#[cfg(test)]`，继续给存储层契约测试钉住"只读 ACTIVE"的投影。
+  **鉴权阶段语句数 5 → 4**（session 行、device/client 黑名单匹配、IP 规则、播放策略）。测试：
+  `application::playback::session::tests::hls_resource_authorization_reads_the_session_row_once`。
+- **已实施（第 3 条，2026-06-11，提交 `13cf680b`）**：`authorize_resource_with_ip` 返回
+  `AuthorizedWebPlaybackResource { session, policy }`，把鉴权阶段读到的 `UserPlaybackPolicy` 交给
+  `reserve_playback_admission(..., known_policy)`。**SQLite 上准入语句数 5 → 3**（陈旧名额回收、计数、UPSERT）。
+  **PostgreSQL 保留事务内那次读**：它的准入事务是普通 `READ COMMITTED` 的 `BEGIN`，同一个用户两路并发准入
+  只靠那行 `FOR UPDATE` 串行化；去掉它会让两路同时看到"还有空位"而一起进入。所以 PG 上语句数 5 → 4，
+  且由事务内读到的**最新**值决定准入。依据：`begin_playback_admission_transaction`（SQLite `BEGIN IMMEDIATE`／
+  PG 普通 `BEGIN`，`src/storage/repository.rs:1492`）。风险：SQLite 上复用的是一次请求内的策略快照，
+  管理员改上限/停播在"请求内两次读之间"的窗口内最多多放行这一路（原本也存在同样的窗口，只是短几十微秒）；
+  准入决策仍与本次请求已经通过的 tier 校验用同一份策略，不会再分叉。测试：
+  `storage::repository::sessions::tests::playback_admission_reuses_the_policy_the_caller_already_read`。
+- **未做（第 2 条）**：`trusted_proxy_cidrs` 的进程内缓存按任务边界另行处理（涉及 `src/api/legacy.rs`）。
+- **单请求汇总（不含第 2 条）**：一个 HLS 清单/分片 GET 的存储层语句数 **10 → 7**，写提交仍是 1 次
+  （`BEGIN IMMEDIATE` + `COMMIT`，H1 主体未做）。
 
 ### H3 HLS 启动路径重复读设置与 session 行（已读代码确认）
 
@@ -218,6 +246,14 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 - **建议修法**：`start_hls_with_runtime` 把已读到的 `TranscodingSettings` 传下去；`mark_session_tier` 接受已知的 `user_id`。
 - **风险**：无（纯传参重构）。
 - **是否值得做**：**低-中**。顺手做，不单独排任务。
+- **已实施（2026-06-11，提交 `2914f407`）**：`create` 与 `start_hls_with_runtime` 合并为
+  `create_with_settings` / `start_hls_with_settings`，由调用方传入已读到的 `TranscodingSettings`：
+  Web 处理器（`src/api/playback.rs` 的 `create_web_playback_session_json`）、
+  `create_and_start_emby_hls`、`restart_with_software` 各自只读一次；`mark_session_tier` 拆出
+  `mark_known_session_tier`，Emby 降级路径（`activate_emby_hls_session`）用已持有的会话行记录 tier。
+  **每次启动的 `server_settings` 读次数 2–3 → 1**；Emby 创建+启动路径语句数 5 → 4，Web 创建+启动同样 5 → 4，
+  软件回退路径 4 → 3。行为不变：每次启动仍把当前策略应用给 FFmpeg，运行中的会话继续用自己捕获的参数。
+  测试：`application::playback::session::tests::emby_hls_start_reads_the_transcoding_policy_once`。
 
 ### H4 会话生命周期里的无条件 UPDATE（已读代码确认）
 
