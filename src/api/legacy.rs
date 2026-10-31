@@ -653,6 +653,9 @@ impl AppState {
         if let Some(worker) = self.identity_merge_worker() {
             worker.shutdown().await;
         }
+        if let Some(scan_jobs) = self.scan_jobs() {
+            scan_jobs.shutdown_local_metadata_outbox_worker().await;
+        }
         crate::application::probe::shutdown_probe_runtime()
             .await
             .map_err(|error| error.to_string())?;

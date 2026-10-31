@@ -53,6 +53,9 @@ pub struct ScanJobService {
     pub(super) metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     pub(super) local_metadata_image_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     pub(super) local_metadata_outbox_worker_started: Arc<AtomicBool>,
+    /// Stop handle of the outbox worker loop, so a shutdown can drain it instead of abandoning it.
+    pub(super) local_metadata_outbox_worker:
+        Arc<tokio::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
     pub(super) local_metadata_outbox_notify: Arc<Notify>,
     pub(super) lite_manifest_discovery: Arc<Mutex<HashMap<String, LiteManifestDiscoverySession>>>,
     /// Wake-up handle for the automatic media identity merge worker (LUX-841).

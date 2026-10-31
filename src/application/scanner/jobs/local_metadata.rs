@@ -14,8 +14,19 @@ pub(in crate::application::scanner) const LOCAL_METADATA_JOB_REFRESH_FALLBACK: D
 
 pub(in crate::application::scanner) const LOCAL_METADATA_BATCH_SIZE: usize = 16;
 
+/// How long an idle outbox worker sleeps before checking the queue on its own.
+///
+/// Completing an outbox write signals `local_metadata_outbox_notify` (see
+/// [`ScanJobService::notify_local_metadata_outbox_worker`]), so this timer is not the freshness
+/// path: it only covers rows this process cannot observe, such as another process sharing the
+/// database. Before this was 250 ms, which alone was half of the process's idle wake-ups.
 pub(in crate::application::scanner) const SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK: Duration =
-    Duration::from_millis(250);
+    Duration::from_secs(10);
+
+/// How long the worker waits before retrying after a failed claim. A failed claim is local (a
+/// locked table), so it is retried far sooner than the idle fallback.
+pub(in crate::application::scanner) const SCAN_LOCAL_METADATA_OUTBOX_ERROR_RETRY: Duration =
+    Duration::from_secs(1);
 
 pub(in crate::application::scanner) const SCAN_LOCAL_METADATA_RETRY_DELAY_SECONDS: i64 = 30;
 
@@ -884,9 +895,16 @@ struct ScanLocalMetadataOutboxWorkerContext {
     resources: ResourceMetrics,
     outbox_notify: Arc<Notify>,
     image_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    /// Idle wait before the worker checks the queue on its own; see the constant for why.
+    idle_fallback: Duration,
+    /// Wait before retrying a failed claim.
+    error_retry: Duration,
 }
 
-async fn run_scan_local_metadata_outbox_worker(context: ScanLocalMetadataOutboxWorkerContext) {
+async fn run_scan_local_metadata_outbox_worker(
+    context: ScanLocalMetadataOutboxWorkerContext,
+    mut shutdown: watch::Receiver<bool>,
+) {
     let enricher = MetadataEnricher::new(context.database.clone())
         .with_resource_metrics(context.resources.clone());
     let enricher = match context.local_nfo.clone() {
@@ -895,6 +913,9 @@ async fn run_scan_local_metadata_outbox_worker(context: ScanLocalMetadataOutboxW
     };
     let mut nfo_tasks = JoinSet::new();
     loop {
+        if *shutdown.borrow() {
+            return;
+        }
         if nfo_tasks.len() >= MAX_SCAN_LOCAL_METADATA_NFO_BATCHES_IN_FLIGHT {
             if let Some(Err(error)) = nfo_tasks.join_next().await {
                 tracing::error!(%error, "local metadata NFO worker task panicked");
@@ -932,18 +953,43 @@ async fn run_scan_local_metadata_outbox_worker(context: ScanLocalMetadataOutboxW
                         )
                         .await;
                     }
-                    Ok(None) => wait_for_scan_local_metadata_work(&context, &mut nfo_tasks).await,
+                    Ok(None) => {
+                        if wait_for_scan_local_metadata_work(
+                            &context,
+                            &mut nfo_tasks,
+                            &mut shutdown,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                    }
                     Err(error) => {
                         tracing::warn!(%error, "local metadata backfill claim failed; retrying");
-                        tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
+                        if sleep_or_shutdown(&mut shutdown, context.error_retry).await {
+                            return;
+                        }
                     }
                 }
             }
             Err(error) => {
                 tracing::warn!(%error, "local metadata outbox claim failed; retrying");
-                tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK).await;
+                if sleep_or_shutdown(&mut shutdown, context.error_retry).await {
+                    return;
+                }
             }
         }
+    }
+}
+
+/// Sleeps for `duration`, returning `true` when shutdown was requested first.
+async fn sleep_or_shutdown(shutdown: &mut watch::Receiver<bool>, duration: Duration) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    tokio::select! {
+        () = tokio::time::sleep(duration) => *shutdown.borrow(),
+        changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
     }
 }
 
@@ -1050,24 +1096,37 @@ async fn process_scan_local_metadata_backfill_page(
     }
 }
 
+/// Waits for new outbox work, an NFO task finishing, or shutdown; returns `true` on shutdown.
+///
+/// An idle worker blocks on the write notification alone; the much longer fallback only covers
+/// outbox rows this process cannot observe.
 async fn wait_for_scan_local_metadata_work(
     context: &ScanLocalMetadataOutboxWorkerContext,
     nfo_tasks: &mut JoinSet<String>,
-) {
+    shutdown: &mut watch::Receiver<bool>,
+) -> bool {
+    if *shutdown.borrow() {
+        return true;
+    }
+    // `JoinSet::join_next` on an empty set returns immediately, so the task arm is only polled
+    // while NFO batches are actually in flight.
     if nfo_tasks.is_empty() {
         tokio::select! {
-            _ = context.outbox_notify.notified() => {}
-            _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+            () = context.outbox_notify.notified() => false,
+            () = tokio::time::sleep(context.idle_fallback) => false,
+            changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         }
     } else {
         tokio::select! {
+            () = context.outbox_notify.notified() => false,
+            () = tokio::time::sleep(context.idle_fallback) => false,
             result = nfo_tasks.join_next() => {
                 if let Some(Err(error)) = result {
                     tracing::error!(%error, "local metadata worker task panicked");
                 }
+                false
             }
-            _ = context.outbox_notify.notified() => {}
-            _ = tokio::time::sleep(SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK) => {}
+            changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         }
     }
 }
@@ -1565,22 +1624,226 @@ impl ScanJobService {
             resources,
             outbox_notify,
             image_notifications,
+            idle_fallback: SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK,
+            error_retry: SCAN_LOCAL_METADATA_OUTBOX_ERROR_RETRY,
         };
         let started = Arc::clone(&self.local_metadata_outbox_worker_started);
-        tokio::spawn(crate::application::background_loop::supervise_with_restart(
+        // `BackgroundLoop` restarts the body after a panic (the behaviour the previous
+        // `supervise_with_restart` call provided) and keeps the stop handle the application drains
+        // on shutdown, so a stop can no longer interrupt a batch halfway.
+        let worker = crate::application::background_loop::BackgroundLoop::spawn(
             "scan_local_metadata_outbox",
-            move || {
+            move |shutdown| {
                 let context = worker_context.clone();
                 let started = Arc::clone(&started);
                 async move {
-                    run_scan_local_metadata_outbox_worker(context).await;
+                    run_scan_local_metadata_outbox_worker(context, shutdown).await;
                     // The worker body only returns when it stops for good. Release the
                     // single-flight guard so a later start request can run it again; a panic
                     // keeps the guard set because the supervisor restarts the worker.
                     started.store(false, std::sync::atomic::Ordering::Release);
                 }
             },
+        );
+        *self.local_metadata_outbox_worker.lock().await = Some(worker);
+        Ok(())
+    }
+
+    /// Runs the outbox worker body directly with test timings.
+    ///
+    /// The production loop waits ten seconds when idle, which no test can afford; the fields the
+    /// fallback reads are injected here instead of being constants.
+    #[cfg(test)]
+    pub(in crate::application::scanner) fn spawn_outbox_worker_for_tests(
+        &self,
+        idle_fallback: Duration,
+    ) -> (watch::Sender<bool>, JoinHandle<()>, Arc<Notify>) {
+        let (shutdown, shutdown_receiver) = watch::channel(false);
+        let outbox_notify = Arc::clone(&self.local_metadata_outbox_notify);
+        let context = ScanLocalMetadataOutboxWorkerContext {
+            database: self.database.clone(),
+            local_nfo: self.local_nfo.clone(),
+            metadata_selection: self.metadata_selection.clone(),
+            metadata_reidentify: self.metadata_reidentify.clone(),
+            home: self.home.clone(),
+            user_events: self.user_events.clone(),
+            resources: self.resources.clone(),
+            outbox_notify: Arc::clone(&outbox_notify),
+            image_notifications: Arc::clone(&self.local_metadata_image_notifications),
+            idle_fallback,
+            error_retry: Duration::from_millis(20),
+        };
+        let task = tokio::spawn(run_scan_local_metadata_outbox_worker(
+            context,
+            shutdown_receiver,
         ));
+        (shutdown, task, outbox_notify)
+    }
+
+    /// Stops the outbox worker and waits for the loop to finish its current batch.
+    pub async fn shutdown_local_metadata_outbox_worker(&self) {
+        let worker = {
+            let mut worker = self.local_metadata_outbox_worker.lock().await;
+            worker.take()
+        };
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
+        self.local_metadata_outbox_worker_started
+            .store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod outbox_worker_tests {
+    use std::time::Duration;
+
+    use tokio::time::{sleep, timeout};
+
+    use super::*;
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    /// Long enough that a pass can only come from a notification.
+    const LONG_FALLBACK: Duration = Duration::from_secs(60);
+
+    async fn root_id(
+        database: &Database,
+        media_root: &std::path::Path,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        let libraries = LibraryService::new(database.clone());
+        let library = libraries
+            .create_library("Worker", LibraryKind::Movie, false)
+            .await?;
+        let display_path = media_root.to_str().ok_or("non-UTF8 media root")?;
+        let root = libraries.add_root(library.id, display_path).await?;
+        Ok(root.root.id.to_string())
+    }
+
+    async fn queue_batch(
+        database: &Database,
+        root: &str,
+        sequence: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        sqlx::query(
+            "INSERT INTO scan_local_metadata_batches (
+                 id, job_id, library_root_id, batch_sequence, source_refs_json, source_count
+             ) VALUES (?, 'worker-job', ?, ?, '[\"missing-source\"]', 1)",
+        )
+        .bind(format!("worker-job:{root}:{sequence}"))
+        .bind(root)
+        .bind(sequence)
+        .execute(database.pool())
+        .await?;
+        Ok(())
+    }
+
+    async fn statuses(
+        database: &Database,
+        root: &str,
+    ) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT status FROM scan_local_metadata_batches WHERE library_root_id = ? ORDER BY batch_sequence",
+        )
+        .bind(root)
+        .fetch_all(database.pool())
+        .await?;
+        Ok(rows)
+    }
+
+    #[tokio::test]
+    async fn an_idle_worker_does_not_query_the_database() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp, database) = test_database().await?;
+        let jobs = ScanJobService::new(database.clone());
+        let (shutdown, task, _notify) = jobs.spawn_outbox_worker_for_tests(LONG_FALLBACK);
+        // Let the worker reach its wait (one claim of each queue, both empty).
+        sleep(Duration::from_millis(300)).await;
+        let before = database.query_count();
+        // Longer than the four per second the old 250 ms fallback produced.
+        sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            database.query_count(),
+            before,
+            "an idle outbox worker must wait for a notification, not poll"
+        );
+        shutdown.send_replace(true);
+        timeout(Duration::from_secs(2), task).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_notification_is_handled_long_before_the_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        let media_root = tempfile::tempdir()?;
+        let root = root_id(&database, media_root.path()).await?;
+        let jobs = ScanJobService::new(database.clone());
+        let (shutdown, task, _notify) = jobs.spawn_outbox_worker_for_tests(LONG_FALLBACK);
+        sleep(Duration::from_millis(200)).await;
+
+        queue_batch(&database, &root, 0).await?;
+        jobs.notify_local_metadata_outbox_worker();
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let statuses = statuses(&database, &root).await.unwrap_or_default();
+                if statuses.first().is_some_and(|status| status != "PENDING") {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the notification must claim the batch long before the 60 s fallback");
+        shutdown.send_replace(true);
+        timeout(Duration::from_secs(2), task).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_backlog_is_claimed_by_consecutive_passes() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp, database) = test_database().await?;
+        let media_root = tempfile::tempdir()?;
+        let root = root_id(&database, media_root.path()).await?;
+        let jobs = ScanJobService::new(database.clone());
+        let (shutdown, task, _notify) = jobs.spawn_outbox_worker_for_tests(LONG_FALLBACK);
+        sleep(Duration::from_millis(200)).await;
+
+        for sequence in 0..3 {
+            queue_batch(&database, &root, sequence).await?;
+        }
+        jobs.notify_local_metadata_outbox_worker();
+
+        timeout(Duration::from_secs(3), async {
+            loop {
+                let statuses = statuses(&database, &root).await.unwrap_or_default();
+                if statuses.len() == 3 && statuses.iter().all(|status| status != "PENDING") {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a queued backlog must be claimed by consecutive passes");
+        shutdown.send_replace(true);
+        timeout(Duration::from_secs(2), task).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_worker_and_joins_it() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        let jobs = ScanJobService::new(database.clone());
+        let (shutdown, task, _notify) = jobs.spawn_outbox_worker_for_tests(LONG_FALLBACK);
+        sleep(Duration::from_millis(100)).await;
+        shutdown.send_replace(true);
+        timeout(Duration::from_secs(2), task)
+            .await
+            .expect("shutdown must not wait for the fallback")
+            .expect("worker task");
         Ok(())
     }
 }
