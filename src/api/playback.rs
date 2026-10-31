@@ -3664,10 +3664,12 @@ async fn admit_web_playback_request(
 
 /// Admits the segment or manifest request that is about to be served.
 ///
-/// Unlike [`admit_web_playback_request`], which always runs the full admission, this one renews
-/// the slot the stream already holds and only re-evaluates the limits when the renewal cannot
-/// stand in for it (reclaimed slot, or an admission older than the renewal window). HLS requests
-/// arrive every few seconds, so the full admission is what has to be the exception here.
+/// Unlike [`admit_web_playback_request`], which always runs the full admission, this one only
+/// checks the slot the stream already holds: a live slot admitted less than the re-check interval
+/// ago is served after one read, and everything else (reclaimed slot, expired interval, revoked
+/// `can_play`) runs the full admission. HLS requests arrive every few seconds, so the full
+/// admission is the exception here — but it does still run every interval, which is what keeps the
+/// limits from freezing for the whole playback.
 async fn admit_web_playback_hls_request(
     headers: &HeaderMap,
     service: &crate::application::playback::session::WebPlaybackSessionService,
@@ -3679,7 +3681,7 @@ async fn admit_web_playback_hls_request(
         .await
         .map_err(|error| web_playback_error(headers, error))?
     {
-        PlaybackAssetAdmission::Renewed => Ok(()),
+        PlaybackAssetAdmission::Fresh => Ok(()),
         PlaybackAssetAdmission::NotFound => Err(StatusCode::NOT_FOUND.into_response()),
         PlaybackAssetAdmission::Evaluated(result) => {
             if let Some(response) = playback_admission_error(headers, &result) {

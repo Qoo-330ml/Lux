@@ -18824,7 +18824,7 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
 }
 
 #[tokio::test]
-async fn playback_admission_asset_renewal_is_one_statement_inside_its_window()
+async fn playback_admission_freshness_check_reads_and_never_writes()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
     let database = Database::connect(&Config {
@@ -18832,9 +18832,9 @@ async fn playback_admission_asset_renewal_is_one_statement_inside_its_window()
         config_dir: temp_dir.path().join("config"),
     })
     .await?;
-    let user_id = "asset-renewal-user";
+    let user_id = "asset-freshness-user";
     database
-        .insert_user(user_id, user_id, "Asset Renewal", "test", false, true)
+        .insert_user(user_id, user_id, "Asset Freshness", "test", false, true)
         .await?;
     database
         .update_user_playback_policy(
@@ -18850,102 +18850,110 @@ async fn playback_admission_asset_renewal_is_one_statement_inside_its_window()
         .await?;
 
     let now = 1_000_000_i64;
+    let play_session_id = "asset-freshness-session";
     let admitted = database
-        .reserve_playback_admission(user_id, "asset-renewal-session", now, None)
+        .reserve_playback_admission(user_id, play_session_id, now, None)
         .await?
         .expect("user exists");
     assert_eq!(admitted.decision, PlaybackAdmissionDecision::Admitted);
+    let opening_stamp = asset_admission_stamp(&database, user_id, play_session_id).await?;
+    assert_eq!(opening_stamp, now, "the full admission opens the interval");
 
-    database.reset_query_count();
-    assert!(
-        database
-            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 10)
-            .await?,
-        "an admission this recent is renewed"
-    );
-    assert_eq!(
-        database.query_count(),
-        1,
-        "the renewal must stay a single statement"
-    );
-    assert_eq!(
-        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
-        now + 10,
-        "the renewal moves the stamp forward"
-    );
-
-    assert!(
-        database
-            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 5,)
-            .await?,
-        "a clock that is behind still renews"
-    );
-    assert_eq!(
-        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
-        now + 10,
-        "the renewal never moves the stamp backwards"
-    );
-
-    for declined in [now + 40, now + 41] {
+    // Inside the interval the check is one read: the stamp must not move, otherwise the interval
+    // would never expire and the limits would freeze for the whole playback.
+    for elapsed in [1, 10, 29] {
+        database.reset_query_count();
         assert!(
-            !database
-                .renew_playback_admission_for_asset_request(
-                    user_id,
-                    "asset-renewal-session",
-                    declined
-                )
+            database
+                .has_fresh_playback_admission(user_id, play_session_id, now + elapsed)
                 .await?,
-            "an admission at or beyond the renewal window has to run the full admission again"
+            "an admission {elapsed} seconds old is fresh"
         );
         assert_eq!(
-            asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
-            now + 10,
-            "a declined renewal leaves the row untouched"
+            database.query_count(),
+            1,
+            "the freshness check is a single statement"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now,
+            "the freshness check must not write the stamp"
         );
     }
 
-    assert!(
-        database
-            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 39)
-            .await?,
-        "one second inside the window still renews"
-    );
-    assert_eq!(
-        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
-        now + 39
-    );
+    for elapsed in [30, 31, 90] {
+        assert!(
+            !database
+                .has_fresh_playback_admission(user_id, play_session_id, now + elapsed)
+                .await?,
+            "an admission {elapsed} seconds old has to run the full admission again"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now,
+            "a refused freshness check writes nothing either"
+        );
+    }
 
-    // The heartbeat and playback-event renewals keep the wider stale window: they are the only
-    // paths that may still revive an admission the asset path would have re-admitted.
+    // The full admission re-opens the interval from its own request time.
+    let re_admitted = database
+        .reserve_playback_admission(user_id, play_session_id, now + 32, None)
+        .await?
+        .expect("user exists");
+    assert_eq!(re_admitted.decision, PlaybackAdmissionDecision::Admitted);
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, play_session_id).await?,
+        now + 32
+    );
     assert!(
         database
-            .renew_existing_playback_admission(user_id, "asset-renewal-session", now + 55)
+            .has_fresh_playback_admission(user_id, play_session_id, now + 61)
             .await?,
-        "the heartbeat renewal covers the whole stale window, not just the asset window"
-    );
-    assert_eq!(
-        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
-        now + 55
+        "one second inside the re-opened interval is fresh"
     );
     assert!(
         !database
-            .renew_existing_playback_admission(user_id, "asset-renewal-session", now + 146)
+            .has_fresh_playback_admission(user_id, play_session_id, now + 62)
+            .await?,
+        "the re-opened interval lasts exactly thirty seconds"
+    );
+
+    // The heartbeat and playback-event renewals keep moving the stamp inside the wider stale
+    // window, which is what keeps a slot in the active set between two full admissions.
+    assert!(
+        database
+            .renew_existing_playback_admission(user_id, play_session_id, now + 75)
+            .await?
+    );
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, play_session_id).await?,
+        now + 75
+    );
+    assert!(
+        database
+            .has_fresh_playback_admission(user_id, play_session_id, now + 80)
+            .await?,
+        "a heartbeat renewal also refreshes the interval"
+    );
+    assert!(
+        !database
+            .renew_existing_playback_admission(user_id, play_session_id, now + 166)
             .await?,
         "a stale admission is not renewed by any path"
     );
 
     database
-        .release_playback_admission(user_id, "asset-renewal-session", now + 147)
+        .release_playback_admission(user_id, play_session_id, now + 167)
         .await?;
     assert!(
         !database
-            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 148)
+            .has_fresh_playback_admission(user_id, play_session_id, now + 168)
             .await?,
-        "a released slot is never renewed back to life"
+        "a released slot is never fresh"
     );
     assert!(
         !database
-            .renew_playback_admission_for_asset_request(user_id, "unknown-session", now + 148)
+            .has_fresh_playback_admission(user_id, "unknown-session", now + 168)
             .await?,
         "a request without an admission row falls back to the full admission"
     );
@@ -18969,19 +18977,19 @@ async fn asset_admission_stamp(
         .await?)
 }
 
-/// Same renewal contract as the SQLite test above, on the backend that spells the stamp update
-/// with `GREATEST` instead of `MAX`.
+/// Same freshness contract as the SQLite test above, on the backend that spells the heartbeat
+/// stamp update with `GREATEST` instead of `MAX`.
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
-async fn postgres_playback_admission_asset_renewal_keeps_the_newest_stamp()
+async fn postgres_playback_admission_freshness_never_writes()
 -> Result<(), Box<dyn std::error::Error>> {
     with_isolated_postgres_database(|database| async move {
-        let user_id = "postgres-asset-renewal-user";
+        let user_id = "postgres-asset-freshness-user";
         database
             .insert_user(
                 user_id,
                 user_id,
-                "Postgres Asset Renewal",
+                "Postgres Asset Freshness",
                 "test",
                 false,
                 true,
@@ -19000,7 +19008,7 @@ async fn postgres_playback_admission_asset_renewal_keeps_the_newest_stamp()
             )
             .await?;
         let now = 1_000_000_i64;
-        let play_session_id = "postgres-asset-renewal-session";
+        let play_session_id = "postgres-asset-freshness-session";
         let admitted = database
             .reserve_playback_admission(user_id, play_session_id, now, None)
             .await?
@@ -19009,33 +19017,29 @@ async fn postgres_playback_admission_asset_renewal_keeps_the_newest_stamp()
 
         assert!(
             database
-                .renew_playback_admission_for_asset_request(user_id, play_session_id, now + 10)
+                .has_fresh_playback_admission(user_id, play_session_id, now + 29)
                 .await?
         );
         assert_eq!(
             asset_admission_stamp(&database, user_id, play_session_id).await?,
-            now + 10
-        );
-        assert!(
-            database
-                .renew_playback_admission_for_asset_request(user_id, play_session_id, now + 5)
-                .await?,
-            "a clock that is behind still renews"
-        );
-        assert_eq!(
-            asset_admission_stamp(&database, user_id, play_session_id).await?,
-            now + 10,
-            "GREATEST keeps the newer stamp"
+            now,
+            "the freshness check must not write the stamp"
         );
         assert!(
             !database
-                .renew_playback_admission_for_asset_request(user_id, play_session_id, now + 41)
+                .has_fresh_playback_admission(user_id, play_session_id, now + 30)
                 .await?,
-            "the renewal window applies to both backends"
+            "the re-check interval applies to both backends"
+        );
+        assert!(
+            database
+                .renew_existing_playback_admission(user_id, play_session_id, now + 40)
+                .await?,
+            "GREATEST keeps the heartbeat renewal working"
         );
         assert_eq!(
             asset_admission_stamp(&database, user_id, play_session_id).await?,
-            now + 10
+            now + 40
         );
         Ok::<(), Box<dyn std::error::Error>>(())
     })
