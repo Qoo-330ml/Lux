@@ -49,6 +49,7 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
   `docs/COMPATIBILITY.md` 的“search_outbox 拆表”。
 - **续播位置在阈值处不更新**：跨过续播阈值的 tick 现在会立即刷新续播指针，不再等下一个状态变化。
 - **进度回调的时长读取**：普通进度 tick 复用已存时长，不再为取 duration 加载整条详情；播放入口重复的媒体库查询合并成一次。
+- **PostgreSQL 起不来（0.7.4 内引入并修复）**：连接池的 `after_connect` 把多语句的会话设置（`SET TIME ZONE`、`statement_timeout`、`idle_in_transaction_session_timeout`、`work_mem`、`jit` 等）改成走预处理语句，PostgreSQL 以 `cannot insert multiple commands into a prepared statement` 拒绝，于是每个新连接都失败、连接池超时、进程起不来。现在这条路固定走简单查询协议，SQLite 侧的多条 `PRAGMA` 也恢复成一次执行；并补了一条被忽略的 PostgreSQL 回归测试，断言这些会话设置真的落在连接上（时区 UTC、`application_name=lux`、`work_mem=16MB`、`jit=off`、两个超时）。
 
 ## [0.7.3] - 2026-10-31
 

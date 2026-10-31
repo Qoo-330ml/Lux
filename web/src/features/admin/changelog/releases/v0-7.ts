@@ -24,6 +24,7 @@ export const changelogReleases07: ChangelogRelease[] = [
         "catalog_outbox 无限重排撑满磁盘：搜索事件与读模型事件共用同一 outbox 与 id 序列，缺口判定拿单一 kind 的 MIN(id) 比混合水位，每一拍都误报缺口并重排全部条目（一晚 6.97 亿行、89 GB）。现在搜索事件拆到 search_outbox（迁移 0243/0245，消费者 search_reindex@2）、读取按 kind 走 (kind, id) 索引、缺口修复每消费者 5 分钟冷却且超过 200 万待处理行直接拒绝、trim 每批执行、旧 search 行后台分批清理；已膨胀的部署按 docs/RUNBOOK-OUTBOX-BLOAT.md 回收空间。",
         "续播位置在阈值处不更新：跨过续播阈值的 tick 现在立即刷新续播指针，不再等下一个状态变化。",
         "进度回调的时长读取：普通进度 tick 复用已存时长，不再为取 duration 加载整条详情；播放入口的媒体库查询也合并成一次。",
+        "PostgreSQL 起不来（0.7.4 内引入并修复）：连接池的 after_connect 把多语句的会话设置（SET TIME ZONE、statement_timeout、work_mem、jit 等）改成走预处理语句，PostgreSQL 以 cannot insert multiple commands into a prepared statement 拒绝，每个新连接都失败、连接池超时、进程起不来；现在固定走简单查询协议，SQLite 侧的多条 PRAGMA 也恢复成一次执行，并补了断言这些会话设置真的生效的 PostgreSQL 回归测试。",
       ] },
     ],
   },
