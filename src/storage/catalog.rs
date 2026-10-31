@@ -529,6 +529,90 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of `list_item_image_candidates`: one stored image plus the library root it resolves under.
+#[derive(Debug, sqlx::FromRow)]
+struct ItemImageCandidateRow {
+    id: String,
+    image_type: String,
+    local_path: String,
+    root_path: String,
+    content_tag: Option<String>,
+    width: Option<i64>,
+    height: Option<i64>,
+}
+
+impl From<ItemImageCandidateRow> for StoredItemImageCandidate {
+    fn from(row: ItemImageCandidateRow) -> Self {
+        Self {
+            id: row.id,
+            image_type: row.image_type,
+            local_path: row.local_path,
+            root_path: row.root_path,
+            content_tag: row.content_tag,
+            width: row.width,
+            height: row.height,
+        }
+    }
+}
+
+/// Row of `list_item_image_path_conflicts`: one image whose local path is shared with an image of
+/// the other FANART/THUMB type on the same item.
+#[derive(Debug, sqlx::FromRow)]
+struct ItemImagePathConflictRow {
+    id: String,
+    item_id: String,
+    image_type: String,
+    local_path: String,
+}
+
+impl From<ItemImagePathConflictRow> for StoredItemImagePathConflict {
+    fn from(row: ItemImagePathConflictRow) -> Self {
+        Self {
+            id: row.id,
+            item_id: row.item_id,
+            image_type: row.image_type,
+            local_path: row.local_path,
+        }
+    }
+}
+
+/// Row of `list_catalog_image_tags_by_ids`: one image tag of a catalog item.
+#[derive(Debug, sqlx::FromRow)]
+struct CatalogImageTagRow {
+    item_id: String,
+    id: String,
+    image_type: String,
+    image_index: i64,
+}
+
+impl From<CatalogImageTagRow> for StoredCatalogImageTag {
+    fn from(row: CatalogImageTagRow) -> Self {
+        Self {
+            id: row.id,
+            image_type: row.image_type,
+            image_index: row.image_index,
+        }
+    }
+}
+
+/// Row of `list_random_library_poster_paths`: one random poster of a library.
+#[derive(Debug, sqlx::FromRow)]
+struct LibraryPosterRow {
+    item_id: String,
+    local_path: String,
+    root_path: String,
+}
+
+impl From<LibraryPosterRow> for StoredLibraryPoster {
+    fn from(row: LibraryPosterRow) -> Self {
+        Self {
+            item_id: row.item_id,
+            local_path: row.local_path,
+            root_path: row.root_path,
+        }
+    }
+}
+
 /// Row of `media_content_restriction_classifications_for_item`: one related item of the target,
 /// its optional stored classification and one of its tags.
 #[derive(Debug, sqlx::FromRow)]
@@ -9439,7 +9523,7 @@ impl Database {
         image_type: &str,
         image_index: i64,
     ) -> Result<Vec<StoredItemImageCandidate>, StorageError> {
-        self.query(
+        self.query_as::<ItemImageCandidateRow>(
             "SELECT ii.id, ii.image_type, ii.local_path, lr.canonical_path AS root_path,
                     ii.content_tag, ii.width, ii.height
              FROM item_images ii
@@ -9456,15 +9540,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredItemImageCandidate {
-                    id: row.get("id"),
-                    image_type: row.get("image_type"),
-                    local_path: row.get("local_path"),
-                    root_path: row.get("root_path"),
-                    content_tag: row.get("content_tag"),
-                    width: row.get("width"),
-                    height: row.get("height"),
-                })
+                .map(StoredItemImageCandidate::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -9580,7 +9656,7 @@ impl Database {
     pub(crate) async fn list_item_image_path_conflicts(
         &self,
     ) -> Result<Vec<StoredItemImagePathConflict>, StorageError> {
-        self.query(
+        self.query_as::<ItemImagePathConflictRow>(
             "SELECT ii.id, ii.item_id, ii.image_type, ii.local_path
              FROM item_images ii
              JOIN media_items mi ON mi.id = ii.item_id
@@ -9600,12 +9676,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredItemImagePathConflict {
-                    id: row.get("id"),
-                    item_id: row.get("item_id"),
-                    image_type: row.get("image_type"),
-                    local_path: row.get("local_path"),
-                })
+                .map(StoredItemImagePathConflict::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -9659,7 +9730,7 @@ impl Database {
         &self,
         item_id: &str,
     ) -> Result<Option<(i32, i32)>, StorageError> {
-        self.query(
+        self.query_as::<(i32, i32)>(
             "SELECT width, height
              FROM item_images
              WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0
@@ -9668,7 +9739,6 @@ impl Database {
         .bind(item_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(|row| (row.get("width"), row.get("height"))))
         .map_err(self.sqlx_err())
     }
 
@@ -9717,7 +9787,7 @@ impl Database {
                  WHERE item_id IN ({placeholders})
                  ORDER BY item_id, image_type, image_index, id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<CatalogImageTagRow>(sqlx::AssertSqlSafe(query));
             for item_id in item_ids {
                 statement = statement.bind(item_id);
             }
@@ -9726,14 +9796,9 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let item_id: String = row.get("item_id");
-                tags.entry(item_id.clone())
+                tags.entry(row.item_id.clone())
                     .or_insert_with(Vec::new)
-                    .push(StoredCatalogImageTag {
-                        id: row.get("id"),
-                        image_type: row.get("image_type"),
-                        image_index: row.get("image_index"),
-                    });
+                    .push(StoredCatalogImageTag::from(row));
             }
         }
         Ok(tags)
@@ -9763,7 +9828,7 @@ impl Database {
         library_id: &str,
         limit: i64,
     ) -> Result<Vec<StoredLibraryPoster>, StorageError> {
-        self.query(
+        self.query_as::<LibraryPosterRow>(
             "SELECT ii.item_id, ii.local_path, lr.canonical_path AS root_path
              FROM item_images ii
              JOIN media_items mi ON mi.id = ii.item_id
@@ -9780,15 +9845,7 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(|row| StoredLibraryPoster {
-                    item_id: row.get("item_id"),
-                    local_path: row.get("local_path"),
-                    root_path: row.get("root_path"),
-                })
-                .collect()
-        })
+        .map(|rows| rows.into_iter().map(StoredLibraryPoster::from).collect())
         .map_err(self.sqlx_err())
     }
 
@@ -13187,6 +13244,142 @@ mod content_restriction_classification_row_decoding_tests {
             matches!(error, sqlx::Error::ColumnNotFound(_)),
             "unexpected decode error: {error}"
         );
+        Ok(())
+    }
+}
+
+/// Decoding tests for the item-image candidate/conflict/tag projections and the library poster
+/// lookup.
+#[cfg(test)]
+mod item_image_row_decoding_tests {
+    use super::*;
+
+    async fn insert_image_fixture(database: &Database) -> Result<(), Box<dyn std::error::Error>> {
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES ('img-lib', 'Images', 'SERIES');
+                 INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('img-root', 'img-lib', '/img', '/img', 1, 1);
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES (
+                     'img-episode', 'img-lib', 'EPISODE', 'Episode', 'episode',
+                     'LOCAL_CONFIRMED', 1
+                 );
+                 INSERT INTO item_images (
+                     id, item_id, image_type, image_index, local_path, content_tag,
+                     source, width, height
+                 ) VALUES
+                     ('img-poster', 'img-episode', 'POSTER', 0, '/img/poster.jpg', 'tag',
+                      'LOCAL', 800, 600),
+                     ('img-fanart', 'img-episode', 'FANART', 0, '/img/shared.jpg', NULL,
+                      'LOCAL', NULL, NULL),
+                     ('img-thumb', 'img-episode', 'THUMB', 0, '/img/shared.jpg', NULL,
+                      'LOCAL', NULL, NULL)",
+            )
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn item_image_rows_decode_candidates_conflicts_tags_and_posters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        insert_image_fixture(&database).await?;
+
+        let candidates = database
+            .list_item_image_candidates("img-episode", "POSTER", 0)
+            .await?;
+        assert_eq!(candidates.len(), 1);
+        let candidate = &candidates[0];
+        assert_eq!(candidate.id, "img-poster");
+        assert_eq!(candidate.image_type, "POSTER");
+        assert_eq!(candidate.local_path, "/img/poster.jpg");
+        assert_eq!(candidate.root_path, "/img");
+        assert_eq!(candidate.content_tag.as_deref(), Some("tag"));
+        assert_eq!(candidate.width, Some(800));
+        assert_eq!(candidate.height, Some(600));
+
+        let dimensions = database
+            .find_primary_image_dimensions("img-episode")
+            .await?;
+        assert_eq!(dimensions, Some((800, 600)));
+        assert_eq!(
+            database
+                .find_primary_image_dimensions("img-missing")
+                .await?,
+            None
+        );
+
+        let conflicts = database.list_item_image_path_conflicts().await?;
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(
+            conflicts
+                .iter()
+                .map(|conflict| conflict.id.as_str())
+                .collect::<Vec<_>>(),
+            ["img-fanart", "img-thumb"]
+        );
+        assert!(
+            conflicts
+                .iter()
+                .all(|conflict| conflict.item_id == "img-episode")
+        );
+        assert!(
+            conflicts
+                .iter()
+                .all(|conflict| conflict.local_path == "/img/shared.jpg")
+        );
+
+        let tags = database
+            .list_catalog_image_tags_by_ids(&["img-episode".to_owned()])
+            .await?;
+        let tags = tags.get("img-episode").expect("image tags");
+        assert_eq!(
+            tags.iter()
+                .map(|tag| (tag.id.as_str(), tag.image_type.as_str(), tag.image_index))
+                .collect::<Vec<_>>(),
+            [
+                ("img-fanart", "FANART", 0),
+                ("img-poster", "POSTER", 0),
+                ("img-thumb", "THUMB", 0)
+            ]
+        );
+
+        let posters = database
+            .list_random_library_poster_paths("img-lib", 10)
+            .await?;
+        assert_eq!(posters.len(), 1);
+        assert_eq!(posters[0].item_id, "img-episode");
+        assert_eq!(posters[0].local_path, "/img/poster.jpg");
+        assert_eq!(posters[0].root_path, "/img");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn item_image_row_structs_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let errors = [
+            ItemImageCandidateRow::from_row(&row).expect_err("candidate columns must not decode"),
+            ItemImagePathConflictRow::from_row(&row).expect_err("conflict columns must not decode"),
+            CatalogImageTagRow::from_row(&row).expect_err("image tag columns must not decode"),
+            LibraryPosterRow::from_row(&row).expect_err("library poster columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
         Ok(())
     }
 }
