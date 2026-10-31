@@ -159,15 +159,17 @@ idx_media_items_series_removed (series_id, removed_at)        左前缀 ⊆ idx_
 等值谓词可用。两者都没有唯一性，也没有「排序专用」作用（列顺序相同、方向相同），所以窄索引
 既不能被唯一约束需要，也不能提供宽索引提供不了的顺序。
 
-双向的查询计划证据（`--simulate-drop`，本机 arm64，6 000 + 2 160 行数据集）：
+双向的查询计划证据（本机 arm64，脚本的默认数据集：6 000 部电影 + 2 880 集）：
 
 - 在宽索引存在时，`count_catalog_children`（`WHERE parent_id = ? AND item_type IN (…) AND removed_at IS NULL`）
   与 `sync_played_container_states_for_scope`（`parent_id = ? AND removed_at IS NULL AND has_available_source = 1`）
   **都选择宽索引**，没有一个选窄索引：
   `SEARCH mi USING INDEX idx_media_items_parent_available (parent_id=? AND removed_at=?)`、
   `SEARCH episode USING INDEX idx_media_items_parent_available (parent_id=? AND removed_at=? AND has_available_source=?)`。
-- 反过来 `--simulate-drop idx_media_items_parent_available`，上述两条计划**全部转用窄索引**且没有
-  变成全表扫描；`idx_media_items_series_available` 与 `series_removed` 之间也是同样的互换关系。
+- 反过来 `--simulate-drop idx_media_items_parent_available`（在 0242 合入**之前**测得；现在窄索引
+  已经不存在，要复现需先在临时库里手工重建 `idx_media_items_parent_removed`），上述两条计划**全部
+  转用窄索引**且没有变成全表扫描；`idx_media_items_series_available` 与 `series_removed` 之间也是
+  同样的互换关系。
 
 也就是说：删掉窄索引后，所有现存查询都由宽索引接手，行检查数不变，而每次 `media_items` 插入/更新
 少维护一个 B-tree。删索引走迁移是必须的，`python3 scripts/check-migration-parity.py` 保证 PG 侧同步。
