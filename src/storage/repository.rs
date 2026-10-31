@@ -2607,7 +2607,7 @@ pub(crate) struct StoredLibraryDeletionJob {
     pub(crate) finished_at: Option<i64>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredLibraryScraper {
     pub(crate) scraper_id: String,
     pub(crate) position: i64,
@@ -4135,7 +4135,7 @@ pub(crate) struct StoredMetadataCandidate {
     pub(crate) item_title: String,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredMetadataCapabilityAttempt {
     pub(crate) provider: String,
     pub(crate) provider_id: String,
@@ -4176,7 +4176,7 @@ pub(crate) struct MetadataCapabilityWrite<'a> {
     pub(crate) now: i64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct StoredMetadataImageAttempt {
     pub(crate) image_type: String,
     pub(crate) candidate_key: String,
