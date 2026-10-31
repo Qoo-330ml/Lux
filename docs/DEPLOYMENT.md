@@ -79,6 +79,60 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 管理员可以在“任务与日志 → 系统日志”选择 UTC 起止日期并直接下载日志；选择单日会下载原始 `.log` 文件，跨日会下载 ZIP。也可以在宿主机使用
 `docker compose logs --no-color --timestamps --since 1h lux` 查看容器 stdout。日志文件和导出内容可能包含媒体相对路径及请求诊断信息，不要公开发布；不要把 `/config` 整目录、Cookie、配置凭据或数据库文件作为日志附件发送。
 
+### SQLite 写入耐久性（LUX_SQLITE_SYNCHRONOUS）
+
+内置 SQLite 使用 WAL。每条池连接在建立时统一设置 `synchronous`，可以用部署环境变量在 `FULL` 与
+`NORMAL` 之间切换：
+
+| 选项 | 默认 | 取值 | 说明 |
+|---|---|---|---|
+| `LUX_SQLITE_SYNCHRONOUS` | `FULL` | `full`、`normal`（不区分大小写） | 每条新建连接执行一次 `PRAGMA synchronous = <FULL\|NORMAL>`；留空按默认处理，其他值回退 `FULL` 并在启动日志里留下一条告警 |
+
+`FULL` 是 SQLite 自己的默认值：每次提交都把 WAL 刷到磁盘。`NORMAL` 在 WAL 模式下不会损坏数据库，
+断电时最多丢掉最后几次已提交的事务，对小事务密集的路径（例如每 10 秒一次的播放进度上报）收益最大，
+在机械盘 NAS 上尤其明显。**默认值保持 `FULL`**；在 NAS 上做完 A/B 并确认可以接受断电丢最后几次提交
+之后，才建议把默认切换纳入决定。该变量只影响内置 SQLite；PostgreSQL 后端和不带持久化保证的
+内存数据库测试路径都不读取它，扫描事务的 PostgreSQL 局部 `synchronous_commit = off` 也保持不变。
+
+在 NAS 上做 A/B 的方法（两轮使用同一份数据库副本和同一组操作，交替顺序再跑一轮以抵消缓存影响）：
+
+```bash
+# 1. 停机，为每轮准备一份完整的 /config 副本（含 database.json 与 lux.db）
+docker compose stop lux
+cp -a config config-ab-full
+cp -a config config-ab-normal
+
+# 2. 每轮用独立的 /config 副本和独立容器名，避免两次运行互相污染
+docker run -d --name lux-ab \
+  -e LUX_SQLITE_SYNCHRONOUS=full \
+  -v "$PWD/config-ab-full:/config" -v "$PWD/media:/media" \
+  -p 8097:8097 -p 7359:7359/udp pdzhou/lux:latest
+# 跑完同一套操作序列（连续播放上报，混一次小库扫描）后记录墙钟、CPU、iowait、
+# 播放上报延迟与日志里的写锁等待，然后停掉容器
+docker stop lux-ab && docker rm lux-ab
+
+docker run -d --name lux-ab \
+  -e LUX_SQLITE_SYNCHRONOUS=normal \
+  -v "$PWD/config-ab-normal:/config" -v "$PWD/media:/media" \
+  -p 8097:8097 -p 7359:7359/udp pdzhou/lux:latest
+
+# 3. 确认连接实际生效：启动日志有一条“sqlite connection durability level”记录，
+#    FULL 显示 synchronous=FULL，NORMAL 显示 synchronous=NORMAL；
+#    再对比两轮的 /config/lux.db-wal 增长与 checkpoint 次数
+docker logs lux-ab 2>&1 | grep 'sqlite connection durability level'
+
+# 4. 断电恢复证据：在 NORMAL 副本上强杀容器后重启，确认数据库能打开、任务可继续
+docker kill --signal=KILL lux-ab && docker start lux-ab
+```
+
+Compose 部署若希望长期保留该设置，可在 `.env` 里写 `LUX_SQLITE_SYNCHRONOUS=normal`，
+并给 `compose.yaml` 的 `lux.environment` 加上对应转发（默认的 Compose 文件目前没有转发这一项，
+只写 `.env` 不会进入容器）；非容器部署直接作为进程环境变量设置即可。
+
+只在一台 ARM 开发机上跑出的数字不能外推到 NAS：机械盘、低功耗 x86、容器 I/O 限速都会改变 fsync
+成本。批量扫描的 A/B 数据不代表小事务，因为批量提交已经把 fsync 压到很少；要用播放上报这类小事务
+路径判断收益。
+
 ### Docker Hub 镜像
 
 `.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证；推送 `test` 分支时发布 Docker Hub `test` 标签，推送 `main` 分支时发布 `latest` 标签。两种分支都分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。runtime 依赖按 `RUNTIME_IMAGE_TAG` 发布到独立的 `lux-runtime` 仓库：每个架构只有在对应版本标签不存在时才构建，应用构建随后解析该架构镜像的 digest，并以 `image@digest` 引用。只有在 Debian/FFmpeg 依赖变化时才提升 `RUNTIME_IMAGE_TAG`；普通应用更新不会重新生成 runtime 层。应用镜像仍会携带 runtime 层，Docker Hub 会按 layer digest 复用它。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`，runtime 镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux-runtime`。
