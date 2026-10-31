@@ -91,6 +91,8 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 | W4 | `media_items` 写放大：约 18 个索引、6 个触发器 | `migrations/` | 用 dbstat 或查询计划找出无人使用的索引，逐个删除 | 需要实测；删索引要走迁移，且 PG 迁移要配对（`scripts/check-migration-parity.py`） |
 | W5 | `user_series_next` 先 DELETE 再 INSERT | `src/storage/user_series_next.rs` | 改成单条 UPSERT，找不到下一集时才 DELETE | 与 P2 同一处 |
 
+已实施（W3，第二轮 B/W3，提交 `62f4d06d`）：对 `src/storage/` 下 `media_items`、`media_sources`、`filesystem_entries` 的 13 条高频且大概率值不变的 UPDATE 加了 NULL 安全的 `IS DISTINCT FROM` 条件（重扫的 STRM 目标与变体标签、未删除条目的 `restore_media_item`、重复标记缺失、NFO 元数据复核 `mark_media_item_metadata_checked` 与 `sync_media_item_nfo_state`、STRM probe 重排队的 3 条、全局集合同步的 2 条成员更新与 `ensure_global_generated_media_item`），条件覆盖语句写入的每一列，`updated_at` 只在真正变化时推进；未改的 34 条是有意保留的：`rows_affected()` 被调用方当作乐观并发或计数信号（`apply_manifest_existing_file*`、`update_manifest_presence_*`、`mark_missing_*`），`last_seen_generation` 每代必变的"触碰"类写入，以及一次性迁移/清理语句；测试见 `src/storage/redundant_write_tests.rs`（相同值第二次写入不产生 `catalog_outbox` 行、不改 `updated_at`，不同值仍写入）。
+
 **进度写合并（会改变可见行为，必须先确认）**：位置 upsert 在内存里合并，每 30 秒或状态变化时落盘。代价：崩溃最多丢约
 30 秒进度；其他设备的"继续观看"位置晚到几十秒。
 
