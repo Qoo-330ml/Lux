@@ -230,7 +230,9 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   且由事务内读到的**最新**值决定准入。依据：`begin_playback_admission_transaction`（SQLite `BEGIN IMMEDIATE`／
   PG 普通 `BEGIN`，`src/storage/repository.rs:1492`）。风险：SQLite 上复用的是一次请求内的策略快照，
   管理员改上限/停播在"请求内两次读之间"的窗口内最多多放行这一路（原本也存在同样的窗口，只是短几十微秒）；
-  准入决策仍与本次请求已经通过的 tier 校验用同一份策略，不会再分叉。测试：
+  准入决策仍与本次请求已经通过的 tier 校验用同一份策略，不会再分叉。另一个窗口：用户在鉴权读与准入之间被
+  硬删除（`src/storage/users.rs:1514`，`playback_admissions` 有 `ON DELETE CASCADE` 外键）时，原来返回
+  "用户不存在"（404），现在会在 UPSERT 处撞外键失败（503）；两者都是错误响应，且窗口只有一条语句的间隔。测试：
   `storage::repository::sessions::tests::playback_admission_reuses_the_policy_the_caller_already_read`。
 - **未做（第 2 条）**：`trusted_proxy_cidrs` 的进程内缓存按任务边界另行处理（涉及 `src/api/legacy.rs`）。
 - **单请求汇总（不含第 2 条）**：一个 HLS 清单/分片 GET 的存储层语句数 **10 → 7**，写提交仍是 1 次
@@ -252,7 +254,9 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `create_and_start_emby_hls`、`restart_with_software` 各自只读一次；`mark_session_tier` 拆出
   `mark_known_session_tier`，Emby 降级路径（`activate_emby_hls_session`）用已持有的会话行记录 tier。
   **每次启动的 `server_settings` 读次数 2–3 → 1**；Emby 创建+启动路径语句数 5 → 4，Web 创建+启动同样 5 → 4，
-  软件回退路径 4 → 3。行为不变：每次启动仍把当前策略应用给 FFmpeg，运行中的会话继续用自己捕获的参数。
+  软件回退路径（`restart_with_software`）5 → 4（`mark_session_tier` 那一次会话行读保留，因为该路径手上没有会话行），
+  Emby 启动降级路径（`activate_emby_hls_session`）少一次会话行读。行为不变：每次启动仍把当前策略应用给
+  FFmpeg，运行中的会话继续用自己捕获的参数。
   测试：`application::playback::session::tests::emby_hls_start_reads_the_transcoding_policy_once`。
 
 ### H4 会话生命周期里的无条件 UPDATE（已读代码确认）
