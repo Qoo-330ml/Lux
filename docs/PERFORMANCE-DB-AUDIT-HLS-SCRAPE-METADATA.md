@@ -70,8 +70,8 @@
 | **S6** | `jobs` SSE 事件每秒失效 10 个管理端查询键，其中"元数据任务列表"带 `pending_counts` 聚合 | `web/src/features/admin/useAdminEvents.ts:18`、`src/storage/jobs/metadata_reidentify/lifecycle.rs:186` | 任务运行时 ≤1 次/秒（页面打开时） | 管理端轮询放大；聚合按 job_items × candidates 规模增长 | **中** |
 | **H5** | 管理端转码页每 2 s 轮询，N 个会话 → 1+N 次查询 | `src/api/admin/admin_transcoding.rs:32`、`web/src/features/admin/AdminTranscodingPage.tsx:39` | 30 次/分 × (1+N) | 管理端观感端点，用户少 | **中（已实施 `f95b039b`）** |
 | **H3** | HLS 启动路径重复读转码设置与 session 行 | `src/application/playback/session.rs:1075`、`:1104` | 每次启动 1–3 次 | 启动本身已很重 | 低-中 |
-| **S2** | 备份 scraper 循环内重复读同一条 item 元数据 | `src/application/reidentify.rs:2144` | 每条目 1–2 次 | 纯可省的读 | 中 |
-| **S4** | 每条目解析一次 scraper 配置、读一次能力尝试表，作业内无跨条目复用 | `src/application/scraper.rs:1551`、`src/application/candidates.rs:2805` | 5 万条目作业 = 各 5 万次 | 键查索引，单次便宜 | 中 |
+| **S2** | 备份 scraper 循环内重复读同一条 item 元数据 | `src/application/reidentify.rs:2144` | 每条目 1–2 次 | 纯可省的读 | 中（已实施 `051797e0`） |
+| **S4** | 每条目解析一次 scraper 配置、读一次能力尝试表，作业内无跨条目复用 | `src/application/scraper.rs:1551`、`src/application/candidates.rs:2805` | 5 万条目作业 = 各 5 万次 | 键查索引，单次便宜 | 中（已实施 `3a2d1a0d`） |
 | **M8** | `select_internal` 重复读调用方已持有的 item 元数据 | `src/application/candidates.rs:2996` | 每次选中 1 次 | 读便宜 | 低-中 |
 | **H4** | 会话 tier / temp_dir 更新没有"值未变则不写"保护 | `src/storage/sessions.rs:1339`、`:1601` | 每次启动/回退几次 | 与 M3 同类但频率低 | 低（本轮跳过，见 H4 条目） |
 | **H6** | 停止转码时 `transcoding_history` 写 + 保留清理两条独立自动提交 | `src/storage/sessions.rs:1230`、`:1262` | 每次转码结束 | 每次多一次提交 | 低（已实施 `f95b039b`） |
@@ -502,6 +502,20 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   正确做法是"写入后失效"，不是"永远复用"。
 - **是否值得做**：**中**。
 
+- **已实施：提交 `051797e0`**。`refresh_with_scraper_roles` 的备份循环用
+  `let mut reusable_snapshot: Option<StoredMediaMetadata>` 持有快照，只在"上一次尝试没写行"时复用：
+  只有 `Err(NoCandidate)` / `Err(LowConfidence)`（都在选中前返回：候选数为 0，或没有可自动选中的候选）
+  保留快照；其余结果（`Ok(..)` 表示选中已写行，`Err(Selection(..))` / `Err(SelectionUnavailable)`
+  可能在写了一半之后才报错）一律丢弃快照，下一个备份重新读库。因此不是"永远复用"，而是"写入后失效"。
+  - **前后数字**（第 2 节口径）：`application::reidentify::tests::backup_attempts_reuse_the_item_snapshot_until_an_attempt_can_write`
+    的夹具（预确认条目 + 1 个 get 失败的主 scraper + 2 个搜索为空、都在选中前失败的备份）：
+    回退循环总计 **17 → 16 条语句**，少掉的正好是第二次备份那次 `find_media_item_metadata`；
+    第一次备份的读保留（调用方快照早于主 scraper 尝试，主尝试可能已写行）。
+  - 同一用例断言：备份尝试顺序仍是 backup-one → backup-two；选中前的失败不写 `media_items`
+    （标题/provider ids/scraper id/识别状态逐字段与执行前一致）；返回 `Confirmed(0)`。
+  - 未覆盖：如果某个 scraper 在"搜索成功但选中报错"的半写状态下返回非 `Selection` 错误，快照仍按
+    "可能已写"处理（保守重读）。备份循环只有 1–3 个 scraper，最坏情况退化为改前行为。
+
 ### S3 调用方已持有 current 时仍会再读一次（已读代码确认）
 
 - **位置**：`src/application/candidates.rs:671-683`（`let fetched_current = if current.is_none() { find_media_item_metadata… }`）。
@@ -537,6 +551,47 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `worker_permits.len()` 个），可以在领取后批量预取这两张表的相关行，随 `process_item` 传入。
 - **风险**：低（需要保证缓存能反映本条目在作业期间的写入）。
 - **是否值得做**：**中**（大库回填时省 10 万次往返，非最优先）。
+
+- **已实施：提交 `3a2d1a0d`**。`run` 在 `claim_next_metadata_reidentify_items` 之后、派发 worker 之前
+  调用新的 `MetadataReidentifyService::prefetch_claimed_items`，把整批的
+  `list_item_scraper_configurations_by_ids(item_ids)`（有 resolver 时）与
+  `list_metadata_attempts_by_item_ids(item_ids)`（FillMissing 且配置了 selection 时）各读一次，装进
+  `ClaimBatchPrefetch`；每个 worker 只取自己那一条（`ClaimBatchPrefetch::for_item`，0 条语句），经
+  `process_item(.., &ItemPrefetch)` 传给两处读点：
+  - `providers_for_item` 新增 `prefetched_configuration` 参数，命中时走
+    `ScraperResolver::for_prefetched_configuration`（不查库）；批量读里没有该条目时按"空配置"解析，
+    与单条读 `remove(item_id).unwrap_or_default()` 的结果相同。
+  - `MetadataSelectionService::fill_missing_request_plan_for_current` 新增 `prefetched_attempts` 参数：
+    `should_read_attempt_state` 为真时优先用它，省掉 `list_metadata_attempts(item_id)`。
+  - 备份回退循环里的 `fallback_request_plan_for_current` 仍读库：那里必须是"写后重读"（它本来就用
+    `IgnoreRetryState`，不读尝试表），预取快照只服务"本条目的第一次尝试之前"那张计划。
+  - 为什么批内条目互不影响：配置取自 `media_items`/`libraries`/`library_scrapers`，作业从不写这些行；
+    尝试表只由本条目自己的搜索/选中写入。所以整批配置快照在条目整个生命周期有效，尝试快照只对
+    首张计划有效。预取发生在派发之前，晚于该条目的历史写入、早于它自己的任何写入。
+  - 失败语义：两个批量读都是尽力而为，失败只 `tracing::warn!` 并留空该快照，worker 退回原来的逐条目读，
+    单条目错误处理与改造前完全一致。
+  - 残余竞态：如果别的入口（管理端手动"搜索候选"）在批量读与 worker 开始处理之间为同一条目写尝试表，
+    首张计划会用稍旧的历史。窗口只有派发前的几微秒，且改造前的逐条目读同样与并发写竞争，等级不变。
+  - **前后数字**（第 2 节口径）：
+    - `claim_batch_prefetch_reads_configuration_and_attempt_history_once_per_batch`：对 6 个条目的一批，
+      逐条目路径 **12 条语句**（配置 6 + 尝试 6），批量路径 **2 条语句**（1 + 1）；两者返回的行逐字段
+      相同（`StoredLibraryScraper`/`StoredMetadataCapabilityAttempt`/`StoredMetadataImageAttempt` 直接比较），
+      逐条目切片本身 0 条语句。
+    - `fill_missing_plan_uses_the_prefetched_attempt_history_without_reading_it`：计划完全相同，
+      语句数 **-1**；并断言预取快照是权威数据（传入"首次搜索前的空历史"时 `needs_credits` 仍为真，
+      与库里那条 `UNAVAILABLE` 行抑制掉的结果不同）。
+    - `process_item_uses_the_claim_batch_scraper_configuration_without_a_per_item_read` /
+      `process_item_uses_the_claim_batch_attempt_history_without_a_per_item_read`：两个同构条目，
+      一个带预取、一个不带，语句数差 **恰好 1**（配置用例 4 → 5，尝试用例 11 → 12），且作业项
+      状态/候选数/错误与 `media_items` 身份字段逐字段一致。
+    - 5 万条目作业的静态外推：配置读 **5 万 → 每批 1 次**（批大小 = 并发上限，≤16），
+      attempts 读 **≤5 万 → 每批 1 次**；可用上面的用例 + `query_count()` 复现（第 2.2 节）。
+  - 测试：`cargo test --locked --lib application::reidentify` 47 通过（新增 3 个用例），
+    `cargo test --locked --test reidentify` 25 通过。
+  - 顺带：`StoredLibraryScraper`、`StoredMetadataCapabilityAttempt`、`StoredMetadataImageAttempt`
+    三个 crate 内部结构体补了 `Clone`/`PartialEq`/`Eq` derive，只为比较与切片；形状与表结构不变。
+    未新增 SQL 分支（`DatabaseBackend::` 分支数不变），`check-backend-branches.py`、
+    `check-migration-parity.py` 均通过。
 
 ### S5 过期 PENDING 候选清理缺索引（已读代码确认）
 
@@ -999,7 +1054,7 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
    - S6：`pending_count` 改计数列或按需计算（所有者确认"按需计算"）。**已实施（提交 `4c20d3c8` + `677a7508`）**。
 3. **批次 3（要有实测支撑再做）**
    - S5/I1 索引迁移（先在一份库副本上 `EXPLAIN QUERY PLAN` 对比）。**已实施（提交 `80cd3a4b`，两组迁移 0244/0246，测试里带前后计划断言）**。
-   - S2/S3/S4 的读复用、M8/M9、H3/H5/H6（顺手做）。**H5/H6 已实施（提交 `f95b039b`）；H4 按条目说明跳过。**
+   - S2/S3/S4 的读复用、M8/M9、H3/H5/H6（顺手做）。**H5/H6 已实施（提交 `f95b039b`）；H4 按条目说明跳过；S2 已实施（提交 `051797e0`）；S4 已实施（提交 `3a2d1a0d`）。**
 4. **不做**
    - H7/I2（加索引反而增加高频更新表的写成本）、I3。
 

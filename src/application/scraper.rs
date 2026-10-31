@@ -1555,7 +1555,23 @@ impl ScraperResolver {
         let (configured, legacy_scraper_id) = configurations
             .remove(item_id)
             .unwrap_or_else(|| (Vec::new(), None));
-        self.resolve_configured_scrapers(&configured, legacy_scraper_id.as_deref())
+        self.for_prefetched_configuration(&configured, legacy_scraper_id.as_deref())
+            .await
+    }
+
+    /// Resolves one item's scraper configuration from rows the caller already read.
+    ///
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S4: a metadata job claims a whole batch
+    /// of items, so it reads every claimed item's configuration in one
+    /// `list_item_scraper_configurations_by_ids` call and resolves each item from that snapshot
+    /// instead of running one keyed read per item. Passing the rows a missing item maps to
+    /// (empty scrapers, no legacy id) yields the same empty resolution `for_item_ordered` returns.
+    pub(crate) async fn for_prefetched_configuration(
+        &self,
+        configured: &[StoredLibraryScraper],
+        legacy_scraper_id: Option<&str>,
+    ) -> Result<Vec<ResolvedScraper>, ScraperError> {
+        self.resolve_configured_scrapers(configured, legacy_scraper_id)
             .await
     }
 

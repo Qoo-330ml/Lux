@@ -58,6 +58,17 @@ const CAPABILITY_TRAILERS: &str = "TRAILERS";
 const CANDIDATE_METADATA_DETAILS_VERSION: u64 = 2;
 const COMPLETENESS_INPUT_VERSION: u64 = 1;
 
+/// Capability and image attempt history for one item.
+///
+/// Same shape as `Database::list_metadata_attempts` and the per-item entries of
+/// `list_metadata_attempts_by_item_ids`, so a plan computed from a prefetched batch entry and one
+/// computed from the single-item read are interchangeable
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` S4).
+pub(crate) type MetadataAttemptHistory = (
+    Vec<StoredMetadataCapabilityAttempt>,
+    Vec<crate::storage::StoredMetadataImageAttempt>,
+);
+
 #[derive(Clone)]
 struct LocalCompletenessPlanningCaches {
     nfo_projection: LocalNfoProjectionCache,
@@ -293,10 +304,7 @@ fn requestable_metadata_plan(
     actual_plan: MetadataRequestPlan,
     image_types: &[&str],
     capability_identity: Option<&(String, String)>,
-    attempts: Option<&(
-        Vec<StoredMetadataCapabilityAttempt>,
-        Vec<crate::storage::StoredMetadataImageAttempt>,
-    )>,
+    attempts: Option<&MetadataAttemptHistory>,
 ) -> MetadataRequestPlan {
     let (capability_states, image_attempts) =
         attempts.map_or((&[][..], &[][..]), |(capability_states, image_attempts)| {
@@ -2536,12 +2544,14 @@ impl MetadataSelectionService {
         &self,
         item_id: &str,
         current: &StoredMediaMetadata,
+        prefetched_attempts: Option<&MetadataAttemptHistory>,
     ) -> Result<FillMissingRequestPlan, MetadataSelectionError> {
         let (_, requestable, actual_missing_image_mask) = self
             .fill_missing_request_plans_for_current(
                 item_id,
                 current,
                 MetadataAttemptMode::RespectRetryState,
+                prefetched_attempts,
             )
             .await?;
         Ok(FillMissingRequestPlan {
@@ -2560,6 +2570,7 @@ impl MetadataSelectionService {
                 item_id,
                 current,
                 MetadataAttemptMode::IgnoreRetryState,
+                None,
             )
             .await?;
         Ok(actual_plan)
@@ -2829,6 +2840,7 @@ impl MetadataSelectionService {
         item_id: &str,
         current: &StoredMediaMetadata,
         attempt_mode: MetadataAttemptMode,
+        prefetched_attempts: Option<&MetadataAttemptHistory>,
     ) -> Result<(MetadataRequestPlan, MetadataRequestPlan, u16), MetadataSelectionError> {
         if fill_missing_fields(&current.item_type).is_none() {
             return Ok((MetadataRequestPlan::full(), MetadataRequestPlan::full(), 0));
@@ -2863,16 +2875,23 @@ impl MetadataSelectionService {
         // confirmed provider identity. Backups use actual missing data only.
         let should_read_attempt_state =
             capability_identity.is_some() && metadata_request_plan_has_work(actual_plan);
-        let attempts = if should_read_attempt_state {
-            Some(self.database.list_metadata_attempts(item_id).await?)
-        } else {
+        // A claim batch already read this item's history (audit S4); that snapshot is taken before
+        // the item's first search, so it is the state the single-item read would have returned here.
+        // Later reads must not reuse it -- the item's own attempts changed by then.
+        let read_attempts;
+        let attempts: Option<&MetadataAttemptHistory> = if !should_read_attempt_state {
             None
+        } else if let Some(prefetched_attempts) = prefetched_attempts {
+            Some(prefetched_attempts)
+        } else {
+            read_attempts = self.database.list_metadata_attempts(item_id).await?;
+            Some(&read_attempts)
         };
         let requestable_plan = requestable_metadata_plan(
             actual_plan,
             &image_types,
             capability_identity.as_ref(),
-            attempts.as_ref(),
+            attempts,
         );
         Ok((actual_plan, requestable_plan, actual_missing_image_mask))
     }
