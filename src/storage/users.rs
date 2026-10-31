@@ -3272,10 +3272,19 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
-    pub(crate) async fn set_trusted_proxy_cidrs_json(
-        &self,
-        value: &str,
-    ) -> Result<(), StorageError> {
+    /// Stores the raw JSON of the trusted-proxy CIDR setting.
+    ///
+    /// This is the one write path for `server_settings.trusted_proxy_cidrs`: the admin settings
+    /// write uses it, and it is public so an embedding test can change the setting the same way
+    /// instead of writing the row behind the reader cache. Callers pass the normalized JSON that
+    /// `crate::application::settings` validates.
+    ///
+    /// # Caching
+    ///
+    /// The access-IP resolver keeps the parsed list in memory. The epoch bump below runs after the
+    /// commit, so a read that starts once this call returned is guaranteed to refill from the new
+    /// value; keep the order (commit, then bump) if this body is ever refactored.
+    pub async fn set_trusted_proxy_cidrs_json(&self, value: &str) -> Result<(), StorageError> {
         self.query(
             "INSERT INTO server_settings (key, value)
              VALUES ('trusted_proxy_cidrs', ?)
@@ -3286,6 +3295,9 @@ impl Database {
         .execute(&self.pool)
         .await
         .map_err(self.sqlx_err())?;
+        // The access-IP resolver caches the parsed list; bump after the commit so the first read
+        // that starts once this returned refills from the new value.
+        self.access_changes.invalidate_trusted_proxy_cidrs();
         Ok(())
     }
 

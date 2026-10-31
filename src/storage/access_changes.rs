@@ -9,12 +9,13 @@
 //!
 //! The counters live next to the writes instead of next to the cache on purpose: every writer goes
 //! through these storage functions, so a new call site cannot silently forget to invalidate. The
-//! registry keeps no SQL and no data, only two counters per user plus one global counter.
+//! registry keeps no SQL and no data, only two counters per user plus one global counter and one
+//! counter per access setting (currently the trusted-proxy CIDR list).
 
 use std::{
     collections::HashMap,
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -40,6 +41,8 @@ pub(crate) struct AccessEpoch {
 pub(crate) struct AccessChangeEpochs {
     global: AtomicU64,
     users: Mutex<HashMap<String, u64>>,
+    /// Advanced by a write to a setting that the access-IP resolver reads.
+    trusted_proxy_cidrs: AtomicU64,
 }
 
 impl AccessChangeEpochs {
@@ -77,11 +80,87 @@ impl AccessChangeEpochs {
     pub(crate) fn invalidate_all(&self) {
         self.global.fetch_add(1, Ordering::Relaxed);
     }
+
+    /// The counter a cached trusted-proxy CIDR list must match to stay usable.
+    ///
+    /// Callers snapshot this *before* reading the setting and only publish the value while the
+    /// counter still matches, so a write that commits during the read cannot be cached over.
+    pub(crate) fn trusted_proxy_cidrs_epoch(&self) -> u64 {
+        self.trusted_proxy_cidrs.load(Ordering::SeqCst)
+    }
+
+    /// Marks every cached trusted-proxy CIDR list as stale.
+    ///
+    /// The access-IP resolver reads this list for every protected request that carries a forwarded
+    /// chain, so the raw JSON and its normalized form are cached per instance. Every writer of the
+    /// setting must call this *after* its write committed: reads that start once the writer returned
+    /// then see the new counter and refill from the database.
+    pub(crate) fn invalidate_trusted_proxy_cidrs(&self) {
+        self.trusted_proxy_cidrs.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+/// One instance's cached copy of the trusted-proxy CIDR setting.
+///
+/// The parsed and normalized list is cached because the access-IP resolver needs it on every
+/// protected request that arrives with a forwarded chain, while administrators change it rarely.
+/// The value is keyed by the database instance it was read from plus
+/// [`AccessChangeEpochs::trusted_proxy_cidrs_epoch`] at read time:
+///
+/// * a write bumps the epoch, so the next request misses and refills - the same "bump after the
+///   commit, store under the snapshot" contract the other caches in this crate follow;
+/// * two databases (or two tests running in parallel) never share an entry, so neither can serve
+///   the other's setting.
+///
+/// The cache returns the normalized list, exactly what a database read returns; it does not change
+/// which forwarded values the resolver accepts.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct TrustedProxyCidrCache {
+    cached: Arc<Mutex<Option<CachedTrustedProxyCidrs>>>,
+}
+
+#[derive(Debug)]
+struct CachedTrustedProxyCidrs {
+    /// `Database::server_id`, so an entry is only reused by the database it was read from.
+    database: String,
+    /// The epoch the value was read under.
+    epoch: u64,
+    /// The normalized list the database returned.
+    values: Vec<String>,
+}
+
+impl TrustedProxyCidrCache {
+    /// The cached list, when it was read from `database` under `epoch`.
+    pub(crate) fn get(&self, database: &str, epoch: u64) -> Option<Vec<String>> {
+        let cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let entry = cached.as_ref()?;
+        (entry.epoch == epoch && entry.database == database).then(|| entry.values.clone())
+    }
+
+    /// Publishes a freshly read list for `database` under `epoch`.
+    ///
+    /// Callers must only pass an epoch that is still current; a value stored under an outdated
+    /// epoch is unreachable but would make the invariant harder to audit, so the caller checks
+    /// [`AccessChangeEpochs::trusted_proxy_cidrs_epoch`] again before calling this.
+    pub(crate) fn insert(&self, database: &str, epoch: u64, values: Vec<String>) {
+        let mut cached = self
+            .cached
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *cached = Some(CachedTrustedProxyCidrs {
+            database: database.to_owned(),
+            epoch,
+            values,
+        });
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::AccessChangeEpochs;
+    use super::{AccessChangeEpochs, TrustedProxyCidrCache};
 
     #[test]
     fn user_invalidation_only_moves_that_users_epoch() {
@@ -112,5 +191,56 @@ mod tests {
         assert_eq!(after.global, before.global + 1);
         assert_eq!(after.user, before.user);
         assert_ne!(after, before);
+    }
+
+    #[test]
+    fn trusted_proxy_invalidation_advances_only_its_own_epoch() {
+        let epochs = AccessChangeEpochs::default();
+        let before = epochs.trusted_proxy_cidrs_epoch();
+        let before_snapshot = epochs.snapshot("epoch-user-a");
+
+        epochs.invalidate_trusted_proxy_cidrs();
+
+        assert_eq!(epochs.trusted_proxy_cidrs_epoch(), before + 1);
+        assert_eq!(
+            epochs.snapshot("epoch-user-a"),
+            before_snapshot,
+            "a trusted-proxy write must not invalidate per-user access decisions"
+        );
+    }
+
+    #[test]
+    fn trusted_proxy_cache_only_serves_the_epoch_and_database_it_was_stored_for() {
+        let cache = TrustedProxyCidrCache::default();
+        assert_eq!(cache.get("database-a", 7), None);
+
+        cache.insert("database-a", 7, vec!["10.0.0.0/8".to_owned()]);
+
+        assert_eq!(
+            cache.get("database-a", 7),
+            Some(vec!["10.0.0.0/8".to_owned()])
+        );
+        assert_eq!(
+            cache.get("database-a", 8),
+            None,
+            "a write bumped the epoch, so the entry must be a miss"
+        );
+        assert_eq!(
+            cache.get("database-b", 7),
+            None,
+            "another database must never see this entry"
+        );
+    }
+
+    #[test]
+    fn a_clone_of_the_trusted_proxy_cache_shares_its_entries() {
+        let cache = TrustedProxyCidrCache::default();
+        let clone = cache.clone();
+        cache.insert("database-a", 1, vec!["192.0.2.0/24".to_owned()]);
+
+        assert_eq!(
+            clone.get("database-a", 1),
+            Some(vec!["192.0.2.0/24".to_owned()])
+        );
     }
 }
