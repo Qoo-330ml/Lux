@@ -143,7 +143,7 @@ CPU **0.39 → 0.08 s/分（−79 %）**，空闲仍零写入（方法与口径�
 | 线索 | 说明 |
 |---|---|
 | 读模型默认关闭 | `LUX_READ_MODEL_MODE` 默认 `off`（读取点在 `src/application/catalog.rs` 约 103 行）。读模型已实现；文档里首页读模型的 A/B 数据是 CPU 密集的主要出路。是否默认打开需要决定，并要在 NAS 上实测 |
-| 库页缓存刷新走慢路径？（**未验证**） | `src/application/catalog.rs` 约 304 行，库页缓存后台刷新服务构造时硬编码了 `read_model_mode: ReadModelMode::Off`。即使环境变量设为 `on`，后台刷新可能仍走慢路径。当时没有深究，需要确认是不是有意的 |
+| 库页缓存刷新走慢路径？（**已确认并修复**） | 结论：**不是有意设计**。`read_model_mode: ReadModelMode::Off` 是 LUX-865（`690839e8`）给 `CatalogService` 新增该字段时，为刷新线程那个结构体字面量补的默认值；此后 `with_read_model_mode` 只改请求路径那一个实例，两边的模式必然分叉。**已实施**：库页缓存以 `AtomicU8` 持有属主的模式，`with_read_model_mode` 同时写入，后台刷新按批读取并用它构造服务（`5dfbc113` 重构、`15594afe` 修复）；`shadow` 在刷新里**有意降级为 `off`**——shadow 服务的权威页与 off 相同，只多一次对比查询，刷新结果无人对比，理由写在 `LibraryPageCache::refresh_read_model_mode` 的注释里。回归测试 `library_page_refresh_uses_the_configured_read_model_mode`（夹具里权威行与派生行标题不同，刷新后仍读派生行）与 `library_page_refresh_skips_the_shadow_comparison` |
 | 管理员批量操作的 N+1 | `user_account_preferences`、`user_permission_copy`、`user_presets` 的循环逐个查。第一轮评估后**决定不改**：循环体是读后写，需要保留每用户事务和错误隔离。若要降到常数，需新增 `storage/users.rs` 的批量读接口（`find_users_by_ids` 与偏好版本批量读） |
 | 旧身份键修复逐集查询 | `repair_legacy_identity_keys`（`src/application/scanner/library.rs` 约 426 行）首次执行 5 万条语句、约 3.4 秒，在后台跑不阻塞监听，已有完成标记，只在首次升级时付一次。可考虑批量化 |
 | HLS 转码、刮削、元数据写入的数据库行为 | 第二轮**没有覆盖**，值得单独审计 |
