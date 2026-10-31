@@ -260,6 +260,7 @@ pub struct ReadyServices {
     web_playback: WebPlaybackSessionService,
     playback_progress: PlaybackProgressService,
     user_cleanup_worker: UserCleanupWorker,
+    library_watch: LibraryWatchService,
 }
 
 /// Shared HTTP state: a single `Router` is mounted for both modes.
@@ -617,6 +618,7 @@ impl AppState {
         playback_progress -> PlaybackProgressService,
         user_cleanup_worker -> UserCleanupWorker,
         web_playback -> WebPlaybackSessionService,
+        library_watch -> LibraryWatchService,
     }
 
     optional_service_accessor! {
@@ -686,6 +688,10 @@ impl AppState {
         // The login-background refresh reads plugin results, so it must stop before the plugins do.
         if let Some(plugins) = self.plugins() {
             plugins.shutdown().await;
+        }
+        // The library watcher owns `notify` watcher threads; stopping it drops them with the loop.
+        if let Some(library_watch) = self.library_watch() {
+            library_watch.shutdown().await;
         }
         Ok(())
     }
@@ -954,6 +960,13 @@ impl AppState {
             request_rate_limiter: crate::security::RequestRateLimiter::default(),
             sse_permits: SseConnectionBudget::default(),
         };
+        // Built here (not in `start_realtime_watchers`) so the shutdown can reach its stop handle.
+        let library_watch = LibraryWatchService::with_scan_jobs_and_metadata(
+            database.clone(),
+            scan_jobs.clone(),
+            Some(metadata_reidentify.clone()),
+        )
+        .with_library_change_notifications(libraries.change_notifier());
         let ready = ReadyServices {
             database_setup,
             setup,
@@ -1012,6 +1025,7 @@ impl AppState {
                 user_avatars.clone(),
                 Some(config_dir.clone()),
             ),
+            library_watch,
             user_avatars,
             ip_location: IpLocationService::new(plugins.clone()),
             web_playback,
@@ -1137,24 +1151,10 @@ impl AppState {
     }
 
     pub async fn start_realtime_watchers(&self) {
-        let Some(database) = self.core.database.clone() else {
+        let Some(watch_service) = self.library_watch() else {
             return;
         };
-        let Some(scan_jobs) = self.scan_jobs().cloned() else {
-            return;
-        };
-        let watch_service = LibraryWatchService::with_scan_jobs_and_metadata(
-            database,
-            scan_jobs,
-            self.metadata_reidentify().cloned(),
-        );
-        let watch_service = match self.libraries() {
-            Some(libraries) => {
-                watch_service.with_library_change_notifications(libraries.change_notifier())
-            }
-            None => watch_service,
-        };
-        watch_service.spawn();
+        watch_service.spawn_managed();
     }
 
     pub async fn start_scheduled_tasks(&self) {

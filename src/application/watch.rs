@@ -33,7 +33,12 @@ use crate::{
 const EVENT_CHANNEL_CAPACITY: usize = 256;
 const DEFAULT_DEBOUNCE: Duration = Duration::from_millis(250);
 const WATCHER_INIT_CONCURRENCY: usize = 2;
-const LIBRARY_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+/// Fallback re-read of the enabled library roots.
+///
+/// Root changes arrive through [`LibraryChangeNotifier`] (library create/update/delete and root
+/// edits), so this only catches a missing notification; it is no longer a 30 s refresh of the
+/// root list.
+const LIBRARY_ROOT_REFRESH_INTERVAL: Duration = Duration::from_secs(300);
 
 async fn initialize_watcher_on_dedicated_thread(
     root: PathBuf,
@@ -188,6 +193,8 @@ pub struct LibraryWatchService {
     watcher_init_permits: Arc<Semaphore>,
     library_change_notifier: LibraryChangeNotifier,
     library_change_receiver: watch::Receiver<u64>,
+    /// Stop handle of the loop started by [`LibraryWatchService::spawn_managed`].
+    worker: Arc<std::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
 }
 
 impl LibraryWatchService {
@@ -214,6 +221,7 @@ impl LibraryWatchService {
             watcher_init_permits: Arc::new(Semaphore::new(WATCHER_INIT_CONCURRENCY)),
             library_change_notifier,
             library_change_receiver,
+            worker: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -223,13 +231,53 @@ impl LibraryWatchService {
         self
     }
 
-    pub fn spawn(self) -> tokio::task::JoinHandle<()> {
+    /// Starts the loop and hands back its task handle.
+    ///
+    /// The loop returns only when the watcher channel closes, so a caller that keeps the handle can
+    /// abort it. Application shutdown uses [`Self::spawn_managed`], which keeps a stop handle
+    /// instead.
+    pub fn spawn(&self) -> tokio::task::JoinHandle<()> {
+        let service = self.clone();
         tokio::spawn(async move {
-            self.run().await;
+            // The sender stays in the future, so the loop never sees a closed channel and only the
+            // task handle can end it.
+            let (_shutdown_sender, shutdown_receiver) = watch::channel(false);
+            service.run(shutdown_receiver).await;
         })
     }
 
-    async fn run(self) {
+    /// Starts the loop once under a supervised stop handle.
+    pub fn spawn_managed(&self) {
+        if self
+            .worker
+            .lock()
+            .map(|slot| slot.is_some())
+            .unwrap_or(false)
+        {
+            return;
+        }
+        let service = self.clone();
+        let worker = crate::application::background_loop::BackgroundLoop::spawn(
+            "library_watch",
+            move |shutdown| {
+                let service = service.clone();
+                async move { service.run(shutdown).await }
+            },
+        );
+        if let Ok(mut slot) = self.worker.lock() {
+            *slot = Some(worker);
+        }
+    }
+
+    /// Stops the loop and waits for it to drop its root watchers.
+    pub(crate) async fn shutdown(&self) {
+        let worker = self.worker.lock().ok().and_then(|mut slot| slot.take());
+        if let Some(worker) = worker {
+            worker.shutdown().await;
+        }
+    }
+
+    async fn run(self, mut shutdown: watch::Receiver<bool>) {
         let mut active_roots = HashMap::<String, ActiveWatcher>::new();
         let mut watcher_tasks = JoinSet::new();
         let running_jobs = Arc::new(Mutex::new(HashSet::<String>::new()));
@@ -268,6 +316,11 @@ impl LibraryWatchService {
                 Some(result) = watcher_tasks.join_next() => {
                     if let Ok(result) = result {
                         remove_completed_watcher(&mut active_roots, result);
+                    }
+                }
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() {
+                        break;
                     }
                 }
             }
@@ -579,6 +632,59 @@ mod tests {
 
     use super::*;
     use tokio::sync::oneshot;
+
+    /// The root list is refreshed by library-change events, so the periodic fallback must be slow.
+    #[test]
+    fn the_root_refresh_fallback_stays_at_least_five_minutes() {
+        assert!(
+            LIBRARY_ROOT_REFRESH_INTERVAL >= Duration::from_secs(300),
+            "the root list fallback must be at least five minutes"
+        );
+    }
+
+    /// An idle service must not re-read the root list on a short tick.
+    #[tokio::test]
+    async fn an_idle_watch_service_does_not_refresh_roots() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let temp_dir = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = LibraryWatchService::new(database.clone());
+        service.spawn_managed();
+        // Let the first pass read the (empty) root list.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        database.reset_query_count();
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        assert_eq!(
+            database.query_count(),
+            0,
+            "an idle watcher must not poll the library roots"
+        );
+        tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the watch loop");
+        Ok(())
+    }
+
+    /// Shutdown must stop the loop without waiting for the refresh fallback.
+    #[tokio::test]
+    async fn shutdown_stops_the_watch_loop() -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = crate::config::Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await?;
+        let service = LibraryWatchService::new(database);
+        service.spawn_managed();
+        tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the watch loop");
+        Ok(())
+    }
 
     #[tokio::test]
     async fn watcher_initialization_runs_on_a_dedicated_thread() {
