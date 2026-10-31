@@ -529,6 +529,72 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of `list_global_collection_cards_page_ordered`: one global collection card plus the two
+/// poster lookups the ordering query resolves in the same statement.
+#[derive(Debug, sqlx::FromRow)]
+struct GlobalCollectionCardRow {
+    item_id: String,
+    title: String,
+    member_count: i64,
+    collection_poster_tag: Option<String>,
+    fallback_poster_item_id: Option<String>,
+    fallback_poster_image_tag: Option<String>,
+}
+
+impl From<GlobalCollectionCardRow> for StoredGlobalCollection {
+    fn from(row: GlobalCollectionCardRow) -> Self {
+        let poster_item_id = row
+            .collection_poster_tag
+            .as_ref()
+            .map(|_| row.item_id.clone())
+            .or(row.fallback_poster_item_id);
+        Self {
+            item_id: row.item_id,
+            title: row.title,
+            member_count: row.member_count,
+            poster_item_id,
+            poster_image_tag: row.collection_poster_tag.or(row.fallback_poster_image_tag),
+        }
+    }
+}
+
+/// Row of `list_global_collection_sources_for_works_with_restrictions`: one playable source of a
+/// collection work, with the user's preferred source and the poster lookup.
+#[derive(Debug, sqlx::FromRow)]
+struct GlobalCollectionSourceRow {
+    work_item_id: String,
+    source_item_id: String,
+    library_id: String,
+    library_name: String,
+    title: String,
+    media_source_id: Option<String>,
+    edition_name: Option<String>,
+    quality_label: Option<String>,
+    container: Option<String>,
+    preferred_source_item_id: Option<String>,
+    preferred_media_source_id: Option<String>,
+    poster_image_tag: Option<String>,
+}
+
+impl From<GlobalCollectionSourceRow> for StoredGlobalCollectionSource {
+    fn from(row: GlobalCollectionSourceRow) -> Self {
+        Self {
+            work_item_id: row.work_item_id,
+            source_item_id: row.source_item_id,
+            library_id: row.library_id,
+            library_name: row.library_name,
+            title: row.title,
+            media_source_id: row.media_source_id,
+            edition_name: row.edition_name,
+            quality_label: row.quality_label,
+            container: row.container,
+            preferred_source_item_id: row.preferred_source_item_id,
+            preferred_media_source_id: row.preferred_media_source_id,
+            poster_image_tag: row.poster_image_tag,
+        }
+    }
+}
+
 /// Row of `list_chapter_detection_sources_page`: one eligible episode source plus whatever the
 /// per-plugin detection state already records. Every `state_*` column comes from a `LEFT JOIN`, so
 /// a source without a state row decodes with `state_status = None` and the other state columns
@@ -6905,7 +6971,7 @@ impl Database {
             visible_collection_filter,
         );
         let mut rows = self
-            .query(sqlx::AssertSqlSafe(query))
+            .query_as::<GlobalCollectionCardRow>(sqlx::AssertSqlSafe(query))
             .bind(database_flag(is_admin))
             .bind(user_id);
         for bind in &content_restriction_binds {
@@ -6936,25 +7002,7 @@ impl Database {
         }
         rows = rows.bind(limit).bind(offset);
         let rows = rows.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
-        let cards = rows
-            .into_iter()
-            .map(|row| {
-                let collection_poster_tag: Option<String> = row.get("collection_poster_tag");
-                let fallback_poster_item_id: Option<String> = row.get("fallback_poster_item_id");
-                let fallback_poster_image_tag: Option<String> =
-                    row.get("fallback_poster_image_tag");
-                StoredGlobalCollection {
-                    item_id: row.get("item_id"),
-                    title: row.get("title"),
-                    member_count: row.get("member_count"),
-                    poster_item_id: collection_poster_tag
-                        .as_ref()
-                        .map(|_| row.get("item_id"))
-                        .or(fallback_poster_item_id),
-                    poster_image_tag: collection_poster_tag.or(fallback_poster_image_tag),
-                }
-            })
-            .collect();
+        let cards = rows.into_iter().map(StoredGlobalCollection::from).collect();
         Ok((cards, total))
     }
 
@@ -7042,7 +7090,7 @@ impl Database {
         let total = count.fetch_one(&self.pool).await.map_err(self.sqlx_err())?;
 
         let rows = self
-            .query(sqlx::AssertSqlSafe(format!(
+            .query_scalar::<String>(sqlx::AssertSqlSafe(format!(
                 "SELECT member.item_id {base_query}
                  ORDER BY member.sort_order, work_item.sort_title, member.item_id
                  LIMIT ? OFFSET ?"
@@ -7065,10 +7113,7 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        Ok((
-            rows.into_iter().map(|row| row.get("item_id")).collect(),
-            total,
-        ))
+        Ok((rows, total))
     }
 
     #[cfg(test)]
@@ -7151,7 +7196,9 @@ impl Database {
                       source_library.name, source_item.id,
                       media_source.is_default DESC, media_source.id"
         );
-        let mut rows = self.query(sqlx::AssertSqlSafe(query)).bind(user_id);
+        let mut rows = self
+            .query_as::<GlobalCollectionSourceRow>(sqlx::AssertSqlSafe(query))
+            .bind(user_id);
         for work_item_id in work_item_ids {
             rows = rows.bind(work_item_id);
         }
@@ -7166,20 +7213,7 @@ impl Database {
         let rows = rows.fetch_all(&self.pool).await.map_err(self.sqlx_err())?;
         Ok(rows
             .into_iter()
-            .map(|row| StoredGlobalCollectionSource {
-                work_item_id: row.get("work_item_id"),
-                source_item_id: row.get("source_item_id"),
-                library_id: row.get("library_id"),
-                library_name: row.get("library_name"),
-                title: row.get("title"),
-                media_source_id: row.get("media_source_id"),
-                edition_name: row.get("edition_name"),
-                quality_label: row.get("quality_label"),
-                container: row.get("container"),
-                preferred_source_item_id: row.get("preferred_source_item_id"),
-                preferred_media_source_id: row.get("preferred_media_source_id"),
-                poster_image_tag: row.get("poster_image_tag"),
-            })
+            .map(StoredGlobalCollectionSource::from)
             .collect())
     }
 
@@ -12897,6 +12931,130 @@ mod chapter_detection_row_decoding_tests {
                 .expect_err("detection source columns must not decode"),
             ChapterDetectionItemRow::from_row(&row)
                 .expect_err("detection item columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the global collection card, source and member projections.
+#[cfg(test)]
+mod global_collection_row_decoding_tests {
+    use super::*;
+
+    async fn insert_global_collection_fixture(
+        database: &Database,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database
+            .query(
+                "INSERT OR IGNORE INTO libraries (id, name, kind)
+                 VALUES ('00000000-0000-7000-8000-000000000538', 'Global', 'MOVIE');
+                 INSERT INTO libraries (id, name, kind) VALUES ('gc-lib', 'Movies', 'MOVIE');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('gc-box', '00000000-0000-7000-8000-000000000538', 'BOX_SET', 'Saga',
+                      'saga', 'LOCAL_CONFIRMED', 1),
+                     ('gc-work', 'gc-lib', 'MOVIE', 'Work', 'work', 'LOCAL_CONFIRMED', 1),
+                     ('gc-source', 'gc-lib', 'MOVIE', 'Source', 'source', 'LOCAL_CONFIRMED', 1);
+                 INSERT INTO collections (
+                     id, item_id, library_id, provider, provider_id, title
+                 ) VALUES (
+                     'gc-coll', 'gc-box', '00000000-0000-7000-8000-000000000538',
+                     'tmdb', '10', 'Saga'
+                 );
+                 INSERT INTO collection_items (collection_id, item_id, sort_order)
+                 VALUES ('gc-coll', 'gc-work', 0);
+                 INSERT INTO collection_work_items (work_item_id, movie_provider, movie_provider_id)
+                 VALUES ('gc-work', 'tmdb', '20');
+                 INSERT INTO collection_work_sources (work_item_id, source_item_id, sort_order)
+                 VALUES ('gc-work', 'gc-source', 0);
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, edition_name, quality_label, container,
+                     is_default
+                 ) VALUES (
+                     'gc-media-source', 'gc-source', 'LOCAL_FILE', 'Extended', '1080p', 'mkv', 1
+                 );
+                 INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+                 VALUES ('gc-poster', 'gc-source', 'POSTER', 0, '/gc/poster.jpg')",
+            )
+            .execute(database.pool())
+            .await?;
+        database
+            .insert_user("gc-user", "gc", "GC", "hash", false, false)
+            .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_collection_rows_decode_cards_sources_and_member_ids()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        insert_global_collection_fixture(&database).await?;
+
+        let (cards, total) = database
+            .list_global_collection_cards_page_with_restrictions("gc-user", false, 0, 10, None)
+            .await?;
+        assert_eq!(total, 1);
+        assert_eq!(cards.len(), 1);
+        let card = &cards[0];
+        assert_eq!(card.item_id, "gc-box");
+        assert_eq!(card.title, "Saga");
+        assert_eq!(card.member_count, 1);
+        assert_eq!(card.poster_item_id.as_deref(), Some("gc-source"));
+        assert_eq!(card.poster_image_tag.as_deref(), Some("gc-poster"));
+
+        let (member_ids, member_total) = database
+            .list_global_collection_member_ids_page_with_restrictions(
+                "gc-box", "gc-user", false, 0, 10, None,
+            )
+            .await?;
+        assert_eq!(member_total, 1);
+        assert_eq!(member_ids, vec!["gc-work".to_owned()]);
+
+        let sources = database
+            .list_global_collection_sources_for_works_with_restrictions(
+                &["gc-work".to_owned()],
+                "gc-user",
+                false,
+                None,
+            )
+            .await?;
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.work_item_id, "gc-work");
+        assert_eq!(source.source_item_id, "gc-source");
+        assert_eq!(source.library_id, "gc-lib");
+        assert_eq!(source.library_name, "Movies");
+        assert_eq!(source.title, "Source");
+        assert_eq!(source.media_source_id.as_deref(), Some("gc-media-source"));
+        assert_eq!(source.edition_name.as_deref(), Some("Extended"));
+        assert_eq!(source.quality_label.as_deref(), Some("1080p"));
+        assert_eq!(source.container.as_deref(), Some("mkv"));
+        assert_eq!(source.preferred_source_item_id, None);
+        assert_eq!(source.preferred_media_source_id, None);
+        assert_eq!(source.poster_image_tag.as_deref(), Some("gc-poster"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_collection_row_structs_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let errors = [
+            GlobalCollectionCardRow::from_row(&row).expect_err("card columns must not decode"),
+            GlobalCollectionSourceRow::from_row(&row).expect_err("source columns must not decode"),
         ];
         for error in errors {
             assert!(
