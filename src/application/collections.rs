@@ -297,8 +297,7 @@ async fn run_global_collection_sync_worker(
             Ok(reconciled) => reconciled,
             Err(error) => {
                 tracing::warn!(%error, "failed to reconcile pending movie NFO collection identities; will retry");
-                if wait_for_global_collection_sync(&database, &mut shutdown_receiver, retry_delay)
-                    .await
+                if wait_for_global_collection_sync_retry(&mut shutdown_receiver, retry_delay).await
                 {
                     return;
                 }
@@ -312,8 +311,7 @@ async fn run_global_collection_sync_worker(
             Ok(pending) => pending,
             Err(error) => {
                 tracing::warn!(%error, "failed to load global collection sync jobs; will retry");
-                if wait_for_global_collection_sync(&database, &mut shutdown_receiver, retry_delay)
-                    .await
+                if wait_for_global_collection_sync_retry(&mut shutdown_receiver, retry_delay).await
                 {
                     return;
                 }
@@ -325,8 +323,12 @@ async fn run_global_collection_sync_worker(
                 continue;
             }
             // Nothing queued: wait for a write signal, not for a timer tick.
-            if wait_for_global_collection_sync(&database, &mut shutdown_receiver, idle_fallback)
-                .await
+            if wait_for_global_collection_sync_work(
+                &database,
+                &mut shutdown_receiver,
+                idle_fallback,
+            )
+            .await
             {
                 return;
             }
@@ -352,7 +354,7 @@ async fn run_global_collection_sync_worker(
             }
         }
         if failed
-            && wait_for_global_collection_sync(&database, &mut shutdown_receiver, retry_delay).await
+            && wait_for_global_collection_sync_retry(&mut shutdown_receiver, retry_delay).await
         {
             return;
         }
@@ -436,8 +438,12 @@ fn provider_ids_for_collection_reconciliation(
     provider_ids
 }
 
-/// Waits for `delay`, a write signal, or shutdown; returns `true` when the worker must stop.
-async fn wait_for_global_collection_sync(
+/// Waits `delay` for new work, a write signal, or shutdown; returns `true` when it must stop.
+///
+/// Only the idle path uses this. A write signal is not a reason to end a retry delay: the worker's
+/// own failed attempt is usually followed by other writes (`WriteLockGuard::drop` signals on every
+/// committed write), and honouring them would turn the retry delay into a spin.
+async fn wait_for_global_collection_sync_work(
     database: &Database,
     shutdown_receiver: &mut watch::Receiver<bool>,
     delay: Duration,
@@ -448,6 +454,20 @@ async fn wait_for_global_collection_sync(
     let signals = database.outbox_signals();
     tokio::select! {
         () = signals.notified_collections() => false,
+        () = tokio::time::sleep(delay) => false,
+        changed = shutdown_receiver.changed() => changed.is_err() || *shutdown_receiver.borrow(),
+    }
+}
+
+/// Waits `delay` before retrying a failed attempt; write signals do not shorten it.
+async fn wait_for_global_collection_sync_retry(
+    shutdown_receiver: &mut watch::Receiver<bool>,
+    delay: Duration,
+) -> bool {
+    if *shutdown_receiver.borrow() {
+        return true;
+    }
+    tokio::select! {
         () = tokio::time::sleep(delay) => false,
         changed = shutdown_receiver.changed() => changed.is_err() || *shutdown_receiver.borrow(),
     }
@@ -573,6 +593,68 @@ mod global_sync_worker_tests {
         .await?;
         assert_eq!(collections, 3);
         worker.shutdown().await;
+        Ok(())
+    }
+
+    /// The worker's own failed attempt is followed by unrelated writes, and every committed write
+    /// signals the consumers — including the failed sync's own write lock. Honouring those signals
+    /// during the retry delay turns the delay into a busy retry loop.
+    ///
+    /// A failing trigger rolls back with its transaction, so attempts cannot be counted in a table.
+    /// The test measures the database work of the same window twice, once without and once with a
+    /// signal every 40 ms; with a 400 ms retry delay over 800 ms both windows cost a handful of
+    /// passes (measured ~60 queries), while a signal-aware retry loop spins into thousands.
+    #[tokio::test]
+    async fn the_retry_delay_is_not_shortened_by_write_signals() -> Result<(), Box<dyn Error>> {
+        let (_directory, database) = database_with_pending_collection().await?;
+        sqlx::query(
+            "CREATE TRIGGER fail_retry_delay_collection_sync
+             BEFORE INSERT ON collection_items
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected worker sync failure');
+             END",
+        )
+        .execute(database.pool())
+        .await?;
+        let retry_delay = Duration::from_millis(400);
+        /// Ten times the measured cost of two retry delays: generous enough for a slow machine,
+        /// far below the thousands a signal-shortcutted retry loop produces.
+        const RETRY_WINDOW_QUERY_CAP: usize = 600;
+
+        async fn measure(database: &Database, retry_delay: Duration, signal: bool) -> usize {
+            let worker = GlobalCollectionSyncWorker::start_with_timings(
+                database.clone(),
+                retry_delay,
+                LONG_FALLBACK,
+            );
+            // Let the first attempt fail before the window starts.
+            sleep(Duration::from_millis(200)).await;
+            let before = database.query_count();
+            for _ in 0..20 {
+                if signal {
+                    database.signal_outbox_consumers();
+                }
+                sleep(Duration::from_millis(40)).await;
+            }
+            let worked = database.query_count().saturating_sub(before);
+            worker.shutdown().await;
+            worked
+        }
+
+        let unsignalled = measure(&database, retry_delay, false).await;
+        assert!(
+            unsignalled <= RETRY_WINDOW_QUERY_CAP,
+            "the retry delay must pace the retries even on its own; queries={unsignalled}"
+        );
+        let signalled = measure(&database, retry_delay, true).await;
+        assert!(
+            signalled <= RETRY_WINDOW_QUERY_CAP,
+            "write signals must not shortcut the retry delay; queries={signalled}"
+        );
+        assert!(
+            pending_syncs(&database).await? > 0,
+            "the failing sync must still be queued for the next retry"
+        );
         Ok(())
     }
 
