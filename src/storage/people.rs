@@ -2669,26 +2669,34 @@ impl CanonicalPersonBatch<'_> {
     /// Reads the name candidates inside the batch transaction.
     ///
     /// The actor page may have created a person moments ago, so this must see the transaction's
-    /// own writes - a pooled read would see the pre-batch snapshot.
+    /// own writes - a pooled read would see the pre-batch snapshot. The read sits in its own
+    /// savepoint like the writes: a failing statement then leaves the page transaction usable, so
+    /// PostgreSQL can still commit the actors resolved before the failure.
     pub(crate) async fn list_people_by_normalized_name(
         &mut self,
         normalized_name: &str,
     ) -> Result<Vec<StoredCanonicalPersonMatch>, StorageError> {
-        self.database
+        let savepoint = self.open_savepoint().await?;
+        let result = self
+            .database
             .list_canonical_people_by_normalized_name_in_transaction(
                 &mut self.transaction,
                 normalized_name,
             )
-            .await
+            .await;
+        self.finish_savepoint(&savepoint, result).await
     }
 
     pub(crate) async fn find_match_candidate(
         &mut self,
         candidate_id: &str,
     ) -> Result<Option<StoredPersonMatchCandidate>, StorageError> {
-        self.database
+        let savepoint = self.open_savepoint().await?;
+        let result = self
+            .database
             .find_person_match_candidate_in_transaction(&mut self.transaction, candidate_id)
-            .await
+            .await;
+        self.finish_savepoint(&savepoint, result).await
     }
 
     /// Commits the whole page.
