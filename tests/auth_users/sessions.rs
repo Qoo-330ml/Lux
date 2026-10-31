@@ -33,13 +33,9 @@ async fn playback_events_preserve_same_session_order_and_allow_new_session_rewin
     let admin = setup.complete("Admin", "Admin", "correct password").await?;
     // Playback callbacks travel through a trusted proxy in this scenario, so the forwarded
     // address is resolved instead of being taken from the raw header.
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
+        .await?;
     sqlx::query("UPDATE users SET can_remote_access = 1 WHERE id = ?")
         .bind(admin.id.to_string())
         .execute(database.pool())

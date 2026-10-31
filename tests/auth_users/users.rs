@@ -5973,13 +5973,9 @@ async fn admin_access_blacklist_uses_peer_and_complete_trusted_proxy_chain()
         .await?;
     assert_eq!(peer_rule.status(), reqwest::StatusCode::CONFLICT);
 
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\",\"10.0.0.0/8\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\",\"10.0.0.0/8\"]")
+        .await?;
 
     let trusted_chain_rule = client
         .post(&global_path)
@@ -6280,13 +6276,9 @@ async fn web_login_and_existing_sessions_enforce_ip_blacklists_through_trusted_p
     assert_eq!(untrusted_header_login.status(), reqwest::StatusCode::OK);
     let untrusted_session_cookie = cookie_pair(untrusted_header_login.headers());
 
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
+        .await?;
 
     assert!(matches!(
         web_auth
@@ -6439,13 +6431,9 @@ async fn emby_tokens_enforce_ip_blacklists_in_lux_api_routes()
     .bind(admin.id.to_string())
     .execute(database.pool())
     .await?;
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
+        .await?;
 
     let allowed_address = client
         .get(format!("{base_url}/api/v1/auth/me"))

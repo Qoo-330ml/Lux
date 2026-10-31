@@ -1200,13 +1200,9 @@ async fn emby_authenticated_access_refreshes_device_activity()
         .build()
         .expect("test client");
     let device_id = "emby-activity-device";
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
+        .await?;
     let login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(
@@ -1261,9 +1257,7 @@ async fn emby_authenticated_access_refreshes_device_activity()
 
     // Once the proxy allowlist is gone the forwarded header must not be believed: the recorded
     // address has to fall back to the connection peer.
-    sqlx::query("DELETE FROM server_settings WHERE key = 'trusted_proxy_cidrs'")
-        .execute(database.pool())
-        .await?;
+    database.set_trusted_proxy_cidrs_json("[]").await?;
     let untrusted_forward = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
         .header(
@@ -1512,13 +1506,9 @@ async fn emby_password_logins_update_device_inventory_without_blocking_auth()
         .expect("test client");
     let device_id = "emby-shared-device";
     let remote_ip = "203.0.113.10";
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
+        .await?;
 
     let first_login = client
         .post(format!("http://{address}/Users/AuthenticateByName"))
@@ -2036,13 +2026,9 @@ async fn emby_login_and_existing_tokens_enforce_ip_blacklists_through_trusted_pr
         .ok_or("missing access token")?
         .to_owned();
 
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
+        .await?;
     let no_peer_auth = emby_auth
         .authenticate(
             "emby-ip-target",
@@ -2125,20 +2111,16 @@ async fn emby_login_and_existing_tokens_enforce_ip_blacklists_through_trusted_pr
     .execute(database.pool())
     .await?;
 
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', 'invalid-json')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("invalid-json")
+        .await?;
     let invalid_proxy_settings_login = login("192.0.2.21").send().await?;
     assert_eq!(
         invalid_proxy_settings_login.status(),
         reqwest::StatusCode::SERVICE_UNAVAILABLE
     );
-    sqlx::query("UPDATE server_settings SET value = ? WHERE key = 'trusted_proxy_cidrs'")
-        .bind("[\"127.0.0.1/32\"]")
-        .execute(database.pool())
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
         .await?;
 
     sqlx::query(

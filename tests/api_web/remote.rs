@@ -255,13 +255,9 @@ async fn forwarded_headers_are_only_honoured_for_trusted_proxies()
         );
     }
 
-    sqlx::query(
-        "INSERT INTO server_settings (key, value) VALUES ('trusted_proxy_cidrs', ?)
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .bind("[\"127.0.0.1/32\"]")
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("[\"127.0.0.1/32\"]")
+        .await?;
 
     for prefix in ["", "/emby"] {
         for (header, value, expected) in [
