@@ -624,7 +624,7 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: A
     mutationFn: () => globalPlan ? api.runAdminScheduledTask({ ownerType: "GLOBAL", ownerId: "global", taskType: plan.taskType }) : api.runAdminScheduledTaskPlan(plan.id),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
@@ -776,7 +776,7 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
     mutationFn: () => runRegisteredTask(task),
     onSuccess: () => {
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminJobs() });
-      void queryClient.invalidateQueries({ queryKey: queryKeys.adminMetadataJobs() });
+      void queryClient.invalidateQueries({ queryKey: ["admin", "metadata-jobs"] });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminStrmProbeJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminChapterDetectionJobs() });
       void queryClient.invalidateQueries({ queryKey: queryKeys.adminDanmakuMatchJobs() });
