@@ -29,7 +29,10 @@
 - `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted` 与
   `web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`：对 `transcodingStatus.available` 的期望互相
   矛盾，在装了 VideoToolbox 的开发机上必有一个失败，与优化无关。
-- `web_static::*`：需要先 `pnpm --dir web build` 生成 `web/dist`。
+- `web_static::*`：需要先 `pnpm --dir web build` 生成 `web/dist`（本机未构建，实测为 404 → 400/200 断言失败）。
+- `api_web` 的 `remote::forwarded_headers_are_only_honoured_for_trusted_proxies`：2026-10-31 在本机
+  单独串行也是失败（`X-Forwarded-For` 未被采信，落库仍是 peer `127.0.0.1`），并在**未改动的 `test`
+  基线**（`7cf5f223`）上复现，属既有失败，与本轮后台唤醒改造无关；查明原因前不要当成回归。
 - 并发高负载时会随机失败，**单独串行跑稳定通过**：登录请求超时（argon2 在负载下）、`danmaku::…`、
   `image_writer::manual_scraper…`、`media_info_config_api::…`。
 
