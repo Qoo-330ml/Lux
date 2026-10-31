@@ -506,6 +506,29 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   另外 `rows_affected()` 在当前调用链没有被当作信号（`select_metadata_candidate_with_cache_and_collection_reference`
   只检查候选状态更新，`src/storage/metadata.rs:1823`），所以加条件本身不破坏语义。
 - **是否值得做**：**中-高**。
+- **已实施（提交 `ca9b9d6b`，2026-10-31）**：
+  - **`updated_at` 语义确认（改动前先查证）**：`media_items.updated_at` 的消费者全部把它当"这一行最后一次真实变化"：
+    Emby 详情 DTO 的 `DateLastSaved`/`DateModified`（`src/api/emby_catalog.rs:3609`）、列表 DTO 的
+    `DateModified`/`DateLastSaved`（`:3843-3857`）、Emby 增量刷新的 `MinDateLastSaved` 过滤条件
+    `mi.updated_at >= ?`（`src/storage/repository.rs:5084`），以及目录读模型把 `mi.updated_at` 原样复制到
+    `catalog_items.updated_at`（`src/storage/catalog_read_model.rs:1239`）。没有任何读模型或缓存靠"`updated_at`
+    推进"来失效：目录失效由 `catalog_outbox` 驱动，`media_items_updated_at_ai` 只补 INSERT 时 `updated_at = 0`。
+    因此**值未变时不刷新 `updated_at` 才是正确语义**，与 W3 已对 `update_media_item_metadata_in_transaction`
+    （`src/storage/catalog.rs`）、`sync_media_item_nfo_state`、`mark_media_item_metadata_checked` 采用的写法一致。
+  - **改法**：`src/storage/metadata.rs` 的选中 UPDATE 加 WHERE 条件，覆盖语句写入的每一列
+    （`title`/`sort_title`/`original_title`/`overview`/`production_year`、4 个 `COALESCE` 列按
+    `? IS NOT NULL AND col IS DISTINCT FROM ?`、`rating` 按存在标志、`provider_ids_json`、
+    `metadata_scraper_id`、`identification_status` 用与 SET 相同的 `CASE` 表达式比较、
+    `metadata_fingerprint`/`metadata_provenance_json`/`locked_fields_json`、`nfo_metadata_json IS NOT NULL`、
+    `nfo_metadata_fingerprint`、`poster_fallback_required`），`updated_at` 不参与条件。SQLite 与 PostgreSQL
+    共用同一条语句（`IS DISTINCT FROM` 两侧通用，占位符由现有适配层改写），未新增 `DatabaseBackend::` 分支。
+  - **前后数字（静态口径 + `query_count` 断言，见第 2.2 节）**：
+    - `media_items` 的 UPDATE：值全未变时 **1 条 → 0 条**（该事务仍会因候选状态更新而提交，所以**提交数不变**，
+      省下的是行写、`media_items_catalog_au` 触发与读模型重建）。
+    - `catalog_outbox`：同一场景 **最多 5 行 → 0 行**（`docs/INDEX-AUDIT.md` §7 的整行触发器不再触发）。
+    - 值真的变化时行为不变（1 行 UPDATE + 若干 outbox 行）。
+  - 测试：`src/storage/redundant_write_tests.rs::repeating_an_unchanged_metadata_selection_does_not_rewrite_the_item`
+    （相同值二次选中不改 `updated_at`、不增 `catalog_outbox`；改 `overview` 后仍写入并触发 outbox）。
 
 ### M4 未变更的 NFO 每次扫描仍重写 `collection_item_references`（已读代码确认）
 
@@ -532,6 +555,34 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
      批次（`src/application/metadata.rs:2255-2256` 的 flush），一次事务写整页。
 - **风险**：低。引用是派生数据，幂等；方案 1 不改变任何可见值。
 - **是否值得做**：**高**（改动小、频率高、与扫描写路径直接竞争）。
+- **已实施（提交 `ca9b9d6b`，2026-10-31）**（按方案 1，并额外把"完全没变化"的情况挡在写事务之前）：
+  - **改法**：`src/storage/catalog.rs` 抽出共享的 `STORED_MOVIE_COLLECTION_REFERENCE_QUERY`（沿用原来的
+    `collection_item_references` × `media_items` 单行投影）与纯比较函数 `collection_reference_is_unchanged`，
+    两个入口共用：
+    1. `replace_global_movie_collection_reference_in_transaction`（`Some` 与 `None` 两种情况都比现值，
+       相同即 `return Ok(())`）——覆盖选中/回填批量写事务里的引用更新。`Some` 时按 6 个存储列逐一比较；
+       `None` 时保留"未限定 NFO set id 且身份匹配则保留"的原语义，并新增"本来就没有行则不做 DELETE"。
+    2. `update_movie_collection_reference`（NFO 快路径的三个调用点都走它）先在池上做一次只读比较，
+       相同则**不取写锁、不开事务**直接返回。事务内会用同一函数再比较一次，所以这次预检与写入之间的
+       并发变更不会丢。
+  - **前后数字（静态口径 + `query_count`/generation 断言）**：
+    - 未变更复扫、电影属于合集（`Some`）：**1 次写事务 + 2 条写语句（DELETE+INSERT）→ 0 次事务 + 1 条读语句**；
+      `collection_item_references.updated_at` 不再被重置，`collection_sync_outbox.generation` **+2 → 0**
+      （若 5 000 部电影都有合集且都未变化，全库复扫从最多 5 000 次提交、最多 10 000 次 generation 增量降到 0）。
+    - 未变更复扫、电影没有合集（`None`）：**1 次写事务 + 1 条 0 行 DELETE → 0 次事务 + 1 条 SELECT**。
+    - 引用真的变化：**1 次事务 + 2 条语句 → 1 次事务 + 3 条语句**（事务内多一次比较读，换取并发安全），
+      写入值与 generation 语义完全不变。批量路径 `commit_local_nfo_state_batch_with_collection_references`
+      同理：每个引用更新多 1 条事务内 SELECT，无变化的不再 DELETE+INSERT（不增加提交）。
+  - **附带调整**：`src/storage/mod.rs` 的 `metadata_selection_updates_collection_reference_in_the_same_transaction`
+    用 `BEFORE INSERT` 触发器注入失败来验证事务回滚，原来第二次选中传入的是**同一个**引用；幂等跳过之后
+    INSERT 不再发生，触发器也就打不到。测试改为传入**不同的合集引用**，验证的语义（引用写失败时条目与候选一起回滚）
+    保持不变。
+  - 测试：`src/storage/redundant_write_tests.rs::repeating_an_unchanged_collection_reference_does_not_rewrite_the_reference_row`
+    （相同引用第二次只花 1 条语句、行 `updated_at` 与 `collection_sync_outbox.generation` 不变；改合集后仍写入并改 generation；
+    去掉引用仍删除）与 `::a_movie_without_a_collection_reference_does_not_open_a_write_transaction`；
+    端到端 `src/application/metadata.rs::tests::rescanning_an_unchanged_nfo_does_not_rewrite_the_collection_reference`
+    （复扫同一份未变 NFO：`nfo_skipped == 1`、引用行与 `media_items.updated_at` 的哨兵值不变、`catalog_outbox`
+    行数不增、`collection_sync_outbox.generation` 不变；改 NFO 的 `<setid>` 后仍替换引用并入队）。
 
 ### M5 每张图片 3 个写事务，串行在元数据写锁上（已读代码确认）
 
@@ -657,11 +708,11 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 1. **批次 1（零行为变化，收益确定）**
    - H1 的副产品：删掉 `reserve_playback_admission` 里重复的第二次计数（`sessions.rs:378`）。
    - H2 第 1、3 条：合并 session 投影、复用策略行（`session.rs:890-934`）。
-   - M4：给 `collection_item_references` 加现值比较（`catalog.rs:7775-7853`）。
+   - M4：给 `collection_item_references` 加现值比较（`catalog.rs:7775-7853`）。**已实施（提交 `ca9b9d6b`）**。
    - M2 方案 2：演员循环放进一个事务（`src/storage/people.rs` + `relations.rs` 签名）。
    - M5 方案 1：finish 与图片行同一事务。
    - S1：候选能力写入移到循环之后。
-   - M3：`UPDATE media_items` 加 `IS DISTINCT FROM` 式条件（需要先确认 `updated_at` 语义）。
+   - M3：`UPDATE media_items` 加 `IS DISTINCT FROM` 式条件（需要先确认 `updated_at` 语义）。**已实施（提交 `ca9b9d6b`）**。
 2. **批次 2（需要所有者确认"可能改变可观察行为"）**
    - H1：分片路径改"renew 优先、失败回落 reserve"（并发上限最长滞后一个心跳周期）。
    - S6：`pending_count` 改计数列或按需计算。
