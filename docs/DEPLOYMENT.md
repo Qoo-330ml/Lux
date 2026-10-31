@@ -91,8 +91,9 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 `FULL` 是 SQLite 自己的默认值：每次提交都把 WAL 刷到磁盘。`NORMAL` 在 WAL 模式下不会损坏数据库，
 断电时最多丢掉最后几次已提交的事务，对小事务密集的路径（例如每 10 秒一次的播放进度上报）收益最大，
 在机械盘 NAS 上尤其明显。**默认值保持 `FULL`**；在 NAS 上做完 A/B 并确认可以接受断电丢最后几次提交
-之后，才建议把默认切换纳入决定。该变量只影响内置 SQLite；PostgreSQL 后端和不带持久化保证的
-内存数据库测试路径都不读取它，扫描事务的 PostgreSQL 局部 `synchronous_commit = off` 也保持不变。
+之后，才建议把默认切换纳入决定。该变量只作用于内置 SQLite 的池连接：`Database` 只把它写进 SQLite 的
+`after_connect`；PostgreSQL 后端的连接初始化不设置 `synchronous`，扫描事务的 PostgreSQL 局部
+`synchronous_commit = off` 也保持不变。`:memory:` 只在测试里以裸池形式出现，不经过这条连接初始化路径。
 
 在 NAS 上做 A/B 的方法（两轮使用同一份数据库副本和同一组操作，交替顺序再跑一轮以抵消缓存影响）：
 
