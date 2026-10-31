@@ -373,6 +373,16 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 - **风险**：无。
 - **是否值得做**：**低-中**。
 
+- **已实施：提交 `6aae02d3`**。`MetadataReidentifyService::search_item_candidates` 改成先读一次
+  `find_media_item_metadata`（用它的 `item_type` 做原有的 `VIDEO` 拒绝），再把快照交给新的
+  `MetadataCandidateService::search_and_store_for_current`（与 `search_and_store` 同参，`mode = Manual`、
+  `plan = full`）。因为 `search_and_store_with_mode` 收到 `current` 后 `reuse_current_snapshot = true`，
+  末尾的 `list_pending_after_search` 也不再重读条目。
+  - 每次手动"搜索候选"：条目读 **3 → 1**（kind 读 + 搜索内 metadata 读 + 返回页重读 → 只读 1 次 metadata）。
+    用 `application::candidates::tests::manual_search_with_the_callers_snapshot_skips_item_reads` 断言
+    "带快照的语句数 + 2 == 不带的语句数"，并断言两次搜索落库的 `(provider_id, score)` 完全一致。
+  - 备份 scraper 循环（S2）本轮未改：那 1 次读仍是"写后重读"的正确做法。
+
 ### S4 作业内没有跨条目复用配置与尝试历史（已读代码确认）
 
 - **位置**：`src/application/scraper.rs:1551-1557`（每条目一次 `list_item_scraper_configurations_by_ids([item_id])`）；
@@ -622,6 +632,20 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   （模式与 `search_and_store_*_for_current` 一致，`candidates.rs:608-651` 已有先例）。
 - **风险**：调用方传入的快照必须在写路径开始前仍然有效（选中过程会改写条目，所以只有入口处可用）。
 - **是否值得做**：**低-中**。
+
+- **已实施：提交 `6aae02d3`**。`MetadataSelectionOptions` 增加 `current: Option<&StoredMediaMetadata>`，
+  `select_internal` 只在它为 `None` 时读 `find_media_item_metadata`；`select_with_scraper_and_policy` /
+  `select_for_review_with_scraper_and_policy` / `select_fallback_with_scraper_and_policy` 各多一个
+  `current` 参数（`pub` 包装 `select` / `select_for_review` / `select_with_scraper` 仍传 `None`）。
+  - 调用方（`reidentify::refresh_with_scraper_roles`）只在"快照可证明未失效"的场合传：
+    第一个 primary 尝试（此后 `current_snapshot.take()` 清空，因为失败/待审尝试可能已经写过 NFO 投影）；
+    备份循环里"刚读到的那一行"。supplement 尝试在更早的写者之后运行，仍传入 `None`（保持重读）。
+  - 每次选中：条目读 **1 → 0**（`application::candidates::tests::selection_reuses_the_callers_item_snapshot`
+    用两个独立库比较：带快照的语句数 + 1 == 不带的语句数，并断言带快照时写入的 title 来自快照）。
+  - 剩余风险：快照在"读条目 → 选中"之间的窗口从毫秒级扩展到整个搜索耗时（TMDb 往返）；
+    这期间若有并发用户编辑同一条目，选中会用陈旧值覆盖。该 read-modify-write 竞态在改造前就存在
+    （选中全程不锁 `media_items`），本改动只是把窗口拉长；需要"用户编辑与后台作业并发"更强的保证时，
+    应在 `select_metadata_candidate_*` 上加乐观并发（如 `updated_at` 条件）。
 
 ### M9 其它已确认的小项（正面记录）
 
