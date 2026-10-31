@@ -19,7 +19,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::{
-    application::strm_target::{StrmTargetKind, classify_strm_target},
+    application::strm_target::{StrmTargetKind, canonical_local_strm_target, classify_strm_target},
     application::{
         images::{
             acquire_image_write_lock, canonical_thumbnail_path, first_available_thumbnail_path,
@@ -808,6 +808,24 @@ impl StrmProbeService {
         semaphore: Arc<Semaphore>,
         options: ProbeSourceOptions,
     ) -> SourceOutcome {
+        let relative_path = source.relative_path.clone();
+        let target_kind = source.external_url.as_deref().map_or("none", |target| {
+            target_kind_label(classify_strm_target(target).kind)
+        });
+        let started = Instant::now();
+        let mut outcome = self.probe_source_inner(source, semaphore, options).await;
+        outcome.relative_path = relative_path;
+        outcome.target_kind = target_kind;
+        outcome.elapsed_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        outcome
+    }
+
+    async fn probe_source_inner(
+        &self,
+        source: StoredStrmMediaSource,
+        semaphore: Arc<Semaphore>,
+        options: ProbeSourceOptions,
+    ) -> SourceOutcome {
         let path = match safe_media_path(&source.root_path, &source.relative_path) {
             Ok(path) => path,
             Err(error) => {
@@ -856,8 +874,14 @@ impl StrmProbeService {
             return SourceOutcome::failed(
                 &source.source_id,
                 "FAILED",
-                "STRM source has no external URL".to_owned(),
+                "STRM file has no stored target; rescan the library to read it again".to_owned(),
             );
+        };
+        let url = match probe_target(&url, &source.root_path, &source.relative_path).await {
+            Ok(target) => target,
+            Err(message) => {
+                return SourceOutcome::failed(&source.source_id, "FAILED", message.to_owned());
+            }
         };
         if !validate_remote_media_url(&url) {
             return SourceOutcome::failed(
@@ -918,6 +942,31 @@ impl StrmProbeService {
         }
     }
 
+    /// Persists a failed probe and logs why. The error text is already free of targets: plugin
+    /// errors carry fixed messages and local errors are static strings.
+    async fn record_probe_failure(
+        &self,
+        job: &StoredStrmProbeJob,
+        context: &ProbeLogContext,
+        source_id: &str,
+        status: &str,
+        error: &str,
+    ) -> Result<(), StorageError> {
+        tracing::warn!(
+            job_id = %job.id,
+            source_id,
+            file = %context.relative_path,
+            target_kind = context.target_kind,
+            elapsed_ms = context.elapsed_ms,
+            status,
+            error,
+            "STRM media probe failed"
+        );
+        self.database
+            .mark_media_probe_failed(source_id, status, error)
+            .await
+    }
+
     async fn finish_source(
         &self,
         job: &StoredStrmProbeJob,
@@ -929,14 +978,20 @@ impl StrmProbeService {
                 .await?;
             return Ok(0);
         }
+        let log_context = ProbeLogContext {
+            relative_path: outcome.relative_path.clone(),
+            target_kind: outcome.target_kind,
+            elapsed_ms: outcome.elapsed_ms,
+        };
         let Some(result) = outcome.result else {
-            self.database
-                .mark_media_probe_failed(
-                    &outcome.source_id,
-                    &outcome.failure_status,
-                    &outcome.error,
-                )
-                .await?;
+            self.record_probe_failure(
+                job,
+                &log_context,
+                &outcome.source_id,
+                &outcome.failure_status,
+                &outcome.error,
+            )
+            .await?;
             return Ok(1);
         };
         if outcome.media_info_needed {
@@ -981,44 +1036,49 @@ impl StrmProbeService {
                     chapters: &[],
                 })
                 .await?;
-            if job.write_sidecars
-                && write_media_info_sidecar_with_context(
+            let sidecar_result = if job.write_sidecars {
+                write_media_info_sidecar_with_context(
                     &outcome.path,
                     &result.media,
                     outcome.sidecar_context,
                 )
                 .await
-                .is_err()
-            {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "media info sidecar write failed",
-                    )
-                    .await?;
+            } else {
+                Ok(())
+            };
+            if let Err(error) = sidecar_result {
+                self.record_probe_failure(
+                    job,
+                    &log_context,
+                    &outcome.source_id,
+                    "FAILED",
+                    &format!("media info was saved but the mediainfo.json sidecar could not be written: {error}"),
+                )
+                .await?;
                 return Ok(1);
             }
         }
         if outcome.thumbnail_needed {
             let Some(thumbnail) = result.thumbnail_jpeg.as_deref() else {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "thumbnail output is missing",
-                    )
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &log_context,
+                    &outcome.source_id,
+                    "FAILED",
+                    "plugin returned no thumbnail image although one was requested",
+                )
+                .await?;
                 return Ok(1);
             };
             if !is_valid_jpeg(thumbnail) {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "thumbnail output is invalid",
-                    )
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &log_context,
+                    &outcome.source_id,
+                    "FAILED",
+                    "plugin returned thumbnail data that is not a valid JPEG",
+                )
+                .await?;
                 return Ok(1);
             }
             let _image_write_lock = acquire_image_write_lock(&outcome.item_id).await;
@@ -1028,20 +1088,26 @@ impl StrmProbeService {
                     path
                 }
                 _ => {
-                    self.database
-                        .mark_media_probe_failed(
-                            &outcome.source_id,
-                            "FAILED",
-                            "STRM path has no valid thumbnail name",
-                        )
-                        .await?;
+                    self.record_probe_failure(
+                        job,
+                        &log_context,
+&outcome.source_id,
+                        "FAILED",
+                        "no safe thumbnail path next to the STRM file (invalid name or outside the library root)",
+                    )
+                    .await?;
                     return Ok(1);
                 }
             };
-            if write_image_atomically(&target, thumbnail).await.is_err() {
-                self.database
-                    .mark_media_probe_failed(&outcome.source_id, "FAILED", "thumbnail write failed")
-                    .await?;
+            if let Err(error) = write_image_atomically(&target, thumbnail).await {
+                self.record_probe_failure(
+                    job,
+                    &log_context,
+                    &outcome.source_id,
+                    "FAILED",
+                    &format!("thumbnail could not be written next to the STRM file: {error}"),
+                )
+                .await?;
                 return Ok(1);
             }
             let file_size =
@@ -1056,19 +1122,21 @@ impl StrmProbeService {
                 dimensions.map(|(_, height)| height),
                 &content_tag,
             );
-            if self
+            if let Err(error) = self
                 .database
                 .insert_item_images_batch_at_indices(&[image_batch])
                 .await
-                .is_err()
             {
-                self.database
-                    .mark_media_probe_failed(
-                        &outcome.source_id,
-                        "FAILED",
-                        "thumbnail registration failed",
-                    )
-                    .await?;
+                self.record_probe_failure(
+                    job,
+                    &log_context,
+                    &outcome.source_id,
+                    "FAILED",
+                    &format!(
+                        "thumbnail was written but could not be registered in the database: {error}"
+                    ),
+                )
+                .await?;
                 return Ok(1);
             }
         }
@@ -1326,6 +1394,47 @@ mod tests {
     use crate::config::Config;
 
     #[tokio::test]
+    async fn probe_target_resolves_relative_paths_and_rejects_unreadable_protocols() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let root = dir.path().join("lib");
+        tokio::fs::create_dir_all(root.join("nested"))
+            .await
+            .expect("dirs");
+        tokio::fs::write(root.join("movie.mkv"), b"x")
+            .await
+            .expect("media");
+        tokio::fs::write(root.join("nested/a.strm"), b"../movie.mkv")
+            .await
+            .expect("strm");
+        let root_str = root.to_str().expect("utf8");
+
+        let resolved = super::probe_target("../movie.mkv", root_str, "nested/a.strm").await;
+        assert_eq!(
+            resolved.map(std::path::PathBuf::from),
+            Ok(root.join("movie.mkv").canonicalize().expect("canonical"))
+        );
+        assert_eq!(
+            super::probe_target("https://h/v.mkv", root_str, "nested/a.strm").await,
+            Ok("https://h/v.mkv".to_owned())
+        );
+        assert!(
+            super::probe_target("smb://nas/v.mkv", root_str, "nested/a.strm")
+                .await
+                .is_err()
+        );
+        assert!(
+            super::probe_target("magnet:?xt=1", root_str, "nested/a.strm")
+                .await
+                .is_err()
+        );
+        assert!(
+            super::probe_target("missing.mkv", root_str, "nested/a.strm")
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
     async fn completed_operation_is_removed_from_registry() {
         let temp_dir = tempfile::tempdir().expect("temporary directory");
         let config = Config {
@@ -1512,6 +1621,55 @@ mod tests {
         database.close().await;
     }
 
+    #[tokio::test]
+    async fn failed_probe_outcome_names_the_file_target_kind_and_reason() {
+        let temp_dir = tempfile::tempdir().expect("temporary directory");
+        let root = temp_dir.path().join("library");
+        tokio::fs::create_dir_all(&root)
+            .await
+            .expect("library root");
+        tokio::fs::write(root.join("Movie.strm"), b"gone.mkv")
+            .await
+            .expect("strm file");
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse().expect("test address"),
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = Database::connect(&config).await.expect("database");
+        let plugins = PluginService::new(database.clone(), config.config_dir.clone());
+        let service = StrmProbeService::new(database.clone(), plugins);
+
+        let outcome = service
+            .probe_source(
+                StoredStrmMediaSource {
+                    source_id: "source-1".to_owned(),
+                    item_id: "item-1".to_owned(),
+                    poster_fallback_required: false,
+                    has_media_info: false,
+                    external_url: Some("gone.mkv".to_owned()),
+                    root_path: root.to_string_lossy().into_owned(),
+                    relative_path: "Movie.strm".to_owned(),
+                    thumbnail_path: None,
+                    has_strm_thumbnail: false,
+                },
+                Arc::new(Semaphore::new(1)),
+                ProbeSourceOptions {
+                    include_ready: false,
+                    media_info_enabled: true,
+                    thumbnail_enabled: false,
+                    thumbnail_position_percent: 30,
+                    thumbnail_mode: ThumbnailScrapingMode::default(),
+                },
+            )
+            .await;
+
+        assert_eq!(outcome.relative_path, "Movie.strm");
+        assert_eq!(outcome.target_kind, "local_path");
+        assert_eq!(outcome.failure_status, "FAILED");
+        assert_eq!(outcome.error, "STRM local target is missing or not a file");
+        database.close().await;
+    }
+
     #[test]
     fn probe_progress_batches_updates_and_cancel_checks() {
         let start = Instant::now();
@@ -1594,6 +1752,9 @@ struct SourceOutcome {
     skipped: bool,
     failure_status: String,
     error: String,
+    relative_path: String,
+    target_kind: &'static str,
+    elapsed_ms: u64,
 }
 
 impl SourceOutcome {
@@ -1618,6 +1779,9 @@ impl SourceOutcome {
             thumbnail_needed,
             failure_status: String::new(),
             error: String::new(),
+            relative_path: String::new(),
+            target_kind: "unknown",
+            elapsed_ms: 0,
         }
     }
 
@@ -1634,6 +1798,9 @@ impl SourceOutcome {
             thumbnail_needed: false,
             failure_status: String::new(),
             error: String::new(),
+            relative_path: String::new(),
+            target_kind: "unknown",
+            elapsed_ms: 0,
         }
     }
 
@@ -1650,6 +1817,48 @@ impl SourceOutcome {
             thumbnail_needed: false,
             failure_status: status.to_owned(),
             error,
+            relative_path: String::new(),
+            target_kind: "unknown",
+            elapsed_ms: 0,
+        }
+    }
+}
+
+struct ProbeLogContext {
+    relative_path: String,
+    target_kind: &'static str,
+    elapsed_ms: u64,
+}
+
+fn target_kind_label(kind: StrmTargetKind) -> &'static str {
+    match kind {
+        StrmTargetKind::Url => "http",
+        StrmTargetKind::Path => "local_path",
+        StrmTargetKind::Smb => "smb",
+        StrmTargetKind::Ftp => "ftp",
+        StrmTargetKind::Empty => "empty",
+        StrmTargetKind::Unsupported => "unsupported",
+    }
+}
+
+/// Turns the stored STRM target into something `ffprobe` can open from the plugin process, whose
+/// working directory is the plugin root. Relative local paths are resolved against the `.strm`
+/// file; protocols `ffprobe` cannot read are rejected here with a clear reason.
+async fn probe_target(
+    target: &str,
+    root_path: &str,
+    strm_relative_path: &str,
+) -> Result<String, &'static str> {
+    let classified = classify_strm_target(target);
+    match classified.kind {
+        StrmTargetKind::Url | StrmTargetKind::Ftp => Ok(target.trim().to_owned()),
+        StrmTargetKind::Path => canonical_local_strm_target(root_path, strm_relative_path, target)
+            .await
+            .map(|path| path.to_string_lossy().into_owned())
+            .map_err(|_| "STRM local target is missing or not a file"),
+        StrmTargetKind::Smb => Err("STRM SMB targets cannot be probed"),
+        StrmTargetKind::Empty | StrmTargetKind::Unsupported => {
+            Err("STRM target protocol is not supported for probing")
         }
     }
 }

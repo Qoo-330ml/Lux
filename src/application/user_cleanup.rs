@@ -23,7 +23,11 @@ async fn purge_expired_user_activity_batch(
         .await
 }
 
-pub(crate) fn spawn_user_cleanup_worker(database: Database, avatars: UserAvatarService) {
+pub(crate) fn spawn_user_cleanup_worker(
+    database: Database,
+    avatars: UserAvatarService,
+    config_dir: Option<std::path::PathBuf>,
+) {
     tokio::spawn(async move {
         let first_tick = tokio::time::Instant::now() + USER_CLEANUP_INTERVAL;
         let mut interval = tokio::time::interval_at(first_tick, USER_CLEANUP_INTERVAL);
@@ -59,6 +63,36 @@ pub(crate) fn spawn_user_cleanup_worker(database: Database, avatars: UserAvatarS
 
             if let Err(error) = purge_expired_user_activity_batch(&database, now).await {
                 tracing::warn!(%error, "failed to purge expired user activity events");
+            }
+            if let Err(error) = database
+                .purge_expired_session_history(now, USER_CLEANUP_BATCH_SIZE)
+                .await
+            {
+                tracing::warn!(%error, "failed to purge expired session and playback history");
+            }
+            if let Err(error) = database
+                .delete_expired_emby_direct_playback_tickets(now, USER_CLEANUP_BATCH_SIZE)
+                .await
+            {
+                tracing::warn!(%error, "failed to purge expired Emby direct-play tickets");
+            }
+            if let Err(error) = database
+                .purge_expired_account_records(now, USER_CLEANUP_BATCH_SIZE)
+                .await
+            {
+                tracing::warn!(%error, "failed to purge expired account records");
+            }
+            if let Some(config_dir) = &config_dir
+                && let Err(error) =
+                    crate::application::playback_history_retention::archive_playback_history(
+                        config_dir,
+                        &database,
+                        now,
+                        USER_CLEANUP_BATCH_SIZE,
+                    )
+                    .await
+            {
+                tracing::warn!(%error, "failed to archive expired playback history");
             }
         }
     });

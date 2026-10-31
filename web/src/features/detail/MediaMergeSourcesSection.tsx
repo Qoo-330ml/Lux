@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminItemMergeRecord, MediaItem } from "../../lib/api/types";
+import { LuxButton } from "../../components/ui";
 
 const MERGEABLE_ITEM_TYPES = new Set(["MOVIE", "SERIES"]);
 
@@ -81,27 +82,24 @@ export function MediaMergeSourcesSection({ item }: { item: MediaItem }) {
               {confirmingId === record.id ? (
                 <span className="lux-detail-merge-confirm">
                   <span className="lux-muted-copy">拆分后恢复为独立条目，播放进度保留在此条目。</span>
-                  <button
-                    className="lux-button lux-button-secondary"
+                  <LuxButton tone="secondary"
                     type="button"
                     disabled={unmerge.isPending}
                     onClick={() => setConfirmingId(undefined)}
                   >
                     取消
-                  </button>
-                  <button
-                    className="lux-button lux-button-primary"
+                  </LuxButton>
+                  <LuxButton tone="primary"
                     type="button"
                     data-action="confirm-unmerge"
                     disabled={unmerge.isPending}
                     onClick={() => unmerge.mutate(record)}
                   >
                     {unmerge.isPending ? "拆分中…" : "确认拆分"}
-                  </button>
+                  </LuxButton>
                 </span>
               ) : (
-                <button
-                  className="lux-button lux-button-secondary"
+                <LuxButton tone="secondary"
                   type="button"
                   data-action="unmerge-item"
                   aria-label={`拆分已合并条目 ${record.mergedItemTitle}`}
@@ -113,7 +111,7 @@ export function MediaMergeSourcesSection({ item }: { item: MediaItem }) {
                   }}
                 >
                   拆分
-                </button>
+                </LuxButton>
               )}
             </li>
           ))}

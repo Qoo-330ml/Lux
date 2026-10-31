@@ -1,4 +1,8 @@
-use super::{DatabaseBackend, NewEpisodeFile, NewMovieFile, adapt_sql_for_backend};
+use super::{
+    ADAPTED_SQL_CACHE, AdaptedSqlCache, DatabaseBackend, MAX_ADAPTED_SQL_CACHE_ENTRIES,
+    MAX_ADAPTED_SQL_CACHE_TEXT_BYTES, NewEpisodeFile, NewMovieFile, adapt_postgres_sql_uncached,
+    adapt_sql_for_backend, adapt_static_sql_for_backend_with_cache,
+};
 use crate::storage::sql_templates::{
     SqlTemplateCache, filesystem_entries_by_paths_template, manifest_delta_finalize_template,
     manifest_delta_insert_template, manifest_delta_verify_template,
@@ -149,7 +153,7 @@ async fn execute_count_query(
 }
 
 fn filesystem_path_template(cache: &SqlTemplateCache, capacity: u16) -> Arc<str> {
-    filesystem_entries_by_paths_template(cache, DatabaseBackend::Postgres, capacity)
+    filesystem_entries_by_paths_template(cache, POSTGRES, capacity)
         .expect("valid filesystem path template")
 }
 
@@ -776,4 +780,374 @@ fn manifest_positive_file_reference_collection_benchmark() {
         elapsed,
         snapshot,
     );
+}
+
+// A2: PostgreSQL placeholder adaptation. These five statements stand in for the shapes the
+// adapter sees in `storage`: a tiny insert, an ordinary paged select, a long join, a wide
+// `IN (...)` list, and text where `?` appears inside quotes and comments.
+
+const ADAPTATION_SHORT_SQL: &str =
+    "INSERT INTO catalog_outbox (kind, item_id, library_id) VALUES (?, ?, ?) RETURNING id";
+
+const ADAPTATION_TYPICAL_SQL: &str = "SELECT mi.id, mi.item_type, mi.title, mi.sort_title,
+        mi.production_year, fe.relative_path
+ FROM media_items mi
+ JOIN media_sources ms ON ms.item_id = mi.id
+ JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+ WHERE mi.library_root_id = ?
+   AND mi.removed_at IS NULL
+   AND mi.item_type IN ('VIDEO', 'EPISODE')
+ ORDER BY mi.sort_title, mi.id
+ LIMIT ? OFFSET ?";
+
+const ADAPTATION_LONG_JOIN_SQL: &str = "SELECT ms.id AS source_id, ms.item_id,
+        mi.item_type, mi.season_number, mi.episode_number,
+        mi.title, mi.original_title,
+        series.title AS series_title,
+        series.original_title AS series_original_title,
+        lr.canonical_path AS root_path, fe.relative_path
+ FROM media_sources ms
+ JOIN media_items mi ON mi.id = ms.item_id
+ LEFT JOIN media_items series ON series.id = mi.series_id
+ JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+ JOIN library_roots lr ON lr.id = fe.library_root_id
+ WHERE mi.id = ? AND ms.id = ?
+   AND ms.source_kind IN ('LOCAL_FILE', 'STRM_URL')
+   AND fe.is_missing = 0
+ LIMIT 1";
+
+const ADAPTATION_QUOTES_AND_COMMENTS_SQL: &str = "-- item lookup; the ? in this comment is prose
+SELECT mi.id,
+       'it''s ?' AS note,
+       \"quoted ?\" AS identifier,
+       'what?' AS suffix
+ FROM media_items mi
+ /* the ? below this block comment is prose as well */
+ WHERE mi.library_root_id = ?
+   AND mi.identity_key = ?
+   AND mi.title <> 'Who?'
+   AND mi.item_type = ?
+   AND mi.removed_at IS NULL
+   AND EXISTS (
+       SELECT 1
+       FROM media_sources ms
+       WHERE ms.item_id = mi.id AND ms.source_kind = ?
+   )
+ ORDER BY mi.title
+ LIMIT ?";
+
+fn adaptation_wide_in_list_sql(placeholder_count: usize) -> &'static str {
+    let placeholders = std::iter::repeat_n("?", placeholder_count)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let sql = format!(
+        "SELECT id FROM filesystem_entries WHERE library_root_id = ? AND relative_path IN ({placeholders})"
+    );
+    Box::leak(sql.into_boxed_str())
+}
+
+fn adaptation_benchmark_cases() -> Vec<(&'static str, &'static str, usize)> {
+    vec![
+        ("short_insert_3_placeholders", ADAPTATION_SHORT_SQL, 20_000),
+        (
+            "typical_select_3_placeholders",
+            ADAPTATION_TYPICAL_SQL,
+            20_000,
+        ),
+        ("long_join_2_placeholders", ADAPTATION_LONG_JOIN_SQL, 20_000),
+        (
+            "wide_in_list_128_placeholders",
+            adaptation_wide_in_list_sql(128),
+            5_000,
+        ),
+        (
+            "quotes_and_comments_5_placeholders",
+            ADAPTATION_QUOTES_AND_COMMENTS_SQL,
+            20_000,
+        ),
+    ]
+}
+
+/// The dialect these benchmarks exercise, named once so the rest of the file stays dialect-neutral.
+const POSTGRES: DatabaseBackend = DatabaseBackend::Postgres;
+
+/// The production entry point: what `Database::query*` pays, memo included.
+fn adapt_production(sql: &'static str) -> sqlx::SqlStr {
+    adapt_sql_for_backend(POSTGRES, sql)
+}
+
+/// The pre-cache behaviour, kept as the reference point for every memo comparison.
+fn adapt_uncached(sql: &'static str) -> sqlx::SqlStr {
+    adapt_postgres_sql_uncached(sql)
+}
+
+/// Measures the production entry point, so the number covers whatever `Database::query*` pays.
+fn report_postgres_adaptation(case: &str, sql: &'static str, iterations: usize) {
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        || adapt_production(sql),
+        || adapt_production(sql),
+    );
+    report_allocation_case(
+        &format!("postgres_adapt_{case}"),
+        iterations,
+        elapsed,
+        snapshot,
+    );
+    let adapted = adapt_production(sql);
+    assert_ne!(
+        adapted.as_str(),
+        sql,
+        "case {case} must rewrite placeholders"
+    );
+    assert!(adapted.as_str().contains('$'), "case {case} must use $n");
+}
+
+/// The pre-cache behaviour, kept as the reference point for the memo comparison.
+fn report_postgres_adaptation_uncached(case: &str, sql: &'static str, iterations: usize) {
+    let (elapsed, snapshot) =
+        measure_operation(iterations, || adapt_uncached(sql), || adapt_uncached(sql));
+    report_allocation_case(
+        &format!("postgres_rewrite_uncached_{case}"),
+        iterations,
+        elapsed,
+        snapshot,
+    );
+    let expected = adapt_uncached(sql);
+    assert_eq!(
+        adapt_production(sql).as_str(),
+        expected.as_str(),
+        "cached and uncached rewrites must agree for case {case}"
+    );
+}
+
+#[test]
+#[ignore = "run explicitly to record the A2 PostgreSQL placeholder adaptation baseline"]
+fn postgres_placeholder_adaptation_benchmark() {
+    for (case, sql, iterations) in adaptation_benchmark_cases() {
+        println!(
+            "adaptation_case={case} source_bytes={} placeholders={}",
+            sql.len(),
+            sql.matches('?').count()
+        );
+        report_postgres_adaptation_uncached(case, sql, iterations);
+        report_postgres_adaptation(case, sql, iterations);
+    }
+}
+
+/// Same five statements, but hammered from four threads through the shared cache, to record what
+/// the memo mutex costs once several Tokio workers adapt SQL at the same time.
+#[test]
+#[ignore = "run explicitly to record the A2 cache contention cost"]
+fn postgres_placeholder_adaptation_contention_benchmark() {
+    const THREADS: usize = 4;
+    const ITERATIONS_PER_THREAD: usize = 5_000;
+    let cases = adaptation_benchmark_cases();
+    // Warm the memo so every thread measures the steady state.
+    for (_, sql, _) in &cases {
+        drop(adapt_production(sql));
+    }
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..THREADS {
+            scope.spawn(|| {
+                for _ in 0..ITERATIONS_PER_THREAD {
+                    for (_, sql, _) in &cases {
+                        drop(black_box(adapt_production(sql)));
+                    }
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    let operations = THREADS
+        .saturating_mul(ITERATIONS_PER_THREAD)
+        .saturating_mul(cases.len());
+    println!(
+        "postgres_adapt_contention threads={THREADS} operations={operations} elapsed_ns_per_op={}",
+        elapsed.as_nanos() / u128::try_from(operations).unwrap_or(1)
+    );
+}
+
+/// Statement shapes that appear in the real tree, one variant per index so every entry is distinct.
+fn working_set_statements(statement_count: usize) -> Vec<&'static str> {
+    (0..statement_count)
+        .map(|index| {
+            let variant = format!("media_items_variant_{index:05}");
+            let sql = match index % 5 {
+                0 => format!(
+                    "INSERT INTO catalog_outbox_{index:05} (kind, item_id, library_id) VALUES (?, ?, ?) RETURNING id"
+                ),
+                1 => format!(
+                    "SELECT mi.id, mi.item_type, mi.title, mi.sort_title, mi.production_year,
+                            fe.relative_path
+                     FROM {variant} mi
+                     JOIN media_sources ms ON ms.item_id = mi.id
+                     JOIN filesystem_entries fe ON fe.id = ms.filesystem_entry_id
+                     WHERE mi.library_root_id = ? AND mi.removed_at IS NULL
+                       AND mi.item_type IN ('VIDEO', 'EPISODE')
+                     ORDER BY mi.sort_title, mi.id
+                     LIMIT ? OFFSET ?"
+                ),
+                2 => format!("{ADAPTATION_LONG_JOIN_SQL} -- {variant}"),
+                3 => format!(
+                    "SELECT id FROM filesystem_entries
+                     WHERE library_root_id = ? AND relative_path IN ({}) -- {variant}",
+                    std::iter::repeat_n("?", 64).collect::<Vec<_>>().join(", ")
+                ),
+                _ => format!("{ADAPTATION_QUOTES_AND_COMMENTS_SQL} -- {variant}"),
+            };
+            let leaked: &'static str = Box::leak(sql.into_boxed_str());
+            leaked
+        })
+        .collect()
+}
+
+/// One pass over the working set against a fresh memo: the cost the first query of every statement
+/// shape pays (rewrite + memo insert) instead of the steady state.
+fn report_working_set_cold_fill(statements: &[&'static str]) {
+    let cache = AdaptedSqlCache::default();
+    let started = Instant::now();
+    for sql in statements {
+        drop(black_box(adapt_static_sql_for_backend_with_cache(
+            &cache, sql,
+        )));
+    }
+    let elapsed = started.elapsed();
+    println!(
+        "working_set case=cold_fill statements={} entries={} cached_bytes={} elapsed_ns_per_op={}",
+        statements.len(),
+        cache.entry_count(),
+        cache.cached_text_bytes(),
+        elapsed.as_nanos() / u128::try_from(statements.len()).unwrap_or(1)
+    );
+}
+
+/// Walks the whole working set on one thread, reporting ns/op and allocations per op.
+fn report_working_set_case(
+    case: &str,
+    statements: &[&'static str],
+    iterations: usize,
+    adapt: fn(&'static str) -> sqlx::SqlStr,
+) {
+    let mut allocation_index = 0_usize;
+    let mut timing_index = 0_usize;
+    let (elapsed, snapshot) = measure_operation(
+        iterations,
+        move || {
+            let sql = statements[allocation_index % statements.len()];
+            allocation_index += 1;
+            drop(black_box(adapt(sql)));
+        },
+        move || {
+            let sql = statements[timing_index % statements.len()];
+            timing_index += 1;
+            drop(black_box(adapt(sql)));
+        },
+    );
+    report_allocation_case(case, iterations, elapsed, snapshot);
+}
+
+/// Same walk with `threads` threads, each one looping over the whole working set.
+fn report_working_set_threads_case(
+    case: &str,
+    statements: &[&'static str],
+    threads: usize,
+    rounds: usize,
+    adapt: fn(&'static str) -> sqlx::SqlStr,
+) {
+    let started = Instant::now();
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            scope.spawn(move || {
+                for _ in 0..rounds {
+                    for sql in statements {
+                        drop(black_box(adapt(sql)));
+                    }
+                }
+            });
+        }
+    });
+    let elapsed = started.elapsed();
+    let operations = threads
+        .saturating_mul(rounds)
+        .saturating_mul(statements.len());
+    println!(
+        "working_set case={case} statements={} threads={threads} operations={operations} elapsed_ns_per_op={}",
+        statements.len(),
+        elapsed.as_nanos() / u128::try_from(operations).unwrap_or(1)
+    );
+}
+
+/// A working set the size of the real one (~1,000 distinct static statements, see
+/// docs/PERFORMANCE.md for the count), compared against the pre-cache rewrite on 1 and 8 threads.
+#[test]
+#[ignore = "run explicitly to record the A2 working-set cost"]
+fn postgres_placeholder_adaptation_working_set_benchmark() {
+    const STATEMENTS: usize = 1_000;
+    const THREADS: usize = 8;
+    const OPERATIONS: usize = 160_000;
+
+    let statements = working_set_statements(STATEMENTS);
+    let distinct = statements
+        .iter()
+        .copied()
+        .collect::<std::collections::HashSet<&str>>();
+    let source_bytes: usize = statements.iter().map(|sql| sql.len()).sum();
+    let placeholders: usize = statements.iter().map(|sql| sql.matches('?').count()).sum();
+    println!(
+        "working_set shape statements={} distinct={} source_bytes={} placeholders={}",
+        statements.len(),
+        distinct.len(),
+        source_bytes,
+        placeholders
+    );
+    assert_eq!(distinct.len(), STATEMENTS);
+
+    report_working_set_cold_fill(&statements);
+
+    // Steady state: fill the memo once, then walk the whole working set.
+    for sql in &statements {
+        drop(adapt_production(sql));
+    }
+    report_working_set_case(
+        "memoized_single_thread",
+        &statements,
+        OPERATIONS,
+        adapt_production,
+    );
+    report_working_set_case(
+        "uncached_single_thread",
+        &statements,
+        OPERATIONS,
+        adapt_uncached,
+    );
+
+    let rounds = OPERATIONS / STATEMENTS / THREADS;
+    report_working_set_threads_case(
+        "memoized_threads",
+        &statements,
+        THREADS,
+        rounds,
+        adapt_production,
+    );
+    report_working_set_threads_case(
+        "uncached_threads",
+        &statements,
+        THREADS,
+        rounds,
+        adapt_uncached,
+    );
+
+    let entries = ADAPTED_SQL_CACHE.entry_count();
+    let cached_text_bytes = ADAPTED_SQL_CACHE.cached_text_bytes();
+    println!(
+        "working_set case=memo_coverage entries={entries} cached_bytes={cached_text_bytes} entry_limit={MAX_ADAPTED_SQL_CACHE_ENTRIES} text_limit={MAX_ADAPTED_SQL_CACHE_TEXT_BYTES}"
+    );
+    assert!(
+        entries >= STATEMENTS,
+        "the whole working set should be memoized, got {entries}"
+    );
+    assert!(entries <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
+    assert!(cached_text_bytes <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
 }

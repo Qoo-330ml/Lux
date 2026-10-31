@@ -218,6 +218,8 @@ pub struct PluginSupervisor {
     call_timeout: Duration,
     config_dir: Option<PathBuf>,
     network_proxy_url: Option<String>,
+    /// Plugin ids that must reach their upstream without the configured outbound proxy.
+    proxy_bypass: Vec<String>,
 }
 
 impl PluginSupervisor {
@@ -233,6 +235,7 @@ impl PluginSupervisor {
             call_timeout: DEFAULT_PLUGIN_CALL_TIMEOUT,
             config_dir: None,
             network_proxy_url: None,
+            proxy_bypass: Vec::new(),
         }
     }
 
@@ -249,6 +252,23 @@ impl PluginSupervisor {
     pub fn with_network_proxy_url(mut self, proxy_url: Option<String>) -> Self {
         self.network_proxy_url = proxy_url;
         self
+    }
+
+    /// Marks plugins that must not use the configured outbound proxy.
+    pub fn with_proxy_bypass(mut self, proxy_bypass: Vec<String>) -> Self {
+        self.proxy_bypass = proxy_bypass;
+        self
+    }
+
+    fn bypasses_proxy(&self, plugin_id: &str) -> bool {
+        self.proxy_bypass.iter().any(|entry| entry == plugin_id)
+    }
+
+    fn proxy_url_for(&self, plugin_id: &str) -> Option<&str> {
+        if self.bypasses_proxy(plugin_id) {
+            return None;
+        }
+        self.network_proxy_url.as_deref()
     }
 
     pub async fn catalog(&self) -> PluginCatalog {
@@ -318,7 +338,8 @@ impl PluginSupervisor {
                 let process = match spawn_process(
                     &plugin,
                     self.config_access(&plugin, allow_config_access),
-                    self.network_proxy_url.as_deref(),
+                    self.proxy_url_for(plugin_id),
+                    self.bypasses_proxy(plugin_id),
                 ) {
                     Ok(process) => process,
                     Err(error) => {
@@ -368,6 +389,19 @@ impl PluginSupervisor {
         method: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value, PluginRuntimeError> {
+        self.call_isolated_with_timeout(plugin_id, method, params, self.call_timeout)
+            .await
+    }
+
+    /// Like [`Self::call_isolated`] with a caller-specific deadline, for work such as remote
+    /// media probing that legitimately outlasts the default call timeout.
+    pub async fn call_isolated_with_timeout(
+        &self,
+        plugin_id: &str,
+        method: &str,
+        params: serde_json::Value,
+        call_timeout: Duration,
+    ) -> Result<serde_json::Value, PluginRuntimeError> {
         let plugin = self
             .catalog
             .read()
@@ -378,7 +412,8 @@ impl PluginSupervisor {
         let process = match spawn_process(
             &plugin,
             self.config_access(&plugin, true),
-            self.network_proxy_url.as_deref(),
+            self.proxy_url_for(plugin_id),
+            self.bypasses_proxy(plugin_id),
         ) {
             Ok(process) => process,
             Err(error) => {
@@ -386,7 +421,7 @@ impl PluginSupervisor {
                 return Err(error);
             }
         };
-        let result = process.call(method, params, self.call_timeout).await;
+        let result = process.call(method, params, call_timeout).await;
         process.stop().await;
         if let Err(error) = &result {
             self.record_error(plugin_id, error).await;
@@ -675,10 +710,55 @@ fn response_result(response: PluginResponse) -> Result<serde_json::Value, Plugin
         .ok_or_else(|| PluginRuntimeError::Protocol("plugin response has no result".to_owned()))
 }
 
+/// Proxy variables a plugin child process may see, in both spellings.
+const PLUGIN_PROXY_ENV_KEYS: [&str; 7] = [
+    "LUX_PROXY_URL",
+    "HTTP_PROXY",
+    "HTTPS_PROXY",
+    "ALL_PROXY",
+    "http_proxy",
+    "https_proxy",
+    "all_proxy",
+];
+
+/// Proxy environment for a plugin child process: `None` values must be removed, not set.
+///
+/// A bypassed plugin gets no `LUX_PROXY_URL` and also loses the proxy variables it would otherwise
+/// inherit, because inheriting `HTTP_PROXY` from the container would defeat an explicit bypass.
+fn plugin_proxy_env(
+    network_proxy_url: Option<&str>,
+    bypass_proxy: bool,
+) -> Vec<(&'static str, Option<String>)> {
+    if bypass_proxy {
+        return PLUGIN_PROXY_ENV_KEYS
+            .into_iter()
+            .map(|key| (key, None))
+            .collect();
+    }
+    network_proxy_url
+        .map(|proxy_url| ("LUX_PROXY_URL", Some(proxy_url.to_owned())))
+        .into_iter()
+        .collect()
+}
+
+fn configure_plugin_proxy_env(
+    command: &mut Command,
+    network_proxy_url: Option<&str>,
+    bypass_proxy: bool,
+) {
+    for (key, value) in plugin_proxy_env(network_proxy_url, bypass_proxy) {
+        match value {
+            Some(value) => command.env(key, value),
+            None => command.env_remove(key),
+        };
+    }
+}
+
 fn spawn_process(
     plugin: &DiscoveredPlugin,
     config_access: PluginConfigAccess,
     network_proxy_url: Option<&str>,
+    bypass_proxy: bool,
 ) -> Result<Arc<PluginProcess>, PluginRuntimeError> {
     let entrypoint = absolute_runtime_path(&plugin.entrypoint).map_err(PluginRuntimeError::Io)?;
     let root_path = absolute_runtime_path(&plugin.root_path).map_err(PluginRuntimeError::Io)?;
@@ -712,9 +792,7 @@ fn spawn_process(
                 .env_remove("LUX_PLUGIN_CONFIG_PATH");
         }
     }
-    if let Some(proxy_url) = network_proxy_url {
-        command.env("LUX_PROXY_URL", proxy_url);
-    }
+    configure_plugin_proxy_env(&mut command, network_proxy_url, bypass_proxy);
     let mut child = command.spawn().map_err(PluginRuntimeError::Io)?;
     let stdin = child
         .stdin
@@ -1020,6 +1098,50 @@ mod tests {
             read_manifest(&path),
             Err(PluginDiscoveryError::InvalidPackage(_))
         ));
+    }
+
+    #[test]
+    fn a_bypassed_plugin_removes_every_proxy_variable() {
+        let env: Vec<(&str, Option<String>)> =
+            plugin_proxy_env(Some("http://127.0.0.1:7890"), true);
+        assert!(env.iter().all(|(_, value)| value.is_none()));
+        for expected in ["LUX_PROXY_URL", "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY"] {
+            assert!(
+                env.iter().any(|(key, _)| *key == expected),
+                "{expected} must be removed"
+            );
+        }
+    }
+
+    #[test]
+    fn a_configured_proxy_is_injected_without_a_bypass() {
+        assert_eq!(
+            plugin_proxy_env(Some("http://127.0.0.1:7890"), false),
+            vec![("LUX_PROXY_URL", Some("http://127.0.0.1:7890".to_owned()))]
+        );
+    }
+
+    #[test]
+    fn a_plugin_without_a_configured_proxy_keeps_the_inherited_environment() {
+        assert!(plugin_proxy_env(None, false).is_empty());
+    }
+
+    #[test]
+    fn the_bypass_list_decides_per_plugin() {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let supervisor = PluginSupervisor::new(PluginCatalog::discover(directory.path()))
+            .with_network_proxy_url(Some("http://127.0.0.1:7890".to_owned()))
+            .with_proxy_bypass(vec!["org.lux.theintrodb-chapter-source".to_owned()]);
+        assert_eq!(
+            supervisor.proxy_url_for("org.lux.theintrodb-chapter-source"),
+            None
+        );
+        assert_eq!(
+            supervisor.proxy_url_for("org.lux.tmdb"),
+            Some("http://127.0.0.1:7890")
+        );
+        assert!(supervisor.bypasses_proxy("org.lux.theintrodb-chapter-source"));
+        assert!(!supervisor.bypasses_proxy("org.lux.tmdb"));
     }
 
     #[test]

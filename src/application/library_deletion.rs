@@ -86,6 +86,27 @@ impl LibraryDeletionService {
         }
     }
 
+    /// Runs queued deletions during a scheduler pass instead of inside the admin
+    /// request. Bounded to one page per pass; `spawn_worker` still serializes them
+    /// through the worker semaphore.
+    pub(crate) async fn drain_pending(&self) {
+        const PENDING_PAGE_SIZE: i64 = 8;
+        let jobs = match self
+            .database
+            .list_library_deletion_jobs(0, PENDING_PAGE_SIZE, Some("PENDING"))
+            .await
+        {
+            Ok(jobs) => jobs,
+            Err(error) => {
+                tracing::warn!(%error, "could not list pending library deletions");
+                return;
+            }
+        };
+        for job in jobs {
+            self.spawn_worker(&job.id);
+        }
+    }
+
     pub(crate) fn spawn_worker(&self, job_id: &str) {
         let service = self.clone();
         let job_id = job_id.to_owned();
@@ -202,7 +223,7 @@ impl LibraryDeletionService {
         {
             Ok(Some(true)) => {
                 if let Some(home) = &self.home {
-                    home.invalidate();
+                    home.invalidate_directory();
                 }
                 tracing::info!(
                     job_id,
@@ -385,5 +406,77 @@ impl std::error::Error for LibraryDeletionError {}
 impl From<StorageError> for LibraryDeletionError {
     fn from(error: StorageError) -> Self {
         Self::Storage(error)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::Config;
+
+    async fn test_database() -> Result<(tempfile::TempDir, Database), Box<dyn std::error::Error>> {
+        let temp = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp.path().join("config"),
+        })
+        .await?;
+        Ok((temp, database))
+    }
+
+    #[tokio::test]
+    async fn queued_deletion_runs_on_the_scheduler_pass_only()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp, database) = test_database().await?;
+        let library_id: LibraryId = "018f0000-0000-7000-8000-000000000001".parse::<LibraryId>()?;
+        let library_key = library_id.to_string();
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, 'Queue', 'SERIES')")
+            .bind(&library_key)
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES ('018f0000-0000-7000-8000-000000000002', ?, 'MOVIE', 'A', 'a',
+                       'LOCAL_CONFIRMED')",
+        )
+        .bind(&library_key)
+        .execute(database.pool())
+        .await?;
+
+        let service = LibraryDeletionService::new(database.clone(), None, None, None);
+        let job = service.request(library_id).await?;
+        assert_eq!(job.status, "PENDING");
+
+        // Requesting a deletion must not touch the library's rows on its own.
+        let remaining: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE library_id = ?")
+                .bind(&library_key)
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(
+            remaining, 1,
+            "the admin request must leave the rows in place"
+        );
+
+        service.drain_pending().await;
+
+        for _ in 0..200 {
+            let job = database
+                .get_library_deletion_job(&job.id)
+                .await?
+                .ok_or("deletion job disappeared")?;
+            if job.status == "COMPLETED" {
+                let remaining: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM media_items WHERE library_id = ?")
+                        .bind(&library_key)
+                        .fetch_one(database.pool())
+                        .await?;
+                assert_eq!(remaining, 0);
+                return Ok(());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        Err("queued deletion did not complete during the scheduler pass".into())
     }
 }

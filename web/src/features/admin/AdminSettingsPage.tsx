@@ -10,6 +10,7 @@ import type {
   NetworkProxyDiagnostics,
   NetworkProxyProbe,
 } from "../../lib/api/types";
+import { LuxButton, LuxSelectField, LuxSwitch, LuxTextField } from "../../components/ui";
 
 const emptyNetworkProxy: AdminNetworkProxySettings = {
   configured: false,
@@ -129,39 +130,17 @@ export function AdminSettingsPage() {
             <span>继续观看最小进度</span>
             <small>低于此播放时长的记录不会显示在“继续观看”。</small>
             <div className="lux-admin-input-with-suffix">
-              <input type="number" min="0" value={minimumMinutes} onChange={(event) => { setSaved(false); setMinimumMinutes(event.target.value); }} />
+              <LuxTextField type="number" min="0" value={minimumMinutes} onChange={(event) => { setSaved(false); setMinimumMinutes(event.target.value); }} />
               <em>分钟</em>
             </div>
           </label>
-          <label className="lux-admin-toggle">
-            <input
-              type="checkbox"
-              aria-label="显示媒体库待确认标记"
-              checked={showMetadataPending}
-              onChange={(event) => {
-                setSaved(false);
-                setShowMetadataPending(event.target.checked);
-              }}
-            />
-            <span>显示媒体库待确认标记</span>
-          </label>
+          <LuxSwitch className="lux-admin-toggle" aria-label="显示媒体库待确认标记" checked={showMetadataPending} onChange={(event) => { setSaved(false); setShowMetadataPending(event.target.checked); }} label="显示媒体库待确认标记" />
           <small>关闭后只隐藏卡片上的标记，不会改变待确认状态或待确认筛选。</small>
-          <label className="lux-admin-toggle">
-            <input
-              type="checkbox"
-              aria-label="媒体库顺序强制按照管理员排序"
-              checked={forceAdminLibraryOrder}
-              onChange={(event) => {
-                setSaved(false);
-                setForceAdminLibraryOrder(event.target.checked);
-              }}
-            />
-            <span>媒体库顺序强制按照管理员排序</span>
-          </label>
+          <LuxSwitch className="lux-admin-toggle" aria-label="媒体库顺序强制按照管理员排序" checked={forceAdminLibraryOrder} onChange={(event) => { setSaved(false); setForceAdminLibraryOrder(event.target.checked); }} label="媒体库顺序强制按照管理员排序" />
           <small>开启后，普通用户只能按照管理员保存的媒体库顺序浏览。</small>
-          <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={save.isPending} onClick={() => save.mutate()}>
+          <LuxButton tone="primary" className="lux-settings-save" type="button" disabled={save.isPending} onClick={() => save.mutate()}>
             <Save size={16} /> {save.isPending ? "保存中…" : "保存设置"}
-          </button>
+          </LuxButton>
         </div>
         {saved ? <p className="lux-settings-saved"><Check size={15} /> 设置已保存</p> : null}
         {save.error ? <p className="lux-error-copy">{save.error.message}</p> : null}
@@ -175,7 +154,7 @@ export function AdminSettingsPage() {
           <label>
             <span>登录页背景来源</span>
             <small>固定海报墙保持现有登录页视觉；最新添加展示电影和剧集海报，插件来源使用 Lux 固定布局。</small>
-            <select
+            <LuxSelectField
               aria-label="登录页背景来源"
               value={loginBackgroundSource}
               onChange={(event) => {
@@ -193,7 +172,7 @@ export function AdminSettingsPage() {
               {loginBackgroundPlugins.map((plugin) => (
                 <option key={plugin.id} value={`PLUGIN:${plugin.id}`}>{plugin.name}</option>
               ))}
-            </select>
+            </LuxSelectField>
           </label>
           {plugins.isPending ? (
             <p className="lux-login-background-status" role="status">正在读取已安装的登录背景插件…</p>
@@ -209,14 +188,13 @@ export function AdminSettingsPage() {
           {loginBackgroundSource.startsWith("PLUGIN:") && loginBackgroundStatusMessage ? (
             <p className="lux-login-background-status" role="status">{loginBackgroundStatusMessage}</p>
           ) : null}
-          <button
-            className="lux-button lux-button-primary lux-settings-save"
+          <LuxButton tone="primary" className="lux-settings-save"
             type="button"
             disabled={saveLoginBackground.isPending}
             onClick={() => saveLoginBackground.mutate()}
           >
             <Save size={16} /> {saveLoginBackground.isPending ? "保存中…" : "保存登录页背景"}
-          </button>
+          </LuxButton>
         </div>
         {loginBackgroundSaved ? <p className="lux-settings-saved"><Check size={15} /> 登录页背景设置已保存</p> : null}
         {saveLoginBackground.error ? <p className="lux-error-copy">{saveLoginBackground.error.message}</p> : null}
@@ -230,7 +208,7 @@ export function AdminSettingsPage() {
           <label>
             <span>代理地址</span>
             <small>支持 HTTP、HTTPS、SOCKS4、SOCKS4A、SOCKS5 和 SOCKS5H，例如 http://192.168.1.2:7890。</small>
-            <input
+            <LuxTextField
               type="url"
               aria-label="网络代理地址"
               autoComplete="off"
@@ -250,12 +228,12 @@ export function AdminSettingsPage() {
           </p>
           {networkProxy.source === "environment" && !networkProxy.url ? <p className="lux-network-proxy-status">当前代理由环境变量提供。</p> : null}
           <div className="lux-network-proxy-actions">
-            <button className="lux-button lux-button-primary lux-settings-save" type="button" disabled={saveProxy.isPending} onClick={() => saveProxy.mutate()}>
+            <LuxButton tone="primary" className="lux-settings-save" type="button" disabled={saveProxy.isPending} onClick={() => saveProxy.mutate()}>
               <Save size={16} /> {saveProxy.isPending ? "保存中…" : "保存网络代理"}
-            </button>
-            <button className="lux-button lux-button-secondary lux-settings-save" type="button" disabled={testProxy.isPending} onClick={() => testProxy.mutate()}>
+            </LuxButton>
+            <LuxButton tone="secondary" className="lux-settings-save" type="button" disabled={testProxy.isPending} onClick={() => testProxy.mutate()}>
               {testProxy.isPending ? "检测中…" : "检测延迟与出口"}
-            </button>
+            </LuxButton>
           </div>
         </div>
         {proxySaved ? <p className="lux-settings-saved"><Check size={15} /> 网络代理设置已保存，重启 Lux 后生效。</p> : null}

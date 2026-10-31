@@ -60,6 +60,26 @@ export function posterUrlWithFallback(item: MediaItem, series?: MediaItem, width
     ?? (item.itemType === "SEASON" && series?.itemType === "SERIES" ? imageUrl(series, "poster", width) : undefined);
 }
 
+/**
+ * Detail-page backdrop: series, seasons and episodes share the series artwork, and any landscape
+ * image (fanart, then thumb) wins over a poster. Seasons and episodes wait for the series to load
+ * rather than flashing their own still first.
+ */
+export function detailBackdropUrl(item: MediaItem, series?: MediaItem, width?: number) {
+  const inheritsSeries = item.itemType === "SEASON" || item.itemType === "EPISODE";
+  if (inheritsSeries && !series && (item.seriesId ?? item.parentId)) return undefined;
+  const sources = inheritsSeries && series ? [series, item] : [item];
+  for (const source of sources) {
+    const landscape = imageUrl(source, "fanart", width);
+    if (landscape) return landscape;
+  }
+  for (const source of sources) {
+    const poster = imageUrl(source, "poster", width);
+    if (poster) return poster;
+  }
+  return undefined;
+}
+
 export function stillImageUrl(url: string, width?: number) {
   return withImageWidth(url, width);
 }

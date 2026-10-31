@@ -12,17 +12,14 @@ impl Database {
         self.query(
             "UPDATE filesystem_entries
              SET is_missing = 1, updated_at = unixepoch()
-             WHERE library_root_id = ? AND relative_path = ?",
+             WHERE library_root_id = ? AND relative_path = ? AND is_missing = 0",
         )
         .bind(library_root_id)
         .bind(relative_path)
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_filesystem_entry(
@@ -51,11 +48,10 @@ impl Database {
         .bind(relative_path)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_filesystem_entry))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())?
+        .map(stored_filesystem_entry)
+        .transpose()
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_filesystem_entries_for_paths(
@@ -115,16 +111,12 @@ impl Database {
             for _ in 0..padding_count {
                 statement = statement.bind(None::<String>);
             }
-            let rows =
-                statement
-                    .fetch_all(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+            let rows = statement
+                .fetch_all(&self.pool)
+                .await
+                .map_err(self.sqlx_err())?;
             for row in rows {
-                let entry = stored_filesystem_entry(row);
+                let entry = stored_filesystem_entry(row).map_err(self.sqlx_err())?;
                 entries.insert(entry.relative_path.clone(), entry);
             }
         }
@@ -144,10 +136,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_filesystem_entry_by_inode(
@@ -186,28 +175,22 @@ impl Database {
             .bind(relative_path)
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if rows.len() != 1 {
             return Ok(None);
         }
-        Ok(rows.into_iter().next().map(stored_filesystem_entry))
+        rows.into_iter()
+            .next()
+            .map(stored_filesystem_entry)
+            .transpose()
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn move_filesystem_entry(
         &self,
         entry: FilesystemEntryMove<'_>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "UPDATE filesystem_entries
              SET library_root_id = ?, relative_path = ?, size = ?, modified_at = ?,
@@ -226,22 +209,13 @@ impl Database {
         .bind(entry.entry_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.restore_media_items_for_filesystem_entries(
             &mut transaction,
             &[entry.entry_id.to_owned()],
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_filesystem_entry_inode(
@@ -255,10 +229,7 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_filesystem_entries_seen_batch(
@@ -276,13 +247,7 @@ impl Database {
             last_seen_generation,
         )
         .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(super) async fn restore_filesystem_entries_batch_in_transaction(
@@ -309,10 +274,7 @@ impl Database {
             let restored = statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if restored > 0 {
                 self.restore_media_items_for_filesystem_entries(transaction, chunk)
@@ -349,10 +311,7 @@ impl Database {
             statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             self.restore_media_items_for_filesystem_entries(transaction, chunk)
                 .await?;
         }
@@ -363,14 +322,7 @@ impl Database {
         &self,
         update: FilesystemEntryUpdate<'_>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "UPDATE filesystem_entries
              SET size = ?, modified_at = ?, fingerprint = ?, device = ?, inode = ?, last_seen_generation = ?,
@@ -386,19 +338,10 @@ impl Database {
         .bind(update.id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.restore_media_items_for_filesystem_entries(&mut transaction, &[update.id.to_owned()])
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_filesystem_entry_seen(
@@ -408,14 +351,7 @@ impl Database {
         device: Option<i64>,
         inode: Option<i64>,
     ) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "UPDATE filesystem_entries
              SET last_seen_generation = ?, device = ?, inode = ?, is_missing = 0, updated_at = unixepoch()
@@ -427,19 +363,10 @@ impl Database {
         .bind(id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.restore_media_items_for_filesystem_entries(&mut transaction, &[id.to_owned()])
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// Applies the changed-file writes of an incremental scan in one
@@ -466,10 +393,7 @@ impl Database {
         .bind(update.id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.restore_media_items_for_filesystem_entries(&mut transaction, &[update.id.to_owned()])
             .await?;
         self.reset_media_probe_for_filesystem_entry_in_transaction(
@@ -489,18 +413,9 @@ impl Database {
             .bind(update.id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     /// Marks an unchanged incremental file as seen and updates its STRM target
@@ -527,35 +442,28 @@ impl Database {
         .bind(id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.restore_media_items_for_filesystem_entries(&mut transaction, &[id.to_owned()])
             .await?;
         if strm_target_kind.is_some() {
+            // The file is unchanged, so the parsed STRM target usually is too; skipping the
+            // redundant row avoids a media source write and its catalog outbox row per scan.
             self.query(
                 "UPDATE media_sources
                  SET external_url = ?, strm_target_kind = ?, updated_at = unixepoch()
-                 WHERE filesystem_entry_id = ?",
+                 WHERE filesystem_entry_id = ?
+                   AND (external_url IS DISTINCT FROM ? OR strm_target_kind IS DISTINCT FROM ?)",
             )
             .bind(strm_target)
             .bind(strm_target_kind)
             .bind(id)
+            .bind(strm_target)
+            .bind(strm_target_kind)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_missing_filesystem_entries(
@@ -571,13 +479,7 @@ impl Database {
                 generation,
             )
             .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(missing_entries)
     }
 
@@ -597,10 +499,7 @@ impl Database {
             .bind(generation)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
         self.refresh_removed_media_items_in_transaction(transaction, library_root_id)
             .await?;
@@ -637,10 +536,7 @@ impl Database {
                 statement
                     .execute(&mut **transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+                    .map_err(self.sqlx_err())?
                     .rows_affected(),
             );
         }

@@ -3,7 +3,11 @@ import { createContext, useCallback, useContext, useEffect, useRef, useState } f
 import { clearHomeCarouselCache } from "../home/carousel";
 import { queryKeys } from "../../lib/api/query-keys";
 
-type UserEvent = { scope: "home" | "item" | "library" | "favorites"; itemId?: string; libraryId?: string };
+type UserEvent = {
+  scope: "home" | "item" | "library" | "favorites" | "progress";
+  itemId?: string;
+  libraryId?: string;
+};
 
 export type SseConnectionState = "connected" | "disconnected";
 export const SseConnectionContext = createContext<SseConnectionState>("disconnected");
@@ -56,6 +60,14 @@ export function useUserEvents() {
 
     const source = new EventSource("/api/v1/events");
     const invalidate = (event: UserEvent) => {
+      // Progress ticks only move the user's resume pointer and the playing
+      // item's playback state; refreshing the whole media surface for every
+      // 10s report is what the server-side per-user filtering exists to avoid.
+      if (event.scope === "progress") {
+        refreshQueries(queryKeys.homeContinueWatching);
+        refreshQueries(event.itemId ? queryKeys.playback(event.itemId) : ["playback"]);
+        return;
+      }
       clearHomeCarouselCache();
       // Legacy home notifications also cover metadata, images and user state.
       // The server may send scope-only events; IDs narrow updates when available.
@@ -114,7 +126,7 @@ function parseUserEvent(data: string): UserEvent | null {
   try {
     const payload: unknown = JSON.parse(data);
     if (!payload || typeof payload !== "object" || !("scope" in payload)) return null;
-    if (typeof payload.scope !== "string" || !["home", "item", "library", "favorites"].includes(payload.scope)) return null;
+    if (typeof payload.scope !== "string" || !["home", "item", "library", "favorites", "progress"].includes(payload.scope)) return null;
     for (const key of ["itemId", "libraryId"] as const) {
       if (key in payload) {
         const value = (payload as Record<string, unknown>)[key];

@@ -37,6 +37,8 @@ const SQLITE_INCREMENTAL_VACUUM_PAGES_PER_STEP: i64 = 2_048;
 const MAINTENANCE_ENV: &str = "LUX_DATABASE_MAINTENANCE";
 const MAINTENANCE_INTERVAL_ENV: &str = "LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS";
 const MAINTENANCE_INITIAL_DELAY_ENV: &str = "LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS";
+const QUERY_STATISTICS_EXTENSION_ENV: &str = "LUX_POSTGRES_QUERY_STATISTICS_EXTENSION";
+const QUERY_STATISTICS_EXTENSION_TIMEOUT: Duration = Duration::from_secs(10);
 /// A full SQLite `VACUUM` rewrites the entire file and holds the write lock for the
 /// whole rewrite, so the default budget stays short. Operators who accept the lock
 /// for an offline compaction can raise it.
@@ -171,10 +173,33 @@ impl Database {
             )
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        Ok(active != 0)
+    }
+
+    /// Whether a client is watching right now.
+    ///
+    /// A full `VACUUM` rewrites the file while holding the write lock, and playback progress is
+    /// persisted every few seconds, so a round that starts during playback competes with the one
+    /// write a user notices immediately -- the resume position of the film they are watching.
+    async fn active_playback_in_progress(&self) -> Result<bool, StorageError> {
+        let query = format!(
+            "SELECT CASE WHEN EXISTS(
+                 SELECT 1 FROM playback_sessions
+                 WHERE state IN ('PLAYING', 'PAUSED')
+                   AND last_event_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+             ) OR EXISTS(
+                 SELECT 1 FROM web_playback_sessions
+                 WHERE state = 'ACTIVE'
+                   AND last_heartbeat_at > unixepoch() - {PLAYBACK_SESSION_STALE_AFTER_SECONDS}
+                   AND expires_at >= unixepoch()
+             ) THEN 1 ELSE 0 END"
+        );
+        let active: i64 = self
+            .query_scalar(sqlx::AssertSqlSafe(query))
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
         Ok(active != 0)
     }
 
@@ -202,10 +227,7 @@ impl Database {
             )
             .fetch_all(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut candidates = Vec::with_capacity(rows.len());
         for row in rows {
             let table: String = row.try_get("table_name").unwrap_or_default();
@@ -235,18 +257,12 @@ impl Database {
             .query_scalar("PRAGMA freelist_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let page_count: i64 = self
             .query_scalar("PRAGMA page_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         // SQLite tracks no per-table dead tuples. Model the database-wide
         // freelist as one synthetic candidate so the round can run `VACUUM` when
         // enough pages are reclaimable, and skip it otherwise.
@@ -267,10 +283,7 @@ impl Database {
         self.query_scalar("PRAGMA auto_vacuum")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     /// Returns free pages to the filesystem in bounded steps. Incremental vacuum only
@@ -329,10 +342,7 @@ impl Database {
         self.query_scalar("PRAGMA freelist_count")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     async fn run_maintenance_vacuum(&self, table: &str, report: &mut MaintenanceReport) -> bool {
@@ -413,10 +423,322 @@ impl Database {
             .execute(&self.pool)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
+            .map_err(self.sqlx_err())
+    }
+}
+
+/// Statistics refresh outcomes. Every skip is a deliberate decision, not a failure.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SqliteStatisticsRefresh {
+    /// Statistics existed already; the planner was told to check whether they still fit.
+    Optimized,
+    /// The database had never been analyzed, so a full `ANALYZE` ran.
+    Analyzed,
+    /// No catalog rows yet. Statistics taken on an empty database teach the planner that every
+    /// table has a single row, which it then plans full scans for long after the library filled up.
+    SkippedEmpty,
+    /// A scan or metadata job owns the database; describing it mid-flight would sample a shape
+    /// that is about to change.
+    SkippedBusy,
+    /// PostgreSQL maintains its own statistics through autovacuum and the per-table
+    /// `VACUUM (ANALYZE)` this module already issues.
+    SkippedBackend,
+}
+
+/// `ANALYZE` reads every indexed row. A library that needs much longer than this is better served
+/// by a partial sample than by holding the write lock for minutes.
+const SQLITE_ANALYZE_TIMEOUT: Duration = Duration::from_secs(120);
+/// Statistics refresh cadence. `PRAGMA optimize` is usually a no-op, so this stays cheap enough
+/// to run far more often than the daily maintenance round that reclaims space.
+const STATISTICS_REFRESH_INTERVAL: Duration = Duration::from_secs(900);
+const STATISTICS_REFRESH_INITIAL_DELAY: Duration = Duration::from_secs(10);
+
+impl Database {
+    /// Keeps `sqlite_stat1` describing the catalog the planner actually sees.
+    ///
+    /// Without statistics SQLite falls back to fixed selectivity guesses, which is exactly the
+    /// wrong input for the composite indexes the catalog relies on (`library_id` + `removed_at` +
+    /// `has_available_source` and friends are anything but uniform).
+    ///
+    /// The first pass after a library appears runs a full `ANALYZE`; later passes only run
+    /// `PRAGMA optimize`, which decides for itself whether any table grew enough to be worth
+    /// re-sampling. The `analysis_limit` a pooled connection may have inherited from a previous
+    /// `PRAGMA optimize` is restored after the full pass, so this never turns into sampled
+    /// statistics by accident.
+    pub async fn refresh_query_statistics(&self) -> Result<SqliteStatisticsRefresh, StorageError> {
+        if self.backend != DatabaseBackend::Sqlite {
+            return Ok(SqliteStatisticsRefresh::SkippedBackend);
+        }
+        let _refresh_guard =
+            acquire_write_lock(&self.statistics_refresh_lock, "sqlite_statistics").await;
+        if self.maintenance_scan_in_progress().await? {
+            return Ok(SqliteStatisticsRefresh::SkippedBusy);
+        }
+        let has_items: i64 = self
+            .query_scalar("SELECT EXISTS(SELECT 1 FROM media_items)")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if has_items == 0 {
+            return Ok(SqliteStatisticsRefresh::SkippedEmpty);
+        }
+        let analyzed: i64 = self
+            .query_scalar(
+                "SELECT EXISTS(
+                     SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'sqlite_stat1')",
+            )
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if analyzed == 0 {
+            self.analyze_catalog().await?;
+            return Ok(SqliteStatisticsRefresh::Analyzed);
+        }
+        self.query("PRAGMA optimize")
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(SqliteStatisticsRefresh::Optimized)
+    }
+
+    /// Re-describes the catalog after a bulk change such as a completed scan or import.
+    ///
+    /// The periodic pass only runs `PRAGMA optimize`, which can leave a freshly scanned 60k-item
+    /// library without statistics until the next 15-minute tick. The planner then falls back to
+    /// fixed selectivity guesses and some catalog queries degrade by orders of magnitude
+    /// (measured: a per-library "latest" selection taking 14 s instead of 2 ms). This pass is
+    /// bounded by the same timeout and skips while a scan still owns the database.
+    pub async fn refresh_query_statistics_after_bulk_change(
+        &self,
+    ) -> Result<SqliteStatisticsRefresh, StorageError> {
+        if self.backend != DatabaseBackend::Sqlite {
+            return Ok(SqliteStatisticsRefresh::SkippedBackend);
+        }
+        let _refresh_guard =
+            acquire_write_lock(&self.statistics_refresh_lock, "sqlite_statistics").await;
+        if self.maintenance_scan_in_progress().await? {
+            return Ok(SqliteStatisticsRefresh::SkippedBusy);
+        }
+        let has_items: i64 = self
+            .query_scalar("SELECT EXISTS(SELECT 1 FROM media_items)")
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        if has_items == 0 {
+            return Ok(SqliteStatisticsRefresh::SkippedEmpty);
+        }
+        self.analyze_catalog().await?;
+        Ok(SqliteStatisticsRefresh::Analyzed)
+    }
+
+    /// Runs [`Self::refresh_query_statistics_after_bulk_change`] in the background after a scan.
+    pub fn spawn_bulk_change_statistics_refresh(&self) {
+        if !maintenance_enabled() {
+            return;
+        }
+        let database = self.clone();
+        tokio::spawn(async move {
+            match database.refresh_query_statistics_after_bulk_change().await {
+                Ok(outcome) => {
+                    tracing::debug!(?outcome, "post-scan query statistics refresh finished");
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "post-scan query statistics refresh failed");
+                }
+            }
+        });
+    }
+
+    async fn analyze_catalog(&self) -> Result<(), StorageError> {
+        let previous: Option<i64> = self
+            .query_scalar("PRAGMA analysis_limit")
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        self.query("PRAGMA analysis_limit = 0")
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        let analyzed = tokio::time::timeout(
+            SQLITE_ANALYZE_TIMEOUT,
+            self.query("ANALYZE").execute(&self.pool),
+        )
+        .await;
+        if let Some(limit) = previous {
+            // The connection goes back to the pool, so hand it over the way it was handed to us.
+            let restore = format!("PRAGMA analysis_limit = {limit}");
+            let _ = self
+                .query(sqlx::AssertSqlSafe(restore))
+                .execute(&self.pool)
+                .await;
+        }
+        match analyzed {
+            Ok(Ok(_)) => {
+                tracing::info!("analyzed sqlite catalog statistics for the first time");
+                Ok(())
+            }
+            Ok(Err(source)) => Err(StorageError::Sqlx {
                 path: self.path.clone(),
                 source,
-            })
+            }),
+            Err(_) => {
+                tracing::warn!(
+                    timeout_seconds = SQLITE_ANALYZE_TIMEOUT.as_secs(),
+                    "sqlite ANALYZE did not finish in time; keeping the statistics it wrote"
+                );
+                Ok(())
+            }
+        }
+    }
+
+    /// Keeps query statistics fresh between maintenance rounds.
+    ///
+    /// Separate from the space-reclaiming round on purpose: that one runs daily and skips whole
+    /// scans, while a fresh library needs statistics within minutes of its first scan.
+    pub fn spawn_query_statistics_refresh(&self) {
+        if !maintenance_enabled() {
+            tracing::info!("query statistics refresh disabled with database maintenance");
+            return;
+        }
+        let database = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(STATISTICS_REFRESH_INITIAL_DELAY).await;
+            let mut ticker = tokio::time::interval(STATISTICS_REFRESH_INTERVAL);
+            ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                ticker.tick().await;
+                if let Err(error) = database.refresh_query_statistics().await {
+                    tracing::warn!(%error, "refreshing query statistics failed");
+                }
+            }
+        });
+    }
+}
+
+/// `LUX_POSTGRES_QUERY_STATISTICS_EXTENSION` defaults to on; `0`, `false`, `off` and `no` opt out.
+pub(crate) fn resolve_query_statistics_extension_enabled(configured: Option<&str>) -> bool {
+    !matches!(
+        configured
+            .map(|value| value.trim().to_ascii_lowercase())
+            .as_deref(),
+        Some("0" | "false" | "off" | "no")
+    )
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum QueryStatisticsExtensionPlan {
+    Disabled,
+    /// Creating the extension without the preload would only make every query fail.
+    NotPreloaded,
+    AlreadyInstalled,
+    Create,
+}
+
+pub(crate) fn plan_query_statistics_extension(
+    enabled: bool,
+    preload_libraries: &str,
+    installed: bool,
+) -> QueryStatisticsExtensionPlan {
+    if !enabled {
+        QueryStatisticsExtensionPlan::Disabled
+    } else if installed {
+        QueryStatisticsExtensionPlan::AlreadyInstalled
+    } else if !super::database_diagnostics::shared_preload_contains_pg_stat_statements(
+        preload_libraries,
+    ) {
+        QueryStatisticsExtensionPlan::NotPreloaded
+    } else {
+        QueryStatisticsExtensionPlan::Create
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub(crate) enum QueryStatisticsExtensionOutcome {
+    NotApplicable,
+    Disabled,
+    NotPreloaded,
+    AlreadyInstalled,
+    Created,
+    Failed,
+}
+
+impl Database {
+    /// Installs `pg_stat_statements` in the business database when the server already preloads
+    /// it, so the administrator diagnostics can report query statistics without a manual step.
+    ///
+    /// Best effort: the extension needs a superuser on most servers, so a managed or external
+    /// PostgreSQL may refuse. A refusal is logged once and never affects startup.
+    pub(crate) async fn ensure_postgres_query_statistics_extension(
+        &self,
+    ) -> QueryStatisticsExtensionOutcome {
+        if self.backend != DatabaseBackend::Postgres {
+            return QueryStatisticsExtensionOutcome::NotApplicable;
+        }
+        let enabled = resolve_query_statistics_extension_enabled(
+            std::env::var(QUERY_STATISTICS_EXTENSION_ENV)
+                .ok()
+                .as_deref(),
+        );
+        let state = match self
+            .query_as::<(String, bool)>(
+                "SELECT current_setting('shared_preload_libraries')::TEXT,
+                        EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')",
+            )
+            .fetch_one(&self.pool)
+            .await
+        {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(%error, "could not inspect the pg_stat_statements configuration");
+                return QueryStatisticsExtensionOutcome::Failed;
+            }
+        };
+        match plan_query_statistics_extension(enabled, &state.0, state.1) {
+            QueryStatisticsExtensionPlan::Disabled => QueryStatisticsExtensionOutcome::Disabled,
+            QueryStatisticsExtensionPlan::NotPreloaded => {
+                tracing::info!(
+                    "pg_stat_statements is not in shared_preload_libraries; query statistics stay unavailable"
+                );
+                QueryStatisticsExtensionOutcome::NotPreloaded
+            }
+            QueryStatisticsExtensionPlan::AlreadyInstalled => {
+                QueryStatisticsExtensionOutcome::AlreadyInstalled
+            }
+            QueryStatisticsExtensionPlan::Create => {
+                match tokio::time::timeout(
+                    QUERY_STATISTICS_EXTENSION_TIMEOUT,
+                    self.query("CREATE EXTENSION IF NOT EXISTS pg_stat_statements")
+                        .execute(&self.pool),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        tracing::info!("created the pg_stat_statements extension");
+                        QueryStatisticsExtensionOutcome::Created
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            "could not create pg_stat_statements; ask a database superuser to run CREATE EXTENSION pg_stat_statements"
+                        );
+                        QueryStatisticsExtensionOutcome::Failed
+                    }
+                    Err(_) => {
+                        tracing::warn!("creating pg_stat_statements timed out");
+                        QueryStatisticsExtensionOutcome::Failed
+                    }
+                }
+            }
+        }
+    }
+
+    /// Runs [`Self::ensure_postgres_query_statistics_extension`] once in the background, independent
+    /// of the periodic maintenance schedule.
+    pub fn spawn_postgres_query_statistics_extension(&self) {
+        let database = self.clone();
+        tokio::spawn(async move {
+            database.ensure_postgres_query_statistics_extension().await;
+        });
     }
 }
 
@@ -492,6 +814,19 @@ impl Database {
             Ok(false) => {}
             Err(error) => {
                 tracing::warn!(%error, "database maintenance scan check failed");
+                return report;
+            }
+        }
+        match self.active_playback_in_progress().await {
+            Ok(true) => {
+                // Deferring costs nothing: the next round reclaims the same pages, and the client
+                // never sees its progress write fail against a VACUUM holding the write lock.
+                tracing::debug!("database maintenance deferred while a client is streaming");
+                return report;
+            }
+            Ok(false) => {}
+            Err(error) => {
+                tracing::warn!(%error, "database maintenance playback check failed");
                 return report;
             }
         }
@@ -623,5 +958,46 @@ mod tests {
             delay < interval,
             "first round must precede the daily cadence"
         );
+    }
+
+    #[test]
+    fn query_statistics_extension_is_created_only_when_preloaded_and_missing() {
+        use super::{QueryStatisticsExtensionPlan as Plan, plan_query_statistics_extension};
+        assert_eq!(
+            plan_query_statistics_extension(true, "pg_stat_statements", false),
+            Plan::Create
+        );
+        assert_eq!(
+            plan_query_statistics_extension(true, "auto_explain, \"pg_stat_statements\"", false),
+            Plan::Create
+        );
+        assert_eq!(
+            plan_query_statistics_extension(true, "pg_stat_statements", true),
+            Plan::AlreadyInstalled
+        );
+        // Without the preload the extension would exist but every query would fail.
+        assert_eq!(
+            plan_query_statistics_extension(true, "", false),
+            Plan::NotPreloaded
+        );
+        assert_eq!(
+            plan_query_statistics_extension(true, "auto_explain", false),
+            Plan::NotPreloaded
+        );
+        assert_eq!(
+            plan_query_statistics_extension(false, "pg_stat_statements", false),
+            Plan::Disabled
+        );
+    }
+
+    #[test]
+    fn query_statistics_extension_switch_defaults_on() {
+        use super::resolve_query_statistics_extension_enabled as resolve;
+        assert!(resolve(None));
+        assert!(resolve(Some("1")));
+        assert!(resolve(Some("yes please")));
+        for off in ["0", "false", "OFF", " no "] {
+            assert!(!resolve(Some(off)), "{off:?} must disable the extension");
+        }
     }
 }

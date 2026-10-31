@@ -8,6 +8,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AdminUserAccessRulesPanel } from "../src/features/admin/AdminUserAccessRulesPanel";
 import { AdminUserDetailPage, AdminUserSettingsPage } from "../src/features/admin/AdminUserManagementPage";
 import { ApiError, api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxOptions } from "./lux-select-helpers";
 import type { AdminUserAccessBlacklistRule, AdminUserAccessBlacklistRulesPage, AdminUserDevice, AdminUserDevicePage } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -160,11 +161,11 @@ describe("global user access blacklist settings", () => {
   }
 
   async function chooseRuleType(ruleType: string) {
-    await act(async () => setInput(container.querySelector<HTMLSelectElement>('[aria-label="规则类型"]')!, ruleType));
+    await chooseLuxOptionByValue(container, "规则类型", ruleType);
   }
 
   async function chooseDevice(deviceId: string) {
-    await act(async () => setInput(container.querySelector<HTMLSelectElement>('[aria-label="已记录设备"]')!, deviceId));
+    await chooseLuxOptionByValue(container, "已记录设备", deviceId);
   }
 
   async function setRuleValue(value: string) {
@@ -290,7 +291,7 @@ describe("global user access blacklist settings", () => {
     expect(api.adminUserAccessBlacklistRules).toHaveBeenCalledWith("user-42", 1, 20);
     expect(api.adminUserDevices).toHaveBeenCalledWith("user-42", 1, 100);
     expect(container.textContent).toContain("仅应用于此账号");
-    expect(container.querySelector('[aria-label="已记录设备"]')?.textContent).toContain("客厅电视");
+    expect((await luxOptions(container, "已记录设备")).some((option) => option.label.includes("客厅电视"))).toBe(true);
     expect(api.adminGlobalAccessBlacklistRules).not.toHaveBeenCalled();
     expect(api.adminUserAccessBlacklistRules).not.toHaveBeenCalledWith(expect.not.stringMatching(/^user-42$/u), expect.anything(), expect.anything());
   });
@@ -340,7 +341,7 @@ describe("global user access blacklist settings", () => {
     await act(async () => button("下一页").click());
     await waitForText("设备选项第 2 / 2 页");
     expect(api.adminUserDevices).toHaveBeenLastCalledWith("user-42", 2, 100);
-    expect(container.querySelector('[aria-label="已记录设备"]')?.textContent).toContain("书房电视");
+    expect((await luxOptions(container, "已记录设备")).some((option) => option.label.includes("书房电视"))).toBe(true);
   });
 
   it("does not offer a retry for duplicate-rule conflicts", async () => {
@@ -411,7 +412,7 @@ describe("global user access blacklist settings", () => {
     await act(async () => button("重新加载访问规则").click());
     await act(async () => button("重试读取设备").click());
     await waitForText("当前没有此用户的访问规则");
-    await waitForText("客厅电视");
+    await vi.waitFor(async () => expect((await luxOptions(container, "已记录设备")).some((option) => option.label.includes("客厅电视"))).toBe(true));
     expect(api.adminUserAccessBlacklistRules).toHaveBeenCalledTimes(2);
     expect(api.adminUserDevices).toHaveBeenCalledTimes(2);
   });

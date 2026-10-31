@@ -28,7 +28,6 @@ import type {
   AdminChapterDetectionJob,
   AdminDanmakuMatchJob,
   AdminLibraryCoverJob,
-  AdminLibraryDeletionJob,
   AdminJob,
   AdminLibrary,
   AdminMetadataReidentifyJob,
@@ -37,6 +36,7 @@ import type {
   AdminStrmProbeJob,
 } from "../../lib/api/types";
 import { formatAdminDate } from "./date";
+import { LuxButton, LuxIconButton, LuxSwitch, LuxTextField, useLuxConfirm } from "../../components/ui";
 
 type OperationsTab = "registered" | "runs" | "logs";
 type OperationsJob =
@@ -109,6 +109,57 @@ const AUDIT_EVENT_LABELS: Record<string, string> = {
   DANMAKU_MATCH_STARTED: "开始弹幕匹配",
   DANMAKU_MATCH_CANCEL_REQUESTED: "取消弹幕匹配",
   DANMAKU_MATCH_RETRIED: "重试弹幕匹配",
+  ADMIN_API_KEY_REVOKED: "吊销管理 API 密钥",
+  ADMIN_API_KEY_ROTATED: "轮换管理 API 密钥",
+  COLLECTION_REFRESHED: "刷新合集",
+  EMBY_MIGRATION_CREATED: "创建 Emby 迁移任务",
+  EMBY_REFRESH_STARTED: "开始 Emby 数据刷新",
+  IMAGE_DELETED: "删除图片",
+  IMAGE_SELECTED: "选择图片",
+  LIBRARY_ACCESS_MODE_UPDATED: "更新媒体库访问模式",
+  LIBRARY_DELETION_REQUESTED: "请求删除媒体库",
+  LIBRARY_DELETION_RETRIED: "重试删除媒体库",
+  LOCAL_METADATA_REFRESH_STARTED: "开始本地元数据刷新",
+  MEDIA_DELETED: "删除媒体",
+  MEDIA_ITEMS_MERGED: "合并媒体条目",
+  MEDIA_ITEM_UNMERGED: "拆分媒体条目",
+  METADATA_BATCH_CONFIRMED: "批量确认元数据",
+  METADATA_REIDENTIFY_CANCELLED: "取消元数据匹配",
+  PEOPLE_INDEX_REBUILD_CANCEL_REQUESTED: "取消人物索引重建",
+  PEOPLE_INDEX_REBUILD_QUEUED: "排队重建人物索引",
+  PERSON_FIELD_LOCKS_UPDATED: "更新人物字段锁定",
+  PERSON_IDENTITY_SPLIT: "拆分人物身份",
+  PERSON_MATCH_CONFIRMED: "确认人物匹配",
+  PERSON_MATCH_REJECTED: "拒绝人物匹配",
+  PERSON_MATCH_UNDONE: "撤销人物匹配",
+  PERSON_METADATA_EDITED: "编辑人物资料",
+  PLUGIN_ENABLED: "启用插件",
+  PLUGIN_STORE_UPDATED: "更新插件商店",
+  PLUGIN_UNINSTALLED: "卸载插件",
+  PLUGIN_UPDATED: "更新插件",
+  SCAN_PATH_STARTED: "开始扫描指定路径",
+  SUBTITLE_UPDATED: "更新字幕",
+  TRANSCODING_SESSION_STOPPED: "停止转码会话",
+  USER_ACCOUNT_PREFERENCES_COPIED: "复制用户账户偏好",
+  USER_CONTENT_RESTRICTIONS_UPDATED: "更新用户内容限制",
+  USER_DELETED: "删除用户",
+  USER_EMBY_LOGIN_SESSIONS_REVOKED: "注销用户全部 Emby 登录会话",
+  USER_EMBY_LOGIN_SESSION_REVOKED: "注销用户 Emby 登录会话",
+  USER_INVITATION_CREATED: "创建用户邀请",
+  USER_INVITATION_RESEND_QUEUED: "重发用户邀请",
+  USER_INVITATION_REVOKED: "撤销用户邀请",
+  USER_PERMISSION_GROUPS_COPIED: "复制用户权限组",
+  USER_PERMISSION_PRESET_APPLIED: "应用权限预设",
+  USER_PERMISSION_PRESET_CREATED: "创建权限预设",
+  USER_PERMISSION_PRESET_DELETED: "删除权限预设",
+  USER_PERMISSION_PRESET_UPDATED: "更新权限预设",
+  USER_PLAYBACK_POLICY_UPDATED: "更新用户播放策略",
+  USER_PLAYBACK_STOPPED: "停止用户播放",
+  USER_PURGED: "彻底清除用户",
+  USER_REGISTRATION_APPROVED: "通过注册申请",
+  USER_REGISTRATION_REJECTED: "拒绝注册申请",
+  USER_RESTORED: "恢复用户",
+  USER_SESSION_REVOKED: "注销用户会话",
 };
 
 const ERROR_LABELS: Record<string, string> = {
@@ -155,7 +206,6 @@ export function AdminOperationsPage() {
   const [logExportSuccess, setLogExportSuccess] = useState(false);
   const [taskPage, setTaskPage] = useState(1);
   const [taskPlanPage, setTaskPlanPage] = useState(1);
-  const [libraryDeletionPage, setLibraryDeletionPage] = useState(1);
   const [taskPlanSearch, setTaskPlanSearch] = useState("");
   const [creatingPlan, setCreatingPlan] = useState(false);
   const tasks = useQuery({
@@ -206,13 +256,6 @@ export function AdminOperationsPage() {
     enabled: !isMetadataOnlyJobStatus(status),
     refetchInterval: 5_000,
   });
-  const libraryDeletionJobs = useQuery({
-    queryKey: queryKeys.adminLibraryDeletionJobs(libraryDeletionStatusFilter(status), libraryDeletionPage),
-    queryFn: () => api.adminLibraryDeletionJobs(libraryDeletionStatusFilter(status), libraryDeletionPage),
-    enabled: tab === "runs",
-    refetchInterval: tab === "runs" ? 5_000 : false,
-    retry: false,
-  });
   const logs = useQuery({ queryKey: queryKeys.adminLogs, queryFn: () => api.adminLogs() });
   const cancel = useMutation({
     mutationFn: (jobId: string) => api.cancelAdminJob(jobId),
@@ -259,10 +302,6 @@ export function AdminOperationsPage() {
   const retryDanmaku = useMutation({
     mutationFn: (jobId: string) => api.retryDanmakuMatch(jobId),
     onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "danmaku-match-jobs"] }),
-  });
-  const retryLibraryDeletion = useMutation({
-    mutationFn: (jobId: string) => api.retryAdminLibraryDeletion(jobId),
-    onSuccess: () => void queryClient.invalidateQueries({ queryKey: ["admin", "library-deletion-jobs"] }),
   });
 
   const jobItems: OperationsJob[] = [
@@ -397,23 +436,12 @@ export function AdminOperationsPage() {
       ) : null}
       {tab === "runs" ? (
         runtimeLoading ? <AdminOperationsState label="正在读取运行记录…" /> : <>
-        <LibraryDeletionJobsSection
-          jobs={libraryDeletionJobs.data?.jobs ?? []}
-          page={libraryDeletionJobs.data?.page ?? libraryDeletionPage}
-          pageSize={libraryDeletionJobs.data?.pageSize ?? 20}
-          total={libraryDeletionJobs.data?.total ?? 0}
-          loading={libraryDeletionJobs.isLoading}
-          error={libraryDeletionJobs.error?.message || retryLibraryDeletion.error?.message}
-          retrying={retryLibraryDeletion.isPending}
-          onPageChange={setLibraryDeletionPage}
-          onRetry={(jobId) => retryLibraryDeletion.mutate(jobId)}
-        />
         <RunsSection
           jobs={jobItems}
           libraryNames={libraryNames}
           libraryKinds={libraryKinds}
           status={status}
-          onStatusChange={(nextStatus) => { setStatus(nextStatus); setLibraryDeletionPage(1); }}
+          onStatusChange={setStatus}
           onCancel={(job) => job.kind === "cover" ? undefined : job.kind === "metadata" ? cancelMetadata.mutate(job.id) : job.kind === "strm" ? cancelStrm.mutate(job.id) : job.kind === "chapter" ? cancelChapter.mutate(job.id) : job.kind === "danmaku" ? cancelDanmaku.mutate(job.id) : cancel.mutate(job.id)}
           onRetry={(job) => job.kind === "cover" ? undefined : job.kind === "metadata" ? retryMetadata.mutate(job.id) : job.kind === "strm" ? retryStrm.mutate(job.id) : job.kind === "chapter" ? retryChapter.mutate(job.id) : job.kind === "danmaku" ? retryDanmaku.mutate(job.id) : retry.mutate(job.id)}
           busy={cancel.isPending || cancelMetadata.isPending || cancelStrm.isPending || cancelChapter.isPending || cancelDanmaku.isPending || retry.isPending || retryMetadata.isPending || retryStrm.isPending || retryChapter.isPending || retryDanmaku.isPending}
@@ -423,6 +451,7 @@ export function AdminOperationsPage() {
       {tab === "logs" ? (
         logsLoading ? <AdminOperationsState label="正在读取系统日志…" /> : <LogsSection
           logs={logItems}
+          libraryNames={libraryNames}
           level={logLevel}
           search={logSearch}
           onLevelChange={setLogLevel}
@@ -507,12 +536,12 @@ function RegisteredPlansSection({
         <div className="lux-registered-plans-tools">
           <label className="lux-registered-plans-search">
             <span className="lux-sr-only">搜索执行计划或媒体库</span>
-            <input aria-label="搜索执行计划或媒体库" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索计划或媒体库" />
+            <LuxTextField aria-label="搜索执行计划或媒体库" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索计划或媒体库" />
           </label>
-          <button className="lux-button lux-button-primary lux-button-compact" type="button" onClick={() => onCreatingChange(!creating)}>
+          <LuxButton tone="primary" size="compact" type="button" onClick={() => onCreatingChange(!creating)}>
             {creating ? <X size={15} /> : <Plus size={15} />}
             {creating ? "取消新建" : "新建执行计划"}
-          </button>
+          </LuxButton>
         </div>
       </div>
       {creating ? <ScheduledTaskPlanEditor libraries={libraries} onSaved={() => { onCreatingChange(false); onRefresh(); }} onCancel={() => onCreatingChange(false)} /> : null}
@@ -550,6 +579,7 @@ function RegisteredPlansEmpty({ creating }: { creating: boolean }) {
 }
 
 function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: AdminScheduledTaskPlan; libraries: AdminLibrary[]; onSaved: () => void; onDeleted: () => void }) {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [editing, setEditing] = useState(false);
   const [schedule, setSchedule] = useState(plan.schedule ?? "");
@@ -599,8 +629,8 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: A
     mutationFn: () => api.deleteAdminScheduledTaskPlan(plan.id),
     onSuccess: onDeleted,
   });
-  const handleDelete = () => {
-    if (!window.confirm(`删除“${name}”后，${knownLibraries} 个媒体库将回到默认计划，并恢复默认 Cron 和启停状态。确定删除吗？`)) {
+  const handleDelete = async () => {
+    if (!(await confirm(`删除“${name}”后，${knownLibraries} 个媒体库将回到默认计划，并恢复默认 Cron 和启停状态。确定删除吗？`))) {
       return;
     }
     deletePlan.mutate();
@@ -620,14 +650,14 @@ function ScheduledTaskPlanRow({ plan, libraries, onSaved, onDeleted }: { plan: A
         <div className="lux-registered-task-meta"><span>{globalPlan ? "全局插件计划" : `${knownLibraries} 个媒体库`}</span><span>{plan.isDefault ? "默认计划" : "自定义计划"}</span>{plan.sourceType === "PLUGIN" ? <span>插件注册{plan.pluginId ? ` · ${plan.pluginId}` : ""}</span> : <span>系统注册</span>}</div>
         {globalPlan ? null : <div className="lux-registered-plan-libraries">{(plan.libraries ?? []).map((library) => <span key={library.id}>{library.name}</span>)}</div>}
         {editing ? <form className="lux-registered-task-editor lux-registered-plan-editor" onSubmit={(event) => { event.preventDefault(); update.mutate(); }}>
-          <label htmlFor={`plan-schedule-${plan.id}`}>Cron 执行计划<input id={`plan-schedule-${plan.id}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={!globalPlan} /></label>
-          {globalPlan ? null : <><label className="lux-admin-toggle" htmlFor={`plan-enabled-${plan.id}`}><input id={`plan-enabled-${plan.id}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此计划</span></label><PlanLibraryPicker libraries={libraries} selectedIds={libraryIds} onChange={setLibraryIds} /></>}
-          <div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑执行计划" onClick={() => setEditing(false)}><X size={16} /></button></div>
+          <label htmlFor={`plan-schedule-${plan.id}`}>Cron 执行计划<LuxTextField id={`plan-schedule-${plan.id}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={!globalPlan} /></label>
+          {globalPlan ? null : <><LuxSwitch className="lux-admin-toggle" id={`plan-enabled-${plan.id}`} checked={enabled} onChange={(event) => setEnabled(event.target.checked)} label="启用此计划" /><PlanLibraryPicker libraries={libraries} selectedIds={libraryIds} onChange={setLibraryIds} /></>}
+          <div className="lux-registered-task-editor-actions"><LuxButton tone="secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</LuxButton><LuxIconButton className="lux-icon-button-small" type="button" aria-label="取消编辑执行计划" onClick={() => setEditing(false)}><X size={16} /></LuxIconButton></div>
           <small className="lux-registered-task-editor-help">标准五段式：分 时 日 月 周，按 UTC 执行。全量校验触发后按媒体库进入全局扫描队列，同一时刻只执行一个全量扫描。</small>
           {update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}
         </form> : <span className="lux-registered-task-schedule">{plan.schedule || "尚未配置执行计划"}</span>}
       </div>
-      {!editing ? <div className="lux-registered-task-actions"><button className="lux-button lux-button-compact lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending || deletePlan.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button><button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing} disabled={deletePlan.isPending}><Pencil size={15} /></button>{canDelete ? <button className="lux-icon-button lux-icon-button-small lux-danger-icon" type="button" aria-label={`删除${name}`} onClick={handleDelete} disabled={deletePlan.isPending} title="删除执行计划"><Trash2 size={15} /></button> : null}</div> : null}
+      {!editing ? <div className="lux-registered-task-actions"><LuxButton tone="secondary" size="compact" className="lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending || deletePlan.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</LuxButton><LuxIconButton className="lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing} disabled={deletePlan.isPending}><Pencil size={15} /></LuxIconButton>{canDelete ? <LuxIconButton danger className="lux-icon-button-small" type="button" aria-label={`删除${name}`} onClick={handleDelete} disabled={deletePlan.isPending} title="删除执行计划"><Trash2 size={15} /></LuxIconButton> : null}</div> : null}
       {runNow.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{runNow.error.message}</p> : null}
       {deletePlan.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{deletePlan.error.message}</p> : null}
     </article>
@@ -647,13 +677,13 @@ function ScheduledTaskPlanEditor({ libraries, onSaved, onCancel }: { libraries: 
   return <form className="lux-registered-plan-create" onSubmit={(event) => { event.preventDefault(); create.mutate(); }}>
     <div className="lux-registered-plan-create-grid">
       <label>任务类型<LuxSelect value={taskType} options={SCHEDULE_TASK_TYPE_OPTIONS.map(([value, label]) => ({ value, label }))} onChange={setTaskType} aria-label="执行计划任务类型" /></label>
-      <label>计划名称<input value={name} onChange={(event) => setName(event.target.value)} maxLength={128} placeholder="例如 夜间校验" required /></label>
-      <label> Cron 执行计划<input value={schedule} onChange={(event) => setSchedule(event.target.value)} maxLength={128} placeholder="例如 0 3 * * *" /></label>
-      <label className="lux-admin-toggle lux-registered-plan-enabled"><input type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>创建后启用</span></label>
+      <label>计划名称<LuxTextField value={name} onChange={(event) => setName(event.target.value)} maxLength={128} placeholder="例如 夜间校验" required /></label>
+      <label> Cron 执行计划<LuxTextField value={schedule} onChange={(event) => setSchedule(event.target.value)} maxLength={128} placeholder="例如 0 3 * * *" /></label>
+      <LuxSwitch className="lux-admin-toggle lux-registered-plan-enabled" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} label="创建后启用" />
     </div>
     <PlanLibraryPicker libraries={libraries} selectedIds={libraryIds} onChange={setLibraryIds} />
     {create.error ? <p className="lux-error-copy" role="alert">{create.error.message}</p> : null}
-    <div className="lux-registered-plan-create-actions"><button className="lux-button lux-button-primary" type="submit" disabled={create.isPending}>{create.isPending ? "创建中…" : "创建执行计划"}</button><button className="lux-button lux-button-secondary" type="button" onClick={onCancel}>取消</button></div>
+    <div className="lux-registered-plan-create-actions"><LuxButton tone="primary" type="submit" disabled={create.isPending}>{create.isPending ? "创建中…" : "创建执行计划"}</LuxButton><LuxButton tone="secondary" type="button" onClick={onCancel}>取消</LuxButton></div>
   </form>;
 }
 
@@ -769,102 +799,15 @@ function RegisteredTaskRow({ task, onSaved }: { task: AdminScheduledTask; onSave
         <div className="lux-registered-task-heading"><strong>{name}</strong><span className={`lux-registered-task-status ${task.isEnabled && configured ? "is-enabled" : configured ? "is-disabled" : "is-unconfigured"}`}>{stateLabel}</span></div>
         <p>{task.description || "由后台注册的任务。"}</p>
         <div className="lux-registered-task-meta"><span>{task.ownerName || (task.ownerType === "GLOBAL" ? "全局" : "指定媒体库")}</span><span>{task.sourceType === "PLUGIN" ? `插件注册${task.pluginId ? ` · ${task.pluginId}` : ""}` : "系统注册"}</span><code>{task.taskType}</code></div>
-        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>Cron 执行计划<input id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={pluginSchedule} /></label>{pluginSchedule ? null : <label className="lux-admin-toggle" htmlFor={`enabled-${task.id ?? task.taskType}`}><input id={`enabled-${task.id ?? task.taskType}`} type="checkbox" checked={enabled} onChange={(event) => setEnabled(event.target.checked)} /><span>启用此任务</span></label>}<div className="lux-registered-task-editor-actions"><button className="lux-button lux-button-secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</button><button className="lux-icon-button lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></button></div><small className="lux-registered-task-editor-help">标准五段式：分 时 日 月 周，按 UTC 执行</small>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
+        {editing ? <form className="lux-registered-task-editor" onSubmit={submit}><label htmlFor={`schedule-${task.id ?? task.taskType}`}>Cron 执行计划<LuxTextField id={`schedule-${task.id ?? task.taskType}`} value={schedule} onChange={(event) => setSchedule(event.target.value)} placeholder="例如 0 3 * * *" maxLength={128} required={pluginSchedule} /></label>{pluginSchedule ? null : <LuxSwitch className="lux-admin-toggle" id={`enabled-${task.id ?? task.taskType}`} checked={enabled} onChange={(event) => setEnabled(event.target.checked)} label="启用此任务" />}<div className="lux-registered-task-editor-actions"><LuxButton tone="secondary" type="submit" disabled={update.isPending}><Save size={15} />{update.isPending ? "保存中…" : "保存"}</LuxButton><LuxIconButton className="lux-icon-button-small" type="button" aria-label="取消编辑任务" onClick={() => setEditing(false)}><X size={16} /></LuxIconButton></div><small className="lux-registered-task-editor-help">标准五段式：分 时 日 月 周，按 UTC 执行</small>{update.error ? <p className="lux-error-copy" role="alert">{update.error.message}</p> : null}</form> : <span className="lux-registered-task-schedule">{task.schedule || "尚未配置执行计划"}</span>}
       </div>
       {!editing ? <div className="lux-registered-task-actions">
-        {canRunNow ? <button className="lux-button lux-button-compact lux-button-secondary lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</button> : null}
-        {canEdit ? <button className="lux-icon-button lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing}><Pencil size={15} /></button> : null}
+        {canRunNow ? <LuxButton tone="secondary" size="compact" className="lux-registered-task-run" type="button" aria-label={`立即执行${name}`} onClick={() => runNow.mutate()} disabled={runNow.isPending}><Play size={14} />{runNow.isPending ? "执行中…" : "立即执行"}</LuxButton> : null}
+        {canEdit ? <LuxIconButton className="lux-icon-button-small lux-registered-task-edit" type="button" aria-label={`编辑${name}`} onClick={beginEditing}><Pencil size={15} /></LuxIconButton> : null}
       </div> : null}
       {runNow.error ? <p className="lux-error-copy lux-registered-task-error" role="alert">{runNow.error.message}</p> : null}
     </article>
   );
-}
-
-function LibraryDeletionJobsSection({
-  jobs,
-  page,
-  pageSize,
-  total,
-  loading,
-  error,
-  retrying,
-  onPageChange,
-  onRetry,
-}: {
-  jobs: AdminLibraryDeletionJob[];
-  page: number;
-  pageSize: number;
-  total: number;
-  loading: boolean;
-  error?: string;
-  retrying: boolean;
-  onPageChange: (page: number) => void;
-  onRetry: (jobId: string) => void;
-}) {
-  return <section className="lux-admin-panel lux-operations-section" aria-labelledby="library-deletion-jobs-title">
-    <div className="lux-operations-section-heading"><div><span className="lux-eyebrow">后台清理</span><h2 id="library-deletion-jobs-title">媒体库删除</h2><p>媒体库已立即从可用列表移除；数据库内容在后台分批清理，原媒体文件会保留。</p></div></div>
-    {error ? <p className="lux-error-copy" role="alert">{error}</p> : null}
-    {loading ? <AdminOperationsState label="正在读取媒体库删除任务…" /> : error ? <AdminOperationsState label={error} error /> : jobs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无媒体库删除任务</strong><p>确认删除媒体库后，后台进度会显示在这里。</p></div></div> : <div className="lux-admin-job-list">{jobs.map((job) => <LibraryDeletionJobRow key={job.id} job={job} retrying={retrying} onRetry={() => onRetry(job.id)} />)}</div>}
-    {!loading && total > pageSize ? <Pagination page={page} pageSize={pageSize} total={total} onPageChange={onPageChange} /> : null}
-  </section>;
-}
-
-function LibraryDeletionJobRow({ job, retrying, onRetry }: { job: AdminLibraryDeletionJob; retrying: boolean; onRetry: () => void }) {
-  const active = job.status === "PENDING" || job.status === "RUNNING";
-  const retryable = job.status === "FAILED" || job.status === "CANCELLED";
-  const message = job.errorCode ? libraryDeletionErrorLabel(job.errorCode) : null;
-  return <article className="lux-admin-job-row">
-    <div className={`lux-job-icon${active ? " is-active" : ""}`}>{job.status === "FAILED" ? <AlertTriangle size={17} /> : job.status === "COMPLETED" ? <CheckCircle2 size={17} /> : <FileClock size={17} />}</div>
-    <div className="lux-admin-job-main">
-      <div className="lux-admin-job-heading"><strong>{job.libraryName}</strong><span className={`lux-job-status status-${job.status.toLowerCase()}`}>{libraryDeletionStatusLabel(job.status)}</span></div>
-      <div className="lux-admin-job-meta"><span className="lux-admin-job-context">{job.status === "PENDING" ? "等待后台处理" : libraryDeletionStageLabel(job.stage)}</span></div>
-      {message ? <div className="lux-admin-job-error" role="alert"><strong>{message}</strong><code>{job.errorCode}</code></div> : null}
-      <time className="lux-admin-job-finished-at">{active ? `最近更新：${formatAdminDate(job.updatedAt)}` : `完成时间：${job.finishedAt == null ? "—" : formatAdminDate(job.finishedAt)}`}</time>
-    </div>
-    <div className="lux-admin-job-actions">{retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={`重试删除媒体库“${job.libraryName}”`} onClick={onRetry} disabled={retrying}><RotateCcw size={15} /></button> : null}</div>
-  </article>;
-}
-
-function libraryDeletionStatusLabel(status: AdminLibraryDeletionJob["status"]) {
-  switch (status) {
-    case "PENDING": return "等待中";
-    case "RUNNING": return "清理中";
-    case "COMPLETED": return "已删除";
-    case "FAILED": return "失败";
-    case "CANCELLED": return "已暂停";
-    default: return "处理中";
-  }
-}
-
-function libraryDeletionStageLabel(stage: string) {
-  switch (stage) {
-    case "CANCELLING_SCANS": return "正在停止扫描任务";
-    case "MEDIA_ITEMS": return "正在清理媒体条目";
-    case "FILESYSTEM_ENTRIES": return "正在清理文件索引";
-    case "STRM_PROBE_JOBS": return "正在清理 STRM 探测任务";
-    case "SCAN_JOB_DATA": return "正在清理扫描数据";
-    case "SCAN_JOBS": return "正在清理扫描任务";
-    case "FINALIZING": return "正在完成删除";
-    case "COMPLETED": return "删除完成";
-    default: return "正在后台清理";
-  }
-}
-
-function libraryDeletionErrorLabel(errorCode: string) {
-  switch (errorCode) {
-    case "SERVER_SHUTDOWN": return "服务重启后任务已暂停，可重试继续清理。";
-    case "SCAN_CANCEL_TIMEOUT": return "等待扫描停止超时，可重试清理。";
-    case "SCAN_SHUTDOWN_FAILED": return "停止扫描任务失败，可重试清理。";
-    case "DATABASE_ERROR": return "数据库清理失败，可重试。";
-    case "PLUGIN_CLEANUP_FAILED": return "插件配置清理失败，可重试。";
-    case "INVALID_LIBRARY_ID": return "删除任务中的媒体库 ID 无效，请联系管理员。";
-    case "LIBRARY_RECORD_MISSING": return "媒体库记录已不存在，任务无法完成。";
-    default: return "删除任务未完成，可重试；错误码：" + errorCode;
-  }
-}
-
-function libraryDeletionStatusFilter(status: string) {
-  return ["PENDING", "RUNNING", "COMPLETED", "FAILED", "CANCELLED"].includes(status) ? status : undefined;
 }
 
 function RunsSection({
@@ -891,6 +834,7 @@ function RunsSection({
 
 function LogsSection({
   logs,
+  libraryNames,
   level,
   search,
   onLevelChange,
@@ -905,6 +849,7 @@ function LogsSection({
   exportSuccess,
 }: {
   logs: AdminAuditEvent[];
+  libraryNames: ReadonlyMap<string, string>;
   level: string;
   search: string;
   onLevelChange: (level: string) => void;
@@ -923,23 +868,68 @@ function LogsSection({
     <div className="lux-log-export-panel">
       <div className="lux-log-export-copy"><CalendarDays size={18} /><div><strong>导出运行日志</strong><span>单日下载原始 .log 文件，跨日自动打包 ZIP，最多选择 31 天。</span></div></div>
       <div className="lux-log-export-controls">
-        <label>起始日期<input aria-label="日志起始日期" type="date" value={exportFrom} onChange={(event) => onExportFromChange(event.target.value)} /></label>
-        <label>结束日期<input aria-label="日志结束日期" type="date" value={exportTo} onChange={(event) => onExportToChange(event.target.value)} /></label>
-        <button className="lux-button lux-button-secondary" type="button" aria-label={exportFrom === exportTo ? "导出日志文件" : "导出日志 ZIP"} onClick={onExport} disabled={exporting}><Download size={15} />{exporting ? "准备中…" : exportFrom === exportTo ? "导出日志文件" : "导出日志 ZIP"}</button>
+        <label>起始日期<LuxTextField aria-label="日志起始日期" type="date" value={exportFrom} onChange={(event) => onExportFromChange(event.target.value)} /></label>
+        <label>结束日期<LuxTextField aria-label="日志结束日期" type="date" value={exportTo} onChange={(event) => onExportToChange(event.target.value)} /></label>
+        <LuxButton tone="secondary" type="button" aria-label={exportFrom === exportTo ? "导出日志文件" : "导出日志 ZIP"} onClick={onExport} disabled={exporting}><Download size={15} />{exporting ? "准备中…" : exportFrom === exportTo ? "导出日志文件" : "导出日志 ZIP"}</LuxButton>
       </div>
       {exportError ? <p className="lux-error-copy" role="alert">{exportError}</p> : null}
       {exportSuccess ? <p className="lux-log-export-success" role="status">日志已导出。</p> : null}
     </div>
-    <div className="lux-operations-log-toolbar"><input aria-label="搜索系统日志" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索事件、操作者或对象" /><LuxSelect value={level} options={[{ value: "", label: "全部级别" }, { value: "INFO", label: "信息" }, { value: "WARN", label: "警告" }, { value: "ERROR", label: "错误" }]} onChange={onLevelChange} aria-label="日志级别" /></div>
-    <div className="lux-admin-log-list">{logs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无日志</strong><p>系统产生管理员事件后，会在这里保留脱敏记录。</p></div></div> : logs.map((log) => <LogRow key={log.id} log={log} />)}</div>
+    <div className="lux-operations-log-toolbar"><LuxTextField aria-label="搜索系统日志" type="search" value={search} onChange={(event) => onSearchChange(event.target.value)} placeholder="搜索事件、操作者或对象" /><LuxSelect value={level} options={[{ value: "", label: "全部级别" }, { value: "INFO", label: "信息" }, { value: "WARN", label: "警告" }, { value: "ERROR", label: "错误" }]} onChange={onLevelChange} aria-label="日志级别" /></div>
+    <div className="lux-admin-log-list">{logs.length === 0 ? <div className="lux-operations-empty" role="status"><span className="lux-operations-empty-icon"><Inbox size={22} /></span><div><strong>暂无日志</strong><p>系统产生管理员事件后，会在这里保留脱敏记录。</p></div></div> : logs.map((log) => <LogRow key={log.id} log={log} libraryNames={libraryNames} />)}</div>
   </section>;
 }
 
-function LogRow({ log }: { log: AdminAuditEvent }) {
+function LogRow({ log, libraryNames }: { log: AdminAuditEvent; libraryNames: ReadonlyMap<string, string> }) {
   const [open, setOpen] = useState(false);
   const level = auditLevel(log);
-  const metadata = log.metadata && Object.keys(log.metadata).length > 0 ? JSON.stringify(log.metadata, null, 2) : "";
-  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{log.targetId ? ` · ${log.targetId}` : ""}</p>{open && metadata ? <pre>{metadata}</pre> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadata ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</button> : null}</article>;
+  const metadataRows = formatAuditMetadata(log.metadata ?? {}, libraryNames);
+  const targetName = log.targetType === "library" && log.targetId ? libraryNames.get(log.targetId) ?? log.targetId : log.targetId;
+  return <article className={`lux-operations-log-row is-${level.toLowerCase()}`}><span className="lux-operations-log-level">{level}</span><div className="lux-operations-log-copy"><strong>{formatAuditEvent(log.eventType)}</strong><p>{log.actorUsername || "系统"}{log.targetType ? ` · ${formatTargetType(log.targetType)}` : ""}{targetName ? ` · ${targetName}` : ""}</p>{open && metadataRows.length > 0 ? <ul className="lux-operations-log-details">{metadataRows.map((row) => <li key={row.key}><span>{row.label}</span><strong>{row.value}</strong></li>)}</ul> : null}</div><time>{formatAdminDate(log.createdAt)}</time>{metadataRows.length > 0 ? <LuxIconButton className="lux-icon-button-small" type="button" aria-expanded={open} aria-label={open ? "收起日志详情" : "展开日志详情"} onClick={() => setOpen((current) => !current)}>{open ? <X size={15} /> : <FileClock size={15} />}</LuxIconButton> : null}</article>;
+}
+
+const AUDIT_METADATA_LABELS: Record<string, string> = {
+  libraryId: "媒体库",
+  pluginId: "插件",
+  jobId: "任务",
+  newJobId: "新任务",
+  jobCount: "任务数",
+  itemId: "条目",
+  itemCount: "条目数",
+  fileCount: "文件数",
+  sourceCount: "来源数",
+  setId: "合集",
+  mode: "模式",
+  scope: "范围",
+  kind: "类型",
+  transcodingEnabled: "转码已启用",
+  transcodingPreset: "转码预设",
+  processed: "已处理",
+  discovered: "已发现",
+  generated: "已生成",
+  reused: "已复用",
+  considered: "已考虑",
+  failed: "失败",
+  skipped: "跳过",
+  elapsedMs: "耗时（毫秒）",
+};
+
+type AuditMetadataRow = { key: string; label: string; value: string };
+
+function formatAuditMetadata(metadata: Record<string, unknown>, libraryNames: ReadonlyMap<string, string>): AuditMetadataRow[] {
+  return Object.entries(metadata).map(([key, value]) => ({
+    key,
+    label: AUDIT_METADATA_LABELS[key] ?? key,
+    value: formatAuditMetadataValue(key, value, libraryNames),
+  }));
+}
+
+function formatAuditMetadataValue(key: string, value: unknown, libraryNames: ReadonlyMap<string, string>): string {
+  if (key === "libraryId" && typeof value === "string") return libraryNames.get(value) ?? value;
+  if (typeof value === "boolean") return value ? "是" : "否";
+  if (Array.isArray(value)) return value.map(String).join("、");
+  if (value !== null && typeof value === "object") return JSON.stringify(value);
+  return String(value ?? "");
 }
 
 function OperationsStat({ label, value, detail, icon, tone = "default" }: { label: string; value: number; detail: string; icon: ReactNode; tone?: "default" | "warn" }) {
@@ -963,7 +953,7 @@ function OperationsTabButton({ active, label, count, onClick }: { active: boolea
 
 function Pagination({ page, pageSize, total, onPageChange }: { page: number; pageSize: number; total: number; onPageChange: (page: number) => void }) {
   const totalPages = Math.max(1, Math.ceil(total / pageSize));
-  return <div className="lux-admin-pagination"><span>第 {page} / {totalPages} 页，共 {total} 项</span><div><button className="lux-button lux-button-secondary" type="button" onClick={() => onPageChange(Math.max(1, page - 1))} disabled={page === 1}>上一页</button><button className="lux-button lux-button-secondary" type="button" onClick={() => onPageChange(Math.min(totalPages, page + 1))} disabled={page === totalPages}>下一页</button></div></div>;
+  return <div className="lux-admin-pagination"><span>第 {page} / {totalPages} 页，共 {total} 项</span><div><LuxButton tone="secondary" type="button" onClick={() => onPageChange(Math.max(1, page - 1))} disabled={page === 1}>上一页</LuxButton><LuxButton tone="secondary" type="button" onClick={() => onPageChange(Math.min(totalPages, page + 1))} disabled={page === totalPages}>下一页</LuxButton></div></div>;
 }
 
 function JobRow({ job, libraryNames, libraryKinds, onCancel, onRetry, busy }: { job: OperationsJob; libraryNames: ReadonlyMap<string, string>; libraryKinds: ReadonlyMap<string, AdminLibrary["kind"]>; onCancel: () => void; onRetry: () => void; busy: boolean }) {
@@ -1078,8 +1068,8 @@ function JobRow({ job, libraryNames, libraryKinds, onCancel, onRetry, busy }: { 
     <div className="lux-admin-job-actions">
       {postprocessingIssues ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}扫描后处理原因`} onClick={() => setDetailsOpen((open) => !open)}>{detailsOpen ? "收起原因" : "查看原因"}<ChevronDown size={14} /></button> : null}
       {job.kind === "metadata" ? <button className="lux-admin-job-details-toggle" type="button" aria-expanded={detailsOpen} aria-label={`${detailsOpen ? "收起" : "查看"}${jobLabel}问题详情`} onClick={() => setDetailsOpen((open) => !open)}>详情<ChevronDown size={14} /></button> : null}
-      {cancellable && job.kind !== "cover" ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></button> : null}
-      {retryable ? <button className="lux-icon-button lux-icon-button-small" type="button" aria-label="重试任务" onClick={() => { setDetailsOpen(false); onRetry(); }} disabled={busy}><RotateCcw size={15} /></button> : null}
+      {cancellable && job.kind !== "cover" ? <LuxIconButton className="lux-icon-button-small" type="button" aria-label={cancelling ? "正在取消任务" : "取消任务"} onClick={onCancel} disabled={busy || cancelling}><StopCircle size={15} /></LuxIconButton> : null}
+      {retryable ? <LuxIconButton className="lux-icon-button-small" type="button" aria-label="重试任务" onClick={() => { setDetailsOpen(false); onRetry(); }} disabled={busy}><RotateCcw size={15} /></LuxIconButton> : null}
     </div>
   </article>;
 }
@@ -1188,7 +1178,7 @@ function formatJobDuration(job: OperationsJob) {
 }
 
 function formatAuditEvent(eventType: string) {
-  return AUDIT_EVENT_LABELS[eventType] || "系统操作记录";
+  return AUDIT_EVENT_LABELS[eventType] || eventType;
 }
 
 function formatTargetType(targetType: string) {
@@ -1201,13 +1191,39 @@ function formatTargetType(targetType: string) {
     user: "用户",
     plugin: "插件",
     scheduled_task: "注册任务",
+    item: "媒体条目",
+    items: "媒体条目",
+    media_items: "媒体条目",
+    metadata_items: "媒体条目",
+    item_image: "图片",
+    media_stream: "媒体流",
+    user_permission_preset: "权限预设",
+    user_invitation: "用户邀请",
+    user_registration_request: "注册申请",
+    user_library_access: "用户媒体库权限",
+    registration_settings: "注册设置",
+    person: "人物",
+    person_match_candidate: "人物匹配候选",
+    danmaku_match_job: "弹幕任务",
+    chapter_detection_job: "片头片尾任务",
+    strm_probe_job: "STRM任务",
+    admin_api_key: "管理 API 密钥",
+    web_session: "网页会话",
+    transcoding_session: "转码会话",
+    playback_session: "播放会话",
+    scheduled_task_plan: "执行计划",
+    plugin_store: "插件商店",
+    library_root: "媒体库路径",
+    library_deletion_job: "媒体库删除任务",
+    emby_migration_job: "Emby 迁移任务",
+    emby_login_session: "Emby 登录会话",
   };
-  return labels[targetType] || "系统对象";
+  return labels[targetType] || targetType;
 }
 
 function auditLevel(log: AdminAuditEvent) {
   if (/FAILED|ERROR|DENIED/.test(log.eventType)) return "ERROR";
-  if (/CANCELLED|DISABLED/.test(log.eventType)) return "WARN";
+  if (/CANCEL|DISABLED|REJECTED|REVOKED|STOPPED|DELETED|PURGED|UNINSTALLED|UNDONE/.test(log.eventType)) return "WARN";
   return "INFO";
 }
 

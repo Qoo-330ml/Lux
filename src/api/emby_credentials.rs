@@ -97,6 +97,14 @@ pub(super) async fn normalize_credentials(mut request: Request<Body>, next: Next
         Err(status) => return status.into_response(),
     };
     if let Some(token) = token {
+        // A playback-only token can appear in a media URL, which ends up in browser history and
+        // proxy logs. It therefore resolves only on the playback allow-list, and only after every
+        // route-level transformation (mounting, case folding) has settled.
+        if crate::auth::emby::is_playback_token(&token)
+            && !playback_token_may_call(&token, request.uri().path())
+        {
+            return StatusCode::UNAUTHORIZED.into_response();
+        }
         let Ok(value) = HeaderValue::from_str(&token) else {
             return StatusCode::UNAUTHORIZED.into_response();
         };
@@ -120,6 +128,101 @@ pub(super) async fn normalize_credentials(mut request: Request<Body>, next: Next
     };
     *request.uri_mut() = uri;
     next.run(request).await
+}
+
+/// Emby paths a playback-only token may call.
+///
+/// These are exactly what a 302 proxy needs in order to resolve the original `.strm` target: the
+/// item lookup that exposes `MediaSources[].Path`, and the media endpoints themselves. The list is
+/// intentionally closed: an unknown path is rejected rather than handed to a handler.
+#[cfg(test)]
+pub(super) fn is_playback_allow_listed_path(path: &str) -> bool {
+    playback_allow_listed_item(path).is_some()
+}
+
+/// Whether a playback-only `token` may call `path`: the path must be on the allow-list and, when
+/// it addresses an item, that item must be the one the token was issued for.
+pub(super) fn playback_token_may_call(token: &str, path: &str) -> bool {
+    match playback_allow_listed_item(path) {
+        None => false,
+        Some(None) => true,
+        Some(Some(item)) => crate::auth::emby::playback_token_item(token)
+            .is_some_and(|bound| bound.eq_ignore_ascii_case(item)),
+    }
+}
+
+/// `None` when `path` is not on the playback allow-list, `Some(None)` for allow-listed paths that
+/// address no item (`Auth/Keys`) and `Some(Some(id))` with the item id segment otherwise.
+fn playback_allow_listed_item(path: &str) -> Option<Option<&str>> {
+    let path = path.trim();
+    // Both the `/emby/...` mount and the legacy root-path Emby routes are served by the same
+    // router, so either prefix is accepted. Everything else (Lux API, Web assets, SPA fallback)
+    // rejects the token outright.
+    let relative = strip_emby_prefix(path)?;
+    if relative.is_empty() {
+        return None;
+    }
+    let segments: Vec<&str> = relative.split('/').collect();
+    // Emby clients and proxies are not consistent about casing, and the router normalises static
+    // segments case-insensitively. Match the same way so the allow-list never disagrees with the
+    // route the request will actually reach.
+    if let [head, leaf] = segments.as_slice()
+        && head.eq_ignore_ascii_case("auth")
+        && leaf.eq_ignore_ascii_case("keys")
+    {
+        return Some(None);
+    }
+    match segments.as_slice() {
+        [head, item, rest @ ..]
+            if head.eq_ignore_ascii_case("videos")
+                && !item.is_empty()
+                && is_playable_media_tail(rest) =>
+        {
+            Some(Some(item))
+        }
+        [head, item] if head.eq_ignore_ascii_case("items") && !item.is_empty() => Some(Some(item)),
+        [head, user, leaf, item]
+            if head.eq_ignore_ascii_case("users")
+                && leaf.eq_ignore_ascii_case("items")
+                && !user.is_empty()
+                && !item.is_empty() =>
+        {
+            Some(Some(item))
+        }
+        _ => None,
+    }
+}
+
+fn strip_emby_prefix(path: &str) -> Option<&str> {
+    let path = path.strip_prefix('/')?;
+    match path.split_once('/') {
+        Some((first, rest)) if first.eq_ignore_ascii_case("emby") => Some(rest),
+        _ => Some(path),
+    }
+}
+
+/// Accepts `stream`, `stream.{container}`, `original`, `original.{container}` and the optional
+/// `{media_source_id}` path segment Emby clients insert before them.
+fn is_playable_media_tail(rest: &[&str]) -> bool {
+    match rest {
+        [endpoint] => is_playable_media_endpoint(endpoint),
+        // `{media_source_id}` is optional, but it never appears together with a container suffix.
+        [_media_source_id, endpoint] => is_playable_media_endpoint(endpoint),
+        _ => false,
+    }
+}
+
+fn is_playable_media_endpoint(endpoint: &str) -> bool {
+    let (name, container) = match endpoint.split_once('.') {
+        Some((name, container)) => (name, Some(container)),
+        None => (endpoint, None),
+    };
+    if !matches!(name.to_ascii_lowercase().as_str(), "stream" | "original") {
+        return false;
+    }
+    container.is_none_or(|container| {
+        !container.is_empty() && container.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    })
 }
 
 #[cfg(test)]
@@ -157,5 +260,92 @@ mod tests {
         let mut headers = HeaderMap::new();
         headers.insert("X-Emby-Token", HeaderValue::from_static("header"));
         assert_eq!(query.select(&headers), Ok(Some("header".to_owned())));
+    }
+
+    #[test]
+    fn playback_token_is_confined_to_its_item() {
+        let token = "luxpb_123456_abcDEF-_xyz";
+        for path in [
+            "/emby/Items/123456",
+            "/emby/Users/admin/Items/123456",
+            "/emby/Videos/123456/stream.mkv",
+            "/emby/Videos/123456/mediasource_9/stream",
+            "/emby/Auth/Keys",
+        ] {
+            assert!(playback_token_may_call(token, path), "{path}");
+        }
+        for path in [
+            "/emby/Items/654321",
+            "/emby/Users/admin/Items/654321",
+            "/emby/Videos/654321/stream",
+            "/emby/Videos/654321/123456/stream",
+            "/emby/Items/1234567",
+            "/emby/Items/12345",
+            "/emby/Users/admin/Items/456",
+        ] {
+            assert!(!playback_token_may_call(token, path), "{path}");
+        }
+        // A token without a bound item can call nothing that addresses an item.
+        assert!(!playback_token_may_call("luxpb_", "/emby/Items/1"));
+        assert!(!playback_token_may_call(
+            "luxpb_nounderscore",
+            "/emby/Items/1"
+        ));
+        assert!(playback_token_may_call(
+            "luxpb_nounderscore",
+            "/emby/Auth/Keys"
+        ));
+    }
+
+    #[test]
+    fn playback_allow_list_covers_what_a_302_proxy_calls() {
+        for path in [
+            "/emby/Items/123456",
+            "/Items/123456",
+            "/EMBY/items/123456",
+            "/emby/Users/admin/Items/123456",
+            "/emby/Videos/123456/stream",
+            "/emby/Videos/123456/stream.mkv",
+            "/Videos/123456/stream.mp4",
+            "/emby/Videos/123456/123456/stream",
+            "/emby/Videos/123456/mediasource_123456/stream.mp4",
+            "/emby/Videos/123456/original",
+            "/emby/Videos/123456/original.strm",
+            "/emby/Auth/Keys",
+        ] {
+            assert!(is_playback_allow_listed_path(path), "{path}");
+        }
+    }
+
+    #[test]
+    fn playback_allow_list_rejects_everything_else() {
+        for path in [
+            "/",
+            "/emby",
+            "/emby/",
+            "/Users",
+            "/emby/Users",
+            "/emby/Users/New",
+            "/emby/System/Info",
+            "/emby/Sessions",
+            "/emby/Items",
+            "/emby/Items/123456/Refresh",
+            "/emby/Items/123456/Children",
+            "/emby/Items/123456/Images/Primary",
+            "/emby/Items/123456/PlaybackInfo",
+            "/emby/Items/123456/Download",
+            "/emby/Videos/123456/Download",
+            "/emby/Videos/123456/master.m3u8",
+            "/emby/Videos/123456/Subtitles/1/Stream",
+            "/emby/Videos/123456/transcoding/abc/index.m3u8",
+            "/emby/Library/Refresh",
+            "/emby/not-a-route",
+            "/api/v1/items/123456",
+            "/api/v1/playback/bootstrap",
+            "/Videos",
+            "/Assets/app.js",
+        ] {
+            assert!(!is_playback_allow_listed_path(path), "{path}");
+        }
     }
 }

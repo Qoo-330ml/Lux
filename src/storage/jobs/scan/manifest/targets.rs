@@ -45,10 +45,7 @@ impl Database {
             .bind(job_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let Some((manifest_state, workflow, format, ready, job_status, scan_phase, job_generation)) =
             state
         else {
@@ -78,10 +75,7 @@ impl Database {
             .bind(library_root_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if root_checkpoint.as_ref()
             != Some(&(target_stage.to_owned(), target_cursor.map(str::to_owned)))
         {
@@ -105,10 +99,7 @@ impl Database {
             .bind(limit)
             .fetch_all(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let mut targets_changed = false;
         let next_stage;
         let next_cursor;
@@ -175,10 +166,7 @@ impl Database {
             .bind(target_cursor)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if root_update.rows_affected() != 1 {
             return Err(StorageError::Conflict(
                 "manifest target root checkpoint could not advance".to_owned(),
@@ -192,10 +180,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let targets_ready = unfinished_roots == 0;
         if targets_ready {
             self.query(
@@ -206,18 +191,9 @@ impl Database {
             .bind(manifest_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(ManifestPostprocessingTargetBatchResult {
             targets_changed,
             targets_ready,
@@ -243,19 +219,10 @@ impl Database {
             .bind(manifest_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected()
             == 1;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(ready)
     }
 
@@ -343,10 +310,7 @@ impl Database {
             .bind(job_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(target_result.rows_affected() > 0)
     }
 }

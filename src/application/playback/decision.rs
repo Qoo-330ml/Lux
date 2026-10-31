@@ -28,6 +28,8 @@ pub enum UnsupportedReason {
     StrmRequiresDirectPlay,
     BrowserCannotConsumeHls,
     NoCompatibleServerPlan,
+    /// An administrator turned server-side transcoding off, so only direct play is offered.
+    ServerTranscodingDisabled,
 }
 
 impl fmt::Display for UnsupportedReason {
@@ -36,6 +38,7 @@ impl fmt::Display for UnsupportedReason {
             Self::StrmRequiresDirectPlay => "STRM_REQUIRES_DIRECT_PLAY",
             Self::BrowserCannotConsumeHls => "BROWSER_CANNOT_CONSUME_HLS",
             Self::NoCompatibleServerPlan => "NO_COMPATIBLE_SERVER_PLAN",
+            Self::ServerTranscodingDisabled => "SERVER_TRANSCODING_DISABLED",
         })
     }
 }

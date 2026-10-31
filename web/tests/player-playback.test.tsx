@@ -5,8 +5,10 @@ import { createRoot, type Root } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
-import { episodeNavigationFor, PlayerPage } from "../src/features/player/PlayerPage";
+import { PlayerPage } from "../src/features/player/PlayerPage";
+import { episodeNavigationFor } from "../src/features/player/player-page-helpers";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxCombobox, luxSelectValue } from "./lux-select-helpers";
 import { queryKeys } from "../src/lib/api/query-keys";
 import { mockPlaybackBootstrap } from "./player-test-helpers";
 
@@ -37,6 +39,7 @@ describe("PlayerPage playback synchronization", () => {
   let mediaSessionDescriptor: PropertyDescriptor | undefined;
 
   beforeEach(() => {
+    window.localStorage.clear();
     mockPlaybackBootstrap();
     vi.spyOn(api, "progress").mockResolvedValue(undefined);
     vi.spyOn(api, "createWebPlaybackSession").mockImplementation(async (_itemId, sourceId) => ({
@@ -476,12 +479,9 @@ describe("PlayerPage playback synchronization", () => {
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
-    const sourceSelector = container.querySelector<HTMLSelectElement>('select[aria-label="选择播放版本"]');
-    expect(sourceSelector).not.toBeNull();
-    if (!sourceSelector) throw new Error("source selector was not rendered");
+    expect(luxCombobox(container, "选择播放版本")).not.toBeNull();
+    await chooseLuxOptionByValue(container, "选择播放版本", "source-2");
     await act(async () => {
-      sourceSelector.value = "source-2";
-      sourceSelector.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
 
@@ -597,11 +597,8 @@ describe("PlayerPage playback synchronization", () => {
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSettings);
     expect(vi.mocked(api.webPlaybackEvent)).toHaveBeenCalledTimes(eventCallsBeforeSettings);
 
-    const sourceSelector = container.querySelector<HTMLSelectElement>('[aria-label="选择播放版本"]');
-    if (!sourceSelector) throw new Error("source selector was not rendered");
+    await chooseLuxOptionByValue(container, "选择播放版本", "source-presentation-2");
     await act(async () => {
-      sourceSelector.value = "source-presentation-2";
-      sourceSelector.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
     await act(async () => {
@@ -743,8 +740,7 @@ describe("PlayerPage playback synchronization", () => {
     const settings = container.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
     if (!video || !settings) throw new Error("chapter player was not rendered");
     await act(async () => settings.click());
-    const sourceSelector = container.querySelector<HTMLSelectElement>("[aria-label='选择播放版本']");
-    if (!sourceSelector) throw new Error("source selector was not rendered");
+    expect(luxCombobox(container, "选择播放版本")).not.toBeNull();
     Object.defineProperty(video, "duration", { configurable: true, value: 10 });
     Object.defineProperty(video, "currentTime", { configurable: true, writable: true, value: 3 });
     await act(async () => video.dispatchEvent(new Event("durationchange")));
@@ -759,9 +755,8 @@ describe("PlayerPage playback synchronization", () => {
     expect(video.currentTime).toBe(6);
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSeek);
 
+    await chooseLuxOptionByValue(container, "选择播放版本", "source-chapters-2");
     await act(async () => {
-      sourceSelector.value = "source-chapters-2";
-      sourceSelector.dispatchEvent(new Event("change", { bubbles: true }));
       await new Promise((resolve) => setTimeout(resolve, 10));
     });
     await act(async () => {
@@ -821,26 +816,19 @@ describe("PlayerPage playback synchronization", () => {
     if (!settings) throw new Error("settings control was not rendered");
     await act(async () => settings.click());
 
-    const captionSelector = container.querySelector<HTMLSelectElement>('[aria-label="选择字幕"]');
     const video = container.querySelector<HTMLVideoElement>("video");
-    if (!captionSelector || !video) throw new Error("caption controls were not rendered");
+    if (!luxCombobox(container, "选择字幕") || !video) throw new Error("caption controls were not rendered");
     const sessionCallsBeforeSelection = vi.mocked(api.createWebPlaybackSession).mock.calls.length;
     const eventCallsBeforeSelection = vi.mocked(api.webPlaybackEvent).mock.calls.length;
 
-    expect(captionSelector.value).toBe("2");
+    expect(luxSelectValue(container, "选择字幕")).toBe("2");
     expect(video.querySelector("track")?.getAttribute("src"))
       .toBe("/api/v1/items/movie-captions/subtitles/2?sourceId=source%20%2F%204k");
 
-    await act(async () => {
-      captionSelector.value = "";
-      captionSelector.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await chooseLuxOptionByValue(container, "选择字幕", "");
     expect(video.querySelector("track")).toBeNull();
 
-    await act(async () => {
-      captionSelector.value = "2";
-      captionSelector.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await chooseLuxOptionByValue(container, "选择字幕", "2");
     expect(video.querySelector("track")?.getAttribute("src"))
       .toBe("/api/v1/items/movie-captions/subtitles/2?sourceId=source%20%2F%204k");
     expect(vi.mocked(api.createWebPlaybackSession)).toHaveBeenCalledTimes(sessionCallsBeforeSelection);

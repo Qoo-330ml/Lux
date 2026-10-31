@@ -3,6 +3,7 @@ import { FormEvent, type CSSProperties, useEffect, useState } from "react";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { PluginLoginBackgroundResponse } from "../../lib/api/types";
+import { LuxButton, LuxTextField } from "../../components/ui";
 
 const POSTER_WIDTH_PERCENT = 78;
 const POSTER_COLUMN_COUNT = 5;
@@ -99,16 +100,27 @@ export function LoginPage() {
       {/* 左侧海报艺术长卷展示区 */}
       <section className="lux-auth-visual" aria-label="登录页背景">
         {singlePosterItem ? (
-          <img
-            className="lux-auth-single-poster"
-            src={singlePosterItem.imageUrl}
-            alt=""
-            aria-hidden="true"
-            loading="eager"
-            onError={markBackgroundFailed}
-          />
+          <>
+            {/* 同图模糊铺满视觉区，完整原比例海报居中叠在其上，避免上下露黑边又把海报裁掉 */}
+            <img
+              className="lux-auth-single-poster-backdrop"
+              src={singlePosterItem.imageUrl}
+              alt=""
+              aria-hidden="true"
+              loading="eager"
+              onError={markBackgroundFailed}
+            />
+            <img
+              className="lux-auth-single-poster"
+              src={singlePosterItem.imageUrl}
+              alt=""
+              aria-hidden="true"
+              loading="eager"
+              onError={markBackgroundFailed}
+            />
+          </>
         ) : singleImageItem ? (
-          <div className="lux-auth-single-image-content">
+          <>
             <img
               className="lux-auth-single-image"
               src={singleImageItem.imageUrl}
@@ -121,7 +133,7 @@ export function LoginPage() {
               item={singleImageItem}
               sourceName={pluginBackground?.sourceName}
             />
-          </div>
+          </>
         ) : heroItem ? (
           <>
             <img
@@ -201,7 +213,7 @@ export function LoginPage() {
           <form className="lux-auth-form" autoComplete="on" onSubmit={submit}>
             <div className="lux-auth-field">
               <label htmlFor="username">用户名</label>
-              <input
+              <LuxTextField
                 id="username"
                 name="username"
                 type="text"
@@ -216,7 +228,7 @@ export function LoginPage() {
             <div className="lux-auth-field">
               <label htmlFor="password">密码</label>
               <div className="lux-auth-password-wrapper">
-                <input
+                <LuxTextField
                   id="password"
                   name="password"
                   type={showPassword ? "text" : "password"}
@@ -257,13 +269,12 @@ export function LoginPage() {
               </div>
             </div>
 
-            <button
-              className="lux-button lux-button-large lux-auth-submit-btn"
+            <LuxButton size="large" className="lux-auth-submit-btn"
               type="submit"
               disabled={login.isPending}
             >
               {login.isPending ? "正在进入…" : "进入影院 ›"}
-            </button>
+            </LuxButton>
           </form>
 
           {login.error ? (

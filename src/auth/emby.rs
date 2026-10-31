@@ -20,10 +20,13 @@ use crate::{
     },
     domain::ids::UserId,
     storage::{
-        Database, NewAccessToken, StorageError, StoredEmbyLoginSessionSummary,
-        UserAccessBlacklistIpRuleQuery, UserAccessBlacklistRuleMatchQuery,
+        AuthCacheEpochSnapshot, Database, NewAccessToken, NewPlaybackAccessToken, StorageError,
+        StoredEmbyLoginSessionSummary, UserAccessBlacklistIpRuleQuery,
+        UserAccessBlacklistRuleMatchQuery,
     },
 };
+
+use super::cache::ExpiringCache;
 
 /// Activity columns (`access_tokens.last_seen_at`, `user_devices.last_seen_at`)
 /// do not need second-level precision. Refreshing them on every Emby request
@@ -79,11 +82,25 @@ impl EmbyActivityCache {
     }
 }
 
+/// A resolved Emby credential: the token's user and the device identity it was issued to.
+///
+/// The access rules are deliberately *not* cached: they are re-read on every request (one query)
+/// and evaluated against the address the access-IP resolver produced. The rule tables are the only
+/// ACL input that can change without any product code path, so keeping them out of the cache means
+/// a rule change can never be served stale.
+struct CachedEmbyPrincipal {
+    user: UserRecord,
+    device: EmbyDeviceInfo,
+    /// Captured before the credential was read; a hit is only served while it is still current.
+    snapshot: AuthCacheEpochSnapshot,
+}
+
 #[derive(Clone)]
 pub struct EmbyAuthService {
     database: Database,
     users: UserStore,
     activity_cache: Arc<Mutex<EmbyActivityCache>>,
+    principal_cache: Arc<ExpiringCache<CachedEmbyPrincipal>>,
 }
 
 impl EmbyAuthService {
@@ -92,6 +109,7 @@ impl EmbyAuthService {
             users: UserStore::new(database.clone())?,
             database,
             activity_cache: Arc::new(Mutex::new(EmbyActivityCache::default())),
+            principal_cache: Arc::new(ExpiringCache::default()),
         })
     }
 
@@ -359,32 +377,185 @@ impl EmbyAuthService {
         token: &str,
         client_ip: Option<IpAddr>,
     ) -> Result<Option<UserRecord>, EmbyAuthError> {
+        self.resolve_token_scoped(token, client_ip, false).await
+    }
+
+    /// Resolver for the Emby-compatible routes only: unlike [`Self::resolve_token_with_ip`] it also
+    /// honors playback-only tokens. The router restricts those tokens to the playback allow-list
+    /// before any handler runs.
+    pub async fn resolve_emby_route_token_with_ip(
+        &self,
+        token: &str,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<UserRecord>, EmbyAuthError> {
+        self.resolve_token_scoped(token, client_ip, true).await
+    }
+
+    /// Resolves a request principal and evaluates every access rule for this request's address.
+    ///
+    /// The credential lookup and the rule snapshot are cached for a few seconds; the rules
+    /// themselves are re-evaluated here on every call, because the address belongs to the request
+    /// and not to the cached entry.
+    async fn resolve_token_scoped(
+        &self,
+        token: &str,
+        client_ip: Option<IpAddr>,
+        allow_playback_scope: bool,
+    ) -> Result<Option<UserRecord>, EmbyAuthError> {
+        let is_playback_token = is_playback_token(token);
+        if is_playback_token && !allow_playback_scope {
+            return Ok(None);
+        }
         let token_hash = hash_token(token);
-        let Some(stored) = self.database.find_user_by_access_token(&token_hash).await? else {
+        let Some(principal) = self
+            .token_principal(&token_hash, allow_playback_scope)
+            .await?
+        else {
             // Unknown tokens must not reach the activity UPDATE below; otherwise any random
             // string would still open a write transaction on every request.
             return Ok(None);
         };
-        if stored.is_disabled {
-            return Ok(None);
-        }
-        if self.is_user_ip_blacklisted(&stored.id, client_ip).await? {
+        let user_id = principal.user.id.to_string();
+        // Both checks keep the baseline query shape: the IP rules are counted on their own (with
+        // `MAX + 1` rows so an over-limit rule set fails closed) and the device/client rules are
+        // matched by one EXISTS query. A shared rule snapshot ordered by rule type would truncate
+        // the `IP_CIDR` rows first and let a blocked client through.
+        if self.is_user_ip_blacklisted(&user_id, client_ip).await? {
             self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
-        if let Some(device) = self.device_info(token).await?
-            && self
-                .user_access_blacklist_matches(&stored.id, &device)
-                .await?
+        if self
+            .user_access_blacklist_matches(&user_id, &principal.device)
+            .await?
         {
             self.database.revoke_access_token(&token_hash).await?;
             return Ok(None);
         }
-        if self.should_touch_access_token(&token_hash) {
+        // A playback token keeps the expiry it was issued with; it is never refreshed by use.
+        if !is_playback_token && self.should_touch_access_token(&token_hash) {
             self.database.touch_access_token(&token_hash).await?;
             self.mark_access_token_touched(&token_hash);
         }
-        user_record(stored).map(Some)
+        Ok(Some(principal.user.clone()))
+    }
+
+    /// Reads and caches the credential, its user and its device identity; the rules are read
+    /// separately on every request.
+    async fn token_principal(
+        &self,
+        token_hash: &[u8],
+        allow_playback_scope: bool,
+    ) -> Result<Option<Arc<CachedEmbyPrincipal>>, EmbyAuthError> {
+        let epochs = self.database.auth_cache();
+        let cache_key = principal_cache_key(token_hash, allow_playback_scope);
+        if let Some(entry) = self.principal_cache.lookup(&cache_key, Instant::now()) {
+            let principal = entry.value();
+            if epochs.principal_is_current(principal.snapshot) {
+                return Ok(Some(principal));
+            }
+        }
+        // Capture the epochs before reading: if anything invalidates them while the queries below
+        // run, the snapshot is stale and the value is not cached.
+        let snapshot = epochs.principal_snapshot();
+        let Some(stored) = self
+            .database
+            .find_route_token_principal(token_hash, allow_playback_scope)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if stored.user.is_disabled {
+            return Ok(None);
+        }
+        let user = user_record(stored.user)?;
+        let device = EmbyDeviceInfo {
+            client: stored.device.client_name,
+            device: stored.device.device_name,
+            device_id: stored.device.device_id,
+            version: stored.device.client_version,
+            user_id: None,
+        };
+        if epochs.principal_is_current(snapshot) {
+            self.principal_cache.store(
+                cache_key,
+                CachedEmbyPrincipal {
+                    user: user.clone(),
+                    device: device.clone(),
+                    snapshot,
+                },
+                Instant::now(),
+            );
+        }
+        Ok(Some(Arc::new(CachedEmbyPrincipal {
+            user,
+            device,
+            snapshot,
+        })))
+    }
+
+    /// Issues a short-lived, playback-only token bound to one Web playback session. It expires no
+    /// later than `expires_at` (and never more than [`PLAYBACK_TOKEN_MAX_TTL_SECONDS`] from now).
+    pub async fn issue_playback_token(
+        &self,
+        user: &UserRecord,
+        item_public_id: &str,
+        playback_session_id: &str,
+        device: &EmbyDeviceInfo,
+        expires_at: i64,
+        client_ip: Option<IpAddr>,
+    ) -> Result<Option<String>, EmbyAuthError> {
+        // The item id travels inside the token (the hash covers it), so the router can confine
+        // the token to one item without a database lookup.
+        if item_public_id.is_empty()
+            || !item_public_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        {
+            return Ok(None);
+        }
+        let user_id = user.id.to_string();
+        if self.user_access_blacklist_matches(&user_id, device).await?
+            || self.is_user_ip_blacklisted(&user_id, client_ip).await?
+        {
+            return Ok(None);
+        }
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| {
+                i64::try_from(elapsed.as_secs()).unwrap_or(i64::MAX)
+            });
+        let expires_at = expires_at.min(now.saturating_add(PLAYBACK_TOKEN_MAX_TTL_SECONDS));
+        let token = format!(
+            "{PLAYBACK_TOKEN_PREFIX}{item_public_id}_{}",
+            generate_token()?
+        );
+        let token_id = UserId::new().to_string();
+        let token_hash = hash_token(&token);
+        self.database
+            .create_playback_access_token(NewPlaybackAccessToken {
+                id: &token_id,
+                token_hash: &token_hash,
+                user_id: &user_id,
+                device_id: &device.device_id,
+                client_name: &device.client,
+                device_name: &device.device,
+                client_version: &device.version,
+                playback_session_id,
+                expires_at,
+            })
+            .await?;
+        Ok(Some(token))
+    }
+
+    /// Revokes every playback token issued for a playback session.
+    pub async fn revoke_playback_tokens(
+        &self,
+        playback_session_id: &str,
+    ) -> Result<u64, EmbyAuthError> {
+        Ok(self
+            .database
+            .revoke_playback_access_tokens(playback_session_id)
+            .await?)
     }
 
     fn should_touch_access_token(&self, token_hash: &[u8]) -> bool {
@@ -508,6 +679,21 @@ pub struct EmbyAuthResult {
     pub device: EmbyDeviceInfo,
 }
 
+/// Prefix that marks a playback-only token so the router can restrict it without a lookup.
+pub const PLAYBACK_TOKEN_PREFIX: &str = "luxpb_";
+const PLAYBACK_TOKEN_MAX_TTL_SECONDS: i64 = 12 * 60 * 60;
+
+/// Whether `token` has the shape of a playback-only token (it may still be unknown or expired).
+pub fn is_playback_token(token: &str) -> bool {
+    token.starts_with(PLAYBACK_TOKEN_PREFIX)
+}
+
+/// The item id a playback-only token is bound to (`luxpb_{item}_{random}`).
+pub fn playback_token_item(token: &str) -> Option<&str> {
+    let (item, _) = token.strip_prefix(PLAYBACK_TOKEN_PREFIX)?.split_once('_')?;
+    (!item.is_empty()).then_some(item)
+}
+
 fn generate_token() -> Result<String, EmbyAuthError> {
     let mut bytes = [0_u8; 32];
     OsRng
@@ -518,6 +704,15 @@ fn generate_token() -> Result<String, EmbyAuthError> {
 
 fn hash_token(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
+}
+
+/// The cache key separates the two resolver scopes: a playback-only token resolves differently
+/// depending on whether the caller allows playback credentials at all.
+fn principal_cache_key(token_hash: &[u8], allow_playback_scope: bool) -> Vec<u8> {
+    let mut key = Vec::with_capacity(token_hash.len() + 1);
+    key.extend_from_slice(token_hash);
+    key.push(u8::from(allow_playback_scope));
+    key
 }
 
 #[derive(Debug)]
@@ -571,6 +766,303 @@ impl std::error::Error for EmbyAuthError {
                 None
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod route_token_tests {
+    use super::{EmbyAuthService, EmbyDeviceInfo};
+    use crate::{
+        auth::users::UserStore,
+        storage::{Database, NewUserAccessBlacklistRule, UpdateUser},
+    };
+
+    fn device() -> EmbyDeviceInfo {
+        EmbyDeviceInfo {
+            client: "Emby Client".to_owned(),
+            device: "Living Room".to_owned(),
+            device_id: "device-cache".to_owned(),
+            version: "1.0".to_owned(),
+            user_id: None,
+        }
+    }
+
+    /// An Emby login for one regular user, with the token the client would send.
+    async fn fixture()
+    -> Result<(Database, EmbyAuthService, String, String), Box<dyn std::error::Error>> {
+        let (temp, database) = crate::storage::test_database().await?;
+        // The connection keeps the database file open for the whole test.
+        Box::leak(Box::new(temp));
+        let user = UserStore::new(database.clone())?
+            .create_user("emby-cache", "Emby Cache", "emby password", false)
+            .await?;
+        let service = EmbyAuthService::new(database.clone())?;
+        let session = service
+            .authenticate("emby-cache", "emby password", &device())
+            .await?
+            .ok_or("login failed")?;
+        Ok((database, service, session.token, user.id.to_string()))
+    }
+
+    async fn add_rule(database: &Database, user_id: Option<&str>, rule_type: &str, value: &str) {
+        let id = match user_id {
+            Some(_) => format!("route-rule-{rule_type}-{value}"),
+            None => format!("route-global-rule-{rule_type}-{value}"),
+        };
+        database
+            .insert_user_access_blacklist_rule(NewUserAccessBlacklistRule {
+                id: Box::leak(id.into_boxed_str()),
+                user_id,
+                rule_type,
+                match_value: value,
+                is_enabled: true,
+                created_by: user_id,
+                created_at: 1,
+            })
+            .await
+            .expect("rule insert");
+    }
+
+    #[tokio::test]
+    async fn token_resolution_merges_the_credential_and_device_lookups()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, _user_id) = fixture().await?;
+        database.reset_query_count();
+        assert!(service.resolve_token(&token).await?.is_some());
+        assert_eq!(
+            database.query_count(),
+            4,
+            "one JOIN for the credential and device, one IP-rule read, one device/client match, \
+             one throttled activity touch"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_resolution_is_cached_and_revocation_wins()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, _user_id) = fixture().await?;
+        assert!(service.resolve_token(&token).await?.is_some());
+        database.reset_query_count();
+        assert!(service.resolve_token(&token).await?.is_some());
+        assert_eq!(
+            database.query_count(),
+            2,
+            "the credential is cached; the two rule checks are still read per request"
+        );
+
+        service.logout(&token).await?;
+        database.reset_query_count();
+        assert!(
+            service.resolve_token(&token).await?.is_none(),
+            "a revoked token must fail on the very next request"
+        );
+        assert!(database.query_count() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn device_and_client_rules_apply_to_the_very_next_request()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        assert!(service.resolve_token(&token).await?.is_some());
+        database.reset_query_count();
+        assert!(service.resolve_token(&token).await?.is_some());
+        assert_eq!(database.query_count(), 2);
+
+        add_rule(&database, Some(&user_id), "DEVICE", "device-cache").await;
+        database.reset_query_count();
+        assert!(
+            service.resolve_token(&token).await?.is_none(),
+            "a device rule must apply to the very next request"
+        );
+        assert!(database.query_count() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn many_non_ip_rules_do_not_hide_an_ip_rule() -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        // More than the 400-row snapshot the resolver used to read: with a shared, rule-type
+        // ordered snapshot these rows truncate the IP_CIDR row and the client would pass.
+        for index in 0..401 {
+            add_rule(
+                &database,
+                Some(&user_id),
+                "DEVICE",
+                &format!("other-device-{index}"),
+            )
+            .await;
+        }
+        add_rule(&database, Some(&user_id), "IP_CIDR", "10.9.0.0/16").await;
+
+        assert!(
+            service
+                .resolve_token_with_ip(&token, Some("10.9.1.2".parse()?))
+                .await?
+                .is_none(),
+            "an IP rule must still block when the device/client rules overflow a snapshot"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn too_many_ip_rules_fail_closed() -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        for index in
+            0..=crate::application::user_access_rules::MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST
+        {
+            add_rule(
+                &database,
+                Some(&user_id),
+                "IP_CIDR",
+                &format!("10.10.{}.0/24", index % 250),
+            )
+            .await;
+        }
+
+        assert!(
+            matches!(
+                service.resolve_token(&token).await,
+                Err(crate::auth::emby::EmbyAuthError::AccessRulesUnavailable)
+            ),
+            "an over-limit IP rule set must deny instead of evaluating a truncated list"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_resolution_cache_is_invalidated_by_playback_token_revocation()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, _token, user_id) = fixture().await?;
+        let user = service.user_by_id(&user_id).await?.ok_or("user missing")?;
+        let playback_token = service
+            .issue_playback_token(&user, "100", "session-cache", &device(), i64::MAX, None)
+            .await?
+            .ok_or("playback token was not issued")?;
+        assert!(
+            service
+                .resolve_emby_route_token_with_ip(&playback_token, None)
+                .await?
+                .is_some()
+        );
+        database.reset_query_count();
+        assert!(
+            service
+                .resolve_emby_route_token_with_ip(&playback_token, None)
+                .await?
+                .is_some()
+        );
+        assert_eq!(database.query_count(), 2);
+
+        assert_eq!(
+            database
+                .revoke_playback_access_tokens("session-cache")
+                .await?,
+            1
+        );
+        assert!(
+            service
+                .resolve_emby_route_token_with_ip(&playback_token, None)
+                .await?
+                .is_none(),
+            "a revoked playback token must fail on the very next request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn global_rules_apply_to_the_very_next_request() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (database, service, token, _user_id) = fixture().await?;
+        assert!(service.resolve_token(&token).await?.is_some());
+        database.reset_query_count();
+        assert!(service.resolve_token(&token).await?.is_some());
+        assert_eq!(database.query_count(), 2);
+
+        add_rule(&database, None, "CLIENT", "emby client").await;
+        assert!(
+            service.resolve_token(&token).await?.is_none(),
+            "a global client rule applies to every user on the very next request"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_resolution_cache_is_invalidated_by_account_changes()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        assert!(service.resolve_token(&token).await?.is_some());
+        database.reset_query_count();
+        assert!(service.resolve_token(&token).await?.is_some());
+        assert_eq!(database.query_count(), 2);
+
+        database
+            .update_user(
+                &user_id,
+                UpdateUser {
+                    display_name: None,
+                    password_hash: None,
+                    has_password: None,
+                    is_disabled: Some(true),
+                    is_admin: None,
+                    can_manage_server: None,
+                    can_remote_access: None,
+                    can_download: None,
+                },
+            )
+            .await?;
+        database.reset_query_count();
+        assert!(
+            service.resolve_token(&token).await?.is_none(),
+            "disabling the account must apply to the very next request"
+        );
+        assert!(database.query_count() > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn token_resolution_cache_is_invalidated_by_user_deletion()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        assert!(service.resolve_token(&token).await?.is_some());
+        database.reset_query_count();
+        assert!(service.resolve_token(&token).await?.is_some());
+        assert_eq!(database.query_count(), 2);
+
+        assert!(database.delete_user(&user_id).await?);
+        assert!(service.resolve_token(&token).await?.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cached_rules_still_evaluate_each_request_address()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (database, service, token, user_id) = fixture().await?;
+        add_rule(&database, Some(&user_id), "IP_CIDR", "10.0.0.1/32").await;
+        assert!(
+            service
+                .resolve_token_with_ip(&token, Some("10.0.0.2".parse()?))
+                .await?
+                .is_some()
+        );
+        database.reset_query_count();
+        assert!(
+            service
+                .resolve_token_with_ip(&token, Some("10.0.0.2".parse()?))
+                .await?
+                .is_some()
+        );
+        assert_eq!(database.query_count(), 2);
+
+        assert!(
+            service
+                .resolve_token_with_ip(&token, Some("10.0.0.1".parse()?))
+                .await?
+                .is_none(),
+            "the cached rule list must be evaluated against this request's address"
+        );
+        Ok(())
     }
 }
 

@@ -1335,7 +1335,9 @@ async fn safe_local_media_path(
     let path = fs::canonicalize(root.join(relative))
         .await
         .map_err(|error| FingerprintError::InvalidPath(error.to_string()))?;
-    if !path.starts_with(&root) {
+    if !path.starts_with(&root)
+        && !crate::application::scanner::symlink::path_is_allowed(&root, &path)
+    {
         return Err(FingerprintError::InvalidPath(relative_path.to_owned()));
     }
     let metadata = fs::metadata(&path)

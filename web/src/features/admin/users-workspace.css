@@ -2,46 +2,51 @@
 
 .lux-users-page { display: grid; }
 
-.lux-users-heading { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; padding-bottom: 20px; }
+.lux-users-shell { display: grid; gap: 16px; }
 
-.lux-users-heading h1 { margin: 7px 0 6px; color: var(--lux-text); font-size: clamp(1.75rem, 3vw, 2.6rem); letter-spacing: -.055em; line-height: 1.08; }
+.lux-users-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
 
-.lux-users-heading p { max-width: 62ch; margin: 0; color: var(--lux-muted); font-size: .82rem; line-height: 1.55; }
+.lux-users-heading h1 { margin: 0; color: var(--lux-text); font-size: clamp(1.5rem, 2.4vw, 2rem); letter-spacing: -.045em; line-height: 1.15; }
 
 .lux-users-heading-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 9px; }
 
-.lux-users-workspace { display: grid; grid-template-columns: 208px minmax(0, 1fr); gap: 26px; align-items: start; }
-
-.lux-users-rail { position: sticky; top: 18px; display: grid; gap: 20px; }
-
-.lux-users-rail-group { display: grid; gap: 2px; }
-
-.lux-users-rail-label { padding: 0 10px 7px; color: var(--lux-subtle); font-size: .62rem; letter-spacing: .14em; text-transform: uppercase; }
-
-.lux-users-rail-item {
+.lux-users-tabs {
   display: flex;
+  align-items: stretch;
+  gap: 2px;
+  overflow-x: auto;
+  border-bottom: 1px solid var(--lux-line-soft);
+  scrollbar-width: none;
+}
+
+.lux-users-tabs::-webkit-scrollbar { display: none; }
+
+.lux-users-tabs button,
+.lux-users-tabs-policy {
+  display: inline-flex;
   align-items: center;
-  gap: 9px;
-  min-height: 34px;
-  padding: 0 10px;
-  border: 1px solid transparent;
-  border-radius: 8px;
+  min-height: 40px;
+  padding: 0 14px;
+  border: 0;
+  border-bottom: 2px solid transparent;
   background: none;
   color: var(--lux-muted);
   font: inherit;
-  font-size: .8rem;
-  text-align: left;
+  font-size: .82rem;
+  white-space: nowrap;
   cursor: pointer;
-  transition: color .16s ease, background .16s ease, border-color .16s ease;
 }
 
-.lux-users-rail-item:hover { color: var(--lux-text); background: rgba(255, 255, 255, .05); }
+.lux-users-tabs button:hover,
+.lux-users-tabs-policy:hover { color: var(--lux-text); }
 
-.lux-users-rail-item[aria-current="page"] {
-  border-color: color-mix(in srgb, var(--lux-accent) 30%, transparent);
-  color: var(--lux-text);
-  background: color-mix(in srgb, var(--lux-accent) 10%, transparent);
-}
+.lux-users-tabs [aria-current="page"] { border-bottom-color: var(--lux-accent); color: var(--lux-text); font-weight: 600; }
+
+.lux-users-tabs-spacer { flex: 1 1 auto; }
+
+.lux-users-subnav { align-self: start; width: fit-content; max-width: 100%; overflow-x: auto; }
+
+.lux-users-note { margin: 0; padding: 12px 16px 0; color: var(--lux-muted); font-size: .74rem; }
 
 .lux-users-pane { display: grid; gap: 16px; min-width: 0; }
 
@@ -67,10 +72,6 @@
   display: flex;
   align-items: center;
   gap: 12px;
-  padding: 12px 14px;
-  border: 1px solid var(--lux-line-soft);
-  border-radius: 14px;
-  background: var(--lux-surface);
 }
 
 .lux-users-search {
@@ -200,6 +201,20 @@
 
 .lux-users-account-meta { display: block; margin-top: 3px; overflow: hidden; color: var(--lux-subtle); font-size: .68rem; text-overflow: ellipsis; white-space: nowrap; }
 
+a.lux-users-account-name:hover { color: var(--lux-accent); text-decoration: underline; text-decoration-thickness: 1px; text-underline-offset: 2px; }
+
+a.lux-users-account-name:focus-visible { border-radius: 4px; outline: 2px solid color-mix(in srgb, var(--lux-accent) 62%, transparent); outline-offset: 2px; }
+
+a.lux-users-account-username { color: inherit; }
+
+a.lux-users-account-username:hover { color: var(--lux-accent); text-decoration: underline; text-underline-offset: 2px; }
+
+a.lux-users-avatar { cursor: pointer; transition: filter .15s ease, box-shadow .15s ease; }
+
+a.lux-users-avatar:hover { filter: brightness(1.18); }
+
+a.lux-users-avatar:focus-visible { outline: 2px solid var(--lux-accent); outline-offset: 2px; }
+
 .lux-users-avatar {
   display: grid;
   place-items: center;
@@ -271,7 +286,7 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 .lux-users-menu button:hover,
 .lux-users-menu a:hover { background: rgba(255, 255, 255, .07); }
 
-.lux-users-menu button.is-danger { color: var(--lux-danger, #ee9eaa); }
+.lux-users-menu button.is-danger { color: var(--lux-danger); }
 
 .lux-users-menu-divider { height: 1px; margin: 5px 4px; background: var(--lux-line-soft); }
 
@@ -327,9 +342,13 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 
 .lux-users-selection-results ul { display: grid; gap: 4px; margin: 6px 0 0; padding: 0; list-style: none; }
 
-.lux-users-selection-results li.is-success { color: #9bdcb3; }
+.lux-users-selection-results li.is-success { color: var(--lux-success); }
 
-.lux-users-selection-results li.is-failure { color: var(--lux-danger, #ee9eaa); }
+.lux-users-selection-results li.is-failure { color: var(--lux-danger); }
+
+.lux-users-card-body [role="status"] li.is-success { color: var(--lux-success); }
+
+.lux-users-card-body [role="status"] li.is-failure { color: var(--lux-danger); }
 
 /* ---------- 页脚分页 ---------- */
 
@@ -384,9 +403,9 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 
 .lux-users-drawer-form { display: flex; flex: 1; flex-direction: column; min-height: 0; }
 
-.lux-users-danger-text { color: var(--lux-danger, #ee9eaa); }
+.lux-users-danger-text { color: var(--lux-danger); }
 
-.lux-users-danger-text:hover { border-color: color-mix(in srgb, var(--lux-danger, #ee9eaa) 55%, transparent); }
+.lux-users-danger-text:hover { border-color: color-mix(in srgb, var(--lux-danger) 55%, transparent); }
 
 .lux-users-drawer-body { display: grid; gap: 14px; padding: 20px 22px; overflow: auto; }
 
@@ -398,39 +417,7 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 
 .lux-users-empty { margin: 0; padding: 28px 20px; color: var(--lux-muted); font-size: .8rem; }
 
-/* ---------- 响应式 ---------- */
-
-@media (max-width: 1179px) {
-  .lux-users-workspace { grid-template-columns: minmax(0, 1fr); gap: 14px; }
-  .lux-users-rail { position: static; display: flex; gap: 6px; overflow-x: auto; padding-bottom: 2px; scrollbar-width: none; }
-  .lux-users-rail::-webkit-scrollbar { display: none; }
-  .lux-users-rail-group { display: flex; gap: 6px; }
-  .lux-users-rail-label { display: none; }
-  .lux-users-rail-item { flex: 0 0 auto; white-space: nowrap; }
-}
-
-@media (max-width: 1023px) {
-  .lux-users-col-access { display: none; }
-}
-
-@media (max-width: 899px) {
-  .lux-users-toolbar { flex-direction: column; align-items: stretch; gap: 10px; }
-  .lux-users-search { flex: 0 0 auto; width: 100%; height: 38px; }
-  .lux-users-chips { justify-content: space-between; }
-  .lux-users-chips button { flex: 1; }
-  .lux-users-toolbar-end { margin-left: 0; justify-content: space-between; }
-}
-
-@media (max-width: 639px) {
-  .lux-users-heading { flex-direction: column; align-items: flex-start; gap: 14px; }
-  .lux-users-heading-actions { width: 100%; }
-  .lux-users-heading-actions .lux-button { flex: 1; }
-  .lux-users-table-scroll { display: none; }
-  .lux-users-cards { display: grid; gap: 10px; padding: 12px; }
-  .lux-users-pager { flex-direction: column; align-items: flex-start; }
-  .lux-users-pager-actions { width: 100%; justify-content: space-between; }
-  .lux-users-drawer { width: 100%; max-width: 100%; border-left: 0; border-radius: 18px 18px 0 0; height: 82%; top: auto; }
-}
+/* ---------- 手机卡片列表（桌面端由表格展示） ---------- */
 
 .lux-users-cards { display: none; }
 
@@ -447,7 +434,44 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 
 .lux-users-card-item-head .lux-users-menu-wrap { margin-left: auto; }
 
+.lux-users-card-item-facts { display: grid; gap: 4px; margin: 0; min-width: 0; }
+
+.lux-users-card-item-facts > div { display: flex; justify-content: space-between; gap: 12px; min-width: 0; }
+
+.lux-users-card-item-facts dt { color: var(--lux-subtle); font-size: .7rem; }
+
+.lux-users-card-item-facts dd { min-width: 0; margin: 0; overflow-wrap: anywhere; color: var(--lux-muted); font-size: .7rem; }
+
 .lux-users-card-item-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; color: var(--lux-subtle); font-size: .7rem; }
+
+.lux-users-card-item-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; }
+
+.lux-users-card-item-actions .lux-button { flex: 1 1 auto; justify-content: center; }
+
+/* ---------- 响应式 ---------- */
+
+@media (max-width: 1023px) {
+  .lux-users-table-scroll { display: none; }
+  .lux-users-cards { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 10px; padding: 12px 16px 16px; }
+}
+
+@media (max-width: 899px) {
+  .lux-users-toolbar { flex-direction: column; align-items: stretch; gap: 10px; }
+  .lux-users-search { flex: 0 0 auto; width: 100%; height: 38px; }
+  .lux-users-chips { justify-content: space-between; }
+  .lux-users-chips button { flex: 1; }
+  .lux-users-toolbar-end { margin-left: 0; justify-content: space-between; }
+}
+
+@media (max-width: 639px) {
+  .lux-users-heading { flex-direction: column; align-items: flex-start; gap: 12px; }
+  .lux-users-heading-actions { width: 100%; }
+  .lux-users-heading-actions .lux-button { flex: 1; }
+    .lux-users-cards { grid-template-columns: minmax(0, 1fr); }
+  .lux-users-pager { flex-direction: column; align-items: flex-start; }
+  .lux-users-pager-actions { width: 100%; justify-content: space-between; }
+  .lux-users-drawer { width: 100%; max-width: 100%; border-left: 0; border-radius: 18px 18px 0 0; height: 82%; top: auto; }
+}
 
 /* ---------- 用户详情 ---------- */
 
@@ -470,6 +494,8 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
 .lux-users-detail-name h1 { margin: 0; color: var(--lux-text); font-size: clamp(1.6rem, 2.6vw, 2.15rem); letter-spacing: -.045em; }
 
 .lux-users-detail-facts { display: flex; flex-wrap: wrap; gap: 4px 0; margin: 7px 0 0; color: var(--lux-muted); font-size: .76rem; line-height: 1.5; }
+
+.lux-users-detail-tags { margin-top: 10px; }
 
 .lux-users-detail-facts span + span::before { content: "·"; margin: 0 8px; color: var(--lux-subtle); }
 
@@ -531,29 +557,36 @@ html[data-lux-theme="light"] .lux-users-avatar { background: linear-gradient(145
   .lux-users-detail-facts span + span::before { display: none; }
 }
 
-.lux-users-select {
-  min-height: 34px;
-  padding: 0 10px;
-  border: 1px solid var(--lux-line-soft);
-  border-radius: 9px;
-  outline: 0;
-  color: var(--lux-text);
-  background: rgba(255, 255, 255, .05);
-  font: inherit;
-  font-size: .74rem;
-}
+/* ---------- 详情页按需展开区 ---------- */
 
-.lux-users-select:focus { border-color: color-mix(in srgb, var(--lux-accent) 60%, var(--lux-line-soft)); }
+.lux-users-disclosure { display: grid; gap: 12px; min-width: 0; }
+
+.lux-users-disclosure-head { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 14px; }
+
+.lux-users-disclosure-head .lux-admin-muted { margin: 0; font-size: .74rem; line-height: 1.5; }
+
+.lux-users-disclosure-toggle { display: inline-flex; align-items: center; gap: 6px; min-height: 32px; padding: 0 12px; border: 1px solid var(--lux-line-soft); border-radius: 9px; color: var(--lux-text); background: rgba(255, 255, 255, .05); font: inherit; font-size: .74rem; cursor: pointer; }
+
+.lux-users-disclosure-toggle:hover { border-color: color-mix(in srgb, var(--lux-accent) 48%, var(--lux-line-soft)); }
+
+.lux-users-disclosure-toggle:focus-visible { outline: 2px solid color-mix(in srgb, var(--lux-accent) 65%, transparent); outline-offset: 2px; }
+
+.lux-users-disclosure-toggle svg { transition: transform .18s ease; }
+
+.lux-users-disclosure-toggle svg.is-open { transform: rotate(180deg); }
+
+.lux-users-disclosure-body { min-width: 0; }
+
+.lux-users-disclosure-body[hidden] { display: none; }
 
 /* ---------- 浅色主题 ---------- */
 
 html[data-lux-theme="light"] .lux-users-search,
-html[data-lux-theme="light"] .lux-users-chips,
-html[data-lux-theme="light"] .lux-users-select {
+html[data-lux-theme="light"] .lux-users-chips {
   background: rgba(28, 28, 34, .04);
 }
 
-html[data-lux-theme="light"] .lux-users-rail-item:hover { background: rgba(28, 28, 34, .05); }
+html[data-lux-theme="light"] .lux-users-disclosure-toggle { background: rgba(28, 28, 34, .04); }
 
 html[data-lux-theme="light"] .lux-users-table tbody tr:hover td { background: rgba(28, 28, 34, .03); }
 

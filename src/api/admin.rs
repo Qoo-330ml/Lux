@@ -12,6 +12,8 @@ mod admin_users;
 pub(super) use admin_users::user_json;
 #[path = "admin/admin_settings.rs"]
 mod admin_settings;
+#[path = "admin/admin_transcoding.rs"]
+mod admin_transcoding;
 #[path = "admin/admin_user_invitations.rs"]
 mod admin_user_invitations;
 #[path = "admin/admin_user_registrations.rs"]
@@ -49,6 +51,8 @@ mod admin_dashboard;
 mod admin_emby_migration;
 #[path = "admin/admin_health.rs"]
 mod admin_health;
+#[path = "admin/admin_performance.rs"]
+mod admin_performance;
 pub(super) use crate::application::admin_dashboard::DEFAULT_SERVER_NAME;
 #[path = "admin/admin_database_diagnostics.rs"]
 mod admin_database_diagnostics;
@@ -69,12 +73,13 @@ pub(super) use admin_logs_events::{
     record_failed_authentication_event,
 };
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .merge(users_routes())
         .merge(admin_user_invitations::api_routes())
         .merge(admin_user_registrations::api_routes())
         .merge(settings_routes())
+        .merge(transcoding_routes())
         .merge(libraries_routes())
         .merge(items_routes())
         .merge(people_routes())
@@ -87,65 +92,74 @@ pub(super) fn api_routes() -> Router<AppState> {
         .merge(logs_events_routes())
         .merge(health_routes())
         .merge(database_diagnostics_routes())
+        .merge(performance_metrics_routes())
         .merge(dashboard_routes())
 }
 
-pub(super) fn users_routes() -> Router<AppState> {
+pub(super) fn users_routes() -> Router<ReadyAppState> {
     admin_users::api_routes()
 }
 
-pub(super) fn settings_routes() -> Router<AppState> {
+pub(super) fn settings_routes() -> Router<ReadyAppState> {
     admin_settings::api_routes()
 }
 
-pub(super) fn libraries_routes() -> Router<AppState> {
+pub(super) fn transcoding_routes() -> Router<ReadyAppState> {
+    admin_transcoding::api_routes()
+}
+
+pub(super) fn libraries_routes() -> Router<ReadyAppState> {
     admin_libraries::api_routes()
 }
 
-pub(super) fn items_routes() -> Router<AppState> {
+pub(super) fn items_routes() -> Router<ReadyAppState> {
     admin_items::api_routes()
 }
 
-pub(super) fn people_routes() -> Router<AppState> {
+pub(super) fn people_routes() -> Router<ReadyAppState> {
     admin_people::api_routes()
 }
 
-pub(super) fn metadata_routes() -> Router<AppState> {
+pub(super) fn metadata_routes() -> Router<ReadyAppState> {
     admin_metadata::api_routes()
 }
 
-pub(super) fn plugins_routes() -> Router<AppState> {
+pub(super) fn plugins_routes() -> Router<ReadyAppState> {
     admin_plugins::api_routes()
 }
 
-pub(super) fn emby_migration_routes() -> Router<AppState> {
+pub(super) fn emby_migration_routes() -> Router<ReadyAppState> {
     admin_emby_migration::api_routes()
 }
 
-pub(super) fn scheduled_tasks_routes() -> Router<AppState> {
+pub(super) fn scheduled_tasks_routes() -> Router<ReadyAppState> {
     admin_scheduled_tasks::api_routes()
 }
 
-pub(super) fn jobs_routes() -> Router<AppState> {
+pub(super) fn jobs_routes() -> Router<ReadyAppState> {
     admin_jobs::api_routes()
 }
 
-pub(super) fn webhooks_routes() -> Router<AppState> {
+pub(super) fn webhooks_routes() -> Router<ReadyAppState> {
     admin_webhooks::api_routes()
 }
 
-pub(super) fn logs_events_routes() -> Router<AppState> {
+pub(super) fn logs_events_routes() -> Router<ReadyAppState> {
     admin_logs_events::api_routes()
 }
 
-pub(super) fn health_routes() -> Router<AppState> {
+pub(super) fn health_routes() -> Router<ReadyAppState> {
     admin_health::api_routes()
 }
 
-pub(super) fn database_diagnostics_routes() -> Router<AppState> {
+pub(super) fn database_diagnostics_routes() -> Router<ReadyAppState> {
     admin_database_diagnostics::api_routes()
 }
 
-pub(super) fn dashboard_routes() -> Router<AppState> {
+pub(super) fn dashboard_routes() -> Router<ReadyAppState> {
     admin_dashboard::api_routes()
+}
+
+pub(super) fn performance_metrics_routes() -> Router<ReadyAppState> {
+    admin_performance::api_routes()
 }

@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
     str::FromStr,
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 #[cfg(test)]
@@ -19,13 +19,19 @@ use super::{
     UserRegistrationStatus, UserRegistrationVerifyResult,
 };
 use sqlx::{
-    Acquire, Any, AnyPool, Executor, Row,
+    Acquire, Any, AnyPool, Executor, FromRow, Row,
     any::{AnyConnectOptions, AnyPoolOptions},
     migrate::{MigrateError, Migrator},
 };
 use tokio::{fs, sync::Mutex as AsyncMutex};
 use uuid::Uuid;
 
+#[path = "access_changes.rs"]
+mod access_changes;
+pub(crate) use access_changes::{AccessChangeEpochs, AccessEpoch};
+#[path = "auth_cache.rs"]
+mod auth_cache;
+pub(crate) use auth_cache::{AuthCacheEpochSnapshot, AuthCacheEpochs};
 #[path = "catalog.rs"]
 mod catalog;
 #[path = "database_cleanup.rs"]
@@ -37,7 +43,7 @@ pub use database_diagnostics::DatabaseDiagnosticsSnapshot;
 mod database_maintenance;
 pub use database_maintenance::{
     DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
-    MaintenanceCandidate, MaintenanceReport,
+    MaintenanceCandidate, MaintenanceReport, SqliteStatisticsRefresh,
 };
 #[path = "device_pairings.rs"]
 mod device_pairings;
@@ -82,6 +88,20 @@ pub(crate) use media_merge_records::{
 #[path = "scan_fingerprint_migration.rs"]
 mod scan_fingerprint_migration;
 pub(crate) use media_merge::StoredMediaMerge;
+#[path = "catalog_read_model.rs"]
+mod catalog_read_model;
+pub(crate) use catalog::CatalogRowProjection;
+#[cfg(test)]
+pub(crate) use catalog_read_model::FullRequeue;
+pub(crate) use catalog_read_model::{
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, OutboxStream, ReadModelPageQuery,
+    ReadModelSort, RecentByLibraryReadModelQuery, RecentReadModelQuery, SEARCH_OUTBOX,
+};
+#[path = "search_reindex.rs"]
+mod search_reindex;
+pub(crate) use search_reindex::SEARCH_REINDEX_CONSUMER;
+#[path = "mail_outbox.rs"]
+mod mail_outbox;
 #[path = "metadata.rs"]
 mod metadata;
 #[path = "migration.rs"]
@@ -92,8 +112,20 @@ mod notifications;
 mod people;
 #[path = "sessions.rs"]
 mod sessions;
+#[path = "user_mail_flows.rs"]
+mod user_mail_flows;
+pub(crate) use sessions::{
+    NewTranscodingHistory, StoredTranscodingHistory, StoredTranscodingSessionRow,
+};
+#[path = "playback_history_archive.rs"]
+mod playback_history_archive;
+#[path = "user_series_next.rs"]
+mod user_series_next;
+pub(crate) use user_series_next::ResumePointerQuery;
 #[path = "users.rs"]
 mod users;
+#[path = "watch_state_archive.rs"]
+mod watch_state_archive;
 
 // A media_sources row uses 11 bind values. Keep each backend's positive-index batches
 // below its parameter limit while allowing PostgreSQL fewer round trips per transaction.
@@ -169,6 +201,22 @@ pub(crate) fn manifest_existing_file_update_chunk_size(backend: DatabaseBackend)
     chunk_size
 }
 
+/// Maximum bind parameters SQLite/PostgreSQL accept for one prepared statement.
+pub(crate) fn max_sql_bind_parameters(backend: DatabaseBackend) -> usize {
+    match backend {
+        DatabaseBackend::Sqlite => SQLITE_MAX_BIND_PARAMETERS,
+        DatabaseBackend::Postgres => POSTGRES_MAX_BIND_PARAMETERS,
+    }
+}
+
+/// Rows per media-source insert, capped by the backend's bind budget (13 binds per row).
+pub(crate) fn media_source_insert_chunk_size(backend: DatabaseBackend, requested: usize) -> usize {
+    const BIND_VALUES_PER_ROW: usize = 13;
+    (max_sql_bind_parameters(backend) / BIND_VALUES_PER_ROW)
+        .min(requested)
+        .max(1)
+}
+
 pub(crate) fn manifest_path_query_chunk_size(backend: DatabaseBackend) -> usize {
     match backend {
         DatabaseBackend::Sqlite => MANIFEST_PATH_QUERY_SQLITE_CHUNK_SIZE,
@@ -210,6 +258,7 @@ mod manifest_positive_index_batch_tests {
         SQLITE_MAX_BIND_PARAMETERS, manifest_existing_file_update_chunk_size,
         manifest_path_query_chunk_size, manifest_positive_index_insert_chunk_size,
         manifest_seen_filesystem_update_chunk_size, media_item_hierarchy_insert_chunk_size,
+        media_source_insert_chunk_size,
     };
 
     #[test]
@@ -241,6 +290,16 @@ mod manifest_positive_index_batch_tests {
         assert!(
             postgres_update_size * MANIFEST_EXISTING_FILE_UPDATE_MAX_BIND_VALUES_PER_ROW
                 <= POSTGRES_MAX_BIND_PARAMETERS
+        );
+
+        // The media-source insert binds 13 values per row, so the 2,900-row path batch would
+        // overflow SQLite's 32,766-variable limit on database scans.
+        let sqlite_source_size = media_source_insert_chunk_size(DatabaseBackend::Sqlite, 2_900);
+        assert_eq!(sqlite_source_size, 2_520);
+        assert!(sqlite_source_size * 13 <= SQLITE_MAX_BIND_PARAMETERS);
+        assert_eq!(
+            media_source_insert_chunk_size(DatabaseBackend::Postgres, 2_900),
+            2_900
         );
     }
 
@@ -364,6 +423,94 @@ fn parse_sqlite_auto_vacuum_request(configured: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Deployment override for the SQLite `synchronous` PRAGMA applied to every pooled
+/// connection.
+///
+/// The default stays `FULL`, which is also SQLite's own default: in WAL mode `NORMAL`
+/// cannot corrupt the database, it only allows a power loss to drop the last few
+/// committed transactions, and the small-transaction write paths that would benefit most
+/// (playback progress) still need a NAS A/B before the owner changes the default.
+const SQLITE_SYNCHRONOUS_ENV: &str = "LUX_SQLITE_SYNCHRONOUS";
+
+/// Durability level requested for the SQLite `synchronous` PRAGMA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqliteSynchronous {
+    /// `FULL` (default): every commit fsyncs the write-ahead log.
+    Full,
+    /// `NORMAL`: commits no longer fsync; WAL recovery stays consistent, but a power
+    /// loss may drop the last few committed transactions.
+    Normal,
+}
+
+impl SqliteSynchronous {
+    /// The PRAGMA keyword, which is also how the setting is documented.
+    fn pragma_name(self) -> &'static str {
+        match self {
+            Self::Full => "FULL",
+            Self::Normal => "NORMAL",
+        }
+    }
+}
+
+/// A parsed request plus the rejected text, if any, so the caller can warn exactly once.
+struct SqliteSynchronousRequest {
+    synchronous: SqliteSynchronous,
+    rejected: Option<String>,
+}
+
+fn parse_sqlite_synchronous_request(configured: Option<&str>) -> SqliteSynchronousRequest {
+    let Some(configured) = configured
+        .map(str::trim)
+        .filter(|configured| !configured.is_empty())
+    else {
+        return SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Full,
+            rejected: None,
+        };
+    };
+    match configured.to_ascii_lowercase().as_str() {
+        "full" => SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Full,
+            rejected: None,
+        },
+        "normal" => SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Normal,
+            rejected: None,
+        },
+        _ => SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Full,
+            rejected: Some(configured.to_owned()),
+        },
+    }
+}
+
+fn sqlite_synchronous() -> SqliteSynchronous {
+    sqlite_synchronous_for(std::env::var(SQLITE_SYNCHRONOUS_ENV).ok().as_deref())
+}
+
+fn sqlite_synchronous_for(configured: Option<&str>) -> SqliteSynchronous {
+    let request = parse_sqlite_synchronous_request(configured);
+    if let Some(rejected) = request.rejected {
+        // Environment input only: no credentials, paths, or user data are logged.
+        tracing::warn!(
+            env = SQLITE_SYNCHRONOUS_ENV,
+            value = %rejected,
+            fallback = request.synchronous.pragma_name(),
+            "ignoring an invalid SQLite synchronous setting"
+        );
+    }
+    request.synchronous
+}
+
+fn sqlite_after_connect_sql(synchronous: SqliteSynchronous) -> String {
+    format!(
+        "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = {}; PRAGMA busy_timeout = 5000;
+         PRAGMA journal_size_limit = 67108864;",
+        synchronous.pragma_name()
+    )
+}
+
 /// SQLite only honors `auto_vacuum` when it is set before the first table exists, so
 /// a brand-new database reserves incremental-vacuum mode here. Incremental mode lets
 /// a later large deletion return pages to the filesystem in bounded steps instead of
@@ -394,8 +541,99 @@ async fn reserve_sqlite_incremental_vacuum(pool: &AnyPool) -> Result<(), sqlx::E
 
 /// Timeouts applied to every pool so a saturated or half-dead database cannot hang requests.
 const DATABASE_POOL_ACQUIRE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Shutdown cannot hang on a checkpoint: a log that is not truncated only costs a replay on the
+/// next start, so the budget stays short and the failure is logged, never fatal.
+const WAL_TRUNCATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a database write lock may be held before the wait becomes worth a log line. These
+/// locks are only taken by writers, so an occasional wait is normal; a wait past this threshold
+/// means two subsystems are queuing on the same rows and the log should name both.
+const WRITE_LOCK_WAIT_LOG_THRESHOLD: Duration = Duration::from_secs(1);
 const DATABASE_POOL_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(600);
 const DATABASE_POOL_MAX_LIFETIME: std::time::Duration = std::time::Duration::from_secs(1800);
+
+/// Acquires one of the process-wide write locks, reporting a wait that stops being negligible.
+///
+/// The lock is deliberately not a fair queue: the point is to serialise a handful of writers, not to
+/// schedule requests. What the log line adds is the answer to "why did this write take two seconds"
+/// without instrumenting every caller.
+/// Guard that reports write-lock holds long enough to delay maintenance and reader waits.
+///
+/// The caller location is captured at acquisition so a long hold names the code path without
+/// logging SQL text, identifiers, or user data.
+pub(crate) struct WriteLockGuard {
+    _guard: tokio::sync::OwnedMutexGuard<()>,
+    operation: &'static str,
+    caller: &'static std::panic::Location<'static>,
+    acquired_at: Instant,
+}
+
+/// How long one writer may hold a process-wide write lock before the hold is reported.
+const WRITE_LOCK_HOLD_LOG_THRESHOLD: Duration = Duration::from_secs(1);
+
+impl Drop for WriteLockGuard {
+    fn drop(&mut self) {
+        let held = self.acquired_at.elapsed();
+        if held >= WRITE_LOCK_HOLD_LOG_THRESHOLD {
+            tracing::warn!(
+                operation = self.operation,
+                caller = %self.caller,
+                held_ms = u64::try_from(held.as_millis()).unwrap_or(u64::MAX),
+                "database write lock held for a long time"
+            );
+        }
+    }
+}
+
+async fn acquire_write_lock_after(
+    lock: &Arc<AsyncMutex<()>>,
+    operation: &'static str,
+    threshold: Duration,
+    caller: &'static std::panic::Location<'static>,
+) -> WriteLockGuard {
+    match tokio::time::timeout(threshold, lock.clone().lock_owned()).await {
+        Ok(guard) => WriteLockGuard {
+            _guard: guard,
+            operation,
+            caller,
+            acquired_at: Instant::now(),
+        },
+        Err(_) => {
+            let started = Instant::now();
+            tracing::info!(
+                operation,
+                caller = %caller,
+                threshold_ms = threshold.as_millis() as u64,
+                "database write lock is held by another writer; waiting"
+            );
+            let guard = lock.clone().lock_owned().await;
+            tracing::info!(
+                operation,
+                caller = %caller,
+                waited_ms = started.elapsed().as_millis() as u64,
+                "database write lock acquired after waiting"
+            );
+            WriteLockGuard {
+                _guard: guard,
+                operation,
+                caller,
+                acquired_at: started,
+            }
+        }
+    }
+}
+
+/// Returns a future so `#[track_caller]` can capture the real call site (async fns ignore it).
+#[track_caller]
+fn acquire_write_lock(
+    lock: &Arc<AsyncMutex<()>>,
+    operation: &'static str,
+) -> impl std::future::Future<Output = WriteLockGuard> {
+    let caller = std::panic::Location::caller();
+    let lock = lock.clone();
+    async move {
+        acquire_write_lock_after(&lock, operation, WRITE_LOCK_WAIT_LOG_THRESHOLD, caller).await
+    }
+}
 
 fn database_pool_options(max_connections: u32) -> AnyPoolOptions {
     AnyPoolOptions::new()
@@ -458,7 +696,12 @@ fn normalize_person_name(value: &str) -> String {
         .collect()
 }
 
-fn playback_reached_played_threshold(
+/// True when a reported position has reached the user's played threshold.
+///
+/// [`Database::record_playback_event`] uses it to decide the played flip; the playback progress
+/// coalescer uses the same predicate to keep every tick that may flip the flag out of the merge
+/// layer, so a flip is still written the moment it happens.
+pub(crate) fn playback_reached_played_threshold(
     position_ticks: i64,
     duration_ticks: i64,
     played_percent: i64,
@@ -480,10 +723,15 @@ pub struct Database {
     person_credits_write_lock: Arc<AsyncMutex<()>>,
     metadata_write_lock: Arc<AsyncMutex<()>>,
     recommendation_stats_refresh_lock: Arc<AsyncMutex<()>>,
+    statistics_refresh_lock: Arc<AsyncMutex<()>>,
     recommendation_rating_median_cache: Arc<AsyncMutex<RecommendationRatingMedianCache>>,
     dashboard_stats_cache: Arc<AsyncMutex<Option<CachedDashboardStats>>>,
     write_probe: Arc<AsyncMutex<Option<std::time::Instant>>>,
     filesystem_path_templates: Arc<SqlTemplateCache>,
+    /// Change counters for the cached access answers (library access, content restrictions).
+    access_changes: Arc<AccessChangeEpochs>,
+    /// Invalidation epochs for the cached request principals (credentials, access rules, users).
+    auth_cache: Arc<AuthCacheEpochs>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
 }
@@ -950,6 +1198,19 @@ impl TryFrom<UserInvitationRecord> for StoredUserInvitation {
     }
 }
 
+/// Row of the persistent recommendation rating-median cache read.
+#[derive(Debug, sqlx::FromRow)]
+struct RecommendationRatingMedianRow {
+    median_rating: f64,
+    calculated_at: i64,
+}
+
+/// Row of the `_sqlx_migrations` schema version projection.
+#[derive(Debug, sqlx::FromRow)]
+struct SchemaVersionRow {
+    version: i64,
+}
+
 impl Database {
     pub async fn connect(config: &Config) -> Result<Self, StorageError> {
         Self::connect_with_configuration(config, &DatabaseConfiguration::Sqlite).await
@@ -958,6 +1219,18 @@ impl Database {
     pub async fn connect_with_configuration(
         config: &Config,
         configuration: &DatabaseConfiguration,
+    ) -> Result<Self, StorageError> {
+        Self::connect_with_sqlite_synchronous(config, configuration, sqlite_synchronous()).await
+    }
+
+    /// Opens the database with an explicit SQLite `synchronous` level.
+    ///
+    /// Split out from [`Database::connect_with_configuration`] so the pragma wiring can be
+    /// tested without mutating the process environment.
+    async fn connect_with_sqlite_synchronous(
+        config: &Config,
+        configuration: &DatabaseConfiguration,
+        sqlite_synchronous: SqliteSynchronous,
     ) -> Result<Self, StorageError> {
         configuration
             .validate()
@@ -990,6 +1263,13 @@ impl Database {
                     ))
                 })?,
         };
+        migration::refuse_empty_database_when_initialized(
+            &config.config_dir,
+            &path,
+            backend,
+            &database_url,
+        )
+        .await?;
         let options =
             AnyConnectOptions::from_str(&database_url).map_err(|source| StorageError::Sqlx {
                 path: path.clone(),
@@ -997,21 +1277,34 @@ impl Database {
             })?;
         let after_connect_sql = match backend {
             DatabaseBackend::Sqlite => {
-                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;"
+                // The level is connection state and never stored in the file, so this line is
+                // how an A/B run confirms which level the running process applied.
+                tracing::info!(
+                    synchronous = sqlite_synchronous.pragma_name(),
+                    "sqlite connection durability level"
+                );
+                sqlite_after_connect_sql(sqlite_synchronous)
             }
-            DatabaseBackend::Postgres => {
-                "SET TIME ZONE 'UTC';
+            DatabaseBackend::Postgres => "SET TIME ZONE 'UTC';
                  SET idle_in_transaction_session_timeout = '60s';
                  SET work_mem = '16MB';
                  SET jit = off;
                  SET max_parallel_workers_per_gather = 1;
                  SET statement_timeout = '1800s'"
-            }
+                .to_owned(),
         };
         let pool = database_pool_options(pool_max_connections)
             .after_connect(move |connection, _| {
+                // The only interpolated value is the pragma keyword from `SqliteSynchronous`.
+                let after_connect_sql = after_connect_sql.clone();
                 Box::pin(async move {
-                    connection.execute(after_connect_sql).await?;
+                    // Several settings are applied at once, and PostgreSQL rejects a
+                    // multi-statement string on the extended query protocol with
+                    // `cannot insert multiple commands into a prepared statement`. The
+                    // simple query path is the only one that accepts this batch.
+                    connection
+                        .execute(sqlx::raw_sql(sqlx::AssertSqlSafe(after_connect_sql)))
+                        .await?;
                     if backend == DatabaseBackend::Postgres {
                         connection.execute("SET application_name = 'lux'").await?;
                     }
@@ -1071,6 +1364,7 @@ impl Database {
                 path: path.clone(),
                 source,
             })?;
+        migration::record_server_state(&config.config_dir, &server_id).await?;
 
         Ok(Self {
             pool,
@@ -1082,12 +1376,15 @@ impl Database {
             person_credits_write_lock: Arc::new(AsyncMutex::new(())),
             metadata_write_lock: Arc::new(AsyncMutex::new(())),
             recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+            statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
             recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
                 RecommendationRatingMedianCache::default(),
             )),
             dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
             write_probe: Arc::new(AsyncMutex::new(None)),
             filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+            access_changes: Arc::new(AccessChangeEpochs::default()),
+            auth_cache: Arc::new(AuthCacheEpochs::default()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
         })
@@ -1105,13 +1402,27 @@ impl Database {
         }
     }
 
-    pub(crate) async fn acquire_metadata_write_lock(
+    #[track_caller]
+    pub(crate) fn acquire_metadata_write_lock(
         &self,
-    ) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if self.backend == DatabaseBackend::Sqlite {
-            Some(self.metadata_write_lock.clone().lock_owned().await)
-        } else {
-            None
+    ) -> impl std::future::Future<Output = Option<WriteLockGuard>> {
+        let caller = std::panic::Location::caller();
+        let backend = self.backend;
+        let lock = self.metadata_write_lock.clone();
+        async move {
+            if backend == DatabaseBackend::Sqlite {
+                Some(
+                    acquire_write_lock_after(
+                        &lock,
+                        "metadata_write",
+                        WRITE_LOCK_WAIT_LOG_THRESHOLD,
+                        caller,
+                    )
+                    .await,
+                )
+            } else {
+                None
+            }
         }
     }
 
@@ -1130,10 +1441,7 @@ impl Database {
         } else {
             self.pool.begin().await
         };
-        transaction.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        transaction.map_err(self.sqlx_err())
     }
 
     // LUX-620 consumes this transaction helper through the admission methods in `sessions`.
@@ -1146,10 +1454,7 @@ impl Database {
         } else {
             self.pool.begin().await
         };
-        transaction.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        transaction.map_err(self.sqlx_err())
     }
 
     pub(crate) async fn begin_scan_write_transaction(
@@ -1160,19 +1465,13 @@ impl Database {
         } else {
             self.pool.begin().await
         };
-        let mut transaction = transaction.map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let mut transaction = transaction.map_err(self.sqlx_err())?;
         if self.backend == DatabaseBackend::Postgres {
             // Keep the reduced commit durability limited to this rebuildable scan transaction.
             sqlx::query("SET LOCAL synchronous_commit = off")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(transaction)
     }
@@ -1189,10 +1488,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_fingerprint_migration_state SET updated_at = updated_at
              WHERE library_id = ?",
@@ -1200,10 +1496,7 @@ impl Database {
         .bind(library_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.query_scalar(
             "SELECT CASE WHEN lease_token IS NOT NULL
                               AND lease_expires_at > unixepoch()
@@ -1214,10 +1507,7 @@ impl Database {
         .fetch_one(&mut **transaction)
         .await
         .map(|value: i64| value == 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn lock_media_items_for_update(
@@ -1246,10 +1536,7 @@ impl Database {
             statement
                 .fetch_all(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -1376,14 +1663,11 @@ impl Database {
             .bind(&persistent_key)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         {
-            let calculated_at: i64 = row.get("calculated_at");
-            if recommendation_rating_cache_is_fresh(now, calculated_at) {
-                let median: f64 = row.get("median_rating");
+            let row = RecommendationRatingMedianRow::from_row(&row).map_err(self.sqlx_err())?;
+            if recommendation_rating_cache_is_fresh(now, row.calculated_at) {
+                let median = row.median_rating;
                 self.recommendation_rating_median_cache
                     .lock()
                     .await
@@ -1392,7 +1676,7 @@ impl Database {
                         cache_key,
                         RecommendationRatingMedianEntry {
                             value: median,
-                            calculated_at,
+                            calculated_at: row.calculated_at,
                         },
                     );
                 return Ok(median);
@@ -1421,14 +1705,10 @@ impl Database {
         for library_id in &cache_key {
             statement = statement.bind(library_id);
         }
-        let median =
-            statement
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+        let median = statement
+            .fetch_one(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
         let calculated_at = current_unix_timestamp();
         self.query(
             "INSERT INTO recommendation_rating_cache
@@ -1443,10 +1723,7 @@ impl Database {
         .bind(calculated_at)
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.recommendation_rating_median_cache
             .lock()
             .await
@@ -1462,14 +1739,13 @@ impl Database {
     }
 
     pub async fn schema_version(&self) -> Result<i64, StorageError> {
-        self.query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
+        let row = self
+            .query("SELECT COALESCE(MAX(version), 0) AS version FROM _sqlx_migrations")
             .fetch_one(&self.pool)
             .await
-            .map(|row| row.get::<i64, _>("version"))
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())?;
+        let row = SchemaVersionRow::from_row(&row).map_err(self.sqlx_err())?;
+        Ok(row.version)
     }
 
     pub(crate) async fn identity_stability_repair_completed(&self) -> Result<bool, StorageError> {
@@ -1479,10 +1755,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|value| value.as_deref() == Some("completed"))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_identity_stability_repair_completed(
@@ -1496,10 +1769,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Verifies that SQLite can commit a real write transaction.
@@ -1525,14 +1795,7 @@ impl Database {
     }
 
     async fn probe_write_once(&self) -> Result<(), StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         self.query(
             "INSERT INTO lux_meta (key, value)
              VALUES ('__lux_write_probe__', ?)
@@ -1541,20 +1804,34 @@ impl Database {
         .bind(format!("lux-write-probe-{}", Uuid::now_v7()))
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())
     }
 
+    /// Truncates the write-ahead log, then retires the pool.
+    ///
+    /// After this returns, `lux.db` alone is the whole database, which is what an operator
+    /// copying the file expects and what keeps the next start from replaying a log left behind by
+    /// an ungraceful stop. Nothing may be reading while the truncation runs -- a reader pins the
+    /// log open and makes it fail -- so this belongs at shutdown, after the workers stopped.
     pub async fn close(self) {
+        if self.backend == DatabaseBackend::Sqlite {
+            match tokio::time::timeout(
+                WAL_TRUNCATE_TIMEOUT,
+                self.query("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_optional(&self.pool),
+            )
+            .await
+            {
+                Ok(Ok(_)) => {}
+                Ok(Err(error)) => {
+                    tracing::warn!(%error, "could not truncate the write-ahead log before closing");
+                }
+                Err(_) => {
+                    tracing::warn!("truncating the write-ahead log timed out before closing");
+                }
+            }
+        }
         self.pool.close().await;
     }
 
@@ -1563,14 +1840,49 @@ impl Database {
         self.query_count.store(0, AtomicOrdering::Relaxed);
     }
 
+    /// The invalidation epochs of the in-process authentication and access caches.
+    ///
+    /// Caches snapshot the epochs before reading and only reuse a value while the snapshot is
+    /// still current; storage writes bump them after committing.
+    pub(crate) fn auth_cache(&self) -> &AuthCacheEpochs {
+        &self.auth_cache
+    }
+
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
         self.query_count.load(AtomicOrdering::Relaxed)
     }
 
+    /// The change counters that the playback access cache stamps its entries with.
+    ///
+    /// The permission writes in this module bump these counters; the cache only reads them.
+    pub(crate) fn access_changes(&self) -> &AccessChangeEpochs {
+        &self.access_changes
+    }
+
+    /// Maps an sqlx failure onto a storage error that names the database it came from.
+    ///
+    /// Shared by the modules that archive and reattach detached user state, so every one of those
+    /// paths reports failures the same way.
+    pub(super) fn storage_error(&self, source: sqlx::Error) -> StorageError {
+        StorageError::Sqlx {
+            path: self.path.clone(),
+            source,
+        }
+    }
+
+    /// Borrows [`Database::storage_error`] as a reusable `map_err` argument.
+    ///
+    /// Call sites read `.map_err(database.sqlx_err())` instead of spelling out the
+    /// `StorageError::Sqlx` literal. The returned closure only borrows `self`, so nothing is
+    /// allocated up front and the database path is still cloned on the error path alone.
+    pub(super) fn sqlx_err(&self) -> impl Fn(sqlx::Error) -> StorageError + '_ {
+        move |source| self.storage_error(source)
+    }
+
     fn query(
         &self,
-        sql: impl sqlx::SqlSafeStr,
+        sql: impl AdaptSqlText,
     ) -> sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments> {
         #[cfg(test)]
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
@@ -1579,7 +1891,7 @@ impl Database {
 
     fn query_as<O>(
         &self,
-        sql: impl sqlx::SqlSafeStr,
+        sql: impl AdaptSqlText,
     ) -> sqlx::query::QueryAs<'static, sqlx::Any, O, sqlx::any::AnyArguments>
     where
         O: for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
@@ -1591,7 +1903,7 @@ impl Database {
 
     fn query_scalar<O>(
         &self,
-        sql: impl sqlx::SqlSafeStr,
+        sql: impl AdaptSqlText,
     ) -> sqlx::query::QueryScalar<'static, sqlx::Any, O, sqlx::any::AnyArguments>
     where
         (O,): for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
@@ -1600,3308 +1912,6 @@ impl Database {
         self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
-}
-
-// LUX-783 wires the worker and LUX-784 wires the admin queue API to this storage contract.
-#[allow(dead_code)]
-impl Database {
-    pub(crate) async fn enqueue_mail_outbox(
-        &self,
-        message: NewMailOutboxMessage<'_>,
-        now: i64,
-    ) -> Result<StoredMailOutboxMessage, StorageError> {
-        if now < 0
-            || message.available_at < 0
-            || message.idempotency_key.trim() != message.idempotency_key
-            || !(1..=256).contains(&message.idempotency_key.len())
-            || message.idempotency_key.chars().any(char::is_control)
-            || message.recipient_email.trim() != message.recipient_email
-            || !(3..=320).contains(&message.recipient_email.len())
-            || message.recipient_email.chars().any(char::is_control)
-            || message.reference_id.trim() != message.reference_id
-            || !(1..=128).contains(&message.reference_id.len())
-            || message.reference_id.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid mail outbox message".to_owned(),
-            ));
-        }
-
-        let id = Uuid::now_v7().to_string();
-        self.query(
-            "INSERT INTO mail_outbox (
-                 id, idempotency_key, recipient_email, template_kind, reference_id,
-                 status, attempt_count, available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)
-             ON CONFLICT (idempotency_key) DO NOTHING",
-        )
-        .bind(&id)
-        .bind(message.idempotency_key)
-        .bind(message.recipient_email)
-        .bind(message.template_kind.as_str())
-        .bind(message.reference_id)
-        .bind(message.available_at)
-        .bind(now)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        let record = self
-            .query_as::<MailOutboxRecord>(
-                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
-                        status, attempt_count, available_at, lease_expires_at,
-                        last_error_code, sent_at, created_at, updated_at
-                 FROM mail_outbox WHERE idempotency_key = ?",
-            )
-            .bind(message.idempotency_key)
-            .fetch_one(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if record.recipient_email != message.recipient_email
-            || record.template_kind != message.template_kind.as_str()
-            || record.reference_id != message.reference_id
-        {
-            return Err(StorageError::Conflict(
-                "mail outbox idempotency key already used".to_owned(),
-            ));
-        }
-        record.try_into()
-    }
-
-    pub(crate) async fn claim_mail_outbox(
-        &self,
-        now: i64,
-        lease_seconds: i64,
-    ) -> Result<Option<StoredMailOutboxMessage>, StorageError> {
-        if now < 0 || !(1..=900).contains(&lease_seconds) {
-            return Err(StorageError::Conflict(
-                "invalid mail outbox lease".to_owned(),
-            ));
-        }
-        let lease_expires_at = now.saturating_add(lease_seconds);
-        let statement = match self.backend {
-            DatabaseBackend::Sqlite => {
-                "UPDATE mail_outbox
-                 SET status = 'SENDING', attempt_count = attempt_count + 1,
-                     lease_expires_at = ?, last_error_code = NULL,
-                     sent_at = NULL, updated_at = ?
-                 WHERE id = (
-                     SELECT id FROM mail_outbox
-                     WHERE (status IN ('PENDING', 'RETRY_WAIT') AND available_at <= ?)
-                        OR (status = 'SENDING' AND lease_expires_at <= ?)
-                     ORDER BY available_at, created_at, id
-                     LIMIT 1
-                 )
-                 RETURNING id, idempotency_key, recipient_email, template_kind,
-                           reference_id, status, attempt_count, available_at,
-                           lease_expires_at, last_error_code, sent_at, created_at, updated_at"
-            }
-            DatabaseBackend::Postgres => {
-                "WITH candidate AS (
-                     SELECT id FROM mail_outbox
-                     WHERE (status IN ('PENDING', 'RETRY_WAIT') AND available_at <= ?)
-                        OR (status = 'SENDING' AND lease_expires_at <= ?)
-                     ORDER BY available_at, created_at, id
-                     LIMIT 1 FOR UPDATE SKIP LOCKED
-                 )
-                 UPDATE mail_outbox AS outbox
-                 SET status = 'SENDING', attempt_count = outbox.attempt_count + 1,
-                     lease_expires_at = ?, last_error_code = NULL,
-                     sent_at = NULL, updated_at = ?
-                 FROM candidate
-                 WHERE outbox.id = candidate.id
-                 RETURNING outbox.id, outbox.idempotency_key, outbox.recipient_email,
-                           outbox.template_kind, outbox.reference_id, outbox.status,
-                           outbox.attempt_count, outbox.available_at,
-                           outbox.lease_expires_at, outbox.last_error_code,
-                           outbox.sent_at, outbox.created_at, outbox.updated_at"
-            }
-        };
-        let mut query = self.query_as::<MailOutboxRecord>(statement);
-        if self.backend == DatabaseBackend::Postgres {
-            query = query.bind(now).bind(now);
-        }
-        query = query.bind(lease_expires_at).bind(now);
-        if self.backend == DatabaseBackend::Sqlite {
-            query = query.bind(now).bind(now);
-        }
-        query
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .map(TryInto::try_into)
-            .transpose()
-    }
-
-    pub(crate) async fn mark_mail_outbox_sent(
-        &self,
-        id: &str,
-        attempt_count: i64,
-        now: i64,
-    ) -> Result<bool, StorageError> {
-        if attempt_count <= 0 || now < 0 {
-            return Err(StorageError::Conflict(
-                "invalid mail outbox completion".to_owned(),
-            ));
-        }
-        let result = self
-            .query(
-                "UPDATE mail_outbox
-                 SET status = 'SENT', lease_expires_at = NULL, last_error_code = NULL,
-                     sent_at = ?, updated_at = ?
-                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
-            )
-            .bind(now)
-            .bind(now)
-            .bind(id)
-            .bind(attempt_count)
-            .execute(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub(crate) async fn defer_mail_outbox(
-        &self,
-        id: &str,
-        attempt_count: i64,
-        available_at: i64,
-        error_code: MailDeliveryErrorCode,
-        now: i64,
-    ) -> Result<bool, StorageError> {
-        if attempt_count <= 0 || now < 0 || available_at < now {
-            return Err(StorageError::Conflict("invalid mail retry time".to_owned()));
-        }
-        let result = self
-            .query(
-                "UPDATE mail_outbox
-                 SET status = 'RETRY_WAIT', available_at = ?, lease_expires_at = NULL,
-                     last_error_code = ?, sent_at = NULL, updated_at = ?
-                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
-            )
-            .bind(available_at)
-            .bind(error_code.as_str())
-            .bind(now)
-            .bind(id)
-            .bind(attempt_count)
-            .execute(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub(crate) async fn fail_mail_outbox(
-        &self,
-        id: &str,
-        attempt_count: i64,
-        error_code: MailDeliveryErrorCode,
-        now: i64,
-    ) -> Result<bool, StorageError> {
-        if attempt_count <= 0 || now < 0 {
-            return Err(StorageError::Conflict(
-                "invalid mail outbox failure".to_owned(),
-            ));
-        }
-        let result = self
-            .query(
-                "UPDATE mail_outbox
-                 SET status = 'FAILED', lease_expires_at = NULL, last_error_code = ?,
-                     sent_at = NULL, updated_at = ?
-                 WHERE id = ? AND status = 'SENDING' AND attempt_count = ?",
-            )
-            .bind(error_code.as_str())
-            .bind(now)
-            .bind(id)
-            .bind(attempt_count)
-            .execute(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub(crate) async fn retry_failed_mail_outbox(
-        &self,
-        id: &str,
-        now: i64,
-    ) -> Result<bool, StorageError> {
-        if now < 0 {
-            return Err(StorageError::Conflict(
-                "invalid mail outbox retry time".to_owned(),
-            ));
-        }
-        let result = self
-            .query(
-                "UPDATE mail_outbox
-                 SET status = 'PENDING', attempt_count = 0, available_at = ?,
-                     last_error_code = NULL, sent_at = NULL, updated_at = ?
-                 WHERE id = ? AND status = 'FAILED'",
-            )
-            .bind(now)
-            .bind(now)
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub(crate) async fn list_mail_outbox_page(
-        &self,
-        status: Option<MailOutboxStatus>,
-        page_size: i64,
-        offset: i64,
-    ) -> Result<MailOutboxPage, StorageError> {
-        let page_size = page_size.clamp(1, 100);
-        let offset = offset.max(0);
-        let total_count = if let Some(status) = status {
-            self.query_scalar::<i64>("SELECT COUNT(*) FROM mail_outbox WHERE status = ?")
-                .bind(status.as_str())
-                .fetch_one(&self.pool)
-                .await
-        } else {
-            self.query_scalar::<i64>("SELECT COUNT(*) FROM mail_outbox")
-                .fetch_one(&self.pool)
-                .await
-        }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        let records = if let Some(status) = status {
-            self.query_as::<MailOutboxRecord>(
-                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
-                        status, attempt_count, available_at, lease_expires_at,
-                        last_error_code, sent_at, created_at, updated_at
-                 FROM mail_outbox WHERE status = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            )
-            .bind(status.as_str())
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            self.query_as::<MailOutboxRecord>(
-                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
-                        status, attempt_count, available_at, lease_expires_at,
-                        last_error_code, sent_at, created_at, updated_at
-                 FROM mail_outbox ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?",
-            )
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        let messages = records
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<StoredMailOutboxMessage>, StorageError>>()?;
-        Ok(MailOutboxPage {
-            messages,
-            total_count,
-        })
-    }
-}
-
-// LUX-784 consumes these methods while resolving queued invitation and verification mail.
-#[allow(dead_code)]
-impl Database {
-    pub(crate) async fn create_mail_challenge(
-        &self,
-        challenge: NewMailChallenge<'_>,
-        now: i64,
-    ) -> Result<StoredMailChallenge, StorageError> {
-        if now < 0
-            || challenge.expires_at <= now
-            || challenge.id.trim() != challenge.id
-            || !(1..=128).contains(&challenge.id.len())
-            || challenge.id.chars().any(char::is_control)
-            || challenge.token_hash.len() != 32
-            || challenge.recipient_email.trim() != challenge.recipient_email
-            || !(3..=320).contains(&challenge.recipient_email.len())
-            || challenge.recipient_email.chars().any(char::is_control)
-            || challenge.reference_id.trim() != challenge.reference_id
-            || !(1..=128).contains(&challenge.reference_id.len())
-            || challenge.reference_id.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict("invalid mail challenge".to_owned()));
-        }
-
-        self.query_as::<MailChallengeRecord>(
-            "INSERT INTO mail_challenges (
-                 id, challenge_kind, recipient_email, reference_id, token_hash,
-                 expires_at, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)
-             RETURNING id, challenge_kind, recipient_email, reference_id, token_hash,
-                       expires_at, consumed_at, revoked_at, created_at",
-        )
-        .bind(challenge.id)
-        .bind(challenge.kind.as_str())
-        .bind(challenge.recipient_email)
-        .bind(challenge.reference_id)
-        .bind(challenge.token_hash)
-        .bind(challenge.expires_at)
-        .bind(now)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
-        .try_into()
-    }
-
-    pub(crate) async fn create_user_email_change_with_mail(
-        &self,
-        user_id: &str,
-        challenge: NewMailChallenge<'_>,
-        message: NewMailOutboxMessage<'_>,
-        expected_pending_challenge_id: Option<&str>,
-        now: i64,
-    ) -> Result<UserEmailChangeCreateResult, StorageError> {
-        if now < 0
-            || challenge.kind != MailChallengeKind::EmailVerification
-            || challenge.reference_id != user_id
-            || challenge.expires_at <= now
-            || challenge.id.trim() != challenge.id
-            || !(1..=128).contains(&challenge.id.len())
-            || challenge.id.chars().any(char::is_control)
-            || challenge.token_hash.len() != 32
-            || challenge.recipient_email.trim() != challenge.recipient_email
-            || challenge.recipient_email != challenge.recipient_email.to_lowercase()
-            || !(3..=254).contains(&challenge.recipient_email.len())
-            || challenge.recipient_email.chars().any(char::is_control)
-            || user_id.trim() != user_id
-            || !(1..=128).contains(&user_id.len())
-            || user_id.chars().any(char::is_control)
-            || expected_pending_challenge_id.is_some_and(|id| {
-                id.trim() != id
-                    || !(1..=128).contains(&id.len())
-                    || id.chars().any(char::is_control)
-            })
-            || message.idempotency_key.trim() != message.idempotency_key
-            || !(1..=256).contains(&message.idempotency_key.len())
-            || message.idempotency_key.chars().any(char::is_control)
-            || message.recipient_email != challenge.recipient_email
-            || message.template_kind != MailOutboxTemplateKind::EmailVerification
-            || message.reference_id != challenge.id
-            || message.available_at != now
-        {
-            return Err(StorageError::Conflict(
-                "invalid user email change mail request".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let active_user_statement = format!(
-            "SELECT id FROM users WHERE id = ? AND is_disabled = 0
-             AND deleted_at IS NULL{lock_clause}"
-        );
-        let active_user_id: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(active_user_statement))
-            .bind(user_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if active_user_id.is_none() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserEmailChangeCreateResult::NotAcceptable);
-        }
-
-        if let Some(expected_challenge_id) = expected_pending_challenge_id {
-            let current_pending_challenge_id: Option<String> = self
-                .query_scalar(
-                    "SELECT id FROM mail_challenges
-                     WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-                       AND expires_at > ? AND created_at <= ?
-                       AND consumed_at IS NULL AND revoked_at IS NULL
-                     ORDER BY created_at DESC, id DESC LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(now)
-                .bind(now)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            if current_pending_challenge_id.as_deref() != Some(expected_challenge_id) {
-                transaction
-                    .commit()
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
-                return Ok(UserEmailChangeCreateResult::NotAcceptable);
-            }
-        }
-
-        self.query(
-            "INSERT INTO mail_challenges (
-                 id, challenge_kind, recipient_email, reference_id, token_hash,
-                 expires_at, created_at
-             ) VALUES (?, 'EMAIL_VERIFICATION', ?, ?, ?, ?, ?)",
-        )
-        .bind(challenge.id)
-        .bind(challenge.recipient_email)
-        .bind(user_id)
-        .bind(challenge.token_hash)
-        .bind(challenge.expires_at)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        let outbox_id = Uuid::now_v7().to_string();
-        self.query(
-            "INSERT INTO mail_outbox (
-                 id, idempotency_key, recipient_email, template_kind, reference_id,
-                 status, attempt_count, available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, 'EMAIL_VERIFICATION', ?, 'PENDING', 0, ?, ?, ?)",
-        )
-        .bind(&outbox_id)
-        .bind(message.idempotency_key)
-        .bind(message.recipient_email)
-        .bind(message.reference_id)
-        .bind(message.available_at)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        self.query(
-            "UPDATE mail_challenges SET revoked_at = ?
-             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-               AND id <> ? AND consumed_at IS NULL AND revoked_at IS NULL
-               AND created_at <= ?",
-        )
-        .bind(now)
-        .bind(user_id)
-        .bind(challenge.id)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
-            "UPDATE mail_outbox
-             SET status = 'FAILED', lease_expires_at = NULL,
-                 last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
-                 updated_at = ?
-             WHERE reference_id IN (
-                 SELECT id FROM mail_challenges
-                 WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-                   AND id <> ?
-             ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
-        )
-        .bind(now)
-        .bind(user_id)
-        .bind(challenge.id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserEmailChangeCreateResult::Created)
-    }
-
-    pub(crate) async fn clear_user_email_change(
-        &self,
-        user_id: &str,
-        now: i64,
-    ) -> Result<bool, StorageError> {
-        if now < 0
-            || user_id.trim() != user_id
-            || !(1..=128).contains(&user_id.len())
-            || user_id.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid user email change clearing request".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let active_user_statement = format!(
-            "SELECT id FROM users WHERE id = ? AND is_disabled = 0
-             AND deleted_at IS NULL{lock_clause}"
-        );
-        let active_user_id: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(active_user_statement))
-            .bind(user_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if active_user_id.is_none() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(false);
-        }
-
-        self.query(
-            "UPDATE users SET email = NULL, email_verified_at = NULL, updated_at = ?
-             WHERE id = ? AND is_disabled = 0 AND deleted_at IS NULL",
-        )
-        .bind(now)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
-            "UPDATE mail_challenges SET revoked_at = ?
-             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-               AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
-        )
-        .bind(now)
-        .bind(user_id)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
-            "UPDATE mail_outbox
-             SET status = 'FAILED', lease_expires_at = NULL,
-                 last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
-                 updated_at = ?
-             WHERE reference_id IN (
-                 SELECT id FROM mail_challenges
-                 WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-             ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
-        )
-        .bind(now)
-        .bind(user_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(true)
-    }
-
-    pub(crate) async fn create_user_invitation_with_mail(
-        &self,
-        invitation: NewUserInvitation<'_>,
-        challenge: NewMailChallenge<'_>,
-        message: NewMailOutboxMessage<'_>,
-        now: i64,
-    ) -> Result<UserInvitationCreateResult, StorageError> {
-        let snapshot =
-            serde_json::from_str::<serde_json::Value>(invitation.permission_snapshot_json)
-                .map_err(|_| {
-                    StorageError::Conflict("invalid invitation permission snapshot".to_owned())
-                })?;
-        if now < 0
-            || invitation.id.trim() != invitation.id
-            || !(1..=128).contains(&invitation.id.len())
-            || invitation.id.chars().any(char::is_control)
-            || invitation.recipient_email.trim() != invitation.recipient_email
-            || invitation.recipient_email != invitation.recipient_email.to_lowercase()
-            || !(3..=254).contains(&invitation.recipient_email.len())
-            || invitation.recipient_email.chars().any(char::is_control)
-            || invitation
-                .created_by_user_id
-                .is_some_and(|id| id.trim() != id || !(1..=128).contains(&id.len()))
-            || invitation.preset_id.trim() != invitation.preset_id
-            || !(1..=128).contains(&invitation.preset_id.len())
-            || invitation.preset_name.trim() != invitation.preset_name
-            || !(1..=80).contains(&invitation.preset_name.chars().count())
-            || invitation.preset_version < 1
-            || invitation.permission_snapshot_json.len() > 32_768
-            || !snapshot.is_object()
-            || invitation.expires_at <= now
-            || challenge.id.trim() != challenge.id
-            || !(1..=128).contains(&challenge.id.len())
-            || challenge.id.chars().any(char::is_control)
-            || challenge.kind != MailChallengeKind::Invitation
-            || challenge.recipient_email != invitation.recipient_email
-            || challenge.reference_id != invitation.id
-            || challenge.token_hash.len() != 32
-            || challenge.expires_at != invitation.expires_at
-            || message.idempotency_key.trim() != message.idempotency_key
-            || !(1..=256).contains(&message.idempotency_key.len())
-            || message.idempotency_key.chars().any(char::is_control)
-            || message.recipient_email != invitation.recipient_email
-            || message.template_kind != MailOutboxTemplateKind::Invitation
-            || message.reference_id != challenge.id
-            || message.available_at != now
-        {
-            return Err(StorageError::Conflict(
-                "invalid user invitation and mail bundle".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE user_invitations
-             SET status = 'EXPIRED', updated_at = ?
-             WHERE recipient_email = ? AND status = 'PENDING' AND expires_at <= ?",
-        )
-        .bind(now)
-        .bind(invitation.recipient_email)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        let inserted = self
-            .query(
-                "INSERT INTO user_invitations (
-                     id, recipient_email, created_by_user_id, status, preset_id,
-                     preset_name, preset_version, permission_snapshot_json,
-                     expires_at, created_at, updated_at
-                 ) VALUES (?, ?, ?, 'PENDING', ?, ?, ?, ?, ?, ?, ?)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(invitation.id)
-            .bind(invitation.recipient_email)
-            .bind(invitation.created_by_user_id)
-            .bind(invitation.preset_id)
-            .bind(invitation.preset_name)
-            .bind(invitation.preset_version)
-            .bind(invitation.permission_snapshot_json)
-            .bind(invitation.expires_at)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if inserted.rows_affected() != 1 {
-            let pending_invitation_exists: Option<String> = self
-                .query_scalar(
-                    "SELECT id FROM user_invitations
-                     WHERE recipient_email = ? AND status = 'PENDING' AND expires_at > ?
-                     LIMIT 1",
-                )
-                .bind(invitation.recipient_email)
-                .bind(now)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return if pending_invitation_exists.is_some() {
-                Ok(UserInvitationCreateResult::AlreadyPending)
-            } else {
-                Err(StorageError::Conflict(
-                    "user invitation ID already exists".to_owned(),
-                ))
-            };
-        }
-
-        let recent_email_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM mail_outbox
-                 WHERE recipient_email = ? AND template_kind = 'INVITATION'
-                   AND created_at > ?",
-            )
-            .bind(invitation.recipient_email)
-            .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationCreateResult::RateLimited);
-        }
-
-        self.query(
-            "INSERT INTO mail_challenges (
-                 id, challenge_kind, recipient_email, reference_id, token_hash,
-                 expires_at, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(challenge.id)
-        .bind(challenge.kind.as_str())
-        .bind(challenge.recipient_email)
-        .bind(challenge.reference_id)
-        .bind(challenge.token_hash)
-        .bind(challenge.expires_at)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        let outbox_id = Uuid::now_v7().to_string();
-        self.query(
-            "INSERT INTO mail_outbox (
-                 id, idempotency_key, recipient_email, template_kind, reference_id,
-                 status, attempt_count, available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)",
-        )
-        .bind(&outbox_id)
-        .bind(message.idempotency_key)
-        .bind(message.recipient_email)
-        .bind(message.template_kind.as_str())
-        .bind(message.reference_id)
-        .bind(message.available_at)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserInvitationCreateResult::Created)
-    }
-
-    pub(crate) async fn queue_user_invitation_resend(
-        &self,
-        invitation_id: &str,
-        idempotency_key: &str,
-        now: i64,
-    ) -> Result<UserInvitationResendResult, StorageError> {
-        if now < 0
-            || invitation_id.trim() != invitation_id
-            || !(1..=128).contains(&invitation_id.len())
-            || invitation_id.chars().any(char::is_control)
-            || idempotency_key.trim() != idempotency_key
-            || !(1..=256).contains(&idempotency_key.len())
-            || idempotency_key.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid user invitation resend".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let invitation_statement = format!(
-            "SELECT recipient_email, expires_at FROM user_invitations
-             WHERE id = ? AND status = 'PENDING' AND expires_at > ?{lock_clause}"
-        );
-        let invitation: Option<(String, i64)> = self
-            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(invitation_statement))
-            .bind(invitation_id)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some((recipient_email, invitation_expires_at)) = invitation else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationResendResult::NotResendable);
-        };
-
-        let challenge_statement = format!(
-            "SELECT id FROM mail_challenges
-             WHERE challenge_kind = 'INVITATION' AND reference_id = ?
-               AND recipient_email = ? AND expires_at = ? AND expires_at > ?
-               AND created_at <= ? AND consumed_at IS NULL AND revoked_at IS NULL
-             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
-        );
-        let challenge_id: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
-            .bind(invitation_id)
-            .bind(&recipient_email)
-            .bind(invitation_expires_at)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some(challenge_id) = challenge_id else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationResendResult::NotResendable);
-        };
-
-        let existing_message = self
-            .query_as::<MailOutboxRecord>(
-                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
-                        status, attempt_count, available_at, lease_expires_at,
-                        last_error_code, sent_at, created_at, updated_at
-                 FROM mail_outbox WHERE idempotency_key = ?",
-            )
-            .bind(idempotency_key)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if let Some(existing_message) = existing_message {
-            if existing_message.recipient_email != recipient_email
-                || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
-                || existing_message.reference_id != challenge_id
-            {
-                return Err(StorageError::Conflict(
-                    "mail outbox idempotency key already used".to_owned(),
-                ));
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationResendResult::Queued);
-        }
-
-        let recent_email_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM mail_outbox
-                 WHERE recipient_email = ? AND template_kind = 'INVITATION'
-                   AND created_at > ?",
-            )
-            .bind(&recipient_email)
-            .bind(now.saturating_sub(INVITATION_EMAIL_RATE_WINDOW_SECONDS))
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if recent_email_count >= INVITATION_EMAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationResendResult::RateLimited);
-        }
-
-        let outbox_id = Uuid::now_v7().to_string();
-        self.query(
-            "INSERT INTO mail_outbox (
-                 id, idempotency_key, recipient_email, template_kind, reference_id,
-                 status, attempt_count, available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, 'INVITATION', ?, 'PENDING', 0, ?, ?, ?)
-             ON CONFLICT (idempotency_key) DO NOTHING",
-        )
-        .bind(&outbox_id)
-        .bind(idempotency_key)
-        .bind(&recipient_email)
-        .bind(&challenge_id)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        let existing_message = self
-            .query_as::<MailOutboxRecord>(
-                "SELECT id, idempotency_key, recipient_email, template_kind, reference_id,
-                        status, attempt_count, available_at, lease_expires_at,
-                        last_error_code, sent_at, created_at, updated_at
-                 FROM mail_outbox WHERE idempotency_key = ?",
-            )
-            .bind(idempotency_key)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if existing_message.recipient_email != recipient_email
-            || existing_message.template_kind != MailOutboxTemplateKind::Invitation.as_str()
-            || existing_message.reference_id != challenge_id
-        {
-            return Err(StorageError::Conflict(
-                "mail outbox idempotency key already used".to_owned(),
-            ));
-        }
-
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserInvitationResendResult::Queued)
-    }
-
-    pub(crate) async fn get_user_invitation(
-        &self,
-        id: &str,
-        now: i64,
-    ) -> Result<Option<StoredUserInvitation>, StorageError> {
-        if now < 0 {
-            return Err(StorageError::Conflict(
-                "invalid invitation read time".to_owned(),
-            ));
-        }
-        self.query_as::<UserInvitationRecord>(
-            "SELECT id, recipient_email, created_by_user_id, accepted_user_id,
-                    CASE WHEN status = 'PENDING' AND expires_at <= ?
-                         THEN 'EXPIRED' ELSE status END AS status,
-                    preset_id, preset_name, preset_version, permission_snapshot_json,
-                    expires_at, accepted_at, revoked_at, created_at, updated_at
-             FROM user_invitations WHERE id = ?",
-        )
-        .bind(now)
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
-        .map(TryInto::try_into)
-        .transpose()
-    }
-
-    pub(crate) async fn get_user_invitation_for_challenge_hash(
-        &self,
-        token_hash: &[u8],
-        now: i64,
-    ) -> Result<Option<StoredUserInvitationAcceptance>, StorageError> {
-        if now < 0 || token_hash.len() != 32 {
-            return Err(StorageError::Conflict(
-                "invalid invitation challenge lookup".to_owned(),
-            ));
-        }
-        let row = self
-            .query_as::<(String, String, String, i64)>(
-                "SELECT i.id, c.id, c.recipient_email, c.expires_at
-                 FROM mail_challenges c
-                 JOIN user_invitations i ON i.id = c.reference_id
-                 WHERE c.challenge_kind = 'INVITATION' AND c.token_hash = ?
-                   AND c.expires_at > ? AND c.created_at <= ?
-                   AND c.consumed_at IS NULL AND c.revoked_at IS NULL
-                   AND i.status = 'PENDING' AND i.expires_at > ?
-                   AND i.recipient_email = c.recipient_email
-                   AND i.expires_at = c.expires_at
-                 ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
-            )
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(row.map(
-            |(invitation_id, challenge_id, recipient_email, expires_at)| {
-                StoredUserInvitationAcceptance {
-                    invitation_id,
-                    challenge_id,
-                    recipient_email,
-                    expires_at,
-                }
-            },
-        ))
-    }
-
-    pub(crate) async fn accept_user_invitation(
-        &self,
-        challenge_id: &str,
-        token_hash: &[u8],
-        account: NewInvitationUserAccount<'_>,
-        now: i64,
-    ) -> Result<UserInvitationAcceptResult, StorageError> {
-        if now < 0
-            || challenge_id.trim() != challenge_id
-            || !(1..=128).contains(&challenge_id.len())
-            || challenge_id.chars().any(char::is_control)
-            || token_hash.len() != 32
-            || account.id.trim() != account.id
-            || !(1..=128).contains(&account.id.len())
-            || account.id.chars().any(char::is_control)
-            || account.username_normalized.trim() != account.username_normalized
-            || account.username_normalized.is_empty()
-            || account.username_normalized.chars().count() > 128
-            || account.username_normalized != account.username_normalized.to_lowercase()
-            || account.display_name.trim().is_empty()
-            || account.display_name.chars().count() > 128
-            || account.password_hash.trim().is_empty()
-            || account.password_hash.len() > 512
-        {
-            return Err(StorageError::Conflict(
-                "invalid invitation acceptance".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let invitation_statement = format!(
-            "SELECT i.id, i.recipient_email, i.permission_snapshot_json FROM user_invitations i
-             JOIN mail_challenges c ON c.reference_id = i.id
-             WHERE c.id = ? AND c.challenge_kind = 'INVITATION' AND c.token_hash = ?
-               AND c.expires_at > ? AND c.created_at <= ?
-               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
-               AND i.status = 'PENDING' AND i.expires_at > ?
-               AND i.recipient_email = c.recipient_email
-               AND i.expires_at = c.expires_at{lock_clause}"
-        );
-        let invitation: Option<(String, String, String)> = self
-            .query_as(sqlx::AssertSqlSafe(invitation_statement))
-            .bind(challenge_id)
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some((invitation_id, recipient_email, permission_snapshot_json)) = invitation else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationAcceptResult::NotAcceptable);
-        };
-
-        let permission_snapshot: UserInvitationPermissionSnapshot =
-            serde_json::from_str(&permission_snapshot_json).map_err(|_| {
-                StorageError::Serialization("invitation permission snapshot is invalid".to_owned())
-            })?;
-        let permissions = permission_snapshot.permissions;
-        if !matches!(
-            permissions.library_access_mode.as_str(),
-            "ALL" | "SELECTED" | "NONE"
-        ) || permissions.max_simultaneous_playbacks < 0
-        {
-            return Err(StorageError::Serialization(
-                "invitation permission snapshot is invalid".to_owned(),
-            ));
-        }
-
-        let username_taken = self
-            .query_scalar::<String>("SELECT id FROM users WHERE username_normalized = ? LIMIT 1")
-            .bind(account.username_normalized)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .is_some();
-        if username_taken {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationAcceptResult::UsernameTaken);
-        }
-
-        let insert_user = self
-            .query(
-                "INSERT INTO users (
-                    id, username_normalized, display_name, password_hash,
-                    is_admin, can_manage_server, has_password, email, email_verified_at,
-                    can_download, can_play, max_simultaneous_playbacks,
-                    allow_remux, allow_audio_transcode, allow_video_transcode,
-                    library_access_mode
-                 ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(account.id)
-            .bind(account.username_normalized)
-            .bind(account.display_name)
-            .bind(account.password_hash)
-            .bind(database_flag(permission_snapshot.is_admin))
-            .bind(database_flag(permission_snapshot.can_manage_server))
-            .bind(&recipient_email)
-            .bind(now)
-            .bind(database_flag(permissions.can_download))
-            .bind(database_flag(permissions.can_play))
-            .bind(permissions.max_simultaneous_playbacks)
-            .bind(database_flag(permissions.allow_remux))
-            .bind(database_flag(permissions.allow_audio_transcode))
-            .bind(database_flag(permissions.allow_video_transcode))
-            .bind(&permissions.library_access_mode)
-            .execute(&mut *transaction)
-            .await;
-        if let Err(source) = insert_user {
-            let unique_violation = source
-                .as_database_error()
-                .is_some_and(|error| error.is_unique_violation());
-            if unique_violation {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|rollback_error| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source: rollback_error,
-                    })?;
-
-                let username_taken = self
-                    .query_scalar::<String>(
-                        "SELECT id FROM users WHERE username_normalized = ? LIMIT 1",
-                    )
-                    .bind(account.username_normalized)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
-                    .is_some();
-                if username_taken {
-                    return Ok(UserInvitationAcceptResult::UsernameTaken);
-                }
-
-                let email_already_registered = self
-                    .query_scalar::<String>(
-                        "SELECT id FROM users
-                         WHERE email IS NOT NULL AND email <> ''
-                           AND LOWER(email) = LOWER(?)
-                         LIMIT 1",
-                    )
-                    .bind(&recipient_email)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
-                    .is_some();
-                if email_already_registered {
-                    return Ok(UserInvitationAcceptResult::EmailAlreadyRegistered);
-                }
-            }
-            return Err(StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            });
-        }
-
-        if permissions.library_access_mode == "SELECTED" {
-            for library_id in &permissions.library_ids {
-                self.query(
-                    "INSERT INTO user_library_access (user_id, library_id, can_view)
-                     VALUES (?, ?, 1)",
-                )
-                .bind(account.id)
-                .bind(library_id)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            }
-        }
-
-        let invitation_updated = self
-            .query(
-                "UPDATE user_invitations
-                 SET status = 'ACCEPTED', accepted_user_id = ?, accepted_at = ?, updated_at = ?
-                 WHERE id = ? AND status = 'PENDING' AND expires_at > ?",
-            )
-            .bind(account.id)
-            .bind(now)
-            .bind(now)
-            .bind(&invitation_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected();
-        let challenge_consumed = self
-            .query(
-                "UPDATE mail_challenges SET consumed_at = ?
-                 WHERE id = ? AND token_hash = ? AND challenge_kind = 'INVITATION'
-                   AND consumed_at IS NULL AND revoked_at IS NULL
-                   AND expires_at > ? AND created_at <= ?",
-            )
-            .bind(now)
-            .bind(challenge_id)
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected();
-        if invitation_updated != 1 || challenge_consumed != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserInvitationAcceptResult::NotAcceptable);
-        }
-
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserInvitationAcceptResult::Accepted)
-    }
-
-    pub(crate) async fn list_user_invitations_page(
-        &self,
-        status: Option<UserInvitationStatus>,
-        page_size: i64,
-        offset: i64,
-        now: i64,
-    ) -> Result<UserInvitationPage, StorageError> {
-        if now < 0 {
-            return Err(StorageError::Conflict(
-                "invalid invitation page time".to_owned(),
-            ));
-        }
-        let page_size = page_size.clamp(1, 100);
-        let offset = offset.max(0);
-        let status_filter = if status.is_some() {
-            " WHERE status = ?"
-        } else {
-            ""
-        };
-        let count_statement = format!(
-            "SELECT COUNT(*) FROM (
-                 SELECT CASE WHEN status = 'PENDING' AND expires_at <= ?
-                             THEN 'EXPIRED' ELSE status END AS status
-                 FROM user_invitations
-             ) AS invitations{status_filter}"
-        );
-        let mut count_query = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_statement));
-        count_query = count_query.bind(now);
-        if let Some(status) = status {
-            count_query = count_query.bind(status.as_str());
-        }
-        let total_count =
-            count_query
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-
-        let page_statement = format!(
-            "SELECT id, recipient_email, created_by_user_id, accepted_user_id, status,
-                    preset_id, preset_name, preset_version, permission_snapshot_json,
-                    expires_at, accepted_at, revoked_at, created_at, updated_at
-             FROM (
-                 SELECT id, recipient_email, created_by_user_id, accepted_user_id,
-                        CASE WHEN status = 'PENDING' AND expires_at <= ?
-                             THEN 'EXPIRED' ELSE status END AS status,
-                        preset_id, preset_name, preset_version, permission_snapshot_json,
-                        expires_at, accepted_at, revoked_at, created_at, updated_at
-                 FROM user_invitations
-             ) AS invitations{status_filter}
-             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-        );
-        let mut page_query = self
-            .query_as::<UserInvitationRecord>(sqlx::AssertSqlSafe(page_statement))
-            .bind(now);
-        if let Some(status) = status {
-            page_query = page_query.bind(status.as_str());
-        }
-        let records = page_query
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let entries = records
-            .into_iter()
-            .map(TryInto::try_into)
-            .collect::<Result<Vec<StoredUserInvitation>, StorageError>>()?;
-        Ok(UserInvitationPage {
-            entries,
-            page_size,
-            total_count,
-        })
-    }
-
-    pub(crate) async fn revoke_user_invitation(
-        &self,
-        id: &str,
-        now: i64,
-    ) -> Result<bool, StorageError> {
-        if now < 0 || id.trim() != id || !(1..=128).contains(&id.len()) {
-            return Err(StorageError::Conflict(
-                "invalid invitation revocation".to_owned(),
-            ));
-        }
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        self.query(
-            "UPDATE user_invitations
-             SET status = 'EXPIRED', updated_at = ?
-             WHERE id = ? AND status = 'PENDING' AND expires_at <= ?",
-        )
-        .bind(now)
-        .bind(id)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        let revoked = self
-            .query(
-                "UPDATE user_invitations
-                 SET status = 'REVOKED', revoked_at = ?, updated_at = ?
-                 WHERE id = ? AND status = 'PENDING' AND expires_at > ?",
-            )
-            .bind(now)
-            .bind(now)
-            .bind(id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected()
-            == 1;
-        if revoked {
-            self.query(
-                "UPDATE mail_challenges SET revoked_at = ?
-                 WHERE challenge_kind = 'INVITATION' AND reference_id = ?
-                   AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
-            )
-            .bind(now)
-            .bind(id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            self.query(
-                "UPDATE mail_outbox
-                 SET status = 'FAILED', lease_expires_at = NULL,
-                     last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL,
-                     updated_at = ?
-                 WHERE reference_id IN (
-                     SELECT id FROM mail_challenges
-                     WHERE challenge_kind = 'INVITATION' AND reference_id = ?
-                 ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
-            )
-            .bind(now)
-            .bind(id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(revoked)
-    }
-
-    pub(crate) async fn get_mail_challenge(
-        &self,
-        id: &str,
-    ) -> Result<Option<StoredMailChallenge>, StorageError> {
-        self.query_as::<MailChallengeRecord>(
-            "SELECT id, challenge_kind, recipient_email, reference_id, token_hash,
-                    expires_at, consumed_at, revoked_at, created_at
-             FROM mail_challenges WHERE id = ?",
-        )
-        .bind(id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
-        .map(TryInto::try_into)
-        .transpose()
-    }
-
-    pub(crate) async fn get_user_email_change_challenge_by_token_hash(
-        &self,
-        user_id: &str,
-        token_hash: &[u8],
-        now: i64,
-    ) -> Result<Option<StoredMailChallenge>, StorageError> {
-        if now < 0
-            || user_id.trim() != user_id
-            || !(1..=128).contains(&user_id.len())
-            || user_id.chars().any(char::is_control)
-            || token_hash.len() != 32
-        {
-            return Err(StorageError::Conflict(
-                "invalid user email change challenge lookup".to_owned(),
-            ));
-        }
-        self.query_as::<MailChallengeRecord>(
-            "SELECT c.id, c.challenge_kind, c.recipient_email, c.reference_id,
-                    c.token_hash, c.expires_at, c.consumed_at, c.revoked_at, c.created_at
-             FROM mail_challenges c
-             JOIN users u ON u.id = c.reference_id
-             WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.reference_id = ?
-               AND c.token_hash = ? AND c.expires_at > ? AND c.created_at <= ?
-               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
-               AND u.is_disabled = 0 AND u.deleted_at IS NULL
-             LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(token_hash)
-        .bind(now)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
-        .map(TryInto::try_into)
-        .transpose()
-    }
-
-    pub(crate) async fn get_pending_user_email_change(
-        &self,
-        user_id: &str,
-        now: i64,
-    ) -> Result<Option<StoredMailChallenge>, StorageError> {
-        if now < 0
-            || user_id.trim() != user_id
-            || !(1..=128).contains(&user_id.len())
-            || user_id.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid pending user email change lookup".to_owned(),
-            ));
-        }
-        self.query_as::<MailChallengeRecord>(
-            "SELECT c.id, c.challenge_kind, c.recipient_email, c.reference_id,
-                    c.token_hash, c.expires_at, c.consumed_at, c.revoked_at, c.created_at
-             FROM mail_challenges c
-             JOIN users u ON u.id = c.reference_id
-             WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.reference_id = ?
-               AND c.expires_at > ? AND c.created_at <= ?
-               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
-               AND u.is_disabled = 0 AND u.deleted_at IS NULL
-             ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
-        )
-        .bind(user_id)
-        .bind(now)
-        .bind(now)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?
-        .map(TryInto::try_into)
-        .transpose()
-    }
-
-    pub(crate) async fn consume_mail_challenge(
-        &self,
-        id: &str,
-        token_hash: &[u8],
-        now: i64,
-    ) -> Result<bool, StorageError> {
-        if now < 0 || token_hash.len() != 32 {
-            return Err(StorageError::Conflict(
-                "invalid mail challenge consumption".to_owned(),
-            ));
-        }
-        let result = self
-            .query(
-                "UPDATE mail_challenges SET consumed_at = ?
-                 WHERE id = ? AND token_hash = ? AND consumed_at IS NULL
-                   AND revoked_at IS NULL AND expires_at > ? AND created_at <= ?",
-            )
-            .bind(now)
-            .bind(id)
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .execute(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub(crate) async fn revoke_mail_challenges(
-        &self,
-        kind: MailChallengeKind,
-        reference_id: &str,
-        now: i64,
-    ) -> Result<u64, StorageError> {
-        if now < 0
-            || reference_id.trim() != reference_id
-            || !(1..=128).contains(&reference_id.len())
-            || reference_id.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid mail challenge revocation".to_owned(),
-            ));
-        }
-        let result = self
-            .query(
-                "UPDATE mail_challenges SET revoked_at = ?
-                 WHERE challenge_kind = ? AND reference_id = ?
-                   AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
-            )
-            .bind(now)
-            .bind(kind.as_str())
-            .bind(reference_id)
-            .bind(now)
-            .execute(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(result.rows_affected())
-    }
-}
-
-fn user_registration_permission_snapshot(
-    json: &str,
-) -> Result<UserInvitationPermissionSnapshot, StorageError> {
-    let snapshot: UserInvitationPermissionSnapshot = serde_json::from_str(json).map_err(|_| {
-        StorageError::Conflict("invalid user registration permission snapshot".to_owned())
-    })?;
-    if json.len() > 32_768
-        || !matches!(
-            snapshot.permissions.library_access_mode.as_str(),
-            "ALL" | "SELECTED" | "NONE"
-        )
-        || snapshot.permissions.max_simultaneous_playbacks < 0
-        || snapshot.permissions.library_ids.iter().any(|id| {
-            id.trim() != id || !(1..=128).contains(&id.len()) || id.chars().any(char::is_control)
-        })
-        || snapshot
-            .permissions
-            .library_ids
-            .iter()
-            .collect::<HashSet<_>>()
-            .len()
-            != snapshot.permissions.library_ids.len()
-    {
-        return Err(StorageError::Conflict(
-            "invalid user registration permission snapshot".to_owned(),
-        ));
-    }
-    Ok(snapshot)
-}
-
-#[allow(dead_code)] // LUX-808 and LUX-812 consume this request workflow.
-impl Database {
-    async fn cancel_user_registration_mail(
-        &self,
-        transaction: &mut sqlx::Transaction<'_, Any>,
-        request_id: &str,
-        now: i64,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE mail_challenges SET revoked_at = ?
-             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-               AND consumed_at IS NULL AND revoked_at IS NULL AND created_at <= ?",
-        )
-        .bind(now)
-        .bind(request_id)
-        .bind(now)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
-            "UPDATE mail_outbox
-             SET status = 'FAILED', lease_expires_at = NULL,
-                 last_error_code = 'REFERENCE_UNAVAILABLE', sent_at = NULL, updated_at = ?
-             WHERE reference_id IN (
-                 SELECT id FROM mail_challenges
-                 WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-             ) AND status IN ('PENDING', 'RETRY_WAIT', 'SENDING')",
-        )
-        .bind(now)
-        .bind(request_id)
-        .execute(&mut **transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        Ok(())
-    }
-
-    pub(crate) async fn create_user_registration_request_with_mail(
-        &self,
-        request: NewUserRegistrationRequest<'_>,
-        challenge: NewMailChallenge<'_>,
-        message: NewMailOutboxMessage<'_>,
-        now: i64,
-    ) -> Result<UserRegistrationCreateResult, StorageError> {
-        let _snapshot = user_registration_permission_snapshot(request.permission_snapshot_json)?;
-        if now < 0
-            || request.id.trim() != request.id
-            || !(1..=128).contains(&request.id.len())
-            || request.id.chars().any(char::is_control)
-            || request.recipient_email.trim() != request.recipient_email
-            || request.recipient_email != request.recipient_email.to_lowercase()
-            || !(3..=254).contains(&request.recipient_email.chars().count())
-            || request.recipient_email.chars().any(char::is_whitespace)
-            || request.username_normalized.trim() != request.username_normalized
-            || request.username_normalized.is_empty()
-            || request.username_normalized.chars().count() > 128
-            || request.username_normalized != request.username_normalized.to_lowercase()
-            || request.username_normalized.chars().any(char::is_control)
-            || request.display_name.trim().is_empty()
-            || request.display_name.chars().count() > 128
-            || request.display_name.chars().any(char::is_control)
-            || request.password_hash.len() > 2048
-            || !request.password_hash.starts_with("$argon2id$")
-            || request.expires_at <= now
-            || challenge.id.trim() != challenge.id
-            || !(1..=128).contains(&challenge.id.len())
-            || challenge.id.chars().any(char::is_control)
-            || challenge.kind != MailChallengeKind::EmailVerification
-            || challenge.recipient_email != request.recipient_email
-            || challenge.reference_id != request.id
-            || challenge.token_hash.len() != 32
-            || challenge.expires_at != request.expires_at
-            || message.idempotency_key.trim() != message.idempotency_key
-            || !(1..=256).contains(&message.idempotency_key.len())
-            || message.idempotency_key.chars().any(char::is_control)
-            || message.recipient_email != request.recipient_email
-            || message.template_kind != MailOutboxTemplateKind::EmailVerification
-            || message.reference_id != challenge.id
-            || message.available_at != now
-        {
-            return Err(StorageError::Conflict(
-                "invalid user registration and mail bundle".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let expired_ids: Vec<String> = self
-            .query_scalar(
-                "SELECT id FROM user_registration_requests
-                 WHERE recipient_email = ?
-                   AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?",
-            )
-            .bind(request.recipient_email)
-            .bind(now)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        for expired_id in expired_ids {
-            self.query(
-                "UPDATE user_registration_requests
-                 SET status = 'EXPIRED', password_hash = NULL, last_error_code = NULL, updated_at = ?
-                 WHERE id = ? AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?",
-            )
-            .bind(now)
-            .bind(&expired_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            self.cancel_user_registration_mail(&mut transaction, &expired_id, now)
-                .await?;
-        }
-
-        let existing_user: Option<String> = self
-            .query_scalar(
-                "SELECT id FROM users WHERE email IS NOT NULL AND LOWER(email) = ? LIMIT 1",
-            )
-            .bind(request.recipient_email)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if existing_user.is_some() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationCreateResult::AlreadyExists);
-        }
-
-        let recent_email_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM mail_outbox
-                 WHERE recipient_email = ? AND template_kind = 'EMAIL_VERIFICATION'
-                   AND created_at > ?",
-            )
-            .bind(request.recipient_email)
-            .bind(now.saturating_sub(USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS))
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if recent_email_count >= USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationCreateResult::RateLimited);
-        }
-
-        let inserted = self
-            .query(
-                "INSERT INTO user_registration_requests (
-                     id, recipient_email, username_normalized, display_name, password_hash,
-                     permission_snapshot_json, status, expires_at, created_at, updated_at
-                 ) VALUES (?, ?, ?, ?, ?, ?, 'PENDING_EMAIL', ?, ?, ?)
-                 ON CONFLICT DO NOTHING",
-            )
-            .bind(request.id)
-            .bind(request.recipient_email)
-            .bind(request.username_normalized)
-            .bind(request.display_name)
-            .bind(request.password_hash)
-            .bind(request.permission_snapshot_json)
-            .bind(request.expires_at)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if inserted.rows_affected() != 1 {
-            let existing_request: Option<String> = self
-                .query_scalar(
-                    "SELECT id FROM user_registration_requests
-                     WHERE recipient_email = ? AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL')
-                       AND expires_at > ? LIMIT 1",
-                )
-                .bind(request.recipient_email)
-                .bind(now)
-                .fetch_optional(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return if existing_request.is_some() {
-                Ok(UserRegistrationCreateResult::AlreadyExists)
-            } else {
-                Err(StorageError::Conflict(
-                    "user registration request identifier already exists".to_owned(),
-                ))
-            };
-        }
-
-        self.query(
-            "INSERT INTO mail_challenges (
-                 id, challenge_kind, recipient_email, reference_id, token_hash,
-                 expires_at, created_at
-             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(challenge.id)
-        .bind(challenge.kind.as_str())
-        .bind(challenge.recipient_email)
-        .bind(challenge.reference_id)
-        .bind(challenge.token_hash)
-        .bind(challenge.expires_at)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        self.query(
-            "INSERT INTO mail_outbox (
-                 id, idempotency_key, recipient_email, template_kind, reference_id,
-                 status, attempt_count, available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, ?, ?, 'PENDING', 0, ?, ?, ?)",
-        )
-        .bind(Uuid::now_v7().to_string())
-        .bind(message.idempotency_key)
-        .bind(message.recipient_email)
-        .bind(message.template_kind.as_str())
-        .bind(message.reference_id)
-        .bind(message.available_at)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserRegistrationCreateResult::Created)
-    }
-}
-
-#[allow(dead_code)] // LUX-808 and LUX-812 consume these registration transitions.
-impl Database {
-    pub(crate) async fn queue_user_registration_resend(
-        &self,
-        recipient_email: &str,
-        idempotency_key: &str,
-        now: i64,
-    ) -> Result<UserRegistrationResendResult, StorageError> {
-        if now < 0
-            || recipient_email.trim() != recipient_email
-            || recipient_email != recipient_email.to_lowercase()
-            || !(3..=254).contains(&recipient_email.chars().count())
-            || recipient_email
-                .chars()
-                .any(|character| character.is_control() || character.is_whitespace())
-            || idempotency_key.trim() != idempotency_key
-            || !(1..=256).contains(&idempotency_key.len())
-            || idempotency_key.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid user registration resend".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let request_statement = format!(
-            "SELECT id, expires_at FROM user_registration_requests
-             WHERE recipient_email = ? AND status = 'PENDING_EMAIL'
-               AND email_verified_at IS NULL AND password_hash IS NOT NULL
-               AND expires_at > ? AND created_at <= ?
-             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
-        );
-        let request: Option<(String, i64)> = self
-            .query_as::<(String, i64)>(sqlx::AssertSqlSafe(request_statement))
-            .bind(recipient_email)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some((request_id, request_expires_at)) = request else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationResendResult::NotResendable);
-        };
-
-        let challenge_statement = format!(
-            "SELECT id FROM mail_challenges
-             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-               AND recipient_email = ? AND expires_at = ? AND expires_at > ?
-               AND created_at <= ? AND consumed_at IS NULL AND revoked_at IS NULL
-             ORDER BY created_at DESC, id DESC LIMIT 1{lock_clause}"
-        );
-        let challenge_id: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
-            .bind(&request_id)
-            .bind(recipient_email)
-            .bind(request_expires_at)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some(challenge_id) = challenge_id else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationResendResult::NotResendable);
-        };
-
-        let existing_message: Option<(String, String, String)> = self
-            .query_as(
-                "SELECT recipient_email, template_kind, reference_id FROM mail_outbox
-                 WHERE idempotency_key = ?",
-            )
-            .bind(idempotency_key)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if let Some((existing_email, existing_template, existing_reference)) = existing_message {
-            if existing_email != recipient_email
-                || existing_template != MailOutboxTemplateKind::EmailVerification.as_str()
-                || existing_reference != challenge_id
-            {
-                return Err(StorageError::Conflict(
-                    "mail outbox idempotency key already used".to_owned(),
-                ));
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationResendResult::Queued);
-        }
-
-        let recent_email_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM mail_outbox
-                 WHERE recipient_email = ? AND template_kind = 'EMAIL_VERIFICATION'
-                   AND created_at > ?",
-            )
-            .bind(recipient_email)
-            .bind(now.saturating_sub(USER_REGISTRATION_MAIL_RATE_WINDOW_SECONDS))
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if recent_email_count >= USER_REGISTRATION_MAIL_RATE_LIMIT_PER_HOUR {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationResendResult::RateLimited);
-        }
-
-        self.query(
-            "INSERT INTO mail_outbox (
-                 id, idempotency_key, recipient_email, template_kind, reference_id,
-                 status, attempt_count, available_at, created_at, updated_at
-             ) VALUES (?, ?, ?, 'EMAIL_VERIFICATION', ?, 'PENDING', 0, ?, ?, ?)
-             ON CONFLICT (idempotency_key) DO NOTHING",
-        )
-        .bind(Uuid::now_v7().to_string())
-        .bind(idempotency_key)
-        .bind(recipient_email)
-        .bind(&challenge_id)
-        .bind(now)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-
-        let stored_message: (String, String, String) = self
-            .query_as(
-                "SELECT recipient_email, template_kind, reference_id FROM mail_outbox
-                 WHERE idempotency_key = ?",
-            )
-            .bind(idempotency_key)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if stored_message.0 != recipient_email
-            || stored_message.1 != MailOutboxTemplateKind::EmailVerification.as_str()
-            || stored_message.2 != challenge_id
-        {
-            return Err(StorageError::Conflict(
-                "mail outbox idempotency key already used".to_owned(),
-            ));
-        }
-
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserRegistrationResendResult::Queued)
-    }
-
-    pub(crate) async fn get_user_registration_challenge_by_token_hash(
-        &self,
-        token_hash: &[u8],
-        now: i64,
-    ) -> Result<Option<StoredUserRegistrationChallenge>, StorageError> {
-        if now < 0 || token_hash.len() != 32 {
-            return Err(StorageError::Conflict(
-                "invalid user registration challenge lookup".to_owned(),
-            ));
-        }
-        let record: Option<(String, i64)> = self
-            .query_as(
-                "SELECT c.id, c.expires_at
-                 FROM mail_challenges c
-                 JOIN user_registration_requests r ON r.id = c.reference_id
-                 WHERE c.challenge_kind = 'EMAIL_VERIFICATION' AND c.token_hash = ?
-                   AND c.consumed_at IS NULL AND c.revoked_at IS NULL
-                   AND c.expires_at > ? AND c.created_at <= ?
-                   AND r.status = 'PENDING_EMAIL' AND r.expires_at > ?
-                   AND r.recipient_email = c.recipient_email AND r.expires_at = c.expires_at
-                 ORDER BY c.created_at DESC, c.id DESC LIMIT 1",
-            )
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(record.map(|(id, expires_at)| StoredUserRegistrationChallenge { id, expires_at }))
-    }
-
-    pub(crate) async fn verify_user_registration_email(
-        &self,
-        challenge_id: &str,
-        token_hash: &[u8],
-        now: i64,
-    ) -> Result<UserRegistrationVerifyResult, StorageError> {
-        if now < 0
-            || challenge_id.trim() != challenge_id
-            || !(1..=128).contains(&challenge_id.len())
-            || challenge_id.chars().any(char::is_control)
-            || token_hash.len() != 32
-        {
-            return Err(StorageError::Conflict(
-                "invalid user registration verification".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE OF r, c"
-        } else {
-            ""
-        };
-        let statement = format!(
-            "SELECT r.id FROM user_registration_requests r
-             JOIN mail_challenges c ON c.reference_id = r.id
-             WHERE c.id = ? AND c.challenge_kind = 'EMAIL_VERIFICATION'
-               AND c.token_hash = ? AND c.expires_at > ? AND c.created_at <= ?
-               AND c.consumed_at IS NULL AND c.revoked_at IS NULL
-               AND r.status = 'PENDING_EMAIL' AND r.expires_at > ?
-               AND r.recipient_email = c.recipient_email AND r.expires_at = c.expires_at{lock_clause}"
-        );
-        let request_id: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(statement))
-            .bind(challenge_id)
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some(request_id) = request_id else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationVerifyResult::NotAcceptable);
-        };
-
-        let consumed = self
-            .query(
-                "UPDATE mail_challenges SET consumed_at = ?
-                 WHERE id = ? AND challenge_kind = 'EMAIL_VERIFICATION' AND token_hash = ?
-                   AND consumed_at IS NULL AND revoked_at IS NULL
-                   AND expires_at > ? AND created_at <= ?",
-            )
-            .bind(now)
-            .bind(challenge_id)
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected();
-        let transitioned = self
-            .query(
-                "UPDATE user_registration_requests
-                 SET status = 'PENDING_APPROVAL', email_verified_at = ?, updated_at = ?,
-                     last_error_code = NULL
-                 WHERE id = ? AND status = 'PENDING_EMAIL' AND expires_at > ?
-                   AND email_verified_at IS NULL",
-            )
-            .bind(now)
-            .bind(now)
-            .bind(&request_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected();
-        if consumed != 1 || transitioned != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationVerifyResult::NotAcceptable);
-        }
-        self.cancel_user_registration_mail(&mut transaction, &request_id, now)
-            .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserRegistrationVerifyResult::Verified)
-    }
-
-    pub(crate) async fn verify_user_email_change(
-        &self,
-        user_id: &str,
-        challenge_id: &str,
-        token_hash: &[u8],
-        now: i64,
-    ) -> Result<super::UserEmailChangeVerifyResult, StorageError> {
-        if now < 0
-            || user_id.trim() != user_id
-            || !(1..=128).contains(&user_id.len())
-            || user_id.chars().any(char::is_control)
-            || challenge_id.trim() != challenge_id
-            || !(1..=128).contains(&challenge_id.len())
-            || challenge_id.chars().any(char::is_control)
-            || token_hash.len() != 32
-        {
-            return Err(StorageError::Conflict(
-                "invalid user email change verification".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let user_statement = format!(
-            "SELECT id FROM users WHERE id = ? AND is_disabled = 0
-             AND deleted_at IS NULL{lock_clause}"
-        );
-        let active_user_id: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(user_statement))
-            .bind(user_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if active_user_id.is_none() {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(super::UserEmailChangeVerifyResult::NotAcceptable);
-        }
-
-        let challenge_statement = format!(
-            "SELECT recipient_email FROM mail_challenges
-             WHERE id = ? AND challenge_kind = 'EMAIL_VERIFICATION'
-               AND reference_id = ? AND token_hash = ?
-               AND expires_at > ? AND created_at <= ?
-               AND consumed_at IS NULL AND revoked_at IS NULL{lock_clause}"
-        );
-        let recipient_email: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(challenge_statement))
-            .bind(challenge_id)
-            .bind(user_id)
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some(recipient_email) = recipient_email else {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(super::UserEmailChangeVerifyResult::NotAcceptable);
-        };
-
-        let email_in_use: i64 = self
-            .query_scalar(
-                "SELECT CASE WHEN EXISTS (
-                     SELECT 1 FROM users WHERE id <> ? AND LOWER(COALESCE(email, '')) = LOWER(?)
-                 ) THEN 1 ELSE 0 END",
-            )
-            .bind(user_id)
-            .bind(&recipient_email)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if email_in_use != 0 {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(super::UserEmailChangeVerifyResult::EmailConflict);
-        }
-
-        let updated_user = self
-            .query(
-                "UPDATE users SET email = ?, email_verified_at = ?, updated_at = ?
-                 WHERE id = ? AND is_disabled = 0 AND deleted_at IS NULL",
-            )
-            .bind(&recipient_email)
-            .bind(now)
-            .bind(now)
-            .bind(user_id)
-            .execute(&mut *transaction)
-            .await;
-        let updated_user = match updated_user {
-            Ok(result) => result.rows_affected(),
-            Err(source)
-                if source
-                    .as_database_error()
-                    .is_some_and(|error| error.is_unique_violation()) =>
-            {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|rollback| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source: rollback,
-                    })?;
-                return Ok(super::UserEmailChangeVerifyResult::EmailConflict);
-            }
-            Err(source) => {
-                return Err(StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                });
-            }
-        };
-        let consumed_challenge = self
-            .query(
-                "UPDATE mail_challenges SET consumed_at = ?
-                 WHERE id = ? AND challenge_kind = 'EMAIL_VERIFICATION'
-                   AND reference_id = ? AND token_hash = ?
-                   AND consumed_at IS NULL AND revoked_at IS NULL
-                   AND expires_at > ? AND created_at <= ?",
-            )
-            .bind(now)
-            .bind(challenge_id)
-            .bind(user_id)
-            .bind(token_hash)
-            .bind(now)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected();
-        if updated_user != 1 || consumed_challenge != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(super::UserEmailChangeVerifyResult::NotAcceptable);
-        }
-
-        self.query(
-            "UPDATE mail_challenges SET revoked_at = ?
-             WHERE challenge_kind = 'EMAIL_VERIFICATION' AND reference_id = ?
-               AND id <> ? AND consumed_at IS NULL AND revoked_at IS NULL
-               AND created_at <= ?",
-        )
-        .bind(now)
-        .bind(user_id)
-        .bind(challenge_id)
-        .bind(now)
-        .execute(&mut *transaction)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(super::UserEmailChangeVerifyResult::Verified)
-    }
-
-    pub(crate) async fn list_user_registration_requests_page(
-        &self,
-        status: Option<UserRegistrationStatus>,
-        page_size: i64,
-        offset: i64,
-        now: i64,
-    ) -> Result<UserRegistrationRequestPage, StorageError> {
-        if now < 0 {
-            return Err(StorageError::Conflict(
-                "invalid user registration page time".to_owned(),
-            ));
-        }
-        let page_size = page_size.clamp(1, 100);
-        let offset = offset.max(0);
-        let status_filter = if status.is_some() {
-            " WHERE status = ?"
-        } else {
-            ""
-        };
-        let count_statement = format!(
-            "SELECT COUNT(*) FROM (
-                 SELECT CASE
-                     WHEN status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?
-                         THEN 'EXPIRED' ELSE status END AS status
-                 FROM user_registration_requests
-             ) AS requests{status_filter}"
-        );
-        let mut count_query = self.query_scalar::<i64>(sqlx::AssertSqlSafe(count_statement));
-        count_query = count_query.bind(now);
-        if let Some(status) = status {
-            count_query = count_query.bind(status.as_str());
-        }
-        let total_count =
-            count_query
-                .fetch_one(&self.pool)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-
-        let page_statement = format!(
-            "SELECT id, recipient_email, username_normalized, display_name,
-                    permission_snapshot_json, status, expires_at, email_verified_at,
-                    reviewed_at, reviewed_by_user_id, approved_user_id, last_error_code,
-                    created_at, updated_at
-             FROM (
-                 SELECT id, recipient_email, username_normalized, display_name,
-                        permission_snapshot_json,
-                        CASE WHEN status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?
-                             THEN 'EXPIRED' ELSE status END AS status,
-                        expires_at, email_verified_at, reviewed_at, reviewed_by_user_id,
-                        approved_user_id, last_error_code, created_at, updated_at
-                 FROM user_registration_requests
-             ) AS requests{status_filter}
-             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-        );
-        let mut page_query = self
-            .query_as::<UserRegistrationRequestSummaryRecord>(sqlx::AssertSqlSafe(page_statement))
-            .bind(now);
-        if let Some(status) = status {
-            page_query = page_query.bind(status.as_str());
-        }
-        let records = page_query
-            .bind(page_size)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let requests = records
-            .into_iter()
-            .map(|record| {
-                Ok(StoredUserRegistrationRequest {
-                    id: record.id,
-                    recipient_email: record.recipient_email,
-                    username_normalized: record.username_normalized,
-                    display_name: record.display_name,
-                    status: UserRegistrationStatus::parse(&record.status)?,
-                    permission_snapshot_json: record.permission_snapshot_json,
-                    expires_at: record.expires_at,
-                    email_verified_at: record.email_verified_at,
-                    reviewed_at: record.reviewed_at,
-                    reviewed_by_user_id: record.reviewed_by_user_id,
-                    approved_user_id: record.approved_user_id,
-                    last_error_code: record.last_error_code,
-                    created_at: record.created_at,
-                    updated_at: record.updated_at,
-                })
-            })
-            .collect::<Result<Vec<_>, StorageError>>()?;
-        Ok(UserRegistrationRequestPage {
-            requests,
-            page_size,
-            total_count,
-        })
-    }
-
-    async fn mark_user_registration_error(
-        &self,
-        request_id: &str,
-        error_code: &str,
-        now: i64,
-    ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE user_registration_requests
-             SET last_error_code = ?, updated_at = ?
-             WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at > ?
-               AND email_verified_at IS NOT NULL",
-        )
-        .bind(error_code)
-        .bind(now)
-        .bind(request_id)
-        .bind(now)
-        .execute(&self.pool)
-        .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        Ok(())
-    }
-
-    pub(crate) async fn approve_user_registration_request(
-        &self,
-        request_id: &str,
-        reviewer_user_id: &str,
-        permission_snapshot_json: &str,
-        now: i64,
-    ) -> Result<UserRegistrationApproveResult, StorageError> {
-        let permission_snapshot = user_registration_permission_snapshot(permission_snapshot_json)?;
-        if now < 0
-            || request_id.trim() != request_id
-            || !(1..=128).contains(&request_id.len())
-            || request_id.chars().any(char::is_control)
-            || reviewer_user_id.trim() != reviewer_user_id
-            || !(1..=128).contains(&reviewer_user_id.len())
-            || reviewer_user_id.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid user registration approval".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let request_statement = format!(
-            "SELECT recipient_email, username_normalized, display_name, password_hash,
-                    email_verified_at
-             FROM user_registration_requests
-             WHERE id = ? AND status = 'PENDING_APPROVAL' AND email_verified_at IS NOT NULL
-               AND expires_at > ?{lock_clause}"
-        );
-        let request = self
-            .query_as::<UserRegistrationRequestRecord>(sqlx::AssertSqlSafe(request_statement))
-            .bind(request_id)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let Some(request) = request else {
-            let expired = self
-                .query(
-                    "UPDATE user_registration_requests
-                     SET status = 'EXPIRED', password_hash = NULL,
-                         last_error_code = NULL, updated_at = ?
-                     WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at <= ?",
-                )
-                .bind(now)
-                .bind(request_id)
-                .bind(now)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .rows_affected();
-            if expired == 1 {
-                self.cancel_user_registration_mail(&mut transaction, request_id, now)
-                    .await?;
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationApproveResult::NotReviewable);
-        };
-        let Some(email_verified_at) = request.email_verified_at else {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationApproveResult::NotReviewable);
-        };
-        if now < email_verified_at {
-            return Err(StorageError::Conflict(
-                "registration approval time precedes email verification".to_owned(),
-            ));
-        }
-        let Some(password_hash) = request.password_hash.as_deref() else {
-            return Err(StorageError::Serialization(
-                "pending user registration has no password hash".to_owned(),
-            ));
-        };
-
-        let username_taken = self
-            .query_scalar::<String>("SELECT id FROM users WHERE username_normalized = ? LIMIT 1")
-            .bind(&request.username_normalized)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .is_some();
-        if username_taken {
-            self.query(
-                "UPDATE user_registration_requests
-                 SET last_error_code = 'USERNAME_CONFLICT', updated_at = ? WHERE id = ?",
-            )
-            .bind(now)
-            .bind(request_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationApproveResult::UsernameConflict);
-        }
-        let email_taken = self
-            .query_scalar::<String>(
-                "SELECT id FROM users WHERE email IS NOT NULL AND LOWER(email) = ? LIMIT 1",
-            )
-            .bind(&request.recipient_email)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .is_some();
-        if email_taken {
-            self.query(
-                "UPDATE user_registration_requests
-                 SET last_error_code = 'EMAIL_CONFLICT', updated_at = ? WHERE id = ?",
-            )
-            .bind(now)
-            .bind(request_id)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationApproveResult::EmailConflict);
-        }
-
-        let user_id = Uuid::now_v7().to_string();
-        let permissions = permission_snapshot.permissions;
-        let inserted_user = self
-            .query(
-                "INSERT INTO users (
-                    id, username_normalized, display_name, password_hash,
-                    is_admin, can_manage_server, has_password, email, email_verified_at,
-                    can_download, can_play, max_simultaneous_playbacks,
-                    allow_remux, allow_audio_transcode, allow_video_transcode,
-                    library_access_mode
-                 ) VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            )
-            .bind(&user_id)
-            .bind(&request.username_normalized)
-            .bind(&request.display_name)
-            .bind(password_hash)
-            .bind(database_flag(permission_snapshot.is_admin))
-            .bind(database_flag(permission_snapshot.can_manage_server))
-            .bind(&request.recipient_email)
-            .bind(email_verified_at)
-            .bind(database_flag(permissions.can_download))
-            .bind(database_flag(permissions.can_play))
-            .bind(permissions.max_simultaneous_playbacks)
-            .bind(database_flag(permissions.allow_remux))
-            .bind(database_flag(permissions.allow_audio_transcode))
-            .bind(database_flag(permissions.allow_video_transcode))
-            .bind(&permissions.library_access_mode)
-            .execute(&mut *transaction)
-            .await;
-        if let Err(source) = inserted_user {
-            let unique_violation = source
-                .as_database_error()
-                .is_some_and(|error| error.is_unique_violation());
-            transaction
-                .rollback()
-                .await
-                .map_err(|rollback_error| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source: rollback_error,
-                })?;
-            if unique_violation {
-                let username_taken = self
-                    .query_scalar::<String>(
-                        "SELECT id FROM users WHERE username_normalized = ? LIMIT 1",
-                    )
-                    .bind(&request.username_normalized)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
-                    .is_some();
-                if username_taken {
-                    self.mark_user_registration_error(request_id, "USERNAME_CONFLICT", now)
-                        .await?;
-                    return Ok(UserRegistrationApproveResult::UsernameConflict);
-                }
-                let email_taken = self
-                    .query_scalar::<String>(
-                        "SELECT id FROM users WHERE email IS NOT NULL AND LOWER(email) = ? LIMIT 1",
-                    )
-                    .bind(&request.recipient_email)
-                    .fetch_optional(&self.pool)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
-                    .is_some();
-                if email_taken {
-                    self.mark_user_registration_error(request_id, "EMAIL_CONFLICT", now)
-                        .await?;
-                    return Ok(UserRegistrationApproveResult::EmailConflict);
-                }
-            }
-            return Err(StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            });
-        }
-
-        if permissions.library_access_mode == "SELECTED" {
-            for library_id in &permissions.library_ids {
-                if let Err(source) = self
-                    .query(
-                        "INSERT INTO user_library_access (user_id, library_id, can_view)
-                         VALUES (?, ?, 1)",
-                    )
-                    .bind(&user_id)
-                    .bind(library_id)
-                    .execute(&mut *transaction)
-                    .await
-                {
-                    transaction
-                        .rollback()
-                        .await
-                        .map_err(|rollback_error| StorageError::Sqlx {
-                            path: self.path.clone(),
-                            source: rollback_error,
-                        })?;
-                    return Err(StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    });
-                }
-            }
-        }
-        let updated = self
-            .query(
-                "UPDATE user_registration_requests
-                 SET status = 'APPROVED', permission_snapshot_json = ?,
-                     reviewed_at = ?, reviewed_by_user_id = ?, approved_user_id = ?,
-                     password_hash = NULL, last_error_code = NULL, updated_at = ?
-                 WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at > ?",
-            )
-            .bind(permission_snapshot_json)
-            .bind(now)
-            .bind(reviewer_user_id)
-            .bind(&user_id)
-            .bind(now)
-            .bind(request_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected();
-        if updated != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationApproveResult::NotReviewable);
-        }
-        self.cancel_user_registration_mail(&mut transaction, request_id, now)
-            .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserRegistrationApproveResult::Approved(user_id))
-    }
-}
-
-#[allow(dead_code)] // LUX-812 and the registration expiry worker consume these transitions.
-impl Database {
-    pub(crate) async fn reject_user_registration_request(
-        &self,
-        request_id: &str,
-        reviewer_user_id: &str,
-        now: i64,
-    ) -> Result<UserRegistrationRejectResult, StorageError> {
-        if now < 0
-            || request_id.trim() != request_id
-            || !(1..=128).contains(&request_id.len())
-            || request_id.chars().any(char::is_control)
-            || reviewer_user_id.trim() != reviewer_user_id
-            || !(1..=128).contains(&reviewer_user_id.len())
-            || reviewer_user_id.chars().any(char::is_control)
-        {
-            return Err(StorageError::Conflict(
-                "invalid user registration rejection".to_owned(),
-            ));
-        }
-
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE"
-        } else {
-            ""
-        };
-        let statement = format!(
-            "SELECT id FROM user_registration_requests
-             WHERE id = ? AND status = 'PENDING_APPROVAL' AND email_verified_at IS NOT NULL
-               AND expires_at > ?{lock_clause}"
-        );
-        let reviewable: Option<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(statement))
-            .bind(request_id)
-            .bind(now)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        if reviewable.is_none() {
-            let expired = self
-                .query(
-                    "UPDATE user_registration_requests
-                     SET status = 'EXPIRED', password_hash = NULL,
-                         last_error_code = NULL, updated_at = ?
-                     WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at <= ?",
-                )
-                .bind(now)
-                .bind(request_id)
-                .bind(now)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .rows_affected();
-            if expired == 1 {
-                self.cancel_user_registration_mail(&mut transaction, request_id, now)
-                    .await?;
-            }
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationRejectResult::NotReviewable);
-        }
-
-        let updated = self
-            .query(
-                "UPDATE user_registration_requests
-                 SET status = 'REJECTED', reviewed_at = ?, reviewed_by_user_id = ?,
-                     password_hash = NULL, last_error_code = NULL, updated_at = ?
-                 WHERE id = ? AND status = 'PENDING_APPROVAL' AND expires_at > ?",
-            )
-            .bind(now)
-            .bind(reviewer_user_id)
-            .bind(now)
-            .bind(request_id)
-            .bind(now)
-            .execute(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
-            .rows_affected();
-        if updated != 1 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            return Ok(UserRegistrationRejectResult::NotReviewable);
-        }
-        self.cancel_user_registration_mail(&mut transaction, request_id, now)
-            .await?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(UserRegistrationRejectResult::Rejected)
-    }
-
-    pub(crate) async fn expire_user_registration_requests(
-        &self,
-        now: i64,
-        limit: i64,
-    ) -> Result<u64, StorageError> {
-        if now < 0 {
-            return Err(StorageError::Conflict(
-                "invalid user registration expiry time".to_owned(),
-            ));
-        }
-        let limit = limit.clamp(1, 100);
-        let mut transaction = self.begin_metadata_write_transaction().await?;
-        let lock_clause = if self.backend == DatabaseBackend::Postgres {
-            " FOR UPDATE SKIP LOCKED"
-        } else {
-            ""
-        };
-        let statement = format!(
-            "SELECT id FROM user_registration_requests
-             WHERE status IN ('PENDING_EMAIL', 'PENDING_APPROVAL') AND expires_at <= ?
-             ORDER BY expires_at, id LIMIT ?{lock_clause}"
-        );
-        let expired_ids: Vec<String> = self
-            .query_scalar(sqlx::AssertSqlSafe(statement))
-            .bind(now)
-            .bind(limit)
-            .fetch_all(&mut *transaction)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let mut expired_count = 0_u64;
-        for request_id in expired_ids {
-            let updated = self
-                .query(
-                    "UPDATE user_registration_requests
-                     SET status = 'EXPIRED', password_hash = NULL,
-                         last_error_code = NULL, updated_at = ?
-                     WHERE id = ? AND status IN ('PENDING_EMAIL', 'PENDING_APPROVAL')
-                       AND expires_at <= ?",
-                )
-                .bind(now)
-                .bind(&request_id)
-                .bind(now)
-                .execute(&mut *transaction)
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
-                .rows_affected();
-            if updated == 1 {
-                self.cancel_user_registration_mail(&mut transaction, &request_id, now)
-                    .await?;
-                expired_count += 1;
-            }
-        }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        Ok(expired_count)
-    }
-}
-
-#[derive(serde::Deserialize, serde::Serialize)]
-#[serde(deny_unknown_fields)]
-struct RegistrationModeRecord {
-    mode: super::RegistrationMode,
-    version: i64,
-}
-
-// LUX-803 consumes these versioned settings without changing the other settings keys.
-#[allow(dead_code)]
-impl Database {
-    pub(crate) async fn registration_mode(
-        &self,
-    ) -> Result<super::StoredRegistrationMode, StorageError> {
-        let raw_value: Option<String> = self
-            .query_scalar("SELECT value FROM server_settings WHERE key = 'registration_mode'")
-            .fetch_optional(&self.pool)
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        let parsed = raw_value
-            .as_deref()
-            .and_then(|value| serde_json::from_str::<RegistrationModeRecord>(value).ok())
-            .filter(|record| record.version > 0);
-        let (mode, version) = parsed
-            .map_or((super::RegistrationMode::InvitationOnly, 0), |record| {
-                (record.mode, record.version)
-            });
-        Ok(super::StoredRegistrationMode {
-            mode,
-            version,
-            raw_value,
-        })
-    }
-
-    pub(crate) async fn compare_and_set_registration_mode(
-        &self,
-        expected: &super::StoredRegistrationMode,
-        mode: super::RegistrationMode,
-    ) -> Result<bool, StorageError> {
-        let version = expected.version.checked_add(1).ok_or_else(|| {
-            StorageError::Conflict("registration setting version exhausted".to_owned())
-        })?;
-        let value =
-            serde_json::to_string(&RegistrationModeRecord { mode, version }).map_err(|_| {
-                StorageError::Serialization("registration setting serialization failed".to_owned())
-            })?;
-        let result = if let Some(raw_value) = expected.raw_value.as_deref() {
-            self.query(
-                "UPDATE server_settings SET value = ?, updated_at = unixepoch()
-                        WHERE key = 'registration_mode' AND value = ?",
-            )
-            .bind(&value)
-            .bind(raw_value)
-            .execute(&self.pool)
-            .await
-        } else {
-            self.query(
-                "INSERT INTO server_settings (key, value) VALUES ('registration_mode', ?)
-                        ON CONFLICT(key) DO NOTHING",
-            )
-            .bind(&value)
-            .execute(&self.pool)
-            .await
-        }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
-        Ok(result.rows_affected() == 1)
-    }
-}
-
-async fn sqlite_has_legacy_timestamp_migration_checksum(
-    pool: &AnyPool,
-) -> Result<bool, sqlx::Error> {
-    let migrations_table_exists: i64 = sqlx::query_scalar(
-        "SELECT EXISTS (
-             SELECT 1 FROM sqlite_master
-             WHERE type = 'table' AND name = '_sqlx_migrations'
-         )",
-    )
-    .fetch_one(pool)
-    .await?;
-    if migrations_table_exists == 0 {
-        return Ok(false);
-    }
-
-    let checksum: Option<Vec<u8>> = sqlx::query_scalar(
-        "SELECT checksum FROM _sqlx_migrations WHERE version = 126 AND success = 1",
-    )
-    .fetch_optional(pool)
-    .await?;
-    Ok(checksum.as_deref() == Some(LEGACY_SQLITE_MIGRATION_0126_CHECKSUM))
 }
 
 fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {
@@ -5094,6 +2104,15 @@ pub(crate) struct StoredAccessTokenDevice {
     pub(crate) client_version: String,
 }
 
+/// One Emby-route credential: the token's user together with the device identity it was issued to.
+///
+/// The resolver needs both to apply the device and client rules, and reading them with one JOIN
+/// replaces the separate token-to-user and token-to-device lookups that used to run per request.
+pub(crate) struct StoredRouteTokenPrincipal {
+    pub(crate) user: StoredUser,
+    pub(crate) device: StoredAccessTokenDevice,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct StoredEmbyLoginSessionSummary {
     pub(crate) id: String,
@@ -5107,60 +2126,121 @@ pub(crate) struct StoredEmbyLoginSessionSummary {
     pub(crate) last_seen_at: Option<i64>,
 }
 
-pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> StoredUser {
-    StoredUser {
-        id: row.get("id"),
-        username_normalized: row.get("username_normalized"),
-        display_name: row.get("display_name"),
-        password_hash: row.get("password_hash"),
-        has_password: row.get::<i64, _>("has_password") != 0,
-        is_disabled: row.get::<i64, _>("is_disabled") != 0,
-        is_admin: row.get::<i64, _>("is_admin") != 0,
-        can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-        can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-        can_download: row.get::<i64, _>("can_download") != 0,
-        email: row.get("email"),
-        email_verified_at: row.get("email_verified_at"),
-        deleted_at: row.get("deleted_at"),
-        deletion_purge_at: row.get("deletion_purge_at"),
-        last_login_at: row.get("last_login_at"),
-        last_activity_at: row.get("last_activity_at"),
-    }
+/// Row of every user projection that decodes into [`StoredUser`].
+///
+/// The permission flags stay `i64` because both backends store them as `BIGINT` 0/1 and the
+/// conversion to `bool` happens in [`stored_user`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredUserRow {
+    id: String,
+    username_normalized: String,
+    display_name: String,
+    password_hash: String,
+    has_password: i64,
+    is_disabled: i64,
+    is_admin: i64,
+    can_manage_server: i64,
+    can_remote_access: i64,
+    can_download: i64,
+    email: Option<String>,
+    email_verified_at: Option<i64>,
+    deleted_at: Option<i64>,
+    deletion_purge_at: Option<i64>,
+    last_login_at: Option<i64>,
+    last_activity_at: Option<i64>,
 }
 
-pub(crate) fn stored_admin_user_list_item(row: sqlx::any::AnyRow) -> StoredAdminUserListItem {
-    StoredAdminUserListItem {
-        id: row.get("id"),
-        username_normalized: row.get("username_normalized"),
-        display_name: row.get("display_name"),
-        has_password: row.get::<i64, _>("has_password") != 0,
-        is_disabled: row.get::<i64, _>("is_disabled") != 0,
-        is_admin: row.get::<i64, _>("is_admin") != 0,
-        can_manage_server: row.get::<i64, _>("can_manage_server") != 0,
-        can_remote_access: row.get::<i64, _>("can_remote_access") != 0,
-        can_download: row.get::<i64, _>("can_download") != 0,
-        email: row.get("email"),
-        email_verified_at: row.get("email_verified_at"),
-        deleted_at: row.get("deleted_at"),
-        deletion_purge_at: row.get("deletion_purge_at"),
-        last_login_at: row.get("last_login_at"),
-        last_activity_at: row.get("last_activity_at"),
-        created_at: row.get("created_at"),
-        current_playback_count: row.get("current_playback_count"),
-    }
+pub(crate) fn stored_user(row: sqlx::any::AnyRow) -> Result<StoredUser, sqlx::Error> {
+    let row = StoredUserRow::from_row(&row)?;
+    Ok(StoredUser {
+        id: row.id,
+        username_normalized: row.username_normalized,
+        display_name: row.display_name,
+        password_hash: row.password_hash,
+        has_password: row.has_password != 0,
+        is_disabled: row.is_disabled != 0,
+        is_admin: row.is_admin != 0,
+        can_manage_server: row.can_manage_server != 0,
+        can_remote_access: row.can_remote_access != 0,
+        can_download: row.can_download != 0,
+        email: row.email,
+        email_verified_at: row.email_verified_at,
+        deleted_at: row.deleted_at,
+        deletion_purge_at: row.deletion_purge_at,
+        last_login_at: row.last_login_at,
+        last_activity_at: row.last_activity_at,
+    })
+}
+
+/// Row of the administrator user list projection that decodes into
+/// [`StoredAdminUserListItem`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredAdminUserListItemRow {
+    id: String,
+    username_normalized: String,
+    display_name: String,
+    has_password: i64,
+    is_disabled: i64,
+    is_admin: i64,
+    can_manage_server: i64,
+    can_remote_access: i64,
+    can_download: i64,
+    email: Option<String>,
+    email_verified_at: Option<i64>,
+    deleted_at: Option<i64>,
+    deletion_purge_at: Option<i64>,
+    last_login_at: Option<i64>,
+    last_activity_at: Option<i64>,
+    created_at: i64,
+    current_playback_count: i64,
+}
+
+pub(crate) fn stored_admin_user_list_item(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredAdminUserListItem, sqlx::Error> {
+    let row = StoredAdminUserListItemRow::from_row(&row)?;
+    Ok(StoredAdminUserListItem {
+        id: row.id,
+        username_normalized: row.username_normalized,
+        display_name: row.display_name,
+        has_password: row.has_password != 0,
+        is_disabled: row.is_disabled != 0,
+        is_admin: row.is_admin != 0,
+        can_manage_server: row.can_manage_server != 0,
+        can_remote_access: row.can_remote_access != 0,
+        can_download: row.can_download != 0,
+        email: row.email,
+        email_verified_at: row.email_verified_at,
+        deleted_at: row.deleted_at,
+        deletion_purge_at: row.deletion_purge_at,
+        last_login_at: row.last_login_at,
+        last_activity_at: row.last_activity_at,
+        created_at: row.created_at,
+        current_playback_count: row.current_playback_count,
+    })
+}
+
+/// Row of the administrator permission-preset source projection.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredUserPermissionPresetSourceRow {
+    preset_id: String,
+    preset_name: String,
+    preset_version: i64,
+    applied_at: i64,
 }
 
 // LUX-648 uses this mapping when building administrator user projections.
 #[allow(dead_code)]
 pub(crate) fn stored_user_permission_preset_source(
     row: sqlx::any::AnyRow,
-) -> StoredUserPermissionPresetSource {
-    StoredUserPermissionPresetSource {
-        preset_id: row.get("preset_id"),
-        preset_name: row.get("preset_name"),
-        preset_version: row.get("preset_version"),
-        applied_at: row.get("applied_at"),
-    }
+) -> Result<StoredUserPermissionPresetSource, sqlx::Error> {
+    let row = StoredUserPermissionPresetSourceRow::from_row(&row)?;
+    Ok(StoredUserPermissionPresetSource {
+        preset_id: row.preset_id,
+        preset_name: row.preset_name,
+        preset_version: row.preset_version,
+        applied_at: row.applied_at,
+    })
 }
 
 pub(crate) struct UpdateUser<'a> {
@@ -5495,82 +2575,177 @@ pub(crate) struct StoredLibraryRoot {
     pub(crate) scan_cursor: Option<String>,
 }
 
-fn stored_scheduled_task(row: sqlx::any::AnyRow) -> StoredScheduledTaskConfig {
-    StoredScheduledTaskConfig {
-        owner_type: row.get("owner_type"),
-        owner_id: row.get("owner_id"),
-        task_type: row.get("task_type"),
-        plan_id: row.get("plan_id"),
-        task_name: row.get("task_name"),
-        task_description: row.get("task_description"),
-        source_type: row.get("source_type"),
-        plugin_id: row.get("plugin_id"),
-        cron_or_interval: row.get("cron_or_interval"),
-        is_enabled: row.get::<i64, _>("is_enabled") != 0,
-        resource_limit_json: row.get("resource_limit_json"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        library_name: row.get("library_name"),
-    }
+/// Row of the scheduled task config projections that decode into
+/// [`StoredScheduledTaskConfig`].
+///
+/// The library name is a nullable column because the query joins the owner library with a
+/// `LEFT JOIN` to keep `GLOBAL` owners decodable.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScheduledTaskConfigRow {
+    owner_type: String,
+    owner_id: String,
+    task_type: String,
+    plan_id: Option<String>,
+    task_name: String,
+    task_description: String,
+    source_type: String,
+    plugin_id: Option<String>,
+    cron_or_interval: Option<String>,
+    is_enabled: i64,
+    resource_limit_json: String,
+    created_at: i64,
+    updated_at: i64,
+    library_name: Option<String>,
 }
 
-fn stored_scheduled_task_plan(row: sqlx::any::AnyRow) -> StoredScheduledTaskPlan {
-    StoredScheduledTaskPlan {
-        id: row.get("id"),
-        task_type: row.get("task_type"),
-        plan_name: row.get("plan_name"),
-        task_name: row.get("task_name"),
-        task_description: row.get("task_description"),
-        source_type: row.get("source_type"),
-        plugin_id: row.get("plugin_id"),
-        cron_or_interval: row.get("cron_or_interval"),
-        is_enabled: row.get::<i64, _>("is_enabled") != 0,
-        resource_limit_json: row.get("resource_limit_json"),
-        scope_type: row.get("scope_type"),
-        is_default: row.get::<i64, _>("is_default") != 0,
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
+fn stored_scheduled_task(row: sqlx::any::AnyRow) -> Result<StoredScheduledTaskConfig, sqlx::Error> {
+    let row = StoredScheduledTaskConfigRow::from_row(&row)?;
+    Ok(StoredScheduledTaskConfig {
+        owner_type: row.owner_type,
+        owner_id: row.owner_id,
+        task_type: row.task_type,
+        plan_id: row.plan_id,
+        task_name: row.task_name,
+        task_description: row.task_description,
+        source_type: row.source_type,
+        plugin_id: row.plugin_id,
+        cron_or_interval: row.cron_or_interval,
+        is_enabled: row.is_enabled != 0,
+        resource_limit_json: row.resource_limit_json,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        library_name: row.library_name,
+    })
+}
+
+/// Row of the scheduled task plan projection. The attached libraries are loaded separately by
+/// `load_scheduled_task_plan_libraries`, so they are not part of this row.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScheduledTaskPlanRow {
+    id: String,
+    task_type: String,
+    plan_name: String,
+    task_name: String,
+    task_description: String,
+    source_type: String,
+    plugin_id: Option<String>,
+    cron_or_interval: Option<String>,
+    is_enabled: i64,
+    resource_limit_json: String,
+    scope_type: String,
+    is_default: i64,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_scheduled_task_plan(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredScheduledTaskPlan, sqlx::Error> {
+    let row = StoredScheduledTaskPlanRow::from_row(&row)?;
+    Ok(StoredScheduledTaskPlan {
+        id: row.id,
+        task_type: row.task_type,
+        plan_name: row.plan_name,
+        task_name: row.task_name,
+        task_description: row.task_description,
+        source_type: row.source_type,
+        plugin_id: row.plugin_id,
+        cron_or_interval: row.cron_or_interval,
+        is_enabled: row.is_enabled != 0,
+        resource_limit_json: row.resource_limit_json,
+        scope_type: row.scope_type,
+        is_default: row.is_default != 0,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
         libraries: Vec::new(),
-    }
+    })
 }
 
-fn stored_notification_destination(row: sqlx::any::AnyRow) -> StoredNotificationDestination {
-    StoredNotificationDestination {
-        id: row.get("id"),
-        name: row.get("name"),
-        url: row.get("url"),
-        enabled: row.get::<i64, _>("enabled") != 0,
-        allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
-        event_types_json: row.get("event_types_json"),
-        payload_format: row.get("payload_format"),
-        provider_plugin_id: row.get("provider_plugin_id"),
-        provider_config_json: row.get("provider_config_json"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+/// Row of the notification destination projections.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredNotificationDestinationRow {
+    id: String,
+    name: String,
+    url: String,
+    enabled: i64,
+    allow_private_network: i64,
+    event_types_json: String,
+    payload_format: String,
+    provider_plugin_id: String,
+    provider_config_json: String,
+    created_at: i64,
+    updated_at: i64,
 }
 
-fn stored_notification_delivery(row: sqlx::any::AnyRow) -> StoredNotificationDelivery {
-    StoredNotificationDelivery {
-        id: row.get("id"),
-        event_id: row.get("event_id"),
-        destination_id: row.get("destination_id"),
-        status: row.get("status"),
-        attempt_count: row.get("attempt_count"),
-        next_attempt_at: row.get("next_attempt_at"),
-        last_http_status: row.get("last_http_status"),
-        last_error: row.get("last_error"),
-        delivered_at: row.get("delivered_at"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        event_type: row.get("event_type"),
-        payload_json: row.get("payload_json"),
-        destination_name: row.get("name"),
-        destination_url: row.get("url"),
-        allow_private_network: row.get::<i64, _>("allow_private_network") != 0,
-        provider_plugin_id: row.get("provider_plugin_id"),
-        provider_config_json: row.get("provider_config_json"),
-    }
+fn stored_notification_destination(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredNotificationDestination, sqlx::Error> {
+    let row = StoredNotificationDestinationRow::from_row(&row)?;
+    Ok(StoredNotificationDestination {
+        id: row.id,
+        name: row.name,
+        url: row.url,
+        enabled: row.enabled != 0,
+        allow_private_network: row.allow_private_network != 0,
+        event_types_json: row.event_types_json,
+        payload_format: row.payload_format,
+        provider_plugin_id: row.provider_plugin_id,
+        provider_config_json: row.provider_config_json,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+/// Row of the notification delivery projections.
+///
+/// The destination is joined in, so its `name`/`url` columns decode into the delivery's
+/// `destination_name`/`destination_url` fields.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredNotificationDeliveryRow {
+    id: String,
+    event_id: String,
+    destination_id: String,
+    status: String,
+    attempt_count: i64,
+    next_attempt_at: i64,
+    last_http_status: Option<i64>,
+    last_error: Option<String>,
+    delivered_at: Option<i64>,
+    created_at: i64,
+    updated_at: i64,
+    event_type: String,
+    payload_json: String,
+    name: String,
+    url: String,
+    allow_private_network: i64,
+    provider_plugin_id: String,
+    provider_config_json: String,
+}
+
+fn stored_notification_delivery(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredNotificationDelivery, sqlx::Error> {
+    let row = StoredNotificationDeliveryRow::from_row(&row)?;
+    Ok(StoredNotificationDelivery {
+        id: row.id,
+        event_id: row.event_id,
+        destination_id: row.destination_id,
+        status: row.status,
+        attempt_count: row.attempt_count,
+        next_attempt_at: row.next_attempt_at,
+        last_http_status: row.last_http_status,
+        last_error: row.last_error,
+        delivered_at: row.delivered_at,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        event_type: row.event_type,
+        payload_json: row.payload_json,
+        destination_name: row.name,
+        destination_url: row.url,
+        allow_private_network: row.allow_private_network != 0,
+        provider_plugin_id: row.provider_plugin_id,
+        provider_config_json: row.provider_config_json,
+    })
 }
 
 #[derive(Debug)]
@@ -5917,6 +3092,10 @@ pub(crate) struct NewScanManifestEntry {
     pub(crate) inode: Option<i64>,
     pub(crate) fingerprint: Vec<u8>,
     pub(crate) fingerprint_pending: bool,
+    /// The observation was produced by a symbolic link rather than by the file
+    /// itself; `resolved_path` holds the canonical target it resolved to.
+    pub(crate) is_symlink: bool,
+    pub(crate) resolved_path: Option<String>,
 }
 
 pub(crate) struct NewScanManifestDiscoveryChunk<'a> {
@@ -6056,122 +3235,270 @@ pub(crate) struct NewStrmProbeJob<'a> {
     pub(crate) total_count: i64,
 }
 
-fn stored_scan_job(row: sqlx::any::AnyRow) -> StoredScanJob {
-    StoredScanJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        job_type: row.get("job_type"),
-        status: row.get("status"),
-        generation: row.get("generation"),
-        cursor: row.get("cursor"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        processed_media_count: row.get("processed_media_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-        discovery_completed: row.get::<i64, _>("discovery_completed") != 0,
-        auto_metadata_match: row.get::<i64, _>("auto_metadata_match") != 0,
-        current_item: row.get("current_item"),
-        scan_phase: row.get("scan_phase"),
-    }
+/// Row of the scan-job projections that decode into [`StoredScanJob`].
+///
+/// The three flag columns stay `i64` because both backends store them as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_scan_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScanJobRow {
+    id: String,
+    library_id: String,
+    job_type: String,
+    status: String,
+    generation: String,
+    cursor: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    processed_media_count: Option<i64>,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+    discovery_completed: i64,
+    auto_metadata_match: i64,
+    current_item: Option<String>,
+    scan_phase: String,
 }
 
-fn stored_scan_local_metadata_batch(row: sqlx::any::AnyRow) -> StoredScanLocalMetadataBatch {
-    StoredScanLocalMetadataBatch {
-        id: row.get("id"),
-        job_id: row.get("job_id"),
-        library_root_id: row.get("library_root_id"),
-        batch_sequence: row.get("batch_sequence"),
-        source_refs_json: row.get("source_refs_json"),
-        non_retryable_item_ids_json: row.get("non_retryable_item_ids_json"),
-        source_count: row.get("source_count"),
-        images_completed_at: row.get("images_completed_at"),
-        status: row.get("status"),
-        attempts: row.get("attempts"),
-        next_attempt_at: row.get("next_attempt_at"),
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+fn stored_scan_job(row: sqlx::any::AnyRow) -> Result<StoredScanJob, sqlx::Error> {
+    let row = StoredScanJobRow::from_row(&row)?;
+    Ok(StoredScanJob {
+        id: row.id,
+        library_id: row.library_id,
+        job_type: row.job_type,
+        status: row.status,
+        generation: row.generation,
+        cursor: row.cursor,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        processed_media_count: row.processed_media_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        discovery_completed: row.discovery_completed != 0,
+        auto_metadata_match: row.auto_metadata_match != 0,
+        current_item: row.current_item,
+        scan_phase: row.scan_phase,
+    })
 }
 
-fn stored_scan_job_path(row: sqlx::any::AnyRow) -> StoredScanJobPath {
-    StoredScanJobPath {
-        library_root_id: row.get("library_root_id"),
-        relative_path: row.get("relative_path"),
-        change_kind: row.get("change_kind"),
+/// Row of the local-metadata batch projections that decode into
+/// [`StoredScanLocalMetadataBatch`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScanLocalMetadataBatchRow {
+    id: String,
+    job_id: String,
+    library_root_id: String,
+    batch_sequence: i64,
+    source_refs_json: String,
+    non_retryable_item_ids_json: String,
+    source_count: i64,
+    images_completed_at: Option<i64>,
+    status: String,
+    attempts: i64,
+    next_attempt_at: Option<i64>,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_scan_local_metadata_batch(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredScanLocalMetadataBatch, sqlx::Error> {
+    let row = StoredScanLocalMetadataBatchRow::from_row(&row)?;
+    Ok(StoredScanLocalMetadataBatch {
+        id: row.id,
+        job_id: row.job_id,
+        library_root_id: row.library_root_id,
+        batch_sequence: row.batch_sequence,
+        source_refs_json: row.source_refs_json,
+        non_retryable_item_ids_json: row.non_retryable_item_ids_json,
+        source_count: row.source_count,
+        images_completed_at: row.images_completed_at,
+        status: row.status,
+        attempts: row.attempts,
+        next_attempt_at: row.next_attempt_at,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
+}
+
+/// Row of the pending scan-job path projections that decode into [`StoredScanJobPath`].
+///
+/// `file_change_revision` has no column: normal scan paths never carry a revision, so the
+/// decoder keeps defaulting it to `None`.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredScanJobPathRow {
+    library_root_id: String,
+    relative_path: String,
+    change_kind: String,
+}
+
+fn stored_scan_job_path(row: sqlx::any::AnyRow) -> Result<StoredScanJobPath, sqlx::Error> {
+    let row = StoredScanJobPathRow::from_row(&row)?;
+    Ok(StoredScanJobPath {
+        library_root_id: row.library_root_id,
+        relative_path: row.relative_path,
+        change_kind: row.change_kind,
         file_change_revision: None,
-    }
+    })
 }
 
-fn stored_reconciliation_scan_entry(row: sqlx::any::AnyRow) -> StoredReconciliationScanEntry {
-    StoredReconciliationScanEntry {
-        library_root_id: row.get("library_root_id"),
-        relative_path: row.get("relative_path"),
-    }
+/// Row of the pending reconciliation-entry projections that decode into
+/// [`StoredReconciliationScanEntry`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredReconciliationScanEntryRow {
+    library_root_id: String,
+    relative_path: String,
 }
 
-fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> StoredStrmProbeJob {
-    StoredStrmProbeJob {
-        id: row.get("id"),
-        operation_id: row.get("operation_id"),
-        library_id: row.get("library_id"),
-        status: row.get("status"),
-        concurrency: row.get("concurrency"),
-        include_ready: row.get::<i64, _>("include_ready") != 0,
-        write_sidecars: row.get::<i64, _>("write_sidecars") != 0,
-        media_info_enabled: row.get::<i64, _>("media_info_enabled") != 0,
-        thumbnail_enabled: row.get::<i64, _>("thumbnail_enabled") != 0,
-        thumbnail_position_percent: row.get("thumbnail_position_percent"),
-        target_scan_job_id: row.get("target_scan_job_id"),
-        target_source_id: row.get("target_source_id"),
-        cursor: row.get("cursor"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+fn stored_reconciliation_scan_entry(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredReconciliationScanEntry, sqlx::Error> {
+    let row = StoredReconciliationScanEntryRow::from_row(&row)?;
+    Ok(StoredReconciliationScanEntry {
+        library_root_id: row.library_root_id,
+        relative_path: row.relative_path,
+    })
 }
 
-fn stored_chapter_detection_job(row: sqlx::any::AnyRow) -> StoredChapterDetectionJob {
-    StoredChapterDetectionJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        plugin_id: row.get("plugin_id"),
-        status: row.get("status"),
-        concurrency: row.get("concurrency"),
-        intro_window_seconds: row.get("intro_window_seconds"),
-        credits_window_seconds: row.get("credits_window_seconds"),
-        match_threshold: row.get("match_threshold"),
-        cursor: row.get("cursor"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+/// Row of the STRM probe job projections that decode into [`StoredStrmProbeJob`].
+///
+/// The flag columns stay `i64` because both backends store them as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_strm_probe_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredStrmProbeJobRow {
+    id: String,
+    operation_id: String,
+    library_id: String,
+    status: String,
+    concurrency: i64,
+    include_ready: i64,
+    write_sidecars: i64,
+    media_info_enabled: i64,
+    thumbnail_enabled: i64,
+    thumbnail_position_percent: i64,
+    target_scan_job_id: Option<String>,
+    target_source_id: Option<String>,
+    cursor: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
 }
 
-fn stored_library_root(row: sqlx::any::AnyRow) -> StoredLibraryRoot {
-    StoredLibraryRoot {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        canonical_path: row.get("canonical_path"),
-        display_path: row.get("display_path"),
-        is_available: row.get::<i64, _>("is_available") != 0,
-        is_writable: row.get::<i64, _>("is_writable") != 0,
-        last_checked_at: row.get("last_checked_at"),
-        unavailable_since: row.get("unavailable_since"),
-        scan_cursor: row.get("scan_cursor"),
-    }
+fn stored_strm_probe_job(row: sqlx::any::AnyRow) -> Result<StoredStrmProbeJob, sqlx::Error> {
+    let row = StoredStrmProbeJobRow::from_row(&row)?;
+    Ok(StoredStrmProbeJob {
+        id: row.id,
+        operation_id: row.operation_id,
+        library_id: row.library_id,
+        status: row.status,
+        concurrency: row.concurrency,
+        include_ready: row.include_ready != 0,
+        write_sidecars: row.write_sidecars != 0,
+        media_info_enabled: row.media_info_enabled != 0,
+        thumbnail_enabled: row.thumbnail_enabled != 0,
+        thumbnail_position_percent: row.thumbnail_position_percent,
+        target_scan_job_id: row.target_scan_job_id,
+        target_source_id: row.target_source_id,
+        cursor: row.cursor,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
+}
+
+/// Row of the chapter-detection job projections that decode into
+/// [`StoredChapterDetectionJob`].
+///
+/// `cancel_requested` stays `i64` because both backends store it as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_chapter_detection_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredChapterDetectionJobRow {
+    id: String,
+    library_id: String,
+    plugin_id: String,
+    status: String,
+    concurrency: i64,
+    intro_window_seconds: i64,
+    credits_window_seconds: i64,
+    match_threshold: f64,
+    cursor: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn stored_chapter_detection_job(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredChapterDetectionJob, sqlx::Error> {
+    let row = StoredChapterDetectionJobRow::from_row(&row)?;
+    Ok(StoredChapterDetectionJob {
+        id: row.id,
+        library_id: row.library_id,
+        plugin_id: row.plugin_id,
+        status: row.status,
+        concurrency: row.concurrency,
+        intro_window_seconds: row.intro_window_seconds,
+        credits_window_seconds: row.credits_window_seconds,
+        match_threshold: row.match_threshold,
+        cursor: row.cursor,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
+}
+
+/// Row of the library-root projections that decode into [`StoredLibraryRoot`].
+///
+/// The availability flags stay `i64` because both backends store them as `BIGINT` 0/1; the
+/// conversion to `bool` happens in [`stored_library_root`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredLibraryRootRow {
+    id: String,
+    library_id: String,
+    canonical_path: String,
+    display_path: String,
+    is_available: i64,
+    is_writable: i64,
+    last_checked_at: i64,
+    unavailable_since: Option<i64>,
+    scan_cursor: Option<String>,
+}
+
+fn stored_library_root(row: sqlx::any::AnyRow) -> Result<StoredLibraryRoot, sqlx::Error> {
+    let row = StoredLibraryRootRow::from_row(&row)?;
+    Ok(StoredLibraryRoot {
+        id: row.id,
+        library_id: row.library_id,
+        canonical_path: row.canonical_path,
+        display_path: row.display_path,
+        is_available: row.is_available != 0,
+        is_writable: row.is_writable != 0,
+        last_checked_at: row.last_checked_at,
+        unavailable_since: row.unavailable_since,
+        scan_cursor: row.scan_cursor,
+    })
 }
 
 #[derive(Clone, Debug)]
@@ -6243,24 +3570,48 @@ pub(crate) struct StoredEpisodeIdentityCandidate {
     pub(crate) relative_path: String,
 }
 
-fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> StoredFilesystemEntry {
-    StoredFilesystemEntry {
-        id: row.get("id"),
-        relative_path: row.get("relative_path"),
-        entry_kind: row.get("entry_kind"),
-        size: row.get("size"),
-        modified_at: row.get("modified_at"),
-        device: row.get("device"),
-        inode: row.get("inode"),
-        fingerprint: row.get("fingerprint"),
-        last_seen_generation: row.get("last_seen_generation"),
-        is_missing: row.get::<i64, _>("is_missing") != 0,
-        item_id: row.get("item_id"),
-        parent_identity_key: row.get("parent_identity_key"),
-        item_type: row.get("item_type"),
-        item_identity_key: row.get("item_identity_key"),
-        series_provider_ids_json: row.get("series_provider_ids_json"),
-    }
+/// Row of the filesystem-entry projections that decode into [`StoredFilesystemEntry`].
+///
+/// The item/parent/series columns come from `LEFT JOIN`s, so they are nullable; `is_missing`
+/// stays `i64` because both backends store it as `BIGINT` 0/1.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredFilesystemEntryRow {
+    id: String,
+    relative_path: String,
+    entry_kind: String,
+    size: i64,
+    modified_at: i64,
+    device: Option<i64>,
+    inode: Option<i64>,
+    fingerprint: Option<Vec<u8>>,
+    last_seen_generation: String,
+    is_missing: i64,
+    item_id: Option<String>,
+    parent_identity_key: Option<String>,
+    item_type: Option<String>,
+    item_identity_key: Option<String>,
+    series_provider_ids_json: Option<String>,
+}
+
+fn stored_filesystem_entry(row: sqlx::any::AnyRow) -> Result<StoredFilesystemEntry, sqlx::Error> {
+    let row = StoredFilesystemEntryRow::from_row(&row)?;
+    Ok(StoredFilesystemEntry {
+        id: row.id,
+        relative_path: row.relative_path,
+        entry_kind: row.entry_kind,
+        size: row.size,
+        modified_at: row.modified_at,
+        device: row.device,
+        inode: row.inode,
+        fingerprint: row.fingerprint,
+        last_seen_generation: row.last_seen_generation,
+        is_missing: row.is_missing != 0,
+        item_id: row.item_id,
+        parent_identity_key: row.parent_identity_key,
+        item_type: row.item_type,
+        item_identity_key: row.item_identity_key,
+        series_provider_ids_json: row.series_provider_ids_json,
+    })
 }
 
 #[derive(Debug)]
@@ -6310,8 +3661,15 @@ pub(crate) struct StoredCanonicalPersonMatch {
     pub(crate) birthdays: Vec<String>,
 }
 
-fn stored_canonical_person(row: sqlx::any::AnyRow) -> StoredCanonicalPerson {
-    StoredCanonicalPerson { id: row.get("id") }
+/// Row of the canonical-person projections that decode into [`StoredCanonicalPerson`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredCanonicalPersonRow {
+    id: String,
+}
+
+fn stored_canonical_person(row: sqlx::any::AnyRow) -> Result<StoredCanonicalPerson, sqlx::Error> {
+    let row = StoredCanonicalPersonRow::from_row(&row)?;
+    Ok(StoredCanonicalPerson { id: row.id })
 }
 
 #[derive(Debug)]
@@ -6345,21 +3703,42 @@ pub(crate) struct PersonMatchCandidateRestore<'a> {
     pub(crate) updated_at: i64,
 }
 
-fn stored_person_match_candidate(row: sqlx::any::AnyRow) -> StoredPersonMatchCandidate {
-    StoredPersonMatchCandidate {
-        id: row.get("id"),
-        item_id: row.get("item_id"),
-        provider: row.get("provider"),
-        provider_id: row.get("provider_id"),
-        candidate_person_ids_json: row.get("candidate_person_ids_json"),
-        status: row.get("status"),
-        score: row.get("score"),
-        evidence_json: row.get("evidence_json"),
-        target_person_id: row.get("target_person_id"),
-        previous_person_id: row.get("previous_person_id"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+/// Row of the person-match candidate projections that decode into
+/// [`StoredPersonMatchCandidate`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPersonMatchCandidateRow {
+    id: String,
+    item_id: String,
+    provider: String,
+    provider_id: String,
+    candidate_person_ids_json: String,
+    status: String,
+    score: Option<f64>,
+    evidence_json: String,
+    target_person_id: Option<String>,
+    previous_person_id: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_person_match_candidate(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredPersonMatchCandidate, sqlx::Error> {
+    let row = StoredPersonMatchCandidateRow::from_row(&row)?;
+    Ok(StoredPersonMatchCandidate {
+        id: row.id,
+        item_id: row.item_id,
+        provider: row.provider,
+        provider_id: row.provider_id,
+        candidate_person_ids_json: row.candidate_person_ids_json,
+        status: row.status,
+        score: row.score,
+        evidence_json: row.evidence_json,
+        target_person_id: row.target_person_id,
+        previous_person_id: row.previous_person_id,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 #[derive(Debug)]
@@ -6401,36 +3780,61 @@ fn person_credit_json<T: serde::de::DeserializeOwned + Default>(
     })
 }
 
-fn stored_person_credit(row: sqlx::any::AnyRow) -> StoredPersonCredit {
-    let provider_ids_json: String = row.get("provider_ids_json");
-    let genres_json: String = row.get("genres_json");
-    let tags_json: String = row.get("tags_json");
-    let production_locations_json: String = row.get("production_locations_json");
-    let taglines_json: String = row.get("taglines_json");
-    StoredPersonCredit {
-        item_id: row.get("item_id"),
-        person_id: row.get("person_id"),
-        lux_person_id: row.try_get("lux_person_id").ok(),
-        provider: row.get("provider"),
-        person_name: row.get("person_name"),
-        role: row.get("role"),
-        date_created: row.get("date_created"),
-        biography: row.get("biography"),
-        birthday: row.get("birthday"),
-        deathday: row.get("deathday"),
-        known_for_department: row.get("known_for_department"),
-        place_of_birth: row.get("place_of_birth"),
-        provider_ids: person_credit_json(&provider_ids_json, "provider_ids_json"),
-        genres: person_credit_json(&genres_json, "genres_json"),
-        tags: person_credit_json(&tags_json, "tags_json"),
+/// Row of the person-credit projections that decode into [`StoredPersonCredit`].
+///
+/// `lux_person_id` keeps `#[sqlx(default)]` because the former decoder used
+/// `try_get(..).ok()`: a projection that omits the column still decodes to `None` instead of
+/// failing the whole row. The JSON columns are decoded by [`person_credit_json`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPersonCreditRow {
+    item_id: String,
+    person_id: String,
+    #[sqlx(default)]
+    lux_person_id: Option<String>,
+    provider: String,
+    person_name: String,
+    role: String,
+    date_created: i64,
+    biography: Option<String>,
+    birthday: Option<String>,
+    deathday: Option<String>,
+    known_for_department: Option<String>,
+    place_of_birth: Option<String>,
+    provider_ids_json: String,
+    genres_json: String,
+    tags_json: String,
+    production_locations_json: String,
+    premiere_date: Option<String>,
+    production_year: Option<i64>,
+    taglines_json: String,
+}
+
+fn stored_person_credit(row: sqlx::any::AnyRow) -> Result<StoredPersonCredit, sqlx::Error> {
+    let row = StoredPersonCreditRow::from_row(&row)?;
+    Ok(StoredPersonCredit {
+        item_id: row.item_id,
+        person_id: row.person_id,
+        lux_person_id: row.lux_person_id,
+        provider: row.provider,
+        person_name: row.person_name,
+        role: row.role,
+        date_created: row.date_created,
+        biography: row.biography,
+        birthday: row.birthday,
+        deathday: row.deathday,
+        known_for_department: row.known_for_department,
+        place_of_birth: row.place_of_birth,
+        provider_ids: person_credit_json(&row.provider_ids_json, "provider_ids_json"),
+        genres: person_credit_json(&row.genres_json, "genres_json"),
+        tags: person_credit_json(&row.tags_json, "tags_json"),
         production_locations: person_credit_json(
-            &production_locations_json,
+            &row.production_locations_json,
             "production_locations_json",
         ),
-        premiere_date: row.get("premiere_date"),
-        production_year: row.get("production_year"),
-        taglines: person_credit_json(&taglines_json, "taglines_json"),
-    }
+        premiere_date: row.premiere_date,
+        production_year: row.production_year,
+        taglines: person_credit_json(&row.taglines_json, "taglines_json"),
+    })
 }
 
 #[derive(Debug)]
@@ -6443,15 +3847,32 @@ pub(crate) struct StoredPersonIndexRebuildJob {
     pub(crate) cancel_requested: bool,
 }
 
-fn stored_person_index_rebuild_job(row: sqlx::any::AnyRow) -> StoredPersonIndexRebuildJob {
-    StoredPersonIndexRebuildJob {
-        library_id: row.get("library_id"),
-        status: row.get("status"),
-        cursor_id: row.get("cursor_id"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-    }
+/// Row of the person-index rebuild job projections that decode into
+/// [`StoredPersonIndexRebuildJob`].
+///
+/// `cancel_requested` stays `i64` because both backends store it as `BIGINT` 0/1.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPersonIndexRebuildJobRow {
+    library_id: String,
+    status: String,
+    cursor_id: Option<String>,
+    processed_count: i64,
+    total_count: i64,
+    cancel_requested: i64,
+}
+
+fn stored_person_index_rebuild_job(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredPersonIndexRebuildJob, sqlx::Error> {
+    let row = StoredPersonIndexRebuildJobRow::from_row(&row)?;
+    Ok(StoredPersonIndexRebuildJob {
+        library_id: row.library_id,
+        status: row.status,
+        cursor_id: row.cursor_id,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        cancel_requested: row.cancel_requested != 0,
+    })
 }
 
 #[derive(Debug)]
@@ -6605,6 +4026,13 @@ pub(crate) struct NewMetadataCandidate<'a> {
     pub(crate) expires_at: Option<i64>,
 }
 
+/// One local-NFO snapshot in a batched metadata write.
+pub(crate) struct MediaItemNfoMetadataUpdate<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) json: Option<&'a str>,
+    pub(crate) source_fingerprint: Option<&'a [u8]>,
+}
+
 pub(crate) struct MetadataImageUnavailable<'a> {
     pub(crate) image_type: &'a str,
     pub(crate) candidate_key: &'a str,
@@ -6647,71 +4075,153 @@ pub(crate) struct StoredJobActivityItem {
     pub(crate) series_title: Option<String>,
 }
 
-fn stored_metadata_reidentify_job(row: sqlx::any::AnyRow) -> StoredMetadataReidentifyJob {
-    StoredMetadataReidentifyJob {
-        id: row.get("id"),
-        status: row.get("status"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-        mode: row.get("mode"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        library_id: row.get("library_id"),
-        job_scope: row.get("job_scope"),
-        pending_count: row.get("pending_count"),
-    }
+/// Row of every [`StoredMetadataReidentifyJob`] projection.
+///
+/// `cancel_requested` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the
+/// conversion to `bool` happens in [`stored_metadata_reidentify_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMetadataReidentifyJobRow {
+    id: String,
+    status: String,
+    processed_count: i64,
+    total_count: i64,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+    mode: String,
+    cancel_requested: i64,
+    library_id: Option<String>,
+    job_scope: String,
+    pending_count: i64,
 }
 
-fn stored_metadata_reidentify_item(row: sqlx::any::AnyRow) -> StoredMetadataReidentifyItem {
-    StoredMetadataReidentifyItem {
-        job_id: row.get("job_id"),
-        item_id: row.get("item_id"),
-        status: row.get("status"),
-        candidate_count: row.get("candidate_count"),
-        error: row.get("error"),
-        updated_at: row.get("updated_at"),
-    }
+fn stored_metadata_reidentify_job(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredMetadataReidentifyJob, sqlx::Error> {
+    let row = StoredMetadataReidentifyJobRow::from_row(&row)?;
+    Ok(StoredMetadataReidentifyJob {
+        id: row.id,
+        status: row.status,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+        mode: row.mode,
+        cancel_requested: row.cancel_requested != 0,
+        library_id: row.library_id,
+        job_scope: row.job_scope,
+        pending_count: row.pending_count,
+    })
 }
 
-fn stored_metadata_candidate(row: sqlx::any::AnyRow) -> StoredMetadataCandidate {
-    StoredMetadataCandidate {
-        id: row.get("id"),
-        item_id: row.get("item_id"),
-        provider: row.get("provider"),
-        provider_id: row.get("provider_id"),
-        candidate_json: row.get("candidate_json"),
-        score: row.get("score"),
-        status: row.get("status"),
-        expires_at: row.get("expires_at"),
-        item_title: row.get("item_title"),
-    }
+/// Row of every [`StoredMetadataReidentifyItem`] projection.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMetadataReidentifyItemRow {
+    job_id: String,
+    item_id: String,
+    status: String,
+    candidate_count: i64,
+    error: Option<String>,
+    updated_at: i64,
 }
 
-fn stored_item_metadata_completeness(row: sqlx::any::AnyRow) -> StoredItemMetadataCompleteness {
-    StoredItemMetadataCompleteness {
-        item_id: row.get("item_id"),
-        capability: row.get("capability"),
-        local_state: row.get("local_state"),
-        is_missing: row
-            .get::<Option<i64>, _>("is_missing")
-            .map(|value| value != 0),
-        input_fingerprint: row.get("input_fingerprint"),
-        checked_at: row.get("checked_at"),
-        retry_after: row.get("retry_after"),
-        error: row.get("error"),
-        updated_at: row.get("updated_at"),
-    }
+fn stored_metadata_reidentify_item(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredMetadataReidentifyItem, sqlx::Error> {
+    let row = StoredMetadataReidentifyItemRow::from_row(&row)?;
+    Ok(StoredMetadataReidentifyItem {
+        job_id: row.job_id,
+        item_id: row.item_id,
+        status: row.status,
+        candidate_count: row.candidate_count,
+        error: row.error,
+        updated_at: row.updated_at,
+    })
 }
 
-fn stored_media_item(row: sqlx::any::AnyRow) -> StoredMediaItem {
-    StoredMediaItem { id: row.get("id") }
+/// Row of every [`StoredMetadataCandidate`] projection; `item_title` comes from the joined
+/// `media_items.title`.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMetadataCandidateRow {
+    id: String,
+    item_id: String,
+    provider: String,
+    provider_id: String,
+    candidate_json: String,
+    score: f64,
+    status: String,
+    expires_at: Option<i64>,
+    item_title: String,
 }
 
-#[derive(Debug)]
+fn stored_metadata_candidate(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredMetadataCandidate, sqlx::Error> {
+    let row = StoredMetadataCandidateRow::from_row(&row)?;
+    Ok(StoredMetadataCandidate {
+        id: row.id,
+        item_id: row.item_id,
+        provider: row.provider,
+        provider_id: row.provider_id,
+        candidate_json: row.candidate_json,
+        score: row.score,
+        status: row.status,
+        expires_at: row.expires_at,
+        item_title: row.item_title,
+    })
+}
+
+/// Row of every [`StoredItemMetadataCompleteness`] projection.
+///
+/// `is_missing` stays `Option<i64>` because a non-`READY` row stores `NULL` and the conversion to
+/// `Option<bool>` happens in [`stored_item_metadata_completeness`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredItemMetadataCompletenessRow {
+    item_id: String,
+    capability: String,
+    local_state: String,
+    is_missing: Option<i64>,
+    input_fingerprint: Option<Vec<u8>>,
+    checked_at: Option<i64>,
+    retry_after: Option<i64>,
+    error: Option<String>,
+    updated_at: i64,
+}
+
+fn stored_item_metadata_completeness(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredItemMetadataCompleteness, sqlx::Error> {
+    let row = StoredItemMetadataCompletenessRow::from_row(&row)?;
+    Ok(StoredItemMetadataCompleteness {
+        item_id: row.item_id,
+        capability: row.capability,
+        local_state: row.local_state,
+        is_missing: row.is_missing.map(|value| value != 0),
+        input_fingerprint: row.input_fingerprint,
+        checked_at: row.checked_at,
+        retry_after: row.retry_after,
+        error: row.error,
+        updated_at: row.updated_at,
+    })
+}
+
+/// Row of every [`StoredMediaItem`] projection.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredMediaItemRow {
+    id: String,
+}
+
+fn stored_media_item(row: sqlx::any::AnyRow) -> Result<StoredMediaItem, sqlx::Error> {
+    let row = StoredMediaItemRow::from_row(&row)?;
+    Ok(StoredMediaItem { id: row.id })
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub(crate) struct StoredCatalogRow {
     pub(crate) item_id: String,
     pub(crate) library_id: String,
@@ -6807,6 +4317,51 @@ pub(crate) struct NewPlaybackEvent<'a> {
     pub(crate) duration_ticks: Option<i64>,
     pub(crate) played_percent: i64,
     pub(crate) is_paused: bool,
+    /// State the same session reported before this event, when it already existed. A matching
+    /// state means the event is a plain progress tick, which must not rewrite the derived resume
+    /// pointer or the played container states.
+    pub(crate) previous_state: Option<&'a str>,
+    /// Position the same session reported before this event, when it already existed. A tick that
+    /// moves the position across the configured resume threshold adds the item to, or removes it
+    /// from, continue-watching, so that tick refreshes the derived pointer like a state change.
+    pub(crate) previous_position_ticks: Option<i64>,
+    /// Renew the matching playback admission in the same transaction as the session and item
+    /// state writes. Callers that renew on a separate statement leave this `false` so the write
+    /// pattern stays unchanged for their paths.
+    pub(crate) renew_admission: bool,
+}
+
+/// Episode container identifiers, read once while a playback event refreshes the resume pointer.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackContainerScope {
+    pub(crate) parent_id: Option<String>,
+    pub(crate) series_id: Option<String>,
+}
+
+/// What [`Database::record_playback_event`] changed beyond the reported progress position.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct PlaybackEventEffects {
+    /// `user_item_state.is_played` flipped from `0` to `1` while recording this event.
+    pub(crate) is_played_changed: bool,
+    /// Episode scope read while refreshing the resume pointer. It is present whenever the event
+    /// ran that path for an episode, even when the episode has no series and therefore no pointer
+    /// row is written. The played-state sync reuses it instead of reading the hierarchy again.
+    pub(crate) container_scope: Option<PlaybackContainerScope>,
+}
+
+impl PlaybackEventEffects {
+    /// The effects of an event that has not reached the database yet.
+    ///
+    /// The playback progress coalescer only keeps a plain progress tick in memory. Such a tick
+    /// cannot flip the played flag, cannot refresh the resume pointer, and cannot cross the resume
+    /// threshold (each of those is written through), so it changes nothing beyond the position the
+    /// next flush carries.
+    pub(crate) fn unchanged() -> Self {
+        Self {
+            is_played_changed: false,
+            container_scope: None,
+        }
+    }
 }
 
 pub(crate) struct NewWebPlaybackSession<'a> {
@@ -6904,29 +4459,60 @@ pub(crate) struct StoredWebPlaybackSession {
     pub(crate) updated_at: i64,
 }
 
-fn stored_web_playback_session(row: sqlx::any::AnyRow) -> StoredWebPlaybackSession {
-    StoredWebPlaybackSession {
-        id: row.get("id"),
-        user_id: row.get("user_id"),
-        item_id: row.get("item_id"),
-        media_source_id: row.get("media_source_id"),
-        play_session_id: row.get("play_session_id"),
-        tier: row.get("tier"),
-        plan: row.get("plan"),
-        state: row.get("state"),
-        temp_dir: row.get("temp_dir"),
-        is_admin: row.get::<i64, _>("is_admin") != 0,
-        expires_at: row.get("expires_at"),
-        last_heartbeat_at: row.get("last_heartbeat_at"),
-        last_sequence: row.get("last_sequence"),
-        video_codec: row.get("video_codec"),
-        audio_codec: row.get("audio_codec"),
-        video_bitrate: row.get("video_bitrate"),
-        audio_bitrate: row.get("audio_bitrate"),
-        transcoding_container: row.get("transcoding_container"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-    }
+/// Row of every [`StoredWebPlaybackSession`] projection.
+///
+/// `is_admin` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the conversion
+/// to `bool` happens in [`stored_web_playback_session`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredWebPlaybackSessionRow {
+    id: String,
+    user_id: String,
+    item_id: String,
+    media_source_id: Option<String>,
+    play_session_id: String,
+    tier: i64,
+    plan: String,
+    state: String,
+    temp_dir: Option<String>,
+    is_admin: i64,
+    expires_at: i64,
+    last_heartbeat_at: i64,
+    last_sequence: i64,
+    video_codec: Option<String>,
+    audio_codec: Option<String>,
+    video_bitrate: Option<i64>,
+    audio_bitrate: Option<i64>,
+    transcoding_container: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+}
+
+fn stored_web_playback_session(
+    row: sqlx::any::AnyRow,
+) -> Result<StoredWebPlaybackSession, sqlx::Error> {
+    let row = StoredWebPlaybackSessionRow::from_row(&row)?;
+    Ok(StoredWebPlaybackSession {
+        id: row.id,
+        user_id: row.user_id,
+        item_id: row.item_id,
+        media_source_id: row.media_source_id,
+        play_session_id: row.play_session_id,
+        tier: row.tier,
+        plan: row.plan,
+        state: row.state,
+        temp_dir: row.temp_dir,
+        is_admin: row.is_admin != 0,
+        expires_at: row.expires_at,
+        last_heartbeat_at: row.last_heartbeat_at,
+        last_sequence: row.last_sequence,
+        video_codec: row.video_codec,
+        audio_codec: row.audio_codec,
+        video_bitrate: row.video_bitrate,
+        audio_bitrate: row.audio_bitrate,
+        transcoding_container: row.transcoding_container,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -6950,26 +4536,66 @@ pub(crate) struct StoredPlaybackSession {
     pub(crate) last_event_at: i64,
 }
 
-fn stored_playback_session(row: sqlx::any::AnyRow) -> StoredPlaybackSession {
-    StoredPlaybackSession {
-        id: row.get("id"),
-        user_id: row.get("user_id"),
-        item_id: row.get("item_id"),
-        media_source_id: row.get("media_source_id"),
-        play_session_id: row.get("play_session_id"),
-        device_id: row.get("device_id"),
-        client: row.get("client"),
-        device_name: row.get("device_name"),
-        client_version: row.get("client_version"),
-        device_type: row.get("device_type"),
-        remote_ip: row.get("remote_ip"),
-        state: row.get("state"),
-        position_ticks: row.get("position_ticks"),
-        duration_ticks: row.get("duration_ticks"),
-        is_paused: row.get::<i64, _>("is_paused") != 0,
-        started_at: row.get("started_at"),
-        last_event_at: row.get("last_event_at"),
-    }
+/// Duration candidates for one playback callback, read without the item detail projection.
+///
+/// [`Database::find_catalog_rows`] joins sources, streams, image tags and catalog details only to
+/// read a runtime, and every playback callback needs nothing but these four values. Each field is
+/// the raw column value, so the caller keeps the established precedence and the "zero means
+/// unknown" filtering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, sqlx::FromRow)]
+pub(crate) struct StoredPlaybackDurations {
+    pub(crate) runtime_ticks: Option<i64>,
+    pub(crate) requested_source_ticks: Option<i64>,
+    pub(crate) default_source_ticks: Option<i64>,
+    pub(crate) first_source_ticks: Option<i64>,
+}
+
+/// Row of every [`StoredPlaybackSession`] projection.
+///
+/// `is_paused` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the conversion
+/// to `bool` happens in [`stored_playback_session`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredPlaybackSessionRow {
+    id: String,
+    user_id: String,
+    item_id: String,
+    media_source_id: Option<String>,
+    play_session_id: String,
+    device_id: String,
+    client: Option<String>,
+    device_name: Option<String>,
+    client_version: Option<String>,
+    device_type: Option<String>,
+    remote_ip: Option<String>,
+    state: String,
+    position_ticks: i64,
+    duration_ticks: Option<i64>,
+    is_paused: i64,
+    started_at: i64,
+    last_event_at: i64,
+}
+
+fn stored_playback_session(row: sqlx::any::AnyRow) -> Result<StoredPlaybackSession, sqlx::Error> {
+    let row = StoredPlaybackSessionRow::from_row(&row)?;
+    Ok(StoredPlaybackSession {
+        id: row.id,
+        user_id: row.user_id,
+        item_id: row.item_id,
+        media_source_id: row.media_source_id,
+        play_session_id: row.play_session_id,
+        device_id: row.device_id,
+        client: row.client,
+        device_name: row.device_name,
+        client_version: row.client_version,
+        device_type: row.device_type,
+        remote_ip: row.remote_ip,
+        state: row.state,
+        position_ticks: row.position_ticks,
+        duration_ticks: row.duration_ticks,
+        is_paused: row.is_paused != 0,
+        started_at: row.started_at,
+        last_event_at: row.last_event_at,
+    })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -7086,18 +4712,33 @@ pub(crate) struct StoredLibraryPoster {
     pub(crate) root_path: String,
 }
 
-fn stored_item_image(row: sqlx::any::AnyRow) -> StoredItemImage {
-    StoredItemImage {
-        id: row.get("id"),
-        item_id: row.get("item_id"),
-        image_type: row.get("image_type"),
-        image_index: row.get("image_index"),
-        local_path: row.get("local_path"),
-        file_size: row.get("file_size"),
-        content_tag: row.get("content_tag"),
-        source: row.get("source"),
-        root_path: row.get("root_path"),
-    }
+/// Row of every [`StoredItemImage`] projection; `root_path` comes from the joined library root.
+#[derive(Debug, sqlx::FromRow)]
+struct StoredItemImageRow {
+    id: String,
+    item_id: String,
+    image_type: String,
+    image_index: i64,
+    local_path: String,
+    file_size: Option<i64>,
+    content_tag: Option<String>,
+    source: String,
+    root_path: Option<String>,
+}
+
+fn stored_item_image(row: sqlx::any::AnyRow) -> Result<StoredItemImage, sqlx::Error> {
+    let row = StoredItemImageRow::from_row(&row)?;
+    Ok(StoredItemImage {
+        id: row.id,
+        item_id: row.item_id,
+        image_type: row.image_type,
+        image_index: row.image_index,
+        local_path: row.local_path,
+        file_size: row.file_size,
+        content_tag: row.content_tag,
+        source: row.source,
+        root_path: row.root_path,
+    })
 }
 
 fn catalog_filter_where_clause<'a>(
@@ -7851,24 +5492,48 @@ pub(crate) struct StoredMovieIdentity {
     pub(crate) provider_id: String,
 }
 
-fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> StoredDanmakuMatchJob {
-    StoredDanmakuMatchJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        status: row.get("status"),
-        overwrite: row.get::<i64, _>("overwrite") != 0,
-        concurrency: row.get("concurrency"),
-        total_count: row.get("total_count"),
-        processed_count: row.get("processed_count"),
-        success_count: row.get("success_count"),
-        skipped_count: row.get("skipped_count"),
-        failed_count: row.get("failed_count"),
-        cancel_requested: row.get::<i64, _>("cancel_requested") != 0,
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+/// Row of every [`StoredDanmakuMatchJob`] projection.
+///
+/// `overwrite` and `cancel_requested` stay `i64` because both backends store the flags as
+/// `BIGINT` 0/1 and the conversion to `bool` happens in [`stored_danmaku_match_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredDanmakuMatchJobRow {
+    id: String,
+    library_id: String,
+    status: String,
+    overwrite: i64,
+    concurrency: i64,
+    total_count: i64,
+    processed_count: i64,
+    success_count: i64,
+    skipped_count: i64,
+    failed_count: i64,
+    cancel_requested: i64,
+    error: Option<String>,
+    created_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn stored_danmaku_match_job(row: sqlx::any::AnyRow) -> Result<StoredDanmakuMatchJob, sqlx::Error> {
+    let row = StoredDanmakuMatchJobRow::from_row(&row)?;
+    Ok(StoredDanmakuMatchJob {
+        id: row.id,
+        library_id: row.library_id,
+        status: row.status,
+        overwrite: row.overwrite != 0,
+        concurrency: row.concurrency,
+        total_count: row.total_count,
+        processed_count: row.processed_count,
+        success_count: row.success_count,
+        skipped_count: row.skipped_count,
+        failed_count: row.failed_count,
+        cancel_requested: row.cancel_requested != 0,
+        error: row.error,
+        created_at: row.created_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
 }
 
 fn first_provider_id(
@@ -8051,20 +5716,40 @@ pub(crate) struct StoredLibraryCoverJob {
     pub(crate) finished_at: Option<i64>,
 }
 
-fn stored_library_cover_job(row: sqlx::any::AnyRow) -> StoredLibraryCoverJob {
-    StoredLibraryCoverJob {
-        id: row.get("id"),
-        library_id: row.get("library_id"),
-        is_manual: row.get::<i64, _>("is_manual") != 0,
-        status: row.get("status"),
-        processed_count: row.get("processed_count"),
-        total_count: row.get("total_count"),
-        error: row.get("error"),
-        created_at: row.get("created_at"),
-        updated_at: row.get("updated_at"),
-        started_at: row.get("started_at"),
-        finished_at: row.get("finished_at"),
-    }
+/// Row of every [`StoredLibraryCoverJob`] projection.
+///
+/// `is_manual` stays `i64` because both backends store the flag as `BIGINT` 0/1 and the conversion
+/// to `bool` happens in [`stored_library_cover_job`].
+#[derive(Debug, sqlx::FromRow)]
+struct StoredLibraryCoverJobRow {
+    id: String,
+    library_id: String,
+    is_manual: i64,
+    status: String,
+    processed_count: i64,
+    total_count: i64,
+    error: Option<String>,
+    created_at: i64,
+    updated_at: i64,
+    started_at: Option<i64>,
+    finished_at: Option<i64>,
+}
+
+fn stored_library_cover_job(row: sqlx::any::AnyRow) -> Result<StoredLibraryCoverJob, sqlx::Error> {
+    let row = StoredLibraryCoverJobRow::from_row(&row)?;
+    Ok(StoredLibraryCoverJob {
+        id: row.id,
+        library_id: row.library_id,
+        is_manual: row.is_manual != 0,
+        status: row.status,
+        processed_count: row.processed_count,
+        total_count: row.total_count,
+        error: row.error,
+        created_at: row.created_at,
+        updated_at: row.updated_at,
+        started_at: row.started_at,
+        finished_at: row.finished_at,
+    })
 }
 
 pub(crate) struct NewMediaChapterMarker {
@@ -8118,6 +5803,19 @@ pub(crate) struct NewAccessToken<'a> {
     pub(crate) device_name: &'a str,
     pub(crate) client_version: &'a str,
     pub(crate) device_type: Option<&'a str>,
+}
+
+/// A playback-only credential issued for one Web playback session.
+pub(crate) struct NewPlaybackAccessToken<'a> {
+    pub(crate) id: &'a str,
+    pub(crate) token_hash: &'a [u8],
+    pub(crate) user_id: &'a str,
+    pub(crate) device_id: &'a str,
+    pub(crate) client_name: &'a str,
+    pub(crate) device_name: &'a str,
+    pub(crate) client_version: &'a str,
+    pub(crate) playback_session_id: &'a str,
+    pub(crate) expires_at: i64,
 }
 
 pub(crate) struct NewDevicePairing<'a> {
@@ -8407,6 +6105,15 @@ pub enum StorageError {
     Conflict(String),
     Serialization(String),
     LastManager,
+    /// The configuration directory belongs to a server that has been set up before, but the
+    /// database it points at is missing or empty.
+    ///
+    /// Refusing here is the difference between a loud failure and a silent one: opening a missing
+    /// SQLite file creates it, migrations then build an empty schema, and the next request shows a
+    /// setup wizard over data the operator believes still exists.
+    EmptyDatabase {
+        path: PathBuf,
+    },
 }
 
 impl StorageError {
@@ -8445,20 +6152,296 @@ impl std::fmt::Display for StorageError {
             Self::LastManager => {
                 formatter.write_str("at least one active server manager is required")
             }
+            Self::EmptyDatabase { path } => write!(
+                formatter,
+                "配置目录已初始化但数据库为空: '{}'。请确认数据卷已正确挂载并恢复该数据库；如果确实要从空库重新开始，删除配置目录中的 server-state.json 后再启动",
+                path.display()
+            ),
         }
     }
 }
 
-fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -> sqlx::SqlStr {
-    let sql = sql.into_sql_str();
-    let source = sql.as_str();
-    if backend == DatabaseBackend::Sqlite {
-        return sql;
+/// The SQL text types the `Database::query*` entry points accept.
+///
+/// Only `&'static str` is memoized: [`ADAPTED_SQL_CACHE`] keys on the address of the text, which
+/// stays valid exactly while the text lives in static storage. Strings assembled with `format!`
+/// (and the `SqlTemplateCache` templates) keep the previous rewrite-on-every-call behaviour,
+/// because their address is reuse of a heap allocation rather than a stable identity.
+trait AdaptSqlText {
+    /// Hands the text back untouched, with no rewriting and no allocation.
+    fn into_sql_str(self) -> sqlx::SqlStr;
+
+    /// Hands back PostgreSQL-ready text: `?` becomes `$1`, `$2`, …
+    fn into_postgres_sql(self) -> sqlx::SqlStr;
+}
+
+impl AdaptSqlText for &'static str {
+    #[inline]
+    fn into_sql_str(self) -> sqlx::SqlStr {
+        sqlx::SqlStr::from_static(self)
     }
 
+    #[inline]
+    fn into_postgres_sql(self) -> sqlx::SqlStr {
+        adapt_static_sql_for_backend(self)
+    }
+}
+
+/// A `SqlStr` of unknown provenance is never memoized: it may own a heap buffer.
+impl AdaptSqlText for sqlx::SqlStr {
+    #[inline]
+    fn into_sql_str(self) -> sqlx::SqlStr {
+        self
+    }
+
+    #[inline]
+    fn into_postgres_sql(self) -> sqlx::SqlStr {
+        adapt_postgres_sql_uncached(self)
+    }
+}
+
+/// `AssertSqlSafe(..)` marks dynamically built SQL, so it always takes the uncached path.
+impl<T> AdaptSqlText for sqlx::AssertSqlSafe<T>
+where
+    sqlx::AssertSqlSafe<T>: sqlx::SqlSafeStr,
+{
+    #[inline]
+    fn into_sql_str(self) -> sqlx::SqlStr {
+        sqlx::SqlSafeStr::into_sql_str(self)
+    }
+
+    #[inline]
+    fn into_postgres_sql(self) -> sqlx::SqlStr {
+        adapt_postgres_sql_uncached(self)
+    }
+}
+
+fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl AdaptSqlText) -> sqlx::SqlStr {
+    if backend == DatabaseBackend::Sqlite {
+        // SQLite accepts `?` as-is: the text is never rewritten and never enters the memo.
+        return sql.into_sql_str();
+    }
+    sql.into_postgres_sql()
+}
+
+/// PostgreSQL entry point for `&'static str` statements: memoized by statement identity.
+fn adapt_static_sql_for_backend(sql: &'static str) -> sqlx::SqlStr {
+    adapt_static_sql_for_backend_with_cache(&ADAPTED_SQL_CACHE, sql)
+}
+
+/// [`adapt_static_sql_for_backend`] against an explicit cache, so tests can bound and inspect one.
+///
+/// Statements without a `?` byte never touch the memo: they are not rewritten, keep their static
+/// pointer and cost a single linear scan for `?` with no lock and no allocation.
+fn adapt_static_sql_for_backend_with_cache(
+    cache: &AdaptedSqlCache,
+    sql: &'static str,
+) -> sqlx::SqlStr {
+    if !sql.as_bytes().contains(&b'?') {
+        return sqlx::SqlStr::from_static(sql);
+    }
+    if sql.len() > cache.max_source_bytes {
+        return adapt_postgres_sql_uncached(sql);
+    }
+
+    let key = StaticSqlKey::of(sql);
+    if let Some(rewritten) = cache.lookup(key) {
+        return sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(rewritten));
+    }
+
+    // The fast path above guarantees a `?` byte, so the rewrite always produces text.
+    let Some(rewritten) = rewrite_postgres_placeholders(sql) else {
+        return sqlx::SqlStr::from_static(sql);
+    };
+    let rewritten: Arc<str> = Arc::from(rewritten.as_str());
+    cache.store(key, Arc::clone(&rewritten));
+    sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(rewritten))
+}
+
+/// The pre-cache PostgreSQL rewrite, kept for dynamically built SQL and as the reference the memo
+/// is tested against.
+fn adapt_postgres_sql_uncached(sql: impl sqlx::SqlSafeStr) -> sqlx::SqlStr {
+    let sql = sql.into_sql_str();
+    match rewrite_postgres_placeholders(sql.as_str()) {
+        None => sql,
+        Some(rewritten) => sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(rewritten)),
+    }
+}
+
+/// Number of independently locked memo shards; the count is rounded up to a power of two.
+const ADAPTED_SQL_CACHE_SHARDS: usize = 64;
+/// Upper bound on memoized statements. The production tree passes ~1,124 distinct static
+/// statements to `Database::query*` (counted in docs/PERFORMANCE.md), so this is ~7x headroom: the
+/// statement set is fixed at build time, the memo fills once and then only serves reads.
+const MAX_ADAPTED_SQL_CACHE_ENTRIES: usize = 8_192;
+/// Upper bound on the rewritten text the memo keeps alive. Those same statements rewrite to well
+/// under 1 MiB, so this is safety headroom rather than a working limit.
+const MAX_ADAPTED_SQL_CACHE_TEXT_BYTES: usize = 8 * 1024 * 1024;
+/// Source statements longer than this are rewritten on every call instead of being memoized. The
+/// limit is compared against the source length, before any rewrite work happens.
+const MAX_ADAPTED_SQL_CACHE_SOURCE_BYTES: usize = 64 * 1024;
+/// Odd multiplicative constant used to spread statement addresses over the shards (the 64-bit
+/// golden-ratio word, truncated on 32-bit targets).
+const ADAPTED_SQL_CACHE_SHARD_MULTIPLIER: usize = 0x9E37_79B9_7F4A_7C15_u64 as usize;
+
+/// Identity of a `&'static str` statement. Static storage never moves and is never recycled, so
+/// the address plus the length identify the text for the whole process; two distinct static
+/// strings cannot share both without sharing the bytes they describe.
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct StaticSqlKey {
+    address: usize,
+    length: usize,
+}
+
+impl StaticSqlKey {
+    fn of(sql: &'static str) -> Self {
+        Self {
+            address: sql.as_ptr() as usize,
+            length: sql.len(),
+        }
+    }
+}
+
+/// One shard of the memo: rewritten statement text keyed by statement identity.
+#[derive(Default)]
+struct AdaptedSqlShard {
+    entries: HashMap<StaticSqlKey, Arc<str>>,
+    text_bytes: usize,
+}
+
+/// Append-only memo of PostgreSQL placeholder rewrites for `&'static str` statements.
+///
+/// There is no eviction policy, and none is needed: the set of static statements is fixed when the
+/// binary is built, so the memo fills once and afterwards only serves reads. Capacity is enforced
+/// with per-shard limits that sum to the global limits; a statement that does not fit keeps taking
+/// the uncached path instead of costing an eviction scan on the miss path.
+///
+/// A lock is held for one hash-map operation on one shard: no await, no caller code and never two
+/// shards at once, so the memo cannot deadlock. A poisoned shard degrades to a miss (read) or
+/// skips the insert (write), because rewriting is always correct.
+struct AdaptedSqlCache {
+    shards: Box<[std::sync::RwLock<AdaptedSqlShard>]>,
+    shard_mask: usize,
+    max_entries_per_shard: usize,
+    max_text_bytes_per_shard: usize,
+    max_source_bytes: usize,
+}
+
+static ADAPTED_SQL_CACHE: std::sync::LazyLock<AdaptedSqlCache> =
+    std::sync::LazyLock::new(AdaptedSqlCache::default);
+
+impl Default for AdaptedSqlCache {
+    fn default() -> Self {
+        Self::with_limits(
+            MAX_ADAPTED_SQL_CACHE_ENTRIES,
+            MAX_ADAPTED_SQL_CACHE_TEXT_BYTES,
+            MAX_ADAPTED_SQL_CACHE_SOURCE_BYTES,
+        )
+    }
+}
+
+impl AdaptedSqlCache {
+    /// Cache whose global limits are spread evenly over [`ADAPTED_SQL_CACHE_SHARDS`] shards.
+    fn with_limits(entries: usize, text_bytes: usize, source_bytes: usize) -> Self {
+        Self::with_shard_limits(
+            ADAPTED_SQL_CACHE_SHARDS,
+            entries.div_ceil(ADAPTED_SQL_CACHE_SHARDS),
+            text_bytes.div_ceil(ADAPTED_SQL_CACHE_SHARDS),
+            source_bytes,
+        )
+    }
+
+    /// Cache with explicit per-shard limits; tests use small values to reach them quickly.
+    fn with_shard_limits(
+        shards: usize,
+        entries_per_shard: usize,
+        text_bytes_per_shard: usize,
+        source_bytes: usize,
+    ) -> Self {
+        // Rounding up keeps the shard index a mask instead of a division, and cannot go out of
+        // bounds whatever the caller passes.
+        let shards = shards.max(1).next_power_of_two();
+        Self {
+            shards: (0..shards)
+                .map(|_| std::sync::RwLock::new(AdaptedSqlShard::default()))
+                .collect::<Vec<_>>()
+                .into_boxed_slice(),
+            shard_mask: shards - 1,
+            max_entries_per_shard: entries_per_shard,
+            max_text_bytes_per_shard: text_bytes_per_shard,
+            max_source_bytes: source_bytes,
+        }
+    }
+
+    /// Statements live in read-only data, so their addresses are stable and distinct.
+    ///
+    /// The address is multiplied and folded before masking: real statement addresses are often a
+    /// regular stride apart (consecutive string literals, or the heap blocks of a benchmark's leaked
+    /// statements), and masking the raw address would pile those onto a handful of shards until
+    /// their entry limits stopped the memo from caching them at all.
+    fn shard_index(&self, key: StaticSqlKey) -> usize {
+        let mixed = key.address.wrapping_mul(ADAPTED_SQL_CACHE_SHARD_MULTIPLIER);
+        (mixed ^ (mixed >> 29)) & self.shard_mask
+    }
+
+    /// Returns the memoized rewrite of `key`, taking only a read lock on its shard.
+    fn lookup(&self, key: StaticSqlKey) -> Option<Arc<str>> {
+        let guard = self.shards[self.shard_index(key)].read().ok()?;
+        guard.entries.get(&key).map(Arc::clone)
+    }
+
+    /// Memoizes one rewrite, or leaves it out when this shard is already full.
+    fn store(&self, key: StaticSqlKey, rewritten: Arc<str>) {
+        let Ok(mut guard) = self.shards[self.shard_index(key)].write() else {
+            return;
+        };
+        if guard.entries.contains_key(&key) {
+            return;
+        }
+        if guard.entries.len() >= self.max_entries_per_shard
+            || guard.text_bytes.saturating_add(rewritten.len()) > self.max_text_bytes_per_shard
+        {
+            return;
+        }
+        guard.text_bytes = guard.text_bytes.saturating_add(rewritten.len());
+        guard.entries.insert(key, rewritten);
+    }
+
+    #[cfg(test)]
+    fn entry_count(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .map(|shard| shard.entries.len())
+                    .unwrap_or_default()
+            })
+            .sum()
+    }
+
+    #[cfg(test)]
+    fn cached_text_bytes(&self) -> usize {
+        self.shards
+            .iter()
+            .map(|shard| {
+                shard
+                    .read()
+                    .map(|shard| shard.text_bytes)
+                    .unwrap_or_default()
+            })
+            .sum()
+    }
+}
+
+/// Rewrites `?` into `$1`, `$2`, … while copying quoted text and comments verbatim.
+///
+/// Returns `None` when the statement has no `?` at all, which lets callers keep the source text
+/// (and its static or existing allocation) instead of copying it.
+fn rewrite_postgres_placeholders(source: &str) -> Option<String> {
     let placeholder_count = source.bytes().filter(|byte| *byte == b'?').count();
     if placeholder_count == 0 {
-        return sql;
+        return None;
     }
 
     let placeholder_width = placeholder_count.ilog10() as usize + 1;
@@ -8503,7 +6486,7 @@ fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -
                     adapted.push(next);
                 }
                 let mut previous = '\0';
-                while let Some(next) = characters.next() {
+                for next in characters.by_ref() {
                     adapted.push(next);
                     if previous == '*' && next == '/' {
                         break;
@@ -8520,7 +6503,7 @@ fn adapt_sql_for_backend(backend: DatabaseBackend, sql: impl sqlx::SqlSafeStr) -
             _ => adapted.push(character),
         }
     }
-    sqlx::SqlSafeStr::into_sql_str(sqlx::AssertSqlSafe(adapted))
+    Some(adapted)
 }
 
 impl std::error::Error for StorageError {
@@ -8530,7 +6513,10 @@ impl std::error::Error for StorageError {
             Self::Io { source, .. } => Some(source),
             Self::Sqlx { source, .. } => Some(source),
             Self::Migration { source, .. } => Some(source),
-            Self::Conflict(_) | Self::LastManager | Self::Serialization(_) => None,
+            Self::Conflict(_)
+            | Self::LastManager
+            | Self::Serialization(_)
+            | Self::EmptyDatabase { .. } => None,
         }
     }
 }
@@ -8994,9 +6980,851 @@ mod mail_outbox_tests {
 }
 
 #[cfg(test)]
+mod storage_error_mapping_tests {
+    use super::*;
+    use crate::storage::test_database;
+
+    #[tokio::test]
+    async fn sqlx_err_maps_failures_exactly_like_storage_error()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_first_dir, first) = test_database().await?;
+        let (_second_dir, second) = test_database().await?;
+
+        let mapped_by_helper = first.sqlx_err()(sqlx::Error::RowNotFound);
+        let mapped_by_method = first.storage_error(sqlx::Error::RowNotFound);
+
+        let (
+            StorageError::Sqlx {
+                path: helper_path,
+                source: helper_source,
+            },
+            StorageError::Sqlx {
+                path: method_path,
+                source: method_source,
+            },
+        ) = (&mapped_by_helper, &mapped_by_method)
+        else {
+            return Err("expected StorageError::Sqlx from both mappings".into());
+        };
+        assert_eq!(helper_path, method_path);
+        assert_eq!(helper_path, &first.path);
+        assert!(matches!(helper_source, sqlx::Error::RowNotFound));
+        assert!(matches!(method_source, sqlx::Error::RowNotFound));
+        assert_eq!(mapped_by_helper.to_string(), mapped_by_method.to_string());
+        assert_eq!(
+            format!("{mapped_by_helper:?}"),
+            format!("{mapped_by_method:?}")
+        );
+
+        let other_path = match second.sqlx_err()(sqlx::Error::RowNotFound) {
+            StorageError::Sqlx { path, .. } => path,
+            _ => return Err("expected StorageError::Sqlx from the second database".into()),
+        };
+        assert_eq!(&other_path, &second.path);
+        assert_ne!(other_path.as_path(), helper_path.as_path());
+        Ok(())
+    }
+}
+
+/// Drives the `stored_*` decoders through the query paths that share them.
+///
+/// Each decoder has one named row struct, so a column rename or type change breaks a test
+/// here instead of panicking inside a request.
+#[cfg(test)]
+mod stored_row_decoding_tests {
+    use super::*;
+    use crate::storage::test_database;
+
+    #[tokio::test]
+    async fn stored_user_row_decodes_the_user_projection() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .insert_user("user-alice", "alice", "Alice", "hash", false, true)
+            .await?;
+
+        let user = database
+            .find_user_by_id("user-alice")
+            .await?
+            .expect("user should exist");
+        assert_eq!(user.id, "user-alice");
+        assert_eq!(user.username_normalized, "alice");
+        assert_eq!(user.display_name, "Alice");
+        assert_eq!(user.password_hash, "hash");
+        assert!(user.has_password);
+        assert!(!user.is_admin);
+        assert!(!user.is_disabled);
+        assert_eq!(user.email, None);
+        assert_eq!(user.last_login_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = StoredUserRow::from_row(&row).expect_err("missing columns must not panic");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_admin_user_list_item_row_decodes_the_admin_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .insert_user("user-admin", "admin", "Admin", "hash", true, true)
+            .await?;
+        database
+            .insert_user("user-viewer", "viewer", "Viewer", "hash", false, true)
+            .await?;
+
+        let (users, total) = database
+            .query_admin_users(
+                AdminUserStatusFilter::Active,
+                None,
+                AdminUserSortField::Created,
+                false,
+                50,
+                0,
+            )
+            .await?;
+        assert_eq!(total, 2);
+        assert_eq!(users.len(), 2);
+        let admin = users
+            .iter()
+            .find(|user| user.id == "user-admin")
+            .expect("admin should be listed");
+        assert_eq!(admin.display_name, "Admin");
+        assert!(admin.is_admin);
+        assert!(admin.has_password);
+        assert_eq!(admin.email, None);
+        assert_eq!(admin.last_activity_at, None);
+        assert_eq!(admin.current_playback_count, 0);
+        let viewer = users
+            .iter()
+            .find(|user| user.id == "user-viewer")
+            .expect("viewer should be listed");
+        assert!(!viewer.is_admin);
+        assert_eq!(viewer.last_login_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_scheduled_task_rows_decode_configs_and_plans()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO scheduled_task_plans (
+                 id, task_type, plan_name, task_name, task_description,
+                 source_type, cron_or_interval, scope_type, is_default
+             ) VALUES (
+                 'plan-a', 'INCREMENTAL_SCAN', 'Plan A', 'Scan', 'Incremental scan',
+                 'SYSTEM', '0 3 * * *', 'GLOBAL', 1
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO scheduled_task_configs (
+                 owner_type, owner_id, task_type, plan_id, cron_or_interval, is_enabled
+             ) VALUES ('GLOBAL', 'global', 'INCREMENTAL_SCAN', 'plan-a', '0 3 * * *', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let config = database
+            .find_scheduled_task_config("GLOBAL", "global", "INCREMENTAL_SCAN")
+            .await?
+            .expect("config should exist");
+        assert_eq!(config.owner_type, "GLOBAL");
+        assert_eq!(config.owner_id, "global");
+        assert_eq!(config.plan_id.as_deref(), Some("plan-a"));
+        assert_eq!(config.task_name, "");
+        assert_eq!(config.source_type, "SYSTEM");
+        assert!(config.is_enabled);
+        assert_eq!(config.library_name, None);
+
+        let plan = database
+            .find_scheduled_task_plan("plan-a")
+            .await?
+            .expect("plan should exist");
+        assert_eq!(plan.task_type, "INCREMENTAL_SCAN");
+        assert_eq!(plan.plan_name, "Plan A");
+        assert_eq!(plan.cron_or_interval.as_deref(), Some("0 3 * * *"));
+        assert!(plan.is_enabled);
+        assert!(plan.is_default);
+        assert!(plan.libraries.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_notification_rows_decode_destinations_and_deliveries()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .notifications()
+            .create_notification_destination(NewNotificationDestination {
+                id: "destination-a",
+                name: "Webhook",
+                url: "https://example.test/hook",
+                enabled: true,
+                allow_private_network: false,
+                event_types_json: "[\"ITEM_ADDED\"]",
+                payload_format: "LUX",
+                provider_plugin_id: "builtin.webhook",
+                provider_config_json: "{}",
+            })
+            .await?;
+
+        let destination = database
+            .notifications()
+            .find_notification_destination("destination-a")
+            .await?
+            .expect("destination should exist");
+        assert_eq!(destination.name, "Webhook");
+        assert_eq!(destination.url, "https://example.test/hook");
+        assert!(destination.enabled);
+        assert!(!destination.allow_private_network);
+        assert_eq!(destination.event_types_json, "[\"ITEM_ADDED\"]");
+        assert_eq!(destination.payload_format, "LUX");
+
+        sqlx::query(
+            "INSERT INTO notification_events (
+                 id, event_type, schema_version, occurred_at, dedupe_key, payload_json
+             ) VALUES ('event-a', 'ITEM_ADDED', 1, 1800000000, 'dedupe-a', '{}')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO notification_deliveries (
+                 id, event_id, destination_id, status, attempt_count, next_attempt_at
+             ) VALUES ('delivery-a', 'event-a', 'destination-a', 'PENDING', 0, unixepoch())",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let deliveries = database
+            .notifications()
+            .list_ready_notification_deliveries(10)
+            .await?;
+        assert_eq!(deliveries.len(), 1);
+        let delivery = &deliveries[0];
+        assert_eq!(delivery.id, "delivery-a");
+        assert_eq!(delivery.event_id, "event-a");
+        assert_eq!(delivery.destination_id, "destination-a");
+        assert_eq!(delivery.status, "PENDING");
+        assert_eq!(delivery.attempt_count, 0);
+        assert_eq!(delivery.last_http_status, None);
+        assert_eq!(delivery.event_type, "ITEM_ADDED");
+        assert_eq!(delivery.payload_json, "{}");
+        assert_eq!(delivery.destination_name, "Webhook");
+        assert_eq!(delivery.destination_url, "https://example.test/hook");
+        assert!(!delivery.allow_private_network);
+        assert_eq!(delivery.provider_plugin_id, "builtin.webhook");
+        Ok(())
+    }
+
+    /// Covers the STRM probe job decoder, which has no other library test path.
+    #[tokio::test]
+    async fn stored_strm_probe_job_row_decodes_the_job_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('strm-lib', 'STRM', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .create_strm_probe_job(NewStrmProbeJob {
+                id: "probe-job",
+                operation_id: "probe-operation",
+                library_id: "strm-lib",
+                concurrency: 2,
+                include_ready: true,
+                write_sidecars: false,
+                media_info_enabled: true,
+                thumbnail_enabled: false,
+                thumbnail_position_percent: 25,
+                target_scan_job_id: None,
+                target_source_id: None,
+                total_count: 3,
+            })
+            .await?;
+
+        let job = database
+            .find_strm_probe_job("probe-job")
+            .await?
+            .expect("probe job should exist");
+        assert_eq!(job.operation_id, "probe-operation");
+        assert_eq!(job.library_id, "strm-lib");
+        assert_eq!(job.status, "PENDING");
+        assert_eq!(job.concurrency, 2);
+        assert!(job.include_ready);
+        assert!(!job.write_sidecars);
+        assert!(job.media_info_enabled);
+        assert!(!job.thumbnail_enabled);
+        assert_eq!(job.thumbnail_position_percent, 25);
+        assert_eq!(job.target_scan_job_id, None);
+        assert_eq!(job.target_source_id, None);
+        assert_eq!(job.cursor, None);
+        assert_eq!(job.processed_count, 0);
+        assert_eq!(job.total_count, 3);
+        assert!(!job.cancel_requested);
+        assert_eq!(job.error, None);
+        assert_eq!(job.started_at, None);
+        assert_eq!(job.finished_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_library_root_and_filesystem_entry_rows_decode_existing_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('root-lib', 'Roots', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .insert_library_root(NewLibraryRoot {
+                id: "root-a",
+                library_id: "root-lib",
+                canonical_path: "/media/root-a",
+                display_path: "Root A",
+                is_available: true,
+                is_writable: false,
+            })
+            .await?;
+
+        let root = database
+            .find_library_root("root-a")
+            .await?
+            .expect("library root should exist");
+        assert_eq!(root.library_id, "root-lib");
+        assert_eq!(root.canonical_path, "/media/root-a");
+        assert_eq!(root.display_path, "Root A");
+        assert!(root.is_available);
+        assert!(!root.is_writable);
+        assert_eq!(root.unavailable_since, None);
+        assert_eq!(root.scan_cursor, None);
+
+        database
+            .insert_filesystem_entry(NewFilesystemEntry {
+                id: "entry-a",
+                library_root_id: "root-a",
+                relative_path: "movies/a.mkv",
+                entry_kind: "FILE",
+                size: 1024,
+                modified_at: 1_800_000_000,
+                device: Some(7),
+                inode: Some(11),
+                fingerprint: b"fingerprint-a",
+                last_seen_generation: "generation-a",
+            })
+            .await?;
+        let entry = database
+            .find_filesystem_entry("root-a", "movies/a.mkv")
+            .await?
+            .expect("filesystem entry should exist");
+        assert_eq!(entry.entry_kind, "FILE");
+        assert_eq!(entry.size, 1024);
+        assert_eq!(entry.modified_at, 1_800_000_000);
+        assert_eq!(entry.device, Some(7));
+        assert_eq!(entry.inode, Some(11));
+        assert_eq!(entry.fingerprint.as_deref(), Some(&b"fingerprint-a"[..]));
+        assert_eq!(entry.last_seen_generation, "generation-a");
+        assert!(!entry.is_missing);
+        assert_eq!(entry.item_id, None);
+        assert_eq!(entry.parent_identity_key, None);
+        assert_eq!(entry.item_type, None);
+        assert_eq!(entry.item_identity_key, None);
+        assert_eq!(entry.series_provider_ids_json, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_person_index_rebuild_job_row_decodes_the_queue_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind, is_enabled)
+             VALUES ('rebuild-lib', 'Rebuild', 'MOVIE', 1)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let jobs = database.sync_person_index_rebuild_jobs(1).await?;
+        let queued = jobs
+            .iter()
+            .find(|job| job.library_id == "rebuild-lib")
+            .expect("rebuild job should be queued");
+        assert_eq!(queued.status, "QUEUED");
+        assert_eq!(queued.cursor_id, None);
+        assert_eq!(queued.processed_count, 0);
+        assert_eq!(queued.total_count, 0);
+        assert!(!queued.cancel_requested);
+
+        let stored = database
+            .get_person_index_rebuild_job("rebuild-lib")
+            .await?
+            .expect("rebuild job should be readable");
+        assert_eq!(stored.library_id, "rebuild-lib");
+        assert_eq!(stored.status, "QUEUED");
+        assert!(!stored.cancel_requested);
+        Ok(())
+    }
+
+    /// A projection that drifts from its row struct must surface as a storage error.
+    ///
+    /// The shared decoders used to call `row.get`, which panicked on a missing column; every
+    /// `*Row` struct reports `ColumnNotFound` instead.
+    #[tokio::test]
+    async fn stored_row_structs_report_missing_columns_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+
+        let errors = [
+            StoredScanJobRow::from_row(&row).expect_err("scan job columns must not decode"),
+            StoredScanLocalMetadataBatchRow::from_row(&row)
+                .expect_err("local metadata batch columns must not decode"),
+            StoredScanJobPathRow::from_row(&row)
+                .expect_err("scan job path columns must not decode"),
+            StoredReconciliationScanEntryRow::from_row(&row)
+                .expect_err("reconciliation entry columns must not decode"),
+            StoredStrmProbeJobRow::from_row(&row)
+                .expect_err("STRM probe job columns must not decode"),
+            StoredChapterDetectionJobRow::from_row(&row)
+                .expect_err("chapter detection job columns must not decode"),
+            StoredLibraryRootRow::from_row(&row).expect_err("library root columns must not decode"),
+            StoredFilesystemEntryRow::from_row(&row)
+                .expect_err("filesystem entry columns must not decode"),
+            StoredCanonicalPersonRow::from_row(&row)
+                .expect_err("canonical person columns must not decode"),
+            StoredPersonMatchCandidateRow::from_row(&row)
+                .expect_err("person match candidate columns must not decode"),
+            StoredPersonCreditRow::from_row(&row)
+                .expect_err("person credit columns must not decode"),
+            StoredPersonIndexRebuildJobRow::from_row(&row)
+                .expect_err("person index rebuild job columns must not decode"),
+            StoredMetadataReidentifyJobRow::from_row(&row)
+                .expect_err("metadata reidentify job columns must not decode"),
+            StoredMetadataReidentifyItemRow::from_row(&row)
+                .expect_err("metadata reidentify item columns must not decode"),
+            StoredMetadataCandidateRow::from_row(&row)
+                .expect_err("metadata candidate columns must not decode"),
+            StoredItemMetadataCompletenessRow::from_row(&row)
+                .expect_err("item metadata completeness columns must not decode"),
+            StoredMediaItemRow::from_row(&row).expect_err("media item columns must not decode"),
+            StoredWebPlaybackSessionRow::from_row(&row)
+                .expect_err("web playback session columns must not decode"),
+            StoredPlaybackSessionRow::from_row(&row)
+                .expect_err("playback session columns must not decode"),
+            StoredItemImageRow::from_row(&row).expect_err("item image columns must not decode"),
+            StoredDanmakuMatchJobRow::from_row(&row)
+                .expect_err("danmaku match job columns must not decode"),
+            StoredLibraryCoverJobRow::from_row(&row)
+                .expect_err("library cover job columns must not decode"),
+            RecommendationRatingMedianRow::from_row(&row)
+                .expect_err("rating median columns must not decode"),
+            SchemaVersionRow::from_row(&row).expect_err("schema version columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The rating-median cache read is covered by
+    /// `recommendation_rating_median_survives_restart_until_thirty_day_ttl`; the schema version
+    /// projection has no other library test path.
+    #[tokio::test]
+    async fn schema_version_row_decodes_the_migration_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        assert!(database.schema_version().await? > 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_metadata_reidentify_rows_decode_jobs_and_items()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('reid-lib', 'Reid', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (
+                 'reid-item', 'reid-lib', 'MOVIE', 'Reid Movie', 'reid movie', 'LOCAL_CONFIRMED'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        database
+            .create_metadata_reidentify_job("reid-job", &["reid-item".to_owned()], "REIDENTIFY")
+            .await?;
+
+        let job = database
+            .find_metadata_reidentify_job("reid-job")
+            .await?
+            .expect("reidentify job should exist");
+        assert_eq!(job.status, "QUEUED");
+        assert_eq!(job.mode, "REIDENTIFY");
+        assert_eq!(job.job_scope, "ITEMS");
+        assert_eq!(job.library_id.as_deref(), Some("reid-lib"));
+        assert_eq!(job.total_count, 1);
+        assert_eq!(job.processed_count, 0);
+        assert_eq!(job.pending_count, 0);
+        assert!(!job.cancel_requested);
+        assert_eq!(job.error, None);
+        assert_eq!(job.started_at, None);
+        assert_eq!(job.finished_at, None);
+
+        let items = database
+            .list_metadata_reidentify_items("reid-job", 0, 10)
+            .await?;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].job_id, "reid-job");
+        assert_eq!(items[0].item_id, "reid-item");
+        assert_eq!(items[0].status, "PENDING");
+        assert_eq!(items[0].candidate_count, 0);
+        assert_eq!(items[0].error, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_metadata_candidate_and_completeness_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('meta-lib', 'Meta', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (
+                 'candidate-item', 'meta-lib', 'MOVIE', 'Candidate Movie',
+                 'candidate movie', 'LOCAL_CONFIRMED'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status,
+                 expires_at
+             ) VALUES (
+                 'candidate-a', 'candidate-item', 'tmdb', '42', '{\"title\":\"Candidate\"}',
+                 87.5, 'PENDING', 1900000000
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let candidate = database
+            .find_metadata_candidate("candidate-item", "candidate-a")
+            .await?
+            .expect("candidate should exist");
+        assert_eq!(candidate.id, "candidate-a");
+        assert_eq!(candidate.item_id, "candidate-item");
+        assert_eq!(candidate.provider, "tmdb");
+        assert_eq!(candidate.provider_id, "42");
+        assert_eq!(candidate.score, 87.5);
+        assert_eq!(candidate.status, "PENDING");
+        assert_eq!(candidate.expires_at, Some(1_900_000_000));
+        assert_eq!(candidate.item_title, "Candidate Movie");
+
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing, input_fingerprint,
+                 checked_at, retry_after, error
+             ) VALUES (
+                 'candidate-item', 'metadata', 'READY', 1, X'63616665', 1700000000, NULL, NULL
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO item_metadata_completeness (
+                 item_id, capability, local_state, is_missing, input_fingerprint,
+                 checked_at, retry_after, error
+             ) VALUES (
+                 'candidate-item', 'images', 'PENDING', NULL, NULL, NULL, 1700000123, 'queued'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let missing = database
+            .find_item_metadata_completeness("candidate-item", "metadata")
+            .await?
+            .expect("metadata completeness should exist");
+        assert_eq!(missing.local_state, "READY");
+        assert_eq!(missing.is_missing, Some(true));
+        assert_eq!(missing.input_fingerprint.as_deref(), Some(&b"cafe"[..]));
+        assert_eq!(missing.checked_at, Some(1_700_000_000));
+        assert_eq!(missing.retry_after, None);
+        assert_eq!(missing.error, None);
+
+        let pending = database
+            .find_item_metadata_completeness("candidate-item", "images")
+            .await?
+            .expect("image completeness should exist");
+        assert_eq!(pending.local_state, "PENDING");
+        assert_eq!(pending.is_missing, None);
+        assert_eq!(pending.checked_at, None);
+        assert_eq!(pending.retry_after, Some(1_700_000_123));
+        assert_eq!(pending.error.as_deref(), Some("queued"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_media_item_and_item_image_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO libraries (id, name, kind) VALUES ('image-lib', 'Image', 'MOVIE')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('image-root', 'image-lib', '/media/images', 'Images', 1, 1)",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status, identity_key
+             ) VALUES (
+                 'image-item', 'image-lib', 'MOVIE', 'Image Movie', 'image movie',
+                 'LOCAL_CONFIRMED', 'identity-image'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let media_item = database
+            .find_media_item_by_identity("identity-image")
+            .await?
+            .expect("media item should exist");
+        assert_eq!(media_item.id, "image-item");
+
+        sqlx::query(
+            "INSERT INTO item_images (
+                 id, item_id, image_type, image_index, local_path, file_size, content_tag, source
+             ) VALUES (
+                 'image-a', 'image-item', 'POSTER', 1, 'posters/image-a.jpg', 2048, 'tag-a', 'LOCAL'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let image = database
+            .find_item_image("image-item", "image-a")
+            .await?
+            .expect("item image should exist");
+        assert_eq!(image.id, "image-a");
+        assert_eq!(image.item_id, "image-item");
+        assert_eq!(image.image_type, "POSTER");
+        assert_eq!(image.image_index, 1);
+        assert_eq!(image.local_path, "posters/image-a.jpg");
+        assert_eq!(image.file_size, Some(2048));
+        assert_eq!(image.content_tag.as_deref(), Some("tag-a"));
+        assert_eq!(image.source, "LOCAL");
+        assert_eq!(image.root_path.as_deref(), Some("/media/images"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_danmaku_match_and_library_cover_job_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('job-lib', 'Jobs', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        database
+            .create_danmaku_match_job(NewDanmakuMatchJob {
+                id: "danmaku-job",
+                library_id: "job-lib",
+                overwrite: true,
+                concurrency: 3,
+            })
+            .await?;
+
+        let danmaku = database
+            .find_danmaku_match_job("danmaku-job")
+            .await?
+            .expect("danmaku job should exist");
+        assert_eq!(danmaku.id, "danmaku-job");
+        assert_eq!(danmaku.library_id, "job-lib");
+        assert_eq!(danmaku.status, "PENDING");
+        assert!(danmaku.overwrite);
+        assert_eq!(danmaku.concurrency, 3);
+        assert_eq!(danmaku.total_count, 0);
+        assert_eq!(danmaku.processed_count, 0);
+        assert_eq!(danmaku.success_count, 0);
+        assert_eq!(danmaku.skipped_count, 0);
+        assert_eq!(danmaku.failed_count, 0);
+        assert!(!danmaku.cancel_requested);
+        assert_eq!(danmaku.error, None);
+        assert_eq!(danmaku.started_at, None);
+        assert_eq!(danmaku.finished_at, None);
+
+        assert!(
+            database
+                .create_library_cover_job("cover-job", "job-lib", true)
+                .await?
+        );
+        let cover = database
+            .find_library_cover_job("cover-job")
+            .await?
+            .expect("library cover job should exist");
+        assert_eq!(cover.id, "cover-job");
+        assert_eq!(cover.library_id, "job-lib");
+        assert!(cover.is_manual);
+        assert_eq!(cover.status, "PENDING");
+        assert_eq!(cover.processed_count, 0);
+        assert_eq!(cover.total_count, 1);
+        assert_eq!(cover.error, None);
+        assert_eq!(cover.started_at, None);
+        assert_eq!(cover.finished_at, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stored_playback_and_web_playback_session_rows_decode_the_projections()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        database
+            .insert_user("session-user", "session", "Session", "hash", false, true)
+            .await?;
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('session-lib', 'S', 'MOVIE')")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (
+                 'session-item', 'session-lib', 'MOVIE', 'Session Movie',
+                 'session movie', 'LOCAL_CONFIRMED'
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO playback_sessions (
+                 id, user_id, item_id, play_session_id, device_id, client, device_name,
+                 client_version, device_type, remote_ip, state, position_ticks,
+                 duration_ticks, is_paused, started_at, last_event_at
+             ) VALUES (
+                 'ps-a', 'session-user', 'session-item', 'play-a', 'device-a', 'Lux',
+                 'Living Room', '1.2.3', 'TV', '10.0.0.7', 'PAUSED', 120, 240, 1,
+                 1800000000, 1800000060
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO web_playback_sessions (
+                 id, user_id, item_id, media_source_id, play_session_id, tier, plan, state,
+                 temp_dir, is_admin, expires_at, last_heartbeat_at, last_sequence,
+                 video_codec, audio_codec, video_bitrate, audio_bitrate,
+                 transcoding_container, created_at, updated_at
+             ) VALUES (
+                 'wps-a', 'session-user', 'session-item', NULL, 'web-a', 2, 'SERVER_HLS',
+                 'ACTIVE', '/tmp/transcode', 1, 1800003600, 1800000060, 7,
+                 'h264', 'aac', 4000000, 192000, 'fmp4', 1800000000, 1800000060
+             )",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let session = database
+            .find_playback_session_by_id("ps-a")
+            .await?
+            .expect("playback session should exist");
+        assert_eq!(session.user_id, "session-user");
+        assert_eq!(session.item_id, "session-item");
+        assert_eq!(session.media_source_id, None);
+        assert_eq!(session.play_session_id, "play-a");
+        assert_eq!(session.device_id, "device-a");
+        assert_eq!(session.client.as_deref(), Some("Lux"));
+        assert_eq!(session.device_name.as_deref(), Some("Living Room"));
+        assert_eq!(session.client_version.as_deref(), Some("1.2.3"));
+        assert_eq!(session.device_type.as_deref(), Some("TV"));
+        assert_eq!(session.remote_ip.as_deref(), Some("10.0.0.7"));
+        assert_eq!(session.state, "PAUSED");
+        assert_eq!(session.position_ticks, 120);
+        assert_eq!(session.duration_ticks, Some(240));
+        assert!(session.is_paused);
+        assert_eq!(session.started_at, 1_800_000_000);
+        assert_eq!(session.last_event_at, 1_800_000_060);
+
+        let web = database
+            .find_web_playback_session("wps-a")
+            .await?
+            .expect("web playback session should exist");
+        assert_eq!(web.user_id, "session-user");
+        assert_eq!(web.item_id, "session-item");
+        assert_eq!(web.play_session_id, "web-a");
+        assert_eq!(web.tier, 2);
+        assert_eq!(web.plan, "SERVER_HLS");
+        assert_eq!(web.state, "ACTIVE");
+        assert_eq!(web.temp_dir.as_deref(), Some("/tmp/transcode"));
+        assert!(web.is_admin);
+        assert_eq!(web.expires_at, 1_800_003_600);
+        assert_eq!(web.last_heartbeat_at, 1_800_000_060);
+        assert_eq!(web.last_sequence, 7);
+        assert_eq!(web.video_codec.as_deref(), Some("h264"));
+        assert_eq!(web.audio_codec.as_deref(), Some("aac"));
+        assert_eq!(web.video_bitrate, Some(4_000_000));
+        assert_eq!(web.audio_bitrate, Some(192_000));
+        assert_eq!(web.transcoding_container.as_deref(), Some("fmp4"));
+        assert_eq!(web.created_at, 1_800_000_000);
+        assert_eq!(web.updated_at, 1_800_000_060);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 #[path = "repository_tests.rs"]
 mod repository_tests;
 
 #[cfg(all(test, feature = "performance-benchmarks"))]
 #[path = "sql_query_benchmarks.rs"]
 mod sql_query_benchmarks;
+
+async fn sqlite_has_legacy_timestamp_migration_checksum(
+    pool: &AnyPool,
+) -> Result<bool, sqlx::Error> {
+    let migrations_table_exists: i64 = sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM sqlite_master
+             WHERE type = 'table' AND name = '_sqlx_migrations'
+         )",
+    )
+    .fetch_one(pool)
+    .await?;
+    if migrations_table_exists == 0 {
+        return Ok(false);
+    }
+
+    let checksum: Option<Vec<u8>> = sqlx::query_scalar(
+        "SELECT checksum FROM _sqlx_migrations WHERE version = 126 AND success = 1",
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(checksum.as_deref() == Some(LEGACY_SQLITE_MIGRATION_0126_CHECKSUM))
+}

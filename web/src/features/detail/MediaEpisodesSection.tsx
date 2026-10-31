@@ -5,6 +5,7 @@ import type { MediaItem } from "../../lib/api/types";
 import { EpisodeCount, Rating, episodeTitle, imageUrl, mediaTitle, posterUrlWithFallback } from "../home/media-display";
 import { useImageVariants } from "../home/image-variants";
 import { useMediaEpisodes } from "./useMediaEpisodes";
+import { LuxButton , luxButtonClass } from "../../components/ui";
 
 const EpisodesContext = createContext<ReturnType<typeof useMediaEpisodes> | undefined>(undefined);
 
@@ -70,11 +71,11 @@ export function MediaEpisodePlayButton({ item, onNotice }: { item: MediaItem; on
       onNotice("没有可播放的单集。");
     }
   }, [navigate, nextId, onNotice, pending, playRequested]);
-  if (nextId) return <Link className="lux-button lux-button-large lux-button-primary" to={`/watch/${nextId}`}><Play size={17} fill="currentColor" /> 播放</Link>;
-  return <button className="lux-button lux-button-large lux-button-primary" type="button" onClick={() => {
+  if (nextId) return <Link className={luxButtonClass({ tone: "primary", size: "large" })} to={`/watch/${nextId}`}><Play size={17} fill="currentColor" /> 播放</Link>;
+  return <LuxButton tone="primary" size="large" type="button" onClick={() => {
       setPlayRequested(pending);
       onNotice(pending ? "正在查找可播放单集，请稍候。" : "没有可播放的单集。");
-    }}><Play size={17} fill="currentColor" /> 播放</button>;
+    }}><Play size={17} fill="currentColor" /> 播放</LuxButton>;
 }
 
 function selectNextPlayableEpisode(episodes: MediaItem[]) {
@@ -166,15 +167,14 @@ function SeasonEpisodes({
       {!episodesPending && !episodes.length && !error ? <p className="lux-muted-copy">这个季度还没有可播放的单集。</p> : null}
       {hasNextPage ? (
         <div className="lux-person-works-actions">
-          <button
-            className="lux-button lux-button-secondary"
+          <LuxButton tone="secondary"
             type="button"
             data-action="load-more-episodes"
             onClick={onLoadMore}
             disabled={isFetchingNextPage}
           >
             {isFetchingNextPage ? "加载中…" : isFetchNextPageError ? "重试加载" : `加载更多单集（${Math.max(0, (total ?? episodes.length) - episodes.length)} 集）`}
-          </button>
+          </LuxButton>
         </div>
       ) : null}
     </section>

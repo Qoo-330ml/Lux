@@ -5,7 +5,7 @@ use std::{
     path::{Component, Path, PathBuf},
     process::Stdio,
     sync::Arc,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -13,7 +13,7 @@ use std::{ffi::CString, mem::MaybeUninit, os::unix::ffi::OsStrExt};
 
 use tokio::{
     fs,
-    io::AsyncReadExt,
+    io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::{Child, Command},
     sync::{Mutex, OwnedSemaphorePermit, RwLock, Semaphore},
     time::sleep,
@@ -43,6 +43,112 @@ const SESSION_QUOTA_CACHE_TTL: Duration = Duration::from_secs(5);
 const ORPHAN_PROCESS_SCAN_TIMEOUT: Duration = Duration::from_secs(5);
 /// Session identifiers become directory names, so they stay within one predictable segment.
 const MAX_SESSION_ID_BYTES: usize = 128;
+/// `ffmpeg -progress` writes one `key=value` pair per line; anything larger is not a progress
+/// report and must not grow the reader's buffer.
+const MAX_PROGRESS_LINE_BYTES: usize = 4_096;
+/// Encoder self-test budget; a working GPU initialises in well under a second.
+const HARDWARE_PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Result of the last hardware encoder self-test.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct HardwareEncoderStatus {
+    pub(crate) encoder: Option<String>,
+    pub(crate) available: bool,
+    /// Milliseconds since the Unix epoch; zero means "not checked yet".
+    pub(crate) checked_at_ms: i64,
+    pub(crate) error: Option<String>,
+}
+
+/// The newest complete-enough `ffmpeg -progress` values for one HLS process generation.
+///
+/// FFmpeg emits a block of `key=value` lines roughly twice a second and closes each block with
+/// `progress=continue` or `progress=end`. The reader applies lines as they arrive, so a caller can
+/// observe a half-updated block; every field is independently optional and display-only.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub(crate) struct HlsProgressSnapshot {
+    pub(crate) generation: u64,
+    pub(crate) frame: Option<u64>,
+    pub(crate) fps: Option<f64>,
+    /// Encoded output bitrate in kbit/s, as reported by FFmpeg.
+    pub(crate) bitrate_kbps: Option<f64>,
+    pub(crate) total_size: Option<u64>,
+    pub(crate) out_time_us: Option<u64>,
+    pub(crate) speed: Option<f64>,
+    pub(crate) duplicated_frames: Option<u64>,
+    pub(crate) dropped_frames: Option<u64>,
+    pub(crate) finished: bool,
+    /// Milliseconds since the Unix epoch of the last accepted line; zero means "no report yet".
+    pub(crate) updated_at_ms: i64,
+}
+
+impl HlsProgressSnapshot {
+    /// Applies one `key=value` progress line. Returns whether the line carried a known value.
+    fn apply_line(&mut self, line: &str, now_ms: i64) -> bool {
+        let Some((key, value)) = line.trim().split_once('=') else {
+            return false;
+        };
+        let value = value.trim();
+        let changed = match key {
+            "frame" => assign_parsed(&mut self.frame, parse_u64(value)),
+            "fps" => assign_parsed(&mut self.fps, parse_f64(value)),
+            "bitrate" => assign_parsed(&mut self.bitrate_kbps, parse_bitrate_kbps(value)),
+            "total_size" => assign_parsed(&mut self.total_size, parse_u64(value)),
+            "out_time_us" => assign_parsed(&mut self.out_time_us, parse_u64(value)),
+            "speed" => assign_parsed(&mut self.speed, parse_speed(value)),
+            "dup_frames" => assign_parsed(&mut self.duplicated_frames, parse_u64(value)),
+            "drop_frames" => assign_parsed(&mut self.dropped_frames, parse_u64(value)),
+            "progress" => {
+                self.finished = value == "end";
+                true
+            }
+            // `out_time_ms` is documented as microseconds in practice, so it is ignored in
+            // favour of `out_time_us`; every other key (stream_*_q, out_time, ...) is unused.
+            _ => false,
+        };
+        if changed {
+            self.updated_at_ms = now_ms;
+        }
+        changed
+    }
+}
+
+fn assign_parsed<T>(slot: &mut Option<T>, value: Option<T>) -> bool {
+    match value {
+        Some(value) => {
+            *slot = Some(value);
+            true
+        }
+        None => false,
+    }
+}
+
+fn parse_u64(value: &str) -> Option<u64> {
+    value.parse::<u64>().ok()
+}
+
+fn parse_f64(value: &str) -> Option<f64> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite() && *value >= 0.0)
+}
+
+fn parse_bitrate_kbps(value: &str) -> Option<f64> {
+    let value = value.strip_suffix("kbits/s")?.trim();
+    parse_f64(value)
+}
+
+fn parse_speed(value: &str) -> Option<f64> {
+    let value = value.strip_suffix('x')?.trim();
+    parse_f64(value)
+}
+
+fn unix_millis() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or_default()
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum HlsSegmentContainer {
@@ -150,8 +256,18 @@ struct HlsProcess {
     state: Mutex<HlsProcessState>,
     restart: Mutex<()>,
     quota: Mutex<SessionQuotaCache>,
+    progress: Arc<Mutex<HlsProgressSnapshot>>,
 }
 
+struct HlsChildRequest<'a> {
+    directory: &'a Path,
+    init: &'a Path,
+    manifest: &'a Path,
+    generation: u64,
+    start_time_ticks: Option<i64>,
+}
+
+#[derive(Clone)]
 struct HlsProcessSpecification {
     input: PathBuf,
     tier: ServerTier,
@@ -159,6 +275,59 @@ struct HlsProcessSpecification {
     audio_stream_index: Option<i64>,
     emby_vod: bool,
     segment_container: HlsSegmentContainer,
+    /// Encoding parameters captured when the session started; restarts reuse them so a policy
+    /// change never changes the stream mid-playback.
+    encoding: FfmpegEncodingOptions,
+}
+
+#[derive(Clone, Debug)]
+struct FfmpegEncodingOptions {
+    hardware_encoder: Option<String>,
+    software_preset: String,
+    max_output_height: u32,
+    audio_bitrate: i64,
+    max_video_bitrate: i64,
+    hardware_device: String,
+    hardware_decode: bool,
+}
+
+impl Default for FfmpegEncodingOptions {
+    fn default() -> Self {
+        Self {
+            hardware_encoder: None,
+            software_preset: "veryfast".to_owned(),
+            max_output_height: 0,
+            audio_bitrate: 192_000,
+            max_video_bitrate: 0,
+            hardware_device: default_hardware_device(),
+            hardware_decode: false,
+        }
+    }
+}
+
+impl FfmpegEncodingOptions {
+    fn from_runtime(config: &RuntimeTranscodeConfig) -> Self {
+        Self {
+            hardware_encoder: config.hardware_encoder.clone(),
+            software_preset: config.software_preset.clone(),
+            max_output_height: config.max_output_height,
+            audio_bitrate: config.audio_bitrate,
+            max_video_bitrate: config.max_video_bitrate,
+            hardware_device: config.hardware_device.clone(),
+            hardware_decode: config.hardware_decode,
+        }
+    }
+
+    /// Applies the administrator bitrate cap without raising a lower client-requested bitrate.
+    fn effective_video_bitrate(&self, requested: Option<i64>) -> Option<i64> {
+        let cap = (self.max_video_bitrate > 0).then_some(self.max_video_bitrate);
+        match (requested.filter(|value| *value > 0), cap) {
+            (Some(requested), Some(cap)) => Some(requested.min(cap)),
+            (Some(requested), None) => Some(requested),
+            (None, Some(cap)) => Some(cap),
+            (None, None) => None,
+        }
+    }
 }
 
 /// Remembers which generation served a segment without letting the map grow without bound.
@@ -197,7 +366,6 @@ struct HlsOutput<'a> {
 struct FfmpegTimelineOptions {
     start_time_ticks: Option<i64>,
     audio_stream_index: Option<i64>,
-    preserve_input_timestamps: bool,
 }
 
 #[derive(Debug, Default)]
@@ -214,17 +382,142 @@ impl SessionQuotaCache {
     }
 }
 
+/// Concurrency limits and disk watermarks that apply to newly started sessions.
+#[derive(Clone)]
+struct TierSlots {
+    remux: Arc<Semaphore>,
+    hardware: Arc<Semaphore>,
+    software: Arc<Semaphore>,
+    limits: (usize, usize, usize),
+}
+
+impl TierSlots {
+    fn new(limits: (usize, usize, usize)) -> Self {
+        Self {
+            remux: Arc::new(Semaphore::new(limits.0)),
+            hardware: Arc::new(Semaphore::new(limits.1)),
+            software: Arc::new(Semaphore::new(limits.2)),
+            limits,
+        }
+    }
+}
+
+/// Effective transcoding parameters for sessions started from now on.
+///
+/// A running session keeps the values it started with: they are copied into
+/// [`HlsProcessSpecification`] and reused on every seek restart.
+#[derive(Clone, Debug)]
+struct RuntimeTranscodeConfig {
+    enabled: bool,
+    hardware_encoder: Option<String>,
+    min_free_bytes: u64,
+    session_quota_bytes: u64,
+    global_budget_bytes: u64,
+    max_video_bitrate: i64,
+    software_preset: String,
+    max_output_height: u32,
+    audio_bitrate: i64,
+    hardware_device: String,
+    hardware_decode: bool,
+}
+
+impl Default for RuntimeTranscodeConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            hardware_encoder: hardware_encoder_from_env(),
+            min_free_bytes: DEFAULT_MIN_FREE_BYTES,
+            session_quota_bytes: MAX_SESSION_BYTES,
+            global_budget_bytes: global_session_budget_from_env()
+                .unwrap_or(DEFAULT_MAX_GLOBAL_SESSION_BYTES),
+            max_video_bitrate: 0,
+            software_preset: "veryfast".to_owned(),
+            max_output_height: 0,
+            audio_bitrate: 192_000,
+            hardware_device: default_hardware_device(),
+            hardware_decode: false,
+        }
+    }
+}
+
+impl RuntimeTranscodeConfig {
+    fn from_settings(settings: &crate::application::transcoding::TranscodingSettings) -> Self {
+        let session_quota_bytes = if settings.session_quota_mb <= 0 {
+            u64::MAX
+        } else {
+            megabytes(settings.session_quota_mb)
+        };
+        let global_budget_bytes = global_session_budget_from_env().unwrap_or_else(|| {
+            if settings.global_budget_mb <= 0 {
+                u64::MAX
+            } else {
+                megabytes(settings.global_budget_mb)
+            }
+        });
+        Self {
+            enabled: settings.enabled,
+            // The environment variable is an operator override and stays authoritative.
+            hardware_encoder: hardware_encoder_from_env().or_else(|| {
+                let configured = settings.hardware_encoder.trim();
+                (!configured.is_empty()
+                    && !configured.eq_ignore_ascii_case(
+                        crate::application::transcoding::HARDWARE_ENCODER_NONE,
+                    ))
+                .then(|| configured.to_owned())
+            }),
+            min_free_bytes: if settings.min_free_space_mb <= 0 {
+                0
+            } else {
+                megabytes(settings.min_free_space_mb)
+            },
+            session_quota_bytes,
+            global_budget_bytes,
+            max_video_bitrate: settings.max_video_bitrate_kbps.saturating_mul(1_000),
+            software_preset: settings.software_preset.clone(),
+            max_output_height: u32::try_from(settings.max_output_height).unwrap_or(0),
+            audio_bitrate: settings.audio_bitrate_kbps.saturating_mul(1_000),
+            hardware_device: settings.hardware_device.clone(),
+            hardware_decode: settings.hardware_decode,
+        }
+    }
+}
+
+fn megabytes(value: i64) -> u64 {
+    u64::try_from(value)
+        .unwrap_or(0)
+        .saturating_mul(1024 * 1024)
+}
+
+fn default_hardware_device() -> String {
+    crate::application::transcoding::DEFAULT_HARDWARE_DEVICE.to_owned()
+}
+
+/// Device node passed to VAAPI/QSV; empty values mean the documented default.
+fn hardware_device(encoding: &FfmpegEncodingOptions) -> String {
+    let device = encoding.hardware_device.trim();
+    if device.is_empty() {
+        default_hardware_device()
+    } else {
+        device.to_owned()
+    }
+}
+
+fn hardware_encoder_from_env() -> Option<String> {
+    std::env::var("LUX_HLS_HW_ENCODER")
+        .ok()
+        .filter(|value| is_allowed_hardware_encoder(value))
+}
+
+/// Every mutable field is shared through an `Arc`: `AppState` is cloned for each request, so a
+/// per-clone semaphore or self-test status would silently bypass limits and hide the probe result.
 #[derive(Clone)]
 pub(crate) struct HlsManager {
     base_directory: PathBuf,
     processes: Arc<RwLock<HashMap<String, Arc<HlsProcess>>>>,
-    remux_slots: Arc<Semaphore>,
-    hardware_slots: Arc<Semaphore>,
-    software_slots: Arc<Semaphore>,
-    hardware_encoder: Option<String>,
+    slots: Arc<std::sync::RwLock<TierSlots>>,
+    runtime: Arc<std::sync::RwLock<RuntimeTranscodeConfig>>,
+    hardware_status: Arc<std::sync::RwLock<HardwareEncoderStatus>>,
     ffmpeg_executable: String,
-    min_free_bytes: u64,
-    max_global_session_bytes: u64,
 }
 
 impl HlsManager {
@@ -242,8 +535,14 @@ impl HlsManager {
     }
 
     #[cfg(test)]
-    fn with_global_session_budget(mut self, bytes: u64) -> Self {
-        self.max_global_session_bytes = bytes;
+    fn with_global_session_budget(self, bytes: u64) -> Self {
+        self.runtime_write().global_budget_bytes = bytes;
+        self
+    }
+
+    #[cfg(test)]
+    fn with_min_free_bytes(self, bytes: u64) -> Self {
+        self.runtime_write().min_free_bytes = bytes;
         self
     }
 
@@ -252,25 +551,176 @@ impl HlsManager {
         ffmpeg_executable: String,
         min_free_bytes: u64,
     ) -> Self {
-        let hardware_encoder = std::env::var("LUX_HLS_HW_ENCODER")
-            .ok()
-            .filter(|value| is_allowed_hardware_encoder(value));
+        let runtime = RuntimeTranscodeConfig {
+            min_free_bytes,
+            ..RuntimeTranscodeConfig::default()
+        };
         Self {
             base_directory: config_dir.join("web-playback"),
             processes: Arc::new(RwLock::new(HashMap::new())),
-            remux_slots: Arc::new(Semaphore::new(MAX_REMUX_SESSIONS)),
-            hardware_slots: Arc::new(Semaphore::new(MAX_HARDWARE_SESSIONS)),
-            software_slots: Arc::new(Semaphore::new(MAX_SOFTWARE_SESSIONS)),
-            hardware_encoder,
+            slots: Arc::new(std::sync::RwLock::new(TierSlots::new((
+                MAX_REMUX_SESSIONS,
+                MAX_HARDWARE_SESSIONS,
+                MAX_SOFTWARE_SESSIONS,
+            )))),
+            runtime: Arc::new(std::sync::RwLock::new(runtime)),
+            hardware_status: Arc::new(std::sync::RwLock::new(HardwareEncoderStatus::default())),
             ffmpeg_executable,
-            min_free_bytes,
-            max_global_session_bytes: global_session_budget_from_env()
-                .unwrap_or(DEFAULT_MAX_GLOBAL_SESSION_BYTES),
         }
     }
 
+    fn runtime_read(&self) -> std::sync::RwLockReadGuard<'_, RuntimeTranscodeConfig> {
+        self.runtime
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn runtime_write(&self) -> std::sync::RwLockWriteGuard<'_, RuntimeTranscodeConfig> {
+        self.runtime
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn runtime_snapshot(&self) -> RuntimeTranscodeConfig {
+        self.runtime_read().clone()
+    }
+
+    /// Applies an administrator policy to sessions started from now on.
+    ///
+    /// Concurrency limits only rebuild the semaphores when they actually change: running sessions
+    /// keep the permits they already hold, so nothing is interrupted mid-playback.
+    pub(crate) fn apply_settings(
+        &self,
+        settings: &crate::application::transcoding::TranscodingSettings,
+    ) {
+        let previous_encoder = self.runtime_read().hardware_encoder.clone();
+        let limits = (
+            usize::try_from(settings.remux_sessions).unwrap_or(0),
+            usize::try_from(settings.hardware_sessions).unwrap_or(0),
+            usize::try_from(settings.software_sessions).unwrap_or(0),
+        );
+        {
+            let mut slots = self
+                .slots
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            if slots.limits != limits {
+                *slots = TierSlots::new(limits);
+            }
+        }
+        let runtime = RuntimeTranscodeConfig::from_settings(settings);
+        let encoder_changed = previous_encoder != runtime.hardware_encoder;
+        *self.runtime_write() = runtime;
+        if encoder_changed {
+            let mut status = self
+                .hardware_status
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *status = HardwareEncoderStatus {
+                encoder: self.runtime_read().hardware_encoder.clone(),
+                available: false,
+                checked_at_ms: 0,
+                error: None,
+            };
+        }
+    }
+
+    pub(crate) fn hardware_status(&self) -> HardwareEncoderStatus {
+        self.hardware_status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    pub(crate) fn record_hardware_status(&self, status: HardwareEncoderStatus) {
+        *self
+            .hardware_status
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = status;
+    }
+
+    /// A configured encoder only counts as available once the self-test has passed.
     pub(crate) fn hardware_transcode_available(&self) -> bool {
-        self.hardware_encoder.is_some()
+        self.runtime_read().hardware_encoder.is_some() && self.hardware_status().available
+    }
+
+    /// Runs a one-frame encode with the configured hardware encoder and records the result.
+    pub(crate) async fn probe_hardware_encoder(&self) -> HardwareEncoderStatus {
+        let runtime = self.runtime_snapshot();
+        let Some(encoder) = runtime.hardware_encoder.clone() else {
+            let status = HardwareEncoderStatus {
+                encoder: None,
+                available: false,
+                checked_at_ms: unix_millis(),
+                error: None,
+            };
+            self.record_hardware_status(status.clone());
+            return status;
+        };
+        let encoding = FfmpegEncodingOptions {
+            // The probe source is generated by lavfi, so decode acceleration must stay off.
+            hardware_decode: false,
+            ..FfmpegEncodingOptions::from_runtime(&runtime)
+        };
+        let args = hardware_probe_args(&encoding);
+        let result = tokio::time::timeout(
+            HARDWARE_PROBE_TIMEOUT,
+            Command::new(&self.ffmpeg_executable)
+                .args(&args)
+                .stdin(Stdio::null())
+                .kill_on_drop(true)
+                .output(),
+        )
+        .await;
+        let (available, error) = match result {
+            Ok(Ok(output)) if output.status.success() => (true, None),
+            Ok(Ok(output)) => (
+                false,
+                Some(sanitize_probe_error(&String::from_utf8_lossy(
+                    &output.stderr,
+                ))),
+            ),
+            Ok(Err(error)) => (false, Some(format!("无法启动 FFmpeg：{error}"))),
+            Err(_) => (false, Some("编码器自检超时".to_owned())),
+        };
+        let status = HardwareEncoderStatus {
+            encoder: Some(encoder),
+            available,
+            checked_at_ms: unix_millis(),
+            error,
+        };
+        self.record_hardware_status(status.clone());
+        status
+    }
+
+    /// Restarts a hardware session as software transcoding after a failed start.
+    /// Returns the new tier when a hardware session was actually restarted as software.
+    pub(crate) async fn downgrade_to_software(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ServerTier>, HlsError> {
+        let (specification, runtime_ticks) = {
+            let processes = self.processes.read().await;
+            let process = processes.get(session_id).ok_or(HlsError::NotFound)?;
+            (process.specification.clone(), process.runtime_ticks)
+        };
+        if specification.tier != ServerTier::HardwareTranscode {
+            return Ok(None);
+        }
+        self.stop(session_id).await?;
+        let mut specification = specification;
+        specification.tier = ServerTier::SoftwareTranscode;
+        specification.encoding.hardware_encoder = None;
+        let spawn_immediately = !specification.emby_vod;
+        self.start_process(
+            session_id,
+            specification,
+            None,
+            runtime_ticks,
+            spawn_immediately,
+        )
+        .await?;
+        Ok(Some(ServerTier::SoftwareTranscode))
     }
 
     pub(crate) fn with_executable(mut self, executable: String) -> Self {
@@ -318,6 +768,7 @@ impl HlsManager {
                 audio_stream_index: options.audio_stream_index,
                 emby_vod: false,
                 segment_container: HlsSegmentContainer::FragmentedMp4,
+                encoding: FfmpegEncodingOptions::from_runtime(&self.runtime_snapshot()),
             },
             options.start_time_ticks,
             options.runtime_ticks,
@@ -343,6 +794,7 @@ impl HlsManager {
                 audio_stream_index: None,
                 emby_vod: true,
                 segment_container: options.segment_container,
+                encoding: FfmpegEncodingOptions::from_runtime(&self.runtime_snapshot()),
             },
             options.start_time_ticks,
             options.runtime_ticks,
@@ -359,6 +811,10 @@ impl HlsManager {
         runtime_ticks: Option<i64>,
         spawn_immediately: bool,
     ) -> Result<(), HlsError> {
+        let runtime = self.runtime_snapshot();
+        if !runtime.enabled {
+            return Err(HlsError::Limit);
+        }
         let permit = if spawn_immediately {
             Some(self.acquire_permit(specification.tier)?)
         } else {
@@ -367,12 +823,15 @@ impl HlsManager {
         fs::create_dir_all(&self.base_directory)
             .await
             .map_err(HlsError::Io)?;
-        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes).await {
+        if !has_sufficient_free_space(&self.base_directory, runtime.min_free_bytes).await {
             return Err(HlsError::Limit);
         }
-        if !self.session_bytes_within_global_budget().await? {
+        if !self
+            .session_bytes_within_global_budget(runtime.global_budget_bytes)
+            .await?
+        {
             tracing::warn!(
-                budget_bytes = self.max_global_session_bytes,
+                budget_bytes = runtime.global_budget_bytes,
                 session_id = %session_id,
                 "refusing to start Web HLS: the global disk budget is exhausted"
             );
@@ -382,6 +841,10 @@ impl HlsManager {
         fs::create_dir_all(&directory).await.map_err(HlsError::Io)?;
         let segment_start_number = hls_start_number(start_time_ticks);
         let generation = 0;
+        let progress = Arc::new(Mutex::new(HlsProgressSnapshot {
+            generation,
+            ..HlsProgressSnapshot::default()
+        }));
         let init = hls_init_path(
             &directory,
             specification.emby_vod,
@@ -392,11 +855,14 @@ impl HlsManager {
         let child = if spawn_immediately {
             match self.spawn_child(
                 &specification,
-                &directory,
-                &init,
-                &manifest,
-                generation,
-                start_time_ticks,
+                HlsChildRequest {
+                    directory: &directory,
+                    init: &init,
+                    manifest: &manifest,
+                    generation,
+                    start_time_ticks,
+                },
+                Arc::clone(&progress),
             ) {
                 Ok(child) => Some(child),
                 Err(error) => {
@@ -423,6 +889,7 @@ impl HlsManager {
             }),
             restart: Mutex::new(()),
             quota: Mutex::new(SessionQuotaCache::default()),
+            progress,
         });
         let previous = self
             .processes
@@ -438,23 +905,26 @@ impl HlsManager {
     fn spawn_child(
         &self,
         specification: &HlsProcessSpecification,
-        directory: &Path,
-        init: &Path,
-        manifest: &Path,
-        generation: u64,
-        start_time_ticks: Option<i64>,
+        request: HlsChildRequest<'_>,
+        progress: Arc<Mutex<HlsProgressSnapshot>>,
     ) -> Result<Child, HlsError> {
+        let HlsChildRequest {
+            directory,
+            init,
+            manifest,
+            generation,
+            start_time_ticks,
+        } = request;
         let init_file_name = init.file_name().and_then(|name| name.to_str());
         let args = if specification.emby_vod {
             ffmpeg_args_for_output_with_audio(
                 &specification.input,
                 specification.tier,
-                self.hardware_encoder.as_deref(),
+                &specification.encoding,
                 specification.video_bitrate,
                 FfmpegTimelineOptions {
                     start_time_ticks,
                     audio_stream_index: specification.audio_stream_index,
-                    preserve_input_timestamps: true,
                 },
                 HlsOutput {
                     init_file_name: init_file_name.unwrap_or("init.mp4"),
@@ -472,21 +942,33 @@ impl HlsManager {
                 },
             )?
         } else {
-            ffmpeg_args_with_audio(
+            let manifest = directory.join("index.m3u8");
+            ffmpeg_args_for_output_with_audio(
                 &specification.input,
-                directory,
                 specification.tier,
-                self.hardware_encoder.as_deref(),
+                &specification.encoding,
                 specification.video_bitrate,
-                start_time_ticks,
-                specification.audio_stream_index,
+                FfmpegTimelineOptions {
+                    start_time_ticks,
+                    audio_stream_index: specification.audio_stream_index,
+                },
+                HlsOutput {
+                    init_file_name: init_file_name.unwrap_or("init.mp4"),
+                    manifest: &manifest,
+                    segment_file_name: directory
+                        .join("segment_%06d.m4s")
+                        .to_string_lossy()
+                        .into_owned(),
+                    segment_container: specification.segment_container,
+                    preserve_input_timestamps: false,
+                },
             )?
         };
         let mut command = Command::new(&self.ffmpeg_executable);
         command
             .args(args)
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         #[cfg(unix)]
@@ -507,7 +989,75 @@ impl HlsManager {
                 }
             });
         }
+        if let Some(stdout) = child.stdout.take() {
+            tokio::spawn(async move {
+                let mut reader = BufReader::new(stdout);
+                let mut line = Vec::new();
+                loop {
+                    line.clear();
+                    // Bound each read so a malformed producer cannot grow this buffer without
+                    // limit; `read_until` stops at the newline or at `MAX_PROGRESS_LINE_BYTES`.
+                    let read = match (&mut reader)
+                        .take(MAX_PROGRESS_LINE_BYTES as u64)
+                        .read_until(b'\n', &mut line)
+                        .await
+                    {
+                        Ok(read) => read,
+                        Err(_) => break,
+                    };
+                    if read == 0 {
+                        break;
+                    }
+                    let Ok(text) = std::str::from_utf8(&line) else {
+                        continue;
+                    };
+                    let now_ms = unix_millis();
+                    let mut snapshot = progress.lock().await;
+                    if snapshot.generation != generation {
+                        *snapshot = HlsProgressSnapshot {
+                            generation,
+                            ..HlsProgressSnapshot::default()
+                        };
+                    }
+                    snapshot.apply_line(text, now_ms);
+                }
+            });
+        }
         Ok(child)
+    }
+
+    /// Whether the session's FFmpeg child is still running.
+    pub(crate) async fn process_alive(&self, session_id: &str) -> Result<bool, HlsError> {
+        let process = self
+            .processes
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .ok_or(HlsError::NotFound)?;
+        let mut state = process.state.lock().await;
+        match state.child.as_mut() {
+            Some(child) => Ok(child.try_wait().map_err(HlsError::Io)?.is_none()),
+            None => Ok(false),
+        }
+    }
+
+    /// Whether the initial manifest already exists (a tiny input can finish encoding instantly).
+    pub(crate) async fn manifest_ready(&self, session_id: &str) -> bool {
+        let process = self.processes.read().await.get(session_id).cloned();
+        match process {
+            Some(process) => fs::metadata(&process.initial_manifest)
+                .await
+                .is_ok_and(|metadata| metadata.is_file()),
+            None => false,
+        }
+    }
+
+    /// Latest FFmpeg progress for one HLS session, or `None` before FFmpeg reported anything.
+    pub(crate) async fn progress(&self, session_id: &str) -> Option<HlsProgressSnapshot> {
+        let process = self.processes.read().await.get(session_id).cloned()?;
+        let snapshot = process.progress.lock().await.clone();
+        (snapshot.updated_at_ms > 0).then_some(snapshot)
     }
 
     pub(crate) async fn start_for_initial_asset(
@@ -872,11 +1422,14 @@ impl HlsManager {
         );
         let child = self.spawn_child(
             &process.specification,
-            &process.directory,
-            &init,
-            &manifest,
-            generation,
-            Some(start_time_ticks),
+            HlsChildRequest {
+                directory: &process.directory,
+                init: &init,
+                manifest: &manifest,
+                generation,
+                start_time_ticks: Some(start_time_ticks),
+            },
+            Arc::clone(&process.progress),
         )?;
         tracing::info!(
             event = "emby_hls_segment_restart",
@@ -906,14 +1459,16 @@ impl HlsManager {
     }
 
     async fn check_restart_resources(&self, process: &HlsProcess) -> Result<(), HlsError> {
-        if !has_sufficient_free_space(&self.base_directory, self.min_free_bytes).await {
+        let runtime = self.runtime_snapshot();
+        if !has_sufficient_free_space(&self.base_directory, runtime.min_free_bytes).await {
             return Err(HlsError::Limit);
         }
-        let total_bytes = session_directory_bytes(&process.directory).await?;
+        let limit = runtime.session_quota_bytes;
+        let total_bytes = session_directory_bytes(&process.directory, limit).await?;
         let mut quota = process.quota.lock().await;
         quota.total_bytes = total_bytes;
         quota.checked_at = Some(Instant::now());
-        if total_bytes > MAX_SESSION_BYTES {
+        if total_bytes > limit {
             return Err(HlsError::Limit);
         }
         Ok(())
@@ -974,6 +1529,10 @@ impl HlsManager {
     }
 
     pub(crate) async fn within_quota(&self, session_id: &str) -> Result<bool, HlsError> {
+        let limit = self.runtime_snapshot().session_quota_bytes;
+        if limit == u64::MAX {
+            return Ok(true);
+        }
         let process = self
             .processes
             .read()
@@ -981,12 +1540,30 @@ impl HlsManager {
             .get(session_id)
             .cloned()
             .ok_or(HlsError::NotFound)?;
+        Ok(self.cached_session_bytes(&process).await? <= limit)
+    }
+
+    /// Total bytes written by one session, measured fresh for the statistics response.
+    ///
+    /// Admission reuses the quota cache, but a one-second panel poll must not report the zero
+    /// bytes that were measured before FFmpeg wrote its first segment.
+    pub(crate) async fn session_bytes(&self, session_id: &str) -> Result<Option<u64>, HlsError> {
+        let Some(process) = self.processes.read().await.get(session_id).cloned() else {
+            return Ok(None);
+        };
+        let limit = self.runtime_snapshot().session_quota_bytes;
+        session_directory_bytes(&process.directory, limit)
+            .await
+            .map(Some)
+    }
+
+    async fn cached_session_bytes(&self, process: &HlsProcess) -> Result<u64, HlsError> {
+        let limit = self.runtime_snapshot().session_quota_bytes;
         let mut quota = process.quota.lock().await;
-        let now = Instant::now();
-        if quota.is_fresh(now) {
-            return Ok(quota.total_bytes <= MAX_SESSION_BYTES);
+        if quota.is_fresh(Instant::now()) {
+            return Ok(quota.total_bytes);
         }
-        let total = match session_directory_bytes(&process.directory).await {
+        let total = match session_directory_bytes(&process.directory, limit).await {
             Ok(total) => total,
             Err(error) => {
                 quota.checked_at = None;
@@ -995,7 +1572,53 @@ impl HlsManager {
         };
         quota.total_bytes = total;
         quota.checked_at = Some(Instant::now());
-        Ok(total <= MAX_SESSION_BYTES)
+        Ok(total)
+    }
+
+    /// Bitrate of the newest media segment, measured from the file FFmpeg just closed.
+    ///
+    /// The HLS muxer reports `bitrate=N/A` through `-progress`, so the encoded bitrate has to be
+    /// derived from the segment itself: every segment covers [`HLS_SEGMENT_DURATION_TICKS`].
+    pub(crate) async fn latest_segment_bitrate_kbps(&self, session_id: &str) -> Option<f64> {
+        let (directory, extension) = {
+            let processes = self.processes.read().await;
+            let process = processes.get(session_id)?;
+            (
+                process.directory.clone(),
+                process.specification.segment_container.segment_extension(),
+            )
+        };
+        let suffix = format!(".{extension}");
+        let bytes = tokio::task::spawn_blocking(move || -> Option<u64> {
+            let mut newest: Option<(i64, u64)> = None;
+            let entries = std::fs::read_dir(&directory).ok()?;
+            for entry in entries.flatten() {
+                let name = entry.file_name();
+                let Some(name) = name.to_str() else {
+                    continue;
+                };
+                if !name.ends_with(&suffix) {
+                    continue;
+                }
+                let Ok(Some(number)) = asset_segment_number(name) else {
+                    continue;
+                };
+                let Ok(metadata) = entry.metadata() else {
+                    continue;
+                };
+                if !metadata.is_file() || metadata.len() == 0 {
+                    continue;
+                }
+                if newest.is_none_or(|(newest_number, _)| number >= newest_number) {
+                    newest = Some((number, metadata.len()));
+                }
+            }
+            newest.map(|(_, bytes)| bytes)
+        })
+        .await
+        .ok()??;
+        let seconds = HLS_SEGMENT_DURATION_TICKS as f64 / 10_000_000.0;
+        (bytes > 0).then(|| bytes as f64 * 8.0 / seconds / 1_000.0)
     }
 
     /// Resolves the per-session directory without ever escaping the HLS root.
@@ -1050,7 +1673,7 @@ impl HlsManager {
     /// mentions both our ffmpeg executable and the session directory base at startup is stale.
     async fn terminate_orphan_processes(&self) {
         let executable = escape_pgrep_pattern(&self.ffmpeg_executable);
-        let base_directory = escape_pgrep_pattern(&self.base_directory.to_string_lossy().as_ref());
+        let base_directory = escape_pgrep_pattern(&self.base_directory.to_string_lossy());
         let (Some(by_executable), Some(by_directory)) = (
             process_ids_matching(&executable).await,
             process_ids_matching(&base_directory).await,
@@ -1086,7 +1709,7 @@ impl HlsManager {
     /// Uses the cached per-session quota totals when they are fresh and walks the session
     /// directory otherwise, so admitting a playback start never walks every segment on the hot
     /// path. Existing sessions are never evicted: a new start is refused instead.
-    async fn session_bytes_within_global_budget(&self) -> Result<bool, HlsError> {
+    async fn session_bytes_within_global_budget(&self, limit: u64) -> Result<bool, HlsError> {
         let processes = self
             .processes
             .read()
@@ -1104,7 +1727,7 @@ impl HlsManager {
             let bytes = match cached {
                 Some(bytes) => bytes,
                 None => {
-                    let bytes = match session_directory_bytes(&process.directory).await {
+                    let bytes = match session_directory_bytes(&process.directory, limit).await {
                         Ok(bytes) => bytes,
                         // A registered process whose directory is already gone holds no space.
                         Err(HlsError::Io(error))
@@ -1121,7 +1744,7 @@ impl HlsManager {
                 }
             };
             total_bytes = total_bytes.saturating_add(bytes);
-            if total_bytes >= self.max_global_session_bytes {
+            if total_bytes >= limit {
                 return Ok(false);
             }
         }
@@ -1129,25 +1752,28 @@ impl HlsManager {
     }
 
     fn acquire_permit(&self, tier: ServerTier) -> Result<OwnedSemaphorePermit, HlsError> {
-        let semaphore = match tier {
-            ServerTier::Remux | ServerTier::AudioTranscode => &self.remux_slots,
-            ServerTier::HardwareTranscode => {
-                if self.hardware_encoder.is_none() {
-                    return Err(HlsError::Limit);
+        let semaphore = {
+            let slots = self
+                .slots
+                .read()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match tier {
+                ServerTier::Remux | ServerTier::AudioTranscode => Arc::clone(&slots.remux),
+                ServerTier::HardwareTranscode => {
+                    if self.runtime_read().hardware_encoder.is_none() {
+                        return Err(HlsError::Limit);
+                    }
+                    Arc::clone(&slots.hardware)
                 }
-                &self.hardware_slots
+                ServerTier::SoftwareTranscode => Arc::clone(&slots.software),
+                ServerTier::Direct => return Err(HlsError::InvalidAsset),
             }
-            ServerTier::SoftwareTranscode => &self.software_slots,
-            ServerTier::Direct => return Err(HlsError::InvalidAsset),
         };
-        semaphore
-            .clone()
-            .try_acquire_owned()
-            .map_err(|_| HlsError::Limit)
+        semaphore.try_acquire_owned().map_err(|_| HlsError::Limit)
     }
 }
 
-async fn session_directory_bytes(directory: &Path) -> Result<u64, HlsError> {
+async fn session_directory_bytes(directory: &Path, limit: u64) -> Result<u64, HlsError> {
     let directory = directory.to_owned();
     // One blocking hop for the whole walk: per-entry `tokio::fs` calls would schedule a
     // separate blocking task for every segment file on every quota check.
@@ -1157,7 +1783,7 @@ async fn session_directory_bytes(directory: &Path) -> Result<u64, HlsError> {
             let entry = entry?;
             if entry.file_type()?.is_file() {
                 total = total.saturating_add(entry.metadata()?.len());
-                if total > MAX_SESSION_BYTES {
+                if total > limit {
                     break;
                 }
             }
@@ -1418,6 +2044,7 @@ fn ffmpeg_args(
     )
 }
 
+#[cfg(test)]
 fn ffmpeg_args_with_audio(
     input: &Path,
     directory: &Path,
@@ -1436,8 +2063,8 @@ fn ffmpeg_args_with_audio(
         FfmpegTimelineOptions {
             start_time_ticks,
             audio_stream_index,
-            preserve_input_timestamps: false,
         },
+        false,
     )
 }
 
@@ -1460,11 +2087,20 @@ fn ffmpeg_args_with_timeline(
         FfmpegTimelineOptions {
             start_time_ticks,
             audio_stream_index: None,
-            preserve_input_timestamps,
         },
+        preserve_input_timestamps,
     )
 }
 
+#[cfg(test)]
+fn encoding_for(hardware_encoder: Option<&str>) -> FfmpegEncodingOptions {
+    FfmpegEncodingOptions {
+        hardware_encoder: hardware_encoder.map(str::to_owned),
+        ..FfmpegEncodingOptions::default()
+    }
+}
+
+#[cfg(test)]
 fn ffmpeg_args_with_timeline_audio(
     input: &Path,
     directory: &Path,
@@ -1472,12 +2108,14 @@ fn ffmpeg_args_with_timeline_audio(
     hardware_encoder: Option<&str>,
     video_bitrate: Option<i64>,
     timing: FfmpegTimelineOptions,
+    preserve_input_timestamps: bool,
 ) -> Result<Vec<String>, HlsError> {
     let manifest = directory.join("index.m3u8");
+    let encoding = encoding_for(hardware_encoder);
     ffmpeg_args_for_output_with_audio(
         input,
         tier,
-        hardware_encoder,
+        &encoding,
         video_bitrate,
         timing,
         HlsOutput {
@@ -1488,7 +2126,7 @@ fn ffmpeg_args_with_timeline_audio(
                 .to_string_lossy()
                 .into_owned(),
             segment_container: HlsSegmentContainer::FragmentedMp4,
-            preserve_input_timestamps: timing.preserve_input_timestamps,
+            preserve_input_timestamps,
         },
     )
 }
@@ -1503,24 +2141,163 @@ fn ffmpeg_args_for_output(
     start_time_ticks: Option<i64>,
     output: HlsOutput<'_>,
 ) -> Result<Vec<String>, HlsError> {
+    let encoding = encoding_for(hardware_encoder);
     ffmpeg_args_for_output_with_audio(
         input,
         tier,
-        hardware_encoder,
+        &encoding,
         video_bitrate,
         FfmpegTimelineOptions {
             start_time_ticks,
             audio_stream_index: None,
-            preserve_input_timestamps: output.preserve_input_timestamps,
         },
         output,
     )
 }
 
+/// Hardware-specific options that must precede `-i` (device creation, optional hw decode).
+fn hardware_input_options(encoding: &FfmpegEncodingOptions, tier: ServerTier) -> Vec<String> {
+    if tier != ServerTier::HardwareTranscode {
+        return Vec::new();
+    }
+    let Some(encoder) = encoding.hardware_encoder.as_deref() else {
+        return Vec::new();
+    };
+    let device = hardware_device(encoding);
+    let mut args = Vec::new();
+    match encoder {
+        // VAAPI needs an explicit DRM render node before the encoder can see frames.
+        "h264_vaapi" => args.extend(["-vaapi_device".to_owned(), device.clone()]),
+        // QSV initialises a named device that the filter graph uploads into.
+        "h264_qsv" => args.extend([
+            "-init_hw_device".to_owned(),
+            format!("qsv=hw:{device}"),
+            "-filter_hw_device".to_owned(),
+            "hw".to_owned(),
+        ]),
+        _ => {}
+    }
+    if encoding.hardware_decode {
+        match encoder {
+            "h264_vaapi" => args.extend([
+                "-hwaccel".to_owned(),
+                "vaapi".to_owned(),
+                "-hwaccel_device".to_owned(),
+                device,
+            ]),
+            "h264_qsv" => args.extend([
+                "-hwaccel".to_owned(),
+                "qsv".to_owned(),
+                "-hwaccel_device".to_owned(),
+                "hw".to_owned(),
+            ]),
+            "h264_nvenc" => args.extend(["-hwaccel".to_owned(), "cuda".to_owned()]),
+            "h264_videotoolbox" => {
+                args.extend(["-hwaccel".to_owned(), "videotoolbox".to_owned()]);
+            }
+            _ => {}
+        }
+    }
+    args
+}
+
+/// Filter chain for the encoder: scaling for every tier, plus the hardware upload VAAPI/QSV need.
+fn video_filter_chain(encoding: &FfmpegEncodingOptions, tier: ServerTier) -> Option<String> {
+    let scale = (encoding.max_output_height > 0)
+        .then(|| format!("scale=-2:min(ih\\,{})", encoding.max_output_height));
+    if tier != ServerTier::HardwareTranscode {
+        return scale;
+    }
+    let upload = match encoding.hardware_encoder.as_deref() {
+        Some("h264_vaapi") => Some("format=nv12,hwupload".to_owned()),
+        // Upload 8-bit NV12 like VAAPI: QSV rejects RGB/BGRA surfaces, and h264 output is 8-bit.
+        Some("h264_qsv") => Some("format=nv12,hwupload=extra_hw_frames=64,format=qsv".to_owned()),
+        _ => None,
+    };
+    match (scale, upload) {
+        (Some(scale), Some(upload)) => Some(format!("{scale},{upload}")),
+        (Some(scale), None) => Some(scale),
+        (None, Some(upload)) => Some(upload),
+        (None, None) => None,
+    }
+}
+
+/// FFmpeg arguments for the hardware encoder self-test.
+fn hardware_probe_args(encoding: &FfmpegEncodingOptions) -> Vec<String> {
+    let mut args = vec![
+        "-hide_banner".to_owned(),
+        "-loglevel".to_owned(),
+        "error".to_owned(),
+        "-nostdin".to_owned(),
+    ];
+    args.extend(hardware_input_options(
+        encoding,
+        ServerTier::HardwareTranscode,
+    ));
+    args.extend([
+        "-f".to_owned(),
+        "lavfi".to_owned(),
+        "-i".to_owned(),
+        // Decoded video is yuv420p; RGB frames make QSV fail on upload even when it works.
+        "testsrc=size=320x240:rate=30:duration=0.3,format=yuv420p".to_owned(),
+        "-frames:v".to_owned(),
+        "1".to_owned(),
+    ]);
+    if let Some(filter) = video_filter_chain(encoding, ServerTier::HardwareTranscode) {
+        args.extend(["-vf".to_owned(), filter]);
+    }
+    if let Some(encoder) = encoding.hardware_encoder.as_deref() {
+        args.extend(["-c:v".to_owned(), encoder.to_owned()]);
+    }
+    args.extend(["-f".to_owned(), "null".to_owned(), "-".to_owned()]);
+    args
+}
+
+/// Keeps the most useful FFmpeg error lines for the admin UI without dumping the whole log.
+///
+/// FFmpeg ends a failed run with generic "Nothing was written into output file" lines; the real
+/// cause (missing device, driver, permission) comes before them, so those lines are only used
+/// when nothing else was reported.
+fn sanitize_probe_error(stderr: &str) -> String {
+    const GENERIC: [&str; 2] = ["Nothing was written into output file", "Conversion failed!"];
+    let lines: Vec<&str> = stderr
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect();
+    let informative: Vec<&str> = lines
+        .iter()
+        .copied()
+        .filter(|line| !GENERIC.iter().any(|generic| line.contains(generic)))
+        .collect();
+    let chosen = if informative.is_empty() {
+        lines
+    } else {
+        informative
+    };
+    if chosen.is_empty() {
+        return "FFmpeg 未给出错误信息".to_owned();
+    }
+    let tail = &chosen[chosen.len().saturating_sub(3)..];
+    let cleaned: String = tail
+        .join(" | ")
+        .chars()
+        .map(|character| {
+            if character.is_control() {
+                ' '
+            } else {
+                character
+            }
+        })
+        .take(400)
+        .collect();
+    cleaned.trim().to_owned()
+}
+
 fn ffmpeg_args_for_output_with_audio(
     input: &Path,
     tier: ServerTier,
-    hardware_encoder: Option<&str>,
+    encoding: &FfmpegEncodingOptions,
     video_bitrate: Option<i64>,
     timing: FfmpegTimelineOptions,
     output: HlsOutput<'_>,
@@ -1528,7 +2305,7 @@ fn ffmpeg_args_for_output_with_audio(
     if tier == ServerTier::Direct {
         return Err(HlsError::InvalidAsset);
     }
-    if tier == ServerTier::HardwareTranscode && hardware_encoder.is_none() {
+    if tier == ServerTier::HardwareTranscode && encoding.hardware_encoder.is_none() {
         return Err(HlsError::Limit);
     }
     let mut args = vec![
@@ -1536,11 +2313,16 @@ fn ffmpeg_args_for_output_with_audio(
         "-loglevel".to_owned(),
         "warning".to_owned(),
         "-nostdin".to_owned(),
+        // Progress reports are the only stdout consumer: the media goes to segment files, and
+        // the reader task turns these lines into the session's live statistics.
+        "-progress".to_owned(),
+        "pipe:1".to_owned(),
     ];
     let start_time = ffmpeg_start_time(timing.start_time_ticks);
     if let Some(start_time) = start_time.as_ref() {
         args.extend(["-ss".to_owned(), start_time.clone()]);
     }
+    args.extend(hardware_input_options(encoding, tier));
     args.extend([
         "-i".to_owned(),
         input.to_string_lossy().into_owned(),
@@ -1552,6 +2334,7 @@ fn ffmpeg_args_for_output_with_audio(
             .map(|index| format!("0:{index}?"))
             .unwrap_or_else(|| "0:a:0?".to_owned()),
     ]);
+    let audio_bitrate = format!("{}k", (encoding.audio_bitrate / 1_000).max(32));
     match tier {
         ServerTier::Remux => {
             args.extend([
@@ -1568,17 +2351,31 @@ fn ffmpeg_args_for_output_with_audio(
                 "-c:a".to_owned(),
                 "aac".to_owned(),
                 "-b:a".to_owned(),
-                "192k".to_owned(),
+                audio_bitrate,
             ]);
         }
         ServerTier::HardwareTranscode => {
+            let encoder = encoding.hardware_encoder.clone().unwrap_or_default();
+            args.extend(["-c:v".to_owned(), encoder.clone()]);
+            if matches!(encoder.as_str(), "h264_nvenc" | "h264_videotoolbox") {
+                // Normalise 10-bit sources so a hardware H.264 encoder never refuses the input.
+                args.extend(["-pix_fmt".to_owned(), "yuv420p".to_owned()]);
+            }
+            if encoder == "h264_nvenc" {
+                args.extend([
+                    "-preset".to_owned(),
+                    "p4".to_owned(),
+                    "-tune".to_owned(),
+                    "hq".to_owned(),
+                    "-rc".to_owned(),
+                    "vbr".to_owned(),
+                ]);
+            }
             args.extend([
-                "-c:v".to_owned(),
-                hardware_encoder.unwrap_or_default().to_owned(),
                 "-c:a".to_owned(),
                 "aac".to_owned(),
                 "-b:a".to_owned(),
-                "192k".to_owned(),
+                audio_bitrate,
             ]);
         }
         ServerTier::SoftwareTranscode => {
@@ -1586,13 +2383,13 @@ fn ffmpeg_args_for_output_with_audio(
                 "-c:v".to_owned(),
                 "libx264".to_owned(),
                 "-preset".to_owned(),
-                "veryfast".to_owned(),
+                encoding.software_preset.clone(),
                 "-pix_fmt".to_owned(),
                 "yuv420p".to_owned(),
                 "-c:a".to_owned(),
                 "aac".to_owned(),
                 "-b:a".to_owned(),
-                "192k".to_owned(),
+                audio_bitrate,
             ]);
         }
         // Direct play never transcodes; the caller only builds these arguments for transcode
@@ -1602,9 +2399,13 @@ fn ffmpeg_args_for_output_with_audio(
     if matches!(
         tier,
         ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
-    ) && let Some(video_bitrate) = video_bitrate.filter(|value| *value > 0)
-    {
-        args.extend(["-b:v".to_owned(), video_bitrate.to_string()]);
+    ) {
+        if let Some(filter) = video_filter_chain(encoding, tier) {
+            args.extend(["-vf".to_owned(), filter]);
+        }
+        if let Some(video_bitrate) = encoding.effective_video_bitrate(video_bitrate) {
+            args.extend(["-b:v".to_owned(), video_bitrate.to_string()]);
+        }
     }
     if output.preserve_input_timestamps
         && matches!(
@@ -1868,6 +2669,20 @@ fn available_free_bytes(_path: &Path) -> Result<u64, std::io::Error> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn probe_error_prefers_the_cause_over_ffmpeg_closing_lines() {
+        let stderr = "Failed to open VAAPI device /dev/dri/renderD128: Permission denied\n\
+                      [out#0/null @ 0x1] Nothing was written into output file, because at least one of its streams received no packets.\n";
+        let message = sanitize_probe_error(stderr);
+        assert!(message.contains("Permission denied"), "{message}");
+        assert!(!message.contains("Nothing was written"), "{message}");
+        assert_eq!(
+            sanitize_probe_error("Conversion failed!\n"),
+            "Conversion failed!"
+        );
+        assert_eq!(sanitize_probe_error(""), "FFmpeg 未给出错误信息");
+    }
+
     use std::{
         path::{Path, PathBuf},
         sync::Arc,
@@ -1881,7 +2696,7 @@ mod tests {
         SESSION_QUOTA_CACHE_TTL, ServerTier, SessionQuotaCache, asset_segment_number,
         emby_init_segment_number, ffmpeg_args, ffmpeg_args_for_output, ffmpeg_args_with_audio,
         ffmpeg_args_with_timeline, hls_segment_path, hls_start_number, is_valid_asset,
-        vod_manifest,
+        sanitize_probe_error, vod_manifest,
     };
 
     fn fake_process(directory: PathBuf, total_bytes: Option<u64>) -> super::HlsProcess {
@@ -1896,6 +2711,7 @@ mod tests {
                 audio_stream_index: None,
                 emby_vod: false,
                 segment_container: HlsSegmentContainer::MpegTs,
+                encoding: super::FfmpegEncodingOptions::default(),
             },
             state: Mutex::new(super::HlsProcessState {
                 child: None,
@@ -1911,6 +2727,7 @@ mod tests {
                 checked_at: total_bytes.map(|_| Instant::now()),
                 total_bytes: total_bytes.unwrap_or_default(),
             }),
+            progress: Arc::new(Mutex::new(super::HlsProgressSnapshot::default())),
         }
     }
 
@@ -1923,7 +2740,7 @@ mod tests {
                 .with_global_session_budget(1_000);
         assert!(
             manager
-                .session_bytes_within_global_budget()
+                .session_bytes_within_global_budget(manager.runtime_snapshot().global_budget_bytes)
                 .await
                 .expect("empty budget check"),
             "no session directory means no usage"
@@ -1939,7 +2756,7 @@ mod tests {
         );
         assert!(
             manager
-                .session_bytes_within_global_budget()
+                .session_bytes_within_global_budget(manager.runtime_snapshot().global_budget_bytes)
                 .await
                 .expect("stale budget check"),
             "the stale cache must fall back to measuring the directory"
@@ -1964,7 +2781,7 @@ mod tests {
         );
         assert!(
             !manager
-                .session_bytes_within_global_budget()
+                .session_bytes_within_global_budget(manager.runtime_snapshot().global_budget_bytes)
                 .await
                 .expect("over-budget check"),
             "two sessions above the shared budget must refuse another start"
@@ -1977,7 +2794,7 @@ mod tests {
         );
         assert!(
             manager
-                .session_bytes_within_global_budget()
+                .session_bytes_within_global_budget(manager.runtime_snapshot().global_budget_bytes)
                 .await
                 .expect("missing directory check"),
             "a registered session whose directory vanished must not block new starts"
@@ -2221,6 +3038,7 @@ mod tests {
         .unwrap();
         assert!(args.windows(2).any(|pair| pair == ["-c:v", "copy"]));
         assert!(args.windows(2).any(|pair| pair == ["-c:a", "copy"]));
+        assert!(args.windows(2).any(|pair| pair == ["-progress", "pipe:1"]));
         assert!(
             args.windows(2)
                 .any(|pair| pair == ["-hls_segment_type", "fmp4"])
@@ -2902,7 +3720,7 @@ while :; do sleep 1; done
         tokio::fs::set_permissions(&script, permissions)
             .await
             .unwrap();
-        let mut manager = super::HlsManager::new_for_tests(
+        let manager = super::HlsManager::new_for_tests(
             temp_dir.path().join("config"),
             script.to_string_lossy().into_owned(),
         );
@@ -2928,7 +3746,7 @@ while :; do sleep 1; done
             .session_directory("emby-restart-quota")
             .await
             .unwrap();
-        manager.min_free_bytes = u64::MAX;
+        let manager = manager.with_min_free_bytes(u64::MAX);
         assert!(matches!(
             manager
                 .wait_for_asset("emby-restart-quota", "segment_000100.m4s")
@@ -2936,7 +3754,7 @@ while :; do sleep 1; done
             Err(super::HlsError::Limit)
         ));
         assert!(!session_directory.join("generation_000001.m3u8").exists());
-        manager.min_free_bytes = 0;
+        let manager = manager.with_min_free_bytes(0);
 
         let oversized = tokio::fs::File::create(session_directory.join("oversized.tmp"))
             .await
@@ -3037,5 +3855,508 @@ while :; do sleep 1; done
                 .join("config/web-playback/low-space")
                 .exists()
         );
+    }
+
+    #[test]
+    fn ffmpeg_progress_lines_populate_the_snapshot() {
+        let mut snapshot = super::HlsProgressSnapshot {
+            generation: 3,
+            ..super::HlsProgressSnapshot::default()
+        };
+        for line in [
+            "frame=120",
+            "fps=24.00",
+            "bitrate=1234.5kbits/s",
+            "total_size=987654",
+            "out_time_us=5000000",
+            "speed=1.53x",
+            "dup_frames=1",
+            "drop_frames=2",
+            "progress=continue",
+        ] {
+            assert!(snapshot.apply_line(line, 42), "line must be recognized");
+        }
+        assert_eq!(snapshot.generation, 3);
+        assert_eq!(snapshot.frame, Some(120));
+        assert_eq!(snapshot.fps, Some(24.0));
+        assert_eq!(snapshot.bitrate_kbps, Some(1234.5));
+        assert_eq!(snapshot.total_size, Some(987_654));
+        assert_eq!(snapshot.out_time_us, Some(5_000_000));
+        assert_eq!(snapshot.speed, Some(1.53));
+        assert_eq!(snapshot.duplicated_frames, Some(1));
+        assert_eq!(snapshot.dropped_frames, Some(2));
+        assert!(!snapshot.finished);
+        assert_eq!(snapshot.updated_at_ms, 42);
+
+        assert!(snapshot.apply_line("progress=end", 43));
+        assert!(snapshot.finished);
+        assert_eq!(snapshot.updated_at_ms, 43);
+    }
+
+    #[test]
+    fn ffmpeg_progress_ignores_unusable_values() {
+        let mut snapshot = super::HlsProgressSnapshot::default();
+        for line in [
+            "bitrate=N/A",
+            "speed=N/A",
+            "fps=   ",
+            "drop_frames=-1",
+            "out_time_ms=5000000000",
+            "stream_0_0_q=-1.0",
+            "no-equals-sign",
+            "",
+        ] {
+            assert!(!snapshot.apply_line(line, 7), "line must be ignored");
+        }
+        assert_eq!(snapshot, super::HlsProgressSnapshot::default());
+    }
+
+    #[test]
+    fn encoding_options_shape_the_ffmpeg_arguments() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: None,
+            software_preset: "faster".to_owned(),
+            max_output_height: 1_080,
+            audio_bitrate: 256_000,
+            max_video_bitrate: 4_000_000,
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = super::ffmpeg_args_for_output_with_audio(
+            Path::new("movie.mkv"),
+            ServerTier::SoftwareTranscode,
+            &encoding,
+            Some(8_000_000),
+            super::FfmpegTimelineOptions {
+                start_time_ticks: None,
+                audio_stream_index: None,
+            },
+            super::HlsOutput {
+                init_file_name: "init.mp4",
+                manifest: Path::new("session/index.m3u8"),
+                segment_file_name: "session/segment_%06d.m4s".to_owned(),
+                segment_container: HlsSegmentContainer::FragmentedMp4,
+                preserve_input_timestamps: false,
+            },
+        )
+        .unwrap();
+        assert!(args.windows(2).any(|pair| pair == ["-preset", "faster"]));
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vf", "scale=-2:min(ih\\,1080)"])
+        );
+        assert!(args.windows(2).any(|pair| pair == ["-b:a", "256k"]));
+        assert!(
+            args.windows(2).any(|pair| pair == ["-b:v", "4000000"]),
+            "the administrator cap must win over a higher client request"
+        );
+
+        let uncapped = super::FfmpegEncodingOptions {
+            max_output_height: 0,
+            max_video_bitrate: 0,
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = super::ffmpeg_args_for_output_with_audio(
+            Path::new("movie.mkv"),
+            ServerTier::SoftwareTranscode,
+            &uncapped,
+            None,
+            super::FfmpegTimelineOptions {
+                start_time_ticks: None,
+                audio_stream_index: None,
+            },
+            super::HlsOutput {
+                init_file_name: "init.mp4",
+                manifest: Path::new("session/index.m3u8"),
+                segment_file_name: "session/segment_%06d.m4s".to_owned(),
+                segment_container: HlsSegmentContainer::FragmentedMp4,
+                preserve_input_timestamps: false,
+            },
+        )
+        .unwrap();
+        assert!(!args.iter().any(|value| value == "-vf"));
+        assert!(!args.iter().any(|value| value == "-b:v"));
+        assert!(args.windows(2).any(|pair| pair == ["-preset", "veryfast"]));
+    }
+
+    #[test]
+    fn stored_policy_maps_to_runtime_limits() {
+        let settings = crate::application::transcoding::TranscodingSettings {
+            enabled: false,
+            hardware_encoder: crate::application::transcoding::HARDWARE_ENCODER_NONE.to_owned(),
+            software_preset: "fast".to_owned(),
+            session_quota_mb: 0,
+            global_budget_mb: 0,
+            min_free_space_mb: 0,
+            max_video_bitrate_kbps: 4_000,
+            max_output_height: 720,
+            audio_bitrate_kbps: 256,
+            ..crate::application::transcoding::TranscodingSettings::default()
+        };
+        let runtime = super::RuntimeTranscodeConfig::from_settings(&settings);
+        assert!(!runtime.enabled);
+        assert_eq!(runtime.session_quota_bytes, u64::MAX);
+        assert_eq!(runtime.min_free_bytes, 0);
+        assert_eq!(runtime.software_preset, "fast");
+        assert_eq!(runtime.max_video_bitrate, 4_000_000);
+        assert_eq!(runtime.max_output_height, 720);
+        assert_eq!(runtime.audio_bitrate, 256_000);
+        // An operator environment override, when present, stays authoritative.
+        assert_eq!(
+            runtime.hardware_encoder,
+            super::hardware_encoder_from_env(),
+            "NONE in the stored policy must not invent a hardware encoder"
+        );
+    }
+
+    fn hardware_output<'a>(manifest: &'a Path) -> super::HlsOutput<'a> {
+        super::HlsOutput {
+            init_file_name: "init.mp4",
+            manifest,
+            segment_file_name: "session/segment_%06d.m4s".to_owned(),
+            segment_container: HlsSegmentContainer::FragmentedMp4,
+            preserve_input_timestamps: false,
+        }
+    }
+
+    fn hardware_args(encoding: &super::FfmpegEncodingOptions) -> Vec<String> {
+        super::ffmpeg_args_for_output_with_audio(
+            Path::new("movie.mkv"),
+            ServerTier::HardwareTranscode,
+            encoding,
+            None,
+            super::FfmpegTimelineOptions {
+                start_time_ticks: None,
+                audio_stream_index: None,
+            },
+            hardware_output(Path::new("session/index.m3u8")),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn hardware_probe_source_uses_the_pixel_format_of_decoded_video() {
+        // lavfi defaults to RGB frames; QSV rejects those on upload while real yuv420p video
+        // works, so a probe on RGB reports a false negative for a usable encoder.
+        for encoder in ["h264_qsv", "h264_vaapi", "h264_nvenc"] {
+            let encoding = super::FfmpegEncodingOptions {
+                hardware_encoder: Some(encoder.to_owned()),
+                ..super::FfmpegEncodingOptions::default()
+            };
+            let args = super::hardware_probe_args(&encoding);
+            let source = args
+                .windows(2)
+                .find(|pair| pair[0] == "-i")
+                .map(|pair| pair[1].clone())
+                .unwrap_or_default();
+            assert!(
+                source.contains("format=yuv420p"),
+                "{encoder} probe source must be yuv420p: {source}"
+            );
+        }
+    }
+
+    #[test]
+    fn vaapi_arguments_initialise_the_device_and_upload_frames() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_vaapi".to_owned()),
+            hardware_device: "/dev/dri/renderD129".to_owned(),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vaapi_device", "/dev/dri/renderD129"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vf", "format=nv12,hwupload"]),
+            "VAAPI encodes hardware surfaces only: {args:?}"
+        );
+        let device_position = args.iter().position(|arg| arg == "-vaapi_device").unwrap();
+        let input_position = args.iter().position(|arg| arg == "-i").unwrap();
+        assert!(device_position < input_position);
+    }
+
+    #[test]
+    fn qsv_arguments_initialise_a_named_device_and_upload_into_it() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_qsv".to_owned()),
+            hardware_device: "/dev/dri/renderD128".to_owned(),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-init_hw_device", "qsv=hw:/dev/dri/renderD128"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-filter_hw_device", "hw"])
+        );
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vf", "format=nv12,hwupload=extra_hw_frames=64,format=qsv"]),
+            "QSV encodes qsv surfaces only: {args:?}"
+        );
+    }
+
+    #[test]
+    fn nvenc_arguments_use_a_preset_and_normalise_pixel_format() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_nvenc".to_owned()),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(args.windows(2).any(|pair| pair == ["-preset", "p4"]));
+        assert!(args.windows(2).any(|pair| pair == ["-tune", "hq"]));
+        assert!(args.windows(2).any(|pair| pair == ["-rc", "vbr"]));
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+        assert!(!args.iter().any(|arg| arg == "-vaapi_device"));
+    }
+
+    #[test]
+    fn videotoolbox_arguments_normalise_pixel_format() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_videotoolbox".to_owned()),
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(args.windows(2).any(|pair| pair == ["-pix_fmt", "yuv420p"]));
+        assert!(!args.iter().any(|arg| arg == "-vf"));
+    }
+
+    #[test]
+    fn hardware_decode_adds_acceleration_before_the_input() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_nvenc".to_owned()),
+            hardware_decode: true,
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(args.windows(2).any(|pair| pair == ["-hwaccel", "cuda"]));
+        let hwaccel_position = args.iter().position(|arg| arg == "-hwaccel").unwrap();
+        let input_position = args.iter().position(|arg| arg == "-i").unwrap();
+        assert!(hwaccel_position < input_position);
+    }
+
+    #[test]
+    fn scale_combines_with_the_hardware_upload_filter() {
+        let encoding = super::FfmpegEncodingOptions {
+            hardware_encoder: Some("h264_vaapi".to_owned()),
+            max_output_height: 1080,
+            ..super::FfmpegEncodingOptions::default()
+        };
+        let args = hardware_args(&encoding);
+        assert!(
+            args.windows(2)
+                .any(|pair| pair == ["-vf", "scale=-2:min(ih\\,1080),format=nv12,hwupload"]),
+            "{args:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    fn probe_script(directory: &Path, exit_code: i32) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = directory.join(format!("probe-{exit_code}.sh"));
+        std::fs::write(&script, format!("#!/bin/sh\nexit {exit_code}\n")).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    #[tokio::test]
+    async fn cloned_managers_share_slots_runtime_and_probe_state() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            "/usr/bin/true".to_owned(),
+        );
+        let clone = manager.clone();
+        clone.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_videotoolbox".to_owned(),
+            remux_sessions: 0,
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(
+            manager.acquire_permit(ServerTier::Remux).is_err(),
+            "a cloned manager must share the concurrency slots"
+        );
+        assert_eq!(
+            manager.hardware_status().encoder.as_deref(),
+            Some("h264_videotoolbox"),
+            "a cloned manager must share the self-test state"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn hardware_probe_gates_tier_three_availability() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            probe_script(temp_dir.path(), 0)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_videotoolbox".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(
+            !manager.hardware_transcode_available(),
+            "an unchecked encoder must not advertise tier 3"
+        );
+        let status = manager.probe_hardware_encoder().await;
+        assert!(status.available);
+        assert_eq!(status.encoder.as_deref(), Some("h264_videotoolbox"));
+        assert!(status.checked_at_ms > 0);
+        assert!(manager.hardware_transcode_available());
+
+        let failing = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config-failing"),
+            probe_script(temp_dir.path(), 1)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        failing.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_vaapi".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        let status = failing.probe_hardware_encoder().await;
+        assert!(!status.available);
+        assert!(status.error.is_some());
+        assert!(!failing.hardware_transcode_available());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn changing_the_encoder_invalidates_the_previous_probe() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            probe_script(temp_dir.path(), 0)
+                .to_string_lossy()
+                .into_owned(),
+        );
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_videotoolbox".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(manager.probe_hardware_encoder().await.available);
+        assert!(manager.hardware_transcode_available());
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            hardware_encoder: "h264_vaapi".to_owned(),
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(
+            !manager.hardware_transcode_available(),
+            "a new encoder needs its own self-test"
+        );
+    }
+
+    #[tokio::test]
+    async fn applying_a_policy_changes_concurrency_limits_for_new_sessions() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            "/usr/bin/false".to_owned(),
+        );
+        assert!(manager.acquire_permit(ServerTier::Remux).is_ok());
+
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            remux_sessions: 0,
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        assert!(
+            manager.acquire_permit(ServerTier::Remux).is_err(),
+            "a zero session limit disables the tier for new sessions"
+        );
+
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings::default());
+        assert!(manager.acquire_permit(ServerTier::Remux).is_ok());
+    }
+
+    #[tokio::test]
+    async fn a_disabled_policy_refuses_new_hls_processes() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let manager = super::HlsManager::new_for_tests(
+            temp_dir.path().join("config"),
+            "/usr/bin/false".to_owned(),
+        );
+        manager.apply_settings(&crate::application::transcoding::TranscodingSettings {
+            enabled: false,
+            ..crate::application::transcoding::TranscodingSettings::default()
+        });
+        let error = manager
+            .start(
+                "disabled",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, super::HlsError::Limit));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ffmpeg_progress_reaches_the_session_snapshot() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = tempfile::tempdir().unwrap();
+        let script = temp_dir.path().join("fake-ffmpeg");
+        let source = [
+            "#!/bin/sh",
+            "printf 'frame=240\\nfps=24.00\\nbitrate=2048.5kbits/s\\ntotal_size=1048576\\n'",
+            "printf 'out_time_us=10000000\\nspeed=2.00x\\ndup_frames=0\\ndrop_frames=3\\n'",
+            "printf 'progress=end\\n'",
+            "sleep 0.3",
+        ]
+        .join("\n");
+        std::fs::write(&script, source).unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        let manager = super::HlsManager::new_with_limits(
+            temp_dir.path().join("config"),
+            script.to_string_lossy().into_owned(),
+            0,
+        );
+
+        manager
+            .start(
+                "progress",
+                ServerTier::Remux,
+                Path::new("input.mkv"),
+                None,
+                None,
+                None,
+            )
+            .await
+            .unwrap();
+
+        let mut snapshot = None;
+        for _ in 0..200 {
+            snapshot = manager.progress("progress").await;
+            if snapshot.as_ref().is_some_and(|value| value.finished) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        let snapshot = snapshot.expect("progress must be captured");
+        assert_eq!(snapshot.fps, Some(24.0));
+        assert_eq!(snapshot.bitrate_kbps, Some(2048.5));
+        assert_eq!(snapshot.total_size, Some(1_048_576));
+        assert_eq!(snapshot.out_time_us, Some(10_000_000));
+        assert_eq!(snapshot.speed, Some(2.0));
+        assert_eq!(snapshot.dropped_frames, Some(3));
+        assert!(snapshot.finished);
+        assert_eq!(snapshot.generation, 0);
+        assert!(manager.progress("missing-session").await.is_none());
+        let _ = manager.stop("progress").await;
     }
 }

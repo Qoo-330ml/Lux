@@ -3,6 +3,7 @@ import { useEffect, useRef, useState } from "react";
 import type { MediaItem } from "../../lib/api/types";
 import { mediaTitle } from "../home/media-display";
 import "./MediaDeleteDialog.css";
+import { LuxButton } from "../../components/ui";
 
 type MediaDeleteDialogProps = {
   item: MediaItem;
@@ -62,11 +63,11 @@ export function MediaDeleteDialog({ item, onClose, onConfirm, onDeleted }: Media
           <small>{isSeries ? "整部剧下所有季度和分集的视频文件，以及同名的字幕、NFO 和图片旁车文件都会被删除。这个操作无法撤销。" : "视频文件以及同名的字幕、NFO 和图片旁车文件都会被删除。这个操作无法撤销。"}</small>
           {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
           <div className="lux-delete-dialog-actions">
-            <button className="lux-button lux-button-secondary" type="button" disabled={deleting} onClick={onClose}>取消</button>
-            <button className="lux-button lux-button-danger" data-action="delete-confirm" type="button" disabled={deleting} onClick={() => void confirm()}>
+            <LuxButton tone="secondary" type="button" disabled={deleting} onClick={onClose}>取消</LuxButton>
+            <LuxButton tone="danger" data-action="delete-confirm" type="button" disabled={deleting} onClick={() => void confirm()}>
               {deleting ? <LoaderCircle className="lux-spin" size={16} /> : <Trash2 size={16} />}
               {deleting ? "删除中…" : "确认删除"}
-            </button>
+            </LuxButton>
           </div>
         </div>
       </section>

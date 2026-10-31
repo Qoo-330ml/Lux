@@ -7,6 +7,7 @@ import type {
   AdminUserInvitationStatusFilter,
   AdminUserPermissionPreset,
 } from "../../lib/api/types";
+import { LuxButton, LuxSelectField, LuxTextField, LuxTextarea, useLuxConfirm } from "../../components/ui";
 
 const PAGE_SIZE = 20;
 const INVITATION_QUERY_PREFIX = ["admin", "user-invitations"] as const;
@@ -28,6 +29,7 @@ const statusLabels: Record<AdminUserInvitation["status"], string> = {
 };
 
 export function AdminUserInvitationsPanel() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [status, setStatus] = useState<AdminUserInvitationStatusFilter>("all");
@@ -160,8 +162,8 @@ export function AdminUserInvitationsPanel() {
     resend.mutate({ invitationId: invitation.id, idempotencyKey });
   }
 
-  function revokeInvitation(invitation: AdminUserInvitation) {
-    if (!window.confirm(`确定撤销发往 ${invitation.recipientEmail} 的邀请吗？对方将无法使用此邀请链接。`)) return;
+  async function revokeInvitation(invitation: AdminUserInvitation) {
+    if (!(await confirm(`确定撤销发往 ${invitation.recipientEmail} 的邀请吗？对方将无法使用此邀请链接。`))) return;
     setRowMessages((current) => {
       const next = { ...current };
       delete next[invitation.id];
@@ -183,7 +185,7 @@ export function AdminUserInvitationsPanel() {
         <form className="lux-admin-form lux-admin-user-profile-form" aria-label="创建邀请" onSubmit={(event) => void createInvitation(event)}>
           <label>
             邀请邮箱
-            <input
+            <LuxTextField
               aria-label="邀请邮箱"
               type="email"
               autoComplete="email"
@@ -195,7 +197,7 @@ export function AdminUserInvitationsPanel() {
           </label>
           <label>
             角色预设
-            <select
+            <LuxSelectField
               aria-label="邀请角色预设"
               required
               value={presetId}
@@ -206,7 +208,7 @@ export function AdminUserInvitationsPanel() {
               {(presets.data?.presets ?? []).map((preset) => (
                 <option key={preset.id} value={preset.id}>{preset.name}（v{preset.version}）</option>
               ))}
-            </select>
+            </LuxSelectField>
           </label>
           {presets.isPending ? <p className="lux-admin-muted">正在读取角色预设…</p> : null}
           {presets.error ? <p className="lux-error-copy" role="alert">角色预设加载失败：{presets.error.message}</p> : null}
@@ -223,9 +225,9 @@ export function AdminUserInvitationsPanel() {
             : null}
           <p className="lux-admin-muted">邀请创建时会保存该预设当前版本的权限快照，之后修改预设不会改变此邀请。</p>
           <div className="lux-admin-user-profile-actions">
-            <button className="lux-button lux-button-primary" type="submit" disabled={createPending || !selectedPreset || presets.isPending || !!presets.error || mailSettings.isPending}>
+            <LuxButton tone="primary" type="submit" disabled={createPending || !selectedPreset || presets.isPending || !!presets.error || mailSettings.isPending}>
               {createPending ? "创建中…" : "创建邀请"}
-            </button>
+            </LuxButton>
             {createStatus ? <span role="status">{createStatus}</span> : null}
             {createError ? <span role="alert">创建失败：{createError}</span> : null}
           </div>
@@ -235,7 +237,7 @@ export function AdminUserInvitationsPanel() {
             <div className="lux-admin-panel-heading">
               <div><h2>一次性邀请链接</h2><p>此链接只在当前页面内存中保留；离开或刷新后无法恢复，请现在复制或使用邮件重发。</p></div>
             </div>
-            <textarea
+            <LuxTextarea
               ref={linkInput}
               aria-label="一次性邀请链接"
               readOnly
@@ -244,7 +246,7 @@ export function AdminUserInvitationsPanel() {
               onFocus={(event) => event.currentTarget.select()}
             />
             <div className="lux-admin-user-profile-actions">
-              <button className="lux-button lux-button-secondary" type="button" aria-label="复制邀请链接" onClick={() => void copyInvitationLink()}>复制链接</button>
+              <LuxButton tone="secondary" type="button" aria-label="复制邀请链接" onClick={() => void copyInvitationLink()}>复制链接</LuxButton>
               {copyStatus ? <span role="status">{copyStatus}</span> : null}
             </div>
           </div>
@@ -260,9 +262,9 @@ export function AdminUserInvitationsPanel() {
           </div>
           <label className="lux-admin-user-activity-filter">
             邀请状态
-            <select aria-label="邀请状态" value={status} onChange={(event) => { setStatus(event.target.value as AdminUserInvitationStatusFilter); setPage(1); }}>
+            <LuxSelectField aria-label="邀请状态" value={status} onChange={(event) => { setStatus(event.target.value as AdminUserInvitationStatusFilter); setPage(1); }}>
               {statusOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
-            </select>
+            </LuxSelectField>
           </label>
         </div>
         {invitations.isPending ? <p className="lux-admin-muted" role="status">正在读取邀请…</p> : null}
@@ -284,8 +286,7 @@ export function AdminUserInvitationsPanel() {
                     <td>
                       {item.status === "PENDING" ? (
                         <div className="lux-admin-user-profile-actions">
-                          <button
-                            className="lux-button lux-button-secondary lux-button-compact"
+                          <LuxButton tone="secondary" size="compact"
                             type="button"
                             aria-label={`重新发送邀请给 ${item.recipientEmail}`}
                             disabled={resend.isPending || revoke.isPending}
@@ -294,14 +295,13 @@ export function AdminUserInvitationsPanel() {
                             {resend.isPending && resend.variables?.invitationId === item.id
                               ? "发送中…"
                               : resendKeys[item.id] ? "重试发送" : "重新发送"}
-                          </button>
-                          <button
-                            className="lux-button lux-button-secondary lux-button-compact"
+                          </LuxButton>
+                          <LuxButton tone="secondary" size="compact"
                             type="button"
                             aria-label={`撤销发往 ${item.recipientEmail} 的邀请`}
                             disabled={resend.isPending || revoke.isPending}
                             onClick={() => revokeInvitation(item)}
-                          >撤销</button>
+                          >撤销</LuxButton>
                         </div>
                       ) : <span className="lux-admin-muted">—</span>}
                       {rowMessages[item.id] ? (
@@ -319,8 +319,8 @@ export function AdminUserInvitationsPanel() {
         <nav className="lux-admin-user-session-pagination" aria-label="邀请分页">
           <span>第 {page} / {pageCount} 页</span>
           <div>
-            <button className="lux-button lux-button-secondary lux-button-compact" type="button" aria-label="邀请上一页" disabled={page <= 1 || invitations.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</button>
-            <button className="lux-button lux-button-secondary lux-button-compact" type="button" aria-label="邀请下一页" disabled={page >= pageCount || invitations.isFetching} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>下一页</button>
+            <LuxButton tone="secondary" size="compact" type="button" aria-label="邀请上一页" disabled={page <= 1 || invitations.isFetching} onClick={() => setPage((current) => Math.max(1, current - 1))}>上一页</LuxButton>
+            <LuxButton tone="secondary" size="compact" type="button" aria-label="邀请下一页" disabled={page >= pageCount || invitations.isFetching} onClick={() => setPage((current) => Math.min(pageCount, current + 1))}>下一页</LuxButton>
           </div>
         </nav>
       </section>

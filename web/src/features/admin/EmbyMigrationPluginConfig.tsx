@@ -5,6 +5,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import type { AdminPlugin, AdminEmbyMigrationJob, AdminEmbyMigrationScope, AdminEmbyMigrationSourceUser } from "../../lib/api/types";
 import { EmbyMigrationReports, type ReportTab, useMigrationReport } from "./EmbyMigrationReports";
+import { LuxButton, LuxCheckbox, LuxRadio, LuxSwitch, LuxTextField } from "../../components/ui";
 
 type MergePolicy = "MERGE" | "OVERWRITE" | "SKIP";
 type MigrationStep = 1 | 2 | 3;
@@ -114,15 +115,15 @@ export function EmbyMigrationPluginConfig({ plugin }: { plugin: AdminPlugin }) {
             <StepHeading number="1" headingId="emby-plugin-settings-heading" title="连接 Emby" description="先保存并验证来源服务器，成功后才能选择迁移范围。" icon={<ShieldCheck size={18} />} />
             <form className="lux-emby-plugin-settings-form" autoComplete="off" onSubmit={(event) => { event.preventDefault(); saveAndTest.mutate(); }}>
               <div className="lux-emby-connection-fields">
-                {baseUrlField ? <label htmlFor="emby-plugin-base-url">{baseUrlField.label}<input id="emby-plugin-base-url" type="url" required={baseUrlField.required} value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); markConnectionDirty(); }} placeholder="http://emby.local:8096" autoComplete="url" /><small>{baseUrlField.description}</small></label> : null}
-                {apiKeyField ? <label htmlFor="emby-plugin-api-key">{apiKeyField.label}<input id="emby-plugin-api-key" type="password" required={apiKeyField.required && !plugin.configured} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); markConnectionDirty(); }} placeholder="留空保留已保存的 API Key" autoComplete="new-password" /><small>{apiKeyField.description}</small></label> : null}
+                {baseUrlField ? <label htmlFor="emby-plugin-base-url">{baseUrlField.label}<LuxTextField id="emby-plugin-base-url" type="url" required={baseUrlField.required} value={baseUrl} onChange={(event) => { setBaseUrl(event.target.value); markConnectionDirty(); }} placeholder="http://emby.local:8096" autoComplete="url" /><small>{baseUrlField.description}</small></label> : null}
+                {apiKeyField ? <label htmlFor="emby-plugin-api-key">{apiKeyField.label}<LuxTextField id="emby-plugin-api-key" type="password" required={apiKeyField.required && !plugin.configured} value={apiKey} onChange={(event) => { setApiKey(event.target.value); setApiKeyDirty(true); markConnectionDirty(); }} placeholder="留空保留已保存的 API Key" autoComplete="new-password" /><small>{apiKeyField.description}</small></label> : null}
               </div>
-              {privateNetworkField ? <label className="lux-admin-toggle lux-emby-private-toggle"><input type="checkbox" checked={allowPrivateNetwork} onChange={(event) => { setAllowPrivateNetwork(event.target.checked); markConnectionDirty(); }} /><span><strong>{privateNetworkField.label}</strong><small>{privateNetworkField.description}</small></span></label> : null}
+              {privateNetworkField ? <LuxSwitch className="lux-admin-toggle lux-emby-private-toggle" checked={allowPrivateNetwork} onChange={(event) => { setAllowPrivateNetwork(event.target.checked); markConnectionDirty(); }} label=<>{privateNetworkField.label}</> description=<>{privateNetworkField.description}</> /> : null}
               <div className="lux-emby-wizard-actions">
                 <span className="lux-emby-wizard-step-note">第 1 步，共 3 步</span>
-                <button className="lux-button lux-button-primary" type="submit" aria-label="保存并测试 Emby 连接" disabled={saveAndTest.isPending}>
+                <LuxButton tone="primary" type="submit" aria-label="保存并测试 Emby 连接" disabled={saveAndTest.isPending}>
                   <Save size={15} /> {saveAndTest.isPending ? "验证中…" : "保存并测试连接"}
-                </button>
+                </LuxButton>
               </div>
               {connectionDirty ? <span className="lux-emby-unsaved-hint">修改后需要重新保存并测试连接</span> : null}
               {connectionError ? <InlineError message={connectionError} /> : null}
@@ -310,23 +311,20 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
             <>
               <div className="lux-emby-user-selection-toolbar">
                 <span>已选 {selectedUserIds.length} / {sourceUserTotal} 位用户</span>
-                <label className="lux-emby-user-search"><span>搜索用户</span><input type="search" value={sourceUserSearchInput} onChange={(event) => setSourceUserSearchInput(event.target.value)} placeholder="按名称筛选" /></label>
+                <label className="lux-emby-user-search"><span>搜索用户</span><LuxTextField type="search" value={sourceUserSearchInput} onChange={(event) => setSourceUserSearchInput(event.target.value)} placeholder="按名称筛选" /></label>
                 <div>
-                  <button className="lux-button lux-button-secondary" type="button" disabled={users.length === 0 || allVisibleUsersSelected} onClick={() => onSelectedUserIdsChange(Array.from(new Set([...selectedUserIds, ...users.map((user) => user.id)])))}>全选当前页</button>
-                  <button className="lux-button lux-button-secondary" type="button" disabled={selectedUserIds.length === 0} onClick={() => onSelectedUserIdsChange([])}>清空</button>
+                  <LuxButton tone="secondary" type="button" disabled={users.length === 0 || allVisibleUsersSelected} onClick={() => onSelectedUserIdsChange(Array.from(new Set([...selectedUserIds, ...users.map((user) => user.id)])))}>全选当前页</LuxButton>
+                  <LuxButton tone="secondary" type="button" disabled={selectedUserIds.length === 0} onClick={() => onSelectedUserIdsChange([])}>清空</LuxButton>
                 </div>
               </div>
               <div className="lux-emby-user-selection" role="group" aria-labelledby="emby-migration-users-heading">
-                {users.map((user) => <label key={user.id} className="lux-emby-user-option">
-                  <input type="checkbox" checked={selectedUserIds.includes(user.id)} onChange={() => toggleUser(user)} aria-label={`选择 Emby 用户 ${user.name}`} />
-                  <span><strong>{user.name}</strong><small>{user.isDisabled ? "已禁用" : "可用"}{user.isAdministrator ? " · 管理员" : ""}</small></span>
-                </label>)}
+                {users.map((user) => <LuxCheckbox key={user.id} className="lux-emby-user-option" checked={selectedUserIds.includes(user.id)} onChange={() => toggleUser(user)} aria-label={`选择 Emby 用户 ${user.name}`} label=<>{user.name}</> description=<>{user.isDisabled ? "已禁用" : "可用"}{user.isAdministrator ? " · 管理员" : ""}</> />)}
                 {users.length === 0 ? <EmptyState label="没有可迁移的用户" detail="Emby 没有返回用户列表。" /> : null}
               </div>
               {sourceUserPages > 1 ? <div className="lux-emby-pagination" aria-label="Emby 用户分页">
-                <button className="lux-button lux-button-secondary" type="button" disabled={sourceUserPage <= 1} onClick={() => setSourceUserPage((page) => page - 1)}>上一页</button>
+                <LuxButton tone="secondary" type="button" disabled={sourceUserPage <= 1} onClick={() => setSourceUserPage((page) => page - 1)}>上一页</LuxButton>
                 <span>第 {sourceUserPage} / {sourceUserPages} 页</span>
-                <button className="lux-button lux-button-secondary" type="button" disabled={sourceUserPage >= sourceUserPages} onClick={() => setSourceUserPage((page) => page + 1)}>下一页</button>
+                <LuxButton tone="secondary" type="button" disabled={sourceUserPage >= sourceUserPages} onClick={() => setSourceUserPage((page) => page + 1)}>下一页</LuxButton>
               </div> : null}
               <fieldset className="lux-emby-migration-scope">
                 <legend>迁移内容</legend>
@@ -349,10 +347,7 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
                 <legend>目标 Lux 媒体库</legend>
                 <p className="lux-emby-target-library-hint">只会写入勾选媒体库中的状态和访问权限；未勾选的库不会迁移。</p>
                 {targetLibraries.isPending ? <LoadingState label="正在读取 Lux 媒体库…" /> : targetLibraries.error ? <InlineError message={targetLibraries.error.message} /> : enabledTargetLibraries.length ? <div className="lux-emby-scope-options">
-                  {enabledTargetLibraries.map((library) => <label key={library.id} className={`lux-emby-scope-option${selectedTargetLibraryIds.includes(library.id) ? " is-selected" : ""}`}>
-                    <input type="checkbox" aria-label={`选择目标 Lux 媒体库 ${library.name}`} checked={selectedTargetLibraryIds.includes(library.id)} onChange={() => toggleTargetLibrary(library.id)} />
-                    <span><strong>{library.name}</strong><small>{library.kind}</small></span>
-                  </label>)}
+                  {enabledTargetLibraries.map((library) => <LuxCheckbox key={library.id} aria-label={`选择目标 Lux 媒体库 ${library.name}`} checked={selectedTargetLibraryIds.includes(library.id)} onChange={() => toggleTargetLibrary(library.id)} label=<>{library.name}</> description=<>{library.kind}</> />)}
                 </div> : <EmptyState label="没有可用的 Lux 媒体库" detail="请先启用至少一个媒体库，再迁移媒体状态或库权限。" />}
                 {!targetLibraries.isPending && !targetLibraries.error && selectedTargetLibraryIds.length === 0 ? <p className="lux-emby-scope-warning" role="alert">请选择至少一个目标 Lux 媒体库</p> : null}
               </fieldset> : null}
@@ -360,8 +355,8 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
             </>
           )}
           <div className="lux-emby-wizard-actions">
-            <button className="lux-button lux-button-secondary" type="button" onClick={() => onStepChange(1)}>上一步</button>
-            <button className="lux-button lux-button-primary" type="button" aria-label="下一步：确认迁移" disabled={!canAdvance} onClick={() => onStepChange(3)}>下一步：确认迁移</button>
+            <LuxButton tone="secondary" type="button" onClick={() => onStepChange(1)}>上一步</LuxButton>
+            <LuxButton tone="primary" type="button" aria-label="下一步：确认迁移" disabled={!canAdvance} onClick={() => onStepChange(3)}>下一步：确认迁移</LuxButton>
           </div>
         </section>
       ) : (
@@ -385,14 +380,14 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
           <div className="lux-emby-migration-action">
             <div><strong>{selectedUserIds.length > 0 ? `准备迁移 ${selectedUserIds.length} 位用户` : "请返回第二步选择用户"}</strong><span>迁移会在后台运行；媒体数据只会写入已选目标库。</span></div>
             <div className="lux-emby-migration-action-buttons">
-              <button className="lux-button lux-button-secondary" type="button" aria-label="生成 Emby 完整诊断预览" title="完整诊断会读取所选来源数据，但不会写入 Lux 媒体状态" disabled={!canCreate || createJob.isPending} onClick={() => createJob.mutate(true)}><RefreshCw size={15} /> 完整诊断预览</button>
-              <button className="lux-button lux-button-primary" type="button" aria-label="开始 Emby 迁移" disabled={!canCreate || createJob.isPending} onClick={() => createJob.mutate(false)}><CloudDownload size={15} /> {createJob.isPending ? "创建中…" : active ? "迁移进行中" : "开始迁移"}</button>
+              <LuxButton tone="secondary" type="button" aria-label="生成 Emby 完整诊断预览" title="完整诊断会读取所选来源数据，但不会写入 Lux 媒体状态" disabled={!canCreate || createJob.isPending} onClick={() => createJob.mutate(true)}><RefreshCw size={15} /> 完整诊断预览</LuxButton>
+              <LuxButton tone="primary" type="button" aria-label="开始 Emby 迁移" disabled={!canCreate || createJob.isPending} onClick={() => createJob.mutate(false)}><CloudDownload size={15} /> {createJob.isPending ? "创建中…" : active ? "迁移进行中" : "开始迁移"}</LuxButton>
             </div>
           </div>
           {createJob.error ? <InlineError message={createJob.error.message} /> : null}
           {createJob.data ? <p className="lux-emby-migration-success" role="status"><CheckCircle2 size={15} /> {createJob.data.job.dryRun ? "完整诊断任务已创建，可在下方查看报告" : "迁移任务已创建"}</p> : null}
           <div className="lux-emby-wizard-actions">
-            <button className="lux-button lux-button-secondary" type="button" onClick={() => onStepChange(2)}>上一步</button>
+            <LuxButton tone="secondary" type="button" onClick={() => onStepChange(2)}>上一步</LuxButton>
           </div>
         </section>
       )}
@@ -412,7 +407,7 @@ function MigrationWorkspace({ connection, currentStep, onStepChange, selectedUse
 }
 
 function MigrationScopeOption({ checked, onChange, title, detail }: { checked: boolean; onChange: (checked: boolean) => void; title: string; detail: string }) {
-  return <label className={`lux-emby-scope-option${checked ? " is-selected" : ""}`}><input type="checkbox" aria-label={`选择迁移${title}`} checked={checked} onChange={(event) => onChange(event.target.checked)} /><span><strong>{title}</strong><small>{detail}</small></span></label>;
+  return <LuxCheckbox aria-label={`选择迁移${title}`} checked={checked} onChange={(event) => onChange(event.target.checked)} label=<>{title}</> description=<>{detail}</> />;
 }
 
 function selectedScopeLabels(scope: AdminEmbyMigrationScope) {
@@ -435,7 +430,7 @@ function selectedScopeCount(scope: AdminEmbyMigrationScope) {
 }
 
 function MergePolicyOption({ value, selected, onChange, title, detail }: { value: MergePolicy; selected: MergePolicy; onChange: (value: MergePolicy) => void; title: string; detail: string }) {
-  return <label className={`lux-emby-merge-option${selected === value ? " is-selected" : ""}`}><input type="radio" name="emby-merge-policy" value={value} checked={selected === value} onChange={() => onChange(value)} /><span><strong>{title}</strong><small>{detail}</small></span></label>;
+  return <LuxRadio name="emby-merge-policy" value={value} checked={selected === value} onChange={() => onChange(value)} label=<><strong>{title}</strong><small>{detail}</small></> />;
 }
 
 function MigrationDetails({ job, tab, page, onTabChange, onPageChange, onCancel, onRetry, actionPending }: { job: AdminEmbyMigrationJob; tab: ReportTab; page: number; onTabChange: (tab: ReportTab) => void; onPageChange: (page: number) => void; onCancel: () => void; onRetry: () => void; actionPending: boolean }) {
@@ -448,8 +443,8 @@ function MigrationDetails({ job, tab, page, onTabChange, onPageChange, onCancel,
       <div className="lux-emby-detail-heading">
         <div><span className="lux-admin-eyebrow">当前任务</span><h3 id="emby-migration-detail-heading">{job.sourceLabel}</h3><p>{statusLabel(job.status)} · {phaseLabel(job.phase)} · {job.dryRun ? "预览" : "正式迁移"}</p></div>
         <div className="lux-emby-job-actions">
-          {active ? <button className="lux-button lux-button-secondary" type="button" disabled={actionPending || job.cancelRequested} onClick={onCancel}><XCircle size={14} /> {job.cancelRequested ? "取消中…" : "取消"}</button> : null}
-          {job.status === "FAILED" || job.status === "CANCELLED" ? <button className="lux-button lux-button-secondary" type="button" disabled={actionPending} onClick={onRetry}><RefreshCw size={14} /> 重试</button> : null}
+          {active ? <LuxButton tone="secondary" type="button" disabled={actionPending || job.cancelRequested} onClick={onCancel}><XCircle size={14} /> {job.cancelRequested ? "取消中…" : "取消"}</LuxButton> : null}
+          {job.status === "FAILED" || job.status === "CANCELLED" ? <LuxButton tone="secondary" type="button" disabled={actionPending} onClick={onRetry}><RefreshCw size={14} /> 重试</LuxButton> : null}
         </div>
       </div>
       <div className="lux-emby-job-progress" aria-label={`迁移进度 ${progress}%`}>

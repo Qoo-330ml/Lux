@@ -7,6 +7,7 @@ import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUserDetailPage } from "../src/features/admin/AdminUserManagementPage";
 import { ApiError, api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxCombobox } from "./lux-select-helpers";
 import type {
   AdminContentRestrictionIndexStatus,
   AdminUser,
@@ -45,9 +46,9 @@ describe("AdminUserDetailPage content restriction index status", () => {
     expect(indexPanel?.textContent).toContain("尚无分类索引的条目会在受限策略下被服务端按不可见处理");
     expect(indexPanel?.textContent).not.toContain("访问拦截尚未接入");
     expect(indexPanel?.textContent).not.toContain("策略目前不会过滤媒体");
-    const progress = container.querySelector("progress");
-    expect(progress?.value).toBe(6);
-    expect(progress?.max).toBe(8);
+    const progress = container.querySelector("[role='progressbar']");
+    expect(progress?.getAttribute("aria-valuenow")).toBe("6");
+    expect(progress?.getAttribute("aria-valuemax")).toBe("8");
   });
 
   it("keeps saved policy enforcement separate from pending index work", async () => {
@@ -180,8 +181,8 @@ describe("AdminUserDetailPage content restriction policy", () => {
     await waitForPolicyForm();
 
     expect(getPolicy).toHaveBeenCalledWith("user-1");
-    expect(findSelect("分级体系").value).toBe("MPA");
-    expect(findSelect("最高允许等级").value).toBe("");
+    expect(findSelect("分级体系").dataset.value).toBe("MPA");
+    expect(findSelect("最高允许等级").dataset.value).toBe("");
     expect(findCheckbox("允许未分级内容").checked).toBe(true);
     expect(findButton("保存内容限制").disabled).toBe(true);
     expect(container.textContent).toContain("当前没有已保存的限制");
@@ -213,10 +214,10 @@ describe("AdminUserDetailPage content restriction policy", () => {
     await waitForPolicyForm();
 
     await act(async () => {
-      changeSelect(findSelect("分级体系"), "TVPG");
+      await changeSelect(findSelect("分级体系"), "TVPG");
     });
     await act(async () => {
-      changeSelect(findSelect("最高允许等级"), "TV-14");
+      await changeSelect(findSelect("最高允许等级"), "TV-14");
       findCheckbox("允许未分级内容").click();
       changeTextarea(findTextarea("允许标签"), "Animation\nFamily");
       changeTextarea(findTextarea("禁止标签"), "Horror");
@@ -232,8 +233,8 @@ describe("AdminUserDetailPage content restriction policy", () => {
     });
 
     expect(container.textContent).toContain("内容限制已保存。");
-    expect(findSelect("分级体系").value).toBe("TVPG");
-    expect(findSelect("最高允许等级").value).toBe("TV-14");
+    expect(findSelect("分级体系").dataset.value).toBe("TVPG");
+    expect(findSelect("最高允许等级").dataset.value).toBe("TV-14");
     expect(findTextarea("允许标签").value).toBe("animation\nfamily");
     expect(container.textContent).toContain("当前版本 8");
   });
@@ -258,7 +259,7 @@ describe("AdminUserDetailPage content restriction policy", () => {
     await waitForPolicyForm();
 
     await act(async () => {
-      changeSelect(findSelect("最高允许等级"), "PG-13");
+      await changeSelect(findSelect("最高允许等级"), "PG-13");
       findButton("保存内容限制").click();
       await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("其他管理员"));
     });
@@ -266,7 +267,7 @@ describe("AdminUserDetailPage content restriction policy", () => {
 
     await act(async () => {
       findButton("重新读取策略").click();
-      await vi.waitFor(() => expect(findSelect("最高允许等级").value).toBe("R"));
+      await vi.waitFor(() => expect(findSelect("最高允许等级").dataset.value).toBe("R"));
     });
     expect(getPolicy).toHaveBeenCalledTimes(2);
     expect(container.textContent).toContain("当前版本 3");
@@ -332,8 +333,7 @@ describe("AdminUserDetailPage content restriction policy", () => {
   }
 
   function findSelect(label: string) {
-    const select = [...container.querySelectorAll<HTMLSelectElement>("select")]
-      .find((item) => item.getAttribute("aria-label") === label);
+    const select = luxCombobox(container, label);
     expect(select, `select labelled ${label}`).toBeTruthy();
     return select!;
   }
@@ -358,9 +358,9 @@ describe("AdminUserDetailPage content restriction policy", () => {
     return button!;
   }
 
-  function changeSelect(select: HTMLSelectElement, value: string) {
-    select.value = value;
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+  async function changeSelect(select: HTMLElement, value: string) {
+    const label = select.getAttribute("aria-label") ?? "";
+    await chooseLuxOptionByValue(container, label, value);
   }
 
   function changeTextarea(textarea: HTMLTextAreaElement, value: string) {

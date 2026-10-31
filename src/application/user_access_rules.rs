@@ -10,7 +10,6 @@ pub(crate) const MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST: usize = 200;
 /// `Device` and `Client` match identifiers the client asserts in its login request, so they are
 /// advisory: a client that changes its `DeviceId`/`Client` header produces a different identity.
 /// `IpCidr` is evaluated against the trusted-proxy resolver and is the enforceable control.
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum UserAccessBlacklistRuleType {
     Device,
@@ -18,7 +17,6 @@ pub(crate) enum UserAccessBlacklistRuleType {
     IpCidr,
 }
 
-#[allow(dead_code)]
 impl UserAccessBlacklistRuleType {
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
@@ -64,7 +62,6 @@ impl fmt::Display for UserAccessBlacklistRuleValidationError {
 
 impl std::error::Error for UserAccessBlacklistRuleValidationError {}
 
-#[allow(dead_code)]
 pub(crate) fn normalize_user_access_blacklist_value(
     rule_type: UserAccessBlacklistRuleType,
     value: &str,
@@ -127,14 +124,12 @@ pub(crate) fn user_access_blacklist_rule_matches_context(
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct IpCidr {
     network: IpAddr,
     prefix: u8,
 }
 
-#[allow(dead_code)]
 impl IpCidr {
     pub(crate) fn parse(value: &str) -> Result<Self, UserAccessBlacklistRuleValidationError> {
         validate_rule_text(value)?;
@@ -183,7 +178,6 @@ impl IpCidr {
     }
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum TrustedIpResolutionError {
     MalformedForwardedFor,
@@ -191,7 +185,6 @@ pub(crate) enum TrustedIpResolutionError {
     TooManyForwardedHops,
 }
 
-#[allow(dead_code)]
 pub(crate) fn resolve_client_ip_from_trusted_proxies(
     peer: IpAddr,
     forwarded_for_values: &[&str],
@@ -234,14 +227,12 @@ pub(crate) fn resolve_client_ip_from_trusted_proxies(
     Ok(client_ip)
 }
 
-#[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum IpBlacklistEvaluationError {
     TooManyRules,
     InvalidStoredRule,
 }
 
-#[allow(dead_code)]
 pub(crate) fn ip_blacklist_rules_match_address(
     address: IpAddr,
     rules: &[String],
@@ -291,7 +282,6 @@ fn is_trusted_proxy(address: IpAddr, trusted_proxies: &[IpCidr]) -> bool {
         .any(|network| network.contains(address))
 }
 
-#[allow(dead_code)]
 impl fmt::Display for IpCidr {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(formatter, "{}/{}", self.network, self.prefix)

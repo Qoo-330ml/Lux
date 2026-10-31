@@ -4,8 +4,10 @@ import { useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
+import { LuxButton, useLuxConfirm } from "../../components/ui";
 
 export function AdminApiKeyPanel() {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [notice, setNotice] = useState<string | null>(null);
   const apiKey = useQuery({ queryKey: queryKeys.adminApiKey, queryFn: () => api.adminApiKey() });
@@ -42,15 +44,15 @@ export function AdminApiKeyPanel() {
     }
   };
 
-  const rotateKey = () => {
-    if (!currentKey || window.confirm("轮换后所有使用旧 API Key 的脚本都会立即失效，继续吗？")) {
+  const rotateKey = async () => {
+    if (!currentKey || await confirm("轮换后所有使用旧 API Key 的脚本都会立即失效，继续吗？")) {
       setNotice(null);
       rotate.mutate();
     }
   };
 
-  const revokeKey = () => {
-    if (window.confirm("撤销后所有使用该 API Key 的脚本都会立即失效，继续吗？")) {
+  const revokeKey = async () => {
+    if (await confirm("撤销后所有使用该 API Key 的脚本都会立即失效，继续吗？")) {
       setNotice(null);
       revoke.mutate();
     }
@@ -75,21 +77,21 @@ export function AdminApiKeyPanel() {
           <div className="lux-account-api-key-value">
             <code>{currentKey}</code>
             <div className="lux-account-api-key-actions">
-              <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={() => void copyKey()} disabled={busy}>
+              <LuxButton tone="secondary" size="compact" type="button" onClick={() => void copyKey()} disabled={busy}>
                 <Copy size={15} />复制 Key
-              </button>
-              <button className="lux-button lux-button-compact lux-button-secondary" type="button" onClick={rotateKey} disabled={busy}>
+              </LuxButton>
+              <LuxButton tone="secondary" size="compact" type="button" onClick={rotateKey} disabled={busy}>
                 <RefreshCw size={15} />轮换
-              </button>
-              <button className="lux-button lux-button-compact lux-button-danger" type="button" onClick={revokeKey} disabled={busy}>
+              </LuxButton>
+              <LuxButton tone="danger" size="compact" type="button" onClick={revokeKey} disabled={busy}>
                 <Trash2 size={15} />撤销
-              </button>
+              </LuxButton>
             </div>
           </div>
         ) : (
-          <button className="lux-button lux-button-compact lux-button-secondary lux-account-api-key-generate" type="button" onClick={rotateKey} disabled={busy}>
+          <LuxButton tone="secondary" size="compact" className="lux-account-api-key-generate" type="button" onClick={rotateKey} disabled={busy}>
             <KeyRound size={15} />生成共享 API Key
-          </button>
+          </LuxButton>
         )
       ) : null}
       {notice ? <p className="lux-account-notice" role="status">{notice}</p> : null}

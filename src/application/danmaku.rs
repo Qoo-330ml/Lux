@@ -1174,18 +1174,24 @@ async fn safe_danmaku_source_paths(source: &StoredDanmakuSource) -> Result<(Path
     let media_path = fs::canonicalize(root.join(relative))
         .await
         .map_err(|_| ())?;
-    if !media_path.starts_with(&root) {
+    if !media_path.starts_with(&root)
+        && !crate::application::scanner::symlink::path_is_allowed(&root, &media_path)
+    {
         return Err(());
     }
     let sidecar_relative = danmaku_sidecar_path(relative).map_err(|_| ())?;
     let parent = media_path.parent().ok_or(())?.to_path_buf();
-    if !parent.starts_with(&root) {
+    if !parent.starts_with(&root)
+        && !crate::application::scanner::symlink::path_is_allowed(&root, &parent)
+    {
         return Err(());
     }
     let sidecar_name = sidecar_relative.file_name().ok_or(())?.to_owned();
     let sidecar_path = parent.join(sidecar_name);
     if let Ok(canonical_sidecar) = fs::canonicalize(&sidecar_path).await {
-        if !canonical_sidecar.starts_with(&root) {
+        if !canonical_sidecar.starts_with(&root)
+            && !crate::application::scanner::symlink::path_is_allowed(&root, &canonical_sidecar)
+        {
             return Err(());
         }
     }
@@ -1207,7 +1213,9 @@ pub(crate) async fn read_danmaku_sidecar_from_root(
     let sidecar_path = fs::canonicalize(root.join(relative_path))
         .await
         .map_err(|_| ())?;
-    if !sidecar_path.starts_with(&root) {
+    if !sidecar_path.starts_with(&root)
+        && !crate::application::scanner::symlink::path_is_allowed(&root, &sidecar_path)
+    {
         return Err(());
     }
     if !fs::metadata(&sidecar_path).await.map_err(|_| ())?.is_file() {

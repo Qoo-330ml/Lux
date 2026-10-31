@@ -71,10 +71,7 @@ impl Database {
                 .bind(manifest_id)
                 .fetch_optional(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if conflicting_row.is_some() {
                 return Err(StorageError::Conflict(
                     "manifest delta retry disagrees with its persisted baseline".to_owned(),
@@ -118,10 +115,7 @@ impl Database {
                 .fetch_all(&mut **transaction)
                 .await
                 .map(|rows| rows.into_iter().map(|row| row.get("delta_kind")).collect())
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             for kind in &inserted_kinds {
                 let index = match kind.as_str() {
                     "ADD" => 0,

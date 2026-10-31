@@ -2,6 +2,92 @@
 
 本文档记录可重复的基准结果。没有硬件、数据集、命令和提交信息的数字不作为验收证据。
 
+## LUX-857 NFO 外置前后对比方法（待执行）
+
+A/B 方式：在 `ad8bed43^`（内联列）与 `ad8bed43`（缓存表）两个提交上分别
+
+```bash
+CARGO_TARGET_DIR=target-nfo-ab cargo build --release --locked
+python3 scripts/run-api-performance.py --cold-runs 3 --json-out /tmp/nfo-ab-<rev>.json
+```
+
+比较 `databaseBytes`、`walBytes`、`endpoints.detail.p95Ms`。注意夹具本身不含 NFO 载荷，需在夹具里
+补 200 条各 128 KiB 的 NFO 快照（`media_item_nfo_cache` 或旧列）后再跑，否则只能验证“无回归”，不能
+证明体积收益；这一点在 LUX-857 验收记录中必须注明。
+
+## LUX-857 NFO 外置 A/B 实测（2026-10-26，arm64，release）
+
+同一夹具（10k 电影 / 1k 剧集 / 50k 分集，其中 200 条各 128 KiB NFO 快照），分别在
+`46ba0128`（内联列）与 `ad8bed43`（缓存表）上构建 release 并运行
+`scripts/run-api-performance.py --nfo-items 200 --nfo-bytes 131072`：
+
+| 指标 | before（内联列） | after（缓存表） | 变化 |
+|---|---:|---:|---:|
+| detail p50 | 1.82 ms | 1.80 ms | ≈0 |
+| detail p95 | 2.90 ms | 2.30 ms | **−21%** |
+| home p95 | 113.4 ms | 121.6 ms | 噪声范围内 |
+| search p95 | 67.3 ms | 67.1 ms | ≈0 |
+| 数据库文件 | 331.3 MB | 331.4 MB | 持平（载荷搬家，未删除） |
+| 空闲 WAL | 4,152 B | 4,152 B | 持平 |
+| 更新 200 行的 WAL 增量 | 4,569,112 B | 3,798,672 B | **−17%** |
+
+结论：详情读取的 p95 明显下降；WAL 写放大在“只改小字段”的更新上下降 17%。数据库文件持平是预期
+的——载荷从 `media_items` 搬到 `media_item_nfo_cache`，只有删除旧列并 VACUUM 后才会释放空间；
+升级库在写入时把旧列置 NULL，后续版本可安全删列。以上为单次 ARM64 本地测量，不外推到 NAS/x86。
+
+## LUX-855 / LUX-861 规格夹具端点基线（2026-10-26，已修正）
+
+本机 `arm64`（macOS），release `luxd`，固定夹具由 `tools/catalog-fixture/generate.py --spec-target`
+生成：10,000 电影 / 1,000 剧集 / 5,000 季 / 50,000 集 = 66,000 条目，132,000 图片行、66,000 源、
+6,000 轨道、2,000 用户状态、5,000 演职员；`contentSha256=21c1f40b…3186`；数据库 297,619,456 B，
+种子 7.35 s。命令：
+
+```bash
+python3 scripts/run-api-performance.py --binary target/release/luxd \
+  --work-dir /tmp/lux-api-perf-full --requests 15 --warmup 3 \
+  --json-out /tmp/lux-api-baseline.json
+```
+
+脚本先启动一次 `luxd` 让 sqlx 建库，再写夹具、把本地元数据回填标记为 `COMPLETED`、执行 `ANALYZE`
+并 checkpoint WAL，最后启动服务测量。
+
+| 端点 | p50 ms | p95 ms | p99 ms | 平均字节 |
+|---|---:|---:|---:|---:|
+| `GET /api/v1/home` | 111.7 | 117.6 | 117.6 | 93,491 |
+| `GET /api/v1/libraries/{id}/items?pageSize=24&count=false` | 2.2 | 2.4 | 2.4 | 47,761 |
+| `GET /api/v1/libraries/{id}/items?pageSize=24&count=true` | 2.0 | 2.3 | 2.3 | 47,775 |
+| `GET /api/v1/search?q=Spec&pageSize=24` | 66.2 | 67.7 | 67.7 | 47,847 |
+| `GET /api/v1/items/{id}` | 1.6 | 2.0 | 2.0 | 2,034 |
+| `GET /api/v1/continue-watching?pageSize=24` | 11.9 | 12.1 | 12.1 | 40,324 |
+
+冷启动首个 `/api/v1/home`（3 次独立进程重启）：181.3 / 140.5 / 147.3 ms，**p95 = 181.3 ms**，
+均 200、93,491 B。进程 CPU 增量 75.8 ms/请求（仍含后台 worker，只作量级参考）。
+
+### 为什么先前的数字不可用
+
+第一次运行没有执行 `ANALYZE`：SQLite 没有 `sqlite_stat1` 时按固定选择率估算，`latest_by_library`
+与 `continue_watching` 退化为逐父项扫描全部分集。当时记录到冷启动首个 home 超过 90 s（更早一轮
+240 s）、`latest_by_library` 92.5 s，后端日志显示首次启动时维护任务要等 `metadata_write` 写锁约
+2 分钟才完成 `ANALYZE`。同一数据库补跑 `ANALYZE`（66k 条目耗时 1.2 s）后，冷启动 home 变为
+185 ms，热路径也同步恢复到毫秒级。**上表是统计信息存在后的正确基线；旧数字只说明缺统计信息的后果。**
+
+### 产品修复（LUX-861）
+
+- 扫描后处理成功完成后，后台触发一次全量统计刷新（`refresh_query_statistics_after_bulk_change`），
+  不再等 15 分钟周期或首次启动的 120 s 延迟。
+- 周期统计刷新的首次延迟从 120 s 降到 10 s；周期刷新与批量刷新共用 `sqlite_statistics` 写锁，
+  扫描仍占用数据库时返回 `SkippedBusy`。
+- 写锁守卫现在会记录超过 1 s 的持有事件（`operation`、调用点、`held_ms`），不记录 SQL、路径或参数。
+  本轮 5 次启动的日志中超过 1 s 的持有事件为 0，维护任务未被阻塞。
+- 增量扫描只在新增条目 ≥500 时触发统计刷新，避免实时监听的小批量扫描反复全量 `ANALYZE`。
+
+### 限制
+
+- 数字只代表本机 arm64 / 单进程 / 临时目录，不代表 NAS/x86_64 或真实弱网。
+- 未导入 PostgreSQL、未做扫描并发、未测 RSS；图片复用海报池，媒体文件不存在。
+- 冷启动 p95 来自同机连续 3 次进程重启；不含 OS 页缓存清空，也不代表断电恢复后的首次读取。
+- 搜索 67.7 ms、首页 117.6 ms 均低于规格 500 / 400 ms，但这是 66k 夹具，不是生产媒体库。
+
 ## LUX-829–839 总览（2026-10-21）
 
 同一 1,000,000 条夹具、release `luxd`、20 Mbps / 40 ms、每轮重启服务的冷启动序列：
@@ -2537,3 +2623,598 @@ PostgreSQL 16.15 运行在同机 Docker；**没有在 x86_64 或 NAS 上验证�
 指针映射维护把提速全部抵消。因此该模式改为 opt-in（`LUX_SQLITE_AUTO_VACUUM=incremental`），
 默认保持关闭；默认路径下空闲页仍只能由整库 `VACUUM` 回收，其超时由
 `LUX_SQLITE_VACUUM_TIMEOUT_SECONDS` 控制（默认 120 秒）。
+
+### 按表集合删除子行（借鉴 Jellyfin）
+
+同一 502 行/剧夹具、同一批大小（500）：
+
+| 后端 | 逐行级联 | 每表一条集合删除 | 结论 |
+|---|---:|---:|---|
+| SQLite（4,016,000 行） | 37.96 s | **25.15 s** | 快 1.5×，整体从 65.74 s 降到 25.15 s（2.6×） |
+| PostgreSQL（1,004,000 行） | **5.69 s** | 8.29 s | 慢 1.46×，不采用 |
+
+SQLite 在删除前按「media_sources 的子表 → media_sources → media_items 的其余子表」顺序执行 37 条
+`DELETE … WHERE col IN (SELECT … LIMIT ?)`，把每行一次的级联查找换成每批固定条数的语句。
+PostgreSQL 的级联触发器本来就是每行一次索引探查，额外 37 条语句反而要重复扫描批次选择集，因此
+PostgreSQL 保留级联路径。外键两种路径都保持开启：清单漏表时仍由级联兜底。
+`media_item_child_delete_list_covers_every_cascade_edge` 从 live schema 枚举所有 CASCADE 边做覆盖断言，
+本实现落地时它立刻发现了此前遗漏的 `media_merge_records` 两条边。
+
+## 继续观看读模型 A/B（LUX-867，2026-10-27）
+
+同一 66k 夹具（10k 电影 / 1k 剧集 / 50k 集、2,000 条用户进度）、arm64 release、`pageSize=24`，
+`off` 与 `on` 两个进程各取 40 次请求（前 5 次预热）：
+
+| 端点 | 模式 | p50 | p95 | 响应字节 |
+|---|---|---:|---:|---:|
+| `/api/v1/continue-watching` | `off` | 13.14 ms | 18.91 ms | 40,324 |
+| `/api/v1/continue-watching` | `on` | 8.44 ms | 10.21 ms | 40,324 |
+| `/api/v1/home` | `off` | 111.04 ms | 114.96 ms | 93,909 |
+| `/api/v1/home` | `on` | 117.48 ms | 164.12 ms | 93,909 |
+
+两侧继续观看响应 sha256 相同（逐字节一致），首页响应也一致。`LUX_READ_MODEL_MODE=shadow` 下请求
+首页、继续观看第 1/2 页与 `pageSize=100`，`continue watching shadow * differs` 计数为 0。
+本机为 macOS arm64，不能据此外推 NAS/x86_64；首页 p95 的单次波动不代表回归。
+
+## 首页最近添加读模型 A/B（LUX-868，2026-10-27）
+
+同一 66k 夹具、arm64 release、`/api/v1/home` 各 15 次请求（前 3 次预热）：
+
+| 模式 | p50 | p95 | 响应字节 |
+|---|---:|---:|---:|
+| `off` | 109.05 ms | 122.20 ms | 93,909 |
+| `on` | 82.54 ms | 86.69 ms | 93,909 |
+
+两侧首页响应 sha256 相同；`LUX_READ_MODEL_MODE=shadow` 下首页与库列表请求的
+`recently added shadow * differs` 计数为 0。首版用 `library_id IN (...)` 排序时 `on` 反而慢约
+50 ms（跨库临时排序），改成每库有界子查询后回到上表。按库最新 rail 仍是权威查询，未计入本表。
+
+## 首页按库最新 rail A/B（LUX-868，2026-10-27）
+
+在最近添加 rail 已切换的基础上，再切按库最新 rail（同一 66k 夹具、arm64 release）：
+
+| 模式 | 首页 p50 | 首页 p95 | 响应字节 |
+|---|---:|---:|---:|
+| `off` | 111.55 ms | 115.04 ms | 93,909 |
+| `on` | 105.01 ms | 113.30 ms | 93,909 |
+
+两模式响应 sha256 相同，`shadow` 差异告警 0。该 rail 的排序键 `latest_added_at`
+（剧集取可用分集的最新入库时间）无法命中索引，读模型在这一规模没有收益：只切最近添加 rail 时
+`on` 的首页 p95 是 86.7 ms。要拿到收益，需把该排序键物化为列并建
+`(library_id, latest_added_at DESC, item_id)` 索引后再复测。
+
+## 首页按库最新 rail 排序键物化（LUX-868，2026-10-27）
+
+`latest_added_at` 物化成 `catalog_items` 的列并建 `(library_id, latest_added_at DESC, item_id)` 索引后：
+
+```text
+|--SEARCH ci USING INDEX idx_catalog_items_latest_added (library_id=?)
+`--USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+```
+
+即排序前缀走索引，只有 `latest_added_at` 相同的行需要临时排序。
+
+延迟数字本轮不作为结论：同一份构建在会话后段连续复测时，首页 p95 从 86.7 ms 漂到 113.3 ms 再到
+146.7 ms（`off` 也在 115 ms 上下波动），release 构建耗时同样逐次上升，判断为本机负载/散热噪声。
+要给出可信的 `off` vs `on` 收益，需要交错、多轮、同一状态下的复测（例如 off/on 各 3 轮交替取中位数）。
+
+### 可复现的 off/on A/B
+
+`scripts/compare-read-model-modes.py --work-dir <夹具目录> --rounds 3` 会复制夹具、清掉夹具自带的派生行、
+等两个读模型回填完成后，按 off/on 交替跑多轮并给每端点的 p50/p95 中位数和逐字节一致性。
+
+本轮用它确认了两件事：
+
+- 夹具里残留的旧派生行会让 `on` 被“信任”而返回旧内容（同一夹具首跑时继续观看 40,324 B vs 40,180 B）；
+  清掉派生行并重建后，首页/继续观看/库列表在两种模式下都逐字节一致。
+- 单轮数字仍会漂移（首页 p95 `off` 122 / `on` 153 ms，继续观看 `on` 反而更快 8.9 vs 12.9 ms），
+  需要 `--rounds 3` 以上的中位数才有判别力；分段耗时（`stage = "latest_by_library"` 等）需要
+  `RUST_LOG=debug` 才可见。
+
+### 两轮交错复测（2026-10-27，读数可信）
+
+`scripts/compare-read-model-modes.py --rounds 2 --requests 10`，每模式 2 轮、每轮 10 次请求：
+
+| 端点 | `off` p50/p95 | `on` p50/p95 | 逐字节一致 |
+|---|---:|---:|---|
+| `/api/v1/home` | 115.98 / 126.68 ms（p95 122.3–131.0） | 153.63 / 155.82 ms（p95 154.7–156.9） | ✅ 93,909 B |
+| `/api/v1/continue-watching` | 11.28 / 11.73 ms | 8.85 / 9.11 ms | ✅ 40,324 B |
+| `/api/v1/libraries` | 2.18 / 2.78 ms | 1.91 / 2.51 ms | ✅ 249 B |
+
+两轮区间不重叠，说明首页 `on` 慢约 38 ms 是可复现的，不是噪声；继续观看与库列表小幅变快。
+结论：**`on` 在首页仍净亏，必须保持默认关闭**；下一步要用 `RUST_LOG=debug` 抓
+`stage = "recently_added"` / `"latest_by_library"` 的耗时，定位这 38 ms 落在哪个 rail，再决定修查询
+还是回退该 rail 的切换。
+
+### 首页分段耗时（`RUST_LOG=debug`，单轮 9 个请求的中位数）
+
+| rail | `off` | `on` |
+|---|---:|---:|
+| `recently_added` | 104 ms | **150 ms** |
+| `latest_by_library` | 81 ms | **12 ms** |
+| `continue_watching` | 42 ms | **20 ms** |
+| `libraries` | 0 ms | 0 ms |
+
+定位结论：首页 `on` 的净亏来自 **`recently_added` rail 的读模型查询（+46 ms）**，它抵消了
+`latest_by_library`（−69 ms）和 `continue_watching`（−22 ms）的收益。该 rail 的读模型实现每次都要
+`COUNT(*)` 配合“可用条目 ∪ 无源容器”的大 OR 谓词，`catalog_items` 上这份计数没有可用索引，退化成
+整表扫描；权威查询的计数走的是 `media_items` 上的分区索引。
+
+下一步（按收益排序）：
+
+1. 把该 rail 的计数拆成两条可走索引的计数（可用条目一条、无源容器一条），或改为从
+   `catalog_item_stats` 取近似值之前先验证一致性；
+2. 修好后重跑 `--rounds 2`，预期首页 `on` 由 155.8 ms 降到 110 ms 左右；
+3. 保留 `latest_by_library` 的读模型切换——它是当前收益最大的一项（81 → 12 ms）。
+
+### 修复：两段索引计数 + 排序索引（2026-10-27）
+
+分段日志只指出“哪一段慢”，没有指出“哪条 SQL 慢”。直接在夹具上逐条计时（`sqlite3`，66k
+`catalog_items`、3 个库）后，`recently_added` rail 上有两个独立问题：
+
+| 语句 | 修复前 | 根因 | 修复后 |
+|---|---:|---|---:|
+| 总数（单条大 OR） | 56 ms | `OR` 谓词让 SQLite 用 `idx_catalog_items_recent` 逐行回表 | — |
+| 总数：可用条目分支 | — | — | **2.3 ms**（`idx_catalog_items_visibility` 覆盖索引） |
+| 总数：无源容器分支 | — | — | **0.02 ms**（只碰无源容器） |
+| 页查询（每库有界子查询） | 67 ms | 排序键缺 `sort_title`，每库先全量排序再 `LIMIT` | **0.12 ms**（`idx_catalog_items_recent_sort` 走索引序） |
+
+改动：
+
+1. `0235_catalog_items_visibility_index.sql` / PostgreSQL `0237_…`：`(library_id,
+   has_available_source, removed_at, merged_into, item_type)` 覆盖索引；
+2. `0236_catalog_items_recent_sort_index.sql` / PostgreSQL `0238_…`：`(library_id,
+   effective_added_at DESC, sort_title, item_id)`，与页查询的 `ORDER BY` 逐列同向；
+3. `list_recent_read_model_ids` 的计数拆成权威查询同构的两段（可并有界），并与页查询并发执行。
+
+页查询的 67 ms 有一个反直觉点：**首版在 66k 上测到 0.1 ms 只是因为当时没有竞争索引**。
+`latest_added_at` 物化索引上线后，规划器改用它扫整库再临时排序；也就是说这项其实是 LUX-868
+自己引入的回归，靠加排序索引修掉，而不是靠“当时测过”。
+
+### 修复后复测（2026-10-27，`--rounds 2 --requests 10`，读数可信）
+
+| 端点 | `off` p50/p95 | `on` p50/p95 | 逐字节一致 |
+|---|---:|---:|---|
+| `/api/v1/home` | 105.49 / **118.05** ms（p95 110.8–125.3） | 14.08 / **16.58** ms（p95 16.2–16.9） | ✅ 93,909 B |
+| `/api/v1/continue-watching` | 9.56 / 9.97 ms | 8.10 / 9.83 ms | ✅ 40,324 B |
+| `/api/v1/libraries` | 2.05 / 2.47 ms | 1.96 / 4.18 ms | ✅ 249 B |
+
+两模式 p95 区间不重叠（`off` 110.8–125.3 vs `on` 16.2–16.9），首页 `on` 从“净亏 38 ms”变为
+**净赚约 101 ms**（−86%）。库列表 p95 在 `on` 侧反而高 1.7 ms，属于 249 B 小响应上的调度噪声
+（p50 两侧相同 1.96/2.05 ms），不作为回归。
+
+分段耗时同口径（`RUST_LOG=debug`，每模式 10 个请求中位数）：
+
+| rail | `off` | `on` |
+|---|---:|---:|
+| `recently_added` | 104.5 ms | **5.0 ms** |
+| `latest_by_library` | 79.5 ms | **7.0 ms** |
+| `continue_watching` | 44.0 ms | **11.0 ms** |
+| `libraries` | 0 ms | 0 ms |
+
+结论：首页 `on` 的三条 rail 全部变快，`on` 不再是净亏；默认仍保持 `off`，由项目所有者决定
+何时开启。本机为 macOS arm64，不能据此外推到 NAS/x86_64。
+
+## 搜索延迟（LUX-869，2026-10-27）
+
+66k 夹具（`media_items` 66,000；其中 10k 电影标题改为中文以便覆盖 CJK 查询），arm64 release，
+`/api/v1/search`，每例 12 次请求去掉前 2 次预热后取 p95：
+
+| 查询 | p95 | 命中总数 |
+|---|---:|---:|
+| 中文 2 字（`银河`） | 15.9 ms | 1000 |
+| 中文 4 字（`银河护卫`） | 23.7 ms | 1000 |
+| 中文整词（`银河护卫队`） | 11.7 ms | 1000 |
+| 拉丁词元（`Spec`，经 FTS 命中 5.6 万行） | 106.6 ms | 1000 |
+| 拉丁双词（`Spec Movie`） | 19.1 ms | 0 |
+| 拉丁子串（`ec Mov`） | 17.5 ms | 0 |
+| 无结果 | 18.3 ms | 0 |
+
+全部远低于 500 ms 目标。拉丁词元一例的 106 ms 来自 `COUNT(*) OVER()` 对 5.6 万命中行的计数，
+不是索引缺失；如果之后要做搜索分页的总数优化，先从这里下手。
+
+备选 trigram 索引的评估（同夹具）：FTS5 `tokenize='trigram'` 建表 862 ms、数据库 +9.4 MB，
+3–6 字中文 `MATCH` 1.6–1.8 ms（LIKE 全表 6.5–7.8 ms），但 1–2 字查询无法命中，且要在每次媒体
+写入时多维护一份 FTS 索引，本轮不采纳（详见 `docs/LUX-DEVELOPMENT.md` LUX-869 段）。
+
+## 扫描并发下的首页 p95 比值（LUX-868，2026-10-27）
+
+66k 夹具本身只有数据库行（`library_roots` 指向不存在的路径），直接扫描会把全部条目标记为缺失，
+因此脚本新增 `--scan-libraries/--scan-files`：在读数前种 3 个真实文件库（各 1,000 个 4 字节
+`.mkv`），先完成一次扫描落库并重建读模型，随后每轮测量前对 3 个库各触发一次重扫（重扫只重新走路，
+内容不变，因此两模式的响应仍逐字节可比）。
+
+夹具因此变成 69,000 条目、6 个库，首页 124,992 B。`--rounds 2 --requests 12`：
+
+| 场景 | `off` p50/p95 | `on` p50/p95 | p95 比值 | 逐字节一致 |
+|---|---:|---:|---:|---|
+| 无扫描 | 295.97 / **357.89** ms | 45.92 / **57.39** ms | 0.16 | ✅ |
+| 3 库重扫进行中 | 356.87 / **476.16** ms | 55.93 / **85.94** ms | 0.18 | ✅ |
+
+继续观看（`off` 35.28 / `on` 37.75 ms p95）与库列表（5.52 / 6.17 ms）在扫描期间基本持平。
+
+结论：
+
+1. 读模型把首页 p95 从 358–476 ms 压到 57–86 ms，扫描并发下比值没有被拉大（0.16 → 0.18），
+   即收益不是靠“少干活”换来的，而是靠索引路径更短；
+2. 扫描期间旧路径（`off`）已经越过 400 ms 目标，而 `on` 仍远低于目标，这是开启 `on` 的最强
+   论据；是否开启仍由项目所有者决定；
+3. 新增的 3 个库让基线本身变慢（118 → 358 ms），说明首页成本随库数量线性增长的是旧路径的
+   `latest_by_library` 与 `recently_added` 两段；`on` 侧 16.6 → 57.4 ms 的增长来自同两条 rail 的
+   行组装（每库都有新条目），仍是数量级更小的绝对量。
+
+## 扫描写入基准（W4，2026-10-28）
+
+`scripts/run-scan-write-bench.py`：从既有夹具复制一份，清空目录行，种 6,000 个真实文件后跑一次整库
+扫描；WAL 用 10 ms 采样累计（`wal_appended`）并记录峰值。`--legacy-search-triggers` 会在迁移之后把
+搜索触发器换回 W4 之前的“写事务内维护 FTS”版本，用于同夹具对比。
+
+| 配置 | 扫描墙钟 | 队列排空 | WAL 累计 | WAL 峰值 | FTS 行 | 结果 |
+|---|---:|---:|---:|---:|---:|---|
+| 旧：写事务内维护 FTS | 0.42 s | — | 11.5 MiB | 11.5 MiB | 6,000 | 基线 |
+| 新：入队 + 消费者 | **0.37 s** | 0.54 s | **11.0 MiB** | 11.0 MiB | 6,000 | 墙钟 −12%，WAL −4% |
+
+对照 W4 验收（扫描墙钟 +≤5%、WAL +≤10%）两项都在范围内；FTS 行数与旧路径一致（6,000），
+`catalog_outbox` 在扫描结束后归零，水位推进到 6,000。
+
+SQL 级补充（同一夹具，5,000 次标题更新，`synchronous=NORMAL`）：
+
+| 触发器 | 时间 | WAL 增量 |
+|---|---:|---:|
+| 写事务内维护 FTS | 145 ms | 7,350 KiB |
+| 入队（W4） | **69 ms** | **6,767 KiB** |
+| 无搜索触发器（下限） | 56 ms | 6,353 KiB |
+
+即搜索触发器的开销从 89 ms 降到 13 ms（−85%），单条 WAL 从约 2.0 KiB 降到 0.08 KiB。注意派生工作
+总量没有减少（消费者仍要写 6,000 行 FTS），收益在于不再在扫描的写事务里做、且改成每批一次事务。
+
+### 派生写池 `synchronous` 实验（W4，结论：不采纳）
+
+同一夹具、同一批 6,000 条搜索重建事件、每批 500 条提交：
+
+| `synchronous` | 6,000 行重建耗时（3 次最优） |
+|---|---:|
+| `FULL`（当前） | 187 ms |
+| `NORMAL`（独立派生池的前提） | 199 ms |
+
+批量提交已经把 fsync 次数压到 12 次/6k 行，独立派生池没有可测收益；两个池同库还会带来锁竞争和
+“运行中禁止 schema 变更”的运维约束，因此保持单池。断电恢复证据也因此不需要补做。
+
+## 响应字节与压缩（W5，2026-10-28）
+
+66k 夹具，同一台机器；gzip 由 `tower-http` 的 `CompressionLayer` 只对 `application/json` 生效：
+
+| 端点 | 原始字节 | gzip 字节 | 占比 |
+|---|---:|---:|---:|
+| `/api/v1/home` | 92,674 | **8,308** | 9.0% |
+| `/api/v1/continue-watching?pageSize=24` | 40,324 | 4,982 | 12.4% |
+| `/api/v1/search?q=Spec` | 99,614 | 7,002 | 7.0% |
+| 库列表 `pageSize=50` | 99,464 | 6,993 | 7.0% |
+| `/api/v1/libraries?pageSize=100` | 249 | 194 | 77.9% |
+
+压缩 CPU 成本约 0.12 ms/60 KB（zlib level 6）。JSON 响应同时带强 ETag 与
+`Cache-Control: private, no-cache`，二次访问命中 `If-None-Match` 时返回 304 且不传 body。
+
+## CPU / 请求基线（W5，2026-10-28）
+
+`scripts/run-api-cpu-bench.py` 采样服务进程的累计 CPU 时间（user+sys），围绕固定次数顺序请求计算
+每请求 CPU；同时给出每请求墙钟，避免把 CPU 收益和延迟收益混淆。66k 夹具、arm64 release、
+`LUX_READ_MODEL_MODE=off`、每端点 150 次请求（先预热 20 次）：
+
+| 端点 | CPU/请求 | 墙钟/请求 |
+|---|---:|---:|
+| `/api/v1/home` | 277.5 ms | 107.0 ms |
+| `/api/v1/search?q=Spec%20Movie` | 21.3 ms | 21.2 ms |
+| 库列表 `pageSize=50` | 2.1 ms | 2.5 ms |
+| `/api/v1/continue-watching?pageSize=24` | 9.3 ms | 9.7 ms |
+| `/api/v1/libraries?pageSize=100` | 1.3 ms | 1.8 ms |
+
+观察：
+
+- 首页 CPU 远高于墙钟，说明 `off` 模式下多条 rail 的查询在不同线程上并行燃烧 CPU；这正是读模型
+  （`on`）要消除的部分，`on` 侧的数据在 W3 段。
+- 搜索的 21 ms CPU 不在 DTO 装配里：把装配阶段的逐条深克隆改成取得所有权后，CPU 没有变化
+  （21.3 → 21.8 ms，噪声内），说明成本在"匹配 5.6 万行 + 计算总数 + 排序"这条查询上。
+- 库列表与库入口的 CPU 已经很低（1–2 ms），继续压的空间有限。
+
+## 测量模板与回退门（W0/W5 收口）
+
+固定夹具（`scripts/run-api-performance.py` 生成，`tools/catalog-fixture/generate.py` 为生成器）：
+
+| 项 | 值 |
+|---|---|
+| 规模 | 10,000 电影 / 1,000 剧集 / 50,000 集（66,000 `media_items`；`catalog_items` 同数量） |
+| 用户状态 | 2,000 条 `user_item_state`，40 条继续观看 |
+| 库 | 3 个（2 个内容库 + 合集库）；`--scan-libraries` 可再种真实文件库 |
+| 数据库 | 约 375 MB（含读模型与索引）；WAL 模式 |
+| 认证 | 夹具直接种入 `lux_session=lux-api-performance-token`（含 CSRF `spec-csrf-token`） |
+| 机器 | macOS arm64；**不得**据此推断 NAS/x86_64 |
+
+每个端点按下面一行记录（模板，复制填写）：
+
+| 端点 | 模式 | p50 | p95 | 响应字节 | 响应字节(gzip) | SQL/请求 | CPU/请求 | 逐字节一致 | 夹具/提交 |
+|---|---|---:|---:|---:|---:|---:|---:|---|---|
+
+- 延迟用 `scripts/compare-read-model-modes.py`（交错多轮取中位数，单轮数字不作为结论）。
+- 字节用同一脚本的 `bytes` 字段与手工 `Accept-Encoding: gzip` 对照。
+- CPU 用 `scripts/run-api-cpu-bench.py`（进程 CPU 采样，见“CPU / 请求基线”一节）。
+- 扫描写入用 `scripts/run-scan-write-bench.py`（墙钟、累计/峰值 WAL、队列排空）。
+
+**回退门**：任何读路径切换（`on`/`shadow`）或协议层改动，必须同时满足
+
+1. 响应逐字节一致（`off` 与 `on`，或改动前后），
+2. p95 不劣化超过 5%（多轮中位数，两模式区间不重叠才算差异），
+3. 失败或差异可解释——否则回退到上一模式并记录原因，不允许“先上线再看”。
+
+## SQL / 请求（现状记录，2026-10-28）
+
+中间件级的 SQL 计数尚未接入（W0 遗留），因此下表来自实现时的逐条记录与回归断言，不是运行时采样：
+
+| 端点 | 模式 | SQL/请求 | 依据 |
+|---|---|---:|---|
+| 库列表分页 | `on` | 3（id 页 + 核心行 + 批量源/流） | LUX-865 段 |
+| 详情 | `on` | 3（读模型行 + 批量源 + 流）+ 现有详情补充，≤6 | LUX-866 段 |
+| 继续观看 | `on` | ≤4（指针 id 页 + 核心行 + 批量源/流） | LUX-867 段 |
+| 首页 | `on` | 三条 rail 各自 ≤4，另加库入口 1 条 | LUX-868 段；`home_resume_page_returns_items_and_total_with_one_query` |
+| 搜索（SQLite） | `off`/`on` 相同 | 先 FTS 页，空页回退 LIKE（≤2 条）；排空队列时多 1 条 | `search_catalog_item_ids` 与 `drain_search_reindex` |
+
+若要把这一项变成运行时指标，需要给 `Database` 的查询入口加每请求计数（任务局部计数器 + 中间件），
+这会触碰所有查询路径，暂未做。
+
+## release profile 评估（A3，2026-10-30，arm64）
+
+动机：`Cargo.toml` 原本只有 `[profile.dev]` / `[profile.test]`，release 走 cargo 默认（`codegen-units = 16`、
+无 LTO、保留符号表）。本节用构建耗时、二进制体积和每请求 CPU 评估是否值得加 release 优化配置。
+
+前提：
+
+| 项 | 值 |
+|---|---|
+| 机器 | Apple M4，`uname -m` = `arm64`，10 核，16 GiB，macOS 26.5 |
+| 工具链 | rustc / cargo 1.97.1（`rust-toolchain.toml` 为 stable） |
+| 基线提交 | `5e03e7b1`（`test` 分支），独立 worktree、独立 `target/` |
+| 数据来源 | arm64 开发机；**不得**据此推断 NAS / x86_64 的耗时、体积或 CPU |
+
+构建期间同机还有其它 worktree 的 `cargo build` / `cargo test` 并发运行，绝对秒数不可复现（同一配置
+两次全量构建可以差到 3 倍，见下文“噪声”）。这里的用法是只把超过整机波动的差异当信号。
+
+### 构建成本与体积
+
+| 配置 | 全量构建 | 只改 `src/lib.rs` 后重编 | `target/release/luxd` | 相对基线 | `nm -a` 符号数 |
+|---|---:|---:|---:|---:|---:|
+| 基线（无 `[profile.release]`） | 642 s（首次冷缓存）；220 s（暖缓存重建） | 204 s | 85,166,320 B（81.2 MiB） | — | 130,512 |
+| `strip = "symbols"` | 205 s（暖缓存） | 272 s | 69,806,800 B（66.6 MiB） | **−18.0%** | 273 |
+| `lto = "thin"` + `codegen-units = 1` + `strip` | 1062 s（profile 变更导致全量重编，当时并发负载更高） | 584 s | 45,480,528 B（43.4 MiB） | **−46.6%** | 268 |
+
+- 642 s 是这台机器上第一次 release 构建（依赖全部冷编译）；暖缓存的全量重建是 220 s。同一配置的
+  增量重编 204 s（基线）也是在这台有并发编译的机器上测的。
+- `strip` 单独：体积 −18%，全量重建与基线持平（205 s vs 220 s），增量重编 272 s（并发负载下的噪声，
+  低于 204 s 的 1.35 倍）。
+- `lto = "thin"` + `codegen-units = 1`：相对基线再省 23.2 MiB，但增量重编 584 s 是基线 204 s 的
+  **2.9 倍**，全量重编 1062 s，超过“构建耗时恶化 > 2 倍”的门限；两次独立测量方向一致。
+- 未设置 `panic = "abort"`：panic 行为保持不变。
+
+### CPU / 请求（`scripts/run-api-cpu-bench.py`）
+
+66k 夹具（66,000 `media_items` / `catalog_items` / FTS 行，338 MB），`LUX_READ_MODEL_MODE=off`，
+每端点 150 次请求、预热 20 次；三种配置交错执行，每种 7 轮。值为中位（最小–最大），单位 ms：
+
+| 端点 | 基线 | `strip` 单独 | `thin LTO`+CGU=1+`strip` | 判定 |
+|---|---:|---:|---:|---|
+| `/api/v1/home` | 465.7（290.1–643.6） | 585.7（294.5–644.3） | 341.2（287.4–473.6） | 区间完全重叠，无差异 |
+| `/api/v1/search?q=Spec%20Movie` | 25.1（24.7–36.5） | 30.3（24.8–46.7） | 24.3（24.3–29.9） | 区间完全重叠，无差异 |
+| 库列表 `pageSize=50` | 2.3（2.2–5.1） | 3.5（2.1–5.9） | 2.1（2.0–3.1） | 区间完全重叠，无差异 |
+| `/api/v1/continue-watching?pageSize=24` | 10.9（9.4–15.2） | 13.1（9.7–22.3） | 10.9（9.5–12.5） | 区间完全重叠，无差异 |
+| `/api/v1/libraries?pageSize=100` | 1.9（1.5–3.1） | 2.8（1.5–3.1） | 1.7（1.4–2.6） | 区间完全重叠，无差异 |
+
+观察：
+
+- 只走一次库列表查询的 `libraries` 是最干净的噪声标尺：三种配置都各自出现 1.4–1.9 ms 和 2.6–3.1 ms
+  两个簇，说明这台机器存在约 2 倍的整轮次波动（所有端点同向漂移，与配置无关）。其余端点的差异都
+  落在同一个波动内，因此**没有可归因于 profile 的每请求 CPU 收益**。墙上时间与 CPU/请求同向漂移，
+  也没有 config 差异。
+- 与预期一致：读路径的成本主要在 SQLite 查询与 serde 序列化，`thin LTO` / `codegen-units = 1` 能
+  改变的是跨 crate 内联和单线程 codegen，不在这条热点上。
+
+复用夹具的注意事项（本次踩到的坑）：
+
+- `scripts/run-api-performance.py --keep-work-dir` 生成的夹具在 `catalog_outbox` 里留下了
+  `kind='search'` 的约 320 万行积压，服务启动后反复触发 “search reindex queue gap → 全量重建”，
+  每次启动都在后台重索引。此时测出的 CPU/请求被抬到 `home` 721 ms、`search` 1790 ms（墙钟
+  2 s/请求），A/B 结论完全被后台工作污染。
+- 清掉积压（`DELETE FROM catalog_outbox WHERE kind='search'`，随后 `VACUUM`，库文件 642 MB → 354 MB）
+  并确认启动日志里没有 `search reindex applied` 之后，数字才回到 W5 记录的量级（`home` 126 ms
+  墙钟、`search` 24 ms）。做 profile A/B 或复跑 W5 基线前，先确认这一条，否则测的是后台重索引。
+
+### Dockerfile 静态检查
+
+`Dockerfile` 的依赖预构建层只拷 `Cargo.toml` / `Cargo.lock` / `rust-toolchain.toml`，写占位
+`src/lib.rs` + `src/main.rs`，先跑一次 `cargo build --release --locked --bin luxd`，真实源码放在下一层。
+加入 `[profile.release]` 后逐条核对：
+
+1. profile 来自被复制进该层的 `Cargo.toml`，所以依赖层和源码层用同一套编译参数，两层继续共用同一份
+   `target`。本地用同样的占位工程 + 现有 `target` 复现：占位构建 0.71 s 完成、没有重编任何依赖；
+   随后换回真实源码，只重编 `luxd` 一个 crate（3m52s）。
+2. `strip = "symbols"` 由 rustc 自己执行（`-C strip=symbols`），镜像里不需要额外装 `strip`/binutils。
+3. 占位层没有 `src/bin/lux-plugin-danmaku.rs` 不影响 `--bin luxd`（本次复现也没有提供该目标文件）。
+4. `panic` 保持默认 `unwind`，panic 行为不变。
+
+### 结论：部分采用
+
+**采用 `strip = "symbols"`，不启用 `lto = "thin"` + `codegen-units = 1`。**
+
+- `strip = "symbols"` 让发布二进制从 81.2 MiB 降到 66.6 MiB（−18.0%），符号表 130,512 → 273 项；
+  构建耗时与基线持平（205 s vs 220 s 全量、272 s vs 204 s 增量，都在并发噪声内），运行时行为与
+  CPU/请求无变化。
+- `thin LTO` + `codegen-units = 1` 再多省 23.2 MiB（总计 −46.6%），换来的是 release 重编约 2.9 倍
+  （584 s vs 204 s）的耗时，并且在本夹具上没有测到任何每请求 CPU 收益。容器镜像体积由
+  `LUX_RUNTIME_IMAGE` 基础镜像主导，多省 23 MiB 不值得把每次发布构建拉长到这个程度。
+- 如果以后镜像体积成为实际约束，可以单独再评估只开 `lto = "thin"`（不带 `codegen-units = 1`）；
+  本次数据不支持现在就启用。
+
+风险：
+
+- `strip = "symbols"` 之后，线上二进制的 panic backtrace 与采样工具（`perf` / `dtrace`）会失去符号名，
+  排查现场问题时需要用同一个 tag 临时去掉 `strip` 重新构建。
+- 本节所有数字来自 arm64 开发机，NAS / x86_64 的构建耗时与体积未测，不能按比例外推。
+
+## PostgreSQL 占位符改写缓存（A2，2026-10-30，arm64）
+
+动机：`adapt_sql_for_backend`（`src/storage/repository.rs`）在 PostgreSQL 路径上**每次查询**逐字符扫描
+SQL，把 `?` 改写成 `$1,$2,…`，并分配新 `String`；`Database::query/query_as/query_scalar` 每次都调用它，
+而绝大多数 SQL 是 `&'static str` 字面量，同一条会被反复改写。本节先量化改写成本，再决定是否加缓存。
+
+前提：
+
+| 项 | 值 |
+|---|---|
+| 机器 | Apple M4，`uname -m` = `arm64`，10 核，16 GiB，macOS 26.5 |
+| 工具链 | rustc / cargo 1.97.1（`rust-toolchain.toml` 为 stable） |
+| 基线提交 | `673bfebe`（`test` 分支）外加合并后的 `test`；独立 worktree、独立 `target/` |
+| 基准 | `sql_query_benchmarks` 里三个 `#[ignore]` 测试：`…_adaptation_benchmark`（五条代表性 SQL）、`…_working_set_benchmark`（~1000 条 × 1/8 线程）、`…_contention_benchmark`（4 线程热语句） |
+| 运行方式 | `cargo test --release --locked --lib --features performance-benchmarks <测试名> -- --ignored --nocapture`；再用编好的测试二进制重复运行取中位 |
+| 分配计数 | 复用该文件已有的 `CountingSystemAllocator`（`#[global_allocator]`，按 op 归一） |
+| 数据来源 | arm64 开发机；**不得**据此推断 NAS / x86_64 的耗时 |
+
+测得的是**生产入口**（`Database::query*` 走的那个 `adapt_sql_for_backend`），不是单独抽出来的扫描函数。
+计时段前先跑一遍分配计数段，因此同一 `&'static str` 的计时值含缓存预热后的稳态（见下文“五条代表性 SQL”）。
+
+### 真实规模：先统计，再定上限（第 1 版返工原因）
+
+第 1 版按 256 条 LRU 设计，审查指出这个上限不成立。统计（脚本对 `src/**/*.rs` 扫描，排除
+`*_tests.rs`，并从每个文件第一个顶层 `#[cfg(test)]` `mod` 处截断，用一个小型字符串字面量扫描器
+读取 `self.query(` / `self.query_as(` / `self.query_scalar(` 的第一个实参）：
+
+| 项 | 值 |
+|---|---:|
+| 非测试 `.rs` 文件 | 262 |
+| `self.query*` 调用总数 | 1,594 |
+| 首参是字符串字面量（静态 SQL）的调用 | 1,212 |
+| **去重后的不同静态语句** | **1,124** |
+| 动态 SQL（`format!`、`AssertSqlSafe(..)`、常量、变量）调用 | 383 |
+| 静态语句源文本合计 | 374,429 B |
+| 单条最长静态语句 | 10,193 B |
+| 含 `?` 的静态语句 | 1,020 |
+| 静态语句里的 `?` 总数 | 2,892 |
+
+去重按文本做；缓存按地址做 key，相同字面量是否被 rustc 合并取决于编译单元，所以真实条目数与 1,124
+同量级（略高或略低，不会数量级偏离）。结论：**工作集约 1,000 条，256 条的上限意味着稳态下几乎每次都
+未命中**，而未命中原先还要在锁内做一次 O(n) 淘汰扫描，比不加缓存更贵。第 2 版因此改成
+“集合在构建期固定、只增不淘汰”的结构（见下文“设计”），并把上限提到 8,192 条 / 8 MiB（约 7× 余量）。
+
+### 五条代表性 SQL（原实现 vs 缓存路径）
+
+release 实测（`cargo test --release`，三次独立运行取中位）：
+
+| 用例 | 源字节 | `?` 字节 | 原实现 ns/次 | 缓存命中 ns/次 | 加速比 | allocs/次（原 → 缓存） | alloc 字节/次（原） |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| `short_insert`（小 INSERT） | 84 | 3 | 146 | 16 | **9.1×** | 1.00 → 0.00 | 90 |
+| `typical_select`（分页查询） | 377 | 3 | 536 | 23 | **23.3×** | 1.00 → 0.00 | 383 |
+| `long_join`（多表 JOIN 详情） | 641 | 2 | 948 | 35 | **27.1×** | 1.00 → 0.00 | 645 |
+| `wide_in_list`（`IN` 128 个 `?`） | 465 | 129 | 1,448 | 15 | **96.5×** | 1.00 → 0.00 | 981 |
+| `quotes_and_comments`（`''`/`--`/`/* */`/`"x"`） | 505 | 11 | 667 | 13 | **51.3×** | 1.00 → 0.00 | 538 |
+
+**分配字节数 = 缓冲区容量，不是源文本长度**：原实现用
+`String::with_capacity(source.len() + 占位字节数 × (十进制位数 + 1))`，`CountingSystemAllocator` 记录的
+`layout.size()` 就是这个容量，所以上表“源字节”与“alloc 字节/次”不同（84 → 90、465 → 981）。
+debug profile（`cargo test`）下同样的五条用例耗时 1,599 / 6,526 / 10,904 / 11,124 / 8,874 ns，
+分配形态与 release 相同（1.00 次/op，容量 90 / 383 / 645 / 981 / 538 B）；debug 只用于确认分配形态，
+**不用于采用判断**。
+
+### 工作集基准：~1,000 条 × 8 线程
+
+`postgres_placeholder_adaptation_working_set_benchmark`：按上表五种形状生成 **1,000 条互不相同的静态
+语句**（源文本合计 433,000 B，16,800 个 `?`，全部 `Box::leak` 成 `&'static str`），先用全新缓存跑一遍
+（cold fill），再在稳态下分别用 1 线程与 8 线程走完整个工作集，与原实现对比。六次运行：
+
+| 场景 | 原实现 ns/次 | 缓存 ns/次 | 加速比 |
+|---|---:|---:|---:|
+| 首次调用（cold fill，1000 条全部 miss） | — | 1,380（876–1,938） | — |
+| 单线程稳态 | 2,287（1,669–3,257） | 50（39–55） | **~46×** |
+| 8 线程稳态 | 221（198–280） | 47（31–82） | **~4.7×** |
+
+- 覆盖率断言：`entries=1000`、`cached_bytes=459,800`，上限 8,192 条 / 8 MiB（8.2× / 18× 余量）；
+  基准里直接断言“整个工作集都被缓存”，所以缓存悄悄停摆时会**失败**而不是给出好看的数字。
+- 最终二进制在机器更安静时复测 2 次：单线程缓存 34–37 ns vs 原实现 821–828 ns（**~23×**），
+  8 线程缓存 33–36 ns vs 183–194 ns（**~5.4×**）。绝对 ns 随同机并发编译负载整体漂移（上表最慢的一次
+  原实现是 3,257 ns），**比值稳定在 20× 以上 / 4.7× 以上**。
+- 单线程分配：原实现 1.00 次/op、481.80 B/op；缓存 0.00 次/op、0 B/op。
+- 8 线程每一对运行都是缓存更快（最差 82 ns vs 原实现最好 198 ns），**没有出现“比原实现慢”的形态**。
+- cold fill 是唯一有额外成本的地方：首次调用每条语句要改写一次并多做一次 `Arc::from(&str)` 拷贝
+  （2 次分配 vs 原来 1 次），一次性成本约 1.4 µs/条，进程启动后每条语句只付一次。
+
+### 设计（第 2 版）
+
+- **只有 `&'static str` 进缓存**。`Database::query/query_as/query_scalar` 的入参类型是本地 trait
+  `AdaptSqlText`，三个实现：`&'static str` → 缓存路径；`sqlx::SqlStr` 与 `sqlx::AssertSqlSafe<T>` →
+  原样走未缓存路径。调用点类型全部不变，业务模块无需改动。
+- **key =（指针地址，长度）**。静态存储不会移动也不会被回收，两个字段在进程生命周期内唯一确定一段文本；
+  两条不同的静态串不可能同时共享地址和长度。`AssertSqlSafe(String)` 之类动态 SQL 的地址只是堆分配复用，
+  不构成身份，因此永远不缓存。
+- **只增不淘汰**。静态语句集合在构建期固定，缓存填满一次后只读；容量
+  `MAX_ADAPTED_SQL_CACHE_ENTRIES = 8192` 条、`MAX_ADAPTED_SQL_CACHE_TEXT_BYTES = 8 MiB` 改写文本，
+  单条源语句超过 `MAX_ADAPTED_SQL_CACHE_SOURCE_BYTES = 64 KiB` 不入缓存。**单条上限比较源文本长度**
+  （在改写之前判定），不是改写后长度。
+- **分片 + 读写锁**：`std::sync::LazyLock<AdaptedSqlCache>`，内部 64 个
+  `RwLock<HashMap<..>>` 分片；命中只取一个分片的**读锁**；未命中先取读锁查找、释放后再取同一分片的写锁插入
+  （每次 miss 两次加锁、两次 hash 查找，同一时刻只持有一把锁）；锁内只做一次 hash-map 操作，没有 await、
+  不回调调用方代码，因此不会死锁。
+  每个分片的条目/字节上限 = 全局上限 / 64；分片满了就**直接放弃缓存该语句**（继续走未缓存路径），
+  不做任何 O(n) 扫描。锁中毒按 miss 处理（读）或跳过写入（写），不会变成存储错误。
+- **分片索引必须混洗**：`(address × 黄金比例常数) ^ (>> 29)` 再取掩码。第 2 版第一稿用的是
+  `(address >> 3) & mask`，被工作集基准当场抓住——语句地址常常是等间距的，掩码后整段地址挤到少数分片，
+  1000 条里只有 702 条被缓存。修正后 1000/1000 全覆盖，并加了对应回归测试。
+- **没有 `?` 的语句不进缓存也不取锁**：一次线性扫描（`[u8]::contains`）判断后直接返回原 `&'static str`；含 `?` 的语句在未命中路径上
+  会再扫描一遍统计 `?` 个数
+  （零拷贝、零分配、零锁）。这也去掉了第 1 版的 `Unchanged` 缓存变体。
+- **SQLite 判定仍收在 `adapt_sql_for_backend` 一个入口**（与原实现同一处分支）：直接返回原文本，
+  既不查也不写缓存、零拷贝零分配（测试对 `&'static str`、`String`、`Arc<str>` 三种输入断言返回的仍是
+  原缓冲区指针），因此 `repository.rs` 的 `DatabaseBackend::` 分支数与改动前一致（50）。
+- 4 线程抢同一批热语句的压测（`postgres_placeholder_adaptation_contention_benchmark`）：
+  **54 / 56 / 92 ns/次**（三次运行），比第 1 版单锁设计的 91–166 ns 明显低。
+
+### 正确性
+
+`storage::repository::repository_tests::adapted_sql_cache_tests` 共 12 个测试：
+
+- 逐字节对拍：缓存路径 vs 未缓存路径（`adapt_postgres_sql_uncached`，即原实现），在 18 条手写刁钻语句
+  （`''` 转义、`--`、`/* */`、`"标识符"`、未闭合的引号/注释、只有注释里出现 `?`、完全不含 `?`）与
+  **2,000 条合成 SQL**（随机拼装上述片段）上输出完全一致；
+- 真实规模：默认缓存（64 分片 / 8192 条）下 1,000 条互不相同的语句**全部**被缓存；
+- 容量：分片满后保留已有条目、新语句继续走未缓存路径（同一条语句两次调用返回不同缓冲区即为证），
+  条目上限与字节预算各自单独生效，零条目缓存仍能正确改写；
+- 单条上限按**源文本长度**判定（32 个 `?` 的源文本 32 B 命中上限并被缓存，尽管改写后 87 B；33 B 不缓存）；
+- SQLite 保留原缓冲区（`&'static str` / `String` / `Arc<str>` 三种）；
+- 动态 SQL 每次改写；8 线程并发对拍且缓存不超上限。
+
+测试放在 `repository_tests.rs` 而不是实现文件里：`scripts/check-backend-branches.py` 按文件名排除
+`*_tests.rs`，测试里的 `DatabaseBackend::` 用法不应被当成新增生产后端分支。基准文件里的方言名也合并成
+一个 `const POSTGRES`，两个文件的分支计数因此保持 50 / 26，清单不需要上调。
+
+`cargo test --locked --lib storage::` 全绿（422 passed / 36 ignored）。
+
+### 结论：采用（第 2 版）
+
+- 采用门槛是“命中路径相对原实现至少快 3×、无功能差异、8 线程下不得更慢”。代表性五条 SQL 实测
+  9.1×–96.5×；真实规模工作集单线程 ~46×、8 线程 ~4.7×，且每一对 8 线程运行缓存都更快；
+  与未缓存实现逐字节一致；SQLite 零影响。因此**采用**。
+- 收益主要来自两件事：稳态下每条 PostgreSQL 查询少一次堆分配（原先 1.00 次/op、约 0.5 KB），
+  以及不再逐字符扫描 SQL；前者在 8 线程下更明显（malloc 争用）。
+- 只有静态字面量受益。`format!` / `AssertSqlSafe(..)` / `SqlTemplateCache` 模板 / `IN (...)` 列表仍然
+  每次改写，这个语义差异写进了 `AdaptSqlText` 的文档注释。
+- 代价：cold fill 每条语句多一次分配（2 次 vs 1 次，一次性）；进程内多一张 ≤8192 条 / ≤8 MiB 的表
+  （实测工作集 1,000 条 / 459,800 B）；分片锁在 4 线程热语句上 54–92 ns/次。
+
+风险：
+
+- 缓存 key 依赖 `'static` 出处。若以后有人给 `AdaptSqlText` 增加拥有型实现（例如直接实现 `String`），
+  地址身份立即失效（堆地址会被复用），必须改用内容哈希或其他身份——这一点写在 trait 文档注释里。
+- 只增不淘汰意味着 `Box::leak` 出来的动态 SQL 会被当成静态语句长期缓存；仍受 8192 条 / 8 MiB 上限约束，
+  超出后新语句只是不再被缓存。
+- 分片上限是“全局上限 / 64”，因此某个分片可能先于全局上限停止缓存（实测工作集 8.2× 余量下不会发生）；
+  若将来静态语句数量再涨一个数量级，需要同步上调 `MAX_ADAPTED_SQL_CACHE_ENTRIES`/`TEXT_BYTES`，
+  工作集基准的覆盖率断言会先失败提醒。
+- 所有数字来自 arm64 开发机（测试期间同机有其它 worktree 编译，绝对 ns 有 ~1.5× 抖动，
+  比值稳定）；NAS / x86_64 未测，不同架构的 `RwLock` 与哈希成本不同，但“命中与 SQL 长度无关”
+  以及“8 线程不吃亏”的结构性结论与架构无关。
+- 超过 64 KiB 的静态语句不入缓存（当前代码里没有这种静态 SQL；最宽的 `IN` 列表都是动态构建的）。

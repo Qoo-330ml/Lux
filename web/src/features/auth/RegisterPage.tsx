@@ -3,6 +3,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { LuxLogo } from "../../components/LuxLogo";
 import { ApiError, api } from "../../lib/api/client";
+import { LuxButton, LuxLinkButton, LuxTextField } from "../../components/ui";
 
 type RegistrationStatus = "editing" | "submitting" | "submitted";
 type VerificationStatus = "pending" | "success" | "error" | "invalid";
@@ -126,17 +127,17 @@ export function RegisterPage() {
           ) : verificationStatus === "success" ? (
             <div className="lux-auth-form">
               <p className="lux-success-copy" role="status">邮箱验证成功，等待管理员批准。审核完成后即可登录。</p>
-              <a className="lux-button lux-button-primary" href={loginPath}>返回登录</a>
+              <LuxLinkButton tone="primary" href={loginPath}>返回登录</LuxLinkButton>
             </div>
           ) : verificationStatus === "error" ? (
             <div className="lux-auth-form">
               <p className="lux-error-copy" role="alert">{verificationError}</p>
-              <a className="lux-button lux-button-secondary" href={registerPath}>返回注册页面</a>
+              <LuxLinkButton tone="secondary" href={registerPath}>返回注册页面</LuxLinkButton>
             </div>
           ) : (
             <div className="lux-auth-form">
               <p className="lux-error-copy" role="alert">验证链接无效或已失效，请重新打开验证邮件。</p>
-              <a className="lux-button lux-button-secondary" href={registerPath}>返回注册页面</a>
+              <LuxLinkButton tone="secondary" href={registerPath}>返回注册页面</LuxLinkButton>
             </div>
           )}
         </section>
@@ -156,26 +157,25 @@ export function RegisterPage() {
         ) : registrationSettings.error ? (
           <div className="lux-auth-form">
             <p className="lux-error-copy" role="alert">注册状态暂时无法读取，请稍后重试。</p>
-            <button
-              className="lux-button lux-button-secondary"
+            <LuxButton tone="secondary"
               type="button"
               disabled={registrationSettings.isFetching}
               onClick={() => void registrationSettings.refetch()}
             >
               {registrationSettings.isFetching ? "正在重试…" : "重试"}
-            </button>
+            </LuxButton>
           </div>
         ) : registrationSettings.data?.registrationMode !== "PUBLIC_EMAIL" ? (
           <div className="lux-auth-form">
             <p role="status">当前仅接受管理员邀请，请联系管理员获取邀请链接。</p>
-            <a className="lux-button lux-button-secondary" href={loginPath}>返回登录</a>
+            <LuxLinkButton tone="secondary" href={loginPath}>返回登录</LuxLinkButton>
           </div>
         ) : registrationStatus === "submitted" ? (
           <div className="lux-auth-form">
             <p className="lux-success-copy" role="status">
               若申请符合条件，我们会发送验证邮件。请前往邮箱验证；验证后仍需管理员批准。
             </p>
-            <a className="lux-button lux-button-secondary" href={loginPath}>返回登录</a>
+            <LuxLinkButton tone="secondary" href={loginPath}>返回登录</LuxLinkButton>
           </div>
         ) : (
           <>
@@ -188,7 +188,7 @@ export function RegisterPage() {
             >
               <label htmlFor="registration-email">
                 邮箱
-                <input
+                <LuxTextField
                   id="registration-email"
                   name="email"
                   type="email"
@@ -202,7 +202,7 @@ export function RegisterPage() {
               </label>
               <label htmlFor="registration-username">
                 用户名
-                <input
+                <LuxTextField
                   id="registration-username"
                   name="username"
                   autoComplete="username"
@@ -215,7 +215,7 @@ export function RegisterPage() {
               </label>
               <label htmlFor="registration-display-name">
                 显示名称（可选）
-                <input
+                <LuxTextField
                   id="registration-display-name"
                   name="displayName"
                   autoComplete="nickname"
@@ -227,7 +227,7 @@ export function RegisterPage() {
               </label>
               <label htmlFor="registration-password">
                 密码
-                <input
+                <LuxTextField
                   id="registration-password"
                   name="password"
                   type="password"
@@ -239,13 +239,12 @@ export function RegisterPage() {
                   onChange={(event) => setPassword(event.target.value)}
                 />
               </label>
-              <button
-                className="lux-button lux-button-primary"
+              <LuxButton tone="primary"
                 type="submit"
                 disabled={registrationStatus === "submitting"}
               >
                 {registrationStatus === "submitting" ? "正在提交…" : "提交申请"}
-              </button>
+              </LuxButton>
               {registrationError ? (
                 <p id="registration-error" className="lux-error-copy" role="alert">{registrationError}</p>
               ) : null}

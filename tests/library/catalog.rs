@@ -1,0 +1,2474 @@
+use luxd::{
+    api::{AppState, app_with_state},
+    application::{
+        access::{AccessPrincipal, MediaAccessService},
+        catalog::CatalogService,
+        libraries::LibraryService,
+        metadata::MetadataEnricher,
+        nfo::LocalNfoMetadataStore,
+        people::{ActorCredit, PeopleService},
+        scanner::{LibraryScanner, ScanJobService},
+        setup::SetupService,
+    },
+    auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
+    config::Config,
+    domain::ids::UserId,
+    library::LibraryKind,
+    storage::Database,
+};
+use reqwest::header::{AUTHORIZATION, COOKIE, SET_COOKIE};
+use serde_json::{Value, json};
+use std::collections::BTreeSet;
+use tokio::net::TcpListener;
+
+const PNG_1X1: &[u8] = &[
+    0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1f, 0x15, 0xc4,
+    0x89, 0x00, 0x00, 0x00, 0x0d, 0x49, 0x44, 0x41, 0x54, 0x78, 0x9c, 0x63, 0x00, 0x01, 0x00, 0x00,
+    0x05, 0x00, 0x01, 0x0d, 0x0a, 0x2d, 0xb4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae,
+    0x42, 0x60, 0x82,
+];
+
+fn emby_public_id(id: &str) -> String {
+    uuid::Uuid::parse_str(id)
+        .map(|uuid| uuid.as_u128().to_string())
+        .unwrap_or_else(|_| id.to_owned())
+}
+
+#[tokio::test]
+async fn lux_and_emby_catalogs_list_page_and_show_movie_details()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("Admin", "Admin", "correct password").await?;
+    let users = UserStore::new(database.clone())?;
+    let viewer = users
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let series_library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let media_root = temp_dir.path().join("Movies");
+    let first_dir = media_root.join("Alpha Movie (2020)");
+    let second_dir = media_root.join("Beta Movie (2021)");
+    tokio::fs::create_dir_all(&first_dir).await?;
+    tokio::fs::create_dir_all(&second_dir).await?;
+    tokio::fs::write(first_dir.join("Alpha.Movie.2020.mkv"), b"alpha").await?;
+    tokio::fs::write(first_dir.join("poster.jpg"), b"alpha-poster").await?;
+    tokio::fs::write(first_dir.join("fanart.jpg"), b"alpha-fanart").await?;
+    tokio::fs::write(first_dir.join("logo.png"), b"alpha-logo").await?;
+    tokio::fs::write(first_dir.join("thumb.jpg"), b"alpha-thumb").await?;
+    tokio::fs::write(first_dir.join("banner.jpg"), b"alpha-banner").await?;
+    tokio::fs::write(first_dir.join("disc.jpg"), b"alpha-disc").await?;
+    tokio::fs::write(
+        first_dir.join("movie.nfo"),
+        r#"<movie><rating>8.1</rating><votes>123</votes><tagline>本地标语</tagline><premiered>2020-01-02</premiered><runtime>126</runtime><status>Released</status><language>zh</language><website>https://example.com/movie</website><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>本地影业</studio><tmdbid>12345</tmdbid><director tmdbid="88">导演甲</director><writer tmdbid="99">编剧甲</writer><writer>编剧乙</writer><trailer>https://example.com/trailer</trailer></movie>"#,
+    )
+    .await?;
+    tokio::fs::write(second_dir.join("Beta.Movie.2021.mp4"), b"beta").await?;
+    libraries
+        .add_root(library.id, media_root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+    let removed_version = first_dir.join("Alpha.Movie.2020.2160p.mkv");
+    tokio::fs::write(&removed_version, b"alpha-2160p").await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    tokio::fs::remove_file(&removed_version).await?;
+    let removal_scan = LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    assert_eq!(removal_scan.marked_missing, 1);
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'alpha movie'")
+            .fetch_one(database.pool())
+            .await?;
+    let beta_item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE sort_title = 'beta movie'")
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query("UPDATE media_items SET parent_id = NULL WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let alpha_parent_id: String = sqlx::query_scalar(
+        "SELECT parent_id FROM media_items WHERE id = ? AND parent_id IS NOT NULL",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT item_type FROM media_items WHERE id = ?")
+            .bind(&alpha_parent_id)
+            .fetch_one(database.pool())
+            .await?,
+        "FOLDER"
+    );
+    let alpha_source_id: String =
+        sqlx::query_scalar("SELECT id FROM media_sources WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let emby_library_id = emby_public_id(&library.id.to_string());
+    let emby_series_library_id = emby_public_id(&series_library.id.to_string());
+    let emby_item_id = emby_public_id(&item_id);
+    let emby_beta_item_id = emby_public_id(&beta_item_id);
+    let emby_alpha_parent_id = emby_public_id(&alpha_parent_id);
+    sqlx::query(
+        "INSERT INTO media_streams (
+            id, media_source_id, stream_index, stream_type, codec, title,
+            details_json, is_default
+         ) VALUES (?, ?, 0, 'VIDEO', 'h264', '1080p H264', ?, 1),
+                  (?, ?, 1, 'AUDIO', 'aac', 'AAC Stereo', ?, 1)",
+    )
+    .bind("alpha-video-stream")
+    .bind(&alpha_source_id)
+    .bind(
+        r#"{"Width":"1920","Height":"1080","BitDepth":"8","BitRate":"8145838","AverageFrameRate":"24/1","RealFrameRate":"24000/1001","IsInterlaced":"false","Profile":"High"}"#,
+    )
+    .bind("alpha-audio-stream")
+    .bind(&alpha_source_id)
+    .bind(r#"{"Channels":"2","SampleRate":"48000"}"#)
+    .execute(database.pool())
+    .await?;
+    let people = PeopleService::new(config.config_dir.clone()).with_database(database.clone());
+    let person_image = config
+        .config_dir
+        .join("metadata/people/演/演员甲-tmdb-9/folder.png");
+    tokio::fs::create_dir_all(person_image.parent().ok_or("missing person image parent")?).await?;
+    tokio::fs::write(&person_image, PNG_1X1).await?;
+    people
+        .persist_item_actors(
+            &item_id,
+            "tmdb",
+            &[ActorCredit {
+                id: "9".to_owned(),
+                provider: None,
+                identities: Vec::new(),
+                name: "演员甲".to_owned(),
+                character: Some("角色甲".to_owned()),
+                order: Some(0),
+                profile_url: None,
+                person: None,
+            }],
+        )
+        .await?;
+    sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
+        .bind(300_i64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET added_at = ? WHERE id = ?")
+        .bind(200_i64)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET premiere_date = ?, rating = ? WHERE id = ?")
+        .bind("2021-01-01")
+        .bind(8.2_f64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET premiere_date = ?, rating = ? WHERE id = ?")
+        .bind("2020-01-01")
+        .bind(6.5_f64)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = ? WHERE id = ?")
+        .bind(r#"{"tmdb":"12345"}"#)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_items SET provider_ids_json = ? WHERE id = ?")
+        .bind(r#"{"imdb":"tt12345","tmdb":"67890"}"#)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_sources SET duration_ticks = ? WHERE item_id = ?")
+        .bind(2_000_000_000_i64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("UPDATE media_sources SET duration_ticks = ? WHERE item_id = ?")
+        .bind(2_000_000_000_i64)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+    let alpha_poster_id: String = sqlx::query_scalar(
+        "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'POSTER'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE item_images SET width = 1000, height = 1500
+         WHERE item_id = ? AND image_type = 'POSTER' AND image_index = 0",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let alpha_fanart_id: String = sqlx::query_scalar(
+        "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'FANART'",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    let second_fanart_path = first_dir.join("fanart-extra.jpg");
+    tokio::fs::write(&second_fanart_path, b"alpha-fanart-extra").await?;
+    sqlx::query(
+        "INSERT INTO item_images
+         (id, item_id, image_type, image_index, local_path, file_size, source)
+         VALUES (?, ?, 'FANART', 1, ?, ?, 'LOCAL')",
+    )
+    .bind("alpha-fanart-extra-tag")
+    .bind(&item_id)
+    .bind(second_fanart_path.to_string_lossy().as_ref())
+    .bind(18_i64)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_favorite)
+         VALUES (?, ?, 1)
+         ON CONFLICT(user_id, item_id) DO UPDATE SET is_favorite = 1",
+    )
+    .bind(admin.id.to_string())
+    .bind(&beta_item_id)
+    .execute(database.pool())
+    .await?;
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+
+    let admin_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="LuxTest", Device="Mac", DeviceId="admin-device", Version="1""#,
+        )
+        .json(&json!({ "Username": "admin", "Pw": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(admin_login.status(), reqwest::StatusCode::OK);
+    let admin_token = admin_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing admin token")?
+        .to_owned();
+
+    let cover_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cover_session = cookie_value(cover_login.headers(), "lux_session");
+    let cover_csrf = cookie_value(cover_login.headers(), "lux_csrf");
+    let cover_upload = client
+        .put(format!(
+            "{base_url}/api/v1/admin/libraries/{}/cover",
+            library.id
+        ))
+        .header(
+            COOKIE,
+            format!("lux_session={cover_session}; lux_csrf={cover_csrf}"),
+        )
+        .header("X-CSRF-Token", &cover_csrf)
+        .header("Content-Type", "image/png")
+        .body(PNG_1X1)
+        .send()
+        .await?;
+    assert_eq!(cover_upload.status(), reqwest::StatusCode::OK);
+
+    let views = client
+        .get(format!("{base_url}/Users/{}/Views", admin.id))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(views.status(), reqwest::StatusCode::OK);
+    let views_body: Value = views.json().await?;
+    assert_eq!(views_body["TotalRecordCount"], 2);
+    let movie_view = views_body["Items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["Id"] == emby_library_id))
+        .ok_or("missing movie library view")?;
+    assert_eq!(movie_view["CollectionType"], "movies");
+    assert_eq!(movie_view["ChildCount"], 2);
+    assert_eq!(movie_view["PrimaryImageItemId"], emby_library_id);
+    let cover_tag = movie_view["ImageTags"]["Primary"]
+        .as_str()
+        .ok_or("missing movie library cover tag")?;
+    assert!(!cover_tag.is_empty());
+    let shows_view = views_body["Items"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["Id"] == emby_series_library_id)
+        })
+        .ok_or("missing series library view")?;
+    assert_eq!(shows_view["CollectionType"], "tvshows");
+    assert_eq!(shows_view["ChildCount"], 0);
+
+    let root = client
+        .get(format!("{base_url}/Users/{}/Items/Root", admin.id))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(root.status(), reqwest::StatusCode::OK);
+    let root_body: Value = root.json().await?;
+    assert_eq!(root_body["Id"], admin.id.to_string());
+    assert_eq!(root_body["Type"], "Folder");
+    assert_eq!(root_body["IsFolder"], true);
+    assert_eq!(root_body["ChildCount"], 2);
+
+    let modern_root = client
+        .get(format!("{base_url}/Items/Root?userId={}", admin.id))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(modern_root.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        modern_root.json::<Value>().await?["Id"],
+        admin.id.to_string()
+    );
+
+    let root_children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&IncludeItemTypes=CollectionFolder&Limit=10",
+            admin.id, admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(root_children.status(), reqwest::StatusCode::OK);
+    let root_children_body: Value = root_children.json().await?;
+    assert_eq!(root_children_body["TotalRecordCount"], 2);
+    assert_eq!(root_children_body["Items"][0]["Type"], "CollectionFolder");
+    assert_eq!(root_children_body["Items"][0]["IsFolder"], true);
+
+    let filtered_root_children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?IncludeItemTypes=CollectionFolder&Limit=10",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(filtered_root_children.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        filtered_root_children.json::<Value>().await?["TotalRecordCount"],
+        2
+    );
+
+    let emby_library_detail = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/{}?EnableUserData=true&Fields=CollectionType,ChildCount",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_library_detail.status(), reqwest::StatusCode::OK);
+    let emby_library_detail_body: Value = emby_library_detail.json().await?;
+    assert_eq!(emby_library_detail_body["Id"], emby_library_id);
+    assert_eq!(emby_library_detail_body["Name"], "Movies");
+    assert_eq!(emby_library_detail_body["Type"], "CollectionFolder");
+    assert_eq!(emby_library_detail_body["IsFolder"], true);
+    assert_eq!(emby_library_detail_body["CollectionType"], "movies");
+    assert_eq!(emby_library_detail_body["ChildCount"], 2);
+
+    let emby_cover = client
+        .get(format!("{base_url}/Items/{emby_library_id}/Images/Primary"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(emby_cover.headers()["content-type"], "image/png");
+    assert_eq!(emby_cover.bytes().await?.as_ref(), PNG_1X1);
+
+    let emby_capability_cover = client
+        .get(format!(
+            "{base_url}/emby/Items/{}/Images/Primary?tag={cover_tag}",
+            emby_library_id
+        ))
+        .send()
+        .await?;
+    assert_eq!(emby_capability_cover.status(), reqwest::StatusCode::OK);
+    assert_eq!(emby_capability_cover.bytes().await?.as_ref(), PNG_1X1);
+
+    let emby_page = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&Limit=1",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_page.status(), reqwest::StatusCode::OK);
+    let emby_page_body: Value = emby_page.json().await?;
+    assert_eq!(emby_page_body["TotalRecordCount"], 2);
+    assert!(emby_page_body.get("StartIndex").is_none());
+    assert_eq!(emby_page_body["Items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(emby_page_body["Items"][0]["Type"], "Movie");
+    assert_eq!(emby_page_body["Items"][0]["SupportsSync"], false);
+    assert_eq!(emby_page_body["Items"][0]["Name"], "Alpha Movie");
+    assert_eq!(emby_page_body["Items"][0]["CommunityRating"], 8.1);
+    assert_eq!(
+        emby_page_body["Items"][0]["PremiereDate"],
+        "2020-01-02T00:00:00.0000000Z"
+    );
+    assert_eq!(emby_page_body["Items"][0]["RunTimeTicks"], 75600000000_i64);
+    assert_eq!(emby_page_body["Items"][0]["OfficialRating"], "PG-13");
+    assert_eq!(emby_page_body["Items"][0]["Genres"], json!(["动作"]));
+    assert_eq!(emby_page_body["Items"][0]["Studios"][0]["Name"], "本地影业");
+    assert!(emby_page_body["Items"][0]["Studios"][0]["Id"].is_string());
+    assert_eq!(
+        emby_page_body["Items"][0]["PrimaryImageItemId"],
+        emby_item_id
+    );
+    assert_eq!(
+        emby_page_body["Items"][0]["ImageTags"]["Primary"],
+        alpha_poster_id
+    );
+    assert_eq!(
+        emby_page_body["Items"][0]["BackdropImageTags"][0],
+        alpha_fanart_id
+    );
+    assert_eq!(emby_page_body["Items"][0]["ParentId"], emby_alpha_parent_id);
+    assert_eq!(
+        emby_page_body["Items"][0]["MediaSources"][0]["Container"],
+        "mkv"
+    );
+
+    let provider_filtered = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.12345&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(provider_filtered.status(), reqwest::StatusCode::OK);
+    let provider_filtered_body: Value = provider_filtered.json().await?;
+    assert_eq!(provider_filtered_body["TotalRecordCount"], 1);
+    assert_eq!(
+        provider_filtered_body["Items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(provider_filtered_body["Items"][0]["Name"], "Alpha Movie");
+
+    let provider_filtered_multiple = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.67890,imdb.tt12345&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(provider_filtered_multiple.status(), reqwest::StatusCode::OK);
+    let provider_filtered_multiple_body: Value = provider_filtered_multiple.json().await?;
+    assert_eq!(provider_filtered_multiple_body["TotalRecordCount"], 1);
+    assert_eq!(
+        provider_filtered_multiple_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        provider_filtered_multiple_body["Items"][0]["Name"],
+        "Beta Movie"
+    );
+
+    let provider_filtered_namespace = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.tt12345&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        provider_filtered_namespace.status(),
+        reqwest::StatusCode::OK
+    );
+    let provider_filtered_namespace_body: Value = provider_filtered_namespace.json().await?;
+    assert_eq!(provider_filtered_namespace_body["TotalRecordCount"], 0);
+    assert_eq!(
+        provider_filtered_namespace_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let provider_filtered_missing = client
+        .get(format!(
+            "{base_url}/emby/Items?AnyProviderIdEquals=tmdb.does-not-exist&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(provider_filtered_missing.status(), reqwest::StatusCode::OK);
+    let provider_filtered_missing_body: Value = provider_filtered_missing.json().await?;
+    assert_eq!(provider_filtered_missing_body["TotalRecordCount"], 0);
+    assert_eq!(
+        provider_filtered_missing_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let empty_optional_favorite = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={}&IncludeItemTypes=Movie&Recursive=true&Limit=50&StartIndex=0&IsFavorite=",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(empty_optional_favorite.status(), reqwest::StatusCode::OK);
+    let empty_optional_favorite_body: Value = empty_optional_favorite.json().await?;
+    assert_eq!(empty_optional_favorite_body["TotalRecordCount"], 2);
+
+    let avdb_library_count = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={emby_library_id}&Recursive=true&IncludeItemTypes=Movie,Video&Limit=0&EnableTotalRecordCount=true",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(avdb_library_count.status(), reqwest::StatusCode::OK);
+    let avdb_library_count_body: Value = avdb_library_count.json().await?;
+    assert_eq!(avdb_library_count_body["Items"], serde_json::json!([]));
+    assert_eq!(avdb_library_count_body["TotalRecordCount"], 2);
+
+    let zero_limit_without_count = client
+        .get(format!(
+            "{base_url}/emby/Items?Recursive=true&IncludeItemTypes=Movie&Limit=0&UserId={}",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(zero_limit_without_count.status(), reqwest::StatusCode::OK);
+    let zero_limit_without_count_body: Value = zero_limit_without_count.json().await?;
+    assert!(
+        zero_limit_without_count_body["Items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty())
+    );
+
+    let latest_with_empty_optional_favorite = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items/Latest?ParentId={}&Limit=16&IsFavorite=",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        latest_with_empty_optional_favorite.status(),
+        reqwest::StatusCode::OK
+    );
+    let latest_with_empty_optional_favorite_body: Value =
+        latest_with_empty_optional_favorite.json().await?;
+    assert_eq!(
+        latest_with_empty_optional_favorite_body
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let emby_people_page = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&Limit=1&Fields=People",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_people_page.status(), reqwest::StatusCode::OK);
+    let emby_people_page_body: Value = emby_people_page.json().await?;
+    assert_eq!(
+        emby_people_page_body["Items"][0]["People"][0]["Type"],
+        "Person"
+    );
+    assert_eq!(
+        emby_people_page_body["Items"][0]["People"][1]["Type"],
+        "Director"
+    );
+    assert_eq!(
+        emby_people_page_body["Items"][0]["People"][2]["Type"],
+        "Writer"
+    );
+
+    let alpha_added_at: i64 = sqlx::query_scalar("SELECT added_at FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let beta_added_at: i64 = sqlx::query_scalar("SELECT added_at FROM media_items WHERE id = ?")
+        .bind(&beta_item_id)
+        .fetch_one(database.pool())
+        .await?;
+    let alpha_production_year: Option<i64> =
+        sqlx::query_scalar("SELECT production_year FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let beta_production_year: Option<i64> =
+        sqlx::query_scalar("SELECT production_year FROM media_items WHERE id = ?")
+            .bind(&beta_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let beta_parent_id: Option<String> =
+        sqlx::query_scalar("SELECT parent_id FROM media_items WHERE id = ?")
+            .bind(&beta_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let alpha_sort_title: String =
+        sqlx::query_scalar("SELECT sort_title FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let beta_sort_title: String =
+        sqlx::query_scalar("SELECT sort_title FROM media_items WHERE id = ?")
+            .bind(&beta_item_id)
+            .fetch_one(database.pool())
+            .await?;
+    sqlx::query(
+        "UPDATE media_items SET added_at = 100, sort_title = 'zulu', production_year = 2021 WHERE id = ?",
+    )
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "UPDATE media_items SET added_at = 200, sort_title = 'aardvark', production_year = 2020, parent_id = ? WHERE id = ?",
+    )
+    .bind(&alpha_parent_id)
+    .bind(&beta_item_id)
+    .execute(database.pool())
+    .await?;
+
+    let emby_recent_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=2&sortBy=DateCreated&sortOrder=Descending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_recent_items.status(), reqwest::StatusCode::OK);
+    let emby_recent_body: Value = emby_recent_items.json().await?;
+
+    let emby_sort_name_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=2&SortBy=SortName%2CDateCreated&SortOrder=Ascending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_sort_name_items.status(), reqwest::StatusCode::OK);
+    let emby_sort_name_body: Value = emby_sort_name_items.json().await?;
+
+    let emby_production_year_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_library_id}&IncludeItemTypes=Movie&Recursive=true&Limit=2&SortBy=ProductionYear&SortOrder=Descending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_production_year_items.status(), reqwest::StatusCode::OK);
+    let emby_production_year_body: Value = emby_production_year_items.json().await?;
+
+    let emby_recent_folder_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ParentId={emby_alpha_parent_id}&IncludeItemTypes=Movie&Limit=2&sortBy=DateCreated&sortOrder=Descending",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_recent_folder_items.status(), reqwest::StatusCode::OK);
+    let emby_recent_folder_body: Value = emby_recent_folder_items.json().await?;
+
+    sqlx::query(
+        "UPDATE media_items SET added_at = ?, sort_title = ?, production_year = ? WHERE id = ?",
+    )
+    .bind(alpha_added_at)
+    .bind(alpha_sort_title)
+    .bind(alpha_production_year)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET added_at = ?, sort_title = ?, production_year = ?, parent_id = ? WHERE id = ?",
+    )
+        .bind(beta_added_at)
+        .bind(beta_sort_title)
+        .bind(beta_production_year)
+        .bind(beta_parent_id)
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+
+    assert_eq!(emby_recent_body["Items"][0]["Id"], emby_beta_item_id);
+    assert_eq!(emby_sort_name_body["Items"][0]["Id"], emby_beta_item_id);
+    assert_eq!(emby_production_year_body["Items"][0]["Id"], emby_item_id);
+    assert_eq!(emby_recent_folder_body["TotalRecordCount"], 2);
+    assert_eq!(emby_recent_folder_body["Items"][0]["Id"], emby_beta_item_id);
+
+    let popcorn_items = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items?ExcludeItemTypes=Audio%2CBook%2CMusicVideo%2CMusicAlbum%2CGame%2CPhoto&StartIndex=0&Limit=50&ParentId={}&IncludeItemTypes=Movie&Recursive=true&SortOrder=Descending&SortBy=DateCreated%2CSortName&Fields=BasicSyncInfo%2CChildCount%2CRunTimeTicks%2CCommunityRating%2CPremiereDate%2CProductionYear%2CCanDownload",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(popcorn_items.status(), reqwest::StatusCode::OK);
+    let popcorn_body: Value = popcorn_items.json().await?;
+    assert_eq!(
+        popcorn_body
+            .as_object()
+            .ok_or("Popcorn response is not an object")?
+            .keys()
+            .cloned()
+            .collect::<BTreeSet<_>>(),
+        ["Items", "TotalRecordCount"]
+            .into_iter()
+            .map(str::to_owned)
+            .collect::<BTreeSet<_>>()
+    );
+    let popcorn_item = popcorn_body["Items"]
+        .as_array()
+        .and_then(|items| items.first())
+        .ok_or("missing Popcorn compatibility item")?;
+    let item_keys = popcorn_item
+        .as_object()
+        .ok_or("Popcorn item is not an object")?
+        .keys()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let expected_keys = [
+        "Name",
+        "ServerId",
+        "Id",
+        "CanDownload",
+        "SupportsSync",
+        "PremiereDate",
+        "CommunityRating",
+        "RunTimeTicks",
+        "ProductionYear",
+        "IsFolder",
+        "ParentId",
+        "Type",
+        "UserData",
+        "ImageTags",
+        "BackdropImageTags",
+        "MediaType",
+    ]
+    .into_iter()
+    .map(str::to_owned)
+    .collect::<BTreeSet<_>>();
+    assert_eq!(item_keys, expected_keys);
+    assert!(
+        popcorn_item
+            .as_object()
+            .ok_or("Popcorn item is not an object")?
+            .values()
+            .all(|value| !value.is_null())
+    );
+    assert_eq!(popcorn_item["SupportsSync"], false);
+    assert_eq!(popcorn_item["CanDownload"], false);
+    assert_eq!(
+        popcorn_item["ImageTags"]["Logo"],
+        sqlx::query_scalar::<_, String>(
+            "SELECT id FROM item_images WHERE item_id = ? AND image_type = 'LOGO'",
+        )
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?
+    );
+    assert!(popcorn_item["ImageTags"]["Banner"].is_string());
+    assert!(popcorn_item["ImageTags"]["Disc"].is_string());
+    assert!(popcorn_item["ImageTags"]["Thumb"].is_string());
+    assert_eq!(
+        popcorn_item["BackdropImageTags"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(popcorn_item["PremiereDate"], "2020-01-02T00:00:00.0000000Z");
+    assert_eq!(popcorn_item["ParentId"], emby_alpha_parent_id);
+    assert!(
+        !popcorn_item["UserData"]
+            .as_object()
+            .unwrap()
+            .contains_key("PlayedPercentage")
+    );
+
+    let folder_children = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={emby_alpha_parent_id}&IncludeItemTypes=Movie&Limit=50",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(folder_children.status(), reqwest::StatusCode::OK);
+    let folder_children_body: Value = folder_children.json().await?;
+    assert_eq!(folder_children_body["TotalRecordCount"], 1);
+    assert_eq!(folder_children_body["Items"][0]["Id"], emby_item_id);
+
+    let filtered_by_item_id = client
+        .get(format!(
+            "{base_url}/Items?Ids={emby_item_id}&Fields=Path,MediaSources&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(filtered_by_item_id.status(), reqwest::StatusCode::OK);
+    let filtered_by_item_id_body: Value = filtered_by_item_id.json().await?;
+    assert_eq!(filtered_by_item_id_body["TotalRecordCount"], 1);
+    assert_eq!(
+        filtered_by_item_id_body["Items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(filtered_by_item_id_body["Items"][0]["Id"], emby_item_id);
+
+    let filtered_by_multiple_item_ids = client
+        .get(format!(
+            "{base_url}/Items?Ids={emby_item_id},{emby_beta_item_id}&Limit=10"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        filtered_by_multiple_item_ids.status(),
+        reqwest::StatusCode::OK
+    );
+    let filtered_by_multiple_item_ids_body: Value = filtered_by_multiple_item_ids.json().await?;
+    assert_eq!(filtered_by_multiple_item_ids_body["TotalRecordCount"], 2);
+    assert_eq!(
+        filtered_by_multiple_item_ids_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let filtered_by_media_source_id = client
+        .get(format!(
+            "{base_url}/Items?Ids={alpha_source_id}&Fields=Path,MediaSources&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        filtered_by_media_source_id.status(),
+        reqwest::StatusCode::OK
+    );
+    let filtered_by_media_source_id_body: Value = filtered_by_media_source_id.json().await?;
+    assert_eq!(filtered_by_media_source_id_body["TotalRecordCount"], 1);
+    assert_eq!(
+        filtered_by_media_source_id_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    assert_eq!(
+        filtered_by_media_source_id_body["Items"][0]["Id"],
+        emby_item_id
+    );
+    assert_eq!(
+        filtered_by_media_source_id_body["Items"][0]["MediaSources"][0]["Id"],
+        alpha_source_id
+    );
+
+    let unprojected_item_lookup = client
+        .get(format!("{base_url}/Items?Ids={emby_item_id}&Limit=1"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(unprojected_item_lookup.status(), reqwest::StatusCode::OK);
+    let unprojected_item_lookup_body: Value = unprojected_item_lookup.json().await?;
+    assert_eq!(unprojected_item_lookup_body["TotalRecordCount"], 1);
+    assert_eq!(unprojected_item_lookup_body["Items"][0]["Id"], emby_item_id);
+
+    let unprojected_media_source_lookup = client
+        .get(format!("{base_url}/Items?Ids={alpha_source_id}&Limit=1"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(
+        unprojected_media_source_lookup.status(),
+        reqwest::StatusCode::OK
+    );
+    let unprojected_media_source_lookup_body: Value =
+        unprojected_media_source_lookup.json().await?;
+    assert_eq!(unprojected_media_source_lookup_body["TotalRecordCount"], 1);
+    assert_eq!(
+        unprojected_media_source_lookup_body["Items"][0]["Id"],
+        emby_item_id
+    );
+    assert_eq!(
+        unprojected_media_source_lookup_body["Items"][0]["MediaSources"][0]["Id"],
+        alpha_source_id
+    );
+
+    let filtered_by_unknown_id = client
+        .get(format!(
+            "{base_url}/Items?Ids=00000000-0000-0000-0000-000000000000&Limit=1"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(filtered_by_unknown_id.status(), reqwest::StatusCode::OK);
+    let filtered_by_unknown_id_body: Value = filtered_by_unknown_id.json().await?;
+    assert_eq!(filtered_by_unknown_id_body["TotalRecordCount"], 0);
+    assert_eq!(
+        filtered_by_unknown_id_body["Items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    let emby_compact_page = client
+        .get(format!(
+            "{base_url}/Users/{}/Items?ParentId={}&Limit=1&Fields=BasicSyncInfo,Container",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_compact_page.status(), reqwest::StatusCode::OK);
+    let emby_compact_page_body: Value = emby_compact_page.json().await?;
+    assert_eq!(
+        emby_compact_page_body["Items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(
+        emby_compact_page_body["Items"][0]
+            .get("MediaSources")
+            .is_none()
+    );
+
+    let emby_latest = client
+        .get(format!(
+            "{base_url}/Users/{}/Items/Latest?ParentId={}&Limit=2",
+            admin.id, emby_library_id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(emby_latest.status(), reqwest::StatusCode::OK);
+    let emby_latest_body: Value = emby_latest.json().await?;
+    let emby_latest_items = emby_latest_body
+        .as_array()
+        .ok_or("Emby latest items should be returned as a bare array")?;
+    assert_eq!(emby_latest_items.len(), 2);
+    assert_eq!(emby_latest_items[0]["Name"], "Alpha Movie");
+    assert_eq!(emby_latest_items[0]["ParentId"], emby_alpha_parent_id);
+    assert_eq!(emby_latest_items[0]["PrimaryImageItemId"], emby_item_id);
+    assert_eq!(
+        emby_latest_items[0]["ImageTags"]["Primary"],
+        alpha_poster_id
+    );
+
+    let detail = client
+        .get(format!(
+            "{base_url}/Items/{emby_item_id}?api_key={admin_token}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(detail.status(), reqwest::StatusCode::OK);
+    let detail_body: Value = detail.json().await?;
+    assert_eq!(detail_body["Id"], emby_item_id);
+    assert_eq!(detail_body["Name"], "Alpha Movie");
+    assert_eq!(detail_body["ProductionYear"], 2020);
+    assert_eq!(detail_body["PrimaryImageItemId"], emby_item_id);
+    assert_eq!(detail_body["ImageTags"]["Primary"], alpha_poster_id);
+    assert_eq!(
+        detail_body["PrimaryImageAspectRatio"].as_f64(),
+        Some(2.0 / 3.0)
+    );
+    sqlx::query("UPDATE media_items SET added_at = ?, updated_at = ? WHERE id = ?")
+        .bind(1_700_000_000_i64)
+        .bind(1_700_000_100_i64)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+
+    let user_scoped_detail = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items/{emby_item_id}?Fields=BasicSyncInfo%2CPrimaryImageAspectRatio%2CProductionYear%2CCommunityRating%2CPremiereDate%2CChildCount%2CRunTimeTicks%2CMediaSources%2CChapters%2CDateCreated%2CDateLastSaved%2CDateModified%2CCanDownload%2CCanDelete",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(user_scoped_detail.status(), reqwest::StatusCode::OK);
+    let user_scoped_detail_body: Value = user_scoped_detail.json().await?;
+    assert_eq!(user_scoped_detail_body["Id"], emby_item_id);
+    assert_eq!(user_scoped_detail_body["Name"], "Alpha Movie");
+    assert_eq!(user_scoped_detail_body["CanDelete"], true);
+    assert!(user_scoped_detail_body["MediaSources"].is_array());
+    assert_eq!(
+        user_scoped_detail_body["PrimaryImageAspectRatio"].as_f64(),
+        Some(2.0 / 3.0)
+    );
+    assert_eq!(
+        user_scoped_detail_body["DateCreated"],
+        "2023-11-14T22:13:20.0000000Z"
+    );
+    assert_eq!(
+        user_scoped_detail_body["DateLastSaved"],
+        "2023-11-14T22:15:00.0000000Z"
+    );
+    assert_eq!(
+        user_scoped_detail_body["DateModified"],
+        "2023-11-14T22:15:00.0000000Z"
+    );
+    assert!(user_scoped_detail_body["MediaStreams"].is_array());
+    assert_eq!(user_scoped_detail_body["MediaStreams"][0]["Width"], 1920);
+    assert_eq!(user_scoped_detail_body["MediaStreams"][0]["BitDepth"], 8);
+    assert_eq!(
+        user_scoped_detail_body["MediaStreams"][0]["AverageFrameRate"],
+        24
+    );
+    assert!(
+        (user_scoped_detail_body["MediaStreams"][0]["RealFrameRate"]
+            .as_f64()
+            .ok_or("missing numeric real frame rate")?
+            - (24_000.0 / 1_001.0))
+            .abs()
+            < 0.000_001
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaStreams"][0]["IsInterlaced"],
+        false
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaStreams"][1]["SampleRate"],
+        48_000
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaSources"][0]["MediaStreams"][0]["Width"],
+        1920
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaSources"][0]["ItemId"],
+        emby_item_id
+    );
+    assert_eq!(
+        user_scoped_detail_body["MediaSources"][0]["DefaultAudioStreamIndex"],
+        1
+    );
+    assert!(user_scoped_detail_body.get("CollectionType").is_none());
+    assert!(user_scoped_detail_body.get("SeasonId").is_none());
+    assert_eq!(user_scoped_detail_body["People"][0]["Id"], "9");
+    assert_eq!(user_scoped_detail_body["People"][0]["Role"], "角色甲");
+    assert_eq!(user_scoped_detail_body["People"][0]["Type"], "Person");
+    assert_eq!(user_scoped_detail_body["People"][1]["Id"], "88");
+    assert_eq!(user_scoped_detail_body["People"][1]["Name"], "导演甲");
+    assert_eq!(user_scoped_detail_body["People"][1]["Type"], "Director");
+    assert_eq!(user_scoped_detail_body["People"][2]["Id"], "99");
+    assert_eq!(user_scoped_detail_body["People"][2]["Name"], "编剧甲");
+    assert_eq!(user_scoped_detail_body["People"][2]["Type"], "Writer");
+    assert!(user_scoped_detail_body["People"][3]["Id"].is_string());
+    assert!(
+        !user_scoped_detail_body["People"][3]["Id"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty()
+    );
+
+    let path_media_source_detail = client
+        .get(format!(
+            "{base_url}/Items/{item_id}?Fields=Path,MediaSources"
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(path_media_source_detail.status(), reqwest::StatusCode::OK);
+    let path_media_source_detail_body: Value = path_media_source_detail.json().await?;
+    assert!(path_media_source_detail_body["MediaSources"].is_array());
+    assert_eq!(
+        path_media_source_detail_body["Path"],
+        format!("/media/{}/Alpha Movie.mkv", library.id)
+    );
+    assert!(
+        path_media_source_detail_body.get("People").is_none(),
+        "path/media-source detail lookups should not build the heavy cast payload"
+    );
+
+    // Filmly/网易爆米花 sends ShareLevel as a capability hint, while still
+    // requiring the complete detail payload needed to start playback.
+    let popcorn_detail = client
+        .get(format!(
+            "{base_url}/emby/Users/{}/Items/{item_id}?Fields=ShareLevel",
+            admin.id
+        ))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(popcorn_detail.status(), reqwest::StatusCode::OK);
+    let popcorn_detail_body: Value = popcorn_detail.json().await?;
+    assert_eq!(popcorn_detail_body["Id"], emby_item_id);
+    assert!(popcorn_detail_body["MediaSources"].is_array());
+    assert_eq!(
+        popcorn_detail_body["MediaSources"][0]["ItemId"],
+        emby_item_id
+    );
+    assert_eq!(popcorn_detail_body["SupportsSync"], true);
+    assert_eq!(popcorn_detail_body["RunTimeTicks"], 75600000000_i64);
+    // The Android filmly client maps the standard Emby detail scaffolding as
+    // non-null; empty collections and stable identifiers keep the DTO parseable.
+    assert_eq!(popcorn_detail_body["CanDelete"], true);
+    assert_eq!(popcorn_detail_body["LockData"], false);
+    assert_eq!(popcorn_detail_body["LockedFields"], serde_json::json!([]));
+    assert_eq!(
+        popcorn_detail_body["ExternalUrls"],
+        json!([{ "Name": "Website", "Url": "https://example.com/movie" }])
+    );
+    assert_eq!(
+        popcorn_detail_body["RemoteTrailers"],
+        json!([{ "Url": "https://example.com/trailer", "Name": "Trailer 1" }])
+    );
+    assert_eq!(popcorn_detail_body["Taglines"], json!(["本地标语"]));
+    assert_eq!(popcorn_detail_body["Genres"], json!(["动作"]));
+    assert_eq!(popcorn_detail_body["GenreItems"][0]["Name"], "动作");
+    assert!(popcorn_detail_body["GenreItems"][0]["Id"].is_string());
+    assert_eq!(popcorn_detail_body["Studios"][0]["Name"], "本地影业");
+    assert!(popcorn_detail_body["Studios"][0]["Id"].is_string());
+    assert_eq!(popcorn_detail_body["TagItems"], serde_json::json!([]));
+    assert_eq!(popcorn_detail_body["LocalTrailerCount"], 0);
+    assert_eq!(popcorn_detail_body["PartCount"], 1);
+    assert_eq!(popcorn_detail_body["ForcedSortName"], "alpha movie");
+    assert_eq!(popcorn_detail_body["DisplayPreferencesId"], emby_item_id);
+    assert_eq!(popcorn_detail_body["PresentationUniqueKey"], emby_item_id);
+    assert_eq!(popcorn_detail_body["Width"], 1920);
+    assert_eq!(popcorn_detail_body["Height"], 1080);
+    assert!(popcorn_detail_body["Etag"].is_string());
+    assert!(!popcorn_detail_body["Etag"].as_str().unwrap().is_empty());
+    assert!(popcorn_detail_body["DateCreated"].is_string());
+    assert!(popcorn_detail_body["DateModified"].is_string());
+    assert!(popcorn_detail_body["Path"].is_string());
+    assert_eq!(popcorn_detail_body["OfficialRating"], "PG-13");
+    assert_eq!(popcorn_detail_body["CommunityRating"], 8.1);
+    assert_eq!(popcorn_detail_body["OriginalLanguage"], "zh");
+    assert_eq!(popcorn_detail_body["Status"], "Released");
+    assert_eq!(popcorn_detail_body["ProviderIds"]["Tmdb"], "12345");
+
+    let person_image_tag = user_scoped_detail_body["People"][0]["PrimaryImageTag"]
+        .as_str()
+        .ok_or("missing person image tag")?;
+
+    let person_image_response = client
+        .get(format!("{base_url}/emby/Persons/9/Images/Primary"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(person_image_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(person_image_response.headers()["content-type"], "image/png");
+    assert_eq!(person_image_response.bytes().await?.as_ref(), PNG_1X1);
+
+    let person_name_image_response = client
+        .get(format!("{base_url}/emby/Persons/演员甲/Images/Primary"))
+        .header("X-Emby-Token", &admin_token)
+        .send()
+        .await?;
+    assert_eq!(person_name_image_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(person_name_image_response.bytes().await?.as_ref(), PNG_1X1);
+
+    let person_item_image_url = format!(
+        "{base_url}/emby/Items/9/Images/Primary?tag={person_image_tag}&maxWidth=183&maxHeight=273"
+    );
+    let person_item_image_response = client.get(&person_item_image_url).send().await?;
+    assert_eq!(person_item_image_response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        person_item_image_response.headers()["content-type"],
+        "image/png"
+    );
+    assert_eq!(person_item_image_response.bytes().await?.as_ref(), PNG_1X1);
+
+    let person_item_image_head = client.head(person_item_image_url).send().await?;
+    assert_eq!(person_item_image_head.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        person_item_image_head.headers()["content-type"],
+        "image/png"
+    );
+
+    let person_item_detail_url = format!("{base_url}/emby/Items/9?api_key={admin_token}");
+    let person_item_detail_response = client.get(&person_item_detail_url).send().await?;
+    assert_eq!(
+        person_item_detail_response.status(),
+        reqwest::StatusCode::OK
+    );
+    let person_item_detail_body: serde_json::Value = person_item_detail_response.json().await?;
+    assert_eq!(person_item_detail_body["Id"], "9");
+    assert_eq!(person_item_detail_body["Name"], "演员甲");
+    assert_eq!(person_item_detail_body["Type"], "Person");
+    assert!(person_item_detail_body["ImageTags"]["Primary"].is_string());
+    assert_eq!(person_item_detail_body["BackdropImageTags"], json!([]));
+
+    let person_item_detail_head = client.head(&person_item_detail_url).send().await?;
+    assert_eq!(person_item_detail_head.status(), reqwest::StatusCode::OK);
+
+    let person_item_untagged_image = client
+        .get(format!(
+            "{base_url}/emby/Items/9/Images/Primary?api_key={admin_token}"
+        ))
+        .send()
+        .await?;
+    assert_eq!(person_item_untagged_image.status(), reqwest::StatusCode::OK);
+    assert_eq!(person_item_untagged_image.bytes().await?.as_ref(), PNG_1X1);
+
+    let viewer_login = client
+        .post(format!("{base_url}/Users/AuthenticateByName"))
+        .header(
+            AUTHORIZATION,
+            r#"Emby Client="LuxTest", Device="Mac", DeviceId="viewer-device", Version="1""#,
+        )
+        .json(&json!({ "Username": "viewer", "Pw": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_token = viewer_login.json::<Value>().await?["AccessToken"]
+        .as_str()
+        .ok_or("missing viewer token")?
+        .to_owned();
+    let forbidden = client
+        .get(format!("{base_url}/Users/{}/Items", admin.id))
+        .header("X-Emby-Token", &viewer_token)
+        .send()
+        .await?;
+    assert_eq!(forbidden.status(), reqwest::StatusCode::FORBIDDEN);
+
+    let viewer_web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(viewer_web_login.headers(), "lux_session"),
+        cookie_value(viewer_web_login.headers(), "lux_csrf")
+    );
+    let viewer_home = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(viewer_home.status(), reqwest::StatusCode::OK);
+    let viewer_home_body: Value = viewer_home.json().await?;
+    assert_eq!(viewer_home_body["recentlyAddedTotal"], 2);
+    let viewer_library_ids = viewer_home_body["libraries"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|library| library["id"].as_str())
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        viewer_library_ids,
+        [library.id.to_string(), series_library.id.to_string()]
+            .into_iter()
+            .collect()
+    );
+
+    let latest_batch = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[
+            ("libraryId", series_library.id.to_string()),
+            ("libraryId", library.id.to_string()),
+        ])
+        .send()
+        .await?;
+    let latest_batch_status = latest_batch.status();
+    let latest_batch_text = latest_batch.text().await?;
+    assert_eq!(
+        latest_batch_status,
+        reqwest::StatusCode::OK,
+        "{latest_batch_text}"
+    );
+    let latest_batch_body: Value = serde_json::from_str(&latest_batch_text)?;
+    assert_eq!(
+        latest_batch_body["libraries"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][0]["libraryId"],
+        series_library.id.to_string()
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][0]["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["libraryId"],
+        library.id.to_string()
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"][0]["title"],
+        "Alpha Movie"
+    );
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"][1]["title"],
+        "Beta Movie"
+    );
+
+    let movie_latest = client
+        .get(format!("{base_url}/api/v1/libraries/{}/latest", library.id))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(movie_latest.status(), reqwest::StatusCode::OK);
+    let movie_latest_body: Value = movie_latest.json().await?;
+    assert_eq!(
+        latest_batch_body["libraries"][1]["items"],
+        movie_latest_body["items"]
+    );
+
+    let empty_latest = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/latest",
+            series_library.id
+        ))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(empty_latest.status(), reqwest::StatusCode::OK);
+    let empty_latest_body: Value = empty_latest.json().await?;
+    assert_eq!(
+        latest_batch_body["libraries"][0]["items"],
+        empty_latest_body["items"]
+    );
+
+    let duplicate_latest_batch = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[
+            ("libraryId", library.id.to_string()),
+            ("libraryId", library.id.to_string()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(duplicate_latest_batch.status(), reqwest::StatusCode::OK);
+    let duplicate_latest_batch_body: Value = duplicate_latest_batch.json().await?;
+    assert_eq!(
+        duplicate_latest_batch_body["libraries"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+
+    let missing_latest_batch_ids = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(
+        missing_latest_batch_ids.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let invalid_latest_batch_id = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[("libraryId", "invalid")])
+        .send()
+        .await?;
+    assert_eq!(
+        invalid_latest_batch_id.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    let excessive_ids = (0..101)
+        .map(|_| ("libraryId", library.id.to_string()))
+        .collect::<Vec<_>>();
+    let excessive_latest_batch_ids = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&excessive_ids)
+        .send()
+        .await?;
+    assert_eq!(
+        excessive_latest_batch_ids.status(),
+        reqwest::StatusCode::BAD_REQUEST
+    );
+
+    sqlx::query(
+        "INSERT INTO user_library_access (user_id, library_id, can_view)
+         VALUES (?, ?, 1)",
+    )
+    .bind(viewer.id.to_string())
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE users SET library_access_mode = 'SELECTED' WHERE id = ?")
+        .bind(viewer.id.to_string())
+        .execute(database.pool())
+        .await?;
+    let mixed_access_latest_batch = client
+        .get(format!("{base_url}/api/v1/home/libraries/latest"))
+        .header(COOKIE, &viewer_cookies)
+        .query(&[
+            ("libraryId", library.id.to_string()),
+            ("libraryId", series_library.id.to_string()),
+        ])
+        .send()
+        .await?;
+    assert_eq!(
+        mixed_access_latest_batch.status(),
+        reqwest::StatusCode::FORBIDDEN
+    );
+
+    let web_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(web_login.headers(), "lux_session"),
+        cookie_value(web_login.headers(), "lux_csrf")
+    );
+    let lux_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(lux_page.status(), reqwest::StatusCode::OK);
+    let lux_page_body: Value = lux_page.json().await?;
+    assert_eq!(lux_page_body["total"], 2);
+    assert_eq!(lux_page_body["pageSize"], 1);
+    assert_eq!(lux_page_body["items"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        lux_page_body["items"][0]["userData"]["lastPlayedAt"],
+        Value::Null
+    );
+
+    let recent_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=DateCreated&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(recent_page.status(), reqwest::StatusCode::OK);
+    let recent_page_body: Value = recent_page.json().await?;
+    assert_eq!(recent_page_body["items"][0]["title"], "Alpha Movie");
+
+    let release_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=PremiereDate&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(release_page.status(), reqwest::StatusCode::OK);
+    let release_page_body: Value = release_page.json().await?;
+    assert_eq!(release_page_body["items"][0]["title"], "Alpha Movie");
+
+    let release_page_ascending = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=PremiereDate&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(release_page_ascending.status(), reqwest::StatusCode::OK);
+    let release_page_ascending_body: Value = release_page_ascending.json().await?;
+    assert_eq!(
+        release_page_ascending_body["items"][0]["title"],
+        "Beta Movie"
+    );
+
+    let rating_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&sort_by=CommunityRating&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(rating_page.status(), reqwest::StatusCode::OK);
+    let rating_page_body: Value = rating_page.json().await?;
+    assert_eq!(rating_page_body["items"][0]["title"], "Alpha Movie");
+
+    sqlx::query("UPDATE media_items SET rating = NULL WHERE id = ?")
+        .bind(&beta_item_id)
+        .execute(database.pool())
+        .await?;
+    let unrated_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=2&sort_by=CommunityRating&sort_order=Descending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(unrated_page.status(), reqwest::StatusCode::OK);
+    let unrated_page_body: Value = unrated_page.json().await?;
+    assert_eq!(unrated_page_body["items"][0]["title"], "Alpha Movie");
+    assert_eq!(unrated_page_body["items"][1]["title"], "Beta Movie");
+
+    let favorite_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&is_favorite=true",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(favorite_page.status(), reqwest::StatusCode::OK);
+    let favorite_page_body: Value = favorite_page.json().await?;
+    assert_eq!(favorite_page_body["total"], 1);
+    assert_eq!(favorite_page_body["items"][0]["title"], "Beta Movie");
+
+    let full_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=2&sort_by=Name&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(full_page.status(), reqwest::StatusCode::OK);
+    let full_page_body: Value = full_page.json().await?;
+    assert!(
+        full_page_body["items"][0].get("mediaSources").is_some(),
+        "the default projection keeps full media sources"
+    );
+    assert!(full_page_body["items"][0].get("overview").is_some());
+
+    let card_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=2&sort_by=Name&sort_order=Ascending&fields=card",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(card_page.status(), reqwest::StatusCode::OK);
+    let card_page_body: Value = card_page.json().await?;
+    let card = &card_page_body["items"][0];
+    for field in [
+        "id",
+        "libraryId",
+        "itemType",
+        "title",
+        "addedAt",
+        "metadataPending",
+        "localMetadataPending",
+    ] {
+        assert!(card.get(field).is_some(), "card projection lacks {field}");
+    }
+    for field in ["productionYear", "rating", "runtimeTicks"] {
+        let full_value = full_page_body["items"][0]
+            .get(field)
+            .cloned()
+            .unwrap_or(Value::Null);
+        let card_value = card.get(field).cloned().unwrap_or(Value::Null);
+        assert_eq!(
+            card_value, full_value,
+            "card field {field} diverges from full DTO"
+        );
+    }
+    let full_sources = full_page_body["items"][0]["mediaSources"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let full_default_duration = full_sources
+        .iter()
+        .find(|source| source["isDefault"] == true)
+        .or_else(|| full_sources.first())
+        .and_then(|source| source["durationTicks"].as_i64());
+    assert_eq!(
+        card["defaultDurationTicks"].as_i64(),
+        full_default_duration,
+        "card defaultDurationTicks diverges from the default source"
+    );
+    for image_type in ["poster", "fanart", "thumb", "logo"] {
+        let full_value = &full_page_body["items"][0]["imageTags"][image_type];
+        if !full_value.is_null() {
+            assert_eq!(
+                &card["imageTags"][image_type], full_value,
+                "card image tag {image_type} diverges from full DTO"
+            );
+        }
+    }
+    assert!(card["userData"].is_object());
+    assert_eq!(
+        card["userData"]["positionTicks"].as_i64().unwrap_or(0),
+        full_page_body["items"][0]["userData"]["positionTicks"]
+            .as_i64()
+            .unwrap_or(0)
+    );
+    assert!(card.get("mediaSources").is_none());
+    assert!(card.get("overview").is_none());
+    assert!(card.get("sortTitle").is_none());
+    assert!(card.get("providerIds").is_none());
+    assert_eq!(card["id"], full_page_body["items"][0]["id"]);
+
+    let invalid_fields = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?fields=unknown",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(invalid_fields.status(), reqwest::StatusCode::BAD_REQUEST);
+
+    let count_skipped = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?pageSize=1&fields=card&count=false&sort_by=Name&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(count_skipped.status(), reqwest::StatusCode::OK);
+    let count_skipped_body: Value = count_skipped.json().await?;
+    assert_eq!(
+        count_skipped_body["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(count_skipped_body.get("total").is_none());
+    assert_eq!(count_skipped_body["hasNext"], true);
+
+    let last_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?page=3&pageSize=2&fields=card&count=false&sort_by=Name&sort_order=Ascending",
+            library.id
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(last_page.status(), reqwest::StatusCode::OK);
+    let last_page_body: Value = last_page.json().await?;
+    assert!(last_page_body.get("total").is_none());
+    assert_eq!(last_page_body["hasNext"], false);
+
+    let favorites = client
+        .get(format!("{base_url}/api/v1/favorites?pageSize=1"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(favorites.status(), reqwest::StatusCode::OK);
+    let favorites_body: Value = favorites.json().await?;
+    assert_eq!(favorites_body["total"], 1);
+    assert_eq!(favorites_body["items"][0]["title"], "Beta Movie");
+
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, last_played_at)
+         VALUES (?, ?, ?, ?), (?, ?, ?, ?)
+         ON CONFLICT(user_id, item_id) DO UPDATE SET
+             position_ticks = excluded.position_ticks,
+             is_played = 0,
+             last_played_at = excluded.last_played_at",
+    )
+    .bind(admin.id.to_string())
+    .bind(&item_id)
+    .bind(1_700_000_000_i64)
+    .bind(400_i64)
+    .bind(admin.id.to_string())
+    .bind(&beta_item_id)
+    .bind(600_000_000_i64)
+    .bind(Option::<i64>::None)
+    .execute(database.pool())
+    .await?;
+    let pending_sidecar_job = ScanJobService::new(database.clone())
+        .create_movie_scan_job(library.id)
+        .await?;
+    sqlx::query(
+        "INSERT INTO scan_job_targets (
+             job_id, target_type, target_id, item_id, change_kind,
+             probe_state, metadata_state, thumbnail_state
+         ) VALUES (?, 'ITEM', ?, ?, 'NEW', 'SKIPPED', 'PENDING', 'PENDING')",
+    )
+    .bind(&pending_sidecar_job.id)
+    .bind(&item_id)
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let home = client
+        .get(format!("{base_url}/api/v1/home"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(home.status(), reqwest::StatusCode::OK);
+    let home_body: Value = home.json().await?;
+    assert_eq!(home_body["recentlyAddedTotal"], 2);
+    assert_eq!(home_body["continueWatchingTotal"], 1);
+    assert_eq!(home_body["continueWatching"][0]["id"], item_id);
+    assert_eq!(home_body["continueWatching"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        home_body["continueWatching"][0]["imageTags"]["poster"],
+        alpha_poster_id
+    );
+    assert_eq!(
+        home_body["continueWatching"][0]["imageTags"]["fanart"],
+        alpha_fanart_id
+    );
+    assert_eq!(
+        home_body["continueWatching"][0]["userData"]["positionTicks"],
+        1_700_000_000_i64
+    );
+    assert_eq!(
+        home_body["continueWatching"][0]["userData"]["lastPlayedAt"],
+        400_i64
+    );
+    assert_eq!(home_body["recentlyAdded"].as_array().map(Vec::len), Some(2));
+    assert_eq!(home_body["recentlyAdded"][0]["title"], "Alpha Movie");
+    assert_eq!(home_body["recentlyAdded"][1]["title"], "Beta Movie");
+    assert_eq!(home_body["recentlyAdded"][0]["localMetadataPending"], true);
+    assert_eq!(
+        home_body["recentlyAdded"][0]["userData"]["positionTicks"],
+        1_700_000_000_i64
+    );
+    assert_eq!(
+        home_body["recentlyAdded"][1]["userData"]["lastPlayedAt"],
+        Value::Null
+    );
+    let continue_watching = client
+        .get(format!("{base_url}/api/v1/continue-watching?pageSize=10"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(continue_watching.status(), reqwest::StatusCode::OK);
+    let continue_watching_body: Value = continue_watching.json().await?;
+    assert_eq!(
+        continue_watching_body["items"][0]["userData"]["lastPlayedAt"],
+        400_i64
+    );
+    assert_eq!(home_body["libraries"].as_array().map(Vec::len), Some(2));
+    let home_movie_library = home_body["libraries"]
+        .as_array()
+        .and_then(|items| {
+            items
+                .iter()
+                .find(|item| item["id"] == library.id.to_string())
+        })
+        .ok_or("missing movie library in home")?;
+    assert_eq!(
+        home_movie_library["latest"].as_array().map(Vec::len),
+        Some(2)
+    );
+    assert_eq!(home_movie_library["latest"][0]["title"], "Alpha Movie");
+    assert_eq!(
+        home_movie_library["latest"][0]["userData"]["positionTicks"],
+        1_700_000_000_i64
+    );
+    assert_eq!(
+        home_movie_library["latest"][0]["imageTags"]["poster"],
+        alpha_poster_id
+    );
+    assert_eq!(home_movie_library["latest"][1]["title"], "Beta Movie");
+    assert_eq!(home_body["recommended"].as_array().map(Vec::len), Some(2));
+    assert!(
+        home_body["recommended"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["title"] == "Beta Movie"))
+    );
+
+    let emby_resume = client
+        .get(format!("{base_url}/Users/{}/Items/Resume", admin.id))
+        .header("X-Emby-Token", &admin_token)
+        .query(&[("Limit", "10")])
+        .send()
+        .await?;
+    assert_eq!(emby_resume.status(), reqwest::StatusCode::OK);
+    let emby_resume_body: Value = emby_resume.json().await?;
+    assert_eq!(emby_resume_body["TotalRecordCount"], 1);
+    assert_eq!(emby_resume_body["Items"][0]["Id"], emby_item_id);
+    assert_eq!(
+        emby_resume_body["Items"][0]["PrimaryImageItemId"],
+        emby_item_id
+    );
+    assert_eq!(
+        emby_resume_body["Items"][0]["ImageTags"]["Primary"],
+        alpha_poster_id
+    );
+
+    let lux_detail = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(lux_detail.status(), reqwest::StatusCode::OK);
+    let lux_detail_body: Value = lux_detail.json().await?;
+    assert_eq!(lux_detail_body["id"], item_id);
+    assert_eq!(lux_detail_body["userData"]["lastPlayedAt"], 400_i64);
+    let stored_added_at: i64 = sqlx::query_scalar("SELECT added_at FROM media_items WHERE id = ?")
+        .bind(&item_id)
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(lux_detail_body["addedAt"], stored_added_at);
+    assert_eq!(lux_detail_body["productionYear"], 2020);
+    assert_eq!(lux_detail_body["rating"], 8.1);
+    assert_eq!(lux_detail_body["ratingSource"], "NFO");
+    assert_eq!(lux_detail_body["providerIds"]["tmdb"], "12345");
+    assert_eq!(lux_detail_body["nfo"]["tagline"], "本地标语");
+    assert_eq!(lux_detail_body["nfo"]["genres"][0], "动作");
+    assert_eq!(lux_detail_body["nfo"]["directors"][0]["name"], "导演甲");
+    assert_eq!(lux_detail_body["nfo"]["writers"][0]["name"], "编剧甲");
+    assert_eq!(
+        lux_detail_body["nfo"]["trailers"][0],
+        "https://example.com/trailer"
+    );
+    assert_eq!(
+        lux_detail_body["mediaSources"].as_array().map(Vec::len),
+        Some(1)
+    );
+
+    // Malformed database-derived NFO JSON must not take down item detail: degrade
+    // gracefully (nfo null) and clear the cache row for background rebuilding.
+    // The detail request must not parse the source NFO file.
+    sqlx::query(
+        "UPDATE media_item_nfo_cache
+         SET json = ?, bytes = length(CAST(? AS BLOB)), updated_at = unixepoch()
+         WHERE item_id = ?",
+    )
+    .bind("{not-valid-json")
+    .bind("{not-valid-json")
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let lux_detail_malformed = client
+        .get(format!("{base_url}/api/v1/items/{item_id}"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(
+        lux_detail_malformed.status(),
+        reqwest::StatusCode::OK,
+        "malformed nfo_metadata_json must not take down item detail"
+    );
+    let lux_detail_malformed_body: Value = lux_detail_malformed.json().await?;
+    assert_eq!(lux_detail_malformed_body["id"], item_id);
+    assert_eq!(lux_detail_malformed_body["title"], "Alpha Movie");
+    assert_eq!(lux_detail_malformed_body["productionYear"], 2020);
+    assert!(
+        lux_detail_malformed_body["nfo"].is_null(),
+        "malformed cached NFO must degrade to null without failing the response"
+    );
+    assert_eq!(
+        lux_detail_malformed_body["mediaSources"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let cleared_nfo_json: Option<String> =
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_optional(database.pool())
+            .await?;
+    assert!(
+        cleared_nfo_json.is_none(),
+        "malformed nfo_metadata_json cache row must be cleared for background rebuilding"
+    );
+
+    assert_ne!(admin.id, viewer.id);
+    server.abort();
+    Ok(())
+}
+
+#[tokio::test]
+async fn continue_watching_orders_recent_progress_before_legacy_null_dates()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("admin", "Admin", "correct password")
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Resume Ordering", LibraryKind::Movie, false)
+        .await?;
+
+    for index in 0..10 {
+        let item_id = uuid::Uuid::now_v7().to_string();
+        let title = format!("Legacy Resume Movie {index:02}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, runtime_ticks,
+                identification_status, has_available_source
+            ) VALUES (?, ?, 'MOVIE', ?, ?, 36000000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .bind(&title)
+        .bind(title.to_lowercase())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                user_id, item_id, position_ticks, is_played, last_played_at
+            ) VALUES (?, ?, 6000000000, 0, NULL)",
+        )
+        .bind(admin.id.to_string())
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let fresh_item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, runtime_ticks,
+            identification_status, has_available_source
+        ) VALUES (?, ?, 'MOVIE', 'Fresh Resume Movie', 'fresh resume movie',
+                  36000000000, 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&fresh_item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+            user_id, item_id, position_ticks, is_played, last_played_at
+        ) VALUES (?, ?, 6000000000, 0, 100)",
+    )
+    .bind(admin.id.to_string())
+    .bind(&fresh_item_id)
+    .execute(database.pool())
+    .await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let page = catalog
+        .list_continue_watching(
+            AccessPrincipal::new(UserId::new(), true),
+            &admin.id.to_string(),
+            0,
+            10,
+        )
+        .await?;
+
+    assert_eq!(page.total, 11);
+    assert_eq!(page.items.len(), 10);
+    assert_eq!(page.items[0].id, fresh_item_id);
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn homevideo_catalog_folders_are_browsable() -> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    let admin = setup.complete("admin", "Admin", "correct password").await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Other videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let root = temp_dir.path().join("Other videos");
+    tokio::fs::create_dir_all(root.join("Trips/2024")).await?;
+    tokio::fs::create_dir_all(root.join("Trips/Season 01")).await?;
+    tokio::fs::write(root.join("Movie (2024).mkv"), b"root video").await?;
+    tokio::fs::write(
+        root.join("Trips/2024/Movie (2024).mkv"),
+        b"movie-shaped clip",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Trips/Season 01/Show S01E01.mkv"),
+        b"episode-shaped clip",
+    )
+    .await?;
+    LibraryService::new(database.clone())
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    jobs.run_to_completion(&job.id, 100, None).await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, parent_id, title, sort_title, identification_status
+         ) VALUES ('empty-folder', ?, 'FOLDER', ?, 'Empty folder', 'empty folder', 'LOCAL_CONFIRMED')",
+    )
+    .bind(library.id.to_string())
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let user_id = admin.id.to_string();
+    let counts = catalog
+        .count_item_types(AccessPrincipal::new(admin.id, true), &user_id, None)
+        .await?;
+    assert_eq!(counts.movie_count, 0);
+    assert_eq!(counts.series_count, 0);
+    assert_eq!(counts.item_count, 3);
+
+    let web_auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(
+        config,
+        database.clone(),
+        setup,
+        web_auth,
+        emby_auth,
+    ));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .build()
+        .expect("test client");
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    assert_eq!(login.status(), reqwest::StatusCode::OK);
+    let session = cookie_value(login.headers(), "lux_session");
+
+    let root_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId=root&itemType=FOLDER,VIDEO&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(root_page.status(), reqwest::StatusCode::OK);
+    let root_page_body = root_page.json::<Value>().await?;
+    assert_eq!(root_page_body["total"], 2);
+    assert_eq!(root_page_body["pageSize"], 1);
+    let second_root_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId=root&itemType=FOLDER,VIDEO&page=2&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(second_root_page.status(), reqwest::StatusCode::OK);
+    let second_root_page_body = second_root_page.json::<Value>().await?;
+    assert_eq!(second_root_page_body["total"], 2);
+    assert_eq!(second_root_page_body["page"], 2);
+    assert_ne!(
+        root_page_body["items"][0]["id"],
+        second_root_page_body["items"][0]["id"]
+    );
+    let root_items = [
+        root_page_body["items"][0].clone(),
+        second_root_page_body["items"][0].clone(),
+    ];
+    assert!(root_items.iter().any(|item| item["itemType"] == "FOLDER"));
+    assert!(root_items.iter().any(|item| item["itemType"] == "VIDEO"));
+    let trips_id = root_items
+        .iter()
+        .find(|item| item["itemType"] == "FOLDER")
+        .and_then(|item| item["id"].as_str())
+        .ok_or("root Trips folder should be present")?
+        .to_owned();
+    let movie_only_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId=root&itemType=MOVIE&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(movie_only_page.status(), reqwest::StatusCode::OK);
+    let movie_only_page_body = movie_only_page.json::<Value>().await?;
+    assert_eq!(movie_only_page_body["total"], 0);
+
+    let trips_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId={trips_id}&itemType=FOLDER,VIDEO&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(trips_page.status(), reqwest::StatusCode::OK);
+    let trips_page_body = trips_page.json::<Value>().await?;
+    assert_eq!(trips_page_body["total"], 2);
+    assert!(trips_page_body["items"].as_array().is_some_and(|items| {
+        items
+            .iter()
+            .all(|item| item["itemType"] == "FOLDER" && item["parentId"] == trips_id)
+    }));
+    let year_folder_id = trips_page_body["items"]
+        .as_array()
+        .and_then(|items| items.iter().find(|item| item["title"] == "2024"))
+        .and_then(|item| item["id"].as_str())
+        .ok_or("Trips/2024 folder should be present")?
+        .to_owned();
+    let year_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId={year_folder_id}&itemType=FOLDER,VIDEO&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(year_page.status(), reqwest::StatusCode::OK);
+    let year_page_body = year_page.json::<Value>().await?;
+    assert_eq!(year_page_body["total"], 1);
+    assert_eq!(year_page_body["items"][0]["itemType"], "VIDEO");
+    assert_eq!(year_page_body["items"][0]["parentId"], year_folder_id);
+
+    let video_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?itemType=VIDEO&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(video_page.status(), reqwest::StatusCode::OK);
+    let video_page_body = video_page.json::<Value>().await?;
+    assert_eq!(video_page_body["total"], 3);
+    assert_eq!(video_page_body["pageSize"], 1);
+    assert_eq!(video_page_body["items"].as_array().map(Vec::len), Some(1));
+    assert_eq!(video_page_body["items"][0]["itemType"], "VIDEO");
+
+    let second_video_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?itemType=VIDEO&page=2&pageSize=1",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(second_video_page.status(), reqwest::StatusCode::OK);
+    let second_video_page_body = second_video_page.json::<Value>().await?;
+    assert_eq!(second_video_page_body["page"], 2);
+    assert_eq!(
+        second_video_page_body["items"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert_ne!(
+        second_video_page_body["items"][0]["id"],
+        video_page_body["items"][0]["id"]
+    );
+
+    let folder_page = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?itemType=FOLDER&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(folder_page.status(), reqwest::StatusCode::OK);
+    let folder_page_body = folder_page.json::<Value>().await?;
+    assert_eq!(folder_page_body["total"], 2);
+    assert!(
+        folder_page_body["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().all(|item| item["itemType"] == "FOLDER"))
+    );
+
+    let search = client
+        .get(format!("{base_url}/api/v1/search?q=Show"))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(search.status(), reqwest::StatusCode::OK);
+    let search_body = search.json::<Value>().await?;
+    assert_eq!(search_body["total"], 1);
+    assert_eq!(search_body["items"][0]["itemType"], "VIDEO");
+
+    let foreign_library = LibraryService::new(database.clone())
+        .create_library("Foreign videos", LibraryKind::HomeVideos, false)
+        .await?;
+    let foreign_root = temp_dir.path().join("Foreign videos");
+    tokio::fs::create_dir_all(foreign_root.join("Elsewhere")).await?;
+    tokio::fs::write(foreign_root.join("Elsewhere/Foreign clip.mkv"), b"foreign").await?;
+    LibraryService::new(database.clone())
+        .add_root(
+            foreign_library.id,
+            foreign_root.to_str().ok_or("non-utf8 foreign root")?,
+        )
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(foreign_library.id)
+        .await?;
+    let foreign_folder_id: String = sqlx::query_scalar(
+        "SELECT id FROM media_items WHERE library_id = ? AND item_type = 'FOLDER' AND title = 'Elsewhere'",
+    )
+    .bind(foreign_library.id.to_string())
+    .fetch_one(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET parent_id = ?
+         WHERE library_id = ? AND item_type = 'VIDEO' AND parent_id IS NULL",
+    )
+    .bind(&foreign_folder_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let cross_library_children = client
+        .get(format!(
+            "{base_url}/api/v1/libraries/{}/items?parentId={foreign_folder_id}&itemType=FOLDER,VIDEO&pageSize=100",
+            library.id
+        ))
+        .header(COOKIE, format!("lux_session={session}"))
+        .send()
+        .await?;
+    assert_eq!(cross_library_children.status(), reqwest::StatusCode::OK);
+    let cross_library_children_body = cross_library_children.json::<Value>().await?;
+    assert_eq!(cross_library_children_body["total"], 0);
+    assert_eq!(
+        cross_library_children_body["items"]
+            .as_array()
+            .map(Vec::len),
+        Some(0)
+    );
+
+    server.abort();
+    database.close().await;
+    Ok(())
+}
+
+/// The web grid reads `fields=card`, whose DTO renders the item columns, the image tags and the
+/// preferred source duration but no `mediaSources`, so the catalogue reads that page with the
+/// summary row projection instead of joining `media_streams`. The full projection must keep
+/// returning the same rows *and* the streams, including when a card page for the same cache key
+/// was loaded (and cached) first.
+#[tokio::test]
+async fn library_grid_card_page_keeps_the_full_page_streams()
+-> Result<(), Box<dyn std::error::Error>> {
+    use luxd::application::catalog::{CatalogFilter, CatalogItemProjection, CatalogSort};
+
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("admin", "Admin", "correct password")
+        .await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Grid Projection", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    let item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO library_roots (
+            id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('grid-projection-root', ?, '/grid', '/grid', 1, 1)",
+    )
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+            id, library_root_id, relative_path, entry_kind, size, modified_at,
+            last_seen_generation
+         ) VALUES ('grid-projection-file', 'grid-projection-root', 'Grid/grid.mkv',
+                   'FILE', 10, 10, 'gen')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+            id, library_id, item_type, title, sort_title, overview, runtime_ticks,
+            identification_status, has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Grid Movie', 'grid movie', 'Grid overview',
+                   7200000000, 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&item_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (
+            id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+            size, bitrate, duration_ticks, is_default, probe_status
+         ) VALUES ('grid-projection-source', ?, 'LOCAL_FILE', 'grid-projection-file',
+                   '1080p', 'mkv', 1000, 8000000, 7200000000, 1, 'READY')",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (
+            id, media_source_id, stream_index, stream_type, codec, language, title,
+            details_json, is_default
+         ) VALUES ('grid-projection-video', 'grid-projection-source', 0, 'VIDEO',
+                   'h264', 'eng', '1080p H264', '{\"Width\":\"1920\"}', 1),
+                  ('grid-projection-audio', 'grid-projection-source', 1, 'AUDIO',
+                   'aac', 'eng', 'AAC Stereo', '{\"Channels\":\"2\"}', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('grid-projection-poster', ?, 'POSTER', 0, '/grid/poster.jpg')",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+
+    let catalog = CatalogService::new(database.clone(), MediaAccessService::new(database.clone()));
+    let principal = AccessPrincipal::new(admin.id, true);
+    let filter = CatalogFilter {
+        sort_by: CatalogSort::Name,
+        include_total: false,
+        ..CatalogFilter::default()
+    };
+
+    let card_page = catalog
+        .list_library_items_in_scope_with_projection(
+            principal,
+            &library_id,
+            &filter,
+            None,
+            0,
+            10,
+            CatalogItemProjection::Card,
+        )
+        .await?;
+    assert_eq!(card_page.items.len(), 1);
+    let card_item = &card_page.items[0];
+    assert_eq!(card_item.id, item_id);
+    assert_eq!(
+        card_item.poster_image_tag.as_deref(),
+        Some("grid-projection-poster")
+    );
+    let card_source = card_item
+        .media_sources
+        .first()
+        .ok_or("the card page lost the media source it renders defaultDurationTicks from")?;
+    assert_eq!(card_source.duration_ticks, Some(7_200_000_000));
+    assert!(card_source.is_default);
+    assert!(
+        card_source.streams.is_empty(),
+        "the card projection must not read media streams"
+    );
+
+    // Same cache key apart from the projection: the full page must not be served the summary rows.
+    let full_page = catalog
+        .list_library_items_in_scope(principal, &library_id, &filter, None, 0, 10)
+        .await?;
+    assert_eq!(full_page.items.len(), 1);
+    let full_item = &full_page.items[0];
+    assert_eq!(full_item.id, card_item.id);
+    assert_eq!(full_item.poster_image_tag, card_item.poster_image_tag);
+    assert_eq!(full_item.fanart_image_tag, card_item.fanart_image_tag);
+    assert_eq!(full_item.thumb_image_tag, card_item.thumb_image_tag);
+    assert_eq!(full_item.logo_image_tag, card_item.logo_image_tag);
+    assert_eq!(full_item.overview, card_item.overview);
+    assert_eq!(full_item.media_sources.len(), card_item.media_sources.len());
+    let full_source = &full_item.media_sources[0];
+    assert_eq!(full_source.id, card_source.id);
+    assert_eq!(full_source.duration_ticks, card_source.duration_ticks);
+    assert_eq!(full_source.is_default, card_source.is_default);
+    assert_eq!(full_source.quality_label, card_source.quality_label);
+    assert_eq!(full_source.container, card_source.container);
+    assert_eq!(full_source.size, card_source.size);
+    assert_eq!(full_source.bitrate, card_source.bitrate);
+    assert_eq!(
+        full_source
+            .streams
+            .iter()
+            .map(|stream| (
+                stream.index,
+                stream.stream_type.as_str(),
+                stream.codec.as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        [(0, "VIDEO", Some("h264")), (1, "AUDIO", Some("aac"))]
+    );
+    assert_eq!(
+        full_source.streams[0]
+            .details
+            .get("Width")
+            .and_then(serde_json::Value::as_str),
+        Some("1920"),
+        "the full projection still hydrates details_json"
+    );
+
+    // The cached card page stays stream-free after the full page was loaded.
+    let card_again = catalog
+        .list_library_items_in_scope_with_projection(
+            principal,
+            &library_id,
+            &filter,
+            None,
+            0,
+            10,
+            CatalogItemProjection::Card,
+        )
+        .await?;
+    assert!(
+        card_again.items[0].media_sources[0].streams.is_empty(),
+        "the card page must keep the summary projection"
+    );
+
+    database.close().await;
+    Ok(())
+}
+
+fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let (pair, _) = value.split_once(';')?;
+            let (cookie_name, cookie_value) = pair.split_once('=')?;
+            (cookie_name == name).then(|| cookie_value.to_owned())
+        })
+        .expect("expected cookie")
+}

@@ -1,10 +1,13 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new().route("/api/v1/admin/health", get(admin_health))
 }
 
-pub(crate) async fn admin_health(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(crate) async fn admin_health(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
@@ -14,14 +17,12 @@ pub(crate) async fn admin_health(headers: HeaderMap, State(state): State<AppStat
     }
 }
 
-pub(crate) async fn admin_health_payload(state: &AppState) -> Result<Value, StatusCode> {
-    let Some(database) = state.database.as_ref() else {
-        return Err(StatusCode::SERVICE_UNAVAILABLE);
-    };
+pub(crate) async fn admin_health_payload(state: &ReadyAppState) -> Result<Value, StatusCode> {
+    let database = state.database();
     let report = admin_health_report(
         database,
         state.config_dir.as_deref(),
-        state.libraries.as_ref(),
+        Some(state.libraries()),
         &state.resources,
         &state.admin_health_probe_cache,
     )

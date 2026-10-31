@@ -13,6 +13,7 @@ import type {
   MediaImageStrategySettings,
   MediaScraperRole,
 } from "../../lib/api/types";
+import { LuxSelectField } from "../../components/ui";
 
 const levels: Array<{ key: MediaImageLevelKey; label: string }> = [
   { key: "movie", label: "电影" },
@@ -203,7 +204,7 @@ export function ImageLevelPolicyEditor({
             {level.key === "episode" ? (
               <label className="lux-level-policy-episode">
                 单集图片
-                <select
+                <LuxSelectField
                   aria-label={`${level.label}图片来源`}
                   value={levelSettings?.episodeImagePolicy ?? ""}
                   onChange={(event) =>
@@ -215,7 +216,7 @@ export function ImageLevelPolicyEditor({
                       {option.value === "" ? inheritLabel : option.label}
                     </option>
                   ))}
-                </select>
+                </LuxSelectField>
               </label>
             ) : null}
             <table className="lux-level-policy-table">
@@ -273,7 +274,7 @@ export function ImageLevelPolicyEditor({
                         </div>
                       </td>
                       <td>
-                        <select
+                        <LuxSelectField
                           aria-label={`${level.label}${type.label}来源`}
                           value={policy.sources?.join(",") ?? ""}
                           onChange={(event) =>
@@ -289,10 +290,10 @@ export function ImageLevelPolicyEditor({
                               {optionLabel(option)}
                             </option>
                           ))}
-                        </select>
+                        </LuxSelectField>
                       </td>
                       <td>
-                        <select
+                        <LuxSelectField
                           aria-label={`${level.label}${type.label}覆盖策略`}
                           value={policy.overwrite ?? ""}
                           onChange={(event) =>
@@ -309,12 +310,12 @@ export function ImageLevelPolicyEditor({
                               {optionLabel(option)}
                             </option>
                           ))}
-                        </select>
+                        </LuxSelectField>
                       </td>
                       <td>
-                        <select
+                        <LuxSelectField
                           aria-label={`${level.label}${type.label}张数`}
-                          value={policy.maxCount ?? ""}
+                          value={String(policy.maxCount ?? "")}
                           onChange={(event) =>
                             onChange(
                               updateArtworkPolicy(images, level.key, type.key, {
@@ -331,12 +332,12 @@ export function ImageLevelPolicyEditor({
                               {optionLabel(option)}
                             </option>
                           ))}
-                        </select>
+                        </LuxSelectField>
                       </td>
                       <td>
-                        <select
+                        <LuxSelectField
                           aria-label={`${level.label}${type.label}最小宽度`}
-                          value={policy.minWidth ?? ""}
+                          value={String(policy.minWidth ?? "")}
                           onChange={(event) =>
                             onChange(
                               updateArtworkPolicy(images, level.key, type.key, {
@@ -353,10 +354,10 @@ export function ImageLevelPolicyEditor({
                               {optionLabel(option)}
                             </option>
                           ))}
-                        </select>
+                        </LuxSelectField>
                       </td>
                       <td>
-                        <select
+                        <LuxSelectField
                           aria-label={`${level.label}${type.label}刮削器角色`}
                           value={policy.scraperRoles?.join(",") ?? ""}
                           onChange={(event) =>
@@ -372,7 +373,7 @@ export function ImageLevelPolicyEditor({
                               {optionLabel(option)}
                             </option>
                           ))}
-                        </select>
+                        </LuxSelectField>
                       </td>
                     </tr>
                   );

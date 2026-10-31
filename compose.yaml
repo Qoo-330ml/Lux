@@ -19,6 +19,15 @@ services:
     volumes:
       - ./config:/config:rw
       - ./media:/media:rw
+    # 服务端 GPU 转码需要把设备映射进容器，按平台取消对应注释后重启容器：
+    #
+    # Intel / AMD（VAAPI、QSV）：先确认宿主机存在 /dev/dri/renderD128，再映射整个 /dev/dri。
+    # devices:
+    #   - /dev/dri:/dev/dri
+    #
+    # NVIDIA（NVENC）：宿主机需安装驱动与 nvidia-container-toolkit，并为该服务启用 GPU。
+    # gpus: all
+    # runtime: nvidia
     restart: unless-stopped
 
   postgres:

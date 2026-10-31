@@ -120,7 +120,8 @@ import type {
   MediaActor,
   MediaItem,
   ItemMetadata,
-  ItemImage,
+  ItemImagesResponse,
+  ItemImageSelectResponse,
   ImageSearchResult,
   LoginBackgroundResponse,
   MetadataFieldName,
@@ -130,12 +131,17 @@ import type {
   PlaybackEventState,
   WebPlaybackCapabilities,
   WebPlaybackSession,
+  WebPlaybackSessionStats,
   WebPlaybackBootstrap,
+  AdminTranscodingStatus,
+  AdminTranscodingSessions,
+  AdminTranscodingHistoryPage,
   WebPlaybackTrackSelection,
   WebDanmakuInfo,
   SetupStatus,
   SetupDatabaseBackend,
   SetupDatabaseStatus,
+  SetupCompleteResult,
   MetadataRefreshMode,
   UserPlaybackSettings,
   UserPlaybackSettingsUpdate,
@@ -386,8 +392,11 @@ export class LuxApiClient {
     return body as T;
   }
 
-  setupStatus() {
-    return this.request<SetupStatus>("/api/v1/setup/status");
+  setupStatus(options: { signal?: AbortSignal } = {}) {
+    // The restart guide probes this endpoint while the process is down and needs
+    // a short per-probe timeout, so the signal is forwarded. Every other caller
+    // keeps calling setupStatus() with no argument.
+    return this.request<SetupStatus>("/api/v1/setup/status", { signal: options.signal });
   }
 
   setupDatabaseStatus() {
@@ -426,7 +435,7 @@ export class LuxApiClient {
     libraryKind?: LibraryKind;
     libraryRoot?: string;
   }) {
-    return this.request<{ user: LuxUser }>("/api/v1/setup/complete", {
+    return this.request<SetupCompleteResult>("/api/v1/setup/complete", {
       method: "POST",
       body: JSON.stringify(input),
     });
@@ -843,7 +852,7 @@ export class LuxApiClient {
   }
 
   itemImages(itemId: string) {
-    return this.request<{ images?: ItemImage[] }>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
+    return this.request<ItemImagesResponse>(`/api/v1/items/${encodeURIComponent(itemId)}/images`);
   }
 
   searchItemImages(itemId: string, input: { imageType: string; language: string; source: string }) {
@@ -854,7 +863,7 @@ export class LuxApiClient {
   }
 
   selectItemImage(itemId: string, input: { imageType: string; url: string; language?: string | null }) {
-    return this.request<{ image: ItemImage }>(
+    return this.request<ItemImageSelectResponse>(
       `/api/v1/items/${encodeURIComponent(itemId)}/images/select`,
       { method: "POST", body: JSON.stringify(input) },
     );
@@ -934,6 +943,41 @@ export class LuxApiClient {
   webPlaybackHeartbeat(sessionId: string) {
     return this.request<{ sessionId: string; expiresAt: number }>(
       `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}/heartbeat`,
+      { method: "POST", body: JSON.stringify({}) },
+    );
+  }
+
+  webPlaybackStats(sessionId: string, signal?: AbortSignal) {
+    return this.request<WebPlaybackSessionStats>(
+      `/api/v1/playback/sessions/${encodeURIComponent(sessionId)}/stats`,
+      { signal },
+    );
+  }
+
+  adminTranscodingSessions(signal?: AbortSignal) {
+    return this.request<AdminTranscodingSessions>(
+      "/api/v1/admin/transcoding/sessions",
+      { signal },
+    );
+  }
+
+  adminTranscodingHistory(page = 1, pageSize = 10, signal?: AbortSignal) {
+    return this.request<AdminTranscodingHistoryPage>(
+      `/api/v1/admin/transcoding/history?page=${page}&pageSize=${pageSize}`,
+      { signal },
+    );
+  }
+
+  stopAdminTranscodingSession(sessionId: string) {
+    return this.request<void>(
+      `/api/v1/admin/transcoding/sessions/${encodeURIComponent(sessionId)}`,
+      { method: "DELETE" },
+    );
+  }
+
+  probeAdminTranscoding() {
+    return this.request<{ transcodingStatus: AdminTranscodingStatus }>(
+      "/api/v1/admin/settings/transcoding/probe",
       { method: "POST", body: JSON.stringify({}) },
     );
   }
@@ -1079,10 +1123,10 @@ export class LuxApiClient {
     return this.request<AdminPluginStore>("/api/v1/admin/plugin-store");
   }
 
-  updateAdminPluginStore(url: string) {
+  updateAdminPluginStore(urls: string[]) {
     return this.request<AdminPluginStore>("/api/v1/admin/plugin-store", {
       method: "PUT",
-      body: JSON.stringify({ url }),
+      body: JSON.stringify({ urls }),
     });
   }
 

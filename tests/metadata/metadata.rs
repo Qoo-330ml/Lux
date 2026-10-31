@@ -1,0 +1,1308 @@
+use luxd::{
+    application::{
+        libraries::LibraryService,
+        metadata::{
+            ImageType, LocalImage, MetadataCandidate, MetadataEnricher, MetadataField,
+            MetadataSource, MetadataState, NfoMetadata, find_local_images, parse_nfo,
+        },
+        metadata_paths::{library_item_directory, people_directory},
+        nfo::{LocalNfoDetails, LocalNfoMetadataStore},
+        people::PeopleService,
+        scanner::{LibraryScanner, ScanJobService},
+    },
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
+};
+
+#[tokio::test]
+async fn scan_job_metadata_microbatch_isolates_a_broken_series_target()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Shows", LibraryKind::Series, false)
+        .await?;
+    let root = temp_dir.path().join("Shows");
+    let good_episode = root
+        .join("Good Show")
+        .join("Season 01")
+        .join("Good.Show.S01E01.mkv");
+    let broken_episode = root
+        .join("Broken Show")
+        .join("Season 01")
+        .join("Broken.Show.S01E01.mkv");
+    tokio::fs::create_dir_all(good_episode.parent().ok_or("missing good parent")?).await?;
+    tokio::fs::create_dir_all(broken_episode.parent().ok_or("missing broken parent")?).await?;
+    tokio::fs::write(&good_episode, b"good episode").await?;
+    tokio::fs::write(&broken_episode, b"broken episode").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+
+    let jobs = ScanJobService::new(database.clone());
+    let job = jobs.create_movie_scan_job(library.id).await?;
+    loop {
+        if jobs.run_batch(&job.id, 100).await?.completed {
+            break;
+        }
+    }
+    jobs.materialize_manifest_postprocessing_targets(&job.id)
+        .await?;
+
+    sqlx::query(
+        "UPDATE filesystem_entries
+         SET relative_path = 'Missing Show/Season 01/Missing.Show.S01E01.mkv'
+         WHERE relative_path = 'Broken Show/Season 01/Broken.Show.S01E01.mkv'",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_scan_job_targets(&job.id, 8)
+        .await?;
+    assert_eq!(report.items_processed, 2);
+
+    let states: Vec<String> = sqlx::query_scalar(
+        "SELECT targets.metadata_state
+         FROM scan_job_targets targets
+         WHERE targets.job_id = ? AND targets.target_type = 'ITEM'
+         ORDER BY targets.target_id",
+    )
+    .bind(&job.id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(states.iter().filter(|state| *state == "DONE").count(), 1);
+    assert_eq!(states.iter().filter(|state| *state == "FAILED").count(), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn decoded_nfo_cache_skips_the_json_read_until_the_fingerprint_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    let movie = root
+        .join("Cache Fixture (2024)")
+        .join("Cache.Fixture.2024.mkv");
+    tokio::fs::create_dir_all(movie.parent().ok_or("missing movie parent")?).await?;
+    tokio::fs::write(&movie, b"cache fixture").await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+
+    let store = LocalNfoMetadataStore::new(database.clone());
+    let details = LocalNfoDetails {
+        rating: Some(8.1),
+        genres: vec!["Action".to_owned()],
+        ..LocalNfoDetails::default()
+    };
+    let fingerprint = [7_u8; 32];
+    store.write_item(&item_id, &fingerprint, &details).await?;
+
+    let first = store.read_item(&item_id).await?.ok_or("first read")?;
+    assert_eq!(first.rating, Some(8.1));
+
+    // A hit must not read the JSON body: break it while keeping the fingerprint stable.
+    sqlx::query("UPDATE media_item_nfo_cache SET json = 'not json' WHERE item_id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let second = store.read_item(&item_id).await?.ok_or("cache hit")?;
+    assert_eq!(second.genres, vec!["Action".to_owned()]);
+
+    // A new fingerprint invalidates the entry, so the next read falls back to the stored JSON.
+    sqlx::query("UPDATE media_item_nfo_cache SET fingerprint = ? WHERE item_id = ?")
+        .bind(vec![9_u8; 32])
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    assert!(
+        store.read_item(&item_id).await?.is_none(),
+        "the malformed JSON is only reached after the fingerprint changed"
+    );
+    Ok(())
+}
+#[test]
+fn metadata_merge_table_preserves_local_and_locked_values() {
+    struct Case {
+        name: &'static str,
+        initial: NfoMetadata,
+        initial_source: Option<(MetadataField, MetadataSource)>,
+        locked: Option<MetadataField>,
+        candidate: MetadataCandidate,
+        expected: NfoMetadata,
+        expected_source_field: MetadataField,
+        expected_source: MetadataSource,
+    }
+
+    let cases = [
+        Case {
+            name: "local nfo wins over tmdb",
+            initial: NfoMetadata {
+                title: Some("本地标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Title, MetadataSource::LocalNfo)),
+            locked: None,
+            candidate: MetadataCandidate {
+                source: MetadataSource::ScraperLocalized,
+                metadata: NfoMetadata {
+                    title: Some("在线标题".to_owned()),
+                    production_year: Some(2020),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                title: Some("本地标题".to_owned()),
+                production_year: Some(2020),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::ProductionYear,
+            expected_source: MetadataSource::ScraperLocalized,
+        },
+        Case {
+            name: "locked local value cannot be refreshed",
+            initial: NfoMetadata {
+                overview: Some("手工简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Overview, MetadataSource::LocalNfo)),
+            locked: Some(MetadataField::Overview),
+            candidate: MetadataCandidate {
+                source: MetadataSource::ScraperLocalized,
+                metadata: NfoMetadata {
+                    overview: Some("在线简介".to_owned()),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                overview: Some("手工简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::Overview,
+            expected_source: MetadataSource::LockedLocal,
+        },
+        Case {
+            name: "tmdb wins over fallback",
+            initial: NfoMetadata {
+                title: Some("文件名标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Title, MetadataSource::Fallback)),
+            locked: None,
+            candidate: MetadataCandidate {
+                source: MetadataSource::ScraperLocalized,
+                metadata: NfoMetadata {
+                    title: Some("在线标题".to_owned()),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                title: Some("在线标题".to_owned()),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::Title,
+            expected_source: MetadataSource::ScraperLocalized,
+        },
+        Case {
+            name: "blank online value does not erase local value",
+            initial: NfoMetadata {
+                overview: Some("有效简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            initial_source: Some((MetadataField::Overview, MetadataSource::LocalNfo)),
+            locked: None,
+            candidate: MetadataCandidate {
+                source: MetadataSource::ScraperLocalized,
+                metadata: NfoMetadata {
+                    overview: Some("   ".to_owned()),
+                    ..NfoMetadata::default()
+                },
+            },
+            expected: NfoMetadata {
+                overview: Some("有效简介".to_owned()),
+                ..NfoMetadata::default()
+            },
+            expected_source_field: MetadataField::Overview,
+            expected_source: MetadataSource::LocalNfo,
+        },
+    ];
+
+    for case in cases {
+        let mut state = MetadataState::from_metadata(case.initial);
+        if let Some((field, source)) = case.initial_source {
+            state.provenance.insert(field, source);
+        }
+        if let Some(field) = case.locked {
+            state.lock(field);
+        }
+        state.apply_automatic(&case.candidate);
+        assert_eq!(state.metadata, case.expected, "{}", case.name);
+        assert_eq!(
+            state.provenance.get(&case.expected_source_field).copied(),
+            Some(case.expected_source),
+            "{}",
+            case.name
+        );
+    }
+}
+
+#[test]
+fn metadata_state_round_trip_keeps_provenance_and_locks() {
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("锁定标题".to_owned()),
+        ..NfoMetadata::default()
+    });
+    state
+        .provenance
+        .insert(MetadataField::Title, MetadataSource::LocalNfo);
+    state.lock(MetadataField::Title);
+
+    let provenance_json = state.provenance_json();
+    let locked_fields_json = state.locked_fields_json();
+    let restored = MetadataState::from_persisted(
+        state.metadata.clone(),
+        Some(&provenance_json),
+        Some(&locked_fields_json),
+    );
+    let mut refreshed = restored;
+    refreshed.apply_automatic(&MetadataCandidate {
+        source: MetadataSource::ScraperLocalized,
+        metadata: NfoMetadata {
+            title: Some("在线标题".to_owned()),
+            ..NfoMetadata::default()
+        },
+    });
+    assert_eq!(refreshed.metadata.title.as_deref(), Some("锁定标题"));
+    assert_eq!(
+        refreshed.provenance.get(&MetadataField::Title),
+        Some(&MetadataSource::LockedLocal)
+    );
+}
+
+#[test]
+fn explicit_selection_modes_fill_or_refresh_only_unlocked_fields() {
+    let candidate = MetadataCandidate {
+        source: MetadataSource::ScraperLocalized,
+        metadata: NfoMetadata {
+            title: Some("在线标题".to_owned()),
+            overview: Some("在线简介".to_owned()),
+            production_year: Some(2025),
+            ..NfoMetadata::default()
+        },
+    };
+    let mut fill = MetadataState::from_metadata(NfoMetadata {
+        title: Some("本地标题".to_owned()),
+        production_year: Some(2020),
+        ..NfoMetadata::default()
+    });
+    fill.provenance
+        .insert(MetadataField::Title, MetadataSource::LocalNfo);
+    fill.provenance
+        .insert(MetadataField::ProductionYear, MetadataSource::LocalNfo);
+    fill.apply_fill_missing(&candidate);
+    assert_eq!(fill.metadata.title.as_deref(), Some("本地标题"));
+    assert_eq!(fill.metadata.overview.as_deref(), Some("在线简介"));
+    assert_eq!(fill.metadata.production_year, Some(2020));
+
+    let mut refresh = fill.clone();
+    refresh.apply_refresh_unlocked(&candidate);
+    assert_eq!(refresh.metadata.title.as_deref(), Some("在线标题"));
+    assert_eq!(refresh.metadata.overview.as_deref(), Some("在线简介"));
+    assert_eq!(refresh.metadata.production_year, Some(2025));
+    refresh.lock(MetadataField::Title);
+    refresh.apply_refresh_unlocked(&MetadataCandidate {
+        source: MetadataSource::ScraperLocalized,
+        metadata: NfoMetadata {
+            title: Some("再次在线标题".to_owned()),
+            ..NfoMetadata::default()
+        },
+    });
+    assert_eq!(refresh.metadata.title.as_deref(), Some("在线标题"));
+}
+
+#[test]
+fn fill_missing_completeness_rejects_fallback_values() {
+    let fields = [
+        MetadataField::Title,
+        MetadataField::OriginalTitle,
+        MetadataField::Overview,
+        MetadataField::ProductionYear,
+    ];
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("标题".to_owned()),
+        original_title: Some("Original".to_owned()),
+        overview: Some("简介".to_owned()),
+        production_year: Some(2024),
+    });
+    assert!(!state.has_complete_fill_values(&fields));
+
+    for field in fields {
+        state.provenance.insert(field, MetadataSource::LocalNfo);
+    }
+    assert!(state.has_complete_fill_values(&fields));
+}
+
+#[test]
+fn fill_missing_completeness_treats_locked_missing_fields_as_complete() {
+    let fields = [MetadataField::Title, MetadataField::Overview];
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("标题".to_owned()),
+        ..NfoMetadata::default()
+    });
+    state
+        .provenance
+        .insert(MetadataField::Title, MetadataSource::LocalNfo);
+    state.lock(MetadataField::Overview);
+
+    assert!(state.has_complete_fill_values(&fields));
+}
+
+#[test]
+fn fill_missing_replaces_scanner_fallback_with_online_episode_title() {
+    let mut state = MetadataState::from_metadata(NfoMetadata {
+        title: Some("暗夜与黎明".to_owned()),
+        ..NfoMetadata::default()
+    });
+
+    state.apply_fill_missing(&MetadataCandidate {
+        source: MetadataSource::ScraperLocalized,
+        metadata: NfoMetadata {
+            title: Some("第一集：暗夜与黎明".to_owned()),
+            ..NfoMetadata::default()
+        },
+    });
+
+    assert_eq!(state.metadata.title.as_deref(), Some("第一集：暗夜与黎明"));
+    assert_eq!(
+        state.provenance.get(&MetadataField::Title),
+        Some(&MetadataSource::ScraperLocalized)
+    );
+}
+
+#[test]
+fn nfo_parser_reads_local_fields_and_ignores_unknown_fields() {
+    let metadata = parse_nfo(
+        r#"<movie><title>本地标题</title><originaltitle>Original</originaltitle><year>2021</year><plot>简介</plot><unknown>忽略</unknown></movie>"#.as_bytes(),
+    )
+    .expect("valid nfo");
+
+    assert_eq!(
+        metadata,
+        NfoMetadata {
+            title: Some("本地标题".to_owned()),
+            original_title: Some("Original".to_owned()),
+            production_year: Some(2021),
+            overview: Some("简介".to_owned()),
+        }
+    );
+}
+
+#[test]
+fn malformed_nfo_is_rejected() {
+    assert!(parse_nfo(b"<movie><title>broken").is_err());
+}
+
+#[test]
+fn partial_and_empty_nfo_are_accepted() {
+    let partial = parse_nfo(b"<movie><title>Only Title</title></movie>").expect("partial nfo");
+    assert_eq!(partial.title.as_deref(), Some("Only Title"));
+    assert_eq!(partial.production_year, None);
+    assert_eq!(
+        parse_nfo(b"<movie/>").expect("empty nfo"),
+        NfoMetadata::default()
+    );
+}
+
+#[test]
+fn image_discovery_returns_supported_local_image_types() {
+    let paths = [
+        "/media/poster.jpg",
+        "/media/fanart.png",
+        "/media/clearlogo.png",
+        "/media/poster.txt",
+        "/media/thumb.jpg",
+    ];
+
+    let images = find_local_images(paths.iter().map(std::path::Path::new));
+
+    assert_eq!(
+        images,
+        vec![
+            LocalImage {
+                image_type: ImageType::Poster,
+                path: std::path::PathBuf::from("/media/poster.jpg"),
+            },
+            LocalImage {
+                image_type: ImageType::Fanart,
+                path: std::path::PathBuf::from("/media/fanart.png"),
+            },
+            LocalImage {
+                image_type: ImageType::Logo,
+                path: std::path::PathBuf::from("/media/clearlogo.png"),
+            },
+            LocalImage {
+                image_type: ImageType::Thumb,
+                path: std::path::PathBuf::from("/media/thumb.jpg"),
+            },
+        ]
+    );
+}
+
+#[tokio::test]
+async fn metadata_enrichment_updates_items_and_keeps_bad_nfo_non_blocking()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let good_dir = root.join("Good Movie (2020)");
+    let bad_dir = root.join("Broken Movie (2021)");
+    tokio::fs::create_dir_all(&good_dir).await?;
+    tokio::fs::create_dir_all(&bad_dir).await?;
+    tokio::fs::write(good_dir.join("Good.Movie.2020.mkv"), b"movie").await?;
+    tokio::fs::write(
+        good_dir.join("movie.nfo"),
+        r#"<movie><title>本地电影</title><originaltitle>Local Movie</originaltitle><year>2021</year><plot>本地简介</plot></movie>"#,
+    )
+    .await?;
+    tokio::fs::write(good_dir.join("poster.jpg"), b"poster").await?;
+    tokio::fs::write(good_dir.join("fanart.png"), b"fanart").await?;
+    tokio::fs::write(bad_dir.join("Broken.Movie.2021.mkv"), b"movie").await?;
+    tokio::fs::write(bad_dir.join("Broken.Movie.2021.nfo"), b"<movie><title>").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(report.nfo_loaded, 1);
+    assert_eq!(report.nfo_failed, 1);
+    assert_eq!(report.images_found, 2);
+
+    let item: (String, String, String, i64, String) = sqlx::query_as(
+        "SELECT title, sort_title, original_title, production_year, overview
+         FROM media_items WHERE title = '本地电影'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        item,
+        (
+            "本地电影".to_owned(),
+            "本地电影".to_owned(),
+            "Local Movie".to_owned(),
+            2021,
+            "本地简介".to_owned()
+        )
+    );
+    let provenance: String = sqlx::query_scalar(
+        "SELECT metadata_provenance_json FROM media_items WHERE title = '本地电影'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    let provenance: serde_json::Value = serde_json::from_str(&provenance)?;
+    assert_eq!(provenance["title"], "LOCAL_NFO");
+    assert_eq!(provenance["originalTitle"], "LOCAL_NFO");
+    assert_eq!(provenance["overview"], "LOCAL_NFO");
+    assert_eq!(provenance["productionYear"], "LOCAL_NFO");
+    let locked_fields: String =
+        sqlx::query_scalar("SELECT locked_fields_json FROM media_items WHERE title = '本地电影'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&locked_fields)?,
+        serde_json::json!([])
+    );
+    let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(image_count, 2);
+    let image_metadata: (i64, String) =
+        sqlx::query_as("SELECT file_size, source FROM item_images ORDER BY image_type LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(image_metadata, (6, "LOCAL".to_owned()));
+
+    let second_report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(second_report.nfo_loaded, 0);
+    assert_eq!(second_report.nfo_failed, 0);
+    assert_eq!(second_report.nfo_skipped, 2);
+    assert_eq!(second_report.images_found, 0);
+    let image_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM item_images")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(image_count, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_movie_nfo_actors_are_available_without_online_matching_and_reuse_people_image()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Local Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Local.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        r#"<movie><title>本地电影</title><actor><name>演员甲</name><role>角色甲</role><type>Actor</type><tmdbid>9</tmdbid><order>0</order></actor><actor><name>演员乙</name><role>角色乙</role><type>Actor</type><tmdbid>10</tmdbid><order>1</order></actor><actor><name>本地演员</name><role>本地角色</role><order>2</order></actor></movie>"#,
+    )
+    .await?;
+
+    let people_dir = people_directory(&config.config_dir, "演员甲", "tmdb", "9")?;
+    tokio::fs::create_dir_all(&people_dir).await?;
+    tokio::fs::write(people_dir.join("folder.png"), b"person-image").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let people = PeopleService::new(config.config_dir.clone());
+    MetadataEnricher::new(database.clone())
+        .with_people(people.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let actors = people.list_item_actors(&item_id).await?;
+    assert_eq!(actors.len(), 3);
+    assert_eq!(actors[0].name, "演员甲");
+    assert_eq!(
+        actors[0].image_url.as_deref(),
+        Some("/api/v1/people/9/image")
+    );
+    assert_eq!(actors[1].name, "演员乙");
+    assert_eq!(actors[1].image_url, None);
+    assert_eq!(actors[2].name, "本地演员");
+    assert_eq!(actors[2].character.as_deref(), Some("本地角色"));
+    assert_eq!(actors[2].image_url, None);
+    Ok(())
+}
+
+#[tokio::test]
+async fn local_movie_nfo_rich_details_are_cached_during_background_enrichment()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Rich Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Rich.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        r#"<movie><title>本地丰富电影</title><rating>8.1</rating><votes>123</votes><tagline>大漠路远</tagline><premiered>2026-02-17</premiered><releasedate>2026-02-20</releasedate><runtime>126</runtime><status>Released</status><language>zh</language><mpaa>PG-13</mpaa><country>中国</country><genre>动作</genre><studio>示例影业</studio><tmdbid>1462229</tmdbid><director tmdbid="18899">导演甲</director><writer tmdbid="19999">编剧甲</writer><trailer>https://example.com/trailer</trailer></movie>"#,
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let store = LocalNfoMetadataStore::new(database.clone());
+    let report = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(report.nfo_loaded, 1);
+
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let details = store
+        .read_item(&item_id)
+        .await?
+        .ok_or("rich NFO cache missing")?;
+    assert_eq!(details.rating, Some(8.1));
+    assert_eq!(details.genres, vec!["动作"]);
+    assert_eq!(details.directors[0].name, "导演甲");
+    assert_eq!(details.trailers, vec!["https://example.com/trailer"]);
+    let premiere_date: Option<String> = sqlx::query_scalar(
+        "SELECT premiere_date FROM media_items WHERE item_type = 'MOVIE' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(premiere_date.as_deref(), Some("2026-02-17"));
+    sqlx::query(
+        "UPDATE media_items
+         SET premiere_date = NULL, provider_ids_json = '{}'
+         WHERE id = ?",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let skipped = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(skipped.nfo_skipped, 1);
+    let repaired_premiere_date: Option<String> =
+        sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(repaired_premiere_date.as_deref(), Some("2026-02-17"));
+    let repaired_provider_ids: String =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(repaired_provider_ids.contains("1462229"));
+
+    sqlx::query(
+        "UPDATE media_items
+         SET premiere_date = '2025-01-01', provider_ids_json = '{}'
+         WHERE id = ?",
+    )
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let provider_repair = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(provider_repair.nfo_skipped, 1);
+    let preserved_premiere_date: Option<String> =
+        sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(preserved_premiere_date.as_deref(), Some("2025-01-01"));
+    let repaired_provider_ids: String =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(repaired_provider_ids.contains("1462229"));
+
+    sqlx::query("UPDATE media_items SET premiere_date = NULL WHERE id = ?")
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+    let premiere_repair = MetadataEnricher::new(database.clone())
+        .with_nfo_store(store.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(premiere_repair.nfo_skipped, 1);
+    let repaired_premiere_date: Option<String> =
+        sqlx::query_scalar("SELECT premiere_date FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(repaired_premiere_date.as_deref(), Some("2026-02-17"));
+    let preserved_provider_ids: String =
+        sqlx::query_scalar("SELECT provider_ids_json FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(preserved_provider_ids.contains("1462229"));
+
+    let stored_json: Option<String> = sqlx::query_scalar(
+        "SELECT cache.json FROM media_item_nfo_cache cache
+         JOIN media_items item ON item.id = cache.item_id
+         WHERE item.item_type = 'MOVIE' LIMIT 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(stored_json.is_some());
+    assert!(
+        stored_json
+            .as_deref()
+            .is_some_and(|value| value.contains("示例影业"))
+    );
+    assert!(!config.config_dir.join("metadata").join("library").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_nfo_content_keeps_the_rich_snapshot_after_file_revision_changes()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Stable Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Stable.Movie.2026.mkv"), b"movie").await?;
+    let nfo = r#"<movie><title>稳定电影</title><rating>8.2</rating><genre>剧情</genre></movie>"#;
+    let nfo_path = movie_dir.join("movie.nfo");
+    tokio::fs::write(&nfo_path, nfo.as_bytes()).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    let store = LocalNfoMetadataStore::new(database.clone());
+    let enricher = MetadataEnricher::new(database.clone()).with_nfo_store(store);
+    enricher.enrich_movie_library(library.id).await?;
+
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let before: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT cache.json, item.nfo_metadata_fingerprint
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    tokio::fs::write(&nfo_path, nfo.as_bytes()).await?;
+    let second = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(second.nfo_loaded, 0);
+    assert_eq!(second.nfo_skipped, 1);
+
+    let after: (Option<String>, Option<Vec<u8>>) = sqlx::query_as(
+        "SELECT cache.json, item.nfo_metadata_fingerprint
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = ?",
+    )
+    .bind(&item_id)
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(after, before);
+    Ok(())
+}
+
+#[tokio::test]
+async fn semantically_unchanged_nfo_revision_skips_metadata_and_relation_rewrites()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Semantic Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Semantic.Movie.2026.mkv"), b"movie").await?;
+    let nfo_path = movie_dir.join("movie.nfo");
+    let original = r#"<movie><title>语义电影</title><actor sortorder="0" tmdbid="9"><name>演员甲</name><role>角色甲</role></actor><custom key="x">保留</custom></movie>"#;
+    tokio::fs::write(&nfo_path, original).await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let people = PeopleService::new(config.config_dir.clone());
+    let enricher = MetadataEnricher::new(database.clone())
+        .with_people(people)
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+    let first = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(first.nfo_loaded, 1);
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let relation_path = library_item_directory(&config.config_dir, &item_id)?.join("people.json");
+
+    // Simulate a cache written by a previous release. It has the same raw
+    // source revision, but no semantic fingerprint, so it must be parsed and
+    // upgraded once before the exact-revision fast path can resume.
+    let versioned_cache: String =
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let legacy_details = serde_json::from_str::<serde_json::Value>(&versioned_cache)?
+        .get("details")
+        .cloned()
+        .ok_or("versioned NFO cache has no details")?;
+    sqlx::query(
+        "UPDATE media_item_nfo_cache
+         SET json = ?, bytes = length(CAST(? AS BLOB)), updated_at = unixepoch()
+         WHERE item_id = ?",
+    )
+    .bind(legacy_details.to_string())
+    .bind(legacy_details.to_string())
+    .bind(&item_id)
+    .execute(database.pool())
+    .await?;
+    let legacy_upgrade = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(legacy_upgrade.nfo_loaded, 1);
+    assert_eq!(legacy_upgrade.nfo_skipped, 0);
+    let upgraded_cache: String =
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&upgraded_cache)?["schemaVersion"],
+        1
+    );
+    let upgraded_fast_path = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(upgraded_fast_path.nfo_loaded, 0);
+    assert_eq!(upgraded_fast_path.nfo_skipped, 1);
+
+    let relation_before = tokio::fs::read(&relation_path).await?;
+    let cache_before: Option<String> =
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let revision_before: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    let cache_source_revision_before: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(cache_source_revision_before.is_some());
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let equivalent = "<?xml version=\"1.0\"?>\n<movie>\n<!--editor note--><title><![CDATA[语义电影]]></title>\n<actor tmdbid='9' sortorder='0'><name>演员甲</name><role>角色甲</role></actor>\n<custom key='x'>保留</custom>\n</movie>";
+    tokio::fs::write(&nfo_path, equivalent).await?;
+    let second = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(second.nfo_loaded, 0);
+    assert_eq!(second.nfo_skipped, 1);
+    assert_eq!(tokio::fs::read(&nfo_path).await?, equivalent.as_bytes());
+    assert_eq!(tokio::fs::read(&relation_path).await?, relation_before);
+    let cache_after: Option<String> =
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(cache_after, cache_before);
+    let revision_after: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert_ne!(revision_after, revision_before);
+    let cache_source_revision_after: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT nfo_metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(cache_source_revision_after.is_some());
+    assert_ne!(cache_source_revision_after, cache_source_revision_before);
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_unknown = equivalent.replace("key='x'", "key='y'");
+    tokio::fs::write(&nfo_path, &changed_unknown).await?;
+    let third = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(third.nfo_loaded, 1);
+    assert_eq!(
+        tokio::fs::read(&nfo_path).await?,
+        changed_unknown.as_bytes()
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_unknown_text = changed_unknown.replace("保留", "未知文本已变化");
+    tokio::fs::write(&nfo_path, &changed_unknown_text).await?;
+    let fourth = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(fourth.nfo_loaded, 1);
+    assert_eq!(
+        tokio::fs::read(&nfo_path).await?,
+        changed_unknown_text.as_bytes()
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_unknown_node = changed_unknown_text.replace(
+        "</custom>",
+        "<extension-child>未知节点</extension-child></custom>",
+    );
+    tokio::fs::write(&nfo_path, &changed_unknown_node).await?;
+    let fifth = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(fifth.nfo_loaded, 1);
+    assert_eq!(
+        tokio::fs::read(&nfo_path).await?,
+        changed_unknown_node.as_bytes()
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    let changed_known = changed_unknown_node.replace("语义电影", "更新后的电影");
+    tokio::fs::write(&nfo_path, &changed_known).await?;
+    let sixth = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(sixth.nfo_loaded, 1);
+    assert_eq!(tokio::fs::read(&nfo_path).await?, changed_known.as_bytes());
+    Ok(())
+}
+
+#[tokio::test]
+async fn actor_relation_failure_does_not_discard_nfo_and_is_retried_separately()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Actor Retry Movie (2026)");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    tokio::fs::write(movie_dir.join("Actor.Retry.Movie.2026.mkv"), b"movie").await?;
+    tokio::fs::write(
+        movie_dir.join("movie.nfo"),
+        r#"<movie><title>演员重试电影</title><rating>7.5</rating><actor><name>演员甲</name><role>角色甲</role><tmdbid>9</tmdbid></actor></movie>"#,
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let metadata_root = config.config_dir.join("metadata");
+    tokio::fs::create_dir_all(&metadata_root).await?;
+    let blocked_library_dir = metadata_root.join("library");
+    tokio::fs::write(&blocked_library_dir, b"temporarily blocked").await?;
+
+    let people = PeopleService::new(config.config_dir.clone());
+    let enricher = MetadataEnricher::new(database.clone())
+        .with_people(people.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()));
+    let first = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(first.nfo_loaded, 1);
+    assert_eq!(first.nfo_failed, 0);
+    let item_id: String =
+        sqlx::query_scalar("SELECT id FROM media_items WHERE item_type = 'MOVIE' LIMIT 1")
+            .fetch_one(database.pool())
+            .await?;
+    let rich_json: Option<String> =
+        sqlx::query_scalar("SELECT json FROM media_item_nfo_cache WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(rich_json.is_some());
+    let metadata_fingerprint: Option<Vec<u8>> =
+        sqlx::query_scalar("SELECT metadata_fingerprint FROM media_items WHERE id = ?")
+            .bind(&item_id)
+            .fetch_one(database.pool())
+            .await?;
+    assert!(metadata_fingerprint.is_some());
+
+    tokio::fs::remove_file(&blocked_library_dir).await?;
+    let second = enricher.enrich_movie_library(library.id).await?;
+    assert_eq!(second.nfo_loaded, 1);
+    let actors = people.list_item_actors(&item_id).await?;
+    assert_eq!(actors.len(), 1);
+    assert_eq!(actors[0].name, "演员甲");
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_enrichment_skips_conflicting_nfo_and_indexes_following_images()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let existing_dir = root.join("Target Movie (1987)");
+    let conflicting_dir = root.join("Target Movie (2018)");
+    let following_dir = root.join("Z Later Movie (2020)");
+    for directory in [&existing_dir, &conflicting_dir, &following_dir] {
+        tokio::fs::create_dir_all(directory).await?;
+    }
+    tokio::fs::write(
+        existing_dir.join("Target Movie (1987).mkv"),
+        b"existing movie",
+    )
+    .await?;
+    tokio::fs::write(
+        conflicting_dir.join("Target Movie (2018).mkv"),
+        b"conflicting movie",
+    )
+    .await?;
+    tokio::fs::write(
+        conflicting_dir.join("Target Movie (2018).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+    tokio::fs::write(conflicting_dir.join("poster.jpg"), b"conflicting poster").await?;
+    tokio::fs::write(
+        following_dir.join("Z Later Movie (2020).mkv"),
+        b"following movie",
+    )
+    .await?;
+    tokio::fs::write(following_dir.join("poster.jpg"), b"following poster").await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+
+    assert_eq!(report.nfo_loaded, 0);
+    assert_eq!(report.nfo_failed, 1);
+    assert_eq!(report.images_found, 2);
+    let image_paths: Vec<String> =
+        sqlx::query_scalar("SELECT local_path FROM item_images ORDER BY local_path")
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(image_paths.len(), 2);
+    assert!(
+        image_paths
+            .iter()
+            .any(|path| path.ends_with("Target Movie (2018)/poster.jpg"))
+    );
+    assert!(
+        image_paths
+            .iter()
+            .any(|path| path.ends_with("Z Later Movie (2020)/poster.jpg"))
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_enrichment_ignores_conflicts_without_available_sources()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let historical_dir = root.join("Target Movie (1987)");
+    let current_dir = root.join("Renamed Movie (2018)");
+    tokio::fs::create_dir_all(&historical_dir).await?;
+    tokio::fs::create_dir_all(&current_dir).await?;
+    tokio::fs::write(
+        historical_dir.join("Target Movie (1987).mkv"),
+        b"historical",
+    )
+    .await?;
+    tokio::fs::write(current_dir.join("Renamed Movie (2018).mkv"), b"current").await?;
+    tokio::fs::write(
+        current_dir.join("Renamed Movie (2018).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+    sqlx::query(
+        "UPDATE media_items SET has_available_source = 0
+         WHERE library_id = ? AND production_year = 1987",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .with_nfo_store(LocalNfoMetadataStore::new(database.clone()))
+        .enrich_movie_library(library.id)
+        .await?;
+
+    assert_eq!(report.nfo_loaded, 1);
+    assert_eq!(report.nfo_failed, 0);
+    let current: (String, i64, Option<String>) = sqlx::query_as(
+        "SELECT item.title, item.production_year, cache.json
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.has_available_source = 1",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(current.0, "Target Movie");
+    assert_eq!(current.1, 1987);
+    assert!(current.2.is_some());
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_enrichment_allows_same_parent_nfo_identity_variants()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    let movie_dir = root.join("Variant Movie");
+    tokio::fs::create_dir_all(&movie_dir).await?;
+    for year in [2023, 2024] {
+        tokio::fs::write(
+            movie_dir.join(format!("Variant Movie ({year}).mkv")),
+            b"movie",
+        )
+        .await?;
+        tokio::fs::write(
+            movie_dir.join(format!("Variant Movie ({year}).nfo")),
+            "<movie><title>Variant Movie</title><year>2023</year></movie>",
+        )
+        .await?;
+    }
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+    assert_eq!(report.nfo_loaded, 2);
+    assert_eq!(report.nfo_failed, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn metadata_enrichment_rejects_conflicting_nfo_for_flat_movie_files()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    tokio::fs::write(root.join("Target Movie (1987).mkv"), b"existing movie").await?;
+    tokio::fs::write(
+        root.join("Target Movie (1987).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Different Movie (2018).mkv"),
+        b"conflicting movie",
+    )
+    .await?;
+    tokio::fs::write(
+        root.join("Different Movie (2018).nfo"),
+        "<movie><title>Target Movie</title><year>1987</year></movie>",
+    )
+    .await?;
+
+    let database = Database::connect(&config).await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 path")?)
+        .await?;
+    LibraryScanner::new(database.clone())
+        .scan_movie_library(library.id)
+        .await?;
+
+    let report = MetadataEnricher::new(database.clone())
+        .enrich_movie_library(library.id)
+        .await?;
+
+    assert_eq!(report.nfo_loaded, 1);
+    assert_eq!(report.nfo_failed, 1);
+    Ok(())
+}

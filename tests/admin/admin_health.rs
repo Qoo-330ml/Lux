@@ -1,0 +1,237 @@
+use std::{ffi::OsStr, fs, path::Path, time::Duration};
+
+use luxd::{
+    api::{AppState, app_with_state},
+    application::{libraries::LibraryService, setup::SetupService},
+    auth::{emby::EmbyAuthService, sessions::WebAuthService, users::UserStore},
+    config::Config,
+    library::LibraryKind,
+    storage::Database,
+};
+use reqwest::header::{COOKIE, SET_COOKIE};
+use serde_json::{Value, json};
+use tokio::net::TcpListener;
+
+fn latest_migration_version() -> Result<i64, Box<dyn std::error::Error>> {
+    let migration_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("migrations");
+    let mut latest_version = None;
+    for entry in fs::read_dir(migration_dir)? {
+        let path = entry?.path();
+        if path.extension() != Some(OsStr::new("sql")) {
+            continue;
+        }
+        let Some(version) = path
+            .file_stem()
+            .and_then(OsStr::to_str)
+            .and_then(|stem| stem.split('_').next())
+            .and_then(|version| version.parse::<i64>().ok())
+        else {
+            continue;
+        };
+        latest_version = Some(latest_version.map_or(version, |current: i64| current.max(version)));
+    }
+    latest_version.ok_or_else(|| "no migrations found".into())
+}
+
+fn cookie_value(headers: &reqwest::header::HeaderMap, name: &str) -> String {
+    headers
+        .get_all(SET_COOKIE)
+        .iter()
+        .filter_map(|value| value.to_str().ok())
+        .find_map(|value| {
+            let (pair, _) = value.split_once(';')?;
+            let (cookie_name, cookie_value) = pair.split_once('=')?;
+            (cookie_name == name).then(|| cookie_value.to_owned())
+        })
+        .expect("expected cookie")
+}
+
+#[tokio::test]
+async fn admin_health_reports_safe_runtime_diagnostics_and_enforces_access()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await?;
+    let setup = SetupService::new(database.clone())?;
+    setup.complete("Admin", "Admin", "correct password").await?;
+    let _viewer = UserStore::new(database.clone())?
+        .create_user("viewer", "Viewer", "viewer password", false)
+        .await?;
+    let libraries = LibraryService::new(database.clone());
+    let library = libraries
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await?;
+    let root = temp_dir.path().join("Movies");
+    tokio::fs::create_dir_all(&root).await?;
+    libraries
+        .add_root(library.id, root.to_str().ok_or("non-utf8 root")?)
+        .await?;
+    for (id, status) in [
+        ("health-pending", "PENDING"),
+        ("health-running", "RUNNING"),
+        ("health-failed", "FAILED"),
+        ("health-completed", "COMPLETED"),
+    ] {
+        let scan_library_name = format!("Health {id}");
+        let scan_library = libraries
+            .create_library(&scan_library_name, LibraryKind::Movie, false)
+            .await?;
+        sqlx::query(
+            "INSERT INTO scan_jobs (id, library_id, job_type, status, generation)
+             VALUES (?, ?, 'RECONCILE_LIBRARY', ?, 'health-generation')",
+        )
+        .bind(id)
+        .bind(scan_library.id.to_string())
+        .bind(status)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let auth = WebAuthService::new(database.clone())?;
+    let emby_auth = EmbyAuthService::new(database.clone())?;
+    let app = app_with_state(AppState::ready(config, database, setup, auth, emby_auth));
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let address = listener.local_addr()?;
+    let server = tokio::spawn(async move { axum::serve(listener, app).await });
+    let base_url = format!("http://{address}");
+    let client = reqwest::Client::builder()
+        .no_proxy()
+        .timeout(Duration::from_secs(2))
+        .build()?;
+
+    let unauthenticated = client
+        .get(format!("{base_url}/api/v1/admin/health"))
+        .send()
+        .await?;
+    assert_eq!(unauthenticated.status(), reqwest::StatusCode::UNAUTHORIZED);
+
+    let login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "admin", "password": "correct password" }))
+        .send()
+        .await?;
+    let cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(login.headers(), "lux_session"),
+        cookie_value(login.headers(), "lux_csrf")
+    );
+    let health = client
+        .get(format!("{base_url}/api/v1/admin/health"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(health.status(), reqwest::StatusCode::OK);
+    let body: Value = health.json().await?;
+    assert_eq!(
+        body["status"],
+        if body["ffprobe"]["available"] == true {
+            "ok"
+        } else {
+            "degraded"
+        }
+    );
+    assert_eq!(body["schemaVersion"], latest_migration_version()?);
+    assert_eq!(body["jobs"]["scanRunning"], 2);
+    assert_eq!(body["jobs"]["scanFailed"], 1);
+    assert_eq!(body["database"]["status"], "ok");
+    assert_eq!(body["database"]["backend"], "SQLITE");
+    assert_eq!(body["database"]["writable"], true);
+    assert_eq!(body["database"]["pool"]["maxConnections"], 8);
+    assert!(body["database"]["pool"]["size"].is_number());
+    assert!(body["database"]["pool"]["idle"].is_number());
+    assert!(body["database"]["pool"]["inUse"].is_number());
+    assert!(body["database"]["pool"]["saturated"].is_boolean());
+    let in_use = body["database"]["pool"]["inUse"]
+        .as_u64()
+        .expect("pool in-use count should be numeric");
+    let max_connections = body["database"]["pool"]["maxConnections"]
+        .as_u64()
+        .expect("pool max connections should be numeric");
+    assert!(in_use <= max_connections);
+    assert_eq!(body["config"]["available"], true);
+    assert_eq!(body["config"]["writable"], true);
+    assert!(body["ffprobe"]["available"].is_boolean());
+    assert!(body.get("tmdb").is_none());
+    assert!(body["runtime"]["seconds"].is_number());
+    assert_eq!(body["resources"]["cpu"]["source"], "cgroup");
+    assert_eq!(body["resources"]["memory"]["source"], "cgroup");
+    assert_eq!(body["resources"]["mediaStorage"]["path"], "/media");
+    assert_eq!(
+        body["resources"]["mediaStorage"]["source"],
+        "container-filesystem"
+    );
+    let movies_library = body["libraries"]
+        .as_array()
+        .and_then(|libraries| libraries.iter().find(|library| library["name"] == "Movies"))
+        .ok_or("health response omitted the Movies library")?;
+    assert_eq!(movies_library["rootCount"], 1);
+    assert!(body.get("configDir").is_none());
+    let body_text = body.to_string();
+    let config_path = temp_dir.path().to_string_lossy().into_owned();
+    assert!(!body_text.contains(&config_path));
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let config_dir = temp_dir.path().join("config");
+        let mut permissions = std::fs::metadata(&config_dir)?.permissions();
+        permissions.set_mode(0o500);
+        std::fs::set_permissions(&config_dir, permissions)?;
+
+        let cached_health = client
+            .get(format!("{base_url}/api/v1/admin/health"))
+            .header(COOKIE, &cookies)
+            .send()
+            .await?;
+        assert_eq!(cached_health.status(), reqwest::StatusCode::OK);
+        let cached_body: Value = cached_health.json().await?;
+        assert_eq!(cached_body["status"], body["status"]);
+        assert_eq!(
+            cached_body["database"]["status"],
+            body["database"]["status"]
+        );
+        assert_eq!(
+            cached_body["database"]["writable"],
+            body["database"]["writable"]
+        );
+        assert_eq!(
+            cached_body["config"]["writable"],
+            body["config"]["writable"]
+        );
+
+        let mut permissions = std::fs::metadata(&config_dir)?.permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&config_dir, permissions)?;
+    }
+
+    let logs = client
+        .get(format!("{base_url}/api/v1/admin/logs?pageSize=10"))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(logs.status(), reqwest::StatusCode::OK);
+    assert!(logs.json::<Value>().await?["events"].is_array());
+
+    let viewer_login = client
+        .post(format!("{base_url}/api/v1/auth/login"))
+        .json(&json!({ "username": "viewer", "password": "viewer password" }))
+        .send()
+        .await?;
+    let viewer_cookies = format!(
+        "lux_session={}; lux_csrf={}",
+        cookie_value(viewer_login.headers(), "lux_session"),
+        cookie_value(viewer_login.headers(), "lux_csrf")
+    );
+    let denied = client
+        .get(format!("{base_url}/api/v1/admin/health"))
+        .header(COOKIE, viewer_cookies)
+        .send()
+        .await?;
+    assert_eq!(denied.status(), reqwest::StatusCode::FORBIDDEN);
+    server.abort();
+    Ok(())
+}

@@ -218,7 +218,10 @@ async fn canonical_media_path(
     let path = fs::canonicalize(root.join(relative))
         .await
         .map_err(|_| EmbeddedSubtitleError::Missing)?;
-    if !path.starts_with(&root) || path == root {
+    if path == root
+        || (!path.starts_with(&root)
+            && !crate::application::scanner::symlink::path_is_allowed(&root, &path))
+    {
         return Err(EmbeddedSubtitleError::Forbidden);
     }
     let metadata = fs::metadata(&path)

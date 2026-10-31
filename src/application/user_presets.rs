@@ -318,6 +318,9 @@ pub(crate) async fn apply_user_permission_preset_batch(
     let preset_version = i64::try_from(preset.version)
         .map_err(|_| UserPermissionPresetApplicationError::InvalidSnapshot)?;
     let permissions = preset.permissions.stored_snapshot();
+    // The preset source is read and validated once above; every user is then applied in its own
+    // transaction so a failure (last-manager guard, stale version, deleted user) is reported for
+    // that user alone. Merging the writes would drop both the isolation and the error codes.
     let mut results = Vec::with_capacity(user_ids.len());
 
     for user_id in user_ids {

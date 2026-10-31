@@ -9,6 +9,7 @@ export const loadAdminNotificationsPage = () => import("./AdminNotificationsPage
 export const loadAdminUsersPage = () => import("./AdminUsersPage").then(({ AdminUsersPage }) => ({ default: AdminUsersPage }));
 export const loadAdminOperationsPage = () => import("./AdminOperationsPage").then(({ AdminOperationsPage }) => ({ default: AdminOperationsPage }));
 export const loadAdminSettingsPage = () => import("./AdminSettingsPage").then(({ AdminSettingsPage }) => ({ default: AdminSettingsPage }));
+export const loadAdminTranscodingPage = () => import("./AdminTranscodingPage").then(({ AdminTranscodingPage }) => ({ default: AdminTranscodingPage }));
 export const loadAdminChangelogPage = () => import("./AdminChangelogPage").then(({ AdminChangelogPage }) => ({ default: AdminChangelogPage }));
 
 const adminPageLoaders: Record<string, () => Promise<unknown>> = {
@@ -19,6 +20,7 @@ const adminPageLoaders: Record<string, () => Promise<unknown>> = {
   "/admin/users": loadAdminUsersPage,
   "/admin/jobs": loadAdminOperationsPage,
   "/admin/settings": loadAdminSettingsPage,
+  "/admin/transcoding": loadAdminTranscodingPage,
   "/admin/changelog": loadAdminChangelogPage,
 };
 
@@ -75,6 +77,16 @@ export function prefetchAdminPage(queryClient: QueryClient, to: string): void {
       void queryClient.prefetchQuery({
         queryKey: queryKeys.adminSettings,
         queryFn: () => api.adminSettings(),
+      });
+      break;
+    case "/admin/transcoding":
+      void queryClient.prefetchQuery({
+        queryKey: queryKeys.adminSettings,
+        queryFn: () => api.adminSettings(),
+      });
+      void queryClient.prefetchQuery({
+        queryKey: queryKeys.adminTranscodingSessions,
+        queryFn: () => api.adminTranscodingSessions(),
       });
       break;
     case "/admin/changelog":

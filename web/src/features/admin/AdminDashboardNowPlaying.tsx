@@ -22,8 +22,8 @@ function NowPlayingCard({ session }: { session: AdminPlaybackSession }) {
     ? [episodeLabel(session), seriesTitle ? session.title : undefined].filter(Boolean).join(" · ")
     : undefined;
   const detailItemId = isEpisode ? session.seriesId || session.itemId : session.itemId;
-  const posterUrl = session.posterAvailable
-    ? `/api/v1/items/${encodeURIComponent(session.itemId)}/images/poster`
+  const posterUrl = session.posterAvailable && session.posterItemId
+    ? `/api/v1/items/${encodeURIComponent(session.posterItemId)}/images/poster`
     : undefined;
 
   const playMethod = playMethodLabel(session.playMethod);

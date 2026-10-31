@@ -41,14 +41,14 @@ test("global button overrides do not introduce one-off action heights", () => {
 });
 
 test("plugin heading actions share the compact button tier", () => {
-  assert.match(pluginsPage, /className="lux-button lux-button-compact lux-button-secondary"/);
-  assert.match(pluginsPage, /className="lux-button lux-button-compact lux-button-secondary lux-admin-plugin-store-trigger"/);
+  assert.match(pluginsPage, /<LuxButton tone="secondary" size="compact"/);
+  assert.match(pluginsPage, /<LuxButton tone="secondary" size="compact" className="lux-admin-plugin-store-trigger"/);
   const storeTriggerRule = pluginStyles.match(/\.lux-admin-plugin-store-trigger\s*\{([^}]*)\}/)?.[1] ?? "";
   assert.doesNotMatch(storeTriggerRule, /min-height:|font-size:/);
 });
 
 test("user row actions share the compact button tier", () => {
-  assert.match(usersPage, /className="lux-button lux-button-compact lux-button-secondary"/);
+  assert.match(usersPage, /<LuxButton tone="secondary" size="compact"/);
   const userIconRule = rule(".lux-admin-user-actions .lux-icon-button-small");
   assert.match(userIconRule, /min-width:\s*var\(--lux-button-height-compact\)/);
   assert.match(userIconRule, /width:\s*var\(--lux-button-height-compact\)/);

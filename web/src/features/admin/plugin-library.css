@@ -30,6 +30,76 @@
   width: min(100%, 560px);
 }
 
+.lux-admin-plugin-store-source-field {
+  display: grid;
+  gap: 8px;
+  color: var(--lux-muted);
+  font-size: .78rem;
+}
+
+.lux-admin-plugin-store-source-input {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+}
+
+.lux-admin-plugin-store-source-input .lux-button {
+  align-self: stretch;
+}
+
+.lux-admin-plugin-store-source-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+  min-width: 0;
+  padding-top: 2px;
+}
+
+.lux-admin-plugin-store-source-tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+  min-height: 30px;
+  padding: 4px 5px 4px 11px;
+  border: 1px solid color-mix(in srgb, var(--lux-accent) 32%, var(--lux-line-soft));
+  border-radius: 999px;
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-accent) 12%, transparent);
+  font-size: .69rem;
+}
+
+.lux-admin-plugin-store-source-tag > span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lux-admin-plugin-store-source-tag button {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: var(--lux-muted);
+  background: transparent;
+}
+
+.lux-admin-plugin-store-source-tag button:hover,
+.lux-admin-plugin-store-source-tag button:focus-visible {
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-text) 13%, transparent);
+}
+
+.lux-admin-plugin-store-source-placeholder {
+  color: var(--lux-subtle);
+  font-size: .7rem;
+}
+
 .lux-admin-plugin-dialog-copy {
   margin: 8px 0 0;
   color: var(--lux-muted);
@@ -53,8 +123,8 @@
 
 .lux-admin-plugin-tabs button:hover,
 .lux-admin-plugin-tabs button.is-active {
-  color: #fff;
-  background: rgba(255, 255, 255, .13);
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-text) 13%, transparent);
 }
 
 .lux-admin-plugin-tabs button span {
@@ -62,7 +132,7 @@
   padding: 2px 5px;
   border-radius: 999px;
   color: var(--lux-subtle);
-  background: rgba(255, 255, 255, .08);
+  background: color-mix(in srgb, var(--lux-text) 8%, transparent);
   font-size: .68rem;
   text-align: center;
 }
@@ -122,7 +192,7 @@
   min-width: 0;
   margin: 0;
   overflow: hidden;
-  color: #fff;
+  color: var(--lux-text);
   font-size: 1.08rem;
   font-weight: 650;
   letter-spacing: -.02em;
@@ -202,14 +272,14 @@
 }
 
 .lux-admin-plugin-install-status.is-installed {
-  color: #e8e8e9;
+  color: var(--lux-text);
   background: rgba(255, 255, 255, .16);
   box-shadow: 0 8px 20px rgba(0, 0, 0, .18);
 }
 
 .lux-admin-plugin-install-status.is-install {
   border-color: var(--lux-line);
-  color: #fff;
+  color: var(--lux-text);
   background: rgba(255, 255, 255, .08);
 }
 
@@ -227,7 +297,7 @@
   border: 1px solid var(--lux-line);
   border-radius: 999px;
   color: var(--lux-text);
-  background: rgba(255, 255, 255, .06);
+  background: color-mix(in srgb, var(--lux-text) 6%, transparent);
   font-size: .73rem;
   font-weight: 650;
   white-space: nowrap;
@@ -250,7 +320,7 @@
   width: 31px;
   height: 18px;
   border-radius: 999px;
-  background: rgba(255, 255, 255, .2);
+  background: color-mix(in srgb, var(--lux-text) 20%, transparent);
   transition: background .2s ease;
 }
 
@@ -292,9 +362,9 @@
 }
 
 .lux-admin-plugin-uninstall-button:hover:not(:disabled) {
-  border-color: rgba(242, 151, 151, .32);
-  color: #f3a6a6;
-  background: rgba(242, 151, 151, .08);
+  border-color: color-mix(in srgb, var(--lux-danger) 32%, transparent);
+  color: var(--lux-danger);
+  background: color-mix(in srgb, var(--lux-danger) 8%, transparent);
 }
 
 .lux-admin-plugin-config-button {
@@ -308,8 +378,8 @@
 
 .lux-admin-plugin-config-button:hover {
   border-color: var(--lux-line-soft);
-  color: #fff;
-  background: rgba(255, 255, 255, .08);
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-text) 8%, transparent);
 }
 
 .lux-admin-plugin-install-status:focus-visible,
@@ -318,7 +388,7 @@
 .lux-admin-plugin-config-button:focus-visible,
 .lux-admin-plugin-store-trigger:focus-visible,
 .lux-admin-plugin-dialog-close:focus-visible {
-  outline: 2px solid #fff;
+  outline: 2px solid var(--lux-focus-ring);
   outline-offset: 3px;
 }
 
@@ -364,7 +434,7 @@
 
 .lux-admin-plugin-dialog-heading h2 {
   margin: 9px 0 0;
-  color: #fff;
+  color: var(--lux-text);
   font-size: 1.25rem;
 }
 
@@ -393,8 +463,8 @@
   border: 1px solid var(--lux-line-soft);
   border-radius: 8px;
   outline: 0;
-  color: #fff;
-  background: rgba(255, 255, 255, .05);
+  color: var(--lux-text);
+  background: color-mix(in srgb, var(--lux-text) 5%, transparent);
 }
 
 .lux-admin-plugin-dialog-form input:not([type="checkbox"]):not([type="radio"]):disabled {
@@ -413,7 +483,7 @@
   padding: 14px;
   border: 1px solid var(--lux-line-soft);
   border-radius: 9px;
-  background: rgba(255, 255, 255, .035);
+  background: color-mix(in srgb, var(--lux-text) 3.5%, transparent);
 }
 
 .lux-admin-plugin-image-field > strong {
@@ -433,7 +503,7 @@
   border: 1px solid var(--lux-line);
   border-radius: 6px;
   color: var(--lux-text);
-  background: rgba(255, 255, 255, .08);
+  background: color-mix(in srgb, var(--lux-text) 8%, transparent);
   cursor: pointer;
 }
 
@@ -451,7 +521,7 @@
   padding: 10px 12px;
   border: 1px solid var(--lux-line-soft);
   border-radius: 9px;
-  background: rgba(255, 255, 255, .035);
+  background: color-mix(in srgb, var(--lux-text) 3.5%, transparent);
 }
 
 .lux-admin-plugin-toggle input {
@@ -467,7 +537,7 @@
 }
 
 .lux-admin-plugin-toggle strong {
-  color: #fff;
+  color: var(--lux-text);
   font-size: .8rem;
   font-weight: 650;
 }
@@ -511,6 +581,10 @@
 }
 
 @media (max-width: 640px) {
+  .lux-admin-plugin-store-source-input {
+    grid-template-columns: 1fr;
+  }
+
   .lux-admin-plugin-card {
     grid-template-columns: 40px minmax(0, 1fr);
     gap: 12px;

@@ -95,10 +95,7 @@ impl Database {
             let updated = statement
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if usize::try_from(updated.rows_affected()).ok() != Some(chunk.len()) {
                 return Err(StorageError::Conflict(
                     "manifest delta changed before its batch commit".to_owned(),
@@ -195,10 +192,7 @@ impl Database {
             .bind(batch.manifest_id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
             let update = self
                 .query(
                     "UPDATE scan_jobs
@@ -209,10 +203,7 @@ impl Database {
                 .bind(batch.job_id)
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if update.rows_affected() != 1 {
                 return Err(StorageError::Conflict(
                     "scan job stopped during manifest delta apply".to_owned(),

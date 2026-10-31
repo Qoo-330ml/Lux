@@ -35,6 +35,20 @@ pub struct ScanJobService {
     pub(super) default_scan_concurrency: usize,
     pub(super) scan_concurrency_override: Option<usize>,
     pub(super) cancellation_flags: Arc<Mutex<HashMap<String, Arc<AtomicBool>>>>,
+    /// Link provenance observed during discovery, keyed by job then `(device, inode)`.
+    ///
+    /// Lite discovery settles filesystem rows without writing manifest
+    /// observations, so the resolved target is remembered here and applied to
+    /// `filesystem_entries` once the job reaches the indexed state.
+    #[allow(clippy::type_complexity)]
+    pub(super) symlink_origins: Arc<Mutex<HashMap<String, HashMap<(i64, i64), (String, String)>>>>,
+    /// Directory identities already queued for this job.
+    ///
+    /// Following a directory link can reach a subtree that a real path already
+    /// covers, and a link that points at one of its own ancestors would loop
+    /// forever. Both are the same check: `(device, inode)` is only walked once.
+    #[allow(clippy::type_complexity)]
+    pub(super) visited_directories: Arc<Mutex<HashMap<String, HashSet<(i64, i64)>>>>,
     pub(super) scan_run_registry: Arc<Mutex<ScanRunRegistry>>,
     pub(super) metadata_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
     pub(super) local_metadata_image_notifications: Arc<Mutex<HashMap<String, Arc<Notify>>>>,

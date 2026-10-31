@@ -1,0 +1,1238 @@
+{
+  "pairs": [
+    {
+      "name": "bootstrap",
+      "sqlite": 1,
+      "postgres": 1
+    },
+    {
+      "name": "realtime_metadata_auto_match",
+      "sqlite": 46,
+      "postgres": 2
+    },
+    {
+      "name": "strm_probe_features",
+      "sqlite": 47,
+      "postgres": 3
+    },
+    {
+      "name": "strm_target_kinds",
+      "sqlite": 48,
+      "postgres": 4
+    },
+    {
+      "name": "strm_thumbnail_position",
+      "sqlite": 49,
+      "postgres": 5
+    },
+    {
+      "name": "strm_thumbnail_fallback",
+      "sqlite": 50,
+      "postgres": 6
+    },
+    {
+      "name": "strm_probe_incremental_scope",
+      "sqlite": 51,
+      "postgres": 7
+    },
+    {
+      "name": "media_item_nfo_metadata",
+      "sqlite": 53,
+      "postgres": 8
+    },
+    {
+      "name": "nfo_metadata_fingerprint",
+      "sqlite": 54,
+      "postgres": 9
+    },
+    {
+      "name": "media_chapters",
+      "sqlite": 55,
+      "postgres": 10
+    },
+    {
+      "name": "chapter_detection_jobs",
+      "sqlite": 56,
+      "postgres": 11
+    },
+    {
+      "name": "library_chapter_source",
+      "sqlite": 57,
+      "postgres": 12
+    },
+    {
+      "name": "chapter_detection_source_states",
+      "sqlite": 58,
+      "postgres": 13
+    },
+    {
+      "name": "user_playback_settings",
+      "sqlite": 59,
+      "postgres": 14
+    },
+    {
+      "name": "one_active_scan_per_library",
+      "sqlite": 60,
+      "postgres": 15
+    },
+    {
+      "name": "identity_stability",
+      "sqlite": 61,
+      "postgres": 16
+    },
+    {
+      "name": "remove_title_year_unique",
+      "sqlite": 62,
+      "postgres": 17
+    },
+    {
+      "name": "webhook_notifications",
+      "sqlite": 63,
+      "postgres": 18
+    },
+    {
+      "name": "person_credits",
+      "sqlite": 64,
+      "postgres": 19
+    },
+    {
+      "name": "notification_payload_format",
+      "sqlite": 65,
+      "postgres": 20
+    },
+    {
+      "name": "notification_provider_plugins",
+      "sqlite": 66,
+      "postgres": 21
+    },
+    {
+      "name": "home_catalog_indexes",
+      "sqlite": 67,
+      "postgres": 22
+    },
+    {
+      "name": "library_type_visible_index",
+      "sqlite": 68,
+      "postgres": 23
+    },
+    {
+      "name": "person_credits_name",
+      "sqlite": 69,
+      "postgres": 24
+    },
+    {
+      "name": "person_credits_rich_metadata",
+      "sqlite": 70,
+      "postgres": 25
+    },
+    {
+      "name": "scan_job_activity",
+      "sqlite": 71,
+      "postgres": 71
+    },
+    {
+      "name": "metadata_reidentify_job_statuses",
+      "sqlite": 72,
+      "postgres": 72
+    },
+    {
+      "name": "canonical_people",
+      "sqlite": 73,
+      "postgres": 73
+    },
+    {
+      "name": "person_match_candidates",
+      "sqlite": 74,
+      "postgres": 74
+    },
+    {
+      "name": "user_library_order",
+      "sqlite": 75,
+      "postgres": 75
+    },
+    {
+      "name": "person_match_decisions",
+      "sqlite": 76,
+      "postgres": 176
+    },
+    {
+      "name": "library_cover_jobs",
+      "sqlite": 77,
+      "postgres": 77
+    },
+    {
+      "name": "person_index_rebuild_jobs",
+      "sqlite": 78,
+      "postgres": 78
+    },
+    {
+      "name": "person_index_item_state",
+      "sqlite": 79,
+      "postgres": 79
+    },
+    {
+      "name": "person_index_query_indexes",
+      "sqlite": 80,
+      "postgres": 80
+    },
+    {
+      "name": "poster_fallback",
+      "sqlite": 81,
+      "postgres": 81
+    },
+    {
+      "name": "metadata_job_scope",
+      "sqlite": 82,
+      "postgres": 82
+    },
+    {
+      "name": "default_library_schedules",
+      "sqlite": 83,
+      "postgres": 83
+    },
+    {
+      "name": "emby_migration",
+      "sqlite": 84,
+      "postgres": 84
+    },
+    {
+      "name": "emby_migration_sources",
+      "sqlite": 85,
+      "postgres": 85
+    },
+    {
+      "name": "emby_migration_history_capability",
+      "sqlite": 86,
+      "postgres": 86
+    },
+    {
+      "name": "user_person_state",
+      "sqlite": 87,
+      "postgres": 87
+    },
+    {
+      "name": "emby_migration_person_favorites",
+      "sqlite": 88,
+      "postgres": 88
+    },
+    {
+      "name": "person_manifest_restore_state",
+      "sqlite": 89,
+      "postgres": 89
+    },
+    {
+      "name": "ordered_library_scrapers",
+      "sqlite": 90,
+      "postgres": 90
+    },
+    {
+      "name": "media_metadata_scraper",
+      "sqlite": 91,
+      "postgres": 91
+    },
+    {
+      "name": "scan_job_targets",
+      "sqlite": 92,
+      "postgres": 92
+    },
+    {
+      "name": "scan_postprocessing_phase",
+      "sqlite": 93,
+      "postgres": 93
+    },
+    {
+      "name": "scan_removed_targets",
+      "sqlite": 94,
+      "postgres": 94
+    },
+    {
+      "name": "metadata_candidate_identity",
+      "sqlite": 95,
+      "postgres": 95
+    },
+    {
+      "name": "legacy_person_migration_state",
+      "sqlite": 96,
+      "postgres": 96
+    },
+    {
+      "name": "web_playback_sessions",
+      "sqlite": 97,
+      "postgres": 97
+    },
+    {
+      "name": "web_playback_session_admin",
+      "sqlite": 98,
+      "postgres": 98
+    },
+    {
+      "name": "metadata_image_attempts",
+      "sqlite": 99,
+      "postgres": 99
+    },
+    {
+      "name": "metadata_capability_attempts",
+      "sqlite": 100,
+      "postgres": 100
+    },
+    {
+      "name": "item_image_source_url",
+      "sqlite": 101,
+      "postgres": 101
+    },
+    {
+      "name": "user_item_state_favorites",
+      "sqlite": 102,
+      "postgres": 102
+    },
+    {
+      "name": "emby_migration_selected_users",
+      "sqlite": 103,
+      "postgres": 103
+    },
+    {
+      "name": "emby_migration_scope",
+      "sqlite": 104,
+      "postgres": 104
+    },
+    {
+      "name": "emby_migration_handled_items",
+      "sqlite": 106,
+      "postgres": 106
+    },
+    {
+      "name": "media_item_provider_index",
+      "sqlite": 107,
+      "postgres": 107
+    },
+    {
+      "name": "media_item_migration_title_index",
+      "sqlite": 108,
+      "postgres": 108
+    },
+    {
+      "name": "recommendation_query_indexes",
+      "sqlite": 109,
+      "postgres": 110
+    },
+    {
+      "name": "recommendation_materialization",
+      "sqlite": 110,
+      "postgres": 111
+    },
+    {
+      "name": "danmaku_unlimited_concurrency",
+      "sqlite": 111,
+      "postgres": 112
+    },
+    {
+      "name": "emby_user_compatibility",
+      "sqlite": 113,
+      "postgres": 113
+    },
+    {
+      "name": "database_lifecycle_cleanup",
+      "sqlite": 115,
+      "postgres": 115
+    },
+    {
+      "name": "scheduled_task_plans",
+      "sqlite": 116,
+      "postgres": 116
+    },
+    {
+      "name": "redundant_child_indexes",
+      "sqlite": 117,
+      "postgres": 117
+    },
+    {
+      "name": "scan_index_compaction",
+      "sqlite": 118,
+      "postgres": 118
+    },
+    {
+      "name": "device_pairings",
+      "sqlite": 119,
+      "postgres": 119
+    },
+    {
+      "name": "manual_item_merges",
+      "sqlite": 120,
+      "postgres": 120
+    },
+    {
+      "name": "compact_episode_fanart_indices",
+      "sqlite": 121,
+      "postgres": 121
+    },
+    {
+      "name": "reconciliation_entry_states",
+      "sqlite": 122,
+      "postgres": 122
+    },
+    {
+      "name": "avoid_redundant_availability_updates",
+      "sqlite": 123,
+      "postgres": 123
+    },
+    {
+      "name": "web_playback_transcoding_details",
+      "sqlite": 124,
+      "postgres": 124
+    },
+    {
+      "name": "library_order_preferences",
+      "sqlite": 125,
+      "postgres": 125
+    },
+    {
+      "name": "emby_item_timestamps",
+      "sqlite": 126,
+      "postgres": 126
+    },
+    {
+      "name": "playback_session_progress",
+      "sqlite": 127,
+      "postgres": 127
+    },
+    {
+      "name": "full_scan_manifest",
+      "sqlite": 128,
+      "postgres": 128
+    },
+    {
+      "name": "login_background_plugin_cache",
+      "sqlite": 129,
+      "postgres": 129
+    },
+    {
+      "name": "scan_manifest_entry_device",
+      "sqlite": 130,
+      "postgres": 130
+    },
+    {
+      "name": "scan_manifest_resume_state",
+      "sqlite": 131,
+      "postgres": 131
+    },
+    {
+      "name": "streamed_manifest_indexing",
+      "sqlite": 132,
+      "postgres": 132
+    },
+    {
+      "name": "skip_redundant_source_availability_update",
+      "sqlite": 133,
+      "postgres": 133
+    },
+    {
+      "name": "drop_redundant_manifest_entry_index",
+      "sqlite": 134,
+      "postgres": 134
+    },
+    {
+      "name": "manifest_discovery_format_and_seen_paths",
+      "sqlite": 135,
+      "postgres": 135
+    },
+    {
+      "name": "manifest_postprocessing_target_checkpoint",
+      "sqlite": 136,
+      "postgres": 136
+    },
+    {
+      "name": "manifest_lite_discovery_mode",
+      "sqlite": 144,
+      "postgres": 144
+    },
+    {
+      "name": "thumbnail_scraper_retries",
+      "sqlite": 145,
+      "postgres": 145
+    },
+    {
+      "name": "progressive_scan_metadata",
+      "sqlite": 151,
+      "postgres": 151
+    },
+    {
+      "name": "scan_manifest_workflow_three",
+      "sqlite": 152,
+      "postgres": 152
+    },
+    {
+      "name": "scan_local_metadata_image_stage",
+      "sqlite": 153,
+      "postgres": 153
+    },
+    {
+      "name": "scan_local_metadata_backfill",
+      "sqlite": 154,
+      "postgres": 154
+    },
+    {
+      "name": "library_deletion_cascade_indexes",
+      "sqlite": 155,
+      "postgres": 155
+    },
+    {
+      "name": "library_deletion_fk_lookup_indexes",
+      "sqlite": 156,
+      "postgres": 156
+    },
+    {
+      "name": "metadata_reidentify_claim_priority",
+      "sqlite": 157,
+      "postgres": 157
+    },
+    {
+      "name": "media_info_chapters",
+      "sqlite": 158,
+      "postgres": 158
+    },
+    {
+      "name": "job_activity_indexes",
+      "sqlite": 159,
+      "postgres": 159
+    },
+    {
+      "name": "scan_local_metadata_backfill_non_retryable_items",
+      "sqlite": 160,
+      "postgres": 160
+    },
+    {
+      "name": "reconcile_cancelled_metadata_job_items",
+      "sqlite": 161,
+      "postgres": 161
+    },
+    {
+      "name": "filesystem_entry_directory_prefix_index",
+      "sqlite": 162,
+      "postgres": 162
+    },
+    {
+      "name": "scan_job_failed_count_index",
+      "sqlite": 163,
+      "postgres": 163
+    },
+    {
+      "name": "metadata_fill_request_snapshots",
+      "sqlite": 164,
+      "postgres": 164
+    },
+    {
+      "name": "metadata_fill_missing_retry_backoff",
+      "sqlite": 165,
+      "postgres": 165
+    },
+    {
+      "name": "person_index_relation_checksum",
+      "sqlite": 166,
+      "postgres": 166
+    },
+    {
+      "name": "removed_media_items_index",
+      "sqlite": 168,
+      "postgres": 168
+    },
+    {
+      "name": "metadata_reidentify_dispatch_source",
+      "sqlite": 169,
+      "postgres": 169
+    },
+    {
+      "name": "global_movie_collections",
+      "sqlite": 170,
+      "postgres": 170
+    },
+    {
+      "name": "global_collection_sync_outbox",
+      "sqlite": 171,
+      "postgres": 171
+    },
+    {
+      "name": "user_collection_source_preferences",
+      "sqlite": 172,
+      "postgres": 172
+    },
+    {
+      "name": "nfo_collection_reference_key",
+      "sqlite": 173,
+      "postgres": 173
+    },
+    {
+      "name": "scan_job_file_changes",
+      "sqlite": 174,
+      "postgres": 174
+    },
+    {
+      "name": "global_collection_reference_reconciliation_index",
+      "sqlite": 175,
+      "postgres": 175
+    },
+    {
+      "name": "user_item_resume_visibility",
+      "sqlite": 177,
+      "postgres": 177
+    },
+    {
+      "name": "filesystem_entry_device",
+      "sqlite": 178,
+      "postgres": 178
+    },
+    {
+      "name": "scan_fingerprint_migration",
+      "sqlite": 179,
+      "postgres": 179
+    },
+    {
+      "name": "clear_missing_file_fingerprints",
+      "sqlite": 180,
+      "postgres": 180
+    },
+    {
+      "name": "strm_probe_status_not_configured",
+      "sqlite": 181,
+      "postgres": 181
+    },
+    {
+      "name": "scan_job_processed_media",
+      "sqlite": 183,
+      "postgres": 183
+    },
+    {
+      "name": "user_account_profile",
+      "sqlite": 184,
+      "postgres": 184
+    },
+    {
+      "name": "user_playback_policy",
+      "sqlite": 185,
+      "postgres": 185
+    },
+    {
+      "name": "user_playback_admissions",
+      "sqlite": 186,
+      "postgres": 186
+    },
+    {
+      "name": "user_library_access_mode",
+      "sqlite": 187,
+      "postgres": 187
+    },
+    {
+      "name": "user_permission_preset_sources",
+      "sqlite": 188,
+      "postgres": 188
+    },
+    {
+      "name": "user_account_preferences",
+      "sqlite": 189,
+      "postgres": 189
+    },
+    {
+      "name": "user_content_restrictions",
+      "sqlite": 190,
+      "postgres": 190
+    },
+    {
+      "name": "media_content_restriction_index",
+      "sqlite": 191,
+      "postgres": 191
+    },
+    {
+      "name": "media_content_restriction_index_invalidation",
+      "sqlite": 192,
+      "postgres": 192
+    },
+    {
+      "name": "user_activity_events",
+      "sqlite": 193,
+      "postgres": 193
+    },
+    {
+      "name": "user_devices",
+      "sqlite": 194,
+      "postgres": 194
+    },
+    {
+      "name": "web_session_device_id",
+      "sqlite": 195,
+      "postgres": 195
+    },
+    {
+      "name": "user_access_blacklist_rules",
+      "sqlite": 196,
+      "postgres": 196
+    },
+    {
+      "name": "web_playback_access_context",
+      "sqlite": 197,
+      "postgres": 197
+    },
+    {
+      "name": "emby_direct_playback_tickets",
+      "sqlite": 198,
+      "postgres": 198
+    },
+    {
+      "name": "mail_outbox",
+      "sqlite": 199,
+      "postgres": 199
+    },
+    {
+      "name": "mail_challenges",
+      "sqlite": 200,
+      "postgres": 200
+    },
+    {
+      "name": "user_invitations",
+      "sqlite": 201,
+      "postgres": 201
+    },
+    {
+      "name": "library_deletion_jobs",
+      "sqlite": 202,
+      "postgres": 202
+    },
+    {
+      "name": "user_registration_requests",
+      "sqlite": 203,
+      "postgres": 203
+    },
+    {
+      "name": "user_optimized_images",
+      "sqlite": 204,
+      "postgres": 204
+    },
+    {
+      "name": "catalog_sort_indexes",
+      "sqlite": 205,
+      "postgres": 205
+    },
+    {
+      "name": "strm_probe_source_scope",
+      "sqlite": 206,
+      "postgres": 206
+    },
+    {
+      "name": "remove_user_optimized_images",
+      "sqlite": 207,
+      "postgres": 207
+    },
+    {
+      "name": "content_restriction_index_queue",
+      "sqlite": 208,
+      "postgres": 208
+    },
+    {
+      "name": "metadata_reidentify_retry_indexes",
+      "sqlite": 209,
+      "postgres": 209
+    },
+    {
+      "name": "recommendation_stats_fingerprint",
+      "sqlite": 210,
+      "postgres": 210
+    },
+    {
+      "name": "notification_delivery_retention_index",
+      "sqlite": 211,
+      "postgres": 211
+    },
+    {
+      "name": "task_history_retention_indexes",
+      "sqlite": 212,
+      "postgres": 212
+    },
+    {
+      "name": "person_credit_lookup_indexes",
+      "sqlite": 213,
+      "postgres": 213
+    },
+    {
+      "name": "episode_latest_indexes",
+      "sqlite": 215,
+      "postgres": 215
+    },
+    {
+      "name": "scan_job_target_state_indexes",
+      "sqlite": 218,
+      "postgres": 218
+    },
+    {
+      "name": "drop_unused_home_catalog_index",
+      "sqlite": 220,
+      "postgres": 220
+    },
+    {
+      "name": "drop_unused_catalog_sort_indexes",
+      "sqlite": 221,
+      "postgres": 221
+    },
+    {
+      "name": "emby_token_expiry",
+      "sqlite": 222,
+      "postgres": 222
+    },
+    {
+      "name": "media_merge_records",
+      "sqlite": 223,
+      "postgres": 225
+    },
+    {
+      "name": "transcoding_history",
+      "sqlite": 224,
+      "postgres": 226
+    },
+    {
+      "name": "merge_suppressions",
+      "sqlite": 225,
+      "postgres": 227
+    },
+    {
+      "name": "user_item_state_archive",
+      "sqlite": 226,
+      "postgres": 228
+    },
+    {
+      "name": "playback_history_event_archive",
+      "sqlite": 227,
+      "postgres": 229
+    },
+    {
+      "name": "media_item_nfo_cache",
+      "sqlite": 228,
+      "postgres": 230
+    },
+    {
+      "name": "catalog_outbox",
+      "sqlite": 229,
+      "postgres": 231
+    },
+    {
+      "name": "catalog_items",
+      "sqlite": 230,
+      "postgres": 232
+    },
+    {
+      "name": "user_series_next",
+      "sqlite": 231,
+      "postgres": 233
+    },
+    {
+      "name": "user_series_next_last_played_at",
+      "sqlite": 232,
+      "postgres": 234
+    },
+    {
+      "name": "catalog_items_latest_episode_added_at",
+      "sqlite": 233,
+      "postgres": 235
+    },
+    {
+      "name": "catalog_items_latest_added_at",
+      "sqlite": 234,
+      "postgres": 236
+    },
+    {
+      "name": "catalog_items_visibility_index",
+      "sqlite": 235,
+      "postgres": 237
+    },
+    {
+      "name": "catalog_items_recent_sort_index",
+      "sqlite": 236,
+      "postgres": 238
+    },
+    {
+      "name": "search_reindex_outbox",
+      "sqlite": 237,
+      "postgres": 239
+    },
+    {
+      "name": "catalog_items_incremental_outbox",
+      "sqlite": 238,
+      "postgres": 240
+    },
+    {
+      "name": "symlink_media_origin",
+      "sqlite": 239,
+      "postgres": 241
+    },
+    {
+      "name": "nfo_collection_pending_index_without_stale_predicate",
+      "sqlite": 240,
+      "postgres": 242
+    },
+    {
+      "name": "playback_access_tokens",
+      "sqlite": 241,
+      "postgres": 243
+    },
+    {
+      "name": "drop_redundant_media_items_indexes",
+      "sqlite": 242,
+      "postgres": 244
+    },
+    {
+      "name": "search_outbox_split",
+      "sqlite": 243,
+      "postgres": 245
+    }
+  ],
+  "sqlite_only": [
+    {
+      "name": "users",
+      "sqlite": 2,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "web_sessions",
+      "sqlite": 3,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "access_tokens",
+      "sqlite": 4,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "libraries",
+      "sqlite": 5,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_catalog",
+      "sqlite": 6,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "item_images",
+      "sqlite": 7,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_streams",
+      "sqlite": 8,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "user_library_access",
+      "sqlite": 9,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "metadata_fingerprints",
+      "sqlite": 10,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "scan_jobs",
+      "sqlite": 11,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "scheduled_task_configs",
+      "sqlite": 12,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "metadata_candidates",
+      "sqlite": 13,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_item_identity",
+      "sqlite": 14,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "user_item_state",
+      "sqlite": 15,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "external_subtitle_streams",
+      "sqlite": 16,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "playback_sessions",
+      "sqlite": 17,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "playback_settings",
+      "sqlite": 18,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "search_index",
+      "sqlite": 19,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "collections",
+      "sqlite": 20,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "audit_events",
+      "sqlite": 21,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "scan_job_events",
+      "sqlite": 22,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "metadata_reidentify_jobs",
+      "sqlite": 23,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "builtin_plugins_and_library_scraper",
+      "sqlite": 24,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "library_covers",
+      "sqlite": 25,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_stream_details",
+      "sqlite": 26,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "requeue_strm_probes",
+      "sqlite": 27,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "library_media_strategy",
+      "sqlite": 28,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "requeue_failed_strm_probes",
+      "sqlite": 29,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "metadata_refresh_modes",
+      "sqlite": 30,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "strm_probe_jobs",
+      "sqlite": 31,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_ratings",
+      "sqlite": 32,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "danmaku",
+      "sqlite": 33,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "danmaku_active_job_index",
+      "sqlite": 34,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_series_metadata",
+      "sqlite": 35,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "metadata_reidentify_cancellation",
+      "sqlite": 36,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "normalize_local_media_containers",
+      "sqlite": 37,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "incremental_scan_paths",
+      "sqlite": 38,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "playback_session_remote_ip",
+      "sqlite": 39,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "playback_session_device_metadata",
+      "sqlite": 40,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "registered_task_metadata",
+      "sqlite": 41,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "reconciliation_scan_entries",
+      "sqlite": 42,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "reconcile_scheduled_task",
+      "sqlite": 43,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_catalog_hierarchy_indexes",
+      "sqlite": 44,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "media_item_availability",
+      "sqlite": 45,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "strm_probe_scan_job_fk",
+      "sqlite": 52,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "sqlite_home_catalog_indexes",
+      "sqlite": 112,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "skip_empty_alias_lookup_on_media_item_insert",
+      "sqlite": 146,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "skip_redundant_sort_title_fts_tokens",
+      "sqlite": 147,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "fts_columnsize_zero",
+      "sqlite": 148,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    },
+    {
+      "name": "index_media_search_row_ids",
+      "sqlite": 167,
+      "reason": "SQLite-only: FTS5 table, rowid map, pragma or SQLite trigger"
+    }
+  ],
+  "postgres_only": [
+    {
+      "name": "scan_job_active_by_type",
+      "postgres": 109,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "normalize_user_password_flag",
+      "postgres": 114,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "statement_derived_index_refresh",
+      "postgres": 137,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "avoid_alias_rescan_on_media_item_refresh",
+      "postgres": 138,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "promote_media_availability_on_source_insert",
+      "postgres": 139,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "media_search_insert_without_conflict_probe",
+      "postgres": 140,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "statement_provider_index_refresh",
+      "postgres": 141,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "filter_available_source_promotions",
+      "postgres": 142,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "merge_provider_refresh_into_media_search",
+      "postgres": 143,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "skip_empty_provider_index_expansion",
+      "postgres": 146,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "drop_media_search_item_fk",
+      "postgres": 147,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "drop_scan_job_targets_job_fk",
+      "postgres": 148,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "statement_timestamp_unixepoch",
+      "postgres": 149,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "homevideos_video_types",
+      "postgres": 150,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "partial_merged_into_index",
+      "postgres": 182,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "media_search_trigram_indexes",
+      "postgres": 214,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "media_item_trigger_split",
+      "postgres": 219,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "statement_timestamp_defaults",
+      "postgres": 223,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    },
+    {
+      "name": "home_unavailable_series_index",
+      "postgres": 224,
+      "reason": "PostgreSQL-only: extension, statement-level trigger function or index"
+    }
+  ],
+  "ordering": {
+    "shared_names": 176,
+    "rank_mismatches": 84,
+    "note": "Migration histories evolved with different SQLite-only/PostgreSQL-only interleaving, so the shared names are not in the same relative order. New migrations must keep a pair adjacent in both directories, which keeps this count from growing."
+  }
+}

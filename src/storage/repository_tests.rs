@@ -792,6 +792,19 @@ use crate::{
     },
 };
 
+/// Applies every queued search event; write paths only append to the outbox (W4).
+async fn drain_search_index(database: &Database) {
+    loop {
+        let applied = database
+            .drain_search_reindex(100)
+            .await
+            .expect("search reindex drain");
+        if applied == 0 {
+            return;
+        }
+    }
+}
+
 #[tokio::test]
 async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
     let temp_dir = tempfile::tempdir().expect("temporary directory");
@@ -819,6 +832,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .await
         .expect("media item");
     }
+    drain_search_index(&database).await;
     let original_rowid: i64 =
         sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
             .fetch_one(database.pool())
@@ -846,6 +860,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("search metadata update");
+    drain_search_index(&database).await;
     let renamed_rowid: i64 =
         sqlx::query_scalar("SELECT rowid FROM media_search WHERE item_id = 'fts-first'")
             .fetch_one(database.pool())
@@ -869,6 +884,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
     .execute(database.pool())
     .await
     .expect("insert alias");
+    drain_search_index(&database).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
@@ -889,6 +905,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("move alias to another item");
+    drain_search_index(&database).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM media_search WHERE item_id = 'fts-first' AND aliases MATCH 'alias'",
@@ -911,6 +928,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("delete alias");
+    drain_search_index(&database).await;
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT count(*) FROM media_search WHERE item_id = 'fts-second' AND aliases MATCH 'alias'",
@@ -925,6 +943,7 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
         .execute(database.pool())
         .await
         .expect("delete media item");
+    drain_search_index(&database).await;
     let remaining_mappings: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_search_map WHERE item_id = 'fts-first'")
             .fetch_one(database.pool())
@@ -937,6 +956,182 @@ async fn sqlite_media_search_rowid_map_tracks_fts_rows_and_aliases() {
             .expect("deleted FTS row");
     assert_eq!(remaining_mappings, 0);
     assert_eq!(remaining_search_rows, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn search_reindex_queue_defers_fts_writes_until_drained() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title,
+             identification_status, has_available_source
+         ) VALUES ('queued-item', ?, 'MOVIE', 'Queued Title', 'queued title',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await
+    .expect("media item");
+
+    // The write path only appends; the FTS row appears after the consumer runs.
+    let queued: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM search_outbox WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("queued event");
+    assert_eq!(queued, 1);
+    // The search stream has its own table, so it can never share a sequence with catalog events.
+    let leaked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search'")
+            .fetch_one(database.pool())
+            .await
+            .expect("search rows in the catalog outbox");
+    assert_eq!(leaked, 0);
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("FTS rows before drain");
+    assert_eq!(before, 0);
+
+    assert_eq!(database.drain_search_reindex(100).await.expect("drain"), 1);
+    let matches: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_search WHERE item_id = 'queued-item' AND title MATCH 'Queued'",
+    )
+    .fetch_one(database.pool())
+    .await
+    .expect("drained FTS row");
+    assert_eq!(matches, 1);
+    // A second pass is a no-op and leaves a watermark behind.
+    assert_eq!(
+        database
+            .drain_search_reindex(100)
+            .await
+            .expect("second drain"),
+        0
+    );
+    let watermark = database
+        .catalog_consumer(SEARCH_REINDEX_CONSUMER)
+        .await
+        .expect("watermark read")
+        .expect("watermark row");
+    assert!(watermark.applied_seq > 0);
+    assert!(watermark.last_error.is_none());
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'queued-item'")
+        .execute(database.pool())
+        .await
+        .expect("delete media item");
+    assert_eq!(
+        database
+            .drain_search_reindex(100)
+            .await
+            .expect("delete drain"),
+        1
+    );
+    // Applied events are reclaimed; a fresh event survives until it is applied too.
+    let trimmed = database
+        .trim_outbox(SEARCH_REINDEX_CONSUMER, SEARCH_OUTBOX, 100)
+        .await
+        .expect("trim outbox");
+    assert!(trimmed >= 2);
+    let queued_after_trim: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM search_outbox WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("outbox after trim");
+    assert_eq!(queued_after_trim, 0);
+
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted FTS row");
+    let mapping: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search_map WHERE item_id = 'queued-item'")
+            .fetch_one(database.pool())
+            .await
+            .expect("deleted row mapping");
+    assert_eq!(remaining, 0);
+    assert_eq!(mapping, 0);
+    database.close().await;
+}
+
+#[tokio::test]
+async fn search_reindex_detects_a_queue_gap_and_reindexes_everything() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let library = LibraryService::new(database.clone())
+        .create_library("Movies", LibraryKind::Movie, false)
+        .await
+        .expect("library");
+    for item_id in ["gap-a", "gap-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title,
+                 identification_status, has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(item_id)
+        .bind(library.id.to_string())
+        .bind(item_id)
+        .bind(item_id)
+        .execute(database.pool())
+        .await
+        .expect("media item");
+    }
+    assert_eq!(database.drain_search_reindex(100).await.expect("drain"), 2);
+
+    // Simulate a queue trimmed past the watermark without the consumer applying it: the oldest
+    // remaining event is no longer the one the consumer expects, so everything must be re-queued.
+    sqlx::query("DELETE FROM search_outbox WHERE id = 1")
+        .execute(database.pool())
+        .await
+        .expect("lose the first event");
+    sqlx::query(
+        "INSERT INTO catalog_consumers (name, applied_seq) VALUES (?, 0)
+         ON CONFLICT(name) DO UPDATE SET applied_seq = 0",
+    )
+    .bind(SEARCH_REINDEX_CONSUMER)
+    .execute(database.pool())
+    .await
+    .expect("rewind the watermark");
+    sqlx::query("UPDATE media_items SET title = 'gap changed' WHERE id = 'gap-a'")
+        .execute(database.pool())
+        .await
+        .expect("queue a fresh event for gap-a");
+    let applied = database.drain_search_reindex(100).await.expect("gap drain");
+    assert!(
+        applied >= 2,
+        "gap must trigger a full reindex, applied {applied}"
+    );
+    for item_id in ["gap-a", "gap-b"] {
+        let indexed: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_search WHERE item_id = ? AND title MATCH 'gap'",
+        )
+        .bind(item_id)
+        .fetch_one(database.pool())
+        .await
+        .expect("reindexed row");
+        assert_eq!(
+            indexed, 1,
+            "{item_id} must be searchable after the gap repair"
+        );
+    }
     database.close().await;
 }
 
@@ -2289,6 +2484,223 @@ async fn postgres_metadata_batch_writes_preserve_upsert_and_retry_semantics()
     Ok(())
 }
 
+/// Runs `body` against a freshly created PostgreSQL database and drops it afterwards.
+async fn with_isolated_postgres_database<F, Fut>(body: F) -> Result<(), Box<dyn std::error::Error>>
+where
+    F: FnOnce(Database) -> Fut,
+    Fut: std::future::Future<Output = Result<(), Box<dyn std::error::Error>>>,
+{
+    let database_name = format!("lux_test_{}", uuid::Uuid::now_v7().simple());
+    let admin_connection = PostgresConnection {
+        host: std::env::var("POSTGRES_TEST_HOST").unwrap_or_else(|_| "127.0.0.1".to_owned()),
+        port: std::env::var("POSTGRES_TEST_PORT")
+            .ok()
+            .and_then(|port| port.parse().ok())
+            .unwrap_or(55432),
+        database: "postgres".to_owned(),
+        username: std::env::var("POSTGRES_TEST_USER").unwrap_or_else(|_| "lux".to_owned()),
+        password: std::env::var("POSTGRES_TEST_PASSWORD")
+            .unwrap_or_else(|_| "lux-test-password".to_owned()),
+        ssl_mode: "disable".to_owned(),
+    };
+    let admin_url = crate::config::DatabaseConfiguration::Postgres(admin_connection.clone())
+        .postgres_url()?
+        .ok_or("missing PostgreSQL URL")?;
+    let admin_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&admin_url)
+        .await?;
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "CREATE DATABASE {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await?;
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect_with_configuration(
+        &config,
+        &crate::config::DatabaseConfiguration::Postgres(PostgresConnection {
+            database: database_name.clone(),
+            ..admin_connection
+        }),
+    )
+    .await?;
+    let outcome = body(database.clone()).await;
+    database.close().await;
+    let dropped = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS {database_name}"
+    )))
+    .execute(&admin_pool)
+    .await;
+    admin_pool.close().await;
+    outcome?;
+    dropped?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_nfo_collection_reconciliation_commits_and_leaves_the_pending_queue()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let library = LibraryService::new(database.clone())
+            .create_library("Reconcile", LibraryKind::Movie, false)
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES ('reconcile-movie', ?, 'MOVIE', 'Movie', 'movie',
+                           'LOCAL_CONFIRMED', 1)",
+            )
+            .bind(library.id.to_string())
+            .execute(database.pool())
+            .await?;
+        database
+            .query(
+                "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                 VALUES ('reconcile-movie', '{}', 2)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let pending = database
+            .list_pending_movie_nfo_collection_reference_reconciliations(32)
+            .await?;
+        assert_eq!(pending.len(), 1);
+        // A bare FOR UPDATE over the LEFT JOIN used to fail on PostgreSQL and keep the item
+        // at the head of the queue forever.
+        let committed = database
+            .commit_movie_nfo_collection_reference_reconciliation(&pending[0], None, "")
+            .await?;
+        assert!(committed);
+        assert!(
+            database
+                .list_pending_movie_nfo_collection_reference_reconciliations(32)
+                .await?
+                .is_empty()
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_recommendation_stats_refresh_decodes_the_source_fingerprint()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        database.refresh_recommendation_stats_if_needed().await?;
+        // A stale batch key forces the fingerprint query, whose SUM() used to come back as
+        // NUMERIC and fail to decode through the Any driver.
+        database
+            .query("UPDATE recommendation_stats_state SET batch_key = batch_key - 1 WHERE id = 1")
+            .execute(database.pool())
+            .await?;
+        database.refresh_recommendation_stats_if_needed().await?;
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_catalog_read_model_rebuild_and_stats_are_consistent()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let library = LibraryService::new(database.clone())
+            .create_library("Read model", LibraryKind::Movie, false)
+            .await?;
+        for index in 0..3 {
+            database
+                .query(
+                    "INSERT INTO media_items (
+                         id, library_id, item_type, title, sort_title, identification_status,
+                         has_available_source
+                     ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+                )
+                .bind(format!("read-model-{index}"))
+                .bind(library.id.to_string())
+                .bind(format!("Movie {index}"))
+                .bind(format!("movie {index}"))
+                .execute(database.pool())
+                .await?;
+        }
+        let (processed, _) = database.rebuild_catalog_items_batch(None, 100).await?;
+        assert_eq!(processed, 3);
+        // Run twice: the counters are replaced inside one transaction each time.
+        database.rebuild_catalog_item_stats().await?;
+        database.rebuild_catalog_item_stats().await?;
+        let global: i64 = database
+            .query_scalar(
+                "SELECT total FROM catalog_item_stats
+                 WHERE scope = 'global' AND item_type = 'MOVIE'",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(global, 3);
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance started with shared_preload_libraries=pg_stat_statements"]
+async fn postgres_query_statistics_extension_is_created_once_when_preloaded()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let before = database.collect_postgres_query_statistics().await["status"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert_eq!(before, "EXTENSION_MISSING");
+        let first = database.ensure_postgres_query_statistics_extension().await;
+        assert_eq!(
+            first,
+            super::database_maintenance::QueryStatisticsExtensionOutcome::Created
+        );
+        let second = database.ensure_postgres_query_statistics_extension().await;
+        assert_eq!(
+            second,
+            super::database_maintenance::QueryStatisticsExtensionOutcome::AlreadyInstalled
+        );
+        assert_ne!(
+            database.collect_postgres_query_statistics().await["status"]
+                .as_str()
+                .unwrap_or_default()
+                .to_owned(),
+            "EXTENSION_MISSING"
+        );
+        Ok(())
+    })
+    .await
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance started WITHOUT shared_preload_libraries=pg_stat_statements"]
+async fn postgres_query_statistics_extension_is_skipped_when_not_preloaded()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        assert_eq!(
+            database.ensure_postgres_query_statistics_extension().await,
+            super::database_maintenance::QueryStatisticsExtensionOutcome::NotPreloaded
+        );
+        let installed: bool = database
+            .query_scalar(
+                "SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_stat_statements')",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert!(!installed);
+        Ok(())
+    })
+    .await
+}
+
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_scan_write_transaction_uses_local_async_commit()
@@ -2519,13 +2931,13 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
     let user_id = admin.id.to_string();
     sqlx::query(
         "INSERT INTO media_items (
-             id, library_id, item_type, parent_id, series_id, title, sort_title,
-             identification_status, has_available_source
+             id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+             title, sort_title, identification_status, has_available_source
          ) VALUES
-            ('played-parent-series', ?, 'SERIES', NULL, NULL, 'Series', 'series', 'LOCAL_CONFIRMED', 1),
-            ('played-parent-season', ?, 'SEASON', 'played-parent-series', 'played-parent-series', 'Season', 'season', 'LOCAL_CONFIRMED', 1),
-            ('played-episode-1', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1),
-            ('played-episode-2', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1)",
+            ('played-parent-series', ?, 'SERIES', NULL, NULL, NULL, NULL, 'Series', 'series', 'LOCAL_CONFIRMED', 1),
+            ('played-parent-season', ?, 'SEASON', 'played-parent-series', 'played-parent-series', 1, NULL, 'Season', 'season', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-1', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 1, 1, 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1),
+            ('played-episode-2', ?, 'EPISODE', 'played-parent-season', 'played-parent-series', 1, 2, 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1)",
     )
     .bind(&library_id)
     .bind(&library_id)
@@ -2549,6 +2961,8 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
         .sync_played_container_states(&user_id, "played-episode-1")
         .await
         .expect("played parent states");
+    // One episode-scope read, one parent-state read, and one batched state write. The resume
+    // pointer belongs to whoever changed the episode state, so this sync does not touch it.
     assert_eq!(database.query_count(), 3);
 
     let played_states: Vec<(String, i64, i64)> = sqlx::query_as(
@@ -2598,6 +3012,22 @@ async fn played_container_state_sync_batches_parent_queries_and_preserves_state(
             ("played-parent-series".to_owned(), 0, 1),
         ]
     );
+
+    // The episode-state write keeps the resume pointer in step: with episode 1 played and episode 2
+    // unplayed again, the next-up pointer is episode 2.
+    database
+        .refresh_user_series_next_for_item(&user_id, "played-episode-2")
+        .await
+        .expect("resume pointer refresh");
+    let pointer: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT next_item_id, position_ticks FROM user_series_next
+         WHERE user_id = ? AND series_id = 'played-parent-series'",
+    )
+    .bind(&user_id)
+    .fetch_all(database.pool())
+    .await
+    .expect("resume pointer rows");
+    assert_eq!(pointer, vec![("played-episode-2".to_owned(), 0)]);
 }
 
 #[tokio::test]
@@ -4101,6 +4531,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     for index in 0..205 {
         let id = format!("notification-destination-{index:03}");
         database
+            .notifications()
             .create_notification_destination(NewNotificationDestination {
                 id: &id,
                 name: &id,
@@ -4137,6 +4568,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     .await?;
     assert!(
         database
+            .notifications()
             .insert_notification_event_with_deliveries(event(), &destination_ids)
             .await
             .is_err()
@@ -4160,6 +4592,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     database.reset_query_count();
     assert!(
         database
+            .notifications()
             .insert_notification_event_with_deliveries(event(), &destination_ids)
             .await?
     );
@@ -4188,6 +4621,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     database.reset_query_count();
     assert!(
         !database
+            .notifications()
             .insert_notification_event_with_deliveries(event(), &destination_ids)
             .await?
     );
@@ -4200,6 +4634,7 @@ async fn notification_deliveries_are_written_in_bounded_batches()
     database.reset_query_count();
     assert!(
         database
+            .notifications()
             .insert_notification_event_with_deliveries(
                 NewNotificationEvent {
                     id: "notification-event-empty",
@@ -4237,6 +4672,7 @@ async fn notification_history_retention_prunes_old_delivered_rows()
     })
     .await?;
     database
+        .notifications()
         .create_notification_destination(NewNotificationDestination {
             id: "retention-destination",
             name: "Retention",
@@ -4251,6 +4687,7 @@ async fn notification_history_retention_prunes_old_delivered_rows()
         .await?;
     let destination_ids = vec!["retention-destination".to_owned()];
     database
+        .notifications()
         .insert_notification_event_with_deliveries(
             NewNotificationEvent {
                 id: "retention-old-event",
@@ -4264,6 +4701,7 @@ async fn notification_history_retention_prunes_old_delivered_rows()
         )
         .await?;
     database
+        .notifications()
         .insert_notification_event_with_deliveries(
             NewNotificationEvent {
                 id: "retention-new-event",
@@ -4290,7 +4728,10 @@ async fn notification_history_retention_prunes_old_delivered_rows()
     .execute(database.pool())
     .await?;
 
-    let (deleted_deliveries, deleted_events) = database.prune_notification_history(100, 10).await?;
+    let (deleted_deliveries, deleted_events) = database
+        .notifications()
+        .prune_notification_history(100, 10)
+        .await?;
     assert!(deleted_deliveries >= 1);
     assert!(deleted_events >= 1);
     let old_events: i64 = sqlx::query_scalar(
@@ -4356,6 +4797,7 @@ async fn postgres_notification_deliveries_are_written_in_bounded_batches()
         for index in 0..205 {
             let id = format!("postgres-notification-destination-{index:03}");
             database
+                .notifications()
                 .create_notification_destination(NewNotificationDestination {
                     id: &id,
                     name: &id,
@@ -4383,6 +4825,7 @@ async fn postgres_notification_deliveries_are_written_in_bounded_batches()
         database.reset_query_count();
         assert!(
             database
+                .notifications()
                 .insert_notification_event_with_deliveries(event(), &destination_ids)
                 .await?
         );
@@ -4397,6 +4840,7 @@ async fn postgres_notification_deliveries_are_written_in_bounded_batches()
         database.reset_query_count();
         assert!(
             !database
+                .notifications()
                 .insert_notification_event_with_deliveries(event(), &destination_ids)
                 .await?
         );
@@ -11357,7 +11801,9 @@ async fn catalog_sort_expression_indexes_cover_default_sorting()
             limit: 24,
             include_total: true,
         };
-        let plan = database.explain_filtered_catalog_rows(&filter).await?;
+        let plan = database
+            .explain_filtered_catalog_rows(&filter, crate::storage::CatalogRowProjection::Full)
+            .await?;
         let joined = plan.join("\n");
         assert!(
             joined.contains(index_name),
@@ -11445,6 +11891,61 @@ async fn recommendation_query_uses_materialized_stats_and_image_indexes() {
             .any(|detail| detail.contains("idx_item_images_recommendation_lookup")),
         "recommendation image lookup did not use the covering index: {image_plan:?}"
     );
+}
+
+#[tokio::test]
+async fn pending_nfo_collection_reconciliation_query_can_use_the_pending_index() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let plan = sqlx::query(
+        "EXPLAIN QUERY PLAN
+         SELECT item.id
+         FROM media_items item INDEXED BY idx_media_items_nfo_collection_reference_pending
+         JOIN libraries library ON library.id = item.library_id
+         JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.item_type = 'MOVIE'
+           AND item.removed_at IS NULL
+           AND item.nfo_collection_reference_key IS NULL
+         ORDER BY item.id
+         LIMIT 32",
+    )
+    .fetch_all(database.pool())
+    .await
+    .expect("the pending index must be usable by the reconciliation query")
+    .into_iter()
+    .map(|row| row.get::<String, _>("detail"))
+    .collect::<Vec<_>>();
+    assert!(
+        plan.iter()
+            .any(|detail| detail.contains("idx_media_items_nfo_collection_reference_pending")),
+        "pending reconciliation query did not use the pending index: {plan:?}"
+    );
+    assert!(
+        !plan.iter().any(|detail| detail.contains("TEMP B-TREE")),
+        "pending reconciliation query must not sort: {plan:?}"
+    );
+}
+
+#[tokio::test]
+async fn pending_nfo_collection_reconciliation_query_runs_on_both_shapes() {
+    let temp_dir = tempfile::tempdir().expect("temporary directory");
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse().expect("test address"),
+        config_dir: temp_dir.path().join("config"),
+    };
+    let database = Database::connect(&config).await.expect("database");
+    let rows = database
+        .list_pending_movie_nfo_collection_reference_reconciliations(32)
+        .await
+        .expect("fenced reconciliation query is valid SQL");
+    assert!(rows.is_empty());
+    let query = super::catalog::PENDING_NFO_COLLECTION_RECONCILIATION_QUERY;
+    assert_eq!(query.matches("AS MATERIALIZED").count(), 2);
+    assert!(query.trim_end().ends_with("LIMIT ?"));
 }
 
 #[tokio::test]
@@ -11908,12 +12409,15 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     let jobs = database
@@ -14507,12 +15011,15 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
@@ -14576,12 +15083,15 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -14707,12 +15217,15 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -16463,7 +16976,7 @@ async fn user_permission_copy_applies_selected_groups_with_snapshot_checks()
     let source = &copied["permission-write-source"];
     let target = &copied["permission-write-target"];
     assert_eq!(target.library_access_mode, "SELECTED");
-    assert_eq!(target.library_ids, [library_id.clone()]);
+    assert_eq!(target.library_ids, vec![library_id.clone()]);
     assert!(target.can_download);
     let copied_content = target
         .content_restrictions
@@ -16769,17 +17282,28 @@ async fn assert_media_content_restriction_index_storage(
             .query(
                 "INSERT INTO media_items (
                      id, library_id, item_type, title, sort_title, identification_status,
-                     nfo_metadata_json, removed_at
-                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+                     removed_at
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?)",
             )
             .bind(item_id)
             .bind(&library_id)
             .bind(item_id)
             .bind(item_id)
-            .bind(nfo_json)
             .bind(removed_at)
             .execute(database.pool())
             .await?;
+        if let Some(json) = nfo_json {
+            database
+                .query(
+                    "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                     VALUES (?, ?, length(CAST(? AS BLOB)))",
+                )
+                .bind(item_id)
+                .bind(json)
+                .bind(json)
+                .execute(database.pool())
+                .await?;
+        }
     }
     database
         .query(
@@ -16868,10 +17392,7 @@ async fn assert_media_content_restriction_index_storage(
     assert_eq!(indexed_tags, ["family"]);
 
     database
-        .query("UPDATE media_items SET nfo_metadata_json = ? WHERE id = ?")
-        .bind(changed_nfo)
-        .bind("restriction-index-a")
-        .execute(database.pool())
+        .update_media_item_nfo_metadata("restriction-index-a", Some(changed_nfo), None)
         .await?;
     assert!(
         !database
@@ -18222,6 +18743,9 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             duration_ticks: Some(100),
             played_percent: 95,
             is_paused: true,
+            previous_state: None,
+            previous_position_ticks: None,
+            renew_admission: false,
         })
         .await?;
     let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
@@ -18259,6 +18783,9 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             duration_ticks: Some(100),
             played_percent: 95,
             is_paused: false,
+            previous_state: Some("PAUSED"),
+            previous_position_ticks: Some(10),
+            renew_admission: false,
         })
         .await?;
     assert!(
@@ -18567,12 +19094,15 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -18658,12 +19188,15 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
@@ -19161,12 +19694,15 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         person_credits_write_lock: Arc::new(AsyncMutex::new(())),
         metadata_write_lock: Arc::new(AsyncMutex::new(())),
         recommendation_stats_refresh_lock: Arc::new(AsyncMutex::new(())),
+        statistics_refresh_lock: Arc::new(AsyncMutex::new(())),
         recommendation_rating_median_cache: Arc::new(AsyncMutex::new(
             RecommendationRatingMedianCache::default(),
         )),
         dashboard_stats_cache: Arc::new(AsyncMutex::new(None)),
         write_probe: Arc::new(AsyncMutex::new(None)),
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
+        access_changes: Arc::new(AccessChangeEpochs::default()),
+        auth_cache: Arc::new(AuthCacheEpochs::default()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
 
@@ -21269,6 +21805,2224 @@ async fn postgres_metadata_candidate_selection_accepts_integer_boolean_flags() {
             .await
             .expect("confirmed candidate status");
     assert_eq!(candidate_status, "SELECTED");
+}
+
+#[tokio::test]
+async fn rejecting_alternative_candidates_drops_their_payload()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Candidate payload", LibraryKind::Movie, false)
+        .await?;
+    let item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Payload', 'payload', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    for (candidate_id, provider_id, json) in [
+        (
+            "payload-selected",
+            "100",
+            r#"{"title":"Selected","overview":"keep me"}"#,
+        ),
+        (
+            "payload-rejected",
+            "200",
+            r#"{"title":"Rejected","overview":"drop me"}"#,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status
+             ) VALUES (?, ?, 'TMDB', ?, ?, 50, 'PENDING')",
+        )
+        .bind(candidate_id)
+        .bind(&item_id)
+        .bind(provider_id)
+        .bind(json)
+        .execute(database.pool())
+        .await?;
+    }
+
+    assert!(
+        database
+            .select_metadata_candidate(SelectedMetadataUpdate {
+                item_id: &item_id,
+                candidate_id: "payload-selected",
+                title: "Selected",
+                original_title: None,
+                overview: None,
+                production_year: None,
+                premiere_date: None,
+                last_air_date: None,
+                status: None,
+                original_language: None,
+                rating: None,
+                rating_source: None,
+                provider_ids_json: "{}",
+                metadata_scraper_id: None,
+                metadata_fingerprint: &[],
+                provenance_json: "{}",
+                locked_fields_json: "[]",
+                poster_fallback_required: false,
+                keep_pending: false,
+            })
+            .await?
+    );
+
+    let rows: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, status, candidate_json FROM metadata_candidates
+         WHERE item_id = ? ORDER BY id",
+    )
+    .bind(&item_id)
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(rows[0].0, "payload-rejected");
+    assert_eq!(rows[0].1, "REJECTED");
+    assert_eq!(
+        rows[0].2, "{}",
+        "rejected candidates must not keep TMDb JSON"
+    );
+    assert_eq!(rows[1].0, "payload-selected");
+    assert_eq!(rows[1].1, "SELECTED");
+    assert!(rows[1].2.contains("keep me"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn cleanup_removes_expired_pending_candidates_after_grace()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Expired candidates", LibraryKind::Movie, false)
+        .await?;
+    let item_id = uuid::Uuid::now_v7().to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Expired', 'expired', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&item_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    let now = crate::clock::unix_timestamp();
+    for (candidate_id, expires_at) in [
+        ("expired-long-ago", Some(now - 7_200)),
+        ("expired-within-grace", Some(now - 60)),
+        ("fresh", Some(now + 3_600)),
+        ("no-expiry", None),
+    ] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
+             ) VALUES (?, ?, 'TMDB', ?, '{}', 10, 'PENDING', ?)",
+        )
+        .bind(candidate_id)
+        .bind(&item_id)
+        .bind(candidate_id)
+        .bind(expires_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database.prune_task_history(100, 10).await?;
+
+    let remaining: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM metadata_candidates WHERE item_id = ? ORDER BY id")
+            .bind(&item_id)
+            .fetch_all(database.pool())
+            .await?;
+    assert_eq!(
+        remaining,
+        vec![
+            "expired-within-grace".to_owned(),
+            "fresh".to_owned(),
+            "no-expiry".to_owned()
+        ],
+        "only candidates past the one-hour grace are removed"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_history_purge_removes_only_terminal_old_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::auth::users::UserStore;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Purge", "Purge", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    let movie_id = uuid::Uuid::now_v7().to_string();
+    let library = LibraryService::new(database.clone())
+        .create_library("Purge", LibraryKind::Movie, false)
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (?, ?, 'MOVIE', 'Purge', 'purge', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(&movie_id)
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+
+    let now = 90 * 24 * 60 * 60;
+    let old = now - 31 * 24 * 60 * 60;
+    let future = now + 24 * 60 * 60;
+    for (id, expires_at, revoked_at) in [
+        ("ws-old", old, None),
+        ("ws-revoked", future, Some(old)),
+        ("ws-active", future, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_sessions (id, user_id, session_token_hash, csrf_token_hash,
+                                       expires_at, revoked_at)
+             VALUES (?, ?, randomblob(16), randomblob(16), ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(expires_at)
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, revoked_at) in [("at-old", Some(old)), ("at-fresh", None)] {
+        sqlx::query(
+            "INSERT INTO access_tokens (id, token_hash, user_id, device_id, client_name,
+                                        device_name, client_version, revoked_at)
+             VALUES (?, randomblob(16), ?, 'device', 'client', 'device', '1', ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(revoked_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // Playback tokens are never revoked by use, so an expired one is purged by its expiry alone.
+    for (id, expires_at) in [("at-playback-old", old), ("at-playback-live", now + 600)] {
+        sqlx::query(
+            "INSERT INTO access_tokens (id, token_hash, user_id, device_id, client_name,
+                                        device_name, client_version, scope,
+                                        playback_session_id, expires_at)
+             VALUES (?, randomblob(16), ?, 'device', 'client', 'device', '1', 'PLAYBACK',
+                     'play-session', ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(expires_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, state, expires_at) in [
+        ("wps-stopped", "STOPPED", old),
+        ("wps-active", "ACTIVE", old),
+    ] {
+        sqlx::query(
+            "INSERT INTO web_playback_sessions (id, user_id, item_id, play_session_id, tier,
+                                                plan, state, expires_at, last_heartbeat_at)
+             VALUES (?, ?, ?, ?, 0, 'DIRECT', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(&movie_id)
+        .bind(id)
+        .bind(state)
+        .bind(expires_at)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, state) in [("ps-stopped", "STOPPED"), ("ps-playing", "PLAYING")] {
+        sqlx::query(
+            "INSERT INTO playback_sessions (id, user_id, item_id, play_session_id, device_id,
+                                            state, last_event_at)
+             VALUES (?, ?, ?, ?, 'device', ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(&movie_id)
+        .bind(id)
+        .bind(state)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+    for (session_id, state) in [("adm-released", "RELEASED"), ("adm-active", "ACTIVE")] {
+        sqlx::query(
+            "INSERT INTO playback_admissions (user_id, play_session_id, state, admitted_at,
+                                              last_seen_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(session_id)
+        .bind(state)
+        .bind(old)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let purge = database.purge_expired_session_history(now, 100).await?;
+    assert_eq!(purge.web_sessions, 2);
+    assert_eq!(purge.access_tokens, 2);
+    assert_eq!(purge.web_playback_sessions, 1);
+    assert_eq!(purge.playback_sessions, 1);
+    assert_eq!(purge.playback_admissions, 1);
+
+    for (table, kept, gone) in [
+        ("access_tokens", "at-playback-live", "at-playback-old"),
+        ("web_sessions", "ws-active", "ws-old"),
+        ("access_tokens", "at-fresh", "at-old"),
+        ("web_playback_sessions", "wps-active", "wps-stopped"),
+        ("playback_sessions", "ps-playing", "ps-stopped"),
+    ] {
+        let kept_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(kept)
+        .fetch_one(database.pool())
+        .await?;
+        let gone_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(gone)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(kept_count, 1, "{table} must keep {kept}");
+        assert_eq!(gone_count, 0, "{table} must drop {gone}");
+    }
+    let remaining_admission: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM playback_admissions WHERE play_session_id = 'adm-active'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining_admission, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_record_purge_drops_only_terminal_rows_past_retention()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::auth::users::UserStore;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Records", "Records", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    let library = LibraryService::new(database.clone())
+        .create_library("Records", LibraryKind::Movie, false)
+        .await?;
+    let mut movie_ids = Vec::new();
+    for suffix in ["a", "b"] {
+        let movie_id = format!("record-movie-{suffix}");
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&movie_id)
+        .bind(library.id.to_string())
+        .bind(&movie_id)
+        .bind(&movie_id)
+        .execute(database.pool())
+        .await?;
+        movie_ids.push(movie_id);
+    }
+
+    let now = 400 * 24 * 60 * 60;
+    let old = now - 91 * 24 * 60 * 60;
+    let device_old = now - 181 * 24 * 60 * 60;
+    let future = now + 24 * 60 * 60;
+    for (id, status, expires_at, created_at) in [
+        ("inv-old", "EXPIRED", old + 10, old),
+        ("inv-fresh", "EXPIRED", future, now),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_invitations (
+                 id, recipient_email, status, preset_id, preset_name, preset_version,
+                 permission_snapshot_json, expires_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'viewer', 'Viewer', 1, '{}', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("{id}@example.invalid"))
+        .bind(status)
+        .bind(expires_at)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, status, updated_at) in [("mail-old", "SENT", old), ("mail-fresh", "SENT", now)] {
+        sqlx::query(
+            "INSERT INTO mail_outbox (
+                 id, idempotency_key, recipient_email, template_kind, reference_id,
+                 status, sent_at, available_at, created_at, updated_at
+             ) VALUES (?, ?, ?, 'INVITATION', 'ref', ?, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(format!("{id}@example.invalid"))
+        .bind(status)
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(updated_at)
+        .bind(updated_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, expires_at, consumed_at) in [
+        ("challenge-old", old + 10, Some(old + 5)),
+        ("challenge-fresh", future, None),
+    ] {
+        sqlx::query(
+            "INSERT INTO mail_challenges (
+                 id, challenge_kind, recipient_email, reference_id, token_hash,
+                 expires_at, consumed_at, created_at
+             ) VALUES (?, 'INVITATION', 'x@example.invalid', 'ref', randomblob(32), ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(expires_at)
+        .bind(consumed_at)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+    for (device_id, last_seen_at) in [("device-old", device_old), ("device-fresh", now)] {
+        sqlx::query(
+            "INSERT INTO user_devices (
+                 user_id, device_id, client_name, first_seen_at, last_seen_at
+             ) VALUES (?, ?, 'client', ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(device_id)
+        .bind(last_seen_at)
+        .bind(last_seen_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, undone_at) in [("merge-old", Some(old)), ("merge-live", None)] {
+        sqlx::query(
+            "INSERT INTO media_merge_records (
+                 id, library_id, item_type, primary_item_id, merged_item_id, source,
+                 merged_at, undone_at
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'scan', ?, ?)",
+        )
+        .bind(id)
+        .bind(library.id.to_string())
+        .bind(&movie_ids[0])
+        .bind(&movie_ids[1])
+        .bind(old)
+        .bind(undone_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    for (id, expires_at) in [("candidate-old", old), ("candidate-fresh", future)] {
+        sqlx::query(
+            "INSERT INTO metadata_candidates (
+                 id, item_id, provider, provider_id, candidate_json, score, status, expires_at
+             ) VALUES (?, ?, 'TMDB', ?, '{}', 10, 'PENDING', ?)",
+        )
+        .bind(id)
+        .bind(&movie_ids[0])
+        .bind(id)
+        .bind(expires_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, expires_at, created_at) in [
+        ("registration-old", old + 10, old),
+        ("registration-fresh", future, now),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_registration_requests (
+                 id, recipient_email, username_normalized, display_name,
+                 permission_snapshot_json, status, expires_at, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, '{}', 'EXPIRED', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(format!("{id}@example.invalid"))
+        .bind(id)
+        .bind(id)
+        .bind(expires_at)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(database.pool())
+        .await?;
+    }
+    for (id, status, finished_at) in [
+        ("migration-old", "COMPLETED", Some(old)),
+        ("migration-fresh", "RUNNING", Some(old)),
+    ] {
+        sqlx::query(
+            "INSERT INTO emby_migration_jobs (
+                 id, plugin_id, created_by_user_id, source_label, source_base_url,
+                 secret_ref, status, phase, dry_run, merge_policy, created_at, updated_at,
+                 finished_at
+             ) VALUES (?, 'plugin', ?, 'source', 'https://example.invalid', 'secret',
+                       ?, 'TESTING', 1, 'MERGE', ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(&user_id)
+        .bind(status)
+        .bind(old)
+        .bind(old)
+        .bind(finished_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let purge = database.purge_expired_account_records(now, 100).await?;
+    assert_eq!(purge.user_invitations, 1);
+    assert_eq!(purge.mail_outbox, 1);
+    assert_eq!(purge.mail_challenges, 1);
+    assert_eq!(purge.user_devices, 1);
+    assert_eq!(purge.media_merge_records, 1);
+    assert_eq!(purge.user_registration_requests, 1);
+    assert_eq!(purge.emby_migration_jobs, 1);
+    assert_eq!(purge.metadata_candidates, 1);
+
+    for (table, kept, gone) in [
+        ("user_invitations", "inv-fresh", "inv-old"),
+        ("mail_outbox", "mail-fresh", "mail-old"),
+        ("mail_challenges", "challenge-fresh", "challenge-old"),
+        ("media_merge_records", "merge-live", "merge-old"),
+        (
+            "user_registration_requests",
+            "registration-fresh",
+            "registration-old",
+        ),
+        ("emby_migration_jobs", "migration-fresh", "migration-old"),
+        ("metadata_candidates", "candidate-fresh", "candidate-old"),
+    ] {
+        let kept_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(kept)
+        .fetch_one(database.pool())
+        .await?;
+        let gone_count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE id = ?"
+        )))
+        .bind(gone)
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(kept_count, 1, "{table} must keep {kept}");
+        assert_eq!(gone_count, 0, "{table} must drop {gone}");
+    }
+    let device_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM user_devices WHERE device_id IN ('device-fresh', 'device-old')",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(device_count, 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn session_history_purge_respects_the_batch_limit() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Bounded", "Bounded", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    let now = 90 * 24 * 60 * 60;
+    let old = now - 31 * 24 * 60 * 60;
+    for index in 0..5 {
+        sqlx::query(
+            "INSERT INTO web_sessions (id, user_id, session_token_hash, csrf_token_hash,
+                                       expires_at, created_at, updated_at)
+             VALUES (?, ?, randomblob(16), randomblob(16), ?, ?, ?)",
+        )
+        .bind(format!("bounded-session-{index}"))
+        .bind(&user_id)
+        .bind(old)
+        .bind(old)
+        .bind(old)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let first = database.purge_expired_session_history(now, 2).await?;
+    assert_eq!(
+        first.web_sessions, 2,
+        "one call deletes at most the batch limit"
+    );
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM web_sessions WHERE id LIKE 'bounded-session-%'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining, 3);
+
+    let second = database.purge_expired_session_history(now, 10).await?;
+    assert_eq!(second.web_sessions, 3);
+    Ok(())
+}
+
+#[tokio::test]
+async fn account_record_purge_surfaces_a_failure_and_keeps_the_affected_rows()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let _admin = UserStore::new(database.clone())?
+        .create_initial_admin("Failure", "Failure", "correct horse battery staple")
+        .await?;
+    let now = 400 * 24 * 60 * 60;
+    let old = now - 91 * 24 * 60 * 60;
+    sqlx::query(
+        "INSERT INTO mail_outbox (
+             id, idempotency_key, recipient_email, template_kind, reference_id,
+             status, sent_at, available_at, created_at, updated_at
+         ) VALUES ('mail-failing', 'mail-failing', 'x@example.invalid', 'INVITATION', 'ref',
+                   'SENT', ?, ?, ?, ?)",
+    )
+    .bind(old)
+    .bind(old)
+    .bind(old)
+    .bind(old)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER fail_mail_purge BEFORE DELETE ON mail_outbox
+         BEGIN
+             SELECT RAISE(ABORT, 'injected mail purge failure');
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let result = database.purge_expired_account_records(now, 100).await;
+    assert!(
+        result.is_err(),
+        "a cleanup failure must surface to the worker"
+    );
+    let kept: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mail_outbox WHERE id = 'mail-failing'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        kept, 1,
+        "rows whose delete failed stay for the next attempt"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_outbox_appends_reads_and_advances_idempotently()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    const ITEM_UPSERT: OutboxStream = OutboxStream {
+        table: "catalog_outbox",
+        kind: "item_upsert",
+    };
+    const ITEM_DELETE: OutboxStream = OutboxStream {
+        table: "catalog_outbox",
+        kind: "item_delete",
+    };
+
+    let (_temp, database) = test_database().await?;
+    assert_eq!(
+        database.outbox_gap("catalog_items", ITEM_UPSERT).await?,
+        None
+    );
+
+    let first = database
+        .append_catalog_outbox("item_upsert", "item-a", Some("lib"))
+        .await?;
+    let second = database
+        .append_catalog_outbox("item_upsert", "item-b", Some("lib"))
+        .await?;
+    let third = database
+        .append_catalog_outbox("item_delete", "item-c", None)
+        .await?;
+    assert_eq!((first, second, third), (1, 2, 3));
+
+    let page = database.read_outbox_after(ITEM_UPSERT, 0, 2).await?;
+    assert_eq!(page.len(), 2);
+    assert_eq!(page[0].id, 1);
+    assert_eq!(page[0].kind, "item_upsert");
+    assert_eq!(page[0].item_id, "item-a");
+    assert_eq!(page[0].library_id.as_deref(), Some("lib"));
+    assert_eq!(page[1].id, 2);
+    assert_eq!(page[1].item_id, "item-b");
+    // Reads are scoped to one kind: the delete event at id 3 is invisible to the upsert stream, so
+    // a consumer never spends its batch (or its watermark) on another kind's events.
+    assert!(
+        database
+            .read_outbox_after(ITEM_UPSERT, 2, 10)
+            .await?
+            .is_empty()
+    );
+    let rest = database.read_outbox_after(ITEM_DELETE, 0, 10).await?;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].id, 3);
+    assert_eq!(rest[0].library_id, None);
+
+    database
+        .advance_catalog_consumer("catalog_items", 2)
+        .await?;
+    assert_eq!(
+        database
+            .catalog_consumer("catalog_items")
+            .await?
+            .map(|state| state.applied_seq),
+        Some(2)
+    );
+    // Watermarks never move backwards.
+    database
+        .advance_catalog_consumer("catalog_items", 1)
+        .await?;
+    assert_eq!(
+        database
+            .catalog_consumer("catalog_items")
+            .await?
+            .map(|state| state.applied_seq),
+        Some(2)
+    );
+    database
+        .record_catalog_consumer_error("catalog_items", "boom")
+        .await?;
+    assert_eq!(
+        database
+            .catalog_consumer("catalog_items")
+            .await?
+            .and_then(|state| state.last_error),
+        Some("boom".to_owned())
+    );
+    database
+        .advance_catalog_consumer("catalog_items", 3)
+        .await?;
+    let advanced = database
+        .catalog_consumer("catalog_items")
+        .await?
+        .ok_or("consumer")?;
+    assert_eq!(advanced.applied_seq, 3);
+    assert_eq!(advanced.last_error, None);
+
+    // A trimmed queue must surface as a gap instead of silently skipping derived rows.
+    database
+        .query("DELETE FROM catalog_outbox WHERE id IN (2, 3)")
+        .execute(database.pool())
+        .await?;
+    database
+        .advance_catalog_consumer("stale_consumer", 1)
+        .await?;
+    assert_eq!(
+        database.outbox_gap("stale_consumer", ITEM_UPSERT).await?,
+        None,
+        "the remaining sequence follows the watermark"
+    );
+    database
+        .query("DELETE FROM catalog_outbox WHERE id = 1")
+        .execute(database.pool())
+        .await?;
+    database
+        .append_catalog_outbox("item_upsert", "item-d", None)
+        .await?;
+    assert_eq!(
+        database.outbox_gap("stale_consumer", ITEM_UPSERT).await?,
+        Some((1, 4))
+    );
+    Ok(())
+}
+
+/// Seeds `count` movies so the triggers queue events and the full re-queue has items to copy.
+async fn seed_outbox_movies(
+    database: &Database,
+    count: usize,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+
+    let library = LibraryService::new(database.clone())
+        .create_library("Outbox", LibraryKind::Movie, false)
+        .await?;
+    for index in 0..count {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, ?, 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(format!("outbox-movie-{index}"))
+        .bind(library.id.to_string())
+        .bind(format!("Outbox {index}"))
+        .bind(format!("outbox {index}"))
+        .execute(database.pool())
+        .await?;
+    }
+    Ok(())
+}
+
+async fn outbox_rows(database: &Database, table: &str) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+        .fetch_one(database.pool())
+        .await
+}
+
+#[tokio::test]
+async fn outbox_gap_repair_requeues_once_and_closes_the_hole()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    seed_outbox_movies(&database, 3).await?;
+    while database.drain_catalog_items_incremental(500).await? > 0 {}
+
+    // A hole below the oldest remaining catalog event: the watermark points at events that are gone.
+    sqlx::query("UPDATE catalog_consumers SET applied_seq = 0 WHERE name = ?")
+        .bind(CATALOG_ITEMS_INCREMENTAL_CONSUMER)
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM catalog_outbox WHERE id <= (SELECT MAX(id) - 1 FROM catalog_outbox)")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        database
+            .outbox_gap(CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX)
+            .await?
+            .is_some()
+    );
+
+    // The first drain repairs the hole with exactly one full re-queue ...
+    let before = outbox_rows(&database, "catalog_outbox").await?;
+    database.drain_catalog_items_incremental(500).await?;
+    let after_first = outbox_rows(&database, "catalog_outbox").await?;
+    assert_eq!(after_first - before, 3, "one row per media item");
+    assert!(
+        database
+            .outbox_gap(CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX)
+            .await?
+            .is_none(),
+        "the repair closes the hole instead of re-detecting it on every tick"
+    );
+    // ... and later drains must not repeat it.
+    for _ in 0..3 {
+        database.drain_catalog_items_incremental(500).await?;
+    }
+    assert_eq!(outbox_rows(&database, "catalog_outbox").await?, after_first);
+
+    // A second hole right after the repair is closed without another full re-queue.
+    while database.drain_catalog_items_incremental(500).await? > 0 {}
+    let burned = database
+        .append_catalog_outbox(CATALOG_OUTBOX.kind, "burned", None)
+        .await?;
+    let kept = database
+        .append_catalog_outbox(CATALOG_OUTBOX.kind, "kept", None)
+        .await?;
+    sqlx::query("DELETE FROM catalog_outbox WHERE id = ?")
+        .bind(burned)
+        .execute(database.pool())
+        .await?;
+    let before_cooldown = outbox_rows(&database, "catalog_outbox").await?;
+    database.drain_catalog_items_incremental(500).await?;
+    assert_eq!(
+        outbox_rows(&database, "catalog_outbox").await?,
+        before_cooldown,
+        "the cooldown suppresses a second full re-queue"
+    );
+    let applied = database
+        .catalog_consumer(CATALOG_ITEMS_INCREMENTAL_CONSUMER)
+        .await?
+        .map(|state| state.applied_seq)
+        .unwrap_or(0);
+    assert!(applied >= kept, "the watermark moves past the hole");
+    Ok(())
+}
+
+#[tokio::test]
+async fn outbox_full_requeue_is_refused_over_capacity() -> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for index in 0..3 {
+        database
+            .append_catalog_outbox(CATALOG_OUTBOX.kind, &format!("item-{index}"), None)
+            .await?;
+    }
+    assert_eq!(
+        database
+            .full_requeue_decision("consumer", CATALOG_OUTBOX, 3)
+            .await?,
+        FullRequeue::Allowed
+    );
+    assert_eq!(
+        database
+            .full_requeue_decision("consumer", CATALOG_OUTBOX, 2)
+            .await?,
+        FullRequeue::OverCapacity,
+        "a queue that is already this long must not be multiplied by a full re-queue"
+    );
+    database.record_full_requeue("consumer").await?;
+    assert_eq!(
+        database
+            .full_requeue_decision("consumer", CATALOG_OUTBOX, 3)
+            .await?,
+        FullRequeue::CoolingDown
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn legacy_search_rows_are_purged_from_the_catalog_outbox_in_batches()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for index in 0..5 {
+        database
+            .append_catalog_outbox("search", &format!("legacy-{index}"), None)
+            .await?;
+    }
+    for index in 0..2 {
+        database
+            .append_catalog_outbox(CATALOG_OUTBOX.kind, &format!("keep-{index}"), None)
+            .await?;
+    }
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 2);
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 2);
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 1);
+    assert_eq!(database.purge_legacy_search_outbox(2).await?, 0);
+    assert_eq!(outbox_rows(&database, "catalog_outbox").await?, 2);
+    Ok(())
+}
+
+#[tokio::test]
+async fn search_outbox_migration_requeues_every_item_and_resets_the_old_watermark()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    seed_outbox_movies(&database, 4).await?;
+    sqlx::query("DELETE FROM search_outbox")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO catalog_consumers (name, applied_seq) VALUES ('search_reindex@1', 239066206)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("INSERT INTO catalog_outbox (kind, item_id) VALUES ('search', 'stale')")
+        .execute(database.pool())
+        .await?;
+
+    // The migration is written to be re-runnable, so an upgrade over live data can be replayed.
+    sqlx::raw_sql(include_str!(
+        "../../migrations/0243_search_outbox_split.sql"
+    ))
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(outbox_rows(&database, "search_outbox").await?, 4);
+    let old_watermark: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM catalog_consumers WHERE name = 'search_reindex@1'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        old_watermark, 0,
+        "the old coordinate must not survive the split"
+    );
+    assert_eq!(database.drain_search_reindex(100).await?, 4);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_items_incremental_tracks_inserts_updates_images_merges_and_deletes()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::catalog_read_model::rebuild_catalog_read_model;
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Incremental", LibraryKind::Movie, false)
+        .await?;
+    // The consumer only runs once the full rebuild left its watermark.
+    rebuild_catalog_read_model(&database, 100).await?;
+    let triggers: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = 'media_items_catalog_ai'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(triggers, 1, "catalog trigger is installed");
+
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('inc-movie', ?, 'MOVIE', 'Original', 'original', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    assert!(
+        database.drain_catalog_items_incremental(100).await? >= 1,
+        "a new item must reach the derived table"
+    );
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(title, "Original");
+
+    // A metadata update shows up on the next pass.
+    sqlx::query(
+        "UPDATE media_items SET title = 'Renamed', sort_title = 'renamed'
+         WHERE id = 'inc-movie'",
+    )
+    .execute(database.pool())
+    .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(title, "Renamed");
+
+    // A new poster updates the derived image tag without touching media_items.
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('poster-1', 'inc-movie', 'POSTER', 0, 'poster.jpg')",
+    )
+    .execute(database.pool())
+    .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let poster: Option<String> =
+        sqlx::query_scalar("SELECT poster_tag FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(poster.as_deref(), Some("poster-1"));
+
+    // Merging keeps the row and mirrors the redirect.
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('inc-canonical', ?, 'MOVIE', 'Canonical', 'canonical', 'LOCAL_CONFIRMED', 1)",
+    )
+    .bind(library.id.to_string())
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET merged_into_item_id = 'inc-canonical'
+         WHERE id = 'inc-movie'",
+    )
+    .execute(database.pool())
+    .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let merged: Option<String> =
+        sqlx::query_scalar("SELECT merged_into FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(merged.as_deref(), Some("inc-canonical"));
+
+    // Deleting the authoritative row removes the derived row on the next pass.
+    sqlx::query("DELETE FROM media_items WHERE id = 'inc-movie'")
+        .execute(database.pool())
+        .await?;
+    database.drain_catalog_items_incremental(100).await?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM catalog_items WHERE item_id = 'inc-movie'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_read_model_rebuild_copies_authoritative_fields_and_validates()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::application::libraries::LibraryService;
+    use crate::library::LibraryKind;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let library = LibraryService::new(database.clone())
+        .create_library("Read Model", LibraryKind::Movie, false)
+        .await?;
+    let library_id = library.id.to_string();
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at
+         ) VALUES ('rm-movie', ?, 'MOVIE', 'Read Model Movie', 'read model movie',
+                   'LOCAL_CONFIRMED', 1, 100),
+                  ('rm-series', ?, 'SERIES', 'Read Model Series', 'read model series',
+                   'LOCAL_CONFIRMED', 1, 90),
+                  ('rm-season', ?, 'SEASON', 'Read Model Season', 'read model season',
+                   'LOCAL_CONFIRMED', 0, 95),
+                  ('rm-episode', ?, 'EPISODE', 'Read Model Episode', 'read model episode',
+                   'LOCAL_CONFIRMED', 1, 110)",
+    )
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .bind(&library_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "UPDATE media_items SET series_id = 'rm-series', parent_id = 'rm-season',
+                season_number = 1, episode_number = 1 WHERE id = 'rm-episode'",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query("UPDATE media_items SET series_id = 'rm-series' WHERE id = 'rm-season'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, is_default)
+         VALUES ('rm-source', 'rm-movie', 'LOCAL_FILE', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path, content_tag)
+         VALUES ('rm-poster', 'rm-movie', 'POSTER', 0, '/tmp/poster.png', 'poster-tag')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_content_restriction_index (item_id, certification_code)
+         VALUES ('rm-movie', 'PG-13')",
+    )
+    .execute(database.pool())
+    .await?;
+
+    // Resume through one-row batches to exercise the keyset loop.
+    let mut after: Option<String> = None;
+    let mut processed = 0_u64;
+    loop {
+        let (rows, last) = database
+            .rebuild_catalog_items_batch(after.as_deref(), 1)
+            .await?;
+        if rows == 0 {
+            break;
+        }
+        processed += rows;
+        after = last;
+    }
+    assert_eq!(processed, 4);
+    assert_eq!(database.catalog_items_count().await?, 4);
+
+    let movie: (Option<String>, Option<String>, Option<String>, i64, i64) = sqlx::query_as(
+        "SELECT poster_tag, default_source_id, restriction_code, season_count, episode_count
+         FROM catalog_items WHERE item_id = 'rm-movie'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(movie.0.as_deref(), Some("rm-poster"));
+    assert_eq!(movie.1.as_deref(), Some("rm-source"));
+    assert_eq!(movie.2.as_deref(), Some("PG-13"));
+
+    let series: (i64, i64, Option<i64>) = sqlx::query_as(
+        "SELECT season_count, episode_count, latest_child_added_at
+         FROM catalog_items WHERE item_id = 'rm-series'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(series, (1, 1, Some(110)));
+
+    database.rebuild_catalog_item_stats().await?;
+    let totals: Vec<(String, String, String, i64)> = sqlx::query_as(
+        "SELECT scope, scope_id, item_type, total FROM catalog_item_stats
+         WHERE scope = 'library' ORDER BY item_type",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(totals.len(), 4);
+    assert!(
+        totals
+            .iter()
+            .all(|(_, scope_id, _, total)| scope_id == &library_id && *total == 1)
+    );
+
+    let first = database.catalog_items_checksum().await?;
+    assert_eq!(first.item_count, 4);
+    let (_, last) = database.rebuild_catalog_items_batch(None, 100).await?;
+    assert_eq!(last.as_deref(), Some("rm-series"));
+    let second = database.catalog_items_checksum().await?;
+    assert_eq!(second, first, "a repeated rebuild must be idempotent");
+
+    database.truncate_catalog_read_model().await?;
+    assert_eq!(database.catalog_items_count().await?, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_items_rebuild_can_resume_from_the_materialized_prefix()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('resume-lib', 'Resume', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for index in 0..5 {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'resume-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(format!("resume-{index}"))
+        .bind(format!("Resume {index}"))
+        .bind(format!("resume {index}"))
+        .execute(database.pool())
+        .await?;
+    }
+
+    let (first, _) = database.rebuild_catalog_items_batch(None, 2).await?;
+    assert_eq!(first, 2);
+    let resume = database.catalog_items_max_item_id().await?;
+    assert_eq!(resume.as_deref(), Some("resume-1"));
+    let mut after = resume;
+    while let Some(cursor) = after.clone() {
+        let (rows, next) = database
+            .rebuild_catalog_items_batch(Some(&cursor), 2)
+            .await?;
+        if rows == 0 {
+            break;
+        }
+        after = next;
+    }
+    assert_eq!(database.catalog_items_count().await?, 5);
+    let resumed = database.catalog_items_checksum().await?;
+
+    database.truncate_catalog_read_model().await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+    let full = database.catalog_items_checksum().await?;
+    assert_eq!(resumed, full, "resuming must produce the same read model");
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_read_model_shadow_matches_the_legacy_default_list()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('shadow-lib', 'Shadow', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for (id, sort_title, added_at, available) in [
+        ("shadow-a", "alpha", 1, 1),
+        ("shadow-b", "beta", 2, 0),
+        ("shadow-c", "gamma", 3, 1),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES (?, 'shadow-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+        )
+        .bind(id)
+        .bind(sort_title)
+        .bind(sort_title)
+        .bind(available)
+        .bind(added_at)
+        .execute(database.pool())
+        .await?;
+    }
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let library_ids = ["shadow-lib".to_owned()];
+    let empty_types: Vec<String> = Vec::new();
+    let empty_years: Vec<i64> = Vec::new();
+    let query = CatalogFilterQuery {
+        library_ids: &library_ids,
+        user_id: "shadow-user",
+        item_types: &empty_types,
+        excluded_item_types: &empty_types,
+        item_ids: None,
+        person_id: None,
+        media_source_ids: None,
+        provider_id_equals: None,
+        years: &empty_years,
+        is_played: None,
+        is_favorite: None,
+        min_date_last_saved: None,
+        metadata_pending: false,
+        parent_id_scope: None,
+        content_restrictions: None,
+        sort_by: CatalogSort::Name,
+        descending: false,
+        offset: 0,
+        limit: 10,
+        include_total: true,
+    };
+    let (legacy, legacy_total) = database.list_filtered_catalog_rows(&query).await?;
+    let legacy_ids = legacy
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<Vec<_>>();
+    let (shadow_ids, shadow_total) = database
+        .shadow_catalog_library_page(&ReadModelPageQuery {
+            library_id: "shadow-lib",
+            item_types: &empty_types,
+            excluded_item_types: &empty_types,
+            sort: ReadModelSort::SortTitle,
+            descending: false,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        })
+        .await?;
+    assert_eq!(legacy_ids, shadow_ids);
+    assert_eq!(legacy_total, shadow_total);
+    assert_eq!(
+        legacy_ids,
+        vec!["shadow-a".to_owned(), "shadow-c".to_owned()]
+    );
+
+    let recent = CatalogFilterQuery {
+        descending: true,
+        sort_by: CatalogSort::DateCreated,
+        ..query
+    };
+    let (recent_rows, recent_total) = database.list_filtered_catalog_rows(&recent).await?;
+    let recent_ids = recent_rows
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<Vec<_>>();
+    let (shadow_recent, shadow_recent_total) = database
+        .shadow_catalog_library_page(&ReadModelPageQuery {
+            library_id: "shadow-lib",
+            item_types: &empty_types,
+            excluded_item_types: &empty_types,
+            sort: ReadModelSort::EffectiveAddedAt,
+            descending: true,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        })
+        .await?;
+    assert_eq!(recent_ids, shadow_recent);
+    assert_eq!(recent_total, shadow_recent_total);
+    assert_eq!(
+        recent_ids,
+        vec!["shadow-c".to_owned(), "shadow-a".to_owned()]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recently_added_read_model_matches_the_legacy_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for (id, name) in [("recent-lib-a", "A"), ("recent-lib-b", "B")] {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'MOVIE')")
+            .bind(id)
+            .bind(name)
+            .execute(database.pool())
+            .await?;
+    }
+    for (id, library_id, item_type, has_source, added_at) in [
+        ("recent-movie-old", "recent-lib-a", "MOVIE", 1_i64, 10_i64),
+        ("recent-movie-new", "recent-lib-b", "MOVIE", 1, 30),
+        ("recent-movie-copy", "recent-lib-a", "MOVIE", 0, 20),
+        ("recent-series", "recent-lib-a", "SERIES", 1, 15),
+        ("recent-series-empty", "recent-lib-b", "SERIES", 0, 25),
+        ("recent-folder", "recent-lib-a", "FOLDER", 1, 40),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(has_source)
+        .bind(added_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // A container without a source stays visible while one of its children is available.
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at, series_id, season_number, episode_number
+         ) VALUES ('recent-series-episode', 'recent-lib-b', 'EPISODE', 'Episode', 'episode',
+                   'LOCAL_CONFIRMED', 1, 5, 'recent-series-empty', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let library_ids = vec!["recent-lib-a".to_owned(), "recent-lib-b".to_owned()];
+    for media_only in [false, true] {
+        let (legacy_ids, legacy_total) = database
+            .list_recent_catalog_item_ids(&library_ids, 0, 10, media_only, None)
+            .await?;
+        let (read_model_ids, read_model_total) = database
+            .list_recent_read_model_ids(&RecentReadModelQuery {
+                library_ids: &library_ids,
+                media_only,
+                offset: 0,
+                limit: 10,
+                include_total: true,
+            })
+            .await?;
+        assert_eq!(
+            read_model_ids, legacy_ids,
+            "recently added page differs (media_only={media_only})"
+        );
+        assert_eq!(read_model_total, legacy_total);
+    }
+    let (ids, _) = database
+        .list_recent_read_model_ids(&RecentReadModelQuery {
+            library_ids: &library_ids,
+            media_only: false,
+            offset: 0,
+            limit: 10,
+            include_total: true,
+        })
+        .await?;
+    assert_eq!(
+        ids,
+        vec![
+            "recent-movie-new".to_owned(),
+            "recent-series-empty".to_owned(),
+            "recent-series".to_owned(),
+            "recent-movie-old".to_owned(),
+            "recent-series-episode".to_owned()
+        ]
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn recent_by_library_read_model_matches_the_legacy_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    for (id, name) in [("latest-lib-a", "A"), ("latest-lib-b", "B")] {
+        sqlx::query("INSERT INTO libraries (id, name, kind) VALUES (?, ?, 'SERIES')")
+            .bind(id)
+            .bind(name)
+            .execute(database.pool())
+            .await?;
+    }
+    for (id, library_id, item_type, has_source, added_at) in [
+        ("latest-movie-a", "latest-lib-a", "MOVIE", 1_i64, 10_i64),
+        ("latest-series-empty", "latest-lib-a", "SERIES", 1, 50),
+        ("latest-series-fresh", "latest-lib-a", "SERIES", 1, 5),
+        ("latest-movie-b", "latest-lib-b", "MOVIE", 1, 30),
+        ("latest-series-nosource", "latest-lib-b", "SERIES", 0, 5),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, added_at
+             ) VALUES (?, ?, ?, ?, ?, 'LOCAL_CONFIRMED', ?, ?)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(has_source)
+        .bind(added_at)
+        .execute(database.pool())
+        .await?;
+    }
+    // The series added first is "newest" through an episode added much later.
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at, series_id, season_number, episode_number
+         ) VALUES ('latest-series-fresh-ep', 'latest-lib-a', 'EPISODE', 'Episode', 'episode',
+                   'LOCAL_CONFIRMED', 1, 40, 'latest-series-fresh', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at, series_id, season_number, episode_number
+         ) VALUES ('latest-series-nosource-ep', 'latest-lib-b', 'EPISODE', 'Episode', 'episode',
+                   'LOCAL_CONFIRMED', 1, 7, 'latest-series-nosource', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let library_ids = vec!["latest-lib-a".to_owned(), "latest-lib-b".to_owned()];
+    let legacy_rows = database
+        .list_recent_catalog_rows_by_library_with_restrictions(&library_ids, 12, None)
+        .await?;
+    let mut legacy: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for row in &legacy_rows {
+        let ids = legacy.entry(row.library_id.clone()).or_default();
+        if !ids.contains(&row.item_id) {
+            ids.push(row.item_id.clone());
+        }
+    }
+    let read_model: std::collections::BTreeMap<String, Vec<String>> = database
+        .list_recent_read_model_ids_by_library(&RecentByLibraryReadModelQuery {
+            library_ids: &library_ids,
+            limit_per_library: 12,
+        })
+        .await?
+        .into_iter()
+        .collect();
+    assert_eq!(read_model, legacy);
+    assert_eq!(
+        legacy.get("latest-lib-a"),
+        Some(&vec![
+            "latest-series-empty".to_owned(),
+            "latest-series-fresh".to_owned(),
+            "latest-movie-a".to_owned()
+        ])
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn catalog_read_model_single_item_rows_match_the_legacy_join()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('detail-lib', 'Detail', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at
+         ) VALUES ('detail-movie', 'detail-lib', 'MOVIE', 'Detail', 'detail',
+                   'LOCAL_CONFIRMED', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('detail-root', 'detail-lib', '/tmp', '/tmp', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+         ) VALUES ('detail-fe', 'detail-root', 'Detail.Movie.mkv', 'FILE', 1, 1, 1, 1,
+                   X'00', 'g1', 'NEW')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default,
+                                    probe_status)
+         VALUES ('detail-source', 'detail-movie', 'LOCAL_FILE', 'detail-fe', 1, 'READY')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (id, media_source_id, stream_index, stream_type, is_default)
+         VALUES ('detail-stream', 'detail-source', 0, 'VIDEO', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let legacy = database.find_catalog_rows("detail-movie").await?;
+    let read_model = database
+        .find_catalog_rows_from_read_model("detail-movie")
+        .await?;
+    assert_eq!(legacy.len(), read_model.len());
+    for (legacy, read_model) in legacy.iter().zip(read_model.iter()) {
+        assert_eq!(legacy.item_id, read_model.item_id);
+        assert_eq!(legacy.source_id, read_model.source_id);
+        assert_eq!(legacy.source_relative_path, read_model.source_relative_path);
+        assert_eq!(legacy.stream_id, read_model.stream_id);
+        assert_eq!(legacy.is_default, read_model.is_default);
+        assert_eq!(legacy.poster_image_tag, read_model.poster_image_tag);
+    }
+    Ok(())
+}
+
+/// The read model builds the legacy row shape from one core query plus one batched source query.
+/// A grid/card page asks for the summary projection, so that second query must stop joining
+/// `media_streams` and must stop reading `details_json` — while a full page keeps both, from the
+/// same statement count.
+#[tokio::test]
+async fn catalog_read_model_summary_projection_skips_streams_and_details_json()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::storage::{CatalogRowProjection, ReadModelPageQuery, ReadModelSort, test_database};
+
+    let (_temp, database) = test_database().await?;
+    sqlx::query(
+        "INSERT INTO libraries (id, name, kind)
+         VALUES ('read-model-summary-lib', 'Summary RM', 'MOVIE')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, added_at
+         ) VALUES ('read-model-summary-item', 'read-model-summary-lib', 'MOVIE',
+                   'Summary RM', 'summary rm', 'LOCAL_CONFIRMED', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('read-model-summary-root', 'read-model-summary-lib', '/tmp', '/tmp', 1, 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+         ) VALUES ('read-model-summary-fe', 'read-model-summary-root', 'Summary.RM.mkv',
+                   'FILE', 1, 1, 1, 1, X'00', 'g1', 'NEW')",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_sources (id, item_id, source_kind, filesystem_entry_id, is_default,
+                                    probe_status, duration_ticks)
+         VALUES ('read-model-summary-source', 'read-model-summary-item', 'LOCAL_FILE',
+                 'read-model-summary-fe', 1, 'READY', 7200000000)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_streams (
+             id, media_source_id, stream_index, stream_type, codec, details_json, is_default
+         ) VALUES ('read-model-summary-video', 'read-model-summary-source', 0, 'VIDEO',
+                   'h264', '{\"Width\":\"1920\"}', 1),
+                  ('read-model-summary-audio', 'read-model-summary-source', 1, 'AUDIO',
+                   'aac', '{\"Channels\":\"2\"}', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO item_images (id, item_id, image_type, image_index, local_path)
+         VALUES ('read-model-summary-poster', 'read-model-summary-item', 'POSTER', 0,
+                 '/tmp/poster.jpg')",
+    )
+    .execute(database.pool())
+    .await?;
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let item_types = Vec::new();
+    let page = ReadModelPageQuery {
+        library_id: "read-model-summary-lib",
+        item_types: &item_types,
+        excluded_item_types: &[],
+        sort: ReadModelSort::SortTitle,
+        descending: false,
+        offset: 0,
+        limit: 24,
+        include_total: true,
+    };
+
+    database.reset_query_count();
+    let (full_rows, full_total) = database
+        .list_catalog_rows_from_read_model(&page, CatalogRowProjection::Full)
+        .await?;
+    let full_statements = database.query_count();
+    database.reset_query_count();
+    let (summary_rows, summary_total) = database
+        .list_catalog_rows_from_read_model(&page, CatalogRowProjection::Summary)
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        full_statements,
+        "the summary projection must not add a statement"
+    );
+
+    assert_eq!(full_total, 1);
+    assert_eq!(summary_total, full_total);
+    assert_eq!(
+        full_rows.len(),
+        2,
+        "the full projection fans out per stream"
+    );
+    assert_eq!(
+        summary_rows.len(),
+        1,
+        "the summary projection stops at sources"
+    );
+    assert!(full_rows.iter().any(|row| row.stream_id.is_some()));
+    assert!(
+        full_rows
+            .iter()
+            .any(|row| row.stream_details_json.as_deref() == Some(r#"{"Width":"1920"}"#))
+    );
+    assert!(
+        summary_rows
+            .iter()
+            .all(|row| row.stream_id.is_none() && row.stream_details_json.is_none()),
+        "the summary projection reports no stream row and no details_json"
+    );
+
+    // Everything outside the stream group must match the full projection field by field.
+    let mut expected = full_rows[0].clone();
+    expected.stream_id = None;
+    expected.stream_index = None;
+    expected.stream_type = None;
+    expected.codec = None;
+    expected.language = None;
+    expected.stream_title = None;
+    expected.stream_details_json = None;
+    expected.stream_is_external = None;
+    expected.stream_is_default = None;
+    expected.stream_is_forced = None;
+    assert_eq!(summary_rows[0], expected);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_series_next_round_trips_and_orders_by_recent_update()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Next", "Next", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('next-lib', 'Next', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    for id in [
+        "next-series-a",
+        "next-series-b",
+        "next-episode-1",
+        "next-episode-2",
+    ] {
+        let item_type = if id.contains("series") {
+            "SERIES"
+        } else {
+            "EPISODE"
+        };
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'next-lib', ?, ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .upsert_user_series_next(
+            &user_id,
+            "next-series-a",
+            "next-episode-1",
+            120,
+            false,
+            Some(1_700),
+        )
+        .await?;
+    database
+        .upsert_user_series_next(
+            &user_id,
+            "next-series-b",
+            "next-episode-2",
+            30,
+            true,
+            Some(1_800),
+        )
+        .await?;
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 2);
+    let series = rows
+        .iter()
+        .map(|row| row.series_id.as_str())
+        .collect::<Vec<_>>();
+    assert!(series.contains(&"next-series-a") && series.contains(&"next-series-b"));
+    let a = rows
+        .iter()
+        .find(|row| row.series_id == "next-series-a")
+        .ok_or("series a")?;
+    assert_eq!(a.next_item_id, "next-episode-1");
+    assert_eq!(a.position_ticks, 120);
+    assert_eq!(a.played, 0);
+
+    database
+        .upsert_user_series_next(
+            &user_id,
+            "next-series-a",
+            "next-episode-2",
+            0,
+            true,
+            Some(1_900),
+        )
+        .await?;
+    let updated = database.list_user_series_next(&user_id, 0, 10).await?;
+    let a = updated
+        .iter()
+        .find(|row| row.series_id == "next-series-a")
+        .ok_or("series a")?;
+    assert_eq!(a.next_item_id, "next-episode-2");
+    assert_eq!(a.played, 1);
+
+    assert!(
+        database
+            .delete_user_series_next(&user_id, "next-series-b")
+            .await?
+    );
+    assert_eq!(
+        database.list_user_series_next(&user_id, 0, 10).await?.len(),
+        1
+    );
+
+    // Deleting the user cascades the derived rows away.
+    sqlx::query("DELETE FROM users WHERE id = ?")
+        .bind(&user_id)
+        .execute(database.pool())
+        .await?;
+    let remaining: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_series_next")
+        .fetch_one(database.pool())
+        .await?;
+    assert_eq!(remaining, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_series_next_rebuild_picks_the_next_unplayed_episode()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Rebuild", "Rebuild", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('rebuild-lib', 'R', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('rebuild-series', 'rebuild-lib', 'SERIES', 'Series', 'series',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    for episode in 1..=3 {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number
+             ) VALUES (?, 'rebuild-lib', 'EPISODE', ?, ?, 'LOCAL_CONFIRMED', 1,
+                       'rebuild-series', 1, ?)",
+        )
+        .bind(format!("rebuild-episode-{episode}"))
+        .bind(format!("Episode {episode}"))
+        .bind(format!("episode {episode}"))
+        .bind(episode)
+        .execute(database.pool())
+        .await?;
+    }
+    for (episode, last_played_at) in [(1, 10), (2, 20)] {
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, position_ticks, is_played, play_count, last_played_at
+             ) VALUES (?, ?, 100, 1, 1, ?)",
+        )
+        .bind(&user_id)
+        .bind(format!("rebuild-episode-{episode}"))
+        .bind(last_played_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    assert_eq!(database.rebuild_user_series_next().await?, 1);
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].series_id, "rebuild-series");
+    assert_eq!(rows[0].next_item_id, "rebuild-episode-3");
+    assert_eq!(rows[0].played, 0);
+
+    // Finishing the last episode leaves no next pointer.
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES (?, 'rebuild-episode-3', 100, 1, 1, 30)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.rebuild_user_series_next().await?, 0);
+    assert!(
+        database
+            .list_user_series_next(&user_id, 0, 10)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn marking_episodes_played_refreshes_the_next_pointer()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Pointer", "Pointer", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('pointer-lib', 'P', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES ('pointer-series', 'pointer-lib', 'SERIES', 'Series', 'series',
+                   'LOCAL_CONFIRMED', 1)",
+    )
+    .execute(database.pool())
+    .await?;
+    for episode in 1..=3 {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number
+             ) VALUES (?, 'pointer-lib', 'EPISODE', ?, ?, 'LOCAL_CONFIRMED', 1,
+                       'pointer-series', 1, ?)",
+        )
+        .bind(format!("pointer-episode-{episode}"))
+        .bind(format!("Episode {episode}"))
+        .bind(format!("episode {episode}"))
+        .bind(episode)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .set_user_item_played(&user_id, "pointer-episode-1", true)
+        .await?;
+    let pointer = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(pointer.len(), 1);
+    assert_eq!(pointer[0].next_item_id, "pointer-episode-2");
+
+    database
+        .set_user_item_played(&user_id, "pointer-episode-2", true)
+        .await?;
+    let pointer = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(pointer[0].next_item_id, "pointer-episode-3");
+
+    database
+        .set_user_item_played(&user_id, "pointer-episode-3", true)
+        .await?;
+    assert!(
+        database
+            .list_user_series_next(&user_id, 0, 10)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_series_next_rebuild_keeps_the_in_progress_episode()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Progress", "Progress", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('progress-lib', 'P', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    for (id, item_type, episode) in [
+        ("progress-series", "SERIES", None),
+        ("progress-ep1", "EPISODE", Some(1)),
+        ("progress-ep2", "EPISODE", Some(2)),
+    ] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number, runtime_ticks
+             ) VALUES (?, 'progress-lib', ?, ?, ?, 'LOCAL_CONFIRMED', 1,
+                       CASE WHEN ? = 'EPISODE' THEN 'progress-series' ELSE NULL END,
+                       CASE WHEN ? = 'EPISODE' THEN 1 ELSE NULL END, ?, ?)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(item_type)
+        .bind(item_type)
+        .bind(episode)
+        .bind(episode.map(|_| 7_200_000_000_i64))
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, last_played_at
+         ) VALUES (?, 'progress-ep1', 100, 1, 10), (?, 'progress-ep2', 1800000000, 0, 20)",
+    )
+    .bind(&user_id)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(database.rebuild_user_series_next().await?, 1);
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].next_item_id, "progress-ep2");
+    assert_eq!(rows[0].position_ticks, 1_800_000_000);
+
+    // Crossing the played percentage drops the episode from the resume candidates; the pointer
+    // then advances to it as the next unplayed episode, exactly like the authoritative query.
+    sqlx::query(
+        "UPDATE user_item_state SET position_ticks = 7000000000
+         WHERE user_id = ? AND item_id = 'progress-ep2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.rebuild_user_series_next().await?, 1);
+    let rows = database.list_user_series_next(&user_id, 0, 10).await?;
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].next_item_id, "progress-ep2");
+    assert_eq!(rows[0].position_ticks, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn continue_watching_read_model_matches_the_legacy_query()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::auth::users::UserStore;
+    use crate::storage::test_database;
+
+    const RUNTIME: i64 = 7_200_000_000;
+
+    let (_temp, database) = test_database().await?;
+    let admin = UserStore::new(database.clone())?
+        .create_initial_admin("Resume", "Resume", "correct horse battery staple")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('resume-lib', 'R', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    for (id, item_type, series_id, episode, runtime_ticks) in [
+        ("resume-series-a", "SERIES", None, None, None),
+        (
+            "resume-a-ep1",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(1),
+            Some(RUNTIME),
+        ),
+        (
+            "resume-a-ep2",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(2),
+            Some(RUNTIME),
+        ),
+        (
+            "resume-a-ep3",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(3),
+            Some(RUNTIME),
+        ),
+        (
+            "resume-a-ep4",
+            "EPISODE",
+            Some("resume-series-a"),
+            Some(4),
+            Some(RUNTIME),
+        ),
+        ("resume-series-b", "SERIES", None, None, None),
+        (
+            "resume-b-ep1",
+            "EPISODE",
+            Some("resume-series-b"),
+            Some(1),
+            Some(RUNTIME),
+        ),
+        (
+            "resume-b-ep2",
+            "EPISODE",
+            Some("resume-series-b"),
+            Some(2),
+            Some(RUNTIME),
+        ),
+        ("resume-movie", "MOVIE", None, None, Some(RUNTIME)),
+    ] {
+        let season_number = episode.map(|_| 1);
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source, series_id, season_number, episode_number, runtime_ticks
+             ) VALUES (?, 'resume-lib', ?, ?, ?, 'LOCAL_CONFIRMED', 1, ?, ?, ?, ?)",
+        )
+        .bind(id)
+        .bind(item_type)
+        .bind(id)
+        .bind(id)
+        .bind(series_id)
+        .bind(season_number)
+        .bind(episode)
+        .bind(runtime_ticks)
+        .execute(database.pool())
+        .await?;
+    }
+    for (item_id, position_ticks, is_played, hide_from_resume, last_played_at) in [
+        ("resume-a-ep1", 0i64, 1, 0, 10),
+        ("resume-a-ep2", 1_800_000_000, 0, 0, 20),
+        ("resume-a-ep3", 1_800_000_000, 0, 1, 25),
+        // Watched longer ago than ep2 but with the higher episode number: the authoritative
+        // query prefers the higher episode inside one series, and the pointer must match.
+        ("resume-a-ep4", 1_800_000_000, 0, 0, 5),
+        ("resume-b-ep1", 0, 1, 0, 40),
+        ("resume-movie", 2_520_000_000, 0, 0, 30),
+    ] {
+        sqlx::query(
+            "INSERT INTO user_item_state (
+                 user_id, item_id, position_ticks, is_played, hide_from_resume, play_count,
+                 last_played_at
+             ) VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(&user_id)
+        .bind(item_id)
+        .bind(position_ticks)
+        .bind(is_played)
+        .bind(hide_from_resume)
+        .bind(i64::from(is_played))
+        .bind(last_played_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    // The hidden episode is skipped, so only the two live series keep a pointer.
+    assert_eq!(database.rebuild_user_series_next().await?, 2);
+    database.rebuild_catalog_items_batch(None, 100).await?;
+
+    let (played_percent, minimum_ticks) = database.home_resume_settings(&user_id).await?;
+    let library_ids = ["resume-lib".to_owned()];
+    let legacy_query = ResumeItemsQuery {
+        user_id: &user_id,
+        library_ids: &library_ids,
+        item_types: &["MOVIE", "EPISODE", "VIDEO"],
+        content_restrictions: None,
+        played_percent,
+        minimum_ticks,
+        offset: 0,
+        limit: 10,
+    };
+    let (legacy_rows, legacy_total) = database
+        .list_home_resume_items_with_total(&legacy_query, true)
+        .await?;
+    let mut legacy_ids: Vec<String> = Vec::new();
+    for row in &legacy_rows {
+        if !legacy_ids.contains(&row.item_id) {
+            legacy_ids.push(row.item_id.clone());
+        }
+    }
+    assert_eq!(
+        legacy_ids,
+        vec![
+            "resume-b-ep2".to_owned(),
+            "resume-movie".to_owned(),
+            "resume-a-ep4".to_owned()
+        ]
+    );
+    assert_eq!(legacy_total, 3);
+
+    let pointer_query = ResumePointerQuery {
+        user_id: &user_id,
+        library_ids: &library_ids,
+        item_types: &["MOVIE", "EPISODE", "VIDEO"],
+        content_restrictions: None,
+        played_percent,
+        minimum_ticks,
+        offset: 0,
+        limit: 10,
+    };
+    let (pointer_ids, pointer_total) = database.list_resume_pointer_ids(&pointer_query).await?;
+    assert_eq!(pointer_ids, legacy_ids);
+    assert_eq!(pointer_total, legacy_total);
+
+    let rows = database.read_model_rows_in_id_order(&pointer_ids).await?;
+    let read_model_ids = rows
+        .iter()
+        .map(|row| row.item_id.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(read_model_ids, legacy_ids);
+
+    let paged = ResumePointerQuery {
+        offset: 1,
+        limit: 1,
+        ..pointer_query
+    };
+    let (paged_ids, paged_total) = database.list_resume_pointer_ids(&paged).await?;
+    assert_eq!(paged_ids, vec!["resume-movie".to_owned()]);
+    assert_eq!(paged_total, legacy_total);
+    Ok(())
 }
 
 fn invitation_storage_bundle<'a>(
@@ -26762,6 +29516,7 @@ async fn postgres_terminal_local_metadata_batches_are_cleaned_after_the_scan_fin
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subjects()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -26838,6 +29593,7 @@ async fn user_activity_index_insert_redacts_metadata_and_keeps_independent_subje
 }
 
 #[tokio::test]
+#[allow(clippy::type_complexity)]
 async fn user_device_observations_merge_monotonically_and_are_user_scoped()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp = tempfile::tempdir()?;
@@ -28725,6 +31481,8 @@ async fn manifest_discovery_presence_templates_preserve_path_and_generation_resu
         inode: None,
         fingerprint: fingerprint.to_vec(),
         fingerprint_pending: false,
+        is_symlink: false,
+        resolved_path: None,
     };
     let seen_entry =
         |id: &str, relative_path: &str, fingerprint: &[u8]| NewScanManifestSeenFilesystemEntry {
@@ -29101,6 +31859,7 @@ async fn postgres_registration_mode_contract() -> Result<(), Box<dyn std::error:
 
 const REGISTRATION_TEST_PERMISSION_SNAPSHOT: &str = r#"{"isAdmin":false,"canManageServer":false,"permissions":{"libraryAccessMode":"NONE","libraryIds":[],"canDownload":false,"canPlay":true,"maxSimultaneousPlaybacks":2,"allowRemux":true,"allowAudioTranscode":true,"allowVideoTranscode":true}}"#;
 
+#[allow(clippy::too_many_arguments)]
 fn registration_storage_bundle<'a>(
     id: &'a str,
     recipient_email: &'a str,
@@ -30647,35 +33406,287 @@ async fn nfo_metadata_batch_reads_a_page_with_one_query() -> Result<(), Box<dyn 
         sqlx::query(
             "INSERT INTO media_items (
                  id, library_id, item_type, title, sort_title,
-                 identification_status, has_available_source, nfo_metadata_json
-             ) VALUES (?, 'nfo-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1, ?)",
+                 identification_status, has_available_source
+             ) VALUES (?, 'nfo-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
         )
         .bind(id)
         .bind(id)
         .bind(id)
-        .bind(nfo)
         .execute(database.pool())
         .await?;
+        if let Some(json) = nfo {
+            sqlx::query(
+                "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                 VALUES (?, ?, length(CAST(? AS BLOB)))",
+            )
+            .bind(id)
+            .bind(json)
+            .bind(json)
+            .execute(database.pool())
+            .await?;
+        }
     }
 
     let item_ids = vec!["nfo-a".to_owned(), "nfo-b".to_owned(), "nfo-c".to_owned()];
-    let cached = database
-        .media_item_nfo_metadata_json_batch(&item_ids)
-        .await?;
+    let cached = database.media_item_nfo_snapshot_batch(&item_ids).await?;
     assert_eq!(
         cached.len(),
         2,
         "only items with a cached snapshot are returned"
     );
     assert_eq!(
-        cached.get("nfo-a").map(String::as_str),
+        cached.get("nfo-a").map(|(json, ..)| json.as_str()),
         Some("{\"title\":\"A\"}")
     );
     assert_eq!(
-        cached.get("nfo-c").map(String::as_str),
+        cached.get("nfo-c").map(|(json, ..)| json.as_str()),
         Some("{\"title\":\"C\"}")
     );
     assert!(!cached.contains_key("nfo-b"));
+    // No fingerprint column values in this fixture, so the cheap lookup stays empty and the store
+    // will not cache these rows.
+    assert!(
+        !cached
+            .values()
+            .any(|(_, fingerprint, ..)| fingerprint.is_some())
+    );
+    assert!(
+        database
+            .media_item_nfo_validities_batch(&item_ids)
+            .await?
+            .is_empty()
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn unchanged_nfo_snapshot_is_not_rewritten_and_keeps_collection_reference()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('nfo-write-lib', 'NFO', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source, nfo_metadata_fingerprint,
+             nfo_collection_reference_key, updated_at
+         ) VALUES ('nfo-write', 'nfo-write-lib', 'MOVIE', 'Write', 'write', 'LOCAL_CONFIRMED',
+                   1, X'01', 'collection-key', 100)",
+    )
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO media_item_nfo_cache (item_id, fingerprint, json, bytes)
+         VALUES ('nfo-write', X'01', '{\"title\":\"Write\"}',
+                 length(CAST('{\"title\":\"Write\"}' AS BLOB)))",
+    )
+    .execute(database.pool())
+    .await?;
+
+    // Same snapshot and fingerprint: no row rewrite, no reference invalidation.
+    database
+        .update_media_item_nfo_metadata("nfo-write", Some("{\"title\":\"Write\"}"), Some(&[1]))
+        .await?;
+    let unchanged: (i64, Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT item.updated_at, item.nfo_collection_reference_key, item.nfo_metadata_json,
+                cache.json
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = 'nfo-write'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(
+        unchanged.0, 100,
+        "unchanged snapshots must not bump updated_at"
+    );
+    assert_eq!(unchanged.1.as_deref(), Some("collection-key"));
+    assert_eq!(unchanged.2, None, "legacy inline snapshots stay empty");
+    assert_eq!(unchanged.3.as_deref(), Some("{\"title\":\"Write\"}"));
+
+    // A changed snapshot rewrites once and invalidates the derived reference.
+    database
+        .update_media_item_nfo_metadata("nfo-write", Some("{\"title\":\"Changed\"}"), Some(&[2]))
+        .await?;
+    let changed: (i64, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT item.updated_at, item.nfo_collection_reference_key, cache.json
+         FROM media_items item
+         LEFT JOIN media_item_nfo_cache cache ON cache.item_id = item.id
+         WHERE item.id = 'nfo-write'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(changed.0 > 100);
+    assert_eq!(changed.1, None);
+    assert_eq!(changed.2.as_deref(), Some("{\"title\":\"Changed\"}"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_nfo_updates_share_one_transaction_and_skip_unchanged_items()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('nfo-batch-lib', 'NFO', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for id in ["nfo-batch-a", "nfo-batch-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'nfo-batch-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    }
+
+    database
+        .update_media_item_nfo_metadata_batch(&[
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-a",
+                json: Some(r#"{"title":"A"}"#),
+                source_fingerprint: Some(&[1]),
+            },
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-b",
+                json: Some(r#"{"title":"B"}"#),
+                source_fingerprint: Some(&[2]),
+            },
+        ])
+        .await?;
+    let rows: Vec<(String, String, Option<Vec<u8>>)> = sqlx::query_as(
+        "SELECT cache.item_id, cache.json, item.nfo_metadata_fingerprint
+         FROM media_item_nfo_cache cache
+         JOIN media_items item ON item.id = cache.item_id
+         WHERE cache.item_id LIKE 'nfo-batch-%' ORDER BY cache.item_id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0].0, "nfo-batch-a");
+    assert_eq!(rows[0].1, r#"{"title":"A"}"#);
+    assert_eq!(rows[0].2.as_deref(), Some([1].as_slice()));
+    assert_eq!(rows[1].2.as_deref(), Some([2].as_slice()));
+
+    let before: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, updated_at FROM media_items WHERE id LIKE 'nfo-batch-%' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    database
+        .update_media_item_nfo_metadata_batch(&[
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-a",
+                json: Some(r#"{"title":"A"}"#),
+                source_fingerprint: Some(&[1]),
+            },
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-batch-b",
+                json: Some(r#"{"title":"B"}"#),
+                source_fingerprint: Some(&[2]),
+            },
+        ])
+        .await?;
+    let after: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT id, updated_at FROM media_items WHERE id LIKE 'nfo-batch-%' ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(after, before, "unchanged batch items must not be rewritten");
+
+    database
+        .update_media_item_nfo_metadata_batch(&[MediaItemNfoMetadataUpdate {
+            item_id: "nfo-batch-a",
+            json: None,
+            source_fingerprint: None,
+        }])
+        .await?;
+    let remaining: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_item_nfo_cache WHERE item_id = 'nfo-batch-a'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(remaining, 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn batch_nfo_updates_roll_back_together_on_a_mid_batch_failure()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('nfo-batch-lib', 'NFO', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for id in ["nfo-rollback-a", "nfo-rollback-b"] {
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, identification_status,
+                 has_available_source
+             ) VALUES (?, 'nfo-batch-lib', 'MOVIE', ?, ?, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(id)
+        .bind(id)
+        .bind(id)
+        .execute(database.pool())
+        .await?;
+    }
+    sqlx::query(
+        "CREATE TRIGGER fail_second_nfo_cache_write
+         BEFORE INSERT ON media_item_nfo_cache
+         WHEN NEW.item_id = 'nfo-rollback-b'
+         BEGIN
+             SELECT RAISE(ABORT, 'injected cache failure');
+         END",
+    )
+    .execute(database.pool())
+    .await?;
+
+    let result = database
+        .update_media_item_nfo_metadata_batch(&[
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-rollback-a",
+                json: Some(r#"{"title":"A"}"#),
+                source_fingerprint: Some(&[1]),
+            },
+            MediaItemNfoMetadataUpdate {
+                item_id: "nfo-rollback-b",
+                json: Some(r#"{"title":"B"}"#),
+                source_fingerprint: Some(&[2]),
+            },
+        ])
+        .await;
+    assert!(result.is_err(), "the injected failure must surface");
+    let cached: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM media_item_nfo_cache WHERE item_id LIKE 'nfo-rollback-%'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert_eq!(cached, 0, "the first item must not be committed alone");
     Ok(())
 }
 
@@ -30737,7 +33748,7 @@ async fn emby_access_tokens_expire_and_renew_on_touch() -> Result<(), Box<dyn st
         .await?;
     assert!(
         database
-            .find_user_by_access_token(&token_hash)
+            .find_route_token_principal(&token_hash, false)
             .await?
             .is_some(),
         "a fresh token must resolve"
@@ -30755,7 +33766,7 @@ async fn emby_access_tokens_expire_and_renew_on_touch() -> Result<(), Box<dyn st
     .await?;
     assert!(
         database
-            .find_user_by_access_token(&token_hash)
+            .find_route_token_principal(&token_hash, false)
             .await?
             .is_none(),
         "expired tokens must not resolve"
@@ -30845,7 +33856,7 @@ async fn library_strm_source_counts_ignore_removed_items() -> Result<(), Box<dyn
     }
 
     let counts = database
-        .list_strm_media_source_counts_for_libraries(&[library_id.clone()])
+        .list_strm_media_source_counts_for_libraries(std::slice::from_ref(&library_id))
         .await?;
     assert_eq!(
         counts.get(&library_id).copied(),
@@ -30905,7 +33916,13 @@ async fn person_credit_item_ids_are_paged_by_keyset() -> Result<(), Box<dyn std:
     }
 
     let first = database
-        .list_person_credit_item_ids(&[library_id.clone()], "Actor", "person-1", None, 2)
+        .list_person_credit_item_ids(
+            std::slice::from_ref(&library_id),
+            "Actor",
+            "person-1",
+            None,
+            2,
+        )
         .await?;
     assert_eq!(first, vec!["item-a".to_owned(), "item-b".to_owned()]);
     let second = database
@@ -30983,10 +34000,11 @@ async fn search_pages_past_the_end_still_report_the_real_total()
 
     let page = database
         .search_catalog_item_ids(&crate::storage::CatalogSearchQuery {
+            include_total: true,
             query: "Zebra",
             like_query: "%Zebra%",
             item_types: &["MOVIE".to_owned()],
-            library_ids: Some(&[library_id.clone()]),
+            library_ids: Some(std::slice::from_ref(&library_id)),
             offset: 10,
             limit: 5,
             content_restrictions: None,
@@ -31651,9 +34669,9 @@ async fn user_batch_reads_match_single_user_reads() {
                 .expect("single configuration")
         );
     }
-    assert!(orders.get("batch-unknown-user").is_none());
-    assert!(flags.get("batch-unknown-user").is_none());
-    assert!(configurations.get("batch-unknown-user").is_none());
+    assert!(!orders.contains_key("batch-unknown-user"));
+    assert!(!flags.contains_key("batch-unknown-user"));
+    assert!(!configurations.contains_key("batch-unknown-user"));
     database.close().await;
 }
 
@@ -31763,4 +34781,1738 @@ async fn batched_accessible_library_ids_match_single_user_queries() {
         vec!["accessible-active".to_owned()]
     );
     database.close().await;
+}
+
+#[tokio::test]
+async fn library_deletion_open_filter_lists_only_unfinished_jobs()
+-> Result<(), Box<dyn std::error::Error>> {
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    for (id, library_id, name, status, created_at) in [
+        ("job-open-pending", "lib-pending", "Pending", "PENDING", 3),
+        ("job-open-failed", "lib-failed", "Failed", "FAILED", 2),
+        (
+            "job-open-completed",
+            "lib-completed",
+            "Completed",
+            "COMPLETED",
+            1,
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO library_deletion_jobs (
+                 id, library_id, library_name, status, stage, created_at, updated_at
+             ) VALUES (?, ?, ?, ?, 'MEDIA_ITEMS', ?, ?)",
+        )
+        .bind(id)
+        .bind(library_id)
+        .bind(name)
+        .bind(status)
+        .bind(created_at)
+        .bind(created_at)
+        .execute(database.pool())
+        .await?;
+    }
+
+    let open = database
+        .list_library_deletion_jobs(0, 20, Some("OPEN"))
+        .await?;
+    assert_eq!(
+        open.iter().map(|job| job.id.as_str()).collect::<Vec<_>>(),
+        vec!["job-open-pending", "job-open-failed"],
+        "the operations filter must keep running failures visible and completed rows out"
+    );
+    assert_eq!(
+        database.count_library_deletion_jobs(Some("OPEN")).await?,
+        2,
+        "the paginated total follows the same predicate as the page"
+    );
+
+    let completed = database
+        .list_library_deletion_jobs(0, 20, Some("COMPLETED"))
+        .await?;
+    assert_eq!(
+        completed
+            .iter()
+            .map(|job| job.id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["job-open-completed"],
+        "completed history stays reachable by its exact status"
+    );
+    assert_eq!(database.count_library_deletion_jobs(None).await?, 3);
+
+    database.close().await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_item_child_delete_list_covers_every_cascade_edge()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::library_deletion::MEDIA_ITEM_CHILD_DELETES;
+    use crate::config::Config;
+    use sqlx::Row;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    let tables: Vec<String> = sqlx::query_scalar(
+        "SELECT name FROM sqlite_master
+         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '%_new'",
+    )
+    .fetch_all(database.pool())
+    .await?;
+
+    let mut missing = Vec::new();
+    for table in tables {
+        let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "PRAGMA foreign_key_list('{table}')"
+        )))
+        .fetch_all(database.pool())
+        .await?;
+        for row in rows {
+            let parent: String = row.get("table");
+            let column: String = row.get("from");
+            let action: String = row.get("on_delete");
+            // SET NULL edges keep their row on purpose; only cascades must be listed.
+            if action != "CASCADE" || (parent != "media_items" && parent != "media_sources") {
+                continue;
+            }
+            if !MEDIA_ITEM_CHILD_DELETES
+                .iter()
+                .any(|(list_table, list_column, _)| *list_table == table && *list_column == column)
+            {
+                missing.push(format!("{table}.{column} -> {parent}"));
+            }
+        }
+    }
+
+    assert!(
+        missing.is_empty(),
+        "set-based child deletes miss these cascade edges: {missing:?}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn media_item_batch_removes_every_child_table_row() -> Result<(), Box<dyn std::error::Error>>
+{
+    use crate::config::Config;
+
+    let temp = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp.path().join("config"),
+    })
+    .await?;
+
+    for statement in [
+        "INSERT INTO libraries (id, name, kind) VALUES ('lib-batch', 'Batch', 'SERIES')",
+        "INSERT INTO library_roots (
+             id, library_id, canonical_path, display_path, is_available, is_writable
+         ) VALUES ('root-batch', 'lib-batch', '/media/series', '/media/series', 1, 1)",
+        "INSERT INTO filesystem_entries (
+             id, library_root_id, relative_path, entry_kind, size, modified_at,
+             last_seen_generation
+         ) VALUES ('entry-batch', 'root-batch', 'Show/S01E01.mkv', 'FILE', 1, 1, '1')",
+        "INSERT INTO library_deletion_jobs (
+             id, library_id, library_name, status, stage
+         ) VALUES ('job-batch', 'lib-batch', 'Batch', 'RUNNING', 'MEDIA_ITEMS')",
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             provider_ids_json
+         ) VALUES ('series-batch', 'lib-batch', 'SERIES', 'Show', 'show',
+                   'LOCAL_CONFIRMED', '{\"tmdb\":\"1\"}')",
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number,
+             episode_number, title, sort_title, identification_status
+         ) VALUES ('episode-batch', 'lib-batch', 'EPISODE', 'series-batch',
+                   'series-batch', 1, 1, 'Show S01E01', 'show s01e01', 'LOCAL_CONFIRMED')",
+        "INSERT INTO media_sources (
+             id, item_id, source_kind, filesystem_entry_id, container
+         ) VALUES ('source-batch', 'episode-batch', 'LOCAL_FILE', 'entry-batch', 'mkv')",
+        "INSERT INTO media_streams (
+             id, media_source_id, stream_index, stream_type
+         ) VALUES ('stream-batch', 'source-batch', 0, 'VIDEO')",
+        "INSERT INTO media_chapters (
+             id, media_source_id, start_position_ticks, marker_type, chapter_index,
+             provider_id, confidence
+         ) VALUES ('chapter-batch', 'source-batch', 0, 'INTRO_START', 0, 'test', 0.9)",
+        "INSERT INTO person_credits (item_id, person_id, person_type, person_name, role)
+         VALUES ('episode-batch', 'person-1', 'CAST', 'Actor', 'Role')",
+        "INSERT INTO item_images (id, item_id, image_type, local_path)
+         VALUES ('image-batch', 'series-batch', 'POSTER', '/config/metadata/library/x.jpg')",
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('alias-batch', 'series-batch', 'Alias', 'alias')",
+        "INSERT INTO item_metadata_completeness (item_id, capability, local_state, is_missing)
+         VALUES ('series-batch', 'NFO', 'READY', 0)",
+        "INSERT INTO users (id, username_normalized, display_name, password_hash)
+         VALUES ('user-batch', 'user-batch', 'Batch User', 'not-a-real-hash')",
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, is_favorite, play_count,
+             last_played_at
+         ) VALUES ('user-batch', 'series-batch', 0, 1, 1, 4, 1700000000)",
+        "INSERT INTO playback_history_events (
+             id, user_id, item_id, event_type, position_ticks, occurred_at, source,
+             source_event_key
+         ) VALUES ('event-batch', 'user-batch', 'series-batch', 'PLAY_STARTED', 0, 1700000000,
+                   'emby-import', 'emby-event-batch')",
+    ] {
+        sqlx::query(statement).execute(database.pool()).await?;
+    }
+
+    let mut batches = 0;
+    loop {
+        let deleted = database
+            .delete_library_deletion_batch(
+                "job-batch",
+                "lib-batch",
+                crate::storage::LibraryDeletionBatch::MediaItems,
+                500,
+            )
+            .await?
+            .ok_or("deletion batch stopped unexpectedly")?;
+        batches += 1;
+        if deleted == 0 {
+            break;
+        }
+        assert!(batches < 10, "batch loop did not converge");
+    }
+
+    for (table, column) in [
+        ("media_items", "library_id"),
+        ("media_sources", "item_id"),
+        ("media_streams", "media_source_id"),
+        ("media_chapters", "media_source_id"),
+        ("person_credits", "item_id"),
+        ("item_images", "item_id"),
+        ("item_aliases", "item_id"),
+        ("item_metadata_completeness", "item_id"),
+        ("media_item_provider_ids", "media_item_id"),
+        ("media_content_restriction_index_queue", "item_id"),
+    ] {
+        let remaining: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM {table} WHERE {column} IN \
+             (SELECT id FROM media_items WHERE library_id = 'lib-batch')"
+        )))
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(
+            remaining, 0,
+            "{table} still holds rows for the deleted library"
+        );
+    }
+
+    let stray_streams: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_streams WHERE id = 'stream-batch'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        stray_streams, 0,
+        "set-based delete must remove media streams"
+    );
+
+    let remaining_state: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state WHERE item_id = 'series-batch'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        remaining_state, 0,
+        "the batch still removes the state row it copied out"
+    );
+    let archived: Vec<(String, String, String, i64, i64, i64)> = sqlx::query_as(
+        "SELECT provider, provider_id, item_type, is_played, is_favorite, play_count
+         FROM user_item_state_archive",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        archived,
+        vec![(
+            "tmdb".to_owned(),
+            "1".to_owned(),
+            "SERIES".to_owned(),
+            1,
+            1,
+            4
+        )],
+        "deleting a library has to keep the watch state the user earned, exactly once"
+    );
+    let archived_events: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT id, provider, provider_id FROM playback_history_event_archive ORDER BY id",
+    )
+    .fetch_all(database.pool())
+    .await?;
+    assert_eq!(
+        archived_events,
+        vec![("event-batch".to_owned(), "tmdb".to_owned(), "1".to_owned())],
+        "deleting a library has to keep the playback history too"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
+    let lock = Arc::new(AsyncMutex::new(()));
+    let holder_lock = lock.clone();
+    let holder = tokio::spawn(async move {
+        let _guard = holder_lock.lock().await;
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    });
+    // Let the holder take the lock before the acquisition under test starts waiting.
+    tokio::time::sleep(Duration::from_millis(10)).await;
+
+    let started = Instant::now();
+    let guard = acquire_write_lock_after(
+        &lock,
+        "test",
+        Duration::from_millis(1),
+        std::panic::Location::caller(),
+    )
+    .await;
+    let waited = started.elapsed();
+    drop(guard);
+    holder.await.expect("holder task");
+
+    // The holder keeps the lock for 50 ms and the acquisition starts after 10 ms, so a correct wait
+    // is about 40 ms. Timers fire a little early on a busy machine, so the bound leaves headroom;
+    // returning immediately (the failure this test guards against) would be near zero.
+    assert!(
+        waited >= Duration::from_millis(25),
+        "the acquisition returned while another writer still held the lock, after {waited:?}"
+    );
+}
+
+/// A2: the PostgreSQL placeholder rewrite memo.
+///
+/// These tests pin the memoized path to the uncached rewrite byte for byte and pin the memo's
+/// capacity behaviour. They live next to the other storage tests rather than inside
+/// `repository.rs` because `scripts/check-backend-branches.py` counts `DatabaseBackend::` uses in
+/// non-`*_tests.rs` files, and test-only uses must not look like new production backend branches.
+mod adapted_sql_cache_tests {
+    use super::*;
+
+    /// Statements where `?` is not always a placeholder.
+    const TRICKY_STATEMENTS: &[&str] = &[
+        "SELECT ?, '?' AS literal, \"?\" AS identifier, ?",
+        "SELECT * FROM t WHERE a = ? AND b = '?'",
+        "SELECT * FROM t -- note: ? placeholder\nWHERE a = ?",
+        "SELECT /* a ? b */ * FROM t WHERE a = ?",
+        "SELECT 'it''s ?' AS x, ? AS y",
+        "SELECT 'a''?''b' AS x, ? AS y",
+        "SELECT \"a?\" AS x, ? AS y",
+        "?",
+        "??",
+        "SELECT '?' -- question mark in a line comment\n",
+        "SELECT * FROM t WHERE a = ? -- trailing ? comment without newline",
+        "SELECT * FROM t /* unterminated ? block comment",
+        "SELECT 'unterminated ? literal",
+        "SELECT 'no parameters'",
+        "SELECT * FROM t -- only a comment mentions ?",
+        "SELECT * FROM t /* only a block comment mentions ? */",
+        "SELECT * FROM t WHERE a = 'x' || '?'",
+        "",
+    ];
+
+    fn uncached_rewrite(sql: &'static str) -> String {
+        adapt_postgres_sql_uncached(sqlx::AssertSqlSafe(sql.to_owned()))
+            .as_str()
+            .to_owned()
+    }
+
+    #[test]
+    fn memoized_rewrite_matches_the_uncached_rewrite_for_tricky_statements() {
+        let cache = AdaptedSqlCache::default();
+        for sql in TRICKY_STATEMENTS {
+            let cached = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            assert_eq!(
+                cached.as_str(),
+                uncached_rewrite(sql),
+                "memoized rewrite diverged for {sql:?}"
+            );
+            // A second call must answer from the memo, not from a rebuild.
+            let again = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            assert_eq!(again.as_str().as_bytes(), cached.as_str().as_bytes());
+            assert!(std::ptr::eq(
+                again.as_str().as_ptr(),
+                cached.as_str().as_ptr()
+            ));
+        }
+    }
+
+    #[test]
+    fn statements_without_question_marks_bypass_the_memo_entirely() {
+        let cache = AdaptedSqlCache::default();
+        let statements = ["SELECT 'no parameters'", "SELECT 1", ""];
+        for sql in statements {
+            let adapted = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            assert_eq!(adapted.as_str(), sql);
+            assert!(std::ptr::eq(sql.as_ptr(), adapted.as_str().as_ptr()));
+        }
+        // Nothing to rewrite means no lock, no allocation and no memo entry.
+        assert_eq!(cache.entry_count(), 0);
+        assert_eq!(cache.cached_text_bytes(), 0);
+    }
+
+    #[test]
+    fn memoized_rewrites_reuse_the_cached_buffer() {
+        let cache = AdaptedSqlCache::default();
+        let sql = "SELECT /* reuse ? */ ?, ? FROM t";
+        let first = adapt_static_sql_for_backend_with_cache(&cache, sql);
+        let second = adapt_static_sql_for_backend_with_cache(&cache, sql);
+        assert_eq!(first.as_str(), "SELECT /* reuse ? */ $1, $2 FROM t");
+        assert_eq!(first.as_str(), second.as_str());
+        assert!(std::ptr::eq(
+            first.as_str().as_ptr(),
+            second.as_str().as_ptr()
+        ));
+        assert_eq!(cache.entry_count(), 1);
+        assert_eq!(cache.cached_text_bytes(), first.as_str().len());
+    }
+
+    fn synthetic_statement(seed: u64) -> String {
+        const FRAGMENTS: &[&str] = &[
+            "SELECT ",
+            "FROM t ",
+            "WHERE ",
+            "a = ?",
+            "'?'",
+            "'it''s ?'",
+            "\"?\"",
+            "-- ? comment\n",
+            "/* ? */",
+            "/* unterminated ?",
+            "'unterminated ?",
+            "AND b = ?",
+            "('LOCAL_FILE', 'STRM_URL')",
+            "?",
+            " ",
+            "\n",
+            "c <> 'Who?'",
+            "LIMIT ?",
+            "ORDER BY id",
+            "",
+            "??",
+        ];
+        let mut state = seed | 1;
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        let fragment_count = usize::try_from(next() % 13).unwrap_or_default();
+        let mut sql = String::new();
+        for _ in 0..fragment_count {
+            let index = usize::try_from(next() % u64::try_from(FRAGMENTS.len()).unwrap_or(1))
+                .unwrap_or_default();
+            sql.push_str(FRAGMENTS[index]);
+        }
+        sql
+    }
+
+    #[test]
+    fn memoized_rewrite_matches_the_uncached_rewrite_for_generated_statements() {
+        let cache = AdaptedSqlCache::default();
+        let mut rewritten_count = 0_usize;
+        for seed in 1..=2_000_u64 {
+            let sql = Box::leak(synthetic_statement(seed).into_boxed_str());
+            let cached = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            let uncached = uncached_rewrite(sql);
+            assert_eq!(
+                cached.as_str(),
+                uncached,
+                "seed {seed} diverged for {sql:?}"
+            );
+            assert_eq!(cached.as_str().as_bytes(), uncached.as_bytes());
+            if cached.as_str() != sql {
+                rewritten_count += 1;
+            }
+            assert!(cache.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
+            assert!(cache.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
+        }
+        assert!(
+            rewritten_count > 500,
+            "generator produced too few rewritten statements: {rewritten_count}"
+        );
+    }
+
+    #[test]
+    fn default_memo_holds_a_real_sized_working_set() {
+        // The production tree passes ~1,124 distinct static statements to `Database::query*`. The
+        // default memo must hold a set that size: shards have to spread statements evenly, not
+        // funnel a regular stride of addresses onto one shard and stop caching the rest.
+        let cache = AdaptedSqlCache::default();
+        let statements = (0..1_000_usize)
+            .map(|index| {
+                let padding = "x".repeat(index % 97);
+                let sql = format!(
+                    "SELECT id FROM media_items_variant_{index:05}
+                     WHERE library_root_id = ? AND note <> '{padding}' -- {index}"
+                );
+                let leaked: &'static str = Box::leak(sql.into_boxed_str());
+                leaked
+            })
+            .collect::<Vec<_>>();
+        for sql in &statements {
+            let adapted = adapt_static_sql_for_backend_with_cache(&cache, sql);
+            assert!(adapted.as_str().contains("$1"));
+        }
+        assert_eq!(cache.entry_count(), statements.len());
+        assert!(cache.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
+    }
+
+    #[test]
+    fn full_shard_keeps_its_entries_and_leaves_new_statements_uncached() {
+        // One shard, two entries: the third statement must not evict anything.
+        let cache = AdaptedSqlCache::with_shard_limits(1, 2, 1 << 20, 1 << 20);
+        let first = "SELECT ? /* keep a */";
+        let second = "SELECT ? /* keep b */";
+        let third = "SELECT ? /* too many */";
+        let cached_first = adapt_static_sql_for_backend_with_cache(&cache, first);
+        let cached_second = adapt_static_sql_for_backend_with_cache(&cache, second);
+        assert_eq!(cache.entry_count(), 2);
+
+        let rejected_once = adapt_static_sql_for_backend_with_cache(&cache, third);
+        let rejected_twice = adapt_static_sql_for_backend_with_cache(&cache, third);
+        assert_eq!(rejected_once.as_str(), "SELECT $1 /* too many */");
+        assert_eq!(rejected_once.as_str(), rejected_twice.as_str());
+        assert!(
+            !std::ptr::eq(
+                rejected_once.as_str().as_ptr(),
+                rejected_twice.as_str().as_ptr()
+            ),
+            "an over-capacity statement must keep taking the uncached path"
+        );
+
+        assert_eq!(cache.entry_count(), 2);
+        let still_cached = adapt_static_sql_for_backend_with_cache(&cache, first);
+        assert!(std::ptr::eq(
+            still_cached.as_str().as_ptr(),
+            cached_first.as_str().as_ptr()
+        ));
+        let still_cached = adapt_static_sql_for_backend_with_cache(&cache, second);
+        assert!(std::ptr::eq(
+            still_cached.as_str().as_ptr(),
+            cached_second.as_str().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn capacity_limits_stop_caching_without_evicting_or_scanning() {
+        // The entry cap binds first here: 64 distinct statements, room for 32.
+        let entry_bounded = AdaptedSqlCache::with_shard_limits(1, 32, 1 << 20, 1 << 20);
+        for index in 0..64 {
+            let sql = Box::leak(format!("SELECT ? /* kept entry {index} */").into_boxed_str());
+            let adapted = adapt_static_sql_for_backend_with_cache(&entry_bounded, sql);
+            assert_eq!(
+                adapted.as_str(),
+                format!("SELECT $1 /* kept entry {index} */")
+            );
+            assert!(entry_bounded.entry_count() <= 32);
+        }
+        assert_eq!(entry_bounded.entry_count(), 32);
+
+        // The byte budget binds first here: every stored rewrite is ~30 bytes, so 512 bytes hold
+        // only a handful of them even though 1,000 entries would be allowed.
+        let byte_bounded = AdaptedSqlCache::with_shard_limits(1, 1_000, 512, 1 << 20);
+        for index in 0..64 {
+            let sql = Box::leak(format!("SELECT ? /* kept entry {index} */").into_boxed_str());
+            let adapted = adapt_static_sql_for_backend_with_cache(&byte_bounded, sql);
+            assert_eq!(
+                adapted.as_str(),
+                format!("SELECT $1 /* kept entry {index} */")
+            );
+            assert!(byte_bounded.cached_text_bytes() <= 512);
+        }
+        assert!(byte_bounded.entry_count() < 64);
+        assert!(byte_bounded.cached_text_bytes() <= 512);
+    }
+
+    #[test]
+    fn statements_over_the_source_byte_limit_are_rewritten_every_call() {
+        // The limit applies to the source text, so 32 `?` bytes stay cacheable even though the
+        // rewritten text ("$1$2…$32") is longer than the limit.
+        let cache = AdaptedSqlCache::with_shard_limits(1, 8, 1 << 20, 32);
+        let at_limit = Box::leak("?".repeat(32).into_boxed_str());
+        let over_limit = Box::leak("?".repeat(33).into_boxed_str());
+
+        let cached_at_limit = adapt_static_sql_for_backend_with_cache(&cache, at_limit);
+        assert_eq!(cached_at_limit.as_str(), uncached_rewrite(at_limit));
+        assert!(cached_at_limit.as_str().len() > 32);
+        assert_eq!(cache.entry_count(), 1);
+
+        let once = adapt_static_sql_for_backend_with_cache(&cache, over_limit);
+        let twice = adapt_static_sql_for_backend_with_cache(&cache, over_limit);
+        assert_eq!(once.as_str(), uncached_rewrite(over_limit));
+        assert_eq!(once.as_str(), twice.as_str());
+        assert!(
+            !std::ptr::eq(once.as_str().as_ptr(), twice.as_str().as_ptr()),
+            "an over-limit statement must keep taking the uncached path"
+        );
+        assert_eq!(cache.entry_count(), 1);
+
+        let again = adapt_static_sql_for_backend_with_cache(&cache, at_limit);
+        assert!(std::ptr::eq(
+            again.as_str().as_ptr(),
+            cached_at_limit.as_str().as_ptr()
+        ));
+    }
+
+    #[test]
+    fn a_zero_entry_cache_still_rewrites_correctly() {
+        let cache = AdaptedSqlCache::with_shard_limits(1, 0, 0, 1 << 20);
+        let adapted = adapt_static_sql_for_backend_with_cache(&cache, "SELECT ?");
+        assert_eq!(adapted.as_str(), "SELECT $1");
+        assert_eq!(cache.entry_count(), 0);
+    }
+
+    #[test]
+    fn sqlite_adaptation_returns_the_source_without_rewriting_or_copying() {
+        let sql = "SELECT ? /* sqlite keeps placeholders */";
+        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sql);
+        assert_eq!(adapted.as_str(), sql);
+        assert!(std::ptr::eq(sql.as_ptr(), adapted.as_str().as_ptr()));
+
+        // An owned statement keeps its buffer too, so SQLite rewrites and copies nothing; the memo
+        // is only reachable from the PostgreSQL side of `adapt_sql_for_backend`.
+        let owned = String::from("SELECT ? FROM t WHERE a = ?");
+        let owned_pointer = owned.as_ptr();
+        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(owned));
+        assert_eq!(adapted.as_str(), "SELECT ? FROM t WHERE a = ?");
+        assert!(std::ptr::eq(owned_pointer, adapted.as_str().as_ptr()));
+
+        let shared: std::sync::Arc<str> = std::sync::Arc::from("SELECT ? FROM t");
+        let shared_pointer = shared.as_ptr();
+        let adapted = adapt_sql_for_backend(DatabaseBackend::Sqlite, sqlx::AssertSqlSafe(shared));
+        assert_eq!(adapted.as_str(), "SELECT ? FROM t");
+        assert!(std::ptr::eq(shared_pointer, adapted.as_str().as_ptr()));
+    }
+
+    #[test]
+    fn dynamic_statements_are_rewritten_on_every_call() {
+        let sql = "SELECT ?, ? FROM t WHERE a = ?";
+        let first = adapt_sql_for_backend(
+            DatabaseBackend::Postgres,
+            sqlx::AssertSqlSafe(sql.to_owned()),
+        );
+        let second = adapt_sql_for_backend(
+            DatabaseBackend::Postgres,
+            sqlx::AssertSqlSafe(sql.to_owned()),
+        );
+        assert_eq!(first.as_str(), "SELECT $1, $2 FROM t WHERE a = $3");
+        assert_eq!(second.as_str(), first.as_str());
+        assert!(!std::ptr::eq(
+            first.as_str().as_ptr(),
+            second.as_str().as_ptr()
+        ));
+
+        // A `SqlStr` has unknown provenance, so it is never memoized either.
+        let from_str = adapt_sql_for_backend(
+            DatabaseBackend::Postgres,
+            sqlx::SqlStr::from_static("SELECT ? FROM t"),
+        );
+        assert_eq!(from_str.as_str(), "SELECT $1 FROM t");
+    }
+
+    #[test]
+    fn concurrent_memoized_rewrites_match_the_uncached_rewrite() {
+        let statements: &[&'static str] = &[
+            "SELECT ?, '?' AS literal FROM t WHERE a = ?",
+            "SELECT * FROM t /* ? */ WHERE b = ?",
+            "-- ? comment\nSELECT 1",
+            "SELECT 'it''s ?' AS x, ? AS y",
+        ];
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                scope.spawn(|| {
+                    for _ in 0..250 {
+                        for sql in statements {
+                            let cached = adapt_sql_for_backend(DatabaseBackend::Postgres, *sql);
+                            assert_eq!(cached.as_str(), uncached_rewrite(sql));
+                        }
+                    }
+                });
+            }
+        });
+        assert!(ADAPTED_SQL_CACHE.entry_count() <= MAX_ADAPTED_SQL_CACHE_ENTRIES);
+        assert!(ADAPTED_SQL_CACHE.cached_text_bytes() <= MAX_ADAPTED_SQL_CACHE_TEXT_BYTES);
+    }
+}
+
+/// Episode runtime used by the playback-progress fixtures below: long enough that a mid-episode
+/// position stays under the default resume thresholds.
+const PLAYBACK_PROGRESS_RUNTIME_TICKS: i64 = 3_600_000_000;
+
+/// One series, one season, three episodes, and log triggers that record every write to
+/// `user_series_next` so a test can assert the resume pointer was left alone.
+async fn playback_progress_fixture()
+-> Result<(tempfile::TempDir, Database, String), Box<dyn std::error::Error>> {
+    use crate::application::setup::SetupService;
+    use crate::storage::test_database;
+
+    let (temp, database) = test_database().await?;
+    let admin = SetupService::new(database.clone())?
+        .complete("Progress", "Progress", "correct password")
+        .await?;
+    let user_id = admin.id.to_string();
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('progress-lib', 'P', 'SERIES')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+             title, sort_title, identification_status, has_available_source, runtime_ticks
+         ) VALUES
+             ('progress-series', 'progress-lib', 'SERIES', NULL, NULL, NULL, NULL,
+              'Series', 'series', 'LOCAL_CONFIRMED', 1, NULL),
+             ('progress-season', 'progress-lib', 'SEASON', 'progress-series', 'progress-series',
+              1, NULL, 'Season', 'season', 'LOCAL_CONFIRMED', 1, NULL),
+             ('progress-episode-1', 'progress-lib', 'EPISODE', 'progress-season',
+              'progress-series', 1, 1, 'Episode 1', 'episode 1', 'LOCAL_CONFIRMED', 1, ?),
+             ('progress-episode-2', 'progress-lib', 'EPISODE', 'progress-season',
+              'progress-series', 1, 2, 'Episode 2', 'episode 2', 'LOCAL_CONFIRMED', 1, ?),
+             ('progress-episode-3', 'progress-lib', 'EPISODE', 'progress-season',
+              'progress-series', 1, 3, 'Episode 3', 'episode 3', 'LOCAL_CONFIRMED', 1, ?)",
+    )
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .execute(database.pool())
+    .await?;
+    sqlx::query("CREATE TABLE progress_pointer_log (event TEXT NOT NULL)")
+        .execute(database.pool())
+        .await?;
+    for operation in ["INSERT", "UPDATE", "DELETE"] {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "CREATE TRIGGER progress_pointer_{operation} AFTER {operation} ON user_series_next
+             BEGIN INSERT INTO progress_pointer_log (event) VALUES ('{operation}'); END"
+        )))
+        .execute(database.pool())
+        .await?;
+    }
+    Ok((temp, database, user_id))
+}
+
+fn playback_progress_event<'a>(
+    user_id: &'a str,
+    item_id: &'a str,
+    play_session_id: &'a str,
+    state: &'a str,
+    position_ticks: i64,
+    previous: Option<(&'a str, i64)>,
+) -> NewPlaybackEvent<'a> {
+    NewPlaybackEvent {
+        user_id,
+        item_id,
+        media_source_id: None,
+        play_session_id,
+        device_id: "progress-device",
+        client: Some("Progress"),
+        device_name: Some("Progress"),
+        client_version: None,
+        device_type: Some("Progress"),
+        remote_ip: None,
+        state,
+        position_ticks,
+        duration_ticks: Some(PLAYBACK_PROGRESS_RUNTIME_TICKS),
+        played_percent: 95,
+        is_paused: state == "PAUSED",
+        previous_state: previous.map(|(state, _)| state),
+        previous_position_ticks: previous.map(|(_, position_ticks)| position_ticks),
+        renew_admission: false,
+    }
+}
+
+async fn progress_pointer_log(
+    database: &Database,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    Ok(
+        sqlx::query_scalar("SELECT event FROM progress_pointer_log ORDER BY rowid")
+            .fetch_all(database.pool())
+            .await?,
+    )
+}
+
+async fn progress_pointer(
+    database: &Database,
+    user_id: &str,
+) -> Result<Option<(String, i64)>, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_as(
+        "SELECT next_item_id, position_ticks FROM user_series_next
+         WHERE user_id = ? AND series_id = 'progress-series'",
+    )
+    .bind(user_id)
+    .fetch_optional(database.pool())
+    .await?)
+}
+
+#[tokio::test]
+async fn playback_progress_tick_skips_the_resume_pointer_and_container_sync()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    let start = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-tick-session",
+            "PLAYING",
+            0,
+            None,
+        ))
+        .await?;
+    assert!(!start.is_played_changed);
+    assert_eq!(
+        start
+            .container_scope
+            .as_ref()
+            .and_then(|scope| scope.series_id.as_deref()),
+        Some("progress-series"),
+        "the first event of a session is a start and refreshes the resume pointer"
+    );
+    let pointer_writes = progress_pointer_log(&database).await?;
+
+    database.reset_query_count();
+    let tick = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-tick-session",
+            "PLAYING",
+            1_000_000_000,
+            Some(("PLAYING", 0)),
+        ))
+        .await?;
+    assert!(!tick.is_played_changed);
+    assert!(
+        tick.container_scope.is_none(),
+        "a plain progress tick must not refresh the resume pointer"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        pointer_writes,
+        "a plain progress tick must not write user_series_next"
+    );
+    assert_eq!(
+        database.query_count(),
+        3,
+        "a plain tick writes the session row and the user item state, and resolves the resume \
+         threshold without moving the pointer"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_flip_marks_containers_played_and_advances_the_pointer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            0,
+            None,
+        ))
+        .await?;
+    let mid_episode = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            PLAYBACK_PROGRESS_RUNTIME_TICKS / 6,
+            Some(("PLAYING", 0)),
+        ))
+        .await?;
+    assert!(!mid_episode.is_played_changed);
+    assert!(mid_episode.container_scope.is_none());
+
+    database.reset_query_count();
+    let flipped = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            PLAYBACK_PROGRESS_RUNTIME_TICKS,
+            Some(("PLAYING", PLAYBACK_PROGRESS_RUNTIME_TICKS / 6)),
+        ))
+        .await?;
+    assert!(
+        flipped.is_played_changed,
+        "crossing the played threshold flips is_played"
+    );
+    let scope = flipped
+        .container_scope
+        .as_ref()
+        .ok_or("a played flip must refresh the resume pointer")?;
+    database
+        .sync_played_container_states_for_scope(&user_id, scope)
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        9,
+        "the flip event and its container sync cost four reads and five writes"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 0)),
+        "the pointer advances to the next unplayed episode"
+    );
+    assert_eq!(
+        progress_container_states(&database, &user_id).await?,
+        vec![
+            ("progress-season".to_owned(), 0),
+            ("progress-series".to_owned(), 0),
+        ],
+        "the sync ran for the flip and reports the still-unplayed episodes"
+    );
+
+    let pointer_writes = progress_pointer_log(&database).await?;
+    database.reset_query_count();
+    let after_played = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-flip-session",
+            "PLAYING",
+            PLAYBACK_PROGRESS_RUNTIME_TICKS,
+            Some(("PLAYING", PLAYBACK_PROGRESS_RUNTIME_TICKS)),
+        ))
+        .await?;
+    assert!(
+        !after_played.is_played_changed,
+        "a later tick must not report another played flip"
+    );
+    assert!(after_played.container_scope.is_none());
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+    assert_eq!(
+        database.query_count(),
+        4,
+        "a tick past the played threshold writes the session row, the item state, and the \
+         last-played stamp, and resolves the resume threshold only"
+    );
+
+    // Finish the series through the same event path: each remaining episode flips once and only
+    // then does the season and series become played.
+    for episode in 2..=3 {
+        let item_id = format!("progress-episode-{episode}");
+        let session_id = format!("progress-flip-session-{episode}");
+        database
+            .record_playback_event(playback_progress_event(
+                &user_id,
+                &item_id,
+                &session_id,
+                "PLAYING",
+                0,
+                None,
+            ))
+            .await?;
+        let flipped = database
+            .record_playback_event(playback_progress_event(
+                &user_id,
+                &item_id,
+                &session_id,
+                "PLAYING",
+                PLAYBACK_PROGRESS_RUNTIME_TICKS,
+                Some(("PLAYING", 0)),
+            ))
+            .await?;
+        assert!(flipped.is_played_changed);
+        let scope = flipped
+            .container_scope
+            .as_ref()
+            .ok_or("each played flip refreshes the resume pointer")?;
+        database
+            .sync_played_container_states_for_scope(&user_id, scope)
+            .await?;
+    }
+    assert_eq!(
+        progress_container_states(&database, &user_id).await?,
+        vec![
+            ("progress-season".to_owned(), 1),
+            ("progress-series".to_owned(), 1),
+        ],
+        "the last played episode marks the season and the series played"
+    );
+    assert!(
+        progress_pointer(&database, &user_id).await?.is_none(),
+        "a fully played series has no resume pointer"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_progress_state_changes_refresh_the_resume_pointer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "PLAYING",
+            1_800_000_000,
+            None,
+        ))
+        .await?;
+    let after_start = progress_pointer_log(&database).await?;
+    assert!(!after_start.is_empty());
+
+    database.reset_query_count();
+    let paused = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "PAUSED",
+            1_800_000_000,
+            Some(("PLAYING", 1_800_000_000)),
+        ))
+        .await?;
+    assert!(
+        paused.container_scope.is_some(),
+        "pausing refreshes the resume pointer"
+    );
+    assert_eq!(
+        database.query_count(),
+        5,
+        "a pause reads the hierarchy and the next-episode candidate, then writes the session, the \
+         item state, and the pointer in one transaction"
+    );
+    let after_pause = progress_pointer_log(&database).await?;
+    assert_eq!(
+        after_pause, after_start,
+        "a pause that recomputes the same pointer must not write it"
+    );
+
+    let stopped = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "STOPPED",
+            1_800_000_000,
+            Some(("PAUSED", 1_800_000_000)),
+        ))
+        .await?;
+    assert!(
+        stopped.container_scope.is_some(),
+        "stopping refreshes the resume pointer"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        after_start,
+        "a stop at the same position must not rewrite the pointer either"
+    );
+
+    // A state change that also moves the position does write the pointer, in place.
+    let resumed = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-state-session",
+            "PLAYING",
+            2_000_000_000,
+            Some(("STOPPED", 1_800_000_000)),
+        ))
+        .await?;
+    assert!(resumed.container_scope.is_some());
+    assert!(progress_pointer_log(&database).await?.len() > after_start.len());
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-1".to_owned(), 2_000_000_000)),
+        "the in-progress episode stays the resume pointer"
+    );
+    Ok(())
+}
+
+/// SQLite row id of one pointer row.
+///
+/// An UPSERT keeps the row id of the row it updates, while a delete-then-insert rebuild mints a
+/// new one, so this is how the tests tell the two apart.
+async fn resume_pointer_rowid(
+    database: &Database,
+    user_id: &str,
+    series_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(
+        sqlx::query_scalar(
+            "SELECT rowid FROM user_series_next WHERE user_id = ? AND series_id = ?",
+        )
+        .bind(user_id)
+        .bind(series_id)
+        .fetch_one(database.pool())
+        .await?,
+    )
+}
+
+/// Write stamp of one pointer row; it only moves when the refresh actually writes.
+async fn resume_pointer_updated_at(
+    database: &Database,
+    user_id: &str,
+    series_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT updated_at FROM user_series_next WHERE user_id = ? AND series_id = ?",
+    )
+    .bind(user_id)
+    .bind(series_id)
+    .fetch_one(database.pool())
+    .await?)
+}
+
+#[tokio::test]
+async fn resume_pointer_refresh_upserts_instead_of_deleting_the_row()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+         VALUES (?, 'progress-episode-1', 1, 1, 10)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played, last_played_at)
+         VALUES (?, 'progress-episode-2', 1800000000, 0, 20)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    database.reset_query_count();
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        database.query_count(),
+        3,
+        "one hierarchy read, one candidate read, and one pointer write"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_800_000_000))
+    );
+    let rowid = resume_pointer_rowid(&database, &user_id, "progress-series").await?;
+    let stamp = resume_pointer_updated_at(&database, &user_id, "progress-series").await?;
+
+    // A refresh that recomputes the same pointer must not write at all: an UPSERT that rewrites an
+    // identical row still dirties a page and fires the row triggers.
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned()],
+        "an unchanged refresh must leave the pointer row untouched"
+    );
+    assert_eq!(
+        resume_pointer_updated_at(&database, &user_id, "progress-series").await?,
+        stamp,
+        "an unchanged refresh must not restamp the row"
+    );
+
+    // A changed pointer updates the row in place: a delete and insert would mint a new row id and
+    // open the empty-pointer window the UPSERT exists to avoid.
+    sqlx::query(
+        "UPDATE user_item_state SET position_ticks = 1900000000
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "UPDATE".to_owned()],
+        "the refresh must never delete a pointer row while a next episode exists"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series").await?,
+        rowid,
+        "a changed pointer keeps the identity of the row it updates"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_900_000_000))
+    );
+
+    sqlx::query(
+        "UPDATE user_item_state SET is_played = 1, position_ticks = 0
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES (?, 'progress-episode-3', 0, 1, 1, 30)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-3")
+        .await?;
+    assert!(progress_pointer(&database, &user_id).await?.is_none());
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec![
+            "INSERT".to_owned(),
+            "UPDATE".to_owned(),
+            "DELETE".to_owned()
+        ],
+        "the pointer is deleted only once the series has no next episode"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn resume_pointer_refresh_keeps_the_previous_row_visible_until_it_commits()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, is_played, play_count, last_played_at)
+         VALUES (?, 'progress-episode-1', 1, 1, 10)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ticks, is_played, last_played_at)
+         VALUES (?, 'progress-episode-2', 1800000000, 0, 20)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    database
+        .refresh_user_series_next_for_item(&user_id, "progress-episode-2")
+        .await?;
+    let rowid = resume_pointer_rowid(&database, &user_id, "progress-series").await?;
+
+    // Publish a new position from inside an open transaction, the way a playback write joins one.
+    sqlx::query(
+        "UPDATE user_item_state SET position_ticks = 1900000000
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    let mut transaction = database.pool().begin().await?;
+    database
+        .refresh_user_series_next_for_item_in(&mut transaction, &user_id, "progress-episode-2")
+        .await?;
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_800_000_000)),
+        "a reader on another connection sees the previous pointer, never a missing one"
+    );
+    transaction.commit().await?;
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-2".to_owned(), 1_900_000_000)),
+        "the refresh becomes visible as one committed change"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series").await?,
+        rowid,
+        "the refresh updates the existing row instead of rebuilding it"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "UPDATE".to_owned()],
+        "the refresh never deletes a pointer row while a next episode exists"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn user_series_next_rebuild_only_writes_the_pointers_that_changed()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, parent_id, series_id, season_number, episode_number,
+             title, sort_title, identification_status, has_available_source, runtime_ticks
+         ) VALUES
+             ('progress-series-b', 'progress-lib', 'SERIES', NULL, NULL, NULL, NULL,
+              'Series B', 'series b', 'LOCAL_CONFIRMED', 1, NULL),
+             ('progress-episode-b1', 'progress-lib', 'EPISODE', NULL, 'progress-series-b',
+              1, 1, 'Episode B1', 'episode b1', 'LOCAL_CONFIRMED', 1, ?),
+             ('progress-episode-b2', 'progress-lib', 'EPISODE', NULL, 'progress-series-b',
+              1, 2, 'Episode B2', 'episode b2', 'LOCAL_CONFIRMED', 1, ?)",
+    )
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .bind(PLAYBACK_PROGRESS_RUNTIME_TICKS)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES
+             (?, 'progress-episode-1', 0, 1, 1, 10),
+             (?, 'progress-episode-2', 1800000000, 0, 0, 20),
+             (?, 'progress-episode-b1', 0, 1, 1, 40),
+             (?, 'progress-episode-b2', 0, 0, 0, 50)",
+    )
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    assert_eq!(database.rebuild_user_series_next().await?, 2);
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "INSERT".to_owned()],
+        "the first rebuild inserts one pointer per series"
+    );
+    let rowid = resume_pointer_rowid(&database, &user_id, "progress-series-b").await?;
+    let stamp = resume_pointer_updated_at(&database, &user_id, "progress-series-b").await?;
+
+    // The rebuild recomputes every pointer, but must only write the ones whose value changed.
+    assert_eq!(
+        database.rebuild_user_series_next().await?,
+        0,
+        "a rebuild without state changes writes nothing"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec!["INSERT".to_owned(), "INSERT".to_owned()],
+        "an unchanged rebuild must not delete and reinsert the pointers"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series-b").await?,
+        rowid,
+        "an unchanged rebuild keeps the row identity"
+    );
+    assert_eq!(
+        resume_pointer_updated_at(&database, &user_id, "progress-series-b").await?,
+        stamp,
+        "an unchanged rebuild must not restamp the row"
+    );
+
+    // Watching the last episode of series A drops its pointer and leaves the other series alone.
+    sqlx::query(
+        "UPDATE user_item_state SET is_played = 1, position_ticks = 0
+         WHERE user_id = ? AND item_id = 'progress-episode-2'",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "INSERT INTO user_item_state (
+             user_id, item_id, position_ticks, is_played, play_count, last_played_at
+         ) VALUES (?, 'progress-episode-3', 0, 1, 1, 30)",
+    )
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    assert_eq!(database.rebuild_user_series_next().await?, 0);
+    assert!(
+        progress_pointer(&database, &user_id).await?.is_none(),
+        "a finished series has no next pointer"
+    );
+    assert_eq!(
+        progress_pointer_log(&database).await?,
+        vec![
+            "INSERT".to_owned(),
+            "INSERT".to_owned(),
+            "DELETE".to_owned()
+        ],
+        "the rebuild deletes only the pointer whose series has no next episode"
+    );
+    assert_eq!(
+        resume_pointer_rowid(&database, &user_id, "progress-series-b").await?,
+        rowid,
+        "the untouched series keeps its pointer row"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn playback_event_renews_the_admission_in_its_own_transaction()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    let now: i64 = sqlx::query_scalar("SELECT unixepoch()")
+        .fetch_one(database.pool())
+        .await?;
+    database
+        .reserve_playback_admission(&user_id, "progress-admission-session", now)
+        .await?
+        .expect("user exists");
+    let stale_stamp = now.saturating_sub(40);
+    sqlx::query(
+        "UPDATE playback_admissions SET admitted_at = ?, last_seen_at = ?
+         WHERE user_id = ? AND play_session_id = 'progress-admission-session'",
+    )
+    .bind(stale_stamp.saturating_sub(10))
+    .bind(stale_stamp)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+
+    let mut event = playback_progress_event(
+        &user_id,
+        "progress-episode-1",
+        "progress-admission-session",
+        "PLAYING",
+        1_000_000_000,
+        None,
+    );
+    event.renew_admission = false;
+    database.record_playback_event(event).await?;
+    assert_eq!(
+        progress_admission_stamp(&database, &user_id).await?,
+        stale_stamp,
+        "a plain tick that does not renew leaves the admission untouched"
+    );
+
+    let mut event = playback_progress_event(
+        &user_id,
+        "progress-episode-1",
+        "progress-admission-session",
+        "PLAYING",
+        1_200_000_000,
+        Some(("PLAYING", 1_000_000_000)),
+    );
+    event.renew_admission = true;
+    database.record_playback_event(event).await?;
+    assert!(
+        progress_admission_stamp(&database, &user_id).await? > stale_stamp,
+        "a renewing event advances the admission stamp"
+    );
+
+    // The renewal has to commit or roll back with the session and item-state writes: if the item
+    // state write fails, the admission must stay at its old stamp.
+    sqlx::query(
+        "UPDATE playback_admissions SET last_seen_at = ?
+         WHERE user_id = ? AND play_session_id = 'progress-admission-session'",
+    )
+    .bind(stale_stamp)
+    .bind(&user_id)
+    .execute(database.pool())
+    .await?;
+    sqlx::query(
+        "CREATE TRIGGER progress_fail_item_state BEFORE INSERT ON user_item_state
+         BEGIN SELECT RAISE(ABORT, 'progress item state failure'); END",
+    )
+    .execute(database.pool())
+    .await?;
+    let mut event = playback_progress_event(
+        &user_id,
+        "progress-episode-2",
+        "progress-admission-session",
+        "PLAYING",
+        1_000_000_000,
+        None,
+    );
+    event.renew_admission = true;
+    assert!(
+        database.record_playback_event(event).await.is_err(),
+        "the aborted item-state write fails the event"
+    );
+    assert_eq!(
+        progress_admission_stamp(&database, &user_id).await?,
+        stale_stamp,
+        "the admission renewal rolls back with the rest of the event"
+    );
+    Ok(())
+}
+
+async fn progress_admission_stamp(
+    database: &Database,
+    user_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_scalar(
+        "SELECT last_seen_at FROM playback_admissions
+         WHERE user_id = ? AND play_session_id = 'progress-admission-session'",
+    )
+    .bind(user_id)
+    .fetch_one(database.pool())
+    .await?)
+}
+
+async fn progress_container_states(
+    database: &Database,
+    user_id: &str,
+) -> Result<Vec<(String, i64)>, Box<dyn std::error::Error>> {
+    Ok(sqlx::query_as(
+        "SELECT item_id, is_played FROM user_item_state
+         WHERE user_id = ? AND item_id IN ('progress-season', 'progress-series')
+         ORDER BY item_id",
+    )
+    .bind(user_id)
+    .fetch_all(database.pool())
+    .await?)
+}
+
+async fn progress_continue_watching_ids(
+    database: &Database,
+    user_id: &str,
+    minimum_ticks: i64,
+) -> Result<Vec<String>, Box<dyn std::error::Error>> {
+    let library_ids = ["progress-lib".to_owned()];
+    let (ids, _) = database
+        .list_resume_pointer_ids(&ResumePointerQuery {
+            user_id,
+            library_ids: &library_ids,
+            item_types: &["EPISODE"],
+            content_restrictions: None,
+            played_percent: 95,
+            minimum_ticks,
+            offset: 0,
+            limit: 10,
+        })
+        .await?;
+    Ok(ids)
+}
+
+#[tokio::test]
+async fn first_watch_enters_continue_watching_when_the_position_crosses_the_resume_threshold()
+-> Result<(), Box<dyn std::error::Error>> {
+    let (_temp, database, user_id) = playback_progress_fixture().await?;
+    let (_, minimum_ticks) = database.home_resume_settings(&user_id).await?;
+    assert!(
+        minimum_ticks > 0 && minimum_ticks < PLAYBACK_PROGRESS_RUNTIME_TICKS,
+        "the fixture runtime must straddle the default resume threshold"
+    );
+    let below_threshold = minimum_ticks / 2;
+    let above_threshold = minimum_ticks + minimum_ticks / 4;
+
+    // First watch of a series with nothing completed yet: the start event reports position 0, so
+    // the candidate set is empty and no pointer row exists.
+    database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            0,
+            None,
+        ))
+        .await?;
+    assert!(progress_pointer(&database, &user_id).await?.is_none());
+    assert!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks)
+            .await?
+            .is_empty()
+    );
+
+    // Ticks below the threshold must not touch the pointer: the episode is not resumable yet.
+    let pointer_writes = progress_pointer_log(&database).await?;
+    database.reset_query_count();
+    let below = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            below_threshold,
+            Some(("PLAYING", 0)),
+        ))
+        .await?;
+    assert!(below.container_scope.is_none());
+    assert_eq!(
+        database.query_count(),
+        3,
+        "a tick that stays below the threshold resolves the threshold and writes no pointer"
+    );
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+
+    let still_below = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            below_threshold + 1,
+            Some(("PLAYING", below_threshold)),
+        ))
+        .await?;
+    assert!(still_below.container_scope.is_none());
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+    assert!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks)
+            .await?
+            .is_empty()
+    );
+
+    // The tick that crosses the threshold is what makes the episode resumable.
+    database.reset_query_count();
+    let crossing = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            above_threshold,
+            Some(("PLAYING", below_threshold + 1)),
+        ))
+        .await?;
+    assert!(
+        crossing.container_scope.is_some(),
+        "crossing the resume threshold refreshes the pointer"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-1".to_owned(), above_threshold)),
+        "the watched episode becomes its own resume pointer"
+    );
+    assert_eq!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks).await?,
+        vec!["progress-episode-1".to_owned()]
+    );
+
+    // Ticks that stay above the threshold are plain ticks again.
+    let pointer_writes = progress_pointer_log(&database).await?;
+    let above = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            above_threshold + 1,
+            Some(("PLAYING", above_threshold)),
+        ))
+        .await?;
+    assert!(above.container_scope.is_none());
+    assert_eq!(progress_pointer_log(&database).await?, pointer_writes);
+
+    // A report that goes back below the threshold refreshes the pointer in the other direction
+    // too. Inside one session the stored position is monotonic (the upsert keeps the maximum), so
+    // the pointer itself keeps pointing at the episode; the refresh is what used to happen on
+    // every tick and it stays a no-op here instead of drifting.
+    let backwards = database
+        .record_playback_event(playback_progress_event(
+            &user_id,
+            "progress-episode-1",
+            "progress-first-watch",
+            "PLAYING",
+            below_threshold,
+            Some(("PLAYING", above_threshold + 1)),
+        ))
+        .await?;
+    assert!(
+        backwards.container_scope.is_some(),
+        "crossing back below the threshold refreshes the pointer"
+    );
+    assert_eq!(
+        progress_pointer(&database, &user_id).await?,
+        Some(("progress-episode-1".to_owned(), above_threshold + 1)),
+        "the pointer follows the stored position, which one session never lowers"
+    );
+    assert_eq!(
+        progress_continue_watching_ids(&database, &user_id, minimum_ticks).await?,
+        vec!["progress-episode-1".to_owned()]
+    );
+    Ok(())
+}
+
+#[test]
+fn sqlite_synchronous_setting_defaults_to_full_and_parses_overrides() {
+    use super::{SqliteSynchronous, parse_sqlite_synchronous_request};
+
+    let unset = parse_sqlite_synchronous_request(None);
+    assert_eq!(
+        unset.synchronous,
+        SqliteSynchronous::Full,
+        "the default must stay FULL until the owner accepts the NAS A/B result"
+    );
+    assert!(unset.rejected.is_none());
+
+    for blank in ["", "   "] {
+        let parsed = parse_sqlite_synchronous_request(Some(blank));
+        assert_eq!(parsed.synchronous, SqliteSynchronous::Full);
+        assert!(
+            parsed.rejected.is_none(),
+            "blank input means unset, not invalid"
+        );
+    }
+
+    for normal in ["normal", "NORMAL", " Normal "] {
+        let parsed = parse_sqlite_synchronous_request(Some(normal));
+        assert_eq!(parsed.synchronous, SqliteSynchronous::Normal);
+        assert!(parsed.rejected.is_none());
+    }
+
+    for full in ["full", "FULL", " full "] {
+        let parsed = parse_sqlite_synchronous_request(Some(full));
+        assert_eq!(parsed.synchronous, SqliteSynchronous::Full);
+        assert!(parsed.rejected.is_none());
+    }
+
+    let invalid = parse_sqlite_synchronous_request(Some(" fastish "));
+    assert_eq!(
+        invalid.synchronous,
+        SqliteSynchronous::Full,
+        "an unparseable value falls back to FULL"
+    );
+    assert_eq!(invalid.rejected.as_deref(), Some("fastish"));
+}
+
+#[tokio::test]
+async fn sqlite_synchronous_level_reaches_the_connection_pragma()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::{DatabaseConfiguration, SqliteSynchronous};
+    use crate::config::Config;
+
+    // SQLite's numeric `synchronous` levels: 1 = NORMAL, 2 = FULL.
+    for (level, expected) in [
+        (SqliteSynchronous::Full, 2_i64),
+        (SqliteSynchronous::Normal, 1_i64),
+    ] {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect_with_sqlite_synchronous(
+            &Config {
+                http_addr: "127.0.0.1:8097".parse()?,
+                config_dir: temp_dir.path().join("config"),
+            },
+            &DatabaseConfiguration::Sqlite,
+            level,
+        )
+        .await?;
+        let applied: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(
+            applied, expected,
+            "every pooled connection must apply the configured synchronous level"
+        );
+        // The synchronous pragma shares one script with the other connection pragmas, so the
+        // neighbours prove the configured string still runs as a whole.
+        let foreign_keys: i64 = sqlx::query_scalar("PRAGMA foreign_keys")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(foreign_keys, 1, "foreign keys stay enabled");
+        let journal_mode: String = sqlx::query_scalar("PRAGMA journal_mode")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(journal_mode.to_ascii_lowercase(), "wal");
+        let busy_timeout: i64 = sqlx::query_scalar("PRAGMA busy_timeout")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(
+            busy_timeout, 5000,
+            "the busy timeout survives the new pragma"
+        );
+    }
+    Ok(())
 }

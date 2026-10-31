@@ -18,7 +18,7 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
     headers: HeaderMap,
     Path((user_id, item_id)): Path<(String, String)>,
     Query(query): Query<ResumeVisibilityQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let auth_principal =
@@ -51,13 +51,22 @@ pub(in crate::api::legacy) async fn emby_hide_from_resume(
         (Some(hidden), _) | (_, Some(hidden)) => hidden,
         (None, None) => return StatusCode::BAD_REQUEST.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = state.catalog();
     let item_id = emby_internal_id(&item_id);
+    // Publish with the canonical user id: the path segment is a public Emby id
+    // and must not be used as the SSE routing key.
+    let notification_user_id = principal.user_id.map(|user_id| user_id.to_string());
     match catalog.set_resume_hidden(principal, &item_id, hidden).await {
         Ok(user_state) => {
-            state.user_events.publish_home_coalesced().await;
+            // Hiding an item from resume changes only this user's continue-watching rail.
+            if let Some(user_id) = notification_user_id.as_deref() {
+                state.home().invalidate_user(user_id);
+            }
+            match notification_user_id {
+                Some(user_id) => state.user_events.publish_home_coalesced_for(&user_id).await,
+                // No user to attribute the change to; keep the old broadcast.
+                None => state.user_events.publish_home_coalesced().await,
+            }
             Json(emby_user_item_data_json(&item_id, user_state.as_ref())).into_response()
         }
         Err(CatalogError::LibraryNotFound | CatalogError::AccessDenied) => {

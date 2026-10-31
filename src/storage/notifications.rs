@@ -1,54 +1,78 @@
-use super::*;
+//! Notification storage domain: webhook destinations, notification events and the delivery queue.
+//!
+//! The methods live on [`NotificationsRepo`] rather than on `Database` so the whole notification
+//! surface is reachable only through [`Database::notifications`]. Keep this module free of other
+//! domains' helpers: it is the pilot for splitting `Database` by domain.
+
+use super::{
+    Database, MAX_BACKGROUND_PAGE_SIZE, NewNotificationDestination, NewNotificationEvent,
+    StorageError, StoredNotificationDelivery, StoredNotificationDestination,
+    UpdateNotificationDestination, database_flag, stored_notification_delivery,
+    stored_notification_destination,
+};
+use uuid::Uuid;
 
 // Three bind parameters per delivery keep each statement below SQLite's conservative limit.
 const MAX_NOTIFICATION_DELIVERY_INSERT_BATCH_SIZE: usize = 100;
 
+/// Borrowed view of the notification tables.
+///
+/// The repo holds a shared borrow of `Database` and issues statements through the same helpers as
+/// every other storage domain, so it cannot outlive the pool owner and needs no cloning.
+pub(crate) struct NotificationsRepo<'a> {
+    db: &'a Database,
+}
+
 impl Database {
+    /// Borrows the notification storage domain.
+    pub(crate) fn notifications(&self) -> NotificationsRepo<'_> {
+        NotificationsRepo { db: self }
+    }
+}
+
+impl NotificationsRepo<'_> {
     pub(crate) async fn create_notification_destination(
         &self,
         destination: NewNotificationDestination<'_>,
     ) -> Result<(), StorageError> {
-        self.query(
-            "INSERT INTO notification_destinations (
+        self.db
+            .query(
+                "INSERT INTO notification_destinations (
                 id, name, url, enabled, allow_private_network, event_types_json, payload_format,
                 provider_plugin_id, provider_config_json
              ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        )
-        .bind(destination.id)
-        .bind(destination.name)
-        .bind(destination.url)
-        .bind(database_flag(destination.enabled))
-        .bind(database_flag(destination.allow_private_network))
-        .bind(destination.event_types_json)
-        .bind(destination.payload_format)
-        .bind(destination.provider_plugin_id)
-        .bind(destination.provider_config_json)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(destination.id)
+            .bind(destination.name)
+            .bind(destination.url)
+            .bind(database_flag(destination.enabled))
+            .bind(database_flag(destination.allow_private_network))
+            .bind(destination.event_types_json)
+            .bind(destination.payload_format)
+            .bind(destination.provider_plugin_id)
+            .bind(destination.provider_config_json)
+            .execute(&self.db.pool)
+            .await
+            .map(|_| ())
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn find_notification_destination(
         &self,
         id: &str,
     ) -> Result<Option<StoredNotificationDestination>, StorageError> {
-        self.query(
+        self.db.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
                     provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations WHERE id = ?",
         )
         .bind(id)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&self.db.pool)
         .await
-        .map(|row| row.map(stored_notification_destination))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.db.sqlx_err())?
+        .map(stored_notification_destination)
+        .transpose()
+        .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn list_notification_destinations(
@@ -56,7 +80,7 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
-        self.query(
+        self.db.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
                     provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations
@@ -64,40 +88,32 @@ impl Database {
         )
         .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
         .bind(offset.max(0))
-        .fetch_all(&self.pool)
+        .fetch_all(&self.db.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_notification_destination)
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.db.sqlx_err())?
+        .into_iter()
+        .map(stored_notification_destination)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn list_enabled_notification_destinations(
         &self,
     ) -> Result<Vec<StoredNotificationDestination>, StorageError> {
-        self.query(
+        self.db.query(
             "SELECT id, name, url, enabled, allow_private_network, event_types_json, payload_format,
                     provider_plugin_id, provider_config_json, created_at, updated_at
              FROM notification_destinations
              WHERE enabled = 1
              ORDER BY id LIMIT 1000",
         )
-        .fetch_all(&self.pool)
+        .fetch_all(&self.db.pool)
         .await
-        .map(|rows| {
-            rows.into_iter()
-                .map(stored_notification_destination)
-                .collect()
-        })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.db.sqlx_err())?
+        .into_iter()
+        .map(stored_notification_destination)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn update_notification_destination(
@@ -105,8 +121,9 @@ impl Database {
         id: &str,
         update: UpdateNotificationDestination<'_>,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE notification_destinations
+        self.db
+            .query(
+                "UPDATE notification_destinations
              SET name = COALESCE(?, name),
                  url = COALESCE(?, url),
                  enabled = COALESCE(?, enabled),
@@ -117,38 +134,33 @@ impl Database {
                  provider_config_json = COALESCE(?, provider_config_json),
                  updated_at = unixepoch()
              WHERE id = ?",
-        )
-        .bind(update.name)
-        .bind(update.url)
-        .bind(update.enabled.map(database_flag))
-        .bind(update.allow_private_network.map(database_flag))
-        .bind(update.event_types_json)
-        .bind(update.payload_format)
-        .bind(update.provider_plugin_id)
-        .bind(update.provider_config_json)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(update.name)
+            .bind(update.url)
+            .bind(update.enabled.map(database_flag))
+            .bind(update.allow_private_network.map(database_flag))
+            .bind(update.event_types_json)
+            .bind(update.payload_format)
+            .bind(update.provider_plugin_id)
+            .bind(update.provider_config_json)
+            .bind(id)
+            .execute(&self.db.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn delete_notification_destination(
         &self,
         id: &str,
     ) -> Result<bool, StorageError> {
-        self.query("DELETE FROM notification_destinations WHERE id = ?")
+        self.db
+            .query("DELETE FROM notification_destinations WHERE id = ?")
             .bind(id)
-            .execute(&self.pool)
+            .execute(&self.db.pool)
             .await
             .map(|result| result.rows_affected() == 1)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn insert_notification_event_with_deliveries(
@@ -156,15 +168,9 @@ impl Database {
         event: NewNotificationEvent<'_>,
         destination_ids: &[String],
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.db.pool.begin().await.map_err(self.db.sqlx_err())?;
         let inserted = self
+            .db
             .query(
                 "INSERT INTO notification_events (
                     id, event_type, schema_version, occurred_at, dedupe_key, payload_json
@@ -180,10 +186,7 @@ impl Database {
             .execute(&mut *transaction)
             .await
             .map(|result| result.rows_affected() == 1)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.db.sqlx_err())?;
         if inserted {
             for batch in destination_ids.chunks(MAX_NOTIFICATION_DELIVERY_INSERT_BATCH_SIZE) {
                 let mut sql = String::from(
@@ -199,7 +202,7 @@ impl Database {
                 sql.push_str(&values);
                 sql.push_str(" ON CONFLICT(event_id, destination_id) DO NOTHING");
 
-                let mut statement = self.query(sqlx::AssertSqlSafe(sql));
+                let mut statement = self.db.query(sqlx::AssertSqlSafe(sql));
                 for destination_id in batch {
                     statement = statement
                         .bind(Uuid::now_v7().to_string())
@@ -209,19 +212,10 @@ impl Database {
                 statement
                     .execute(&mut *transaction)
                     .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                    .map_err(self.db.sqlx_err())?;
             }
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.db.sqlx_err())?;
         Ok(inserted)
     }
 
@@ -229,8 +223,9 @@ impl Database {
         &self,
         limit: i64,
     ) -> Result<Vec<StoredNotificationDelivery>, StorageError> {
-        self.query(
-            "SELECT d.id, d.event_id, d.destination_id, d.status, d.attempt_count,
+        self.db
+            .query(
+                "SELECT d.id, d.event_id, d.destination_id, d.status, d.attempt_count,
                     d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
                     d.delivered_at, d.created_at, d.updated_at,
                     e.event_type, e.schema_version, e.occurred_at, e.payload_json,
@@ -245,15 +240,15 @@ impl Database {
                     OR (d.status = 'RUNNING' AND d.claimed_until <= unixepoch()))
              ORDER BY d.next_attempt_at, d.created_at, d.id
              LIMIT ?",
-        )
-        .bind(limit.clamp(1, 100))
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(limit.clamp(1, 100))
+            .fetch_all(&self.db.pool)
+            .await
+            .map_err(self.db.sqlx_err())?
+            .into_iter()
+            .map(stored_notification_delivery)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.db.sqlx_err())
     }
 
     /// Deletes one bounded batch of delivered/failed delivery rows and then
@@ -265,6 +260,7 @@ impl Database {
         batch_limit: i64,
     ) -> Result<(u64, u64), StorageError> {
         let deliveries = self
+            .db
             .query(
                 "DELETE FROM notification_deliveries
                  WHERE id IN (
@@ -277,14 +273,12 @@ impl Database {
             )
             .bind(cutoff)
             .bind(batch_limit.clamp(1, 2_000))
-            .execute(&self.pool)
+            .execute(&self.db.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.db.sqlx_err())?
             .rows_affected();
         let events = self
+            .db
             .query(
                 "DELETE FROM notification_events
                  WHERE id IN (
@@ -300,12 +294,9 @@ impl Database {
             )
             .bind(cutoff)
             .bind(batch_limit.clamp(1, 2_000))
-            .execute(&self.pool)
+            .execute(&self.db.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.db.sqlx_err())?
             .rows_affected();
         Ok((deliveries, events))
     }
@@ -315,8 +306,9 @@ impl Database {
         offset: i64,
         limit: i64,
     ) -> Result<Vec<StoredNotificationDelivery>, StorageError> {
-        self.query(
-            "SELECT d.id, d.event_id, d.destination_id, d.status, d.attempt_count,
+        self.db
+            .query(
+                "SELECT d.id, d.event_id, d.destination_id, d.status, d.attempt_count,
                     d.next_attempt_at, d.claimed_until, d.last_http_status, d.last_error,
                     d.delivered_at, d.created_at, d.updated_at,
                     e.event_type, e.schema_version, e.occurred_at, e.payload_json,
@@ -327,16 +319,16 @@ impl Database {
              JOIN notification_destinations n ON n.id = d.destination_id
              ORDER BY d.created_at DESC, d.id DESC
              LIMIT ? OFFSET ?",
-        )
-        .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
-        .bind(offset.max(0))
-        .fetch_all(&self.pool)
-        .await
-        .map(|rows| rows.into_iter().map(stored_notification_delivery).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(limit.clamp(1, MAX_BACKGROUND_PAGE_SIZE))
+            .bind(offset.max(0))
+            .fetch_all(&self.db.pool)
+            .await
+            .map_err(self.db.sqlx_err())?
+            .into_iter()
+            .map(stored_notification_delivery)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn claim_notification_delivery(
@@ -344,8 +336,9 @@ impl Database {
         id: &str,
         lease_seconds: i64,
     ) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE notification_deliveries
+        self.db
+            .query(
+                "UPDATE notification_deliveries
              SET status = 'RUNNING',
                  attempt_count = attempt_count + 1,
                  claimed_until = unixepoch() + ?,
@@ -354,16 +347,13 @@ impl Database {
                  status = 'PENDING'
                  OR (status = 'RUNNING' AND claimed_until <= unixepoch())
              )",
-        )
-        .bind(lease_seconds.max(1))
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(lease_seconds.max(1))
+            .bind(id)
+            .execute(&self.db.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn mark_notification_delivered(
@@ -371,21 +361,19 @@ impl Database {
         id: &str,
         http_status: i64,
     ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE notification_deliveries
+        self.db
+            .query(
+                "UPDATE notification_deliveries
              SET status = 'DELIVERED', claimed_until = NULL, last_http_status = ?,
                  last_error = NULL, delivered_at = unixepoch(), updated_at = unixepoch()
              WHERE id = ?",
-        )
-        .bind(http_status)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(http_status)
+            .bind(id)
+            .execute(&self.db.pool)
+            .await
+            .map(|_| ())
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn mark_notification_retry(
@@ -396,40 +384,36 @@ impl Database {
         error: &str,
         next_attempt_at: i64,
     ) -> Result<(), StorageError> {
-        self.query(
-            "UPDATE notification_deliveries
+        self.db
+            .query(
+                "UPDATE notification_deliveries
              SET status = ?, claimed_until = NULL, last_http_status = ?, last_error = ?,
                  next_attempt_at = ?, updated_at = unixepoch()
              WHERE id = ?",
-        )
-        .bind(status)
-        .bind(http_status)
-        .bind(error)
-        .bind(next_attempt_at)
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(status)
+            .bind(http_status)
+            .bind(error)
+            .bind(next_attempt_at)
+            .bind(id)
+            .execute(&self.db.pool)
+            .await
+            .map(|_| ())
+            .map_err(self.db.sqlx_err())
     }
 
     pub(crate) async fn retry_notification_delivery(&self, id: &str) -> Result<bool, StorageError> {
-        self.query(
-            "UPDATE notification_deliveries
+        self.db
+            .query(
+                "UPDATE notification_deliveries
              SET status = 'PENDING', next_attempt_at = unixepoch(), claimed_until = NULL,
                  last_error = NULL, updated_at = unixepoch()
              WHERE id = ? AND status IN ('FAILED', 'DELIVERED')",
-        )
-        .bind(id)
-        .execute(&self.pool)
-        .await
-        .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+            )
+            .bind(id)
+            .execute(&self.db.pool)
+            .await
+            .map(|result| result.rows_affected() == 1)
+            .map_err(self.db.sqlx_err())
     }
 }

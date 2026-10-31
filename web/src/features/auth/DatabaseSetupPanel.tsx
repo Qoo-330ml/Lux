@@ -5,6 +5,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { DatabaseSetupInput, SetupDatabaseBackend } from "../../lib/api/types";
 import { LuxLogo } from "../../components/LuxLogo";
 import { LuxSelect } from "../../components/LuxSelect";
+import { LuxButton, LuxRadio, LuxTextField } from "../../components/ui";
 
 type DatabaseSetupPanelProps = {
   onSelected: (restartRequired: boolean) => void;
@@ -72,20 +73,20 @@ export function DatabaseSetupPanel({ onSelected }: DatabaseSetupPanelProps) {
       <p>选择 Lux 保存用户、媒体索引、播放进度和后台任务的位置。安装后不能直接切换数据库。</p>
       <fieldset className="lux-setup-database-options">
         <legend>数据库后端</legend>
-        <label><input type="radio" name="database-backend" checked={backend === "SQLITE"} onChange={() => { setBackend("SQLITE"); setTested(false); }} /> 内置 SQLite <small>适合单个 NAS 实例，无需额外服务。</small></label>
-        <label><input type="radio" name="database-backend" checked={backend === "POSTGRESQL"} onChange={() => { setBackend("POSTGRESQL"); setTested(false); }} /> 外部 PostgreSQL <small>需要提前准备可访问的 PostgreSQL 数据库。</small></label>
+        <LuxRadio name="database-backend" checked={backend === "SQLITE"} onChange={() => { setBackend("SQLITE"); setTested(false); }} label={<>内置 SQLite <small>适合单个 NAS 实例，无需额外服务。</small></>} />
+        <LuxRadio name="database-backend" checked={backend === "POSTGRESQL"} onChange={() => { setBackend("POSTGRESQL"); setTested(false); }} label={<>外部 PostgreSQL <small>需要提前准备可访问的 PostgreSQL 数据库。</small></>} />
       </fieldset>
       {backend === "POSTGRESQL" ? <div className="lux-setup-optional lux-setup-postgres-fields">
-        <label htmlFor="setup-pg-host">主机<input id="setup-pg-host" value={postgres.host} onChange={(event) => updatePostgres("host", event.target.value)} required /></label>
-        <label htmlFor="setup-pg-port">端口<input id="setup-pg-port" value={postgres.port} onChange={(event) => updatePostgres("port", event.target.value)} inputMode="numeric" required /></label>
-        <label htmlFor="setup-pg-database">数据库名<input id="setup-pg-database" value={postgres.database} onChange={(event) => updatePostgres("database", event.target.value)} required /></label>
-        <label htmlFor="setup-pg-username">用户名<input id="setup-pg-username" value={postgres.username} onChange={(event) => updatePostgres("username", event.target.value)} required /></label>
-        <label htmlFor="setup-pg-password">密码<input id="setup-pg-password" value={postgres.password} onChange={(event) => updatePostgres("password", event.target.value)} type="password" autoComplete="new-password" /></label>
+        <label htmlFor="setup-pg-host">主机<LuxTextField id="setup-pg-host" value={postgres.host} onChange={(event) => updatePostgres("host", event.target.value)} required /></label>
+        <label htmlFor="setup-pg-port">端口<LuxTextField id="setup-pg-port" value={postgres.port} onChange={(event) => updatePostgres("port", event.target.value)} inputMode="numeric" required /></label>
+        <label htmlFor="setup-pg-database">数据库名<LuxTextField id="setup-pg-database" value={postgres.database} onChange={(event) => updatePostgres("database", event.target.value)} required /></label>
+        <label htmlFor="setup-pg-username">用户名<LuxTextField id="setup-pg-username" value={postgres.username} onChange={(event) => updatePostgres("username", event.target.value)} required /></label>
+        <label htmlFor="setup-pg-password">密码<LuxTextField id="setup-pg-password" value={postgres.password} onChange={(event) => updatePostgres("password", event.target.value)} type="password" autoComplete="new-password" /></label>
         <label htmlFor="setup-pg-ssl">SSL 模式<LuxSelect id="setup-pg-ssl" value={postgres.sslMode} options={sslModes.map(([value, label]) => ({ value, label }))} onChange={(value) => updatePostgres("sslMode", value as typeof postgres.sslMode)} aria-label="SSL 模式" /></label>
       </div> : null}
       <div className="lux-setup-database-actions">
-        <button className="lux-button lux-button-secondary" type="button" onClick={() => test.mutate()} disabled={test.isPending || select.isPending}>{test.isPending ? "正在测试…" : "测试连接"}</button>
-        <button className="lux-button lux-button-primary" type="button" onClick={() => select.mutate()} disabled={!tested || select.isPending}>{select.isPending ? "正在保存…" : "使用此数据库"}</button>
+        <LuxButton tone="secondary" type="button" onClick={() => test.mutate()} disabled={test.isPending || select.isPending}>{test.isPending ? "正在测试…" : "测试连接"}</LuxButton>
+        <LuxButton tone="primary" type="button" onClick={() => select.mutate()} disabled={!tested || select.isPending}>{select.isPending ? "正在保存…" : "使用此数据库"}</LuxButton>
       </div>
       {test.isSuccess ? <p className="lux-success-copy" role="status">连接测试成功，可以继续。</p> : null}
       {test.error ? <p className="lux-error-copy" role="alert">{test.error.message}</p> : null}

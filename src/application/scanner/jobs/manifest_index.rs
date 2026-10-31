@@ -1364,6 +1364,31 @@ impl ScanJobService {
             )
             .into());
         }
+        self.database
+            .project_scan_manifest_symlink_origin(manifest_id)
+            .await?;
+        let origins = self
+            .symlink_origins
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.remove(&job.id))
+            .map(|entries| {
+                entries
+                    .into_iter()
+                    .map(|((device, inode), (relative_path, resolved_path))| {
+                        (device, inode, relative_path, resolved_path)
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        if !origins.is_empty() {
+            self.database
+                .mark_filesystem_entry_symlink_origins(&origins)
+                .await?;
+        }
+        if let Ok(mut registry) = self.visited_directories.lock() {
+            registry.remove(&job.id);
+        }
         let roots = self.database.list_library_roots(&job.library_id).await?;
         for root in roots {
             self.database

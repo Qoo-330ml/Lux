@@ -8,6 +8,7 @@ import { queryKeys } from "../../lib/api/query-keys";
 import type { LuxUser, PersonDetail } from "../../lib/api/types";
 import { MediaCard } from "../home/media";
 import { LibraryGrid } from "../library/LibraryGrid";
+import { LuxButton, LuxTextField, LuxTextarea } from "../../components/ui";
 
 type PersonDetailPageProps = { user?: LuxUser };
 
@@ -60,7 +61,7 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
     return <section className="lux-page-state" aria-busy="true"><p>正在加载人物详情…</p></section>;
   }
   if (person.error) {
-    return <section className="lux-page-state" role="alert"><h1>人物详情加载失败</h1><p>{person.error.message}</p><button className="lux-button lux-button-secondary" type="button" onClick={() => navigate(-1)}>返回</button></section>;
+    return <section className="lux-page-state" role="alert"><h1>人物详情加载失败</h1><p>{person.error.message}</p><LuxButton tone="secondary" type="button" onClick={() => navigate(-1)}>返回</LuxButton></section>;
   }
 
   const detail = person.data;
@@ -149,12 +150,12 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
         <div className="lux-person-detail-copy">
           <p className="lux-eyebrow">人物资料</p>
           <div className="lux-person-title-row">
-            {editing && draft ? <input id="person-name" className="lux-person-title-input" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} aria-label="人物姓名" /> : <h1>{detail.name}</h1>}
-            <button className="lux-button lux-button-secondary" type="button" aria-label={detail.isFavorite ? "取消收藏演员" : "收藏演员"} aria-pressed={Boolean(detail.isFavorite)} onClick={() => void toggleFavorite()} disabled={favoriteSaving}>
+            {editing && draft ? <LuxTextField id="person-name" className="lux-person-title-input" value={draft.name} onChange={(event) => setDraft({ ...draft, name: event.target.value })} aria-label="人物姓名" /> : <h1>{detail.name}</h1>}
+            <LuxButton tone="secondary" type="button" aria-label={detail.isFavorite ? "取消收藏演员" : "收藏演员"} aria-pressed={Boolean(detail.isFavorite)} onClick={() => void toggleFavorite()} disabled={favoriteSaving}>
               <Heart size={16} fill={detail.isFavorite ? "currentColor" : "none"} /> {favoriteSaving ? "保存中…" : detail.isFavorite ? "已收藏" : "收藏演员"}
-            </button>
-            {canEdit && !editing ? <button className="lux-button lux-button-secondary lux-person-edit-button" type="button" aria-label="编辑人物资料" onClick={startEditing}>编辑资料</button> : null}
-            {canEdit && editing ? <div className="lux-person-edit-actions"><button className="lux-button lux-button-primary" type="submit" form="person-editor" aria-label="保存人物资料" disabled={saving}>{saving ? "保存中…" : "保存"}</button><button className="lux-button lux-button-secondary" type="button" onClick={cancelEditing} disabled={saving}>取消</button></div> : null}
+            </LuxButton>
+            {canEdit && !editing ? <LuxButton tone="secondary" className="lux-person-edit-button" type="button" aria-label="编辑人物资料" onClick={startEditing}>编辑资料</LuxButton> : null}
+            {canEdit && editing ? <div className="lux-person-edit-actions"><LuxButton tone="primary" type="submit" form="person-editor" aria-label="保存人物资料" disabled={saving}>{saving ? "保存中…" : "保存"}</LuxButton><LuxButton tone="secondary" type="button" onClick={cancelEditing} disabled={saving}>取消</LuxButton></div> : null}
           </div>
           {favoriteError ? <p className="lux-error-copy" role="alert">{favoriteError}</p> : null}
           {detail.character ? <p className="lux-person-detail-role">饰演：{detail.character}</p> : null}
@@ -196,7 +197,7 @@ export function PersonDetailPage({ user }: PersonDetailPageProps) {
             <LibraryGrid items={workItems} renderItem={(item) => <MediaCard item={item} key={item.id} />} />
           </div>
         ) : null}
-        {works.hasNextPage ? <div className="lux-person-works-actions"><button className="lux-button lux-button-secondary" type="button" onClick={() => void works.fetchNextPage()} disabled={works.isFetchingNextPage}>{works.isFetchingNextPage ? "加载中…" : "加载更多"}</button></div> : null}
+        {works.hasNextPage ? <div className="lux-person-works-actions"><LuxButton tone="secondary" type="button" onClick={() => void works.fetchNextPage()} disabled={works.isFetchingNextPage}>{works.isFetchingNextPage ? "加载中…" : "加载更多"}</LuxButton></div> : null}
       </section>
     </article>
   );
@@ -216,7 +217,7 @@ function PersonEditor({
   const field = (key: keyof PersonDraft, label: string, multiline = false) => (
     <label className="lux-person-editor-field" htmlFor={`person-${key}`}>
       <span>{label}</span>
-      {multiline ? <textarea id={`person-${key}`} value={draft[key]} rows={3} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /> : <input id={`person-${key}`} value={draft[key]} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} />}
+      {multiline ? <LuxTextarea id={`person-${key}`} value={draft[key]} rows={3} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} /> : <LuxTextField id={`person-${key}`} value={draft[key]} onChange={(event) => setDraft({ ...draft, [key]: event.target.value })} />}
     </label>
   );
   return (

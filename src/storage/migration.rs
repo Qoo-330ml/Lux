@@ -1,5 +1,105 @@
 use super::*;
 
+/// `catalog_outbox` fan-out for the derived `catalog_items` read model, keyed by `kind = 'catalog'`.
+/// Migration 0238 creates the same triggers; they are repeated here because the rebuild
+/// migration recreates `media_items` and would otherwise drop them.
+const CATALOG_ITEMS_OUTBOX_TRIGGERS: [&str; 12] = [
+    "CREATE TRIGGER IF NOT EXISTS media_items_catalog_ai
+     AFTER INSERT ON media_items
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.parent_id
+         WHERE NEW.parent_id IS NOT NULL AND NEW.parent_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.series_id
+         WHERE NEW.series_id IS NOT NULL AND NEW.series_id IS NOT NEW.id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_items_catalog_au
+     AFTER UPDATE ON media_items
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.parent_id
+         WHERE NEW.parent_id IS NOT NULL AND NEW.parent_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.parent_id
+         WHERE OLD.parent_id IS NOT NULL
+           AND OLD.parent_id IS NOT OLD.id
+           AND OLD.parent_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', NEW.series_id
+         WHERE NEW.series_id IS NOT NULL AND NEW.series_id IS NOT NEW.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.series_id
+         WHERE OLD.series_id IS NOT NULL
+           AND OLD.series_id IS NOT OLD.id
+           AND OLD.series_id IS NOT NEW.id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_items_catalog_ad
+     AFTER DELETE ON media_items
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.parent_id
+         WHERE OLD.parent_id IS NOT NULL AND OLD.parent_id IS NOT OLD.id;
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.series_id
+         WHERE OLD.series_id IS NOT NULL AND OLD.series_id IS NOT OLD.id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_sources_catalog_ai
+     AFTER INSERT ON media_sources
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_sources_catalog_au
+     AFTER UPDATE ON media_sources
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_sources_catalog_ad
+     AFTER DELETE ON media_sources
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS item_images_catalog_ai
+     AFTER INSERT ON item_images
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS item_images_catalog_au
+     AFTER UPDATE ON item_images
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS item_images_catalog_ad
+     AFTER DELETE ON item_images
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_content_restriction_catalog_ai
+     AFTER INSERT ON media_content_restriction_index
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_content_restriction_catalog_au
+     AFTER UPDATE ON media_content_restriction_index
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', NEW.item_id);
+         INSERT INTO catalog_outbox (kind, item_id)
+         SELECT 'catalog', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
+     END",
+    "CREATE TRIGGER IF NOT EXISTS media_content_restriction_catalog_ad
+     AFTER DELETE ON media_content_restriction_index
+     BEGIN
+         INSERT INTO catalog_outbox (kind, item_id) VALUES ('catalog', OLD.item_id);
+     END",
+];
+
 const MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER: &str =
     "CREATE TRIGGER IF NOT EXISTS trg_media_items_content_restriction_index_invalidate_nfo
      AFTER UPDATE OF nfo_metadata_json ON media_items
@@ -113,6 +213,15 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 path: path.to_path_buf(),
                 source,
             })?;
+        for statement in CATALOG_ITEMS_OUTBOX_TRIGGERS {
+            sqlx::query(statement)
+                .execute(&mut *connection)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        }
         return Ok(());
     }
 
@@ -132,7 +241,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                 path: path.to_path_buf(),
                 source,
             })?;
-        let statements = [
+        let mut statements = vec![
             "CREATE TABLE libraries_new (
                 id TEXT PRIMARY KEY NOT NULL,
                 name TEXT NOT NULL,
@@ -187,6 +296,18 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             "DROP TRIGGER IF EXISTS item_aliases_search_ai",
             "DROP TRIGGER IF EXISTS item_aliases_search_au",
             "DROP TRIGGER IF EXISTS item_aliases_search_ad",
+            "DROP TRIGGER IF EXISTS media_items_catalog_ai",
+            "DROP TRIGGER IF EXISTS media_items_catalog_au",
+            "DROP TRIGGER IF EXISTS media_items_catalog_ad",
+            "DROP TRIGGER IF EXISTS media_sources_catalog_ai",
+            "DROP TRIGGER IF EXISTS media_sources_catalog_au",
+            "DROP TRIGGER IF EXISTS media_sources_catalog_ad",
+            "DROP TRIGGER IF EXISTS item_images_catalog_ai",
+            "DROP TRIGGER IF EXISTS item_images_catalog_au",
+            "DROP TRIGGER IF EXISTS item_images_catalog_ad",
+            "DROP TRIGGER IF EXISTS media_content_restriction_catalog_ai",
+            "DROP TRIGGER IF EXISTS media_content_restriction_catalog_au",
+            "DROP TRIGGER IF EXISTS media_content_restriction_catalog_ad",
             "DROP TRIGGER IF EXISTS media_item_provider_ids_ai",
             "DROP TRIGGER IF EXISTS media_item_provider_ids_au",
             "DROP TRIGGER IF EXISTS trg_media_sources_availability_insert",
@@ -262,10 +383,9 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             "CREATE UNIQUE INDEX idx_media_items_identity_key
              ON media_items(identity_key)
              WHERE identity_key IS NOT NULL",
-            "CREATE INDEX idx_media_items_parent_removed
-             ON media_items(parent_id, removed_at)",
-            "CREATE INDEX idx_media_items_series_removed
-             ON media_items(series_id, removed_at)",
+            // idx_media_items_parent_removed and idx_media_items_series_removed are not recreated:
+            // migration 0242 drops them because they are left prefixes of the *_available indexes
+            // below, and this rebuild must not resurrect them (docs/INDEX-AUDIT.md).
             "CREATE INDEX idx_media_items_library_type_visible
              ON media_items(library_id, item_type, id)
              WHERE removed_at IS NULL",
@@ -293,6 +413,24 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
              WHERE removed_at IS NULL",
             "CREATE INDEX idx_media_items_updated_at
              ON media_items(updated_at, id)",
+            // The rebuild used to omit the indexes added by 0168 and 0215, so a database that went
+            // through this repair lost them while a database that only ran the migrations kept
+            // them. Both are read-path indexes the audit depends on (docs/INDEX-AUDIT.md).
+            "CREATE INDEX IF NOT EXISTS idx_media_items_removed_at
+             ON media_items(removed_at)
+             WHERE removed_at IS NOT NULL",
+            "CREATE INDEX idx_media_items_series_episode_latest
+             ON media_items(series_id, added_at)
+             WHERE item_type = 'EPISODE'
+               AND removed_at IS NULL
+               AND has_available_source = 1
+               AND series_id IS NOT NULL",
+            "CREATE INDEX idx_media_items_parent_episode_latest
+             ON media_items(parent_id, added_at)
+             WHERE item_type = 'EPISODE'
+               AND removed_at IS NULL
+               AND has_available_source = 1
+               AND parent_id IS NOT NULL",
             "CREATE INDEX idx_media_items_library_name_sort
              ON media_items(library_id, LOWER(title), id)
              WHERE removed_at IS NULL",
@@ -311,6 +449,11 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
                  id
              )
              WHERE removed_at IS NULL",
+            "CREATE INDEX idx_media_items_nfo_collection_reference_pending
+             ON media_items(id)
+             WHERE item_type = 'MOVIE'
+               AND removed_at IS NULL
+               AND nfo_collection_reference_key IS NULL",
             "CREATE INDEX idx_media_items_library_rating_sort
              ON media_items(
                  library_id,
@@ -321,52 +464,30 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
              )
              WHERE removed_at IS NULL",
             "CREATE TRIGGER media_items_search_ai AFTER INSERT ON media_items BEGIN
-                INSERT INTO media_search_map (item_id) VALUES (NEW.id);
-                INSERT INTO media_search (rowid, item_id, title, sort_title, original_title, aliases)
-                SELECT map.fts_rowid, NEW.id, NEW.title,
-                       CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE THEN '' ELSE NEW.sort_title END,
-                       COALESCE(NEW.original_title, ''), ''
-                FROM media_search_map map WHERE map.item_id = NEW.id;
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.id);
             END",
             "CREATE TRIGGER media_items_search_au AFTER UPDATE OF title, sort_title, original_title ON media_items
              WHEN OLD.title IS NOT NEW.title
                OR OLD.sort_title IS NOT NEW.sort_title
                OR OLD.original_title IS NOT NEW.original_title
              BEGIN
-                DELETE FROM media_search
-                WHERE rowid = (SELECT fts_rowid FROM media_search_map WHERE item_id = OLD.id);
-                INSERT INTO media_search (rowid, item_id, title, sort_title, original_title, aliases)
-                SELECT map.fts_rowid, NEW.id, NEW.title,
-                       CASE WHEN NEW.sort_title = NEW.title COLLATE NOCASE THEN '' ELSE NEW.sort_title END,
-                       COALESCE(NEW.original_title, ''),
-                       COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.id), '')
-                FROM media_search_map map WHERE map.item_id = NEW.id;
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.id);
             END",
             "CREATE TRIGGER media_items_search_ad AFTER DELETE ON media_items BEGIN
-                DELETE FROM media_search
-                WHERE rowid = (SELECT fts_rowid FROM media_search_map WHERE item_id = OLD.id);
-                DELETE FROM media_search_map WHERE item_id = OLD.id;
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', OLD.id);
             END",
             "CREATE TRIGGER item_aliases_search_ai AFTER INSERT ON item_aliases BEGIN
-                UPDATE media_search
-                SET aliases = COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.item_id), '')
-                WHERE rowid = (SELECT fts_rowid FROM media_search_map WHERE item_id = NEW.item_id);
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.item_id);
             END",
             "CREATE TRIGGER item_aliases_search_au AFTER UPDATE OF alias, alias_normalized, item_id ON item_aliases
              WHEN OLD.alias IS NOT NEW.alias OR OLD.alias_normalized IS NOT NEW.alias_normalized OR OLD.item_id IS NOT NEW.item_id
              BEGIN
-                UPDATE media_search
-                SET aliases = COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = NEW.item_id), '')
-                WHERE rowid = (SELECT fts_rowid FROM media_search_map WHERE item_id = NEW.item_id);
-                UPDATE media_search
-                SET aliases = COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = OLD.item_id), '')
-                WHERE rowid = (SELECT fts_rowid FROM media_search_map WHERE item_id = OLD.item_id)
-                  AND OLD.item_id IS NOT NEW.item_id;
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', NEW.item_id);
+                INSERT INTO search_outbox (kind, item_id)
+                SELECT 'search', OLD.item_id WHERE OLD.item_id IS NOT NEW.item_id;
              END",
             "CREATE TRIGGER item_aliases_search_ad AFTER DELETE ON item_aliases BEGIN
-                UPDATE media_search
-                SET aliases = COALESCE((SELECT group_concat(alias, ' ') FROM item_aliases WHERE item_id = OLD.item_id), '')
-                WHERE rowid = (SELECT fts_rowid FROM media_search_map WHERE item_id = OLD.item_id);
+                INSERT INTO search_outbox (kind, item_id) VALUES ('search', OLD.item_id);
             END",
             "CREATE TRIGGER media_item_provider_ids_ai
              AFTER INSERT ON media_items
@@ -524,6 +645,7 @@ pub(super) async fn migrate_sqlite_catalog_constraints(
             MEDIA_CONTENT_RESTRICTION_INDEX_INVALIDATION_TRIGGER,
             MEDIA_CONTENT_RESTRICTION_INDEX_QUEUE_TRIGGER,
         ];
+        statements.extend(CATALOG_ITEMS_OUTBOX_TRIGGERS);
         for statement in statements {
             sqlx::query(statement)
                 .execute(&mut *transaction)
@@ -615,4 +737,206 @@ pub(super) async fn ensure_server_id(
     sqlx::query_scalar("SELECT value FROM lux_meta WHERE key = 'server_id'")
         .fetch_one(pool)
         .await
+}
+
+/// Marker written next to the configuration once a server identity exists.
+///
+/// The database cannot answer "was this server set up before?" on its own: a missing file and a
+/// first install look identical to SQLite, which creates the file on connect. The marker lives
+/// beside the database precisely so the two can be compared.
+const SERVER_STATE_FILE: &str = "server-state.json";
+
+/// Refuses to start a previously initialized server against an empty database.
+///
+/// Restoring only the configuration directory, or mounting the wrong volume, used to look like a
+/// brand-new install: an empty `lux.db` was created, migrations built a fresh schema, and the setup
+/// wizard appeared over libraries the operator believed were still there. The check runs before the
+/// connection is opened, so the failed attempt does not even create the file.
+pub(super) async fn refuse_empty_database_when_initialized(
+    config_dir: &Path,
+    path: &Path,
+    backend: DatabaseBackend,
+    database_url: &str,
+) -> Result<(), StorageError> {
+    if !server_state_marker_present(config_dir).await? {
+        return Ok(());
+    }
+    let has_identity = match backend {
+        DatabaseBackend::Sqlite => sqlite_database_has_identity(path).await?,
+        DatabaseBackend::Postgres => postgres_database_has_identity(database_url).await?,
+    };
+    if has_identity {
+        return Ok(());
+    }
+    Err(StorageError::EmptyDatabase {
+        path: path.to_path_buf(),
+    })
+}
+
+async fn server_state_marker_present(config_dir: &Path) -> Result<bool, StorageError> {
+    let marker = config_dir.join(SERVER_STATE_FILE);
+    match fs::read(&marker).await {
+        Ok(bytes) => {
+            if serde_json::from_slice::<serde_json::Value>(&bytes).is_err() {
+                // A corrupt marker is not evidence that the server is new, and guessing "new"
+                // here is the one guess that can overwrite real data with a fresh schema.
+                tracing::warn!(
+                    path = %marker.display(),
+                    "server state marker is unreadable; treating this directory as initialized"
+                );
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(StorageError::Io {
+            path: marker,
+            source,
+        }),
+    }
+}
+
+async fn sqlite_database_has_identity(path: &Path) -> Result<bool, StorageError> {
+    if fs::metadata(path).await.is_err() {
+        return Ok(false);
+    }
+    // Read-only, and before the read-write pool exists: opening read-write would create the very
+    // empty database this check is looking for.
+    let url = format!("sqlite://{}?mode=ro", path.display());
+    let options = AnyConnectOptions::from_str(&url).map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let pool = match AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+    {
+        Ok(pool) => pool,
+        Err(error) => {
+            // Being unable to read the file is not proof that it is empty; refusing would turn a
+            // permissions problem into an outage the operator cannot diagnose.
+            tracing::warn!(
+                path = %path.display(),
+                %error,
+                "could not verify the existing database; continuing"
+            );
+            return Ok(true);
+        }
+    };
+    let has_meta_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'lux_meta'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let has_identity = if has_meta_table == 0 {
+        false
+    } else {
+        let identities: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = 'server_id'")
+                .fetch_one(&pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
+        identities > 0
+    };
+    pool.close().await;
+    Ok(has_identity)
+}
+
+async fn postgres_database_has_identity(database_url: &str) -> Result<bool, StorageError> {
+    let path = PathBuf::from("external PostgreSQL");
+    let options =
+        AnyConnectOptions::from_str(database_url).map_err(|source| StorageError::Sqlx {
+            path: path.clone(),
+            source,
+        })?;
+    let pool = AnyPoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .map_err(|source| StorageError::Sqlx {
+            path: path.clone(),
+            source,
+        })?;
+    let has_meta_table: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM information_schema.tables
+         WHERE table_schema = 'public' AND table_name = 'lux_meta'",
+    )
+    .fetch_one(&pool)
+    .await
+    .map_err(|source| StorageError::Sqlx {
+        path: path.clone(),
+        source,
+    })?;
+    let has_identity = if has_meta_table == 0 {
+        false
+    } else {
+        let identities: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM lux_meta WHERE key = 'server_id'")
+                .fetch_one(&pool)
+                .await
+                .map_err(|source| StorageError::Sqlx {
+                    path: path.clone(),
+                    source,
+                })?;
+        identities > 0
+    };
+    pool.close().await;
+    Ok(has_identity)
+}
+
+/// Records that this configuration directory now belongs to an initialized server.
+///
+/// Written once, after the server identity exists, and never rewritten: it is the evidence the
+/// startup guard reads on the next boot.
+pub(super) async fn record_server_state(
+    config_dir: &Path,
+    server_id: &str,
+) -> Result<(), StorageError> {
+    let marker = config_dir.join(SERVER_STATE_FILE);
+    match fs::metadata(&marker).await {
+        Ok(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(source) => {
+            return Err(StorageError::Io {
+                path: marker,
+                source,
+            });
+        }
+    }
+    let state = serde_json::json!({
+        "serverId": server_id,
+        "initializedAt": crate::clock::unix_timestamp(),
+    });
+    let bytes = serde_json::to_vec_pretty(&state)
+        .map_err(|source| StorageError::Serialization(source.to_string()))?;
+    let temporary = config_dir.join(format!(".{SERVER_STATE_FILE}.{}.tmp", Uuid::now_v7()));
+    fs::write(&temporary, bytes)
+        .await
+        .map_err(|source| StorageError::Io {
+            path: temporary.clone(),
+            source,
+        })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600))
+            .await
+            .map_err(|source| StorageError::Io {
+                path: temporary.clone(),
+                source,
+            })?;
+    }
+    fs::rename(&temporary, &marker)
+        .await
+        .map_err(|source| StorageError::Io {
+            path: marker,
+            source,
+        })
 }

@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue } from "./lux-select-helpers";
 import { queryKeys } from "../src/lib/api/query-keys";
 import type { AdminLibrary, AdminUserRegistration, NewUserPermissions } from "../src/lib/api/types";
 
@@ -134,7 +135,7 @@ describe("admin user registration review", () => {
       await vi.waitFor(() => expect(container.querySelector<HTMLInputElement>('input[aria-label="允许下载 person@example.test"]')?.checked).toBe(true));
       setChecked('input[aria-label="允许播放 person@example.test"]', false);
       setChecked('input[aria-label="允许视频转码 person@example.test"]', true);
-      setSelect('select[aria-label="媒体库访问范围 person@example.test"]', "ALL");
+      await setSelect("媒体库访问范围 person@example.test", "ALL");
       setNumber('input[aria-label="同时播放上限 person@example.test"]', "3");
     });
     await act(async () => {
@@ -212,11 +213,8 @@ describe("admin user registration review", () => {
     if (input.checked !== checked) input.click();
   }
 
-  function setSelect(selector: string, value: string) {
-    const select = container.querySelector<HTMLSelectElement>(selector);
-    if (!select) throw new Error(`Missing select: ${selector}`);
-    Object.getOwnPropertyDescriptor(HTMLSelectElement.prototype, "value")?.set?.call(select, value);
-    select.dispatchEvent(new Event("change", { bubbles: true }));
+  async function setSelect(label: string, value: string) {
+    await chooseLuxOptionByValue(container, label, value);
   }
 
   function setNumber(selector: string, value: string) {

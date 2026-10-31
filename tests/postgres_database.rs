@@ -506,6 +506,120 @@ async fn postgres_user_device_inventory_migration_runs_from_an_empty_database()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_search_reindex_moves_to_the_outbox_consumer()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('search-lib', 'Search', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    sqlx::query(
+        "INSERT INTO media_items (
+             id, library_id, item_type, title, sort_title, identification_status,
+             has_available_source
+         ) VALUES (
+             'search-item', 'search-lib', 'MOVIE', 'Alpha Movie', 'Alpha Movie',
+             'LOCAL_CONFIRMED', 1
+         )",
+    )
+    .execute(database.pool())
+    .await?;
+
+    async fn queue_len(database: &Database) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM search_outbox
+             WHERE kind = 'search' AND item_id = 'search-item'",
+        )
+        .fetch_one(database.pool())
+        .await
+    }
+
+    // The writer only queues: the search row must appear after the consumer drains.
+    let queued_after_insert = queue_len(&database).await?;
+    assert!(
+        queued_after_insert >= 1,
+        "insert must enqueue a search event"
+    );
+    let before: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'search-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(
+        before, 0,
+        "media_search is built by the consumer, not the writer"
+    );
+
+    assert!(database.drain_search_reindex(100).await? >= 1);
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM media_search WHERE item_id = 'search-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(title, "Alpha Movie");
+
+    sqlx::query(
+        "INSERT INTO item_aliases (id, item_id, alias, alias_normalized)
+         VALUES ('alias-1', 'search-item', 'Alias One', 'alias one')",
+    )
+    .execute(database.pool())
+    .await?;
+    assert!(
+        queue_len(&database).await? > queued_after_insert,
+        "alias insert must enqueue"
+    );
+    database.drain_search_reindex(100).await?;
+    let aliases: String =
+        sqlx::query_scalar("SELECT aliases FROM media_search WHERE item_id = 'search-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(aliases, "Alias One");
+
+    // A column outside the search projection must not enqueue anything.
+    let queued_before_overview = queue_len(&database).await?;
+    sqlx::query("UPDATE media_items SET overview = 'not indexed' WHERE id = 'search-item'")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        queue_len(&database).await?,
+        queued_before_overview,
+        "overview is not part of search"
+    );
+
+    sqlx::query("UPDATE media_items SET title = 'Beta Movie' WHERE id = 'search-item'")
+        .execute(database.pool())
+        .await?;
+    assert!(
+        queue_len(&database).await? > queued_before_overview,
+        "title update must enqueue"
+    );
+    database.drain_search_reindex(100).await?;
+    let title: String =
+        sqlx::query_scalar("SELECT title FROM media_search WHERE item_id = 'search-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(title, "Beta Movie");
+
+    sqlx::query("DELETE FROM media_items WHERE id = 'search-item'")
+        .execute(database.pool())
+        .await?;
+    database.drain_search_reindex(100).await?;
+    let remaining: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = 'search-item'")
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(remaining, 0);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_user_access_blacklist_rules_migration_runs_from_an_empty_database()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -1716,6 +1830,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
     .fetch_one(database.pool())
     .await?;
     assert_eq!(providerless_index_rows, 0);
+    database.drain_search_reindex(500).await?;
     let providerless_search_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM media_search
          WHERE item_id IN ($1, $2)",
@@ -1815,6 +1930,7 @@ async fn postgres_bootstrap_runs_migrations_and_persists_core_state()
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+#[allow(clippy::type_complexity)]
 async fn postgres_legacy_user_and_library_access_upgrade_from_v183_to_current_schema()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -3652,6 +3768,14 @@ async fn postgres_statement_triggers_refresh_search_and_availability_sets()
     .bind(&library_id)
     .execute(database.pool())
     .await?;
+    let queued_search_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id IN ($1, $2)")
+            .bind(&item_one)
+            .bind(&item_two)
+            .fetch_one(database.pool())
+            .await?;
+    assert_eq!(queued_search_count, 0, "insert only queues a reindex event");
+    database.drain_search_reindex(100).await?;
     let search_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id IN ($1, $2)")
             .bind(&item_one)
@@ -3668,6 +3792,7 @@ async fn postgres_statement_triggers_refresh_search_and_availability_sets()
     .bind(&item_one)
     .execute(database.pool())
     .await?;
+    database.drain_search_reindex(100).await?;
     let alias_text: String =
         sqlx::query_scalar("SELECT aliases FROM media_search WHERE item_id = $1")
             .bind(&item_one)
@@ -3684,6 +3809,7 @@ async fn postgres_statement_triggers_refresh_search_and_availability_sets()
     .bind(&item_two)
     .execute(database.pool())
     .await?;
+    database.drain_search_reindex(100).await?;
     let preserved_alias: String =
         sqlx::query_scalar("SELECT aliases FROM media_search WHERE item_id = $1")
             .bind(&item_one)
@@ -3740,6 +3866,7 @@ async fn postgres_statement_triggers_refresh_search_and_availability_sets()
         .bind(&alias_id)
         .execute(database.pool())
         .await?;
+    database.drain_search_reindex(100).await?;
     let cleared_alias: String =
         sqlx::query_scalar("SELECT aliases FROM media_search WHERE item_id = $1")
             .bind(&item_one)
@@ -3751,6 +3878,7 @@ async fn postgres_statement_triggers_refresh_search_and_availability_sets()
         .bind(&item_two)
         .execute(database.pool())
         .await?;
+    database.drain_search_reindex(100).await?;
     let deleted_item_search_rows: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM media_search WHERE item_id = $1")
             .bind(&item_two)
@@ -4255,7 +4383,7 @@ async fn postgres_resume_visibility_upgrade_preserves_existing_playback_state()
     let version: i64 = sqlx::query_scalar("SELECT MAX(version) FROM _sqlx_migrations")
         .fetch_one(&pool)
         .await?;
-    assert_eq!(version, 187);
+    assert_eq!(version, latest_migration_version("migrations-postgres")?);
     pool.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
@@ -4610,6 +4738,83 @@ async fn postgres_removes_personal_image_preference_without_changing_other_prefe
 
 #[tokio::test]
 #[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_search_outbox_gap_repair_is_bounded_and_idempotent()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+    let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    async fn rows(database: &Database, table: &str) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+            .fetch_one(database.pool())
+            .await
+    }
+
+    sqlx::query("INSERT INTO libraries (id, name, kind) VALUES ('gap-library', 'Gap', 'MOVIE')")
+        .execute(database.pool())
+        .await?;
+    for item_id in ["gap-a", "gap-b", "gap-c"] {
+        sqlx::query(
+            "INSERT INTO media_items
+                (id, library_id, item_type, title, sort_title, identification_status)
+             VALUES ($1, 'gap-library', 'MOVIE', $1, $1, 'LOCAL_CONFIRMED')",
+        )
+        .bind(item_id)
+        .execute(database.pool())
+        .await?;
+    }
+    // The catalog stream and the search stream are separate tables with separate sequences.
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM catalog_outbox WHERE kind = 'search'")
+            .fetch_one(database.pool())
+            .await?,
+        0
+    );
+    while database.drain_search_reindex(100).await? > 0 {}
+
+    // Rewind the watermark and drop all but the newest event: a hole below the oldest remaining row.
+    sqlx::query("UPDATE catalog_consumers SET applied_seq = 0 WHERE name = 'search_reindex@2'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM search_outbox WHERE id < (SELECT MAX(id) FROM search_outbox)")
+        .execute(database.pool())
+        .await?;
+
+    let before = rows(&database, "search_outbox").await?;
+    database.drain_search_reindex(100).await?;
+    let after_first = rows(&database, "search_outbox").await?;
+    assert_eq!(after_first - before, 3, "exactly one full re-queue");
+    for _ in 0..3 {
+        database.drain_search_reindex(100).await?;
+    }
+    assert_eq!(
+        rows(&database, "search_outbox").await?,
+        after_first,
+        "later drains must not repeat the re-queue"
+    );
+
+    // A second hole inside the cooldown is closed without another full re-queue.
+    sqlx::query("UPDATE catalog_consumers SET applied_seq = 0 WHERE name = 'search_reindex@2'")
+        .execute(database.pool())
+        .await?;
+    sqlx::query("DELETE FROM search_outbox WHERE id < (SELECT MAX(id) FROM search_outbox)")
+        .execute(database.pool())
+        .await?;
+    let before_cooldown = rows(&database, "search_outbox").await?;
+    database.drain_search_reindex(100).await?;
+    assert_eq!(rows(&database, "search_outbox").await?, before_cooldown);
+
+    drop(database);
+    drop_postgres_test_database(&database_name).await?;
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
 async fn postgres_media_item_update_triggers_are_column_specific()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
@@ -4619,6 +4824,16 @@ async fn postgres_media_item_update_triggers_are_column_specific()
     };
     let (connection, database_name) = create_postgres_test_database().await?;
     let database = Database::connect_with_configuration(&config, &connection).await?;
+
+    async fn search_enqueue_count(database: &Database) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM search_outbox
+             WHERE kind = 'search' AND item_id = 'trigger-item'",
+        )
+        .fetch_one(database.pool())
+        .await
+    }
+
     sqlx::query(
         "INSERT INTO libraries (id, name, kind) VALUES ('trigger-library', 'Trigger', 'MOVIE')",
     )
@@ -4652,14 +4867,37 @@ async fn postgres_media_item_update_triggers_are_column_specific()
         .find(|(name, _)| name == "media_item_provider_ids_au")
         .map(|(_, definition)| definition)
         .ok_or("missing media_item_provider_ids_au")?;
-    assert!(search_trigger.contains("FOR EACH ROW"));
-    assert!(search_trigger.contains("UPDATE OF title, sort_title, original_title"));
+    // The search refresh is statement-level now: the column filter moved into the enqueue function.
+    assert!(search_trigger.contains("FOR EACH STATEMENT"));
+    assert!(!search_trigger.contains("UPDATE OF title"));
+    let search_function: String = sqlx::query_scalar(
+        "SELECT pg_get_functiondef(p.oid) FROM pg_proc p
+         WHERE p.proname = 'lux_enqueue_search_reindex_items_update_stmt'",
+    )
+    .fetch_one(database.pool())
+    .await?;
+    assert!(search_function.contains("n.title IS DISTINCT FROM o.title"));
     assert!(provider_trigger.contains("FOR EACH ROW"));
     assert!(provider_trigger.contains("UPDATE OF item_type, provider_ids_json"));
+
+    let queued_before = search_enqueue_count(&database).await?;
+    sqlx::query("UPDATE media_items SET overview = 'not indexed' WHERE id = 'trigger-item'")
+        .execute(database.pool())
+        .await?;
+    assert_eq!(
+        search_enqueue_count(&database).await?,
+        queued_before,
+        "a column outside the search projection must not enqueue"
+    );
 
     sqlx::query("UPDATE media_items SET title = 'After' WHERE id = 'trigger-item'")
         .execute(database.pool())
         .await?;
+    assert!(
+        search_enqueue_count(&database).await? > queued_before,
+        "a title update must enqueue"
+    );
+    database.drain_search_reindex(100).await?;
     let search_title: String =
         sqlx::query_scalar("SELECT title FROM media_search WHERE item_id = 'trigger-item'")
             .fetch_one(database.pool())
@@ -4722,4 +4960,55 @@ async fn postgres_home_index_and_statement_timestamp_defaults_exist()
     database.close().await;
     drop_postgres_test_database(&database_name).await?;
     Ok(())
+}
+
+/// The pooled connection setup applies several `SET` statements at once. PostgreSQL
+/// rejects a multi-statement string on the extended query protocol with
+/// `cannot insert multiple commands into a prepared statement`, which makes every
+/// `after_connect` fail and the pool time out before startup. This regression keeps the
+/// connection setup on the simple query protocol and asserts the settings actually land.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_pool_after_connect_applies_session_settings()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let config = Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    };
+    let (connection, database_name) = create_postgres_test_database().await?;
+
+    let result = async {
+        let database = Database::connect_with_configuration(&config, &connection).await?;
+        let (time_zone, application_name, work_mem, jit): (String, String, String, String) =
+            sqlx::query_as(
+                "SELECT current_setting('TimeZone'), current_setting('application_name'),
+                        current_setting('work_mem'), current_setting('jit')",
+            )
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(time_zone, "UTC");
+        assert_eq!(application_name, "lux");
+        assert_eq!(work_mem, "16MB");
+        assert_eq!(jit, "off");
+
+        let idle_in_transaction_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('idle_in_transaction_session_timeout')")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(idle_in_transaction_timeout, "1min");
+
+        let statement_timeout: String =
+            sqlx::query_scalar("SELECT current_setting('statement_timeout')")
+                .fetch_one(database.pool())
+                .await?;
+        assert_eq!(statement_timeout, "30min");
+
+        database.close().await;
+        Ok::<_, Box<dyn std::error::Error>>(())
+    }
+    .await;
+
+    drop_postgres_test_database(&database_name).await?;
+    result
 }

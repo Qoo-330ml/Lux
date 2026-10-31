@@ -54,6 +54,16 @@ export function summarizePlaybackPerformance(mediaDurationMs: number, processing
   };
 }
 
+/** Optional transport metrics an engine exposes for the information panel. */
+export type PlaybackEngineStats = {
+  /** Estimated available bandwidth in bits per second (HLS ABR). */
+  bandwidthBitsPerSecond: number | null;
+  /** Bitrate of the level currently playing, in bits per second. */
+  levelBitrate: number | null;
+  /** Short label of the active level, for example `1920×1080`. */
+  levelLabel: string | null;
+};
+
 export interface PlaybackEngine {
   readonly kind: PlaybackEngineKind;
   readonly element: HTMLVideoElement;
@@ -65,6 +75,8 @@ export interface PlaybackEngine {
   pause(): void;
   seek(seconds: number): void;
   snapshot(): PlaybackSnapshot;
+  /** Engines without transport telemetry omit this method. */
+  stats?(): PlaybackEngineStats | null;
   destroy(): void;
 }
 

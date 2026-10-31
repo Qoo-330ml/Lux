@@ -125,46 +125,71 @@ impl MediaDeleteService {
             }
 
             let requested_path = root.join(&source.relative_path);
-            let (media_path, parent, file_name) = match fs::canonicalize(&requested_path).await {
-                Ok(media_path) => {
-                    if !media_path.starts_with(&root) || media_path == root {
-                        return Err(MediaDeleteError::PathOutsideRoot(media_path));
-                    }
-                    let metadata = fs::metadata(&media_path).await?;
-                    if !metadata.is_file() {
-                        return Err(MediaDeleteError::ItemNotFound);
-                    }
-                    let file_name = media_path
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .ok_or_else(|| MediaDeleteError::InvalidFileName(media_path.clone()))?
-                        .to_owned();
-                    let parent = media_path
-                        .parent()
-                        .ok_or_else(|| MediaDeleteError::PathOutsideRoot(media_path.clone()))?
-                        .to_owned();
-                    (Some(media_path), parent, file_name)
+            let is_link = fs::symlink_metadata(&requested_path)
+                .await
+                .is_ok_and(|metadata| metadata.file_type().is_symlink());
+            let (media_path, parent, file_name) = if is_link {
+                // Deleting a link removes the link itself; the target it points
+                // at stays untouched, even when it lives outside the root.
+                let parent = requested_path
+                    .parent()
+                    .ok_or_else(|| MediaDeleteError::PathOutsideRoot(requested_path.clone()))?
+                    .to_owned();
+                if !parent.starts_with(&root) {
+                    return Err(MediaDeleteError::PathOutsideRoot(parent));
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let parent = requested_path
-                        .parent()
-                        .ok_or_else(|| MediaDeleteError::PathOutsideRoot(requested_path.clone()))?;
-                    let parent = match fs::canonicalize(parent).await {
-                        Ok(parent) => parent,
-                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                        Err(error) => return Err(error.into()),
-                    };
-                    if !parent.starts_with(&root) {
-                        return Err(MediaDeleteError::PathOutsideRoot(parent));
+                let file_name = requested_path
+                    .file_name()
+                    .and_then(|value| value.to_str())
+                    .ok_or_else(|| MediaDeleteError::InvalidFileName(requested_path.clone()))?
+                    .to_owned();
+                (Some(requested_path.clone()), parent, file_name)
+            } else {
+                match fs::canonicalize(&requested_path).await {
+                    Ok(media_path) => {
+                        if !media_path.starts_with(&root) || media_path == root {
+                            return Err(MediaDeleteError::PathOutsideRoot(media_path));
+                        }
+                        let metadata = fs::metadata(&media_path).await?;
+                        if !metadata.is_file() {
+                            return Err(MediaDeleteError::ItemNotFound);
+                        }
+                        let file_name = media_path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .ok_or_else(|| MediaDeleteError::InvalidFileName(media_path.clone()))?
+                            .to_owned();
+                        let parent = media_path
+                            .parent()
+                            .ok_or_else(|| MediaDeleteError::PathOutsideRoot(media_path.clone()))?
+                            .to_owned();
+                        (Some(media_path), parent, file_name)
                     }
-                    let file_name = requested_path
-                        .file_name()
-                        .and_then(|value| value.to_str())
-                        .ok_or_else(|| MediaDeleteError::InvalidFileName(requested_path.clone()))?
-                        .to_owned();
-                    (None, parent, file_name)
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        let parent = requested_path.parent().ok_or_else(|| {
+                            MediaDeleteError::PathOutsideRoot(requested_path.clone())
+                        })?;
+                        let parent = match fs::canonicalize(parent).await {
+                            Ok(parent) => parent,
+                            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                                continue;
+                            }
+                            Err(error) => return Err(error.into()),
+                        };
+                        if !parent.starts_with(&root) {
+                            return Err(MediaDeleteError::PathOutsideRoot(parent));
+                        }
+                        let file_name = requested_path
+                            .file_name()
+                            .and_then(|value| value.to_str())
+                            .ok_or_else(|| {
+                                MediaDeleteError::InvalidFileName(requested_path.clone())
+                            })?
+                            .to_owned();
+                        (None, parent, file_name)
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(error) => return Err(error.into()),
             };
             if let Some(media_path) = media_path.as_ref()
                 && seen_paths.insert(media_path.clone())

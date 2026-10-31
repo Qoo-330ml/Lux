@@ -1,15 +1,25 @@
-use std::{cmp::Ordering, fmt, io::Write, path::PathBuf, time::Duration};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet},
+    fmt,
+    io::Write,
+    path::PathBuf,
+    time::Duration,
+};
 
 use reqwest::{Client, Url};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
+use tokio::task::JoinSet;
 use uuid::Uuid;
 
 use crate::network::client_builder_from_env_or;
 
 pub const DEFAULT_PLUGIN_STORE_URL: &str = "https://github.com/Qoo-330ml/Lux-plugins";
+const PLUGIN_STORE_URLS_FILE: &str = "plugin_store_urls";
 const PLUGIN_STORE_URL_FILE: &str = "plugin_store_url";
+pub(crate) const MAX_STORE_SOURCES: usize = 10;
 const MAX_STORE_URL_LENGTH: usize = 2048;
 const MAX_INDEX_BYTES: usize = 2 * 1024 * 1024;
 const MAX_PACKAGE_BYTES: usize = 128 * 1024 * 1024;
@@ -58,6 +68,7 @@ pub struct PluginStoreEntry {
 #[derive(Debug)]
 pub enum PluginStoreError {
     InvalidSource,
+    TooManySources,
     InvalidCatalog,
     InvalidPackage,
     UnsupportedPlatform,
@@ -69,6 +80,7 @@ impl fmt::Display for PluginStoreError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InvalidSource => formatter.write_str("plugin store source is invalid"),
+            Self::TooManySources => formatter.write_str("too many plugin store sources"),
             Self::InvalidCatalog => formatter.write_str("plugin store catalog is invalid"),
             Self::InvalidPackage => formatter.write_str("plugin package is invalid"),
             Self::UnsupportedPlatform => {
@@ -86,6 +98,7 @@ impl std::error::Error for PluginStoreError {
             Self::Http(error) => Some(error),
             Self::Io(error) => Some(error),
             Self::InvalidSource
+            | Self::TooManySources
             | Self::InvalidCatalog
             | Self::InvalidPackage
             | Self::UnsupportedPlatform => None,
@@ -111,45 +124,97 @@ impl PluginStore {
         Ok(Self { config_dir, client })
     }
 
-    pub async fn source(&self) -> String {
-        fs::read_to_string(self.config_dir.join(PLUGIN_STORE_URL_FILE))
-            .await
-            .ok()
-            .and_then(|value| validate_store_source(&value).ok().map(str::to_owned))
-            .unwrap_or_else(|| DEFAULT_PLUGIN_STORE_URL.to_owned())
+    pub async fn sources(&self) -> Vec<String> {
+        if let Some(sources) = self.read_configured_sources().await {
+            return sources;
+        }
+        vec![DEFAULT_PLUGIN_STORE_URL.to_owned()]
     }
 
-    pub async fn save_source(&self, source: &str) -> Result<String, PluginStoreError> {
-        let source = validate_store_source(source)?;
+    async fn read_configured_sources(&self) -> Option<Vec<String>> {
+        for file_name in [PLUGIN_STORE_URLS_FILE, PLUGIN_STORE_URL_FILE] {
+            let Ok(value) = fs::read_to_string(self.config_dir.join(file_name)).await else {
+                continue;
+            };
+            let lines = value
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .map(str::to_owned)
+                .collect::<Vec<_>>();
+            if let Ok(sources) = normalize_store_sources(&lines)
+                && !sources.is_empty()
+            {
+                return Some(sources);
+            }
+        }
+        None
+    }
+
+    pub async fn save_sources(&self, sources: &[String]) -> Result<Vec<String>, PluginStoreError> {
+        let mut sources = normalize_store_sources(sources)?;
+        if sources.is_empty() {
+            sources.push(DEFAULT_PLUGIN_STORE_URL.to_owned());
+        }
         fs::create_dir_all(&self.config_dir)
             .await
             .map_err(PluginStoreError::Io)?;
-        let path = self.config_dir.join(PLUGIN_STORE_URL_FILE);
+        let path = self.config_dir.join(PLUGIN_STORE_URLS_FILE);
         let temporary = self
             .config_dir
             .join(format!(".plugin-store-{}.tmp", Uuid::now_v7()));
-        let source = source.to_string();
-        let stored_source = source.clone();
+        let stored_sources = sources.join("\n") + "\n";
         tokio::task::spawn_blocking(move || {
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .open(&temporary)?;
-            file.write_all(stored_source.as_bytes())?;
-            file.write_all(b"\n")?;
+            file.write_all(stored_sources.as_bytes())?;
             file.sync_all()?;
             std::fs::rename(temporary, path)
         })
         .await
         .map_err(|error| PluginStoreError::Io(std::io::Error::other(error.to_string())))?
         .map_err(PluginStoreError::Io)?;
-        Ok(source)
+        Ok(sources)
     }
 
     pub async fn fetch_catalog(&self) -> Result<PluginStoreIndex, PluginStoreError> {
-        let source = self.source().await;
-        let catalog_url = catalog_url(&source)?;
+        let source = self
+            .sources()
+            .await
+            .into_iter()
+            .next()
+            .unwrap_or_else(|| DEFAULT_PLUGIN_STORE_URL.to_owned());
+        self.fetch_catalog_from(&source).await
+    }
+
+    pub async fn fetch_catalogs(
+        &self,
+    ) -> Vec<(String, Result<PluginStoreIndex, PluginStoreError>)> {
+        let mut tasks = JoinSet::new();
+        for (order, source) in self.sources().await.into_iter().enumerate() {
+            let store = self.clone();
+            tasks.spawn(async move {
+                let result = store.fetch_catalog_from(&source).await;
+                (order, source, result)
+            });
+        }
+        let mut results = Vec::with_capacity(tasks.len());
+        while let Some(joined) = tasks.join_next().await {
+            if let Ok(result) = joined {
+                results.push(result);
+            }
+        }
+        results.sort_by_key(|(order, _, _)| *order);
+        results
+            .into_iter()
+            .map(|(_, source, result)| (source, result))
+            .collect()
+    }
+
+    async fn fetch_catalog_from(&self, source: &str) -> Result<PluginStoreIndex, PluginStoreError> {
+        let catalog_url = catalog_url(source)?;
         let response = self
             .client
             .get(catalog_url.clone())
@@ -243,6 +308,46 @@ impl PluginStore {
         validate_catalog(&mut index, &base)?;
         Ok(index)
     }
+}
+
+fn normalize_store_sources(sources: &[String]) -> Result<Vec<String>, PluginStoreError> {
+    let mut seen = HashSet::new();
+    let mut normalized = Vec::new();
+    for source in sources {
+        let source = validate_store_source(source)?.to_owned();
+        if !seen.insert(source.clone()) {
+            continue;
+        }
+        if normalized.len() == MAX_STORE_SOURCES {
+            return Err(PluginStoreError::TooManySources);
+        }
+        normalized.push(source);
+    }
+    Ok(normalized)
+}
+
+pub(crate) fn merge_catalogs(
+    catalogs: impl IntoIterator<Item = PluginStoreIndex>,
+) -> PluginStoreIndex {
+    let mut merged = PluginStoreIndex {
+        format_version: 1,
+        plugins: Vec::new(),
+    };
+    let mut positions = HashMap::new();
+    for catalog in catalogs {
+        for entry in catalog.plugins {
+            if let Some(position) = positions.get(&entry.id).copied() {
+                let current: &mut PluginStoreEntry = &mut merged.plugins[position];
+                if is_newer_version(&entry.version, &current.version) {
+                    *current = entry;
+                }
+            } else {
+                positions.insert(entry.id.clone(), merged.plugins.len());
+                merged.plugins.push(entry);
+            }
+        }
+    }
+    merged
 }
 
 async fn read_limited_body(
@@ -566,6 +671,23 @@ const DEFAULT_PLUGIN_INDEX_JSON: &str = r#"
 mod tests {
     use super::*;
 
+    fn store_entry(id: &str, version: &str) -> PluginStoreEntry {
+        PluginStoreEntry {
+            id: id.to_owned(),
+            name: format!("Plugin {id}"),
+            description: String::new(),
+            category: "UTILITY".to_owned(),
+            version: version.to_owned(),
+            runtime: "process".to_owned(),
+            provider_key: None,
+            aliases: Vec::new(),
+            capabilities: Vec::new(),
+            packages: Vec::new(),
+            package_url: String::new(),
+            sha256: String::new(),
+        }
+    }
+
     #[test]
     fn accepts_github_repository_sources_and_resolves_index() {
         let source = validate_store_source(DEFAULT_PLUGIN_STORE_URL).expect("valid source");
@@ -722,14 +844,85 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persists_and_reads_a_custom_store_source() {
+    async fn persists_and_deduplicates_multiple_store_sources() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let store = PluginStore::new(directory.path().to_owned(), None).expect("store client");
-        assert_eq!(store.source().await, DEFAULT_PLUGIN_STORE_URL);
+        assert_eq!(store.sources().await, vec![DEFAULT_PLUGIN_STORE_URL]);
         store
-            .save_source("https://example.com/lux/index.json")
+            .save_sources(&[
+                "https://example.com/lux/index.json".to_owned(),
+                "https://plugins.example.com/index.json".to_owned(),
+                "https://example.com/lux/index.json".to_owned(),
+            ])
             .await
-            .expect("save store source");
-        assert_eq!(store.source().await, "https://example.com/lux/index.json");
+            .expect("save store sources");
+        assert_eq!(
+            store.sources().await,
+            vec![
+                "https://example.com/lux/index.json",
+                "https://plugins.example.com/index.json",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn reads_the_legacy_single_source_file() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        fs::write(
+            directory.path().join(PLUGIN_STORE_URL_FILE),
+            "https://example.com/legacy/index.json\n",
+        )
+        .await
+        .expect("write legacy source");
+        let store = PluginStore::new(directory.path().to_owned(), None).expect("store client");
+        assert_eq!(
+            store.sources().await,
+            vec!["https://example.com/legacy/index.json"]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejects_more_than_the_bounded_number_of_store_sources() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let store = PluginStore::new(directory.path().to_owned(), None).expect("store client");
+        let sources = (0..=MAX_STORE_SOURCES)
+            .map(|index| format!("https://example.com/{index}/index.json"))
+            .collect::<Vec<_>>();
+        assert!(matches!(
+            store.save_sources(&sources).await,
+            Err(PluginStoreError::TooManySources)
+        ));
+    }
+
+    #[test]
+    fn merges_store_catalogs_and_keeps_the_newest_entry_for_each_id() {
+        let merged = merge_catalogs([
+            PluginStoreIndex {
+                format_version: 1,
+                plugins: vec![
+                    store_entry("org.lux.alpha", "1.0.0"),
+                    store_entry("org.lux.shared", "1.0.0"),
+                ],
+            },
+            PluginStoreIndex {
+                format_version: 1,
+                plugins: vec![
+                    store_entry("org.lux.beta", "2.0.0"),
+                    store_entry("org.lux.shared", "1.1.0"),
+                ],
+            },
+        ]);
+        assert_eq!(
+            merged
+                .plugins
+                .iter()
+                .map(|entry| (entry.id.as_str(), entry.version.as_str()))
+                .collect::<Vec<_>>(),
+            vec![
+                ("org.lux.alpha", "1.0.0"),
+                ("org.lux.shared", "1.1.0"),
+                ("org.lux.beta", "2.0.0"),
+            ]
+        );
     }
 }

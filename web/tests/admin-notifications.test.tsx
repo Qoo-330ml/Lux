@@ -217,10 +217,10 @@ describe("AdminNotificationsPage", () => {
     expect(container.textContent).toContain("扫描已完成");
     expect(container.textContent).toContain("媒体库：library-1");
     expect(container.querySelector('input[name="event-MEDIA_ADDED"]')).toBeTruthy();
-    expect(container.querySelector('select[name="notification-provider"]')).toBeTruthy();
+    expect(container.querySelector('[data-name="notification-provider"]')).toBeTruthy();
     expect(container.querySelector('input[name="notification-config-url"]')).toBeTruthy();
     expect(container.querySelector('textarea[name="notification-config-bodyTemplate"]')).toBeTruthy();
-    expect(container.querySelector('select[name="notification-config-payloadFormat"]')).toBeTruthy();
+    expect(container.querySelector('[data-name="notification-config-payloadFormat"]')).toBeTruthy();
     expect(container.querySelector('input[name="notification-url"]')).toBeNull();
     expect(container.textContent).toContain("通知内容");
     expect(container.textContent).toContain("通知器配置");

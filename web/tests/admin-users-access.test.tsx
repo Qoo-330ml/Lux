@@ -9,6 +9,7 @@ import { AdminUserDetailPage } from "../src/features/admin/AdminUserManagementPa
 import { api } from "../src/lib/api/client";
 import { queryKeys } from "../src/lib/api/query-keys";
 import type { AdminUser, AdminUserPermissionPreset } from "../src/lib/api/types";
+import { chooseLuxOptionByValue, luxCombobox, luxSelectValue } from "./lux-select-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -143,12 +144,7 @@ describe("AdminUserDetailPage library access scope", () => {
     expect(container.textContent).toContain("版本 3");
     expect(container.querySelector("time[datetime='2027-01-15T08:00:00.000Z']")).toBeTruthy();
 
-    await act(async () => {
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]');
-      expect(select).toBeTruthy();
-      select!.value = "preset-family";
-      select!.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await chooseLuxOptionByValue(container, "选择角色预设", "preset-family");
     await act(async () => {
       findButton("应用所选预设").click();
       await vi.waitFor(() => expect(apply).toHaveBeenCalledWith("user-1", "preset-family"));
@@ -169,12 +165,7 @@ describe("AdminUserDetailPage library access scope", () => {
     renderPermissions();
     await waitForAccessEditor();
 
-    await act(async () => {
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]');
-      expect(select).toBeTruthy();
-      select!.value = "preset-family";
-      select!.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await chooseLuxOptionByValue(container, "选择角色预设", "preset-family");
     await act(async () => findButton("应用所选预设").click());
 
     expect(apply).not.toHaveBeenCalled();
@@ -189,7 +180,7 @@ describe("AdminUserDetailPage library access scope", () => {
       await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("读取角色预设失败：预设服务不可用"));
     });
 
-    expect(container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]')?.disabled).toBe(true);
+    expect(container.querySelector<HTMLButtonElement>('[role="combobox"][aria-label="选择角色预设"]')?.disabled).toBe(true);
     expect(findButton("应用所选预设").disabled).toBe(true);
   });
 
@@ -200,19 +191,14 @@ describe("AdminUserDetailPage library access scope", () => {
     renderPermissions();
     await waitForAccessEditor();
 
-    await act(async () => {
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]');
-      expect(select).toBeTruthy();
-      select!.value = "preset-family";
-      select!.dispatchEvent(new Event("change", { bubbles: true }));
-    });
+    await chooseLuxOptionByValue(container, "选择角色预设", "preset-family");
     await act(async () => {
       findButton("应用所选预设").click();
       await vi.waitFor(() => expect(container.querySelector('[role="alert"]')?.textContent).toContain("最后管理员不能降权"));
     });
 
     expect(apply).toHaveBeenCalledWith("user-1", "preset-family");
-    expect(container.querySelector<HTMLSelectElement>('select[aria-label="选择角色预设"]')?.value).toBe("preset-family");
+    expect(luxSelectValue(container, "选择角色预设")).toBe("preset-family");
   });
 
   it("does not show default controls when the access list fails to load", async () => {

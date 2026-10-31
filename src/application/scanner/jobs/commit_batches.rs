@@ -239,6 +239,8 @@ mod tests {
             inode: Some(1),
             fingerprint: vec![1],
             fingerprint_pending: false,
+            is_symlink: false,
+            resolved_path: None,
         }
     }
 

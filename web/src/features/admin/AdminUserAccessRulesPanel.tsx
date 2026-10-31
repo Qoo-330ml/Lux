@@ -3,6 +3,7 @@ import type { FormEvent } from "react";
 import { useEffect, useState } from "react";
 import { ApiError, api } from "../../lib/api/client";
 import type { AdminUserAccessBlacklistRule, AdminUserAccessBlacklistRuleType, AdminUserDevice } from "../../lib/api/types";
+import { LuxButton, LuxSelectField, LuxSwitch, LuxTextField, useLuxConfirm } from "../../components/ui";
 
 const RULE_PAGE_SIZE = 20;
 const DEVICE_PAGE_SIZE = 100;
@@ -16,6 +17,7 @@ type RetryAction =
   | { type: "delete"; ruleId: string };
 
 export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
+  const confirm = useLuxConfirm();
   const queryClient = useQueryClient();
   const [page, setPage] = useState(1);
   const [devicePage, setDevicePage] = useState(1);
@@ -98,7 +100,7 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
     },
   });
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const value = ruleType === "DEVICE" ? selectedDeviceId : matchValue;
     const validation = validateRuleValue(ruleType, value);
@@ -107,7 +109,7 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
       setNotice(null);
       return;
     }
-    if (createEnabled && !window.confirm(ruleEffectConfirmation(ruleType))) return;
+    if (createEnabled && !(await confirm(ruleEffectConfirmation(ruleType)))) return;
 
     setValidationError("");
     setNotice(null);
@@ -116,16 +118,16 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
     createRule.mutate({ ruleType, matchValue: normalizedValue, isEnabled: createEnabled });
   }
 
-  function toggleRule(rule: AdminUserAccessBlacklistRule) {
+  async function toggleRule(rule: AdminUserAccessBlacklistRule) {
     const isEnabled = !rule.isEnabled;
-    if (isEnabled && !window.confirm(ruleEffectConfirmation(rule.ruleType))) return;
+    if (isEnabled && !(await confirm(ruleEffectConfirmation(rule.ruleType)))) return;
     setNotice(null);
     setRetryAction(null);
     setRuleEnabled.mutate({ ruleId: rule.id, isEnabled });
   }
 
-  function confirmDelete(rule: AdminUserAccessBlacklistRule) {
-    if (!window.confirm(`确认删除这条${ruleTypeLabel(rule.ruleType)}规则？删除后该账号的匹配值不再被阻止。`)) return;
+  async function confirmDelete(rule: AdminUserAccessBlacklistRule) {
+    if (!(await confirm(`确认删除这条${ruleTypeLabel(rule.ruleType)}规则？删除后该账号的匹配值不再被阻止。`))) return;
     setNotice(null);
     setRetryAction(null);
     deleteRule.mutate(rule.id);
@@ -155,33 +157,33 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
 
       <form className="lux-admin-form lux-admin-user-profile-form lux-admin-user-access-form" onSubmit={submit} aria-busy={createRule.isPending}>
         <label>规则类型
-          <select aria-label="规则类型" value={ruleType} disabled={mutationPending} onChange={(event) => { setRuleType(event.target.value as AdminUserAccessBlacklistRuleType); setValidationError(""); setNotice(null); setRetryAction(null); }}>
+          <LuxSelectField aria-label="规则类型" value={ruleType} disabled={mutationPending} onChange={(event) => { setRuleType(event.target.value as AdminUserAccessBlacklistRuleType); setValidationError(""); setNotice(null); setRetryAction(null); }}>
             <option value="DEVICE">设备 ID</option>
             <option value="CLIENT">客户端名称</option>
             <option value="IP_CIDR">IP/CIDR</option>
-          </select>
+          </LuxSelectField>
         </label>
         {ruleType === "DEVICE" ? (
           <label>已记录设备
-            <select aria-label="已记录设备" value={selectedDeviceId} disabled={mutationPending || devices.isPending || devices.isError || (devices.data?.devices.length ?? 0) === 0} onChange={(event) => { setSelectedDeviceId(event.target.value); setValidationError(""); setNotice(null); setRetryAction(null); }}>
+            <LuxSelectField aria-label="已记录设备" value={selectedDeviceId} disabled={mutationPending || devices.isPending || devices.isError || (devices.data?.devices.length ?? 0) === 0} onChange={(event) => { setSelectedDeviceId(event.target.value); setValidationError(""); setNotice(null); setRetryAction(null); }}>
               <option value="">选择已记录设备</option>
               {(devices.data?.devices ?? []).map((device) => <option key={device.deviceId} value={device.deviceId}>{deviceOptionLabel(device)}</option>)}
-            </select>
+            </LuxSelectField>
           </label>
         ) : (
           <label>匹配值
-            <input aria-label="匹配值" value={matchValue} maxLength={256} disabled={mutationPending} onChange={(event) => { setMatchValue(event.target.value); setValidationError(""); setNotice(null); setRetryAction(null); }} placeholder={ruleType === "CLIENT" ? "输入客户端名称" : "例如 192.0.2.0/24 或 2001:db8::/32"} />
+            <LuxTextField aria-label="匹配值" value={matchValue} maxLength={256} disabled={mutationPending} onChange={(event) => { setMatchValue(event.target.value); setValidationError(""); setNotice(null); setRetryAction(null); }} placeholder={ruleType === "CLIENT" ? "输入客户端名称" : "例如 192.0.2.0/24 或 2001:db8::/32"} />
           </label>
         )}
-        <label className="lux-admin-toggle"><input type="checkbox" checked={createEnabled} disabled={mutationPending} onChange={(event) => setCreateEnabled(event.target.checked)} />创建后立即启用</label>
+        <LuxSwitch className="lux-admin-toggle" checked={createEnabled} disabled={mutationPending} onChange={(event) => setCreateEnabled(event.target.checked)} label="创建后立即启用" />
         <div className="lux-admin-user-profile-actions">
-          <button className="lux-button lux-button-primary" type="submit" disabled={mutationPending}>{createRule.isPending ? "正在保存…" : "添加此用户规则"}</button>
+          <LuxButton tone="primary" type="submit" disabled={mutationPending}>{createRule.isPending ? "正在保存…" : "添加此用户规则"}</LuxButton>
         </div>
         {devices.isPending ? <p className="lux-admin-muted" role="status">正在读取此用户的设备选项…</p> : null}
         {devices.isError ? (
           <div className="lux-admin-access-block" role="alert">
             <p>读取设备列表失败。设备规则暂不可选，其他类型规则仍可管理。</p>
-            <button className="lux-button lux-button-secondary" type="button" onClick={() => void devices.refetch()} disabled={devices.isFetching}>重试读取设备</button>
+            <LuxButton tone="secondary" type="button" onClick={() => void devices.refetch()} disabled={devices.isFetching}>重试读取设备</LuxButton>
           </div>
         ) : null}
         {devices.data && devices.data.totalCount === 0 ? <p className="lux-admin-muted" role="status">此账号尚无已记录设备。</p> : null}
@@ -189,8 +191,8 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
           <div className="lux-admin-pagination" aria-label="设备选项分页">
             <span>设备选项第 {devices.data.page} / {deviceTotalPages} 页</span>
             <div>
-              <button className="lux-button lux-button-secondary" type="button" onClick={() => setDevicePage((current) => Math.max(1, current - 1))} disabled={devices.isFetching || devicePage <= 1}>上一页</button>
-              <button className="lux-button lux-button-secondary" type="button" onClick={() => setDevicePage((current) => Math.min(deviceTotalPages, current + 1))} disabled={devices.isFetching || devicePage >= deviceTotalPages}>下一页</button>
+              <LuxButton tone="secondary" type="button" onClick={() => setDevicePage((current) => Math.max(1, current - 1))} disabled={devices.isFetching || devicePage <= 1}>上一页</LuxButton>
+              <LuxButton tone="secondary" type="button" onClick={() => setDevicePage((current) => Math.min(deviceTotalPages, current + 1))} disabled={devices.isFetching || devicePage >= deviceTotalPages}>下一页</LuxButton>
             </div>
           </div>
         ) : null}
@@ -199,13 +201,13 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
       </form>
 
       {notice ? <p className={notice.kind === "error" ? "lux-error-copy" : "lux-account-notice"} role={notice.kind === "error" ? "alert" : "status"}>{notice.message}</p> : null}
-      {notice?.kind === "error" && retryAction ? <button className="lux-button lux-button-secondary" type="button" onClick={retryFailedOperation} disabled={mutationPending}>重试上次失败操作</button> : null}
+      {notice?.kind === "error" && retryAction ? <LuxButton tone="secondary" type="button" onClick={retryFailedOperation} disabled={mutationPending}>重试上次失败操作</LuxButton> : null}
 
       {rules.isPending ? <p className="lux-admin-muted" role="status">正在读取此用户的访问规则…</p> : null}
       {rules.isError ? (
         <div className="lux-admin-access-block" role="alert">
           <p>读取此用户的访问规则失败，请重试。</p>
-          <button className="lux-button lux-button-secondary" type="button" onClick={() => void rules.refetch()} disabled={rules.isFetching}>重新加载访问规则</button>
+          <LuxButton tone="secondary" type="button" onClick={() => void rules.refetch()} disabled={rules.isFetching}>重新加载访问规则</LuxButton>
         </div>
       ) : null}
       {rules.data && rules.data.rules.length === 0 ? <p className="lux-admin-muted" role="status">当前没有此用户的访问规则。</p> : null}
@@ -223,8 +225,8 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
                     <td><time dateTime={new Date(rule.createdAt * 1000).toISOString()}>{new Date(rule.createdAt * 1000).toLocaleString()}</time></td>
                     <td>
                       <div className="lux-admin-user-profile-actions">
-                        <button className="lux-button lux-button-secondary" type="button" aria-label={`${rule.isEnabled ? "停用" : "启用"}规则 ${rule.id}`} onClick={() => toggleRule(rule)} disabled={mutationPending}>{rule.isEnabled ? "停用" : "启用"}</button>
-                        <button className="lux-button lux-button-secondary" type="button" aria-label={`删除规则 ${rule.id}`} onClick={() => confirmDelete(rule)} disabled={mutationPending}>删除</button>
+                        <LuxButton tone="secondary" type="button" aria-label={`${rule.isEnabled ? "停用" : "启用"}规则 ${rule.id}`} onClick={() => toggleRule(rule)} disabled={mutationPending}>{rule.isEnabled ? "停用" : "启用"}</LuxButton>
+                        <LuxButton tone="secondary" type="button" aria-label={`删除规则 ${rule.id}`} onClick={() => confirmDelete(rule)} disabled={mutationPending}>删除</LuxButton>
                       </div>
                     </td>
                   </tr>
@@ -235,8 +237,8 @@ export function AdminUserAccessRulesPanel({ userId }: { userId: string }) {
           <div className="lux-admin-pagination">
             <span>第 {page} / {totalPages} 页 · {rules.data.totalCount} 条此用户规则（每页最多 {RULE_PAGE_SIZE} 条）</span>
             <div>
-              <button className="lux-button lux-button-secondary" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1}>上一页</button>
-              <button className="lux-button lux-button-secondary" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page >= totalPages}>下一页</button>
+              <LuxButton tone="secondary" type="button" onClick={() => setPage((current) => Math.max(1, current - 1))} disabled={page <= 1}>上一页</LuxButton>
+              <LuxButton tone="secondary" type="button" onClick={() => setPage((current) => Math.min(totalPages, current + 1))} disabled={page >= totalPages}>下一页</LuxButton>
             </div>
           </div>
         </>

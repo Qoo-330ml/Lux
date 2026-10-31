@@ -1934,6 +1934,29 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(7);
   });
 
+  it("updates multiple plugin store sources with CSRF", async () => {
+    const result = {
+      urls: ["https://example.com/lux/index.json", "https://plugins.example.com/index.json"],
+      url: "https://example.com/lux/index.json",
+      defaultUrl: "https://github.com/Qoo-330ml/Lux-plugins",
+    };
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (request, init) => {
+      expect(String(request)).toBe("/api/v1/admin/plugin-store");
+      expect(init?.method).toBe("PUT");
+      expect(JSON.parse(String(init?.body))).toEqual({ urls: result.urls });
+      expect((init?.headers as Headers).get("X-CSRF-Token")).toBe("csrf-token");
+      return new Response(JSON.stringify(result), { status: 200 });
+    });
+    const cookie = installCookieDocument("lux_csrf=csrf-token");
+
+    try {
+      await expect(new LuxApiClient().updateAdminPluginStore(result.urls)).resolves.toEqual(result);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    } finally {
+      cookie.restore();
+    }
+  });
+
   it("unwraps the authenticated user from the login envelope", async () => {
     vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({ user: { id: "admin-1", canManageServer: true }, csrfToken: "csrf" }), {

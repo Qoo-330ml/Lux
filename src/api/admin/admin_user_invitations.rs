@@ -25,7 +25,7 @@ struct CreateAdminUserInvitationRequest {
     preset_id: String,
 }
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/user-invitations",
@@ -44,14 +44,12 @@ pub(super) fn api_routes() -> Router<AppState> {
 async fn admin_list_user_invitations(
     headers: HeaderMap,
     Query(query): Query<AdminUserInvitationListQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let status = match query.status.as_deref() {
         None | Some("all") => None,
         Some("pending") => Some(UserInvitationStatus::Pending),
@@ -90,14 +88,14 @@ async fn admin_list_user_invitations(
 
 async fn admin_create_user_invitation(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<CreateAdminUserInvitationRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let (Some(database), Some(config_dir)) = (state.database.as_ref(), state.config_dir.as_deref())
-    else {
+    let database = state.database();
+    let Some(config_dir) = state.config_dir.as_deref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
     let created_by_user_id = admin_invitation_creator(&headers, &state).await;
@@ -141,14 +139,12 @@ async fn admin_create_user_invitation(
 async fn admin_revoke_user_invitation(
     headers: HeaderMap,
     Path(invitation_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match revoke_user_invitation(database, &invitation_id, current_unix_time()).await {
         Ok(()) => {
             record_audit_event(
@@ -169,14 +165,12 @@ async fn admin_revoke_user_invitation(
 async fn admin_resend_user_invitation(
     headers: HeaderMap,
     Path(invitation_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let idempotency_key = headers
         .get("Idempotency-Key")
         .and_then(|value| value.to_str().ok())
@@ -205,14 +199,13 @@ async fn admin_resend_user_invitation(
     }
 }
 
-async fn admin_invitation_creator(headers: &HeaderMap, state: &AppState) -> Option<String> {
+async fn admin_invitation_creator(headers: &HeaderMap, state: &ReadyAppState) -> Option<String> {
     if lux_api_key_from_headers(headers).is_some() {
         return None;
     }
     let session_token = request_cookie(headers, "lux_session")?;
     state
-        .auth
-        .as_ref()?
+        .auth()
         .resolve(&session_token)
         .await
         .ok()

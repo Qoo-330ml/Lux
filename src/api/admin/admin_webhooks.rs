@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/notification-destinations",
@@ -67,7 +67,7 @@ const fn default_enabled() -> bool {
 pub(crate) async fn admin_list_webhook_destinations(
     headers: HeaderMap,
     Query(query): Query<LuxPageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -84,7 +84,7 @@ pub(crate) async fn admin_list_webhook_destinations(
             .into_response();
         }
     };
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -107,12 +107,12 @@ pub(crate) async fn admin_list_webhook_destinations(
 pub(crate) async fn admin_get_webhook_destination(
     headers: HeaderMap,
     Path(destination_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -136,13 +136,13 @@ pub(crate) async fn admin_get_webhook_destination(
 
 pub(crate) async fn admin_create_webhook_destination(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<WebhookDestinationCreateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -186,13 +186,13 @@ pub(crate) async fn admin_create_webhook_destination(
 pub(crate) async fn admin_update_webhook_destination(
     headers: HeaderMap,
     Path(destination_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<WebhookDestinationUpdateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -223,12 +223,12 @@ pub(crate) async fn admin_update_webhook_destination(
 pub(crate) async fn admin_delete_webhook_destination(
     headers: HeaderMap,
     Path(destination_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -246,12 +246,12 @@ pub(crate) async fn admin_delete_webhook_destination(
 pub(crate) async fn admin_test_webhook_destination(
     headers: HeaderMap,
     Path(destination_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -269,12 +269,12 @@ pub(crate) async fn admin_test_webhook_destination(
 pub(crate) async fn admin_rotate_webhook_secret(
     headers: HeaderMap,
     Path(destination_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -292,7 +292,7 @@ pub(crate) async fn admin_rotate_webhook_secret(
 pub(crate) async fn admin_list_webhook_deliveries(
     headers: HeaderMap,
     Query(query): Query<LuxPageQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -309,7 +309,7 @@ pub(crate) async fn admin_list_webhook_deliveries(
             .into_response();
         }
     };
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -332,12 +332,12 @@ pub(crate) async fn admin_list_webhook_deliveries(
 pub(crate) async fn admin_retry_webhook_delivery(
     headers: HeaderMap,
     Path(delivery_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.webhooks.as_ref() else {
+    let Some(service) = state.webhooks() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,

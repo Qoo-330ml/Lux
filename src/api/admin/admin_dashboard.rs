@@ -1,25 +1,27 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new().route("/api/v1/admin/dashboard", get(admin_dashboard))
 }
 
-pub(crate) async fn admin_dashboard(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(crate) async fn admin_dashboard(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let snapshot = match crate::application::admin_dashboard::load_admin_dashboard(
         database,
         state.config_dir.as_deref(),
         &state.resources,
         crate::application::admin_dashboard::AdminDashboardServices {
-            libraries: state.libraries.as_ref(),
-            catalog: state.catalog.as_ref(),
-            ip_location: state.ip_location.as_ref(),
+            libraries: Some(state.libraries()),
+            catalog: Some(state.catalog()),
+            ip_location: Some(state.ip_location()),
             health_probe_cache: &state.admin_health_probe_cache,
+            playback_progress: Some(state.playback_progress()),
         },
     )
     .await
@@ -97,6 +99,12 @@ pub(crate) fn dashboard_playback_item_json(
         })
         .or_else(|| item.media_sources.iter().find(|source| source.is_default))
         .or_else(|| item.media_sources.first());
+    // Episodes show the series poster, never the season or episode image.
+    let poster_owner = if item.item_type == "EPISODE" {
+        series.filter(|series| series.poster_image_tag.is_some())
+    } else {
+        Some(item).filter(|item| item.poster_image_tag.is_some())
+    };
     json!({
         "id": session.id,
         "userId": session.user_id,
@@ -110,7 +118,8 @@ pub(crate) fn dashboard_playback_item_json(
         "productionYear": item.production_year,
         "parentIndexNumber": item.season_number,
         "indexNumber": item.episode_number,
-        "posterAvailable": item.poster_image_tag.is_some(),
+        "posterAvailable": poster_owner.is_some(),
+        "posterItemId": poster_owner.map(|owner| owner.id.as_str()),
         "positionTicks": session.position_ticks,
         "durationTicks": session.duration_ticks.or(item.runtime_ticks),
         "state": session.state,

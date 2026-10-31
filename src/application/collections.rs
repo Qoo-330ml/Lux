@@ -522,15 +522,22 @@ mod global_sync_worker_tests {
             sqlx::query(
                 "INSERT INTO media_items (
                      id, library_id, item_type, title, sort_title,
-                     provider_ids_json, metadata_scraper_id, nfo_metadata_json,
+                     provider_ids_json, metadata_scraper_id,
                      identification_status, has_available_source
-                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'org.lux.scraper.tmdb', ?, 'PENDING', 1)",
+                 ) VALUES (?, ?, 'MOVIE', ?, ?, ?, 'org.lux.scraper.tmdb', 'PENDING', 1)",
             )
             .bind(item_id)
             .bind(library.id.to_string())
             .bind(title)
             .bind(title.to_lowercase())
             .bind(format!("{{\"tmdb\":\"{movie_id}\"}}"))
+            .execute(database.pool())
+            .await?;
+            sqlx::query(
+                "INSERT INTO media_item_nfo_cache (item_id, json, bytes)
+                 VALUES (?, '{\"setId\":\"1281825\"}', length(CAST(? AS BLOB)))",
+            )
+            .bind(item_id)
             .bind(r#"{"setId":"1281825"}"#)
             .execute(database.pool())
             .await?;

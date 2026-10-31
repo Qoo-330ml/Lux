@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/scheduled-tasks",
@@ -101,15 +101,13 @@ const SCHEDULE_TASK_TYPES: [&str; 4] = [
 
 pub(crate) async fn admin_run_scheduled_task(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AdminScheduledTaskRunRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(scheduled_tasks) = state.scheduled_tasks.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scheduled_tasks = state.scheduled_tasks();
     let owner_type = request.owner_type.trim();
     let owner_id = request.owner_id.trim();
     let task_type = request.task_type.trim();
@@ -192,14 +190,12 @@ pub(crate) fn scheduled_task_error(headers: &HeaderMap, error: ScheduledTaskErro
 
 pub(crate) async fn admin_list_task_activity(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let activities =
         match crate::application::admin_task_activity::list_admin_task_activity(database).await {
             Ok(activities) => activities,
@@ -214,7 +210,7 @@ pub(crate) async fn admin_list_task_activity(
 pub(crate) async fn admin_list_library_pipeline_activity(
     headers: HeaderMap,
     Query(query): Query<AdminLibraryPipelineActivityQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -243,9 +239,7 @@ pub(crate) async fn admin_list_library_pipeline_activity(
         }
     };
     let page = offset / page_size + 1;
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match crate::application::admin_task_activity::list_admin_library_pipeline_activity(
         database, page, page_size,
     )
@@ -431,7 +425,7 @@ fn admin_task_activity_json(
 pub(crate) async fn admin_list_scheduled_tasks(
     headers: HeaderMap,
     Query(query): Query<AdminScheduledTasksQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -448,9 +442,7 @@ pub(crate) async fn admin_list_scheduled_tasks(
             .into_response();
         }
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match database.list_scheduled_task_configs(offset, limit).await {
         Ok((tasks, total)) => Json(json!({
             "scheduledTasks": tasks.iter().map(scheduled_task_json).collect::<Vec<_>>(),
@@ -466,7 +458,7 @@ pub(crate) async fn admin_list_scheduled_tasks(
 pub(crate) async fn admin_list_scheduled_task_plans(
     headers: HeaderMap,
     Query(query): Query<AdminScheduledTaskPlansQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -489,9 +481,7 @@ pub(crate) async fn admin_list_scheduled_task_plans(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_ascii_uppercase);
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match database
         .list_scheduled_task_plans(offset, limit, task_type.as_deref(), query.search.as_deref())
         .await
@@ -509,7 +499,7 @@ pub(crate) async fn admin_list_scheduled_task_plans(
 
 pub(crate) async fn admin_create_scheduled_task_plan(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AdminScheduledTaskPlanCreateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -553,9 +543,7 @@ pub(crate) async fn admin_create_scheduled_task_plan(
         Some(value) => Some(value.to_owned()),
         None => None,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let is_enabled = request.is_enabled.unwrap_or(schedule.is_some());
     let plan_request = crate::application::admin_scheduled_tasks::ScheduledTaskPlanCreate {
         task_type,
@@ -609,15 +597,13 @@ pub(crate) async fn admin_create_scheduled_task_plan(
 pub(crate) async fn admin_update_scheduled_task_plan(
     headers: HeaderMap,
     Path(plan_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AdminScheduledTaskPlanUpdateRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let update = crate::application::admin_scheduled_tasks::ScheduledTaskPlanUpdate {
         name: request.name,
         schedule: request.schedule,
@@ -670,14 +656,12 @@ pub(crate) async fn admin_update_scheduled_task_plan(
 pub(crate) async fn admin_delete_scheduled_task_plan(
     headers: HeaderMap,
     Path(plan_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match database.delete_scheduled_task_plan(&plan_id).await {
         Ok(true) => {
             record_audit_event(
@@ -712,17 +696,15 @@ pub(crate) async fn admin_delete_scheduled_task_plan(
 pub(crate) async fn admin_run_scheduled_task_plan(
     headers: HeaderMap,
     Path(plan_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let result = crate::application::admin_scheduled_tasks::run_scheduled_task_plan(
         database,
-        state.scheduled_tasks.as_ref(),
+        Some(state.scheduled_tasks()),
         &plan_id,
     )
     .await;
@@ -775,7 +757,7 @@ pub(crate) async fn admin_run_scheduled_task_plan(
 
 pub(crate) async fn admin_upsert_scheduled_task(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AdminScheduledTaskRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -845,9 +827,9 @@ pub(crate) async fn admin_upsert_scheduled_task(
         is_enabled: request.is_enabled,
     };
     let task = match crate::application::admin_scheduled_tasks::update_scheduled_task_config(
-        state.database.as_ref(),
-        state.libraries.as_ref(),
-        state.plugins.as_ref(),
+        Some(state.database()),
+        Some(state.libraries()),
+        Some(state.plugins()),
         update,
     )
     .await

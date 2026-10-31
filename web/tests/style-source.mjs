@@ -79,7 +79,10 @@ export function baseRule(selector) {
   let found = "";
 
   for (const file of files) {
-    const text = withoutMediaBlocks(readFileSync(file, "utf8"));
+    // Strip comments first so a `/* ... */` note above a rule does not become
+    // part of that rule's selector and hide it from the lookup.
+    const css = readFileSync(file, "utf8").replace(/\/\*[\s\S]*?\*\//g, " ");
+    const text = withoutMediaBlocks(css);
     const matcher = /([^{}]+)\{([^{}]*)\}/g;
     let match = matcher.exec(text);
     while (match !== null) {

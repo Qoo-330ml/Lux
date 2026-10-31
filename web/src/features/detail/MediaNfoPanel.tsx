@@ -227,7 +227,7 @@ export function MediaNfoPanel({
               {details?.studios?.length ? (
                 <div className="space-y-1.5">
                   <span className="text-[var(--lux-subtle)] block">出品机构</span>
-                  <div className="flex flex-wrap items-center gap-1.5 text-[var(--lux-muted)]">
+                  <div className="lux-media-nfo-studios flex flex-wrap items-center gap-1.5 text-[var(--lux-muted)]">
                     {displayedStudios.map((s) => (
                       <span key={s} className="lux-badge-pill">{s}</span>
                     ))}

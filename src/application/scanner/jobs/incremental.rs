@@ -247,7 +247,7 @@ impl ScanJobService {
         };
         if metadata.is_dir() {
             let mut created_items = 0_usize;
-            let mut walker = FileBatchWalker::new_with_sidecars(&media_path);
+            let mut walker = FileBatchWalker::new_with_sidecars(&media_path).await;
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 for file in files {
                     if cancellation.load(Ordering::Acquire) {

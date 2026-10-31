@@ -7,6 +7,9 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    application::transcoding::{
+        TranscodingSettings, read_transcoding_settings, write_transcoding_settings,
+    },
     application::{
         admin_dashboard::DEFAULT_SERVER_NAME,
         home::HomeService,
@@ -20,8 +23,6 @@ use crate::{
 };
 use tokio::fs;
 
-// The following versioned contract is exposed by LUX-803.
-#[allow(dead_code)]
 #[derive(Debug, Eq, PartialEq)]
 pub(crate) enum RegistrationModeError {
     InvalidMode,
@@ -29,7 +30,6 @@ pub(crate) enum RegistrationModeError {
     Unavailable,
 }
 
-#[allow(dead_code)]
 pub(crate) async fn read_registration_mode(
     database: &Database,
 ) -> Result<crate::storage::StoredRegistrationMode, RegistrationModeError> {
@@ -39,7 +39,6 @@ pub(crate) async fn read_registration_mode(
         .map_err(|_| RegistrationModeError::Unavailable)
 }
 
-#[allow(dead_code)]
 pub(crate) async fn update_registration_mode(
     database: &Database,
     mode: &str,
@@ -69,6 +68,16 @@ pub(crate) async fn update_registration_mode(
 }
 
 pub const NETWORK_PROXY_URL_FILE: &str = "network_proxy_url";
+/// Plugins listed here are started without the configured outbound proxy: the supervisor does not
+/// inject `LUX_PROXY_URL` and removes the proxy variables the child would otherwise inherit.
+///
+/// Some upstream APIs reject a proxy exit address while accepting the host's own address, and a
+/// proxy rule cannot fix that from inside Lux. One plugin id per line (a comma-separated single
+/// line also works).
+pub const PLUGIN_PROXY_BYPASS_FILE: &str = "plugin_proxy_bypass";
+/// Environment fallback for [`PLUGIN_PROXY_BYPASS_FILE`], used by container deployments that do not
+/// want to mount another file.
+pub const PLUGIN_PROXY_BYPASS_ENV: &str = "LUX_PLUGIN_PROXY_BYPASS";
 const MAX_TRUSTED_PROXY_CIDRS: usize = 100;
 pub const DEFAULT_LOGIN_BACKGROUND_SOURCE: &str = "STATIC";
 pub const RECENTLY_ADDED_LOGIN_BACKGROUND_SOURCE: &str = "RECENTLY_ADDED";
@@ -342,6 +351,7 @@ pub(crate) struct AdminSettingsSnapshot {
     pub(crate) login_background_source: String,
     pub(crate) login_background_source_status: String,
     pub(crate) media_strategy: MediaStrategySettings,
+    pub(crate) transcoding: TranscodingSettings,
     pub(crate) network_proxy: NetworkProxySettings,
 }
 
@@ -362,6 +372,7 @@ pub(crate) struct AdminSettingsUpdate {
     pub(crate) new_user_permissions: Option<NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
+    pub(crate) transcoding: Option<TranscodingSettings>,
     pub(crate) network_proxy: NetworkProxyChange,
 }
 
@@ -376,6 +387,7 @@ pub(crate) enum AdminSettingsError {
     InvalidUserActivityRetentionDays,
     InvalidTrustedProxyCidrs,
     InvalidNewUserPermissions,
+    InvalidTranscodingSettings,
     InvalidNetworkProxy,
     PluginServiceUnavailable,
     Plugin(PluginServiceError),
@@ -392,6 +404,7 @@ struct StoredAdminSettings {
     new_user_permissions: NewUserPermissions,
     login_background_source: String,
     media_strategy: MediaStrategySettings,
+    transcoding: TranscodingSettings,
 }
 
 pub(crate) async fn read_admin_settings(
@@ -421,6 +434,7 @@ pub(crate) async fn read_admin_settings(
         _ => DEFAULT_SERVER_NAME.to_owned(),
     };
     let network_proxy = network_proxy_settings(config_dir).await;
+    let transcoding = read_transcoding_settings(database).await;
     Ok(AdminSettingsSnapshot {
         server_name,
         resume_played_percent,
@@ -433,6 +447,7 @@ pub(crate) async fn read_admin_settings(
         login_background_source,
         login_background_source_status,
         media_strategy,
+        transcoding,
         network_proxy,
     })
 }
@@ -472,6 +487,12 @@ pub(crate) async fn update_admin_settings(
         }
     }
     let media_strategy = update.media_strategy.unwrap_or(current.media_strategy);
+    let transcoding = match update.transcoding {
+        Some(settings) => settings
+            .normalized()
+            .map_err(|_| AdminSettingsError::InvalidTranscodingSettings)?,
+        None => current.transcoding,
+    };
     let server_name = match update.server_name {
         Some(name) => normalize_server_name(&name).ok_or(AdminSettingsError::InvalidServerName)?,
         None => current.server_name,
@@ -586,6 +607,9 @@ pub(crate) async fn update_admin_settings(
     )
     .await
     .map_err(|_| AdminSettingsError::Unavailable)?;
+    write_transcoding_settings(database, &transcoding)
+        .await
+        .map_err(|_| AdminSettingsError::InvalidTranscodingSettings)?;
     let login_background_source_status =
         login_background_source_status(plugins, &login_background_source).await;
     let network_proxy = network_proxy_settings(config_dir).await;
@@ -601,6 +625,7 @@ pub(crate) async fn update_admin_settings(
         login_background_source,
         login_background_source_status,
         media_strategy,
+        transcoding,
         network_proxy,
     })
 }
@@ -625,6 +650,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         Some(name) if !name.trim().is_empty() => name,
         _ => DEFAULT_SERVER_NAME.to_owned(),
     };
+    let transcoding = read_transcoding_settings(database).await;
     Ok(StoredAdminSettings {
         server_name,
         resume_played_percent,
@@ -636,6 +662,7 @@ async fn read_stored_admin_settings(database: &Database) -> Result<StoredAdminSe
         new_user_permissions,
         login_background_source,
         media_strategy,
+        transcoding,
     })
 }
 
@@ -986,7 +1013,7 @@ pub(crate) async fn write_admin_settings(
         .await
         .map_err(|_| ())?;
     if let Some(home) = home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     Ok(())
 }
@@ -1013,6 +1040,42 @@ pub fn login_background_plugin_id(source: &str) -> Option<&str> {
 
 pub fn read_network_proxy_url(config_dir: &Path) -> Option<String> {
     read_secret(config_dir.join(NETWORK_PROXY_URL_FILE))
+}
+
+/// Plugin ids that must reach their upstream without the configured outbound proxy.
+///
+/// The file wins over the environment fallback so an operator can keep the list next to the proxy
+/// configuration; both accept one id per line or a comma-separated list.
+pub fn read_plugin_proxy_bypass(config_dir: &Path) -> Vec<String> {
+    let configured = std::fs::read_to_string(config_dir.join(PLUGIN_PROXY_BYPASS_FILE))
+        .ok()
+        .map(|value| parse_plugin_proxy_bypass(&value))
+        .filter(|ids| !ids.is_empty());
+    configured.unwrap_or_else(|| {
+        std::env::var(PLUGIN_PROXY_BYPASS_ENV)
+            .ok()
+            .map(|value| parse_plugin_proxy_bypass(&value))
+            .unwrap_or_default()
+    })
+}
+
+pub fn parse_plugin_proxy_bypass(value: &str) -> Vec<String> {
+    let mut ids = Vec::new();
+    for line in value.lines() {
+        // `#` starts a comment that runs to the end of the line.
+        let line = line.split('#').next().unwrap_or_default();
+        for candidate in line.split([',', ' ', '\t']) {
+            let candidate = candidate.trim();
+            if candidate.is_empty() {
+                continue;
+            }
+            let candidate = candidate.to_owned();
+            if !ids.contains(&candidate) {
+                ids.push(candidate);
+            }
+        }
+    }
+    ids
 }
 
 fn read_secret(path: impl AsRef<Path>) -> Option<String> {
@@ -1071,6 +1134,22 @@ async fn write_secret_file(
 #[cfg(test)]
 mod variant_cache_tests {
     use super::*;
+
+    #[test]
+    fn parses_a_proxy_bypass_list_from_lines_commas_and_comments() {
+        let parsed = parse_plugin_proxy_bypass(
+            "org.lux.theintrodb-chapter-source\n  org.lux.douban , # comment\r\norg.lux.tmdb\norg.lux.tmdb\n",
+        );
+        assert_eq!(
+            parsed,
+            vec![
+                "org.lux.theintrodb-chapter-source".to_owned(),
+                "org.lux.douban".to_owned(),
+                "org.lux.tmdb".to_owned(),
+            ]
+        );
+        assert!(parse_plugin_proxy_bypass("   \n ").is_empty());
+    }
 
     #[test]
     fn legacy_media_strategy_json_defaults_the_variant_cache_to_off() {

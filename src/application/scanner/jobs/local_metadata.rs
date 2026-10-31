@@ -146,7 +146,7 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_batch(
         }
     };
     if let Some(home) = home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     user_events.publish_home_coalesced().await;
 
@@ -216,7 +216,7 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_batch(
         Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     context.user_events.publish_home_coalesced().await;
 
@@ -327,7 +327,7 @@ pub(in crate::application::scanner) async fn process_scan_local_metadata_backfil
         .index_scan_local_metadata_batch_images(&page.entry_ids)
         .await;
     if let Some(home) = home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     user_events.publish_home_coalesced().await;
     let batch = result.map_err(|error| error.to_string())?;
@@ -395,7 +395,7 @@ pub(in crate::application::scanner) async fn finish_scan_local_metadata_backfill
         Err(error) => Err(error.to_string()),
     };
     if let Some(home) = context.home {
-        home.invalidate();
+        home.invalidate_directory();
     }
     context.user_events.publish_home_coalesced().await;
 
@@ -1337,7 +1337,7 @@ impl ScanJobService {
             "local metadata refresh finished"
         );
         if let Some(home) = &self.home {
-            home.invalidate();
+            home.invalidate_directory();
         }
         self.user_events.publish_home_coalesced().await;
     }

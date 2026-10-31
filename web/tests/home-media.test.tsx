@@ -93,7 +93,7 @@ describe("ContinueWatchingRail", () => {
       indexNumber: 5,
       runtimeTicks: 36_000_000_000,
       userData: {
-        positionTicks: 1_000_000_000,
+        positionTicks: 10_000_000_000,
         lastPlayedAt: Math.floor((Date.now() - 30 * 60 * 1000) / 1000),
       },
     };
@@ -108,7 +108,7 @@ describe("ContinueWatchingRail", () => {
 
     expect(container.querySelector(".lux-continue-primary strong")?.textContent).toBe("我不是大师");
     expect(container.querySelector(".lux-continue-context")?.textContent).toBe("S01E05·用魔法打败魔法");
-    expect(container.querySelector(".lux-continue-recency")?.textContent).toBe("半小时前看到这里");
+    expect(container.querySelector(".lux-continue-recency")?.textContent).toBe("半小时前停下的");
   });
 
   it("shows a movie title, remaining time, year, and recent viewing on separate lines", () => {
@@ -137,23 +137,51 @@ describe("ContinueWatchingRail", () => {
     expect(container.querySelector(".lux-continue-primary strong")?.textContent).toBe("蜘蛛侠：崭新之日");
     expect(container.querySelector(".lux-continue-remaining")?.textContent).toBe("还剩 1h 30m");
     expect(container.querySelector(".lux-continue-context")?.textContent).toBe("2026");
-    expect(container.querySelector(".lux-continue-recency")?.textContent).toBe("25 分钟前看到这里");
+    expect(container.querySelector(".lux-continue-recency")?.textContent).toBe("25 分钟前停下的");
   });
 
-  it("uses warm and timezone-local relative playback copy", () => {
-    const now = new Date(2026, 9, 17, 15, 0, 0);
+  it("varies playback copy by progress state, item type, and timezone-local time", () => {
+    const now = new Date(2026, 9, 17, 15, 0, 0).getTime();
     const at = (day: number, hour: number, minute = 0) =>
       Math.floor(new Date(2026, 9, day, hour, minute).getTime() / 1000);
+    const runtimeTicks = 36_000_000_000;
+    const movie = (lastPlayedAt?: number | null, positionTicks = 10_000_000_000) =>
+      ({ id: "m", itemType: "MOVIE", runtimeTicks, userData: { positionTicks, lastPlayedAt } });
+    const episode = (lastPlayedAt?: number | null, positionTicks = 10_000_000_000) =>
+      ({ id: "e", itemType: "EPISODE", runtimeTicks, userData: { positionTicks, lastPlayedAt } });
 
-    expect(recentPlaybackLabel(at(17, 14, 58), now.getTime())).toBe("刚才看到这里");
-    expect(recentPlaybackLabel(at(17, 14, 30), now.getTime())).toBe("半小时前看到这里");
-    expect(recentPlaybackLabel(at(17, 12, 30), now.getTime())).toBe("2 小时前看到这里");
-    expect(recentPlaybackLabel(at(17, 9), now.getTime())).toBe("今天上午看到这里");
-    expect(recentPlaybackLabel(at(16, 20), now.getTime())).toBe("昨天看到这里，接着来");
-    expect(recentPlaybackLabel(at(13, 10), now.getTime())).toBe("4 天前看到这里");
-    expect(recentPlaybackLabel(at(7, 10), now.getTime())).toBe("上次看到这里，回来接着看");
-    expect(recentPlaybackLabel(null, now.getTime())).toBeUndefined();
-    expect(recentPlaybackLabel(at(17, 16), now.getTime())).toBeUndefined();
+    expect(recentPlaybackLabel(movie(at(17, 14, 58)), now)).toBe("刚刚还在看");
+    expect(recentPlaybackLabel(movie(at(17, 14, 30)), now)).toBe("半小时前停下的");
+    expect(recentPlaybackLabel(movie(at(17, 14, 10)), now)).toBe("50 分钟前停下的");
+    expect(recentPlaybackLabel(movie(at(17, 12, 30)), now)).toBe("2 小时前停下的");
+    expect(recentPlaybackLabel(movie(at(17, 9)), now)).toBe("今天上午停在这里");
+    expect(recentPlaybackLabel(movie(at(17, 0, 30)), now)).toBe("今天上午停在这里");
+    expect(recentPlaybackLabel(movie(at(16, 20)), now)).toBe("昨晚看到这儿");
+    expect(recentPlaybackLabel(episode(at(16, 20)), now)).toBe("昨晚追到这里");
+    expect(recentPlaybackLabel(episode(at(16, 10)), now)).toBe("昨天上午追到这里");
+    expect(recentPlaybackLabel(movie(at(15, 10)), now)).toBe("前天看到这儿");
+    expect(recentPlaybackLabel(episode(at(15, 10)), now)).toBe("前天追到这里");
+    expect(recentPlaybackLabel(movie(at(13, 10)), now)).toBe("4 天前停下的");
+    expect(recentPlaybackLabel(movie(at(7, 10)), now)).toBe("搁置 1 周了");
+    expect(recentPlaybackLabel(movie(new Date(2026, 9, 1, 10).getTime() / 1000), now)).toBe("搁置 2 周了");
+    expect(recentPlaybackLabel(movie(new Date(2026, 7, 1, 10).getTime() / 1000), now)).toBe("好久没看了");
+    expect(recentPlaybackLabel(movie(null), now)).toBeUndefined();
+    expect(recentPlaybackLabel(movie(at(17, 16)), now)).toBeUndefined();
+  });
+
+  it("lets progress state take priority over the time phrase", () => {
+    const now = new Date(2026, 9, 17, 15, 0, 0).getTime();
+    const played = Math.floor(new Date(2026, 9, 16, 20).getTime() / 1000);
+    const item = (itemType: string, positionTicks: number, lastPlayedAt: number | null = played) =>
+      ({ id: "x", itemType, runtimeTicks: 36_000_000_000, userData: { positionTicks, lastPlayedAt } });
+
+    expect(recentPlaybackLabel(item("MOVIE", 33_000_000_000), now)).toBe("就差一点点了");
+    expect(recentPlaybackLabel(item("EPISODE", 33_000_000_000), now)).toBe("就差一点点了");
+    expect(recentPlaybackLabel(item("MOVIE", 1_000_000_000), now)).toBe("刚开了个头");
+    expect(recentPlaybackLabel(item("EPISODE", 0, null), now)).toBe("下一集在等你");
+    expect(recentPlaybackLabel(item("MOVIE", 0, null), now)).toBeUndefined();
+    expect(recentPlaybackLabel({ id: "x", itemType: "MOVIE", userData: { positionTicks: 100, lastPlayedAt: played } }, now))
+      .toBe("昨晚看到这儿");
   });
 
   it("shows HomeVideos progress and opens the video player from continue watching", () => {

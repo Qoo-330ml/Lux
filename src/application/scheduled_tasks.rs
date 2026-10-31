@@ -1,3 +1,4 @@
+use crate::application::library_deletion::LibraryDeletionService;
 use std::{
     collections::{HashMap, HashSet},
     fmt,
@@ -67,6 +68,7 @@ pub struct ScheduledTaskService {
     cursors: Arc<Mutex<HashMap<String, TaskCursor>>>,
     thumbnail_retry_semaphore: Arc<Semaphore>,
     worker: Arc<tokio::sync::Mutex<Option<super::background_loop::BackgroundLoop>>>,
+    library_deletion: Option<LibraryDeletionService>,
 }
 
 struct TaskCursor {
@@ -200,6 +202,7 @@ impl ScheduledTaskService {
             thumbnail_retry_semaphore: Arc::new(Semaphore::new(
                 THUMBNAIL_SCRAPER_RETRY_BATCH_SIZE as usize,
             )),
+            library_deletion: None,
             worker: Arc::new(tokio::sync::Mutex::new(None)),
         }
     }
@@ -223,6 +226,14 @@ impl ScheduledTaskService {
         self
     }
 
+    pub(crate) fn with_library_deletion(
+        mut self,
+        library_deletion: LibraryDeletionService,
+    ) -> Self {
+        self.library_deletion = Some(library_deletion);
+        self
+    }
+
     pub fn with_danmaku(mut self, danmaku: DanmakuService) -> Self {
         self.danmaku = Some(danmaku);
         self
@@ -242,6 +253,18 @@ impl ScheduledTaskService {
                 async move { run_scheduled_task_worker(service, shutdown).await }
             },
         ));
+    }
+
+    /// Starts queued library deletions once at startup instead of waiting for the
+    /// first scheduler tick. The loop's first tick is immediate today, but it is an
+    /// implicit dependency of `tokio::time::interval`, and `run_once` returns early on
+    /// a plan read failure, so a queued deletion could otherwise sit until the next
+    /// pass. Best effort: a storage error only logs.
+    pub(crate) async fn drain_queued_library_deletions(&self) {
+        let Some(deletion) = &self.library_deletion else {
+            return;
+        };
+        deletion.drain_pending().await;
     }
 
     /// Stops the scheduler loop and waits for the current pass.
@@ -359,6 +382,11 @@ impl ScheduledTaskService {
             tracing::warn!(%error, "due automatic metadata retries could not be scheduled");
         }
         self.run_due_thumbnail_scraper_retries().await;
+        // Library deletions are queued by the admin API and drained by this pass, so the
+        // request returns without touching the library's rows.
+        if let Some(deletion) = &self.library_deletion {
+            deletion.drain_pending().await;
+        }
         self.cursors
             .lock()
             .await

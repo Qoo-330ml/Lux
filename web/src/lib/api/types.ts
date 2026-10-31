@@ -36,6 +36,14 @@ export type LuxUser = {
   canDownload?: boolean;
 };
 
+// Body of POST /api/v1/setup/complete (docs/SETUP-RESTART-DESIGN.md §4/§5).
+// `restarting` is optional on purpose: backends that cannot schedule a restart
+// (or older builds) omit it, and the page then behaves as it did before.
+export type SetupCompleteResult = {
+  user: LuxUser;
+  restarting?: boolean;
+};
+
 export type UserPlaybackSettings = {
   playedPercent: number;
   preferencesVersion?: number;
@@ -351,27 +359,19 @@ export type CollectionDetailResponse = {
   total: number;
 };
 
-export type MetadataFieldName = "title" | "originalTitle" | "overview" | "productionYear";
+// The item metadata and image types are generated from the Rust DTOs so a renamed or
+// removed field fails `tsc` instead of a request at runtime. Regenerate with
+// `scripts/generate-api-types.sh`; `scripts/check-api-types.sh` fails on stale output.
+// The exported names below are unchanged for the rest of the Web app.
+export type { MetadataField as MetadataFieldName } from "./generated/MetadataField";
 
-export type ItemMetadata = {
-  title: string;
-  originalTitle?: string | null;
-  overview?: string | null;
-  productionYear?: number | null;
-  lockedFields: MetadataFieldName[];
-};
+export type { ItemMetadata } from "./generated/ItemMetadata";
 
-export type ItemImage = {
-  id: string;
-  itemId: string;
-  imageType: string;
-  imageIndex: number;
-  fileSize?: number | null;
-  contentTag?: string | null;
-  source?: string | null;
-  language?: string | null;
-  url: string;
-};
+export type { ItemImage } from "./generated/ItemImage";
+
+export type { ItemImagesResponse } from "./generated/ItemImagesResponse";
+
+export type { ItemImageSelectResponse } from "./generated/ItemImageSelectResponse";
 
 export type ImageSearchResult = {
   id: string;
@@ -468,7 +468,14 @@ export type WebPlaybackCapabilities = {
 };
 
 export type WebPlaybackPlan =
-  | { type: "DIRECT"; url: string; proxyUrl?: string | null; rangeUrl?: string | null }
+  | {
+      type: "DIRECT";
+      url: string;
+      proxyUrl?: string | null;
+      rangeUrl?: string | null;
+      /** Ordered Direct Play entries chosen by the server; `url`/`proxyUrl` remain for older servers. */
+      candidates?: { kind: string; url: string }[] | null;
+    }
   | { type: "SERVER_HLS"; manifestUrl: string; tier: number }
   | { type: "UNSUPPORTED"; reason: string };
 
@@ -479,6 +486,44 @@ export type WebPlaybackSession = {
   tier: number;
   expiresAt: number;
   plan: WebPlaybackPlan;
+};
+
+/** Live `ffmpeg -progress` values for a running server-side HLS transcode. */
+export type WebPlaybackProgress = {
+  generation: number;
+  frame: number | null;
+  fps: number | null;
+  bitrateKbps: number | null;
+  totalSize: number | null;
+  outTimeSeconds: number | null;
+  speed: number | null;
+  duplicatedFrames: number | null;
+  droppedFrames: number | null;
+  finished: boolean;
+  updatedAt: number;
+  /** Measured from the newest closed segment; `bitrateKbps` is usually null for HLS muxing. */
+  latestSegmentBitrateKbps: number | null;
+  /** Total bytes written by the session directory. */
+  directoryBytes: number | null;
+  averageBitrateKbps: number | null;
+};
+
+export type WebPlaybackSessionStats = {
+  sessionId: string;
+  playSessionId: string;
+  sourceId: string | null;
+  plan: "DIRECT" | "SERVER_HLS" | string;
+  tier: number;
+  state: string;
+  expiresAt: number;
+  output: {
+    container: string | null;
+    videoCodec: string | null;
+    audioCodec: string | null;
+    videoBitrate: number | null;
+    audioBitrate: number | null;
+  };
+  progress: WebPlaybackProgress | null;
 };
 
 export type WebPlaybackTrackSelection = {
@@ -493,12 +538,7 @@ export type WebPlaybackBootstrap = {
 };
 
 /** Metadata for a registered, same-origin Lux Web danmaku sidecar. */
-export type WebDanmakuInfo = {
-  available: true;
-  format: "BILIBILI_XML";
-  sourceId: string | null;
-  rawUrl: string;
-};
+export type { WebDanmakuInfo } from "./generated/WebDanmakuInfo";
 
 export type AdminRoot = {
   id: string;
@@ -594,6 +634,7 @@ export type ChapterSource = {
 };
 
 export type AdminPluginStore = {
+  urls: string[];
   url: string;
   defaultUrl: string;
 };
@@ -1132,6 +1173,7 @@ export type AdminPlaybackSession = {
   parentIndexNumber?: number | null;
   indexNumber?: number | null;
   posterAvailable: boolean;
+  posterItemId?: string | null;
   positionTicks: number;
   durationTicks?: number | null;
   state: "PLAYING" | "PAUSED" | string;
@@ -1478,6 +1520,110 @@ export type AdminImage = {
   source?: string | null;
 };
 
+export type AdminTranscodingSettings = {
+  enabled: boolean;
+  hardwareEncoder: string;
+  remuxSessions: number;
+  hardwareSessions: number;
+  softwareSessions: number;
+  sessionQuotaMb: number;
+  globalBudgetMb: number;
+  minFreeSpaceMb: number;
+  maxVideoBitrateKbps: number;
+  softwarePreset: string;
+  maxOutputHeight: number;
+  audioBitrateKbps: number;
+  hardwareDevice: string;
+  hardwareDecode: boolean;
+};
+
+export type AdminTranscodingStatus = {
+  encoder: string | null;
+  available: boolean;
+  /** Milliseconds since the epoch; 0 means "not checked yet". */
+  checkedAt: number;
+  error: string | null;
+};
+
+export type AdminTranscodingSessionProgress = {
+  fps: number | null;
+  speed: number | null;
+  bitrateKbps: number | null;
+  latestSegmentBitrateKbps: number | null;
+  averageBitrateKbps: number | null;
+  directoryBytes: number | null;
+  outTimeSeconds: number | null;
+  droppedFrames: number | null;
+  finished: boolean;
+  updatedAt: number;
+};
+
+export type AdminTranscodingSession = {
+  sessionId: string;
+  playSessionId: string | null;
+  userId: string;
+  userName: string | null;
+  itemId: string;
+  title: string | null;
+  itemType: string | null;
+  tier: number;
+  state: string;
+  container: string | null;
+  videoCodec: string | null;
+  audioCodec: string | null;
+  audioBitrate: number | null;
+  createdAt: number;
+  updatedAt: number;
+  expiresAt: number;
+  progress: AdminTranscodingSessionProgress | null;
+};
+
+export type AdminTranscodingSessions = {
+  sessions: AdminTranscodingSession[];
+  summary: {
+    activeCount: number;
+    hardwareCount: number;
+    softwareCount: number;
+    streamCopyCount: number;
+    outputBytes: number;
+  };
+};
+
+export type AdminTranscodingOutcome = "COMPLETED" | "FAILED" | "EXPIRED" | string;
+
+export type AdminTranscodingHistoryItem = {
+  id: string;
+  sessionId: string;
+  userId: string;
+  userName: string | null;
+  itemId: string;
+  title: string | null;
+  itemType: string | null;
+  mediaSourceId: string | null;
+  tier: number;
+  outcome: AdminTranscodingOutcome;
+  startedAt: number;
+  finishedAt: number;
+  wallSeconds: number;
+  encodedSeconds: number | null;
+  averageSpeed: number | null;
+  lastFps: number | null;
+  outputBytes: number | null;
+  failureReason: string | null;
+};
+
+export type AdminTranscodingHistoryPage = {
+  page: number;
+  pageSize: number;
+  total: number;
+  items: AdminTranscodingHistoryItem[];
+};
+
+export type AdminTranscodingOptions = {
+  hardwareEncoders: string[];
+  softwarePresets: string[];
+};
+
 export type AdminSettings = {
   serverName?: string;
   resumePlayedPercent: number;
@@ -1490,6 +1636,9 @@ export type AdminSettings = {
   loginBackgroundSource: LoginBackgroundSource;
   loginBackgroundSourceStatus?: string;
   mediaStrategy: MediaStrategySettings;
+  transcoding?: AdminTranscodingSettings;
+  transcodingStatus?: AdminTranscodingStatus | null;
+  transcodingOptions?: AdminTranscodingOptions;
   networkProxy?: AdminNetworkProxySettings;
 };
 

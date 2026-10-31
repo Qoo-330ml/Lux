@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/settings/registration",
@@ -11,6 +11,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/admin/settings",
             get(admin_settings).patch(admin_update_settings),
+        )
+        .route(
+            "/api/v1/admin/settings/transcoding/probe",
+            post(admin_probe_transcoding),
         )
         .route(
             "/api/v1/admin/settings/mail",
@@ -48,14 +52,12 @@ fn registration_settings_response(settings: crate::storage::StoredRegistrationMo
 
 async fn admin_get_registration_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match crate::application::settings::read_registration_mode(database).await {
         Ok(settings) => registration_settings_response(settings),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -64,7 +66,7 @@ async fn admin_get_registration_settings(
 
 async fn admin_update_registration_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     payload: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -98,9 +100,7 @@ async fn admin_update_registration_settings(
     if request.version.is_some_and(|version| version < 0) {
         return invalid();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let Some(mode) = request.registration_mode else {
         return match crate::application::settings::read_registration_mode(database).await {
             Ok(settings) => registration_settings_response(settings),
@@ -139,7 +139,7 @@ async fn admin_update_registration_settings(
 
 pub(crate) async fn admin_get_mail_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -166,7 +166,7 @@ pub(crate) async fn admin_get_mail_settings(
 
 pub(crate) async fn admin_update_mail_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(settings): Json<crate::application::mail::MailSettings>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -199,7 +199,7 @@ pub(crate) async fn admin_update_mail_settings(
 
 pub(crate) async fn admin_update_mail_credentials(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(credentials): Json<crate::application::mail::SmtpCredentials>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -232,7 +232,7 @@ pub(crate) async fn admin_update_mail_credentials(
 
 pub(crate) async fn admin_delete_mail_credentials(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -248,7 +248,7 @@ pub(crate) async fn admin_delete_mail_credentials(
 
 pub(crate) async fn admin_test_mail_connection(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -294,16 +294,38 @@ pub(crate) async fn admin_test_mail_connection(
     }
 }
 
-pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
+/// Re-runs the hardware encoder self-test on demand.
+pub(crate) async fn admin_probe_transcoding(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    if let Err(response) = require_admin(&headers, &state, true).await {
+        return response;
+    }
+    let service = state.web_playback();
+    let status = service.refresh_hardware_status().await;
+    Json(json!({
+        "transcodingStatus": {
+            "encoder": status.encoder,
+            "available": status.available,
+            "checkedAt": status.checked_at_ms,
+            "error": status.error,
+        }
+    }))
+    .into_response()
+}
+
+pub(crate) async fn admin_settings(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let settings = match crate::application::settings::read_admin_settings(
         database,
-        state.plugins.as_ref(),
+        Some(state.plugins()),
         state.config_dir.as_deref(),
     )
     .await
@@ -311,7 +333,15 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         Ok(settings) => settings,
         Err(()) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    Json(json!({
+    let status = Some(state.web_playback().hardware_status());
+    Json(admin_settings_json(&settings, status.as_ref())).into_response()
+}
+
+pub(crate) fn admin_settings_json(
+    settings: &crate::application::settings::AdminSettingsSnapshot,
+    hardware_status: Option<&crate::application::playback::hls::HardwareEncoderStatus>,
+) -> Value {
+    json!({
         "serverName": settings.server_name,
         "resumePlayedPercent": settings.resume_played_percent,
         "resumeMinTicks": settings.resume_min_ticks,
@@ -323,9 +353,22 @@ pub(crate) async fn admin_settings(headers: HeaderMap, State(state): State<AppSt
         "loginBackgroundSource": settings.login_background_source,
         "loginBackgroundSourceStatus": settings.login_background_source_status,
         "mediaStrategy": settings.media_strategy,
+        "transcoding": settings.transcoding,
+        "transcodingStatus": hardware_status.map(|status| json!({
+            "encoder": status.encoder,
+            "available": status.available,
+            "checkedAt": status.checked_at_ms,
+            "error": status.error,
+        })),
+        // Advertised so the admin UI never hard-codes a list the server would reject.
+        "transcodingOptions": {
+            "hardwareEncoders": crate::application::transcoding::offered_hardware_encoders(
+                &settings.transcoding.hardware_encoder,
+            ),
+            "softwarePresets": crate::application::transcoding::SOFTWARE_PRESETS,
+        },
         "networkProxy": settings.network_proxy,
-    }))
-    .into_response()
+    })
 }
 
 #[derive(Deserialize, Default)]
@@ -356,7 +399,7 @@ pub(crate) struct NetworkProxyProbeResponse {
 
 pub(crate) async fn admin_test_network_proxy(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<NetworkProxyTestRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -428,20 +471,19 @@ pub(crate) struct UpdatePlaybackSettingsRequest {
     pub(crate) new_user_permissions: Option<crate::application::settings::NewUserPermissions>,
     pub(crate) login_background_source: Option<String>,
     pub(crate) media_strategy: Option<MediaStrategySettings>,
+    pub(crate) transcoding: Option<crate::application::transcoding::TranscodingSettings>,
     #[serde(flatten)]
     pub(crate) extra: BTreeMap<String, Value>,
 }
 
 pub(crate) async fn admin_get_api_key(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin_web_session(&headers, &state, false).await {
         return response;
     }
-    let Some(service) = state.admin_api_key.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = state.admin_api_key();
     match service.current().await {
         Ok(api_key) => Json(json!({
             "configured": api_key.is_some(),
@@ -454,14 +496,12 @@ pub(crate) async fn admin_get_api_key(
 
 pub(crate) async fn admin_rotate_api_key(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin_web_session(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.admin_api_key.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = state.admin_api_key();
     match service.rotate().await {
         Ok(api_key) => {
             record_audit_event(
@@ -485,14 +525,12 @@ pub(crate) async fn admin_rotate_api_key(
 
 pub(crate) async fn admin_revoke_api_key(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin_web_session(&headers, &state, true).await {
         return response;
     }
-    let Some(service) = state.admin_api_key.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = state.admin_api_key();
     match service.revoke().await {
         Ok(()) => {
             record_audit_event(
@@ -512,15 +550,13 @@ pub(crate) async fn admin_revoke_api_key(
 
 pub(crate) async fn admin_update_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<UpdatePlaybackSettingsRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let network_proxy = match request.extra.get("networkProxyUrl") {
         None => crate::application::settings::NetworkProxyChange::Unchanged,
         Some(Value::Null) => crate::application::settings::NetworkProxyChange::Set(None),
@@ -531,8 +567,8 @@ pub(crate) async fn admin_update_settings(
     };
     let settings = match crate::application::settings::update_admin_settings(
         database,
-        state.home.as_ref(),
-        state.plugins.as_ref(),
+        Some(state.home()),
+        Some(state.plugins()),
         state.config_dir.as_deref(),
         crate::application::settings::AdminSettingsUpdate {
             server_name: request.server_name,
@@ -545,6 +581,7 @@ pub(crate) async fn admin_update_settings(
             new_user_permissions: request.new_user_permissions,
             login_background_source: request.login_background_source,
             media_strategy: request.media_strategy,
+            transcoding: request.transcoding,
             network_proxy,
         },
     )
@@ -620,6 +657,15 @@ pub(crate) async fn admin_update_settings(
             )
             .into_response();
         }
+        Err(crate::application::settings::AdminSettingsError::InvalidTranscodingSettings) => {
+            return api_error(
+                &headers,
+                StatusCode::BAD_REQUEST,
+                lux::ApiErrorCode::InvalidRequest,
+                "服务端转码设置无效",
+            )
+            .into_response();
+        }
         Err(crate::application::settings::AdminSettingsError::InvalidNetworkProxy) => {
             return api_error(
                 &headers,
@@ -642,31 +688,24 @@ pub(crate) async fn admin_update_settings(
             return plugin_error(&headers, error);
         }
     };
-    if let Some(variants) = state.image_variants.as_ref() {
+    {
+        let variants = state.image_variants();
         variants.apply_settings(settings.media_strategy.images.variant_cache.clone());
     }
+    let hardware_status = {
+        let web_playback = state.web_playback();
+        web_playback.apply_transcoding_settings(&settings.transcoding);
+        // Re-run the self-test so the response and the capability flags agree immediately.
+        Some(web_playback.refresh_hardware_status().await)
+    };
     record_audit_event(
         &state,
         &headers,
         "SETTINGS_UPDATED",
         Some("settings"),
         None,
-        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"userActivityRetentionDays":{},"loginBackgroundSource":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.user_activity_retention_days, settings.login_background_source),
+        &format!(r#"{{"resumePlayedPercent":{},"resumeMinTicks":{},"forceAdminLibraryOrder":{},"userDeletionGraceDays":{},"userActivityRetentionDays":{},"loginBackgroundSource":"{}","transcodingEnabled":{},"transcodingPreset":"{}"}}"#, settings.resume_played_percent, settings.resume_min_ticks, settings.force_admin_library_order, settings.user_deletion_grace_days, settings.user_activity_retention_days, settings.login_background_source, settings.transcoding.enabled, settings.transcoding.software_preset),
     )
     .await;
-    Json(json!({
-        "serverName": settings.server_name,
-        "resumePlayedPercent": settings.resume_played_percent,
-        "resumeMinTicks": settings.resume_min_ticks,
-        "forceAdminLibraryOrder": settings.force_admin_library_order,
-        "userDeletionGraceDays": settings.user_deletion_grace_days,
-        "userActivityRetentionDays": settings.user_activity_retention_days,
-        "trustedProxyCidrs": settings.trusted_proxy_cidrs,
-        "newUserPermissions": settings.new_user_permissions,
-        "loginBackgroundSource": settings.login_background_source,
-        "loginBackgroundSourceStatus": settings.login_background_source_status,
-        "mediaStrategy": settings.media_strategy,
-        "networkProxy": settings.network_proxy,
-    }))
-    .into_response()
+    Json(admin_settings_json(&settings, hardware_status.as_ref())).into_response()
 }

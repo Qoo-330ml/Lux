@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route("/api/v1/libraries", get(lux_list_libraries))
         .route(
@@ -99,6 +99,10 @@ pub(super) fn api_routes() -> Router<AppState> {
         .route(
             "/api/v1/playback/sessions/{session_id}/heartbeat",
             post(lux_web_playback_heartbeat),
+        )
+        .route(
+            "/api/v1/playback/sessions/{session_id}/stats",
+            get(lux_web_playback_stats),
         )
         .route(
             "/api/v1/playback/sessions/{session_id}/direct",

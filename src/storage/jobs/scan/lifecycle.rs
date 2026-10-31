@@ -16,13 +16,7 @@ impl Database {
                 .lock_scan_fingerprint_migration_state(&mut transaction, library_id)
                 .await?
             {
-                transaction
-                    .rollback()
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?;
+                transaction.rollback().await.map_err(self.sqlx_err())?;
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 continue;
             }
@@ -40,17 +34,8 @@ impl Database {
             .bind(database_flag(auto_metadata_match))
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(());
         }
         Err(StorageError::Conflict(
@@ -71,10 +56,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_scan_job_if_idle(&self, id: &str) -> Result<bool, StorageError> {
@@ -94,10 +76,7 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -117,11 +96,10 @@ impl Database {
         .bind(id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_scan_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())?
+        .map(stored_scan_job)
+        .transpose()
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_jobs(
@@ -162,11 +140,11 @@ impl Database {
             .fetch_all(&self.pool)
             .await
         };
-        rows.map(|rows| rows.into_iter().map(stored_scan_job).collect())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+        rows.map_err(self.sqlx_err())?
+            .into_iter()
+            .map(stored_scan_job)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_jobs_for_library_deletion(
@@ -189,11 +167,11 @@ impl Database {
         .bind(library_id)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_scan_job).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_scan_job)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn count_scan_jobs_by_status(
@@ -211,10 +189,7 @@ impl Database {
             running: row.get("running"),
             failed: row.get("failed"),
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_jobs_for_activity(
@@ -236,11 +211,11 @@ impl Database {
         .bind(limit)
         .fetch_all(&self.pool)
         .await
-        .map(|rows| rows.into_iter().map(stored_scan_job).collect())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())?
+        .into_iter()
+        .map(stored_scan_job)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_scan_job_ids_needing_resume(
@@ -254,10 +229,7 @@ impl Database {
         )
         .fetch_all(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_active_scan_job_for_library(
@@ -278,11 +250,10 @@ impl Database {
         .bind(library_id)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_scan_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())?
+        .map(stored_scan_job)
+        .transpose()
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn find_active_scan_job(
@@ -305,11 +276,10 @@ impl Database {
         .bind(job_type)
         .fetch_optional(&self.pool)
         .await
-        .map(|row| row.map(stored_scan_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())?
+        .map(stored_scan_job)
+        .transpose()
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn has_active_scan_job_type(
@@ -326,10 +296,81 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
+    }
+
+    /// Lists the libraries whose first scan a shutdown cancelled before it could finish.
+    ///
+    /// The predicate reuses the project-wide "`CANCELLED` + `SERVER_SHUTDOWN` means resumable"
+    /// convention and adds the first-scan specifics: the library is still enabled, it was never
+    /// scanned (`last_scan_at IS NULL`), it still has a root, and no scan is active for it.
+    ///
+    /// The stored `library_roots.is_available` flag is deliberately *not* part of the predicate: it
+    /// is only written by the scan path, so it is stale after a mount dropped and came back. The
+    /// application layer probes the roots right before queueing instead.
+    ///
+    /// Only the **latest** `RECONCILE_LIBRARY` scan of a library counts. A recovery that creates a
+    /// replacement job which then fails (`FAILED`) must not be retried on every startup, so an older
+    /// cancelled row may not speak for the library any more. `(created_at, id)` is the creation
+    /// order: the ids are UUIDv7 and compare correctly as text, and the tuple comparison keeps the
+    /// query portable between SQLite and PostgreSQL.
+    /// How many `RECONCILE_LIBRARY` scans of the library a shutdown interrupted.
+    ///
+    /// The first-scan recovery uses it as a retry budget: a scan that keeps killing the process
+    /// (OOM, `SIGKILL`) is cancelled with `SERVER_SHUTDOWN` on every startup and never becomes
+    /// `FAILED`, so without a cap the recovery would queue it again forever.
+    pub(crate) async fn count_shutdown_interrupted_first_scans(
+        &self,
+        library_id: &str,
+    ) -> Result<i64, StorageError> {
+        self.query_scalar(
+            "SELECT COUNT(*) FROM scan_jobs
+             WHERE library_id = ? AND job_type = 'RECONCILE_LIBRARY'
+               AND status = 'CANCELLED' AND error = 'SERVER_SHUTDOWN'",
+        )
+        .bind(library_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
+    pub(crate) async fn list_shutdown_interrupted_first_scan_library_ids(
+        &self,
+        after_library_id: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<String>, StorageError> {
+        self.query_scalar(
+            "SELECT jobs.library_id
+             FROM scan_jobs jobs
+             JOIN libraries lib ON lib.id = jobs.library_id
+             WHERE jobs.job_type = 'RECONCILE_LIBRARY'
+               AND jobs.status = 'CANCELLED'
+               AND jobs.error = 'SERVER_SHUTDOWN'
+               AND lib.is_enabled = 1
+               AND lib.last_scan_at IS NULL
+               AND EXISTS (SELECT 1 FROM library_roots root WHERE root.library_id = lib.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_jobs newer
+                   WHERE newer.library_id = jobs.library_id
+                     AND newer.job_type = 'RECONCILE_LIBRARY'
+                     AND (newer.created_at, newer.id) > (jobs.created_at, jobs.id)
+               )
+               AND NOT EXISTS (
+                   SELECT 1 FROM scan_jobs active
+                   WHERE active.library_id = jobs.library_id
+                     AND active.status IN ('PENDING', 'RUNNING')
+               )
+               AND (? IS NULL OR jobs.library_id > ?)
+             GROUP BY jobs.library_id
+             ORDER BY jobs.library_id
+             LIMIT ?",
+        )
+        .bind(after_library_id)
+        .bind(after_library_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn has_running_scan_job_type(
@@ -345,10 +386,7 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map(|value: i64| value != 0)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn claim_scan_job(&self, id: &str) -> Result<bool, StorageError> {
@@ -362,10 +400,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_scan_job_progress(
@@ -385,10 +420,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn update_scan_job_activity(
@@ -409,10 +441,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn scan_job_cancel_requested(&self, id: &str) -> Result<bool, StorageError> {
@@ -421,10 +450,7 @@ impl Database {
             .fetch_one(&self.pool)
             .await
             .map(|value: i64| value != 0)
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn request_scan_job_cancel(&self, id: &str) -> Result<(), StorageError> {
@@ -437,10 +463,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn finish_scan_job(
@@ -465,10 +488,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn mark_scan_job_postprocessing(&self, id: &str) -> Result<(), StorageError> {
@@ -484,24 +504,14 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn complete_scan_job_postprocessing(
         &self,
         id: &str,
     ) -> Result<bool, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         let result = self
             .query(
                 "UPDATE scan_jobs
@@ -532,10 +542,7 @@ impl Database {
             .bind(id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if result.rows_affected() == 1 {
             self.query(
                 "UPDATE scan_manifests
@@ -547,18 +554,9 @@ impl Database {
             .bind(id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -597,10 +595,7 @@ impl Database {
             .bind(id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -614,32 +609,17 @@ impl Database {
             .bind(id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .flatten();
         let Some(library_id) = library_id else {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         };
         if !self
             .lock_scan_fingerprint_migration_state(&mut transaction, &library_id)
             .await?
         {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         let result = self
@@ -679,17 +659,8 @@ impl Database {
             .bind(id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -700,32 +671,17 @@ impl Database {
             .bind(id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .flatten();
         let Some(library_id) = library_id else {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         };
         if !self
             .lock_scan_fingerprint_migration_state(&mut transaction, &library_id)
             .await?
         {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(false);
         }
         let result = self
@@ -739,17 +695,8 @@ impl Database {
             .bind(id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 }

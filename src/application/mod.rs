@@ -18,8 +18,10 @@ pub(crate) mod background_loop;
 pub(crate) mod background_work;
 pub mod candidates;
 pub mod catalog;
+pub(crate) mod catalog_read_model;
 pub mod chapter_detector;
 pub mod collections;
+pub mod container_gateway;
 pub(crate) mod content_restriction_index;
 pub mod danmaku;
 pub mod database_diagnostics;
@@ -55,6 +57,8 @@ pub mod nfo;
 pub(crate) mod notification_template;
 pub mod people;
 pub mod playback;
+pub(crate) mod playback_history_retention;
+pub(crate) mod playback_progress;
 pub mod plugin_compat;
 pub mod plugin_protocol;
 pub mod plugin_runtime;
@@ -80,22 +84,26 @@ pub mod strm_probe_policy;
 pub mod strm_target;
 pub(crate) mod thumbnail_policy;
 pub mod thumbnails;
+pub(crate) mod transcoding;
 pub(crate) mod user_access_rules;
 pub(crate) mod user_account_preferences;
 pub mod user_avatars;
 pub(crate) mod user_cleanup;
 pub(crate) mod user_content_restrictions;
-// LUX-790 consumes these invitation operations in the admin API.
-#[allow(dead_code)]
-pub(crate) mod user_invitations;
-// LUX-809 connects public registration endpoints to this service.
-#[allow(dead_code)]
 pub(crate) mod user_email_verification;
-#[allow(dead_code)]
-pub(crate) mod user_registration;
-// The next API task consumes this service; keep this task limited to its storage and business model.
+pub(crate) mod user_invitations;
 pub(crate) mod user_permission_copy;
-#[allow(dead_code)]
 pub(crate) mod user_presets;
+pub(crate) mod user_registration;
 pub mod watch;
 pub mod webhooks;
+
+/// Resolves the process-wide probes that read the filesystem the first time they are used.
+///
+/// Blocking. Call it from a blocking thread before the HTTP state is built: otherwise the first
+/// admin settings request pays for the device probe and the first scan or request pays for
+/// canonicalizing `LUX_SYMLINK_TARGET_ROOTS`, both on a Tokio worker.
+pub fn warm_up_startup_probes() {
+    transcoding::warm_up();
+    scanner::warm_up_symlink_policy();
+}

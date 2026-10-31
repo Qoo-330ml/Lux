@@ -1,5 +1,21 @@
 # Lux 客户端兼容性矩阵
 
+## gzip 压缩与搜索总数快路径（2026-10-29）
+
+- JSON 响应可能带 `Content-Encoding: gzip`：只压缩“成功、`application/json`、已知长度 ≤4 MiB”的响应；
+  媒体流、图片、SPA 回退、SSE 与 Range 请求不受影响。ETag 仍基于**未压缩** body，`If-None-Match` 命中
+  返回 304 且不压缩；响应同时带 `Cache-Control: private, no-cache`。`tower-http` 的 `compression-gzip`
+  及三个纯 Rust 传递依赖（`async-compression` / `compression-codecs` / `compression-core`）已由所有者批准。
+- 搜索新增 `count=false`（Lux `/api/v1/search`）与 Emby `EnableTotalRecordCount=false`：返回的条目与排序
+  不变，`total` / `TotalRecordCount` 报 0，后端跳过总数计算。默认（不传）仍返回精确总数与现有排序。
+## W4 PostgreSQL 搜索入队（2026-10-29）
+
+PostgreSQL 的 `media_search` 派生索引不再在写语句里同步维护：迁移 `0239_search_reindex_outbox.sql`
+把 `media_items` / `item_aliases` 的刷新触发器换成语句级入队触发器，只向
+`catalog_outbox(kind='search')` 追加，由 `search_reindex@1` 消费者重建（迁移 `0243`/`0245` 之后改为独立的 `search_outbox` 表与 `search_reindex@2` 消费者，见下方“search_outbox 拆表”）。Lux/Emby API、DTO 与数据库对外
+模型不变；差异只在“写入后到消费者运行之间”的索引可见性：搜索请求进入匹配前仍会做一次有界排空
+（每请求最多 200 条），读己之写保持；后台 worker 每拍 500 条处理扫描积压。升级时为没有 `media_search`
+行的条目补一次入队，不会留下永久未索引的尾巴。SQLite 侧行为不变。
 ## PostgreSQL 迁移 208 启动修复（2026-10-22）
 
 `0208_content_restriction_index_queue.sql` 删除旧触发器时缺少 PostgreSQL 必需的
@@ -71,6 +87,14 @@ IPv4/IPv6；`Forwarded` 按 [RFC 7239](https://www.rfc-editor.org/rfc/rfc7239.ht
 转发头不改变 ACL 使用的 IP；`X-Real-IP`、`Forwarded` 和 `X-Forwarded-Proto` 不参与 IP 黑名单判定。
 因此展示的 `remoteIp` 与 IP/CIDR 封禁所用访问 IP 可能不同，显示为真实地址本身不能证明黑名单已命中。
 反向代理未传递可验证的对端/转发链时，Lux 无法恢复未提供的客户端地址。
+
+容器部署例外（隐式可信代理）：Docker 桥接网络下发布端口会改写源地址，连接对端恒为网桥网关
+（`172.17.0.1`、`172.18.0.1`、`172.31.0.1` …，随地址池变化）。Lux 在检测到自身运行于容器
+（`/.dockerenv`、`/run/.containerenv` 或 cgroup 容器标记）时，把 `/proc/net/route` /
+`/proc/net/ipv6_route` 中的默认网关作为单个 `/32` 或 `/128` 隐式可信代理并入解析列表。
+该信任只覆盖网关主机地址，不覆盖整个网桥网段，管理员配置的 `trustedProxyCidrs` 仍是叠加项；
+非容器部署不启用该逻辑，行为与之前完全一致。因此 Docker 部署无需再手工填写网段配置。
+网关自身无法区分的场景（客户端直接连接发布端口、不经任何反代）仍只能显示网关地址。
 
 自动化验证范围：本机 ARM64/SQLite，真实回环 HTTP 的根路径及 `/emby` 播放回调、
 数据库 `playback_sessions.remote_ip` 和 `/Sessions` 的 `RemoteEndPoint`；可信代理链、伪造头和 IP 黑名单另有解析/认证/播放回归，
@@ -1147,6 +1171,11 @@ U 表示有效用户 token，K 表示有效静态 key。query 名称大小写不
 
 实测 Emby 不把 query `apiKey` 或 query `X-MediaBrowser-Token` 当作标准来源。为保留现有 Lux 客户端合同，Lux 将它们作为所有标准来源为空时的扩展回退；历史 `X-Lux-Api-Key`、`X-Emby-Authentication` 和 Authorization 的 Bearer/原始 token 也仅作扩展回退。选中的 query token 按原始凭据处理，不把其中的 `Bearer ` 或 `Token=` 当作 header 语法。
 
+共享管理员静态 key 的 query 回退只允许只读媒体请求：`/api/v1` 下的 stream/download/image/subtitle/hls 路径，
+以及 Emby 媒体路径（`/Videos/...`、`/emby/Videos/...`、`/Audio/...`、`/Items/.../Images/...`）。`/api/v1/auth/me`、
+`/api/v1/items`、`/Search/Hints` 等非媒体路径必须改用 header 或 Bearer，query 中的 key 不再被接受。共享 key 没有用户身份，
+因此媒体流请求不参与按用户的并发播放准入；它仍不能写入播放 URL 或读取管理员端点。
+
 请求内选中的凭据只在 Emby 路由内部传递，外部同名内部 header 会被清除；该内部 header 不会转发给插件，也不会作为 header 输出到响应或日志。既有用户、媒体库 ACL 与 HMAC 播放票据验证保持不变；签名播放票据继续使用原有独立授权路径。PlaybackInfo 使用实际选中的用户 token 生成 `.strm` 签名播放 URL，低优先级 Lux key header 不再抑制它；管理员共享 key 仍禁止写入播放 URL。
 
 本机验证（Toshiba 已挂载，macOS `arm64`，所有 Cargo 命令使用 `CARGO_TARGET_DIR=/Volumes/Toshiba/mywork/Lux/target`）：
@@ -1269,3 +1298,104 @@ Web 将这些任务显示为“已完成，有问题”，提示“索引已完�
 可触发入口为已授权的 Web/Emby 实际播放 GET，以及已授权的 Emby `PLAYING` 回调；PlaybackInfo、HEAD、浏览详情、暂停和停止回调不触发。播放只排队当前来源，不扩展为全库扫描。单来源范围由 SQLite/PostgreSQL 迁移持久化，普通全库与扫描增量任务范围保持不变。
 
 本机 macOS `arm64` 服务端验证：`playback` 5/5、`playback_strm_probe` 1/1、`strm` 1/1、`strm_probe` 4/4、`strm_probe_api` 2/2、`web_playback` 1/1；另有扫描范围重试锁回归 1/1。完整 Rust 门禁的 4 个失败已在干净 `test` 基线上复现，完整 Clippy 尚有既有诊断；未验证 FNOS/NAS、真实远程媒体服务器或第三方播放器，因此不代表部署环境链路已验证。
+
+## LUX-869：搜索语义矩阵（2026-10-27）
+
+搜索在两个后端走不同索引，但必须给出同一结果集。本轮把差异逐项核对并补齐：
+
+| 维度 | SQLite | PostgreSQL | 处理 |
+| --- | --- | --- | --- |
+| 索引 | FTS5 `media_search`（触发器 + `media_search_map` 行号映射） | `media_search` 表 + `pg_trgm` GIN（`title`/`original_title`/`aliases`） | 各自使用，不共享 DDL |
+| 词元命中 | 先 `MATCH`（整词/短语，`AND` 连接多词，可跨列） | 无词元层，只有 `ILIKE '%…%'` 包含匹配 | 结果集取并集语义：FTS 命中优先，空页回退 LIKE |
+| 包含匹配 | `LIKE … ESCAPE '!'`，ASCII 大小写不敏感 | `ILIKE`，按库 locale 折叠 | 对 ASCII 与 CJK 用例等价 |
+| 可搜索列 | `title`/`original_title`/`aliases`（LIKE）+ `title`/`sort_title`/`original_title`/`aliases`（FTS） | `title`/`original_title`/`sort_title`/`aliases` | 本轮给两后端的 LIKE 分支补上 `sort_title`，列集一致 |
+| 中文 1–2 字 | FTS 单词元不含子串，回退 LIKE 全表（66k 约 16 ms p95） | `ILIKE` + trigram GIN | 都不使用 trigram FTS：FTS5 trigram 要求 ≥3 字符 |
+| 前缀（拉丁） | `"token"` 短语不匹配前缀，回退 LIKE | `ILIKE '%pre%'` | 语义一致（都是包含） |
+| 大小写/重音 | FTS `unicode61` 折叠大小写并去重音；LIKE 只折叠 ASCII | `ILIKE` 折叠大小写 | FTS 命中集合可能更大，回退分支保持一致 |
+| 排序 | `sort_title, id` | `sort_title, id` | 一致；不使用 FTS rank |
+| 权限与内容限制 | 先 ACL/内容限制再分页 | 同 | 一致 |
+
+已知差异与限制：
+
+- 词元语义只在 SQLite 侧存在（例如查询命中 `sort_title` 的某个整词）。因为结果集是“FTS 并集 LIKE”，
+  SQLite 的命中集合是 PostgreSQL 的超集；PostgreSQL 侧通过补齐 `sort_title` 缩小差距，但没有引入
+  `tsvector`，因为 `tsvector` 的中文词元化会把整段中文切成一个 token，反而改变 API 语义。
+- `pg_trgm` 对 CJK 三元组有效，但查询短于 3 字符时 PostgreSQL 也退化为顺序扫描。
+- 本轮未在真实的 PostgreSQL 实例上跑用例矩阵，PostgreSQL 侧只核对了 SQL 形状与绑定数；需要在有
+  PG 的环境执行 `cargo test --locked --test search` 补齐证据。
+
+## W4：搜索索引维护方式的差异（2026-10-28）
+
+| 维度 | SQLite | PostgreSQL |
+| --- | --- | --- |
+| 写入路径 | 触发器只向 `search_outbox` 追加（`0243` 之前是 `catalog_outbox(kind='search')`）；消费者 `search_reindex@2` 批量重建 `media_search`（FTS5） | 行级触发器（`0219` 已按列过滤）在写事务内维护 `media_search` 表 |
+| 一致性 | 搜索请求前有界排空（200 条/请求）+ 后台 worker（1 s、500 条/批）；队列缺口时全量重建 | 同步写入，无滞后 |
+| 滞后 | 最坏约 1 秒；`FTS 空页 → LIKE 回退` 保证不会返回空结果 | 无 |
+| 行号映射 | `media_search_map` 由消费者按批取号，条目删除后清理映射 | 无（`item_id` 直接是主键） |
+| 不一致时的兜底 | 水位缺口检测 → 为所有条目重新入队；drain 幂等 | 不适用 |
+
+因此两后端的**查询语义一致**（同样的 FTS/LIKE 组合在 `LUX-869` 已对齐），差异只在维护机制：
+SQLite 侧可能滞后约 1 秒，PostgreSQL 侧同步但把 FTS 写放大留在扫描路径上。PostgreSQL 的等价入队
+改造待有 PG 实例时再做（见 `LUX-DEVELOPMENT.md` W4「剩余」）。
+
+## W6：迁移配对清单（2026-10-28）
+
+两套迁移目录由各自的专有能力（SQLite 的 FTS5/rowid 映射/pragma，PostgreSQL 的扩展与语句级触发器）
+决定内容，因此允许存在单侧迁移，但**必须登记**。`docs/migration-map.json` + `scripts/check-migration-parity.py`
+（已接入 `scripts/check-all.sh`）保证：
+
+- 每个迁移文件都在清单里（新文件必须 `--write` 生成条目）；
+- 成对迁移两侧的版本号不得单边漂移（例如只改了 SQLite 的 0238 却忘了 PostgreSQL）；
+- 清单里登记为单侧的迁移不得悄悄变成双侧（或反之）。
+
+当前：169 对、51 个 SQLite 专有、19 个 PostgreSQL 专有。同名的相对顺序在两套历史里并不一致
+（`rank_mismatches = 84`），规则改为“新增迁移在两侧保持相邻”，计数不得增长。
+
+### `DatabaseBackend::` 分支清单（W6）
+
+除迁移清单外，后端分支本身也登记：`docs/backend-branches.json` 记录每个文件里
+`DatabaseBackend::` 的出现次数与理由，`scripts/check-backend-branches.py` 拒绝“新文件带分支”和
+“已登记文件增长”。当前 26 个文件、265 处，集中在 `sql_templates.rs`（SQL 方言模板）、
+`repository.rs`（整族查询分派）、`catalog.rs`/`library_deletion.rs`/`database_maintenance.rs`
+（JSON、级联与 pragma 差异）等；`search_reindex.rs` 里的一处是“PostgreSQL 仍走同步 FTS 维护”这个
+已记录的差距。
+
+## `TotalRecordCount` 与回滚步骤（W3/W5 收口）
+
+`TotalRecordCount`（Emby）与 `total`（Lux API）都表示**过滤后的匹配总数**，不是当前页条数：
+
+- 搜索与列表先应用 ACL、库启用状态与内容限制，再算总数；分页字段在总数之后计算。
+- 读模型 `on` 模式下，总数取自派生表；派生表缺行或未回填时**整页回退**权威查询，因此不会出现
+  “条目少一条、总数还是旧值”的短页。
+- 搜索的 FTS 命中为空时回退 LIKE，总数同样来自同一个 SQL 的计数，不会跨路径混用。
+- 已知上限：搜索/列表的总数在 66k 夹具上仍要遍历匹配集（搜索 “Spec” 命中 5.6 万行时 p95 约 106 ms），
+  若要再降需要改总数为有界/近似值，这属于 API 语义变更，需所有者确认（见 `LUX-DEVELOPMENT.md` W5 剩余）。
+
+回滚步骤（按改动类别）：
+
+| 改动 | 回滚方式 | 数据影响 |
+|---|---|---|
+| 读模型开关 `LUX_READ_MODEL_MODE=on`（默认） | 设回 `off`，无需迁移回退 | 派生表可保留，随时重建；增量消费者停用不影响权威数据 |
+| 读模型派生行形状变更 | 递增 `READ_MODEL_SCHEMA_VERSION` 后重启，自动重建 | 旧行被忽略，新构建重建 |
+| 搜索入队（W4） | 迁移 `0237` 已随发布落地；回退需重新部署旧二进制，旧触发器由遗留修复路径重建 | FTS 会在旧二进制启动时由触发器继续维护；出队行残留在 `catalog_outbox`，可安全清空 |
+| JSON gzip/ETag（W5） | 移除 `CompressionLayer`/`json_response_etag` 两个 layer | 无数据影响；客户端立即回到整包传输 |
+| 符号链接媒体源（0.7.1） | 把 `LUX_SYMLINK_POLICY` 设为 `none` 只停用目录链接；文件链接按目标识别是固定的，完全回到旧行为需重新部署 0.7.0 二进制 | 迁移 `0239`/`0241` 只加 `is_symlink`、`resolved_path` 两列，旧二进制可忽略；链接布局若已入库，重扫会按策略不再发现这些路径，条目按缺失处理，目标文件不受影响 |
+| 迁移配对清单（W6） | 删除 `docs/migration-map.json` 即跳过校验 | 无运行期影响 |
+
+## search_outbox 拆表（outbox 无限重排修复）
+
+迁移 `0243_search_outbox_split.sql`（SQLite）/ `0245_search_outbox_split.sql`（PostgreSQL）把搜索重建事件从
+`catalog_outbox(kind='search')` 拆到独立的 `search_outbox`，消费者改名 `search_reindex@2`。Lux/Emby API、
+DTO 与对外数据模型不变。
+
+- **原因**：两种事件共用一个 id 序列，消费者水位与“队列是否有洞”的判断落在不同坐标上，误报缺口后每一拍都
+  全量重排 `media_items`，把 `catalog_outbox` 写到数十 GB。拆表后每条流的序列只属于一个消费者。
+- **升级**：迁移重建 6 个搜索触发器（PostgreSQL 为 3 个语句级函数）指向 `search_outbox`，删除旧水位
+  `search_reindex@1`，并把所有条目入队一次，因此不会丢搜索更新。`catalog_outbox` 里遗留的 `search` 行由后台
+  worker 分批（每拍至多 10 × 2,000 行）删除，迁移本身不删。
+- **缺口修复语义**：检测到缺口后只做一次全量重排（每消费者 5 分钟冷却；队列待处理行数超过 2,000,000 时拒绝重排并记
+  ERROR），并立刻把水位推到最旧事件之前，同一个洞不会被再次检测。
+- **回退**：SQLite 旧二进制启动时会按旧常量重建触发器，回到 `catalog_outbox`，水位从零重放，可安全清空
+  `search_outbox`。**PostgreSQL 旧二进制不会重建函数**，触发器仍写 `search_outbox` 而旧消费者读
+  `catalog_outbox`，回退后全文索引会停止更新；PostgreSQL 请向前发布修复版本而不是回退。
+- 已膨胀部署的清理步骤见 `docs/RUNBOOK-OUTBOX-BLOAT.md`。

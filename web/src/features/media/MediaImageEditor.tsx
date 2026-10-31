@@ -4,6 +4,7 @@ import { LuxSelect } from "../../components/LuxSelect";
 import { api } from "../../lib/api/client";
 import type { ImageSearchResult, ItemImage, MediaItem } from "../../lib/api/types";
 import { mediaTitle } from "../home/media-display";
+import { LuxButton } from "../../components/ui";
 
 type MediaImageEditorProps = {
   item: MediaItem;
@@ -129,7 +130,7 @@ export function MediaImageEditor({ item, onClose }: MediaImageEditorProps) {
           <div className="lux-image-editor-toolbar">
             <label><span>语言</span><LuxSelect value={language} options={languageOptions} onChange={(value) => { setLanguage(value); if (results.length) void searchWithFilters(value, source); }} aria-label="图片语言" /></label>
             <label><span>来源</span><LuxSelect value={source} options={sourceOptions} onChange={(value) => { setSource(value); if (results.length) void searchWithFilters(language, value); }} aria-label="图片来源" /></label>
-            <button className="lux-button lux-button-primary" type="button" disabled={searching} onClick={() => void search()}><Search size={16} /> {searching ? "搜索中…" : "搜索"}</button>
+            <LuxButton tone="primary" type="button" disabled={searching} onClick={() => void search()}><Search size={16} /> {searching ? "搜索中…" : "搜索"}</LuxButton>
           </div>
           {error ? <p className="lux-editor-error" role="alert">{error}</p> : null}
           <div className="lux-image-editor-current">

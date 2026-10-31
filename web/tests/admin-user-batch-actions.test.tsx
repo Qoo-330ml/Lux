@@ -7,6 +7,7 @@ import { MemoryRouter } from "react-router-dom";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue, luxCombobox, luxOptions } from "./lux-select-helpers";
 import type { AdminLibrary, AdminSettings, AdminUser, AdminUserPermissionPreset } from "../src/lib/api/types";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -142,14 +143,10 @@ describe("AdminUsersPage batch user actions", () => {
 
     await act(async () => {
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
-      await vi.waitFor(() => expect(container.querySelector('option[value="preset-basic"]')).toBeTruthy());
+      await vi.waitFor(() => expect(luxCombobox(container, "批量角色预设")?.hasAttribute("disabled")).toBe(false));
       container.querySelector<HTMLInputElement>('input[aria-label="选择鲍勃"]')?.click();
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="批量角色预设"]');
-      if (select) {
-        select.value = preset.id;
-        select.dispatchEvent(new Event("change", { bubbles: true }));
-      }
     });
+    await chooseLuxOptionByValue(container, "批量角色预设", preset.id);
     expect(container.textContent).toContain("当前页已选 2 人");
     expect(container.textContent).toContain("仅对当前页勾选的用户操作");
 
@@ -201,12 +198,10 @@ describe("AdminUsersPage batch user actions", () => {
     await act(async () => {
       await vi.waitFor(() => expect(container.textContent).toContain("爱丽丝"));
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
-      await vi.waitFor(() => expect(container.querySelector('option[value="preset-basic"]')).toBeTruthy());
-      const select = container.querySelector<HTMLSelectElement>('select[aria-label="批量角色预设"]');
-      if (select) {
-        select.value = preset.id;
-        select.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+      await vi.waitFor(() => expect(luxCombobox(container, "批量角色预设")?.hasAttribute("disabled")).toBe(false));
+    });
+    await chooseLuxOptionByValue(container, "批量角色预设", preset.id);
+    await act(async () => {
       container.querySelector<HTMLButtonElement>('button[aria-label="批量应用角色预设"]')?.click();
     });
 
@@ -229,7 +224,7 @@ describe("AdminUsersPage batch user actions", () => {
       await vi.waitFor(() => expect(container.textContent).toContain("爱丽丝"));
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
       expect(container.textContent).toContain("当前页已选 1 人");
-      container.querySelector<HTMLButtonElement>(".lux-admin-user-pagination button:last-child")?.click();
+      container.querySelector<HTMLButtonElement>('button[aria-label="下一页"]')?.click();
       await vi.waitFor(() => expect(container.textContent).toContain("鲍勃"));
     });
 
@@ -281,16 +276,13 @@ describe("AdminUsersPage batch user actions", () => {
     expect(container.textContent).toContain("目标账号 · 2 人");
     expect(container.textContent).toContain("爱丽丝");
     expect(container.textContent).toContain("鲍勃");
-    expect(container.querySelector('option[value="user-a"]')).toBeNull();
-    expect(container.querySelector('option[value="user-b"]')).toBeNull();
-    expect(container.querySelector('option[value="source"]')).toBeTruthy();
+    const copySources = await luxOptions(container, "权限复制来源");
+    expect(copySources.some((option) => option.value === "user-a")).toBe(false);
+    expect(copySources.some((option) => option.value === "user-b")).toBe(false);
+    expect(copySources.some((option) => option.value === "source")).toBe(true);
+    await chooseLuxOptionByValue(container, "权限复制来源", source.id);
 
     await act(async () => {
-      const sourceSelect = container.querySelector<HTMLSelectElement>('select[aria-label="权限复制来源"]');
-      if (sourceSelect) {
-        sourceSelect.value = source.id;
-        sourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      }
       container.querySelector<HTMLInputElement>('input[aria-label="复制内容限制"]')?.click();
       container.querySelector<HTMLButtonElement>('button[aria-label="预览权限复制"]')?.click();
       await vi.waitFor(() => expect(preview).toHaveBeenCalledWith({
@@ -349,11 +341,9 @@ describe("AdminUsersPage batch user actions", () => {
       container.querySelector<HTMLInputElement>('input[aria-label="选择爱丽丝"]')?.click();
       container.querySelector<HTMLButtonElement>('button[aria-label="复制权限"]')?.click();
       await vi.waitFor(() => expect(container.querySelector('[role="dialog"][aria-label="权限复制"]')).toBeTruthy());
-      const sourceSelect = container.querySelector<HTMLSelectElement>('select[aria-label="权限复制来源"]');
-      if (sourceSelect) {
-        sourceSelect.value = source.id;
-        sourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+    });
+    await chooseLuxOptionByValue(container, "权限复制来源", source.id);
+    await act(async () => {
       container.querySelector<HTMLButtonElement>('button[aria-label="预览权限复制"]')?.click();
       await vi.waitFor(() => expect(preview).toHaveBeenCalledTimes(1));
     });

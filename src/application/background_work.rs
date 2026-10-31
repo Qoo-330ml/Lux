@@ -2,15 +2,31 @@ use std::{
     collections::VecDeque,
     env,
     future::Future,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, OnceLock},
     time::{Duration, Instant},
 };
 
 use tokio::sync::{OnceCell, OwnedSemaphorePermit, Semaphore, watch};
 
-use crate::observability::resources::ResourceMetrics;
+use crate::observability::{request_metrics::RequestMetrics, resources::ResourceMetrics};
 
 const BUDGET_ENV: &str = "LUX_BACKGROUND_CPU_BUDGET";
+/// Opt-in switch for the foreground-latency feedback ("on", "1", "true", "yes").
+/// Off by default: the quota change needs an interleaved A/B before it becomes the default.
+const FOREGROUND_THROTTLE_ENV: &str = "LUX_BACKGROUND_FOREGROUND_THROTTLE";
+/// Optional p95 threshold in milliseconds for that feedback.
+const FOREGROUND_THRESHOLD_ENV: &str = "LUX_BACKGROUND_FOREGROUND_P95_MS";
+const FOREGROUND_P95_ROUTE: &str = "/api/v1/home";
+/// Read-model `off` keeps the legacy path, whose home p95 baseline is an order of magnitude higher.
+const FOREGROUND_P95_OFF_MODE_MS: u64 = 300;
+/// Read-model `on` answers the home page at 16–58 ms; the W3 scan-concurrency run measured 85.94 ms,
+/// so this target has to sit well below the legacy default.
+const FOREGROUND_P95_ON_MODE_MS: u64 = 80;
+/// Only samples from this window count: the retained per-route buffer holds 512 samples, which on a
+/// quiet server is minutes of traffic and would keep the downgrade engaged long after recovery.
+const FOREGROUND_PRESSURE_WINDOW: Duration = Duration::from_secs(30);
+const FOREGROUND_PRESSURE_RECHECK: Duration = Duration::from_secs(1);
+const FOREGROUND_PRESSURE_COOLDOWN: Duration = Duration::from_secs(10);
 const MAX_BACKGROUND_BUDGET: usize = 32;
 const MAX_AUTOMATIC_BUDGET: usize = 16;
 const DURATION_SAMPLE_CAPACITY: usize = 128;
@@ -70,6 +86,184 @@ impl BackgroundWorkStage {
     }
 }
 
+/// Foreground-latency feedback for the background media lane.
+///
+/// The sample source is the read-only [`RequestMetrics::route_p95_recent_us`] window over the
+/// requests per route template: when the foreground page p95 stays above the target, a share of the
+/// media lane permits is held back so scans stop competing with the request path. Held permits are
+/// released again only after a cooldown, and the lane keeps at least one permit, so the downgrade
+/// bounds concurrency without changing any result or stopping background progress.
+#[derive(Clone, Copy, Debug)]
+struct ForegroundThrottleConfig {
+    route_needle: &'static str,
+    threshold_us: u64,
+    window: Duration,
+    recheck: Duration,
+    cooldown: Duration,
+}
+
+/// Media-lane permits that stay available while foreground latency is above the target.
+fn foreground_media_permits_kept(media_capacity: usize) -> usize {
+    media_capacity.div_ceil(2).max(1)
+}
+
+fn default_foreground_threshold_ms(read_model_mode: Option<&str>) -> u64 {
+    // The read model is the default, so an unset switch targets the faster budget too.
+    match read_model_mode
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("off") | Some("shadow") => FOREGROUND_P95_OFF_MODE_MS,
+        _ => FOREGROUND_P95_ON_MODE_MS,
+    }
+}
+
+fn foreground_throttle_config_from(
+    switch: Option<&str>,
+    threshold_ms: Option<&str>,
+    read_model_mode: Option<&str>,
+) -> Option<ForegroundThrottleConfig> {
+    let switch = switch.unwrap_or_default().trim().to_ascii_lowercase();
+    if !matches!(switch.as_str(), "on" | "1" | "true" | "yes") {
+        return None;
+    }
+    let threshold_ms = threshold_ms
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or_else(|| default_foreground_threshold_ms(read_model_mode));
+    Some(ForegroundThrottleConfig {
+        route_needle: FOREGROUND_P95_ROUTE,
+        threshold_us: threshold_ms.saturating_mul(1000),
+        window: FOREGROUND_PRESSURE_WINDOW,
+        recheck: FOREGROUND_PRESSURE_RECHECK,
+        cooldown: FOREGROUND_PRESSURE_COOLDOWN,
+    })
+}
+
+fn foreground_throttle_config() -> Option<ForegroundThrottleConfig> {
+    let switch = env::var(FOREGROUND_THROTTLE_ENV).ok();
+    let threshold = env::var(FOREGROUND_THRESHOLD_ENV).ok();
+    let read_model_mode = env::var("LUX_READ_MODEL_MODE").ok();
+    let config = foreground_throttle_config_from(
+        switch.as_deref(),
+        threshold.as_deref(),
+        read_model_mode.as_deref(),
+    );
+    if config.is_none()
+        && switch
+            .as_deref()
+            .is_some_and(|value| !value.trim().is_empty())
+    {
+        tracing::warn!(
+            target: "lux::scan_performance",
+            phase = "background_foreground_pressure",
+            "unknown foreground throttle switch value; the feedback stays off"
+        );
+    }
+    config
+}
+
+struct ForegroundThrottle {
+    metrics: RequestMetrics,
+    media_semaphore: Arc<Semaphore>,
+    /// Permits held back once the foreground is slow: everything above the kept share.
+    withheld_target: usize,
+    config: ForegroundThrottleConfig,
+    state: Mutex<ForegroundThrottleState>,
+}
+
+#[derive(Default)]
+struct ForegroundThrottleState {
+    withheld: Vec<OwnedSemaphorePermit>,
+    over_since: Option<Instant>,
+    last_evaluated: Option<Instant>,
+}
+
+impl ForegroundThrottle {
+    fn new(
+        media_semaphore: Arc<Semaphore>,
+        media_capacity: usize,
+        metrics: RequestMetrics,
+        config: ForegroundThrottleConfig,
+    ) -> Self {
+        Self {
+            metrics,
+            media_semaphore,
+            withheld_target: media_capacity
+                .saturating_sub(foreground_media_permits_kept(media_capacity)),
+            config,
+            state: Mutex::new(ForegroundThrottleState::default()),
+        }
+    }
+
+    /// Re-reads the foreground p95 and adjusts the held-back permits. Never awaits; the permit
+    /// acquisition is best effort because every remaining permit may be busy with running work.
+    fn observe(&self) {
+        let now = Instant::now();
+        let mut state = self.lock_state();
+        if let Some(last) = state.last_evaluated
+            && now.saturating_duration_since(last) < self.config.recheck
+        {
+            return;
+        }
+        state.last_evaluated = Some(now);
+        let p95_us = self
+            .metrics
+            .route_p95_recent_us(self.config.route_needle, self.config.window);
+        let slow = p95_us.is_some_and(|value| value >= self.config.threshold_us);
+        if slow {
+            let was_throttled = !state.withheld.is_empty();
+            state.over_since = Some(now);
+            while state.withheld.len() < self.withheld_target {
+                let Ok(permit) = Arc::clone(&self.media_semaphore).try_acquire_owned() else {
+                    break;
+                };
+                state.withheld.push(permit);
+            }
+            if !was_throttled && !state.withheld.is_empty() {
+                tracing::info!(
+                    target: "lux::scan_performance",
+                    phase = "background_foreground_pressure",
+                    route = self.config.route_needle,
+                    p95_us = ?p95_us,
+                    threshold_us = self.config.threshold_us,
+                    withheld_permits = state.withheld.len(),
+                    "withheld background media permits while the foreground page is slow"
+                );
+            }
+            return;
+        }
+        let cooled_down = state
+            .over_since
+            .is_some_and(|since| now.saturating_duration_since(since) >= self.config.cooldown);
+        if cooled_down && !state.withheld.is_empty() {
+            state.over_since = None;
+            let restored = state.withheld.len();
+            state.withheld.clear();
+            tracing::info!(
+                target: "lux::scan_performance",
+                phase = "background_foreground_pressure",
+                route = self.config.route_needle,
+                p95_us = ?p95_us,
+                restored_permits = restored,
+                "restored background media permits after the foreground cooldown"
+            );
+        }
+    }
+
+    fn snapshot(&self) -> (bool, usize) {
+        let state = self.lock_state();
+        (!state.withheld.is_empty(), state.withheld.len())
+    }
+
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, ForegroundThrottleState> {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub(crate) struct BackgroundWorkSnapshot {
     pub(crate) capacity: usize,
@@ -93,6 +287,9 @@ pub(crate) struct BackgroundWorkSnapshot {
     pub(crate) work_p50_ms: Option<u64>,
     pub(crate) work_p95_ms: Option<u64>,
     pub(crate) work_max_ms: Option<u64>,
+    /// Foreground-latency feedback: whether media permits are currently held back, and how many.
+    pub(crate) foreground_throttled: bool,
+    pub(crate) foreground_withheld_permits: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -148,6 +345,10 @@ pub(crate) struct BackgroundWorkBudget {
     /// keeping them in their own lane stops them from starving probe/NFO/thumbnail work.
     discovery_semaphore: Arc<Semaphore>,
     media_semaphore: Arc<Semaphore>,
+    media_capacity: usize,
+    /// Installed once, either when the budget is created or when the web app registers its
+    /// request metrics, whichever happens last.
+    foreground: OnceLock<ForegroundThrottle>,
     metrics: Mutex<BudgetMetrics>,
 }
 
@@ -173,8 +374,46 @@ impl BackgroundWorkBudget {
             capacity_source,
             discovery_semaphore,
             media_semaphore,
+            media_capacity,
+            foreground: OnceLock::new(),
             metrics: Mutex::new(BudgetMetrics::default()),
         }
+    }
+
+    /// Installs the foreground-latency feedback once per budget.
+    ///
+    /// Idempotent: the first installation wins, so a budget created before the web app registers
+    /// its request metrics and one created after both end up with the same feedback.
+    fn attach_foreground_pressure(
+        &self,
+        metrics: RequestMetrics,
+        config: ForegroundThrottleConfig,
+    ) {
+        // A single-permit budget shares one semaphore between both lanes; it cannot be split.
+        let retained = foreground_media_permits_kept(self.media_capacity);
+        if self.media_capacity < 2 || retained >= self.media_capacity {
+            return;
+        }
+        let throttle = ForegroundThrottle::new(
+            Arc::clone(&self.media_semaphore),
+            self.media_capacity,
+            metrics,
+            config,
+        );
+        if self.foreground.set(throttle).is_err() {
+            return;
+        }
+        tracing::info!(
+            target: "lux::scan_performance",
+            phase = "background_foreground_pressure",
+            route = config.route_needle,
+            threshold_us = config.threshold_us,
+            cooldown_ms = u64::try_from(config.cooldown.as_millis()).unwrap_or(u64::MAX),
+            media_capacity = self.media_capacity,
+            kept_permits = retained,
+            withheld_permits = self.media_capacity - retained,
+            "enabled foreground latency feedback for the background media lane"
+        );
     }
 
     pub(crate) async fn acquire(
@@ -185,6 +424,9 @@ impl BackgroundWorkBudget {
         let semaphore = if stage.is_discovery_lane() {
             Arc::clone(&self.discovery_semaphore)
         } else {
+            if let Some(throttle) = self.foreground.get() {
+                throttle.observe();
+            }
             Arc::clone(&self.media_semaphore)
         };
         let permit = semaphore
@@ -268,6 +510,10 @@ impl BackgroundWorkBudget {
     }
 
     pub(crate) fn snapshot(&self) -> BackgroundWorkSnapshot {
+        let (foreground_throttled, foreground_withheld_permits) = self
+            .foreground
+            .get()
+            .map_or((false, 0), ForegroundThrottle::snapshot);
         let metrics = self.lock_metrics();
         let wait_samples = BackgroundWorkStage::ALL
             .iter()
@@ -347,6 +593,8 @@ impl BackgroundWorkBudget {
             work_p50_ms: work_summary.p50_ms,
             work_p95_ms: work_summary.p95_ms,
             work_max_ms: work_summary.max_ms,
+            foreground_throttled,
+            foreground_withheld_permits,
         }
     }
 
@@ -659,6 +907,24 @@ impl std::fmt::Display for BackgroundWorkTaskError {
 impl std::error::Error for BackgroundWorkTaskError {}
 
 static PROCESS_BACKGROUND_WORK_BUDGET: OnceCell<Arc<BackgroundWorkBudget>> = OnceCell::const_new();
+/// Bounded route samples for the foreground-latency feedback; registered once by the web app.
+static FOREGROUND_REQUEST_METRICS: OnceLock<RequestMetrics> = OnceLock::new();
+
+/// Registers the process request metrics so background work can read the foreground p95.
+///
+/// The budget is a process singleton and the first registration wins, so a second app state in the
+/// same process keeps reporting into the first one's samples. The feedback itself stays off unless
+/// it was opted in, in which case an already-created budget is upgraded here.
+pub(crate) fn install_foreground_request_metrics(metrics: RequestMetrics) {
+    if FOREGROUND_REQUEST_METRICS.set(metrics.clone()).is_err() {
+        return;
+    }
+    if let Some(budget) = PROCESS_BACKGROUND_WORK_BUDGET.get()
+        && let Some(config) = foreground_throttle_config()
+    {
+        budget.attach_foreground_pressure(metrics, config);
+    }
+}
 
 pub(crate) async fn acquire_process_background_work(
     stage: BackgroundWorkStage,
@@ -704,7 +970,13 @@ async fn process_background_work_budget() -> Arc<BackgroundWorkBudget> {
                 source,
                 "initialized process-wide background work budget"
             );
-            Arc::new(BackgroundWorkBudget::with_capacity(capacity, source))
+            let budget = Arc::new(BackgroundWorkBudget::with_capacity(capacity, source));
+            if let Some(metrics) = FOREGROUND_REQUEST_METRICS.get()
+                && let Some(config) = foreground_throttle_config()
+            {
+                budget.attach_foreground_pressure(metrics.clone(), config);
+            }
+            budget
         })
             .await,
     )
@@ -794,9 +1066,11 @@ fn summarize_durations(samples: &VecDeque<u64>) -> DurationSummary {
 #[cfg(test)]
 mod tests {
     use super::{
-        BackgroundWorkBudget, BackgroundWorkStage, DurationSummary, parse_budget_override,
+        BackgroundWorkBudget, BackgroundWorkStage, DurationSummary, ForegroundThrottleConfig,
+        foreground_media_permits_kept, foreground_throttle_config_from, parse_budget_override,
         recommended_budget_capacity, summarize_durations,
     };
+    use crate::observability::request_metrics::RequestMetrics;
     use std::{collections::VecDeque, sync::Arc, time::Duration};
     use tokio::{sync::Semaphore, time::timeout};
 
@@ -1107,5 +1381,161 @@ mod tests {
         assert_eq!(budget.snapshot().active, 0);
         assert_eq!(budget.snapshot().cancelled_running, 0);
         assert_eq!(budget.snapshot().cancelled_running_by_stage[5].1, 0);
+    }
+
+    fn record_home_samples(metrics: &RequestMetrics, count: usize, ms: u64) {
+        for _ in 0..count {
+            metrics.record("GET", "/api/v1/home", 200, Duration::from_millis(ms));
+        }
+    }
+
+    fn test_foreground_throttle_config(cooldown: Duration) -> ForegroundThrottleConfig {
+        ForegroundThrottleConfig {
+            route_needle: "/api/v1/home",
+            threshold_us: 300_000,
+            window: Duration::from_secs(30),
+            recheck: Duration::ZERO,
+            cooldown,
+        }
+    }
+
+    #[test]
+    fn foreground_throttle_is_off_unless_explicitly_enabled() {
+        assert!(foreground_throttle_config_from(None, None, None).is_none());
+        assert!(foreground_throttle_config_from(Some(""), None, None).is_none());
+        assert!(foreground_throttle_config_from(Some(" off "), None, None).is_none());
+        assert!(foreground_throttle_config_from(Some("0"), None, None).is_none());
+
+        let enabled =
+            foreground_throttle_config_from(Some("on"), None, Some("off")).expect("on enables");
+        assert_eq!(enabled.route_needle, "/api/v1/home");
+        assert_eq!(enabled.threshold_us, 300_000);
+        assert_eq!(enabled.window, Duration::from_secs(30));
+
+        let tuned =
+            foreground_throttle_config_from(Some("ON"), Some("75"), None).expect("on enables");
+        assert_eq!(tuned.threshold_us, 75_000);
+        for invalid in ["0", "abc", ""] {
+            let fallback = foreground_throttle_config_from(Some("on"), Some(invalid), None)
+                .expect("on enables");
+            // An unset read-model switch means `on`, so the fallback is the read-model budget.
+            assert_eq!(fallback.threshold_us, 80_000, "{invalid} keeps the default");
+        }
+    }
+
+    #[test]
+    fn foreground_threshold_follows_the_read_model_mode() {
+        // The legacy path needs a much looser target than the read-model path, and the read model
+        // is the default when the switch is unset.
+        for (mode, expected_us) in [
+            (Some("on"), 80_000),
+            (Some("ON"), 80_000),
+            (Some("off"), 300_000),
+            (Some("shadow"), 300_000),
+            (None, 80_000),
+        ] {
+            let config = foreground_throttle_config_from(Some("on"), None, mode).expect("enabled");
+            assert_eq!(config.threshold_us, expected_us, "mode {mode:?}");
+        }
+        // An explicit override wins in both modes.
+        for mode in [Some("on"), Some("off")] {
+            let config =
+                foreground_throttle_config_from(Some("on"), Some("120"), mode).expect("enabled");
+            assert_eq!(config.threshold_us, 120_000, "mode {mode:?}");
+        }
+    }
+
+    #[test]
+    fn foreground_pressure_keeps_at_least_one_media_permit() {
+        for capacity in 1..=32 {
+            let kept = foreground_media_permits_kept(capacity);
+            assert!(kept >= 1, "capacity {capacity} keeps one permit");
+            assert!(
+                kept <= capacity,
+                "capacity {capacity} never invents permits"
+            );
+            assert!(
+                kept <= capacity.div_ceil(2),
+                "capacity {capacity} at most halves"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn foreground_pressure_halves_the_media_lane_and_restores_after_the_cooldown() {
+        let metrics = RequestMetrics::new();
+        record_home_samples(&metrics, 32, 400);
+        // Capacity 4 splits into 2 discovery + 2 media; throttling keeps 1 media permit.
+        let budget = Arc::new(BackgroundWorkBudget::with_capacity(4, "test"));
+        budget.attach_foreground_pressure(
+            metrics.clone(),
+            test_foreground_throttle_config(Duration::from_millis(40)),
+        );
+
+        let first = budget
+            .acquire(BackgroundWorkStage::Probe)
+            .await
+            .expect("probe permit");
+        let throttled = budget.snapshot();
+        assert!(throttled.foreground_throttled);
+        assert_eq!(throttled.foreground_withheld_permits, 1);
+
+        let blocked_budget = Arc::clone(&budget);
+        let mut blocked =
+            tokio::spawn(async move { blocked_budget.acquire(BackgroundWorkStage::Probe).await });
+        assert!(
+            timeout(Duration::from_millis(100), &mut blocked)
+                .await
+                .is_err(),
+            "a throttled media lane must not grant the second probe"
+        );
+        blocked.abort();
+        let _ = blocked.await;
+
+        // Foreground recovers: only fast samples remain and the cooldown elapses.
+        record_home_samples(&metrics, 600, 5);
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        drop(first);
+
+        let second = timeout(
+            Duration::from_secs(2),
+            budget.acquire(BackgroundWorkStage::Probe),
+        )
+        .await
+        .expect("acquire after the cooldown")
+        .expect("budget open");
+        let restored = budget.snapshot();
+        assert!(!restored.foreground_throttled);
+        assert_eq!(restored.foreground_withheld_permits, 0);
+        let third = timeout(
+            Duration::from_secs(2),
+            budget.acquire(BackgroundWorkStage::Probe),
+        )
+        .await
+        .expect("both media permits are available again")
+        .expect("budget open");
+        drop(third);
+        drop(second);
+    }
+
+    #[tokio::test]
+    async fn budgets_without_foreground_pressure_keep_the_media_lane() {
+        let budget = Arc::new(BackgroundWorkBudget::with_capacity(4, "test"));
+        let first = budget
+            .acquire(BackgroundWorkStage::Probe)
+            .await
+            .expect("probe permit");
+        let second = timeout(
+            Duration::from_secs(1),
+            budget.acquire(BackgroundWorkStage::Probe),
+        )
+        .await
+        .expect("both media permits stay available")
+        .expect("budget open");
+        let snapshot = budget.snapshot();
+        assert!(!snapshot.foreground_throttled);
+        assert_eq!(snapshot.foreground_withheld_permits, 0);
+        drop(second);
+        drop(first);
     }
 }

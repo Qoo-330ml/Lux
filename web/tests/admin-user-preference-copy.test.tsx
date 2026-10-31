@@ -8,6 +8,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import { AdminUsersPage } from "../src/features/admin/AdminUsersPage";
 import { api } from "../src/lib/api/client";
 import type { AdminLibrary, AdminSettings, AdminUser } from "../src/lib/api/types";
+import { chooseLuxOptionByValue, luxCombobox } from "./lux-select-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -88,12 +89,10 @@ describe("AdminUsersPage account preference copy", () => {
     expect(container.querySelector(".lux-admin-user-preference-copy-targets")?.textContent).not.toContain("未选择用户");
 
     await act(async () => {
-      await vi.waitFor(() => expect(container.querySelector('option[value="source"]')).toBeTruthy());
-      const sourceSelect = container.querySelector<HTMLSelectElement>('select[aria-label="偏好复制来源"]');
-      if (sourceSelect) {
-        sourceSelect.value = source.id;
-        sourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+      await vi.waitFor(() => expect(luxCombobox(container, "偏好复制来源")).toBeTruthy());
+    });
+    await chooseLuxOptionByValue(container, "偏好复制来源", source.id);
+    await act(async () => {
       const home = container.querySelector<HTMLInputElement>('input[aria-label="复制首页偏好"]');
       home?.click();
       container.querySelector<HTMLButtonElement>('button[aria-label="预览偏好复制"]')?.click();
@@ -156,12 +155,10 @@ describe("AdminUsersPage account preference copy", () => {
       await vi.waitFor(() => expect(container.textContent).toContain("目标账号"));
       container.querySelector<HTMLInputElement>('input[aria-label="选择目标账号"]')?.click();
       container.querySelector<HTMLButtonElement>('button[aria-label="复制偏好"]')?.click();
-      await vi.waitFor(() => expect(container.querySelector('option[value="source"]')).toBeTruthy());
-      const sourceSelect = container.querySelector<HTMLSelectElement>('select[aria-label="偏好复制来源"]');
-      if (sourceSelect) {
-        sourceSelect.value = source.id;
-        sourceSelect.dispatchEvent(new Event("change", { bubbles: true }));
-      }
+      await vi.waitFor(() => expect(luxCombobox(container, "偏好复制来源")).toBeTruthy());
+    });
+    await chooseLuxOptionByValue(container, "偏好复制来源", source.id);
+    await act(async () => {
       container.querySelector<HTMLButtonElement>('button[aria-label="预览偏好复制"]')?.click();
       await vi.waitFor(() => expect(preview).toHaveBeenCalledOnce());
     });

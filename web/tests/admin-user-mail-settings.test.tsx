@@ -28,7 +28,7 @@ describe("AdminUserSettingsPage SMTP settings", () => {
 
     expect(input("SMTP 主机").value).toBe("smtp.example.test");
     expect(input("SMTP 端口").value).toBe("465");
-    expect(input("SMTP TLS 模式").value).toBe("SMTPS");
+    expect(input("SMTP TLS 模式").dataset.value).toBe("SMTPS");
     expect(input("SMTP 密码").value).toBe("");
     expect(container.textContent).toContain("SMTP 凭据已配置");
     expect(container.textContent).not.toContain("smtp-user");

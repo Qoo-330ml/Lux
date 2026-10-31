@@ -441,13 +441,21 @@ html[data-lux-theme="light"] .lux-collection-sub { color: rgba(24,24,28,.8); fon
 
 html[data-lux-theme="light"] .lux-collection-icon-badge { border-color: rgba(217,119,6,.35); background: linear-gradient(135deg, rgba(245,158,11,.15), rgba(245,158,11,.05)); color: #b45309; box-shadow: 0 2px 8px rgba(217,119,6,.1); }
 
-html[data-lux-theme="light"] .lux-badge-pill { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
-
+/* Light pill surfaces are declared per usage family. A bare
+   `html[data-lux-theme="light"] .lux-badge-pill` (0,2,1) would outrank every
+   `.lux-badge-pill` modifier and the shared `:hover` state, silently dropping
+   variant colors and hover feedback. */
 html[data-lux-theme="light"] .lux-badge-accent { border-color: var(--lux-line-soft) !important; color: var(--lux-muted) !important; background: rgba(28,28,34,.05) !important; }
 
 html[data-lux-theme="light"] .lux-media-nfo-tagline { color: var(--lux-muted); }
 
 html[data-lux-theme="light"] .lux-media-nfo-genre-tags span { border-color: rgba(28,28,34,.16); color: var(--lux-text); background: rgba(28,28,34,.05); font-weight: 500; }
+
+html[data-lux-theme="light"] .lux-media-nfo-studios .lux-badge-pill { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
+
+html[data-lux-theme="light"] .lux-media-nfo-links-list .lux-badge-pill { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
+
+html[data-lux-theme="light"] .lux-media-nfo-provider-badge { border-color: rgba(28,28,34,.16); color: var(--lux-text); font-weight: 500; background: rgba(28,28,34,.05); }
 
 html[data-lux-theme="light"] .lux-media-nfo-rating-val strong small { color: var(--lux-muted); }
 
@@ -485,11 +493,13 @@ html[data-lux-theme="light"] .lux-season-episode-copy p { color: var(--lux-text)
 
 .lux-detail-mobile-header { display: none; }
 
-.lux-detail-backdrop { position: absolute; z-index: -3; inset: 0; width: 100%; height: 100%; object-fit: cover; opacity: .58; filter: saturate(.78) brightness(.72) blur(1px); transform: scale(1.02); }
+.lux-detail-backdrop-frame { position: absolute; z-index: -3; top: 0; left: 0; right: 0; }
 
-.lux-detail-overlay { position: absolute; z-index: -2; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95), rgba(5,5,6,.7) 45%, rgba(5,5,6,.42)), linear-gradient(0deg, #050506 4%, transparent 58%); }
+.lux-detail-backdrop { display: block; width: 100%; height: auto; }
 
-.lux-detail-content { position: relative; width: 92%; min-height: 100vh; min-height: 100dvh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
+.lux-detail-overlay { position: absolute; inset: 0; background: linear-gradient(90deg, rgba(5,5,6,.95) 0%, rgba(5,5,6,.88) 30%, rgba(5,5,6,.76) 58%, rgba(5,5,6,.64) 100%), linear-gradient(0deg, #08080a 0%, rgba(5,5,6,0) 40%), linear-gradient(180deg, rgba(5,5,6,.35) 0%, transparent 22%); }
+
+.lux-detail-content { position: relative; width: 92%; text-shadow: 0 1px 8px rgba(0,0,0,.55); min-height: 100vh; min-height: 100dvh; margin: 0 auto; padding: var(--lux-page-top) 0 110px; }
 
 .lux-detail-sections { display: flex; flex-direction: column; }
 
@@ -565,6 +575,18 @@ html[data-lux-theme="light"] .lux-season-episode-copy p { color: var(--lux-text)
 
 .lux-detail-badge.is-audio { border-color: rgba(16,185,129,.35); background: rgba(16,185,129,.1); color: #a7f3d0; }
 
+/* The neutral (codec, bit depth) badges keep the muted pill surface in light mode,
+   while the variant rules below restore each semantic hue. */
+html[data-lux-theme="light"] .lux-detail-badge { border-color: rgba(28,28,34,.16); background: rgba(28,28,34,.05); color: var(--lux-text); font-weight: 500; }
+
+html[data-lux-theme="light"] .lux-detail-badge.is-4k { border-color: rgba(180,83,9,.35); background: rgba(245,158,11,.16); color: #92400e; font-weight: 700; box-shadow: 0 0 10px rgba(245,158,11,.12); }
+
+html[data-lux-theme="light"] .lux-detail-badge.is-1080p { border-color: rgba(29,78,216,.32); background: rgba(59,130,246,.14); color: #1d4ed8; font-weight: 600; }
+
+html[data-lux-theme="light"] .lux-detail-badge.is-hdr { border-color: rgba(109,40,217,.32); background: rgba(168,85,247,.14); color: #6d28d9; font-weight: 600; }
+
+html[data-lux-theme="light"] .lux-detail-badge.is-audio { border-color: rgba(4,120,87,.38); background: rgba(16,185,129,.14); color: #065f46; }
+
 .lux-detail-overview { position: relative; max-width: none; margin: 28px 0 0; color: rgba(255,255,255,.7); font-size: 1rem; line-height: 1.7; }
 
 .lux-detail-overview-text { max-height: calc(1.7em * 3); margin: 0; overflow: hidden; color: inherit; line-height: inherit; }
@@ -636,6 +658,7 @@ html[data-lux-theme="light"] .lux-season-episode-copy p { color: var(--lux-text)
   .lux-detail-mobile-back:hover { border-color: rgba(255,255,255,.36); background: rgba(255,255,255,.1); }
   .lux-detail-mobile-brand { display: inline-flex; align-items: center; gap: 8px; min-height: 46px; color: #fff; font-size: 1rem; font-weight: 650; letter-spacing: -.04em; text-shadow: 0 4px 16px rgba(0,0,0,.4); pointer-events: auto; }
   .lux-detail-mobile-brand-logo { display: block; width: 31px; height: 31px; filter: drop-shadow(0 5px 12px rgba(0,0,0,.28)); }
+  .lux-detail-backdrop-frame { display: none; }
   .lux-detail-backdrop { display: none; }
   .lux-detail-overlay { display: none; }
   .lux-detail-content { width: 100%; padding-top: 0; }
@@ -707,9 +730,9 @@ html[data-lux-theme="light"] .lux-season-episode-copy p { color: var(--lux-text)
 /* Detail pages use the same pale reading layer as the light home hero. */
 html[data-lux-theme="light"] .lux-detail-page { color: var(--lux-text); background: var(--lux-bg); }
 
-html[data-lux-theme="light"] .lux-detail-backdrop { opacity: .36; filter: saturate(.88) brightness(1.02); }
+html[data-lux-theme="light"] .lux-detail-overlay { background: linear-gradient(90deg, rgba(244,243,241,.96) 0%, rgba(244,243,241,.88) 32%, rgba(244,243,241,.7) 60%, rgba(244,243,241,.55) 100%), linear-gradient(0deg, #f4f3f1 0%, rgba(244,243,241,0) 40%), linear-gradient(180deg, rgba(244,243,241,.4) 0%, transparent 22%); }
 
-html[data-lux-theme="light"] .lux-detail-overlay { background: linear-gradient(90deg, rgba(244,243,241,.96) 0%, rgba(244,243,241,.88) 44%, rgba(244,243,241,.4) 76%, rgba(244,243,241,.12) 100%), linear-gradient(0deg, rgba(244,243,241,.98) 0%, rgba(244,243,241,.76) 24%, rgba(244,243,241,.28) 48%, transparent 100%); }
+html[data-lux-theme="light"] .lux-detail-content { text-shadow: none; }
 
 html[data-lux-theme="light"] .lux-detail-mobile-header::before { background: linear-gradient(180deg, rgba(244,243,241,.98) 0%, rgba(244,243,241,.84) 30%, rgba(244,243,241,.52) 52%, rgba(244,243,241,.28) 72%, rgba(244,243,241,0) 100%); }
 

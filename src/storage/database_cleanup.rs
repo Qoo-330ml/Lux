@@ -13,6 +13,29 @@ const CLEANUP_BATCH_SIZE: i64 = 1_000;
 const LOCAL_METADATA_BATCH_RETENTION_SECONDS: i64 = 3_600;
 const MAX_LOG_MIGRATION_BATCH_BYTES: u64 = crate::observability::logs::LOG_SEGMENT_BYTES / 2;
 
+/// Expired tombstones that can be dropped without losing anything the user earned.
+///
+/// Merge targets still block the delete. User state and playback history no longer do when the item
+/// carries a provider identity: that identity is what lets the archived copies find the item again,
+/// so both are archived instead of pinning the row forever. An unidentified item keeps its row,
+/// because there would be nothing left to match its history by later.
+const PURGEABLE_REMOVED_ITEM_SELECT: &str = "
+SELECT mi.id FROM media_items mi
+WHERE mi.removed_at IS NOT NULL
+  AND mi.removed_at < unixepoch() - ?
+  AND mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO', 'UNRESOLVED')
+  AND NOT EXISTS (
+      SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
+  AND (
+      (
+          NOT EXISTS (SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
+          AND NOT EXISTS (SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
+      )
+      OR EXISTS (SELECT 1 FROM media_item_provider_ids p WHERE p.media_item_id = mi.id)
+  )
+ORDER BY mi.removed_at
+LIMIT ?";
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct DatabaseLifecycleCleanupReport {
     pub scan_job_paths_deleted: u64,
@@ -37,10 +60,7 @@ impl Database {
             .query_scalar("SELECT COUNT(*) FROM scan_job_events")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if source_event_count == 0 {
             self.mark_config_log_migration_complete(SCAN_JOB_EVENTS_LOG_MIGRATION_MARKER)
                 .await?;
@@ -58,10 +78,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if rows.is_empty() {
                 break;
             }
@@ -182,10 +199,7 @@ impl Database {
             let deleted = statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             self.log_store
                 .prune_archives()
@@ -212,10 +226,7 @@ impl Database {
             .query_scalar("SELECT COUNT(*) FROM audit_events")
             .fetch_one(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if source_event_count == 0 {
             self.mark_config_log_migration_complete(AUDIT_EVENTS_LOG_MIGRATION_MARKER)
                 .await?;
@@ -237,10 +248,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if rows.is_empty() {
                 break;
             }
@@ -355,10 +363,7 @@ impl Database {
             let deleted = statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             self.log_store
                 .prune_archives()
@@ -380,10 +385,7 @@ impl Database {
             .bind(key)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(value.as_deref() == Some(DATABASE_CLEANUP_COMPLETED))
     }
 
@@ -394,20 +396,14 @@ impl Database {
             .bind(key)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if updated.rows_affected() == 0 {
             self.query("INSERT INTO lux_meta (key, value) VALUES (?, ?)")
                 .bind(key)
                 .bind(DATABASE_CLEANUP_COMPLETED)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -475,10 +471,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn claim_database_cleanup(&self) -> Result<bool, StorageError> {
@@ -493,10 +486,7 @@ impl Database {
             .bind(DATABASE_CLEANUP_PENDING)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -512,10 +502,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn mark_database_cleanup_completed(&self) -> Result<(), StorageError> {
@@ -530,10 +517,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn perform_database_cleanup(
@@ -570,10 +554,7 @@ impl Database {
         )
         .execute(&self.pool)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let scan_manifest_directories_deleted =
             self.delete_completed_scan_manifest_directories().await?;
         let scan_local_metadata_batches_deleted =
@@ -617,10 +598,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -647,10 +625,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -677,10 +652,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -708,10 +680,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -739,10 +708,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -770,10 +736,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -803,10 +766,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -839,10 +799,7 @@ impl Database {
                 .bind(CLEANUP_BATCH_SIZE)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -871,10 +828,7 @@ impl Database {
             )
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected())
     }
 }
@@ -969,6 +923,18 @@ mod prune_sql {
              ORDER BY created_at, id
              LIMIT ?
          )";
+    /// Pending candidates past their expiry can never be selected, but they keep their payload
+    /// until the rejection retention window. Delete them after a one-hour grace so a slow worker
+    /// can still finish a just-expired page.
+    pub(super) const METADATA_CANDIDATE_EXPIRED_PENDING: &str = "DELETE FROM metadata_candidates
+         WHERE id IN (
+             SELECT id FROM metadata_candidates
+             WHERE status = 'PENDING'
+               AND expires_at IS NOT NULL
+               AND expires_at < ?
+             ORDER BY expires_at, id
+             LIMIT ?
+         )";
     /// Orphaned targets belong to a job that no longer exists. The anti-join is bounded by the
     /// batch size, so the sweep finishes its first batches on the pages that still hold orphans.
     pub(super) const ORPHAN_SCAN_JOB_TARGETS: &str = "DELETE FROM scan_job_targets
@@ -1001,6 +967,263 @@ mod prune_sql {
              ORDER BY candidate.created_at, candidate.id
              LIMIT ?
          )";
+}
+
+/// Terminal account records (invitations, mail, merge history) are kept this long for audits.
+const ACCOUNT_RECORD_RETENTION_SECONDS: i64 = 90 * 24 * 60 * 60;
+/// Devices that have not been seen for this long are dropped so the list stays bounded.
+const USER_DEVICE_RETENTION_SECONDS: i64 = 180 * 24 * 60 * 60;
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct AccountRecordPurge {
+    pub user_invitations: u64,
+    pub mail_outbox: u64,
+    pub mail_challenges: u64,
+    pub user_devices: u64,
+    pub media_merge_records: u64,
+    pub user_registration_requests: u64,
+    pub emby_migration_jobs: u64,
+    pub metadata_candidates: u64,
+}
+
+impl Database {
+    /// Drops terminal invitation/mail/merge rows and stale devices in bounded batches.
+    #[allow(clippy::field_reassign_with_default)]
+    pub(crate) async fn purge_expired_account_records(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<AccountRecordPurge, StorageError> {
+        let cutoff = now.saturating_sub(ACCOUNT_RECORD_RETENTION_SECONDS);
+        let device_cutoff = now.saturating_sub(USER_DEVICE_RETENTION_SECONDS);
+        let batch = limit.clamp(1, 5_000);
+        let mut purge = AccountRecordPurge::default();
+        purge.user_invitations = self
+            .query(
+                "DELETE FROM user_invitations WHERE id IN (
+                     SELECT id FROM user_invitations
+                     WHERE status <> 'PENDING' AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.mail_outbox = self
+            .query(
+                "DELETE FROM mail_outbox WHERE id IN (
+                     SELECT id FROM mail_outbox
+                     WHERE status IN ('SENT', 'FAILED') AND updated_at < ?
+                     ORDER BY updated_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.mail_challenges = self
+            .query(
+                "DELETE FROM mail_challenges WHERE id IN (
+                     SELECT id FROM mail_challenges
+                     WHERE expires_at < ?
+                       AND (consumed_at IS NOT NULL OR revoked_at IS NOT NULL)
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.user_devices = self
+            .query(
+                "DELETE FROM user_devices WHERE (user_id, device_id) IN (
+                     SELECT user_id, device_id FROM user_devices
+                     WHERE last_seen_at < ?
+                     ORDER BY last_seen_at, user_id, device_id LIMIT ?
+                 )",
+            )
+            .bind(device_cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.media_merge_records = self
+            .query(
+                "DELETE FROM media_merge_records WHERE id IN (
+                     SELECT id FROM media_merge_records
+                     WHERE undone_at IS NOT NULL AND undone_at < ?
+                     ORDER BY undone_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.user_registration_requests = self
+            .query(
+                "DELETE FROM user_registration_requests WHERE id IN (
+                     SELECT id FROM user_registration_requests
+                     WHERE status IN ('APPROVED', 'REJECTED', 'EXPIRED')
+                       AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.emby_migration_jobs = self
+            .query(
+                "DELETE FROM emby_migration_jobs WHERE id IN (
+                     SELECT id FROM emby_migration_jobs
+                     WHERE status IN ('COMPLETED', 'CANCELLED', 'FAILED')
+                       AND COALESCE(finished_at, updated_at) < ?
+                     ORDER BY COALESCE(finished_at, updated_at), id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        // Pending candidates past their expiry can never be selected. The retention worker also
+        // removes them, but it only runs daily; the minute-level cleanup keeps the table small.
+        purge.metadata_candidates = self
+            .query(
+                "DELETE FROM metadata_candidates WHERE id IN (
+                     SELECT id FROM metadata_candidates
+                     WHERE status = 'PENDING'
+                       AND expires_at IS NOT NULL
+                       AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(now.saturating_sub(60 * 60))
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        Ok(purge)
+    }
+}
+
+/// Session and playback rows older than this are not needed for any active client.
+const SESSION_HISTORY_RETENTION_SECONDS: i64 = 30 * 24 * 60 * 60;
+
+#[derive(Debug, Default, Eq, PartialEq)]
+pub(crate) struct SessionHistoryPurge {
+    pub web_sessions: u64,
+    pub access_tokens: u64,
+    pub web_playback_sessions: u64,
+    pub playback_sessions: u64,
+    pub playback_admissions: u64,
+}
+
+impl Database {
+    /// Drops expired/revoked session rows and finished playback history in bounded batches.
+    ///
+    /// These tables are append-only today: nothing removed them, so a NAS that has been running
+    /// for a year keeps every login and playback row. Only terminal rows older than the retention
+    /// window are touched; active sessions and running playbacks are never deleted.
+    #[allow(clippy::field_reassign_with_default)]
+    pub(crate) async fn purge_expired_session_history(
+        &self,
+        now: i64,
+        limit: i64,
+    ) -> Result<SessionHistoryPurge, StorageError> {
+        let cutoff = now.saturating_sub(SESSION_HISTORY_RETENTION_SECONDS);
+        let batch = limit.clamp(1, 5_000);
+        let mut purge = SessionHistoryPurge::default();
+        purge.web_sessions = self
+            .query(
+                "DELETE FROM web_sessions WHERE id IN (
+                     SELECT id FROM web_sessions
+                     WHERE expires_at < ?
+                        OR (revoked_at IS NOT NULL AND revoked_at < ?)
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.access_tokens = self
+            .query(
+                "DELETE FROM access_tokens WHERE id IN (
+                     SELECT id FROM access_tokens
+                     WHERE (revoked_at IS NOT NULL AND revoked_at < ?)
+                        OR (scope = 'PLAYBACK' AND expires_at < ?)
+                     ORDER BY COALESCE(revoked_at, expires_at), id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.web_playback_sessions = self
+            .query(
+                "DELETE FROM web_playback_sessions WHERE id IN (
+                     SELECT id FROM web_playback_sessions
+                     WHERE state <> 'ACTIVE' AND expires_at < ?
+                     ORDER BY expires_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.playback_sessions = self
+            .query(
+                "DELETE FROM playback_sessions WHERE id IN (
+                     SELECT id FROM playback_sessions
+                     WHERE state = 'STOPPED' AND last_event_at < ?
+                     ORDER BY last_event_at, id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        purge.playback_admissions = self
+            .query(
+                "DELETE FROM playback_admissions WHERE (user_id, play_session_id) IN (
+                     SELECT user_id, play_session_id FROM playback_admissions
+                     WHERE state = 'RELEASED' AND last_seen_at < ?
+                     ORDER BY last_seen_at, user_id, play_session_id LIMIT ?
+                 )",
+            )
+            .bind(cutoff)
+            .bind(batch)
+            .execute(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .rows_affected();
+        Ok(purge)
+    }
 }
 
 static REMOVED_ITEM_PURGE_RUNNING: std::sync::atomic::AtomicBool =
@@ -1091,7 +1314,12 @@ impl Database {
 
     /// Hard-deletes soft-deleted media items older than `retention_seconds` in small
     /// batches, letting `ON DELETE CASCADE` remove images, credits and search rows.
-    /// Items that still carry user state, playback history or are a merge target are kept.
+    /// Items that are a merge target are kept.
+    ///
+    /// User state and playback history no longer block the delete: an identified item has both
+    /// copied into their archives first, so the history survives and is reattached to whichever
+    /// item carries the same provider identity later. Only items without a provider identity keep
+    /// their rows, because there would be nothing to match their history by afterwards.
     pub async fn purge_expired_removed_media_items(
         &self,
         retention_seconds: i64,
@@ -1099,35 +1327,42 @@ impl Database {
         max_batches: u32,
         pause: std::time::Duration,
     ) -> Result<u64, StorageError> {
+        if batch_size <= 0 {
+            return Ok(0);
+        }
         let mut purged = 0_u64;
         for _ in 0..max_batches {
-            let count = self
-                .query(
-                    "DELETE FROM media_items
-                     WHERE id IN (
-                         SELECT mi.id FROM media_items mi
-                         WHERE mi.removed_at IS NOT NULL
-                           AND mi.removed_at < unixepoch() - ?
-                           AND mi.item_type IN ('MOVIE', 'EPISODE', 'VIDEO', 'UNRESOLVED')
-                           AND NOT EXISTS (
-                               SELECT 1 FROM user_item_state s WHERE s.item_id = mi.id)
-                           AND NOT EXISTS (
-                               SELECT 1 FROM playback_history_events e WHERE e.item_id = mi.id)
-                           AND NOT EXISTS (
-                               SELECT 1 FROM media_items m2 WHERE m2.merged_into_item_id = mi.id)
-                         ORDER BY mi.removed_at
-                         LIMIT ?
-                     )",
-                )
+            let candidates = self
+                .query_scalar::<String>(PURGEABLE_REMOVED_ITEM_SELECT)
                 .bind(retention_seconds)
                 .bind(batch_size)
-                .execute(&self.pool)
+                .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?;
+            if candidates.is_empty() {
+                break;
+            }
+            // Archive and delete in one transaction: a crash in between must not leave either an
+            // item whose state was already consumed or a state row whose item is already gone.
+            let mut transaction = self.begin_metadata_write_transaction().await?;
+            self.archive_watch_state_for_items(&mut transaction, &candidates)
+                .await?;
+            self.archive_playback_history_for_items(&mut transaction, &candidates)
+                .await?;
+            let placeholders = std::iter::repeat_n("?", candidates.len())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let delete = format!("DELETE FROM media_items WHERE id IN ({placeholders})");
+            let mut statement = self.query(sqlx::AssertSqlSafe(delete));
+            for id in &candidates {
+                statement = statement.bind(id.as_str());
+            }
+            let count = statement
+                .execute(&mut *transaction)
+                .await
+                .map_err(self.sqlx_err())?
                 .rows_affected();
+            transaction.commit().await.map_err(self.sqlx_err())?;
             if count == 0 {
                 break;
             }
@@ -1179,10 +1414,7 @@ impl Database {
                 .bind(batch_size)
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
                 .rows_affected();
             if count == 0 {
                 break;
@@ -1210,10 +1442,7 @@ impl Database {
             .bind(key)
             .fetch_optional(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(value.as_deref() == Some("1"))
     }
 
@@ -1229,10 +1458,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub async fn normalize_media_source_defaults(&self) -> Result<u64, StorageError> {
@@ -1254,10 +1480,7 @@ impl Database {
                 .bind(SOURCE_DEFAULT_REPAIR_BATCH_SIZE)
                 .fetch_all(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             if item_ids.is_empty() {
                 break;
             }
@@ -1281,10 +1504,7 @@ impl Database {
             statement
                 .execute(&self.pool)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             repaired = repaired.saturating_add(item_ids.len() as u64);
             if repaired > 100_000_000 {
                 break;
@@ -1318,41 +1538,19 @@ impl Database {
                 .execute(&self.pool)
                 .await
                 .map(|result| result.rows_affected())
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                });
+                .map_err(self.sqlx_err());
         }
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         sqlx::query(RETENTION_STATEMENT_TIMEOUT)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let deleted = query
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected();
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(deleted)
     }
 
@@ -1554,6 +1752,16 @@ impl Database {
                 deadline,
             )
             .await;
+        let expired_pending = self
+            .prune_table(
+                &mut failed,
+                "metadata_candidate_expired_pending",
+                prune_sql::METADATA_CANDIDATE_EXPIRED_PENDING,
+                current_unix_timestamp().saturating_sub(60 * 60),
+                METADATA_CANDIDATE_PRUNE_BATCH.max(batch),
+                deadline,
+            )
+            .await;
         Ok(TaskHistoryRetentionReport {
             strm_probe_jobs,
             chapter_detection_jobs,
@@ -1561,7 +1769,9 @@ impl Database {
             metadata_reidentify_jobs,
             scan_jobs,
             scan_job_targets,
-            metadata_candidates: rejected.saturating_add(superseded),
+            metadata_candidates: rejected
+                .saturating_add(superseded)
+                .saturating_add(expired_pending),
             failed,
         })
     }
@@ -1841,5 +2051,149 @@ mod task_history_retention_tests {
             .await?;
         assert_eq!(jobs, 1);
         Ok(())
+    }
+}
+
+/// Manual measurement harness for `docs/STARTUP-REPAIRS.md`.
+///
+/// It opens a catalog fixture seeded by `tools/catalog-fixture/generate.py`, runs every startup
+/// repair once so the one-time markers are recorded, then measures the second, steady-state run.
+/// Query counts come from `Database::query_count`; write statements are counted from the
+/// `sqlx::query` events the subscriber prints between the step markers.
+///
+/// `LUX_STARTUP_REPAIR_FIXTURE_DIR=/tmp/lux-startup-measure/config \
+///  cargo test --release --locked --lib \
+///  storage::repository::database_cleanup::startup_repair_measurements -- --ignored --nocapture`
+#[cfg(test)]
+mod startup_repair_measurements {
+    use super::*;
+    use crate::{
+        application::{image_repairs, scanner::LibraryScanner},
+        config::Config,
+    };
+    use std::time::Instant;
+
+    const FIXTURE_DIR_ENV: &str = "LUX_STARTUP_REPAIR_FIXTURE_DIR";
+
+    #[tokio::test(flavor = "multi_thread")]
+    #[ignore = "manual measurement: seeds a catalog fixture and prints the steady-state cost"]
+    async fn startup_repairs_on_a_steady_catalog() -> Result<(), Box<dyn std::error::Error>> {
+        let Some(fixture_dir) = std::env::var_os(FIXTURE_DIR_ENV) else {
+            eprintln!("{FIXTURE_DIR_ENV} is not set; nothing measured");
+            return Ok(());
+        };
+        let _ = tracing::subscriber::set_global_default(
+            tracing_subscriber::FmtSubscriber::builder()
+                .with_env_filter(tracing_subscriber::EnvFilter::new("warn,sqlx::query=debug"))
+                .with_writer(std::io::stderr)
+                .finish(),
+        );
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: fixture_dir.into(),
+        })
+        .await?;
+        let media_items: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM media_items")
+            .fetch_one(&database.pool)
+            .await?;
+        let media_sources: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM media_sources")
+            .fetch_one(&database.pool)
+            .await?;
+        let filesystem_entries: i64 = database
+            .query_scalar("SELECT COUNT(*) FROM filesystem_entries")
+            .fetch_one(&database.pool)
+            .await?;
+        eprintln!(
+            "fixture media_items={media_items} media_sources={media_sources} \
+             filesystem_entries={filesystem_entries}"
+        );
+        measure_startup_repairs(&database, "warmup").await;
+        eprintln!("steady state below: one-time markers are now recorded");
+        measure_startup_repairs(&database, "steady").await;
+        Ok(())
+    }
+
+    async fn measure_startup_repairs(database: &Database, pass: &str) {
+        macro_rules! step {
+            ($name:expr, $body:expr) => {{
+                eprintln!("== {pass} / {} start", $name);
+                database.reset_query_count();
+                let started = Instant::now();
+                let outcome: String = $body.await;
+                let elapsed = started.elapsed();
+                eprintln!(
+                    "== {pass} / {} elapsed_ms={:.3} queries={} result={}",
+                    $name,
+                    elapsed.as_secs_f64() * 1_000.0,
+                    database.query_count(),
+                    outcome,
+                );
+            }};
+        }
+
+        step!("migrate_legacy_scan_job_events_to_logs", async {
+            match database.migrate_legacy_scan_job_events_to_logs().await {
+                Ok(migrated) => format!("migrated={migrated}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("migrate_legacy_audit_events_to_logs", async {
+            match database.migrate_legacy_audit_events_to_logs().await {
+                Ok(migrated) => format!("migrated={migrated}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("repair_episode_image_path_conflicts", async {
+            match image_repairs::repair_episode_image_path_conflicts(database).await {
+                Ok(report) => format!("repaired={} skipped={}", report.repaired, report.skipped),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("normalize_media_source_defaults", async {
+            match database.normalize_media_source_defaults().await {
+                Ok(repaired) => format!("repaired={repaired}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("run_database_lifecycle_cleanup", async {
+            match database.run_database_lifecycle_cleanup().await {
+                Ok(report) => format!("{report:?}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        step!("repair_legacy_identity_keys", async {
+            match LibraryScanner::new(database.clone())
+                .repair_legacy_identity_keys()
+                .await
+            {
+                Ok(repaired) => format!("repaired={repaired}"),
+                Err(error) => format!("error={error}"),
+            }
+        });
+        // The fingerprint migration only spawns a worker at startup; its first statement runs after
+        // a one minute delay, so measure what that worker repeats once per library.
+        step!("scan_fingerprint_migration_start", async {
+            match database.list_scan_fingerprint_migration_library_ids().await {
+                Ok(library_ids) => {
+                    let mut outcome = format!("libraries={}", library_ids.len());
+                    for library_id in &library_ids {
+                        match database
+                            .ensure_scan_fingerprint_migration_state(library_id)
+                            .await
+                        {
+                            Ok(cursor) => outcome.push_str(&format!(
+                                " {library_id}:completed={}",
+                                cursor.completed_at.is_some()
+                            )),
+                            Err(error) => outcome.push_str(&format!(" error={error}")),
+                        }
+                    }
+                    outcome
+                }
+                Err(error) => format!("error={error}"),
+            }
+        });
     }
 }

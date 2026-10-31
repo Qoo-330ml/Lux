@@ -34,21 +34,19 @@ pub(super) async fn live() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-pub(super) async fn login_background(State(state): State<AppState>) -> Response {
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+pub(super) async fn login_background(State(state): State<ReadyAppState>) -> Response {
+    let database = state.database();
     let source = match database.login_background_source().await {
         Ok(Some(source)) if is_valid_login_background_source(&source) => source,
         Ok(_) => DEFAULT_LOGIN_BACKGROUND_SOURCE.to_owned(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
     if let Some(plugin_id) = login_background_plugin_id(&source) {
-        let Some(plugins) = state.plugins.as_ref() else {
-            return Json(json!({ "source": DEFAULT_LOGIN_BACKGROUND_SOURCE, "images": [] }))
-                .into_response();
-        };
-        let result = match plugins.cached_login_background_result(plugin_id).await {
+        let result = match state
+            .plugins()
+            .cached_login_background_result(plugin_id)
+            .await
+        {
             Ok(Some(result)) => result,
             Ok(None) | Err(_) => {
                 return Json(json!({ "source": DEFAULT_LOGIN_BACKGROUND_SOURCE, "images": [] }))
@@ -69,9 +67,7 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
         return Json(json!({ "source": source, "images": [] })).into_response();
     }
 
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = state.libraries();
     let enabled_library_ids = match libraries.list_libraries().await {
         Ok(views) => views
             .into_iter()
@@ -80,9 +76,7 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
             .collect::<Vec<_>>(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
-    let Some(catalog) = state.catalog.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let catalog = state.catalog();
     let page = match catalog
         .list_recently_added_movies_and_series_for_library_ids(
             &enabled_library_ids,
@@ -113,11 +107,9 @@ pub(super) async fn login_background(State(state): State<AppState>) -> Response 
 
 pub(super) async fn login_background_custom_image(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
-    let Some(plugins) = state.plugins.as_ref() else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let plugins = state.plugins();
     let asset = match plugins.selected_custom_login_background_asset().await {
         Ok(Some(asset)) => asset,
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
@@ -156,7 +148,7 @@ pub(super) async fn login_background_custom_image(
 }
 
 pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let Some(database) = state.database else {
+    let Some(database) = state.database() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -209,7 +201,7 @@ pub(super) async fn ready(State(state): State<AppState>) -> (StatusCode, Json<Va
 }
 
 pub(super) async fn version(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let Some(database) = state.database else {
+    let Some(database) = state.database() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -233,7 +225,7 @@ pub(super) async fn version(State(state): State<AppState>) -> (StatusCode, Json<
 }
 
 pub(super) async fn setup_status(State(state): State<AppState>) -> (StatusCode, Json<Value>) {
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -250,7 +242,7 @@ pub(super) async fn setup_status(State(state): State<AppState>) -> (StatusCode, 
 }
 
 pub(super) async fn setup_database_status(State(state): State<AppState>) -> Response {
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({ "status": "not_ready", "reason": "database_unavailable" })),
@@ -343,7 +335,7 @@ pub(super) async fn setup_database_test(
     if !setup_endpoint_allows_peer(&headers) {
         return setup_remote_peer_rejected(&headers);
     }
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -373,7 +365,7 @@ pub(super) async fn setup_database_test(
             .into_response();
         }
     }
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -401,7 +393,7 @@ pub(super) async fn setup_database_select(
     if !setup_endpoint_allows_peer(&headers) {
         return setup_remote_peer_rejected(&headers);
     }
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -431,7 +423,7 @@ pub(super) async fn setup_database_select(
             .into_response();
         }
     }
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -469,7 +461,7 @@ pub(super) async fn setup_database_restart(
         .into_response();
     }
 
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -500,7 +492,7 @@ pub(super) async fn setup_database_restart(
         }
     }
 
-    let Some(database_setup) = state.database_setup.as_ref() else {
+    let Some(database_setup) = state.database_setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -609,7 +601,7 @@ pub(super) async fn setup_complete(
     State(state): State<AppState>,
     Json(request): Json<SetupCompleteRequest>,
 ) -> Response {
-    let Some(setup) = state.setup.as_ref() else {
+    let Some(setup) = state.setup() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -620,7 +612,7 @@ pub(super) async fn setup_complete(
     };
 
     if state.database_selection_required {
-        let Some(database_setup) = state.database_setup.as_ref() else {
+        let Some(database_setup) = state.database_setup() else {
             return api_error(
                 &headers,
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -700,51 +692,21 @@ pub(super) async fn setup_complete(
         .await
     {
         Ok(user) => {
-            let mut library_json_value = None;
-            if let (Some(first_library), Some(kind), Some(libraries)) =
-                (request.first_library, setup_kind, state.libraries.as_ref())
-            {
-                let library = match libraries
-                    .create_library_with_scraper(
-                        &first_library.name,
-                        kind,
-                        first_library.realtime_watch_enabled,
-                        None,
-                        true,
-                    )
-                    .await
-                {
-                    Ok(library) => library,
-                    Err(error) => return library_error(&headers, error),
-                };
-                let mut roots = Vec::new();
-                let mut warnings = Vec::new();
-                if let Some(root_path) = first_library.root_path {
-                    match libraries.add_root(library.id, &root_path).await {
-                        Ok(result) => {
-                            roots.push(result.root);
-                            warnings = result
-                                .warnings
-                                .iter()
-                                .map(|warning| warning.as_str())
-                                .collect::<Vec<_>>();
+            let library_json_value = match (request.first_library, setup_kind) {
+                (Some(first_library), Some(kind)) => {
+                    match setup_first_library(&state, &headers, first_library, kind).await {
+                        Ok(library) => library,
+                        Err(response) => {
+                            // The administrator is stored, so setup can never run again: ask for the
+                            // restart even though this request answered 4xx. Without it the process
+                            // would stay in setup mode and the owner could not create a library.
+                            schedule_setup_restart(&state);
+                            return response;
                         }
-                        Err(error) => return library_error(&headers, error),
                     }
                 }
-                let scan_job = match spawn_library_scan(&state, library.id).await {
-                    Ok(job) => job,
-                    Err(error) => {
-                        tracing::warn!(library_id = %library.id, %error, "initial library scan could not be started");
-                        None
-                    }
-                };
-                library_json_value = Some(json!({
-                    "library": library_json(&library, &roots),
-                    "warnings": warnings,
-                    "scanJob": scan_job.as_ref().map(scan_job_json),
-                }));
-            }
+                _ => None,
+            };
             let mut response = json!({
                 "initialized": true,
                 "user": user_json(&user),
@@ -754,6 +716,7 @@ pub(super) async fn setup_complete(
                 response["warnings"] = library["warnings"].clone();
                 response["scanJob"] = library["scanJob"].clone();
             }
+            response["restarting"] = json!(schedule_setup_restart(&state));
             (StatusCode::CREATED, Json(response)).into_response()
         }
         Err(SetupError::AlreadyCompleted) => api_error(
@@ -780,6 +743,87 @@ pub(super) async fn setup_complete(
         )
         .into_response(),
     }
+}
+
+/// Creates the optional first library of a completed setup, with its root and its first scan.
+///
+/// The caller has already stored the administrator, so every error here is a partial success: the
+/// caller schedules the restart and answers the 4xx as before.
+async fn setup_first_library(
+    state: &AppState,
+    headers: &HeaderMap,
+    first_library: SetupFirstLibraryRequest,
+    kind: LibraryKind,
+) -> Result<Option<serde_json::Value>, Response> {
+    let Some(libraries) = state.libraries() else {
+        return Ok(None);
+    };
+    let library = match libraries
+        .create_library_with_scraper(
+            &first_library.name,
+            kind,
+            first_library.realtime_watch_enabled,
+            None,
+            true,
+        )
+        .await
+    {
+        Ok(library) => library,
+        Err(error) => return Err(library_error(headers, error)),
+    };
+    let mut roots = Vec::new();
+    let mut warnings = Vec::new();
+    if let Some(root_path) = first_library.root_path {
+        match libraries.add_root(library.id, &root_path).await {
+            Ok(result) => {
+                roots.push(result.root);
+                warnings = result
+                    .warnings
+                    .iter()
+                    .map(|warning| warning.as_str())
+                    .collect::<Vec<_>>();
+            }
+            Err(error) => return Err(library_error(headers, error)),
+        }
+    }
+    let scan_job = match state.as_ready() {
+        Some(ready) => spawn_library_scan(&ready, library.id).await,
+        None => Ok(None),
+    };
+    let scan_job = match scan_job {
+        Ok(job) => job,
+        Err(error) => {
+            tracing::warn!(library_id = %library.id, %error, "initial library scan could not be started");
+            None
+        }
+    };
+    Ok(Some(json!({
+        "library": library_json(&library, &roots),
+        "warnings": warnings,
+        "scanJob": scan_job.as_ref().map(scan_job_json),
+    })))
+}
+
+/// Requests the process restart that leaves the setup mode once the response has been written.
+///
+/// Returns whether the restart was scheduled, which the `201` body reports as `restarting`. A
+/// missing handle is not an error: setup already succeeded, so the request only degrades to "no
+/// restart" (embedded states and older test fixtures inject no handle).
+fn schedule_setup_restart(state: &AppState) -> bool {
+    let Some(handle) = state.restart_handle.clone() else {
+        tracing::warn!("setup completed without a restart handle");
+        return false;
+    };
+    let delay = state.setup_restart_delay();
+    tokio::spawn(async move {
+        tokio::time::sleep(delay).await;
+        if !handle.request_restart() {
+            // The handle is one-shot, so `false` means another path (database switch) already
+            // asked for the same restart.
+            tracing::info!("restart was already requested before setup completed");
+        }
+    });
+    true
 }
 
 #[derive(Deserialize)]
@@ -827,14 +871,15 @@ fn web_login_device_id(headers: &HeaderMap) -> Option<String> {
 }
 
 async fn record_web_device_observation(
-    state: &AppState,
+    state: &ReadyAppState,
     user_id: &str,
     device_id: Option<&str>,
     remote_ip: Option<String>,
 ) {
-    let (Some(device_id), Some(database)) = (device_id, state.database.as_ref()) else {
+    let Some(device_id) = device_id else {
         return;
     };
+    let database = state.database();
     if let Err(error) = database
         .upsert_user_device(NewUserDeviceObservation {
             user_id,
@@ -854,18 +899,10 @@ async fn record_web_device_observation(
 
 pub(super) async fn auth_login(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AuthLoginRequest>,
 ) -> Response {
-    let Some(auth) = state.auth.clone() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let auth = state.auth().clone();
 
     let login_key = login_attempt_key(&headers, &request.username);
     let login_device_id = web_login_device_id(&headers);
@@ -921,7 +958,7 @@ pub(super) async fn auth_login(
     };
     let mut migration_auth_failed = false;
     if session.is_none()
-        && let Some(migration) = state.emby_migration.clone()
+        && let Some(migration) = Some(state.emby_migration().clone())
     {
         match migration
             .authenticate_pending_user(&request.username, &request.password)
@@ -966,7 +1003,7 @@ pub(super) async fn auth_login(
             && let Ok(Some(user_id)) = auth.find_user_id_by_username(&request.username).await
         {
             record_failed_authentication_event(
-                state.database.as_ref(),
+                Some(state.database()),
                 &state.admin_events,
                 &user_id,
                 "LUX_WEB",
@@ -1008,7 +1045,7 @@ pub(super) async fn auth_login(
     )
     .await;
     record_activity_event(
-        state.database.as_ref(),
+        Some(state.database()),
         &state.admin_events,
         &user_id,
         "AUTH_LOGIN",
@@ -1059,7 +1096,7 @@ pub(super) async fn auth_login(
 
 pub(super) async fn auth_accept_user_invitation(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     request: Result<Json<AuthInvitationAcceptRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(request) = match request {
@@ -1083,8 +1120,8 @@ pub(super) async fn auth_accept_user_invitation(
             .into_response();
         }
     };
-    let (Some(database), Some(config_dir)) = (state.database.as_ref(), state.config_dir.as_ref())
-    else {
+    let database = state.database();
+    let Some(config_dir) = state.config_dir.as_ref() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -1252,7 +1289,7 @@ fn registration_connection_peer(headers: &HeaderMap) -> Option<std::net::IpAddr>
 
 pub(super) async fn auth_submit_public_user_registration(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     request: Result<Json<AuthUserRegistrationRequest>, axum::extract::rejection::JsonRejection>,
 ) -> Response {
     let Json(request) = match request {
@@ -1265,7 +1302,7 @@ pub(super) async fn auth_submit_public_user_registration(
         }
     };
     let (Some(database), Some(config_dir), Some(connection_peer)) = (
-        state.database.as_ref(),
+        Some(state.database()),
         state.config_dir.as_deref(),
         registration_connection_peer(&headers),
     ) else {
@@ -1307,7 +1344,7 @@ pub(super) async fn auth_submit_public_user_registration(
 
 pub(super) async fn auth_verify_public_user_registration_email(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     request: Result<
         Json<AuthUserRegistrationTokenRequest>,
         axum::extract::rejection::JsonRejection,
@@ -1323,7 +1360,7 @@ pub(super) async fn auth_verify_public_user_registration_email(
         }
     };
     let (Some(database), Some(config_dir), Some(connection_peer)) = (
-        state.database.as_ref(),
+        Some(state.database()),
         state.config_dir.as_deref(),
         registration_connection_peer(&headers),
     ) else {
@@ -1356,7 +1393,7 @@ pub(super) async fn auth_verify_public_user_registration_email(
 
 pub(super) async fn auth_resend_public_user_registration_email(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     request: Result<
         Json<AuthUserRegistrationResendRequest>,
         axum::extract::rejection::JsonRejection,
@@ -1381,7 +1418,7 @@ pub(super) async fn auth_resend_public_user_registration_email(
         .into_response();
     };
     let (Some(database), Some(connection_peer)) = (
-        state.database.as_ref(),
+        Some(state.database()),
         registration_connection_peer(&headers),
     ) else {
         return api_error(
@@ -1415,27 +1452,17 @@ pub(super) async fn auth_resend_public_user_registration_email(
     }
 }
 
-pub(super) async fn public_registration_settings(State(state): State<AppState>) -> Response {
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+pub(super) async fn public_registration_settings(State(state): State<ReadyAppState>) -> Response {
+    let database = state.database();
     match crate::application::settings::read_registration_mode(database).await {
         Ok(settings) => Json(json!({ "registrationMode": settings.mode })).into_response(),
         Err(_) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
     }
 }
 
-pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(super) async fn auth_me(headers: HeaderMap, State(state): State<ReadyAppState>) -> Response {
     if let Some(candidate) = lux_api_key_from_headers(&headers) {
-        let Some(service) = state.admin_api_key.as_ref() else {
-            return api_error(
-                &headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "认证服务尚未就绪",
-            )
-            .into_response();
-        };
+        let service = state.admin_api_key();
         match service.resolve_principal(&candidate).await {
             Ok(Some(principal)) => {
                 if state.remote_access.is_remote(
@@ -1482,10 +1509,7 @@ pub(super) async fn auth_me(headers: HeaderMap, State(state): State<AppState>) -
         Err(response) => return response,
     };
     let server_name = current_emby_server_name(&state).await;
-    let image_variants_available = state
-        .image_variants
-        .as_ref()
-        .is_some_and(|variants| variants.enabled());
+    let image_variants_available = state.image_variants().enabled();
     Json(json!({
         "user": user_json(&user),
         "serverName": server_name,
@@ -1514,15 +1538,13 @@ fn account_profile_json(
 
 pub(super) async fn auth_account_profile(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1552,16 +1574,14 @@ pub(super) async fn auth_account_profile(
 
 pub(super) async fn auth_update_account_profile(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AuthProfilePatch>,
 ) -> Response {
     let session = match require_web_session_csrf(&headers, &state).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let users = match UserStore::new(database.clone()) {
         Ok(users) => users,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
@@ -1651,15 +1671,13 @@ pub(super) async fn auth_update_account_profile(
 
 pub(super) async fn auth_resend_account_email_change(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let session = match require_web_session_csrf(&headers, &state).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let user_id = session.user.id.to_string();
     let pending = match pending_user_email_change(
         database,
@@ -1710,16 +1728,14 @@ pub(super) struct AuthAccountEmailVerificationRequest {
 
 pub(super) async fn auth_verify_account_email_change(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AuthAccountEmailVerificationRequest>,
 ) -> Response {
     let session = match require_web_session_csrf(&headers, &state).await {
         Ok(session) => session,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let Some(config_dir) = state.config_dir.as_deref() else {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     };
@@ -1744,7 +1760,7 @@ pub(super) async fn auth_verify_account_email_change(
 
 pub(super) async fn auth_create_device_pairing(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let session = match require_web_session_csrf(&headers, &state).await {
         Ok(session) => session,
@@ -1759,15 +1775,7 @@ pub(super) async fn auth_create_device_pairing(
     {
         return rate_limited_response(&headers);
     }
-    let Some(service) = state.device_pairings.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let service = state.device_pairings();
     match service.create(&session.user.id.to_string()).await {
         Ok(pairing) => (
             StatusCode::CREATED,
@@ -1792,7 +1800,7 @@ pub(super) async fn auth_create_device_pairing(
 pub(super) async fn auth_cancel_device_pairing(
     headers: HeaderMap,
     Path(pairing_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let session = match require_web_session_csrf(&headers, &state).await {
         Ok(session) => session,
@@ -1807,15 +1815,7 @@ pub(super) async fn auth_cancel_device_pairing(
         )
         .into_response();
     }
-    let Some(service) = state.device_pairings.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let service = state.device_pairings();
     match service
         .cancel(&session.user.id.to_string(), &pairing_id)
         .await
@@ -1851,7 +1851,7 @@ pub(super) struct DevicePairingRedeemRequest {
 pub(super) async fn redeem_device_pairing(
     headers: HeaderMap,
     Path(pairing_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<DevicePairingRedeemRequest>,
 ) -> Response {
     let client_ip = pairing_rate_limit_client_ip(&headers, &state).await;
@@ -1877,15 +1877,7 @@ pub(super) async fn redeem_device_pairing(
         )
         .into_response();
     }
-    let Some(service) = state.device_pairings.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let service = state.device_pairings();
     let device = PrismDeviceInfo {
         device_id: request.device_id.trim(),
         device_name: request.device_name.trim(),
@@ -1912,17 +1904,9 @@ pub(super) async fn redeem_device_pairing(
 
 async fn require_web_session_csrf(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<AuthenticatedSession, Response> {
-    let Some(auth) = state.auth.as_ref() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response());
-    };
+    let auth = state.auth();
     let Some(session_token) = request_cookie(headers, "lux_session") else {
         return Err(api_error(
             headers,
@@ -2003,7 +1987,7 @@ fn bounded_non_empty(value: &str, max_bytes: usize) -> Option<&str> {
     (!value.is_empty() && value.len() <= max_bytes).then_some(value)
 }
 
-async fn pairing_rate_limit_client_ip(headers: &HeaderMap, state: &AppState) -> String {
+async fn pairing_rate_limit_client_ip(headers: &HeaderMap, state: &ReadyAppState) -> String {
     request_client_ip(headers, state)
         .await
         .unwrap_or_else(|| "local".to_owned())
@@ -2066,17 +2050,16 @@ fn device_pairing_error(headers: &HeaderMap, error: DevicePairingError) -> Respo
     api_error(headers, status, code, message).into_response()
 }
 
-pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(super) async fn auth_settings(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
+    let libraries = state.libraries();
     let preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2099,15 +2082,13 @@ pub(super) async fn auth_settings(headers: HeaderMap, State(state): State<AppSta
 
 pub(super) async fn auth_account_preferences(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2129,7 +2110,7 @@ pub(super) async fn auth_account_preferences(
 
 pub(super) async fn auth_update_account_preferences(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(mut request): Json<UpdateAccountPreferences>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -2139,9 +2120,7 @@ pub(super) async fn auth_update_account_preferences(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let accessible_library_ids = match library_order_access_scope(
         &state,
         AccessPrincipal::new(user.id, user.is_admin),
@@ -2152,9 +2131,7 @@ pub(super) async fn auth_update_account_preferences(
         Err(status) => return status.into_response(),
     };
     if let Some(requested_order) = request.library_order.as_deref() {
-        let Some(libraries) = state.libraries.as_ref() else {
-            return StatusCode::SERVICE_UNAVAILABLE.into_response();
-        };
+        let libraries = state.libraries();
         match libraries
             .normalize_library_order(requested_order, &accessible_library_ids)
             .await
@@ -2177,10 +2154,14 @@ pub(super) async fn auth_update_account_preferences(
             preferences
                 .library_order
                 .retain(|library_id| accessible_library_ids.contains(library_id));
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
+            {
+                let home = state.home();
+                home.invalidate_user(&user.id.to_string());
             }
-            state.user_events.publish_home_coalesced().await;
+            state
+                .user_events
+                .publish_home_coalesced_for(&user.id.to_string())
+                .await;
             Json(preferences).into_response()
         }
         Err(error) => account_preferences_error(&headers, error),
@@ -2223,7 +2204,7 @@ pub(super) struct AuthSettingsPatch {
 
 pub(super) async fn auth_update_settings(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AuthSettingsPatch>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -2245,9 +2226,7 @@ pub(super) async fn auth_update_settings(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     let mut preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2277,7 +2256,11 @@ pub(super) async fn auth_update_settings(
         )
         .await
         {
-            Ok(updated) => preferences = updated,
+            Ok(updated) => {
+                preferences = updated;
+                // The auto-played threshold decides which items continue watching keeps.
+                state.home().invalidate_user(&user.id.to_string());
+            }
             Err(error) => return account_preferences_error(&headers, error),
         }
     }
@@ -2289,14 +2272,16 @@ pub(super) async fn auth_update_settings(
         {
             return StatusCode::SERVICE_UNAVAILABLE.into_response();
         }
-        if let Some(home) = state.home.as_ref() {
-            home.invalidate();
+        {
+            let home = state.home();
+            home.invalidate_user(&user.id.to_string());
         }
-        state.user_events.publish_home_coalesced().await;
+        state
+            .user_events
+            .publish_home_coalesced_for(&user.id.to_string())
+            .await;
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = state.libraries();
     let (use_admin_library_order, library_order_forced) = match libraries
         .uses_admin_library_order(&user.id.to_string(), user.is_admin)
         .await
@@ -2322,7 +2307,7 @@ pub(super) struct AuthPasswordPatch {
 
 pub(super) async fn auth_update_password(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<AuthPasswordPatch>,
 ) -> Response {
     let session = match require_web_session_csrf(&headers, &state).await {
@@ -2338,15 +2323,7 @@ pub(super) async fn auth_update_password(
         )
         .into_response();
     }
-    let Some(auth) = state.auth.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "认证服务尚未就绪",
-        )
-        .into_response();
-    };
+    let auth = state.auth();
     // Keep the caller's own session usable after the change; every other credential is revoked.
     let keep_session_token_hash = request_cookie(&headers, "lux_session")
         .map(|token| crate::auth::sessions::WebAuthService::session_token_hash(&token));
@@ -2397,21 +2374,15 @@ async fn effective_library_order(
 }
 
 async fn library_order_access_scope(
-    state: &AppState,
+    state: &ReadyAppState,
     principal: AccessPrincipal,
 ) -> Result<Vec<String>, StatusCode> {
-    let access = state
-        .access
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let access = state.access();
     let mut library_ids = access
         .accessible_library_ids(principal)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
-    let catalog = state
-        .catalog
-        .as_ref()
-        .ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
+    let catalog = state.catalog();
     let collections = catalog
         .list_global_collection_cards(principal, 0, 1)
         .await
@@ -2424,18 +2395,14 @@ async fn library_order_access_scope(
 
 pub(super) async fn auth_library_order(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = state.libraries();
+    let database = state.database();
     let preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2467,7 +2434,7 @@ pub(super) struct LibraryOrderPatch {
 
 pub(super) async fn auth_update_library_order(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<LibraryOrderPatch>,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -2486,12 +2453,8 @@ pub(super) async fn auth_update_library_order(
         )
         .into_response();
     }
-    let Some(libraries) = state.libraries.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let libraries = state.libraries();
+    let database = state.database();
     let preferences = match get_account_preferences(database, &user.id.to_string()).await {
         Ok(preferences) => preferences,
         Err(error) => return account_preferences_error(&headers, error),
@@ -2564,24 +2527,29 @@ pub(super) async fn auth_update_library_order(
         Ok(updated) => {
             let library_order = updated.library_order;
             let preferences_version = updated.version;
-            if let Some(home) = state.home.as_ref() {
-                home.invalidate();
+            {
+                let home = state.home();
+                home.invalidate_user(&user.id.to_string());
             }
-            state.user_events.publish_home_coalesced().await;
+            state
+                .user_events
+                .publish_home_coalesced_for(&user.id.to_string())
+                .await;
             user_library_order_response(library_order, preferences_version)
         }
         Err(error) => account_preferences_error(&headers, error),
     }
 }
 
-pub(super) async fn auth_avatar(headers: HeaderMap, State(state): State<AppState>) -> Response {
+pub(super) async fn auth_avatar(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
     let user = match require_web_user(&headers, &state).await {
         Ok(user) => user,
         Err(response) => return response,
     };
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = state.user_avatars();
     match avatars.load(user.id).await {
         Ok(Some(avatar)) => match Response::builder()
             .status(StatusCode::OK)
@@ -2606,7 +2574,7 @@ pub(super) async fn auth_avatar(headers: HeaderMap, State(state): State<AppState
 
 pub(super) async fn auth_update_avatar(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     body: Bytes,
 ) -> Response {
     let user = match require_web_user(&headers, &state).await {
@@ -2616,9 +2584,7 @@ pub(super) async fn auth_update_avatar(
     if let Err(response) = require_web_csrf(&headers, &state).await {
         return response;
     }
-    let Some(avatars) = state.user_avatars.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let avatars = state.user_avatars();
     let content_type = headers
         .get(CONTENT_TYPE)
         .and_then(|value| value.to_str().ok())
@@ -2632,10 +2598,11 @@ pub(super) async fn auth_update_avatar(
     }
 }
 
-pub(super) async fn auth_sessions(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+pub(super) async fn auth_sessions(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let auth = state.auth();
     let Some(session_token) = request_cookie(&headers, "lux_session") else {
         return api_error(
             &headers,
@@ -2678,11 +2645,9 @@ pub(super) async fn auth_sessions(headers: HeaderMap, State(state): State<AppSta
 pub(super) async fn auth_revoke_session(
     headers: HeaderMap,
     Path(session_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let auth = state.auth();
     let Some(session_token) = request_cookie(&headers, "lux_session") else {
         return api_error(
             &headers,
@@ -2756,16 +2721,11 @@ pub(super) async fn auth_revoke_session(
     }
 }
 
-pub(super) async fn auth_logout(headers: HeaderMap, State(state): State<AppState>) -> Response {
-    let Some(auth) = state.auth.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+pub(super) async fn auth_logout(
+    headers: HeaderMap,
+    State(state): State<ReadyAppState>,
+) -> Response {
+    let auth = state.auth();
     let Some(session_token) = request_cookie(&headers, "lux_session") else {
         return api_error(
             &headers,
@@ -2841,7 +2801,7 @@ pub(super) async fn auth_logout(headers: HeaderMap, State(state): State<AppState
 
 pub(super) async fn require_web_user(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<UserRecord, Response> {
     match require_web_principal(headers, state).await? {
         crate::auth::users::AuthenticationPrincipal::User(user) => Ok(user),
@@ -2857,7 +2817,7 @@ pub(super) async fn require_web_user(
 
 async fn resolve_web_session_for_request(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     auth: &crate::auth::sessions::WebAuthService,
     session_token: &str,
 ) -> Result<Option<AuthenticatedSession>, crate::auth::sessions::WebAuthError> {
@@ -2870,7 +2830,7 @@ async fn resolve_web_session_for_request(
 
 async fn resolve_web_session_with_ip(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
     auth: &crate::auth::sessions::WebAuthService,
     session_token: &str,
 ) -> Result<
@@ -2886,7 +2846,7 @@ async fn resolve_web_session_with_ip(
 
 pub(super) async fn require_web_principal(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<crate::auth::users::AuthenticationPrincipal, Response> {
     if has_client_token(headers) {
         if let Some(principal) = resolve_shared_admin_api_key(headers, state).await? {
@@ -2914,15 +2874,7 @@ pub(super) async fn require_web_principal(
             )
             .into_response());
         };
-        let Some(auth) = state.emby_auth.as_ref() else {
-            return Err(api_error(
-                headers,
-                StatusCode::SERVICE_UNAVAILABLE,
-                lux::ApiErrorCode::DatabaseUnavailable,
-                "认证服务尚未就绪",
-            )
-            .into_response());
-        };
+        let auth = state.emby_auth();
         let client_ip = match super::request_access_ip(headers, state).await {
             Ok(client_ip) => client_ip,
             Err(_) => {
@@ -2976,15 +2928,7 @@ pub(super) async fn require_web_principal(
             .into_response()),
         };
     }
-    let Some(auth) = state.auth.as_ref() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response());
-    };
+    let auth = state.auth();
     let Some(session_token) = request_cookie(headers, "lux_session") else {
         return Err(api_error(
             headers,
@@ -3076,21 +3020,13 @@ pub(super) async fn require_web_principal(
 
 pub(super) async fn require_web_csrf(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<(), Response> {
     if has_client_token(headers) {
         require_web_user(headers, state).await.map(|_| ())?;
         return Ok(());
     }
-    let Some(auth) = state.auth.as_ref() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response());
-    };
+    let auth = state.auth();
     let Some(session_token) = request_cookie(headers, "lux_session") else {
         return Err(api_error(
             headers,
@@ -3172,19 +3108,15 @@ fn parse_lux_user_token(value: &str) -> Option<String> {
     (!value.is_empty()).then(|| value.to_owned())
 }
 
-pub(super) fn api_routes() -> Router<AppState> {
+/// The setup wizard routes, mounted by both the ready tree and the setup tree.
+///
+/// Their handlers answer from the shared `AppState` façade, which both trees can resolve.
+pub(super) fn setup_routes<S>() -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+    AppState: FromRef<S>,
+{
     Router::new()
-        .route("/health/live", get(users::live))
-        .route("/health/ready", get(users::ready))
-        .route("/api/v1/version", get(users::version))
-        .route(
-            "/api/v1/auth/login-background",
-            get(users::login_background),
-        )
-        .route(
-            "/api/v1/auth/login-background/custom-image",
-            get(users::login_background_custom_image),
-        )
         .route("/api/v1/setup/status", get(users::setup_status))
         .route("/api/v1/setup/database", get(users::setup_database_status))
         .route(
@@ -3200,6 +3132,31 @@ pub(super) fn api_routes() -> Router<AppState> {
             post(users::setup_database_restart),
         )
         .route("/api/v1/setup/complete", post(users::setup_complete))
+}
+
+/// The fixed answer of `GET /api/v1/auth/me` while no administrator exists: no session can exist.
+pub(super) async fn setup_auth_me(headers: HeaderMap) -> Response {
+    api_error(
+        &headers,
+        StatusCode::UNAUTHORIZED,
+        lux::ApiErrorCode::AuthenticationRequired,
+        "需要登录",
+    )
+    .into_response()
+}
+
+pub(super) fn api_routes() -> Router<ReadyAppState> {
+    // `/health/live`, `/health/ready` and `/api/v1/version` live in
+    // `routes::core_routes()` now: both router trees mount them.
+    Router::new()
+        .route(
+            "/api/v1/auth/login-background",
+            get(users::login_background),
+        )
+        .route(
+            "/api/v1/auth/login-background/custom-image",
+            get(users::login_background_custom_image),
+        )
         .route(
             "/api/v1/auth/login",
             post(users::auth_login).layer(DefaultBodyLimit::max(8 * 1024)),

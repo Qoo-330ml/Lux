@@ -21,8 +21,10 @@ import {
   loadAdminOperationsPage,
   loadAdminPluginsPage,
   loadAdminSettingsPage,
+  loadAdminTranscodingPage,
   loadAdminUsersPage,
 } from "../features/admin/admin-navigation";
+import { LuxButton } from "../components/ui";
 
 const LibrariesPage = lazy(() => import("../features/library/LibrariesPage").then(({ LibrariesPage }) => ({ default: LibrariesPage })));
 const LibraryPage = lazy(() => import("../features/library/LibraryPage").then(({ LibraryPage }) => ({ default: LibraryPage })));
@@ -41,6 +43,7 @@ const AdminNotificationsPage = lazy(loadAdminNotificationsPage);
 const AdminUsersPage = lazy(loadAdminUsersPage);
 const AdminOperationsPage = lazy(loadAdminOperationsPage);
 const AdminSettingsPage = lazy(loadAdminSettingsPage);
+const AdminTranscodingPage = lazy(loadAdminTranscodingPage);
 const AdminChangelogPage = lazy(loadAdminChangelogPage);
 const AdminUserDetailPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserDetailPage }) => ({ default: AdminUserDetailPage })));
 const AdminUserSettingsPage = lazy(() => import("../features/admin/AdminUserManagementPage").then(({ AdminUserSettingsPage }) => ({ default: AdminUserSettingsPage })));
@@ -146,6 +149,7 @@ function AuthenticatedRoutes({ user, serverName }: { user: LuxUser; serverName?:
               <Route path="users/:userId" element={<AdminUserDetailPage />} />
               <Route path="jobs" element={<AdminOperationsPage />} />
               <Route path="settings" element={<AdminSettingsPage />} />
+              <Route path="transcoding" element={<AdminTranscodingPage />} />
               <Route path="changelog" element={<AdminChangelogPage />} />
             </Route>
           </Route>
@@ -187,13 +191,12 @@ class RouteErrorBoundary extends Component<{ children: ReactNode }, { hasError: 
         <main className="lux-state-screen" role="alert">
           <h1>页面加载失败</h1>
           <p>页面资源可能已更新，请重新加载后继续。</p>
-          <button
-            className="lux-button lux-button-secondary"
+          <LuxButton tone="secondary"
             type="button"
             onClick={() => window.location.reload()}
           >
             重新加载
-          </button>
+          </LuxButton>
         </main>
       );
     }
@@ -224,13 +227,12 @@ function ErrorScreen({ error }: { error: Error }) {
     <main className="lux-state-screen" role="alert">
       <h1>暂时无法连接服务器</h1>
       <p>{error.message}</p>
-      <button
-        className="lux-button lux-button-secondary"
+      <LuxButton tone="secondary"
         type="button"
         onClick={() => void queryClient.invalidateQueries()}
       >
         重试
-      </button>
+      </LuxButton>
     </main>
   );
 }

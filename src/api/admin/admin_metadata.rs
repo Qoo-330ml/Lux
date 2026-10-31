@@ -1,6 +1,6 @@
 use super::*;
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/metadata/pending",
@@ -164,7 +164,7 @@ fn metadata_dispatch_unavailable(
 pub(crate) async fn admin_refresh_library_local_metadata(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<RefreshLocalMetadataRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -179,9 +179,7 @@ pub(crate) async fn admin_refresh_library_local_metadata(
         )
         .into_response();
     };
-    let Some(scan_jobs) = state.scan_jobs.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let scan_jobs = state.scan_jobs();
     let accepted = match scan_jobs
         .start_local_metadata_refresh(library_id, request.root_id.as_deref(), &request.paths)
         .await
@@ -235,7 +233,7 @@ pub(crate) async fn admin_refresh_library_local_metadata(
 pub(crate) async fn admin_start_library_reidentify(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -249,15 +247,7 @@ pub(crate) async fn admin_start_library_reidentify(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.clone() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刮削器匹配服务尚未配置",
-        )
-        .into_response();
-    };
+    let reidentify = state.metadata_reidentify().clone();
     let job = match reidentify
         .create_library_refresh_job(
             &library_id.to_string(),
@@ -296,7 +286,7 @@ pub(crate) async fn admin_start_library_reidentify(
 pub(crate) async fn admin_start_library_metadata_refresh(
     headers: HeaderMap,
     Path(library_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<MetadataRefreshRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -311,15 +301,7 @@ pub(crate) async fn admin_start_library_metadata_refresh(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.clone() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刷新服务尚未配置",
-        )
-        .into_response();
-    };
+    let reidentify = state.metadata_reidentify().clone();
     let mode = request.mode.application_mode();
     let job = match reidentify
         .create_library_refresh_job(&library_id.to_string(), mode)
@@ -359,7 +341,7 @@ pub(crate) async fn admin_start_library_metadata_refresh(
 pub(crate) async fn admin_list_pending_metadata(
     headers: HeaderMap,
     Query(query): Query<MetadataCandidateQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -376,15 +358,7 @@ pub(crate) async fn admin_list_pending_metadata(
             .into_response();
         }
     };
-    let Some(candidates) = state.metadata_candidates.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let candidates = state.metadata_candidates();
     match candidates.list_pending(offset, limit).await {
         Ok(page) => Json(metadata_candidate_page_json(&page)).into_response(),
         Err(error) => metadata_candidate_error(&headers, error),
@@ -394,7 +368,7 @@ pub(crate) async fn admin_list_pending_metadata(
 pub(crate) async fn admin_list_metadata_reidentify(
     headers: HeaderMap,
     Query(query): Query<MetadataReidentifyListQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -432,9 +406,7 @@ pub(crate) async fn admin_list_metadata_reidentify(
         )
         .into_response();
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match database
         .list_metadata_reidentify_jobs(status.as_deref(), offset, limit)
         .await
@@ -451,7 +423,7 @@ pub(crate) async fn admin_list_metadata_reidentify(
 
 pub(crate) async fn admin_start_metadata_reidentify(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<MetadataReidentifyRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -470,15 +442,7 @@ pub(crate) async fn admin_start_metadata_reidentify(
         )
         .into_response();
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刮削器匹配服务尚未配置",
-        )
-        .into_response();
-    };
+    let reidentify = state.metadata_reidentify();
     let job = match reidentify.create_job(request.item_ids).await {
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
@@ -504,7 +468,7 @@ pub(crate) async fn admin_start_metadata_reidentify(
 
 pub(crate) async fn admin_confirm_metadata(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<MetadataBatchConfirmationRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -543,7 +507,7 @@ pub(crate) async fn admin_confirm_metadata(
         )
         .into_response();
     }
-    let Some(selection) = state.metadata_selection.as_ref() else {
+    let Some(selection) = state.metadata_selection() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -584,7 +548,7 @@ pub(crate) async fn admin_confirm_metadata(
 
 pub(crate) async fn admin_merge_items(
     headers: HeaderMap,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<ItemMergeRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -625,13 +589,11 @@ pub(crate) async fn admin_merge_items(
         )
         .into_response();
     }
-    let Some(service) = state.item_merge.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let service = state.item_merge();
     let result = match crate::application::admin_media_mutations::merge_media_items(
         service,
-        state.home.as_ref(),
-        state.catalog.as_ref(),
+        Some(state.home()),
+        Some(state.catalog()),
         &request.primary_item_id,
         &request.item_ids,
     )
@@ -673,20 +635,12 @@ pub(crate) async fn admin_merge_items(
 pub(crate) async fn admin_get_metadata_reidentify(
     headers: HeaderMap,
     Path(job_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刮削器匹配服务尚未配置",
-        )
-        .into_response();
-    };
+    let reidentify = state.metadata_reidentify();
     match reidentify.get_job(&job_id).await {
         Ok(job) => Json(json!({ "job": metadata_reidentify_job_json(&job) })).into_response(),
         Err(error) => metadata_reidentify_error(&headers, error),
@@ -696,20 +650,12 @@ pub(crate) async fn admin_get_metadata_reidentify(
 pub(crate) async fn admin_retry_metadata_reidentify(
     headers: HeaderMap,
     Path(job_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刮削器匹配服务尚未配置",
-        )
-        .into_response();
-    };
+    let reidentify = state.metadata_reidentify();
     let job = match reidentify.retry_job(&job_id).await {
         Ok(job) => job,
         Err(error) => return metadata_reidentify_error(&headers, error),
@@ -736,20 +682,18 @@ pub(crate) async fn admin_retry_metadata_reidentify(
 pub(crate) async fn admin_cancel_metadata_reidentify(
     headers: HeaderMap,
     Path(job_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
     }
-    let Some(reidentify) = state.metadata_reidentify.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刮削器匹配服务尚未配置",
-        )
-        .into_response();
-    };
+    let reidentify = state.metadata_reidentify();
+    let previous = reidentify.get_job(&job_id).await.ok();
+    let cancel_metadata = json!({
+        "libraryId": previous.as_ref().and_then(|job| job.library_id.clone()),
+        "previousStatus": previous.as_ref().map(|job| job.status.clone()),
+    })
+    .to_string();
     match reidentify.cancel(&job_id).await {
         Ok(()) => {
             record_audit_event(
@@ -758,7 +702,7 @@ pub(crate) async fn admin_cancel_metadata_reidentify(
                 "METADATA_REIDENTIFY_CANCELLED",
                 Some("metadata_reidentify_job"),
                 Some(&job_id),
-                "{}",
+                &cancel_metadata,
             )
             .await;
             StatusCode::ACCEPTED.into_response()
@@ -771,7 +715,7 @@ pub(crate) async fn admin_list_item_candidates(
     headers: HeaderMap,
     Path(item_id): Path<String>,
     Query(query): Query<MetadataCandidateQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -797,15 +741,7 @@ pub(crate) async fn admin_list_item_candidates(
             .into_response();
         }
     };
-    let Some(candidates) = state.metadata_candidates.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response();
-    };
+    let candidates = state.metadata_candidates();
     match candidates
         .list_for_item(&item_id, query.search.as_deref(), offset, limit)
         .await
@@ -818,7 +754,7 @@ pub(crate) async fn admin_list_item_candidates(
 pub(crate) async fn admin_search_item_candidates(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<MetadataCandidateSearchRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -833,15 +769,7 @@ pub(crate) async fn admin_search_item_candidates(
         )
         .into_response();
     }
-    let Some(metadata_reidentify) = state.metadata_reidentify.as_ref() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据候选服务尚未就绪",
-        )
-        .into_response();
-    };
+    let metadata_reidentify = state.metadata_reidentify();
     match metadata_reidentify
         .search_item_candidates(&item_id, &request.query, request.year)
         .await
@@ -865,7 +793,7 @@ pub(crate) async fn admin_search_item_candidates(
 pub(crate) async fn admin_list_item_images(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
@@ -880,8 +808,8 @@ pub(crate) async fn admin_list_item_images(
         .into_response();
     }
     match crate::application::admin_media_mutations::list_admin_item_images(
-        state.database.as_ref(),
-        state.image_writes.as_ref(),
+        Some(state.database()),
+        state.image_writes(),
         &item_id,
     )
     .await
@@ -919,7 +847,7 @@ pub(crate) async fn admin_list_item_images(
 pub(crate) async fn admin_delete_item_image(
     headers: HeaderMap,
     Path((item_id, image_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -935,9 +863,7 @@ pub(crate) async fn admin_delete_item_image(
         )
         .into_response();
     }
-    let Some(images) = state.image_writes.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let images = require_service!(state.image_writes);
     match images.delete_item_image(&item_id, &image_id).await {
         Ok(()) => {
             record_audit_event(
@@ -963,7 +889,7 @@ pub(crate) struct MetadataSelectionRequest {
 pub(crate) async fn admin_select_candidate(
     headers: HeaderMap,
     Path((item_id, candidate_id)): Path<(String, String)>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<MetadataSelectionRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -978,7 +904,7 @@ pub(crate) async fn admin_select_candidate(
         )
         .into_response();
     }
-    let Some(selection) = state.metadata_selection.as_ref() else {
+    let Some(selection) = state.metadata_selection() else {
         return api_error(
             &headers,
             StatusCode::SERVICE_UNAVAILABLE,
@@ -989,7 +915,7 @@ pub(crate) async fn admin_select_candidate(
     };
     match crate::application::admin_metadata::select_metadata_candidate(
         selection,
-        state.metadata_reidentify.as_ref(),
+        Some(state.metadata_reidentify()),
         &item_id,
         &candidate_id,
         request.mode,
@@ -1107,24 +1033,32 @@ pub(crate) fn image_write_error(headers: &HeaderMap, error: ImageWriteError) -> 
     }
 }
 
-pub(crate) fn item_image_json(item_id: &str, image: &crate::storage::StoredItemImage) -> Value {
+pub(crate) fn item_image_json(
+    item_id: &str,
+    image: &crate::storage::StoredItemImage,
+) -> super::super::media::ItemImage {
     let image_type = image.image_type.to_ascii_lowercase();
     let index = if image.image_index > 0 {
         format!("/{}", image.image_index)
     } else {
         String::new()
     };
-    json!({
-        "id": image.id,
-        "itemId": item_id,
-        "imageType": image.image_type,
-        "imageIndex": image.image_index,
-        "fileSize": image.file_size,
-        "contentTag": image.content_tag,
-        "source": image.source,
-        "language": Value::Null,
-        "url": format!("/api/v1/items/{}/images/{}{}", encode_path_segment(item_id), image_type, index),
-    })
+    super::super::media::ItemImage {
+        content_tag: image.content_tag.clone(),
+        file_size: image.file_size,
+        id: image.id.clone(),
+        image_index: image.image_index,
+        image_type: image.image_type.clone(),
+        item_id: item_id.to_owned(),
+        language: None,
+        source: image.source.clone(),
+        url: format!(
+            "/api/v1/items/{}/images/{}{}",
+            encode_path_segment(item_id),
+            image_type,
+            index
+        ),
+    }
 }
 
 pub(crate) fn image_candidate_json(image: &crate::application::images::ImageCandidate) -> Value {
@@ -1482,7 +1416,7 @@ pub(crate) fn metadata_candidate_error(
 pub(crate) async fn admin_start_item_metadata_refresh(
     headers: HeaderMap,
     Path(item_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<MetadataRefreshRequest>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
@@ -1497,15 +1431,7 @@ pub(crate) async fn admin_start_item_metadata_refresh(
         )
         .into_response();
     };
-    let Some(reidentify) = state.metadata_reidentify.clone() else {
-        return api_error(
-            &headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "元数据刷新服务尚未配置",
-        )
-        .into_response();
-    };
+    let reidentify = state.metadata_reidentify().clone();
     let mode = request.mode.application_mode();
     let job = match reidentify
         .create_item_refresh_job(&item_id.to_string(), mode)

@@ -1,6 +1,6 @@
 import "./admin.css";
 import "./users-workspace.css";
-import { Activity, BellRing, BookOpen, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
+import { Activity, BellRing, BookOpen, Cpu, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
 import { Suspense } from "react";
 import { NavLink, Outlet } from "react-router-dom";
@@ -15,6 +15,7 @@ export const adminNav = [
   { to: "/admin/users", label: "用户与权限", icon: Users },
   { to: "/admin/jobs", label: "任务与日志", icon: FileClock },
   { to: "/admin/settings", label: "服务器设置", icon: Settings2 },
+  { to: "/admin/transcoding", label: "转码", icon: Cpu },
   { to: "/admin/changelog", label: "更新日志", icon: BookOpen },
 ];
 

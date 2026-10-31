@@ -2,6 +2,7 @@ import { useLayoutEffect, useRef, useState, type FormEvent } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { LuxLogo } from "../../components/LuxLogo";
 import { ApiError, api } from "../../lib/api/client";
+import { LuxButton, LuxLinkButton, LuxTextField } from "../../components/ui";
 
 function invitationErrorMessage(error: unknown): string {
   if (error instanceof ApiError) {
@@ -62,12 +63,12 @@ export function AcceptInvitationPage() {
         {created ? (
           <div className="lux-auth-form">
             <p role="status">现在可以使用新账户登录。</p>
-            <a className="lux-button lux-button-primary" href={loginPath}>前往登录</a>
+            <LuxLinkButton tone="primary" href={loginPath}>前往登录</LuxLinkButton>
           </div>
         ) : !token ? (
           <div className="lux-auth-form">
             <p className="lux-error-copy" role="alert">邀请链接无效，请联系管理员重新发送。</p>
-            <a className="lux-button lux-button-secondary" href={loginPath}>返回登录</a>
+            <LuxLinkButton tone="secondary" href={loginPath}>返回登录</LuxLinkButton>
           </div>
         ) : (
           <>
@@ -75,17 +76,17 @@ export function AcceptInvitationPage() {
             <form className="lux-auth-form" onSubmit={(event) => void submit(event)} aria-busy={submitting} aria-describedby={error ? "invitation-error" : undefined}>
               <label htmlFor="invitation-username">
                 用户名
-                <input id="invitation-username" name="username" autoComplete="username" required maxLength={128} value={username} disabled={submitting} onChange={(event) => setUsername(event.target.value)} />
+                <LuxTextField id="invitation-username" name="username" autoComplete="username" required maxLength={128} value={username} disabled={submitting} onChange={(event) => setUsername(event.target.value)} />
               </label>
               <label htmlFor="invitation-display-name">
                 显示名称（可选）
-                <input id="invitation-display-name" name="displayName" autoComplete="nickname" maxLength={128} value={displayName} disabled={submitting} onChange={(event) => setDisplayName(event.target.value)} />
+                <LuxTextField id="invitation-display-name" name="displayName" autoComplete="nickname" maxLength={128} value={displayName} disabled={submitting} onChange={(event) => setDisplayName(event.target.value)} />
               </label>
               <label htmlFor="invitation-password">
                 密码
-                <input id="invitation-password" name="password" type="password" autoComplete="new-password" required maxLength={1024} value={password} disabled={submitting} onChange={(event) => setPassword(event.target.value)} />
+                <LuxTextField id="invitation-password" name="password" type="password" autoComplete="new-password" required maxLength={1024} value={password} disabled={submitting} onChange={(event) => setPassword(event.target.value)} />
               </label>
-              <button className="lux-button lux-button-primary" type="submit" disabled={submitting}>{submitting ? "正在创建…" : "创建账户"}</button>
+              <LuxButton tone="primary" type="submit" disabled={submitting}>{submitting ? "正在创建…" : "创建账户"}</LuxButton>
               {error ? <p id="invitation-error" className="lux-error-copy" role="alert">{error}</p> : null}
             </form>
           </>

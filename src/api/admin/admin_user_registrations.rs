@@ -23,7 +23,7 @@ struct ApproveUserRegistrationRequest {
     permissions: NewUserPermissions,
 }
 
-pub(super) fn api_routes() -> Router<AppState> {
+pub(super) fn api_routes() -> Router<ReadyAppState> {
     Router::new()
         .route(
             "/api/v1/admin/user-registrations",
@@ -42,14 +42,12 @@ pub(super) fn api_routes() -> Router<AppState> {
 async fn admin_list_user_registrations(
     headers: HeaderMap,
     Query(query): Query<AdminUserRegistrationListQuery>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, false).await {
         return response;
     }
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match list_pending_user_registrations(
         database,
         query.page.unwrap_or(1),
@@ -72,16 +70,14 @@ async fn admin_list_user_registrations(
 async fn admin_approve_user_registration(
     headers: HeaderMap,
     Path(request_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
     Json(request): Json<ApproveUserRegistrationRequest>,
 ) -> Response {
     let reviewer_user_id = match registration_reviewer_user_id(&headers, &state).await {
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match approve_pending_user_registration(
         database,
         &request_id,
@@ -110,15 +106,13 @@ async fn admin_approve_user_registration(
 async fn admin_reject_user_registration(
     headers: HeaderMap,
     Path(request_id): Path<String>,
-    State(state): State<AppState>,
+    State(state): State<ReadyAppState>,
 ) -> Response {
     let reviewer_user_id = match registration_reviewer_user_id(&headers, &state).await {
         Ok(user_id) => user_id,
         Err(response) => return response,
     };
-    let Some(database) = state.database.as_ref() else {
-        return StatusCode::SERVICE_UNAVAILABLE.into_response();
-    };
+    let database = state.database();
     match reject_pending_user_registration(
         database,
         &request_id,
@@ -145,7 +139,7 @@ async fn admin_reject_user_registration(
 
 async fn registration_reviewer_user_id(
     headers: &HeaderMap,
-    state: &AppState,
+    state: &ReadyAppState,
 ) -> Result<String, Response> {
     if lux_api_key_from_headers(headers).is_some() {
         return Err(api_error(
@@ -166,15 +160,7 @@ async fn registration_reviewer_user_id(
         )
         .into_response());
     };
-    let Some(auth) = state.auth.as_ref() else {
-        return Err(api_error(
-            headers,
-            StatusCode::SERVICE_UNAVAILABLE,
-            lux::ApiErrorCode::DatabaseUnavailable,
-            "服务尚未就绪",
-        )
-        .into_response());
-    };
+    let auth = state.auth();
     match auth.resolve(&session_token).await {
         Ok(Some(session)) if session.user.can_manage_server => Ok(session.user.id.to_string()),
         Ok(Some(_)) => Err(api_error(

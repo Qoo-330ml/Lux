@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wait-for-restart.sh
+source "$ROOT_DIR/scripts/lib/wait-for-restart.sh"
 BIN="${LUX_BIN:-$ROOT_DIR/target/debug/luxd}"
 PORT="${LUX_RECOVERY_PORT:-18607}"
 FILE_COUNT="${LUX_RECOVERY_FILE_COUNT:-5000}"
@@ -57,6 +59,9 @@ until curl -fsS "http://127.0.0.1:$PORT/health/live" >/dev/null; do
     sleep 0.05
 done
 
+# A fresh config directory starts in the database-selection mode, so pick SQLite before setup.
+lux_select_sqlite_database "http://127.0.0.1:$PORT"
+
 setup_payload="$(jq -n --arg root "$MEDIA_DIR" '{
     username: "admin",
     displayName: "Recovery Admin",
@@ -67,41 +72,43 @@ curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/setup/complete" \
     -H 'Content-Type: application/json' \
     -d "$setup_payload" >/dev/null
 
+# The instance replaces itself a moment after that `201`, and the restart cancels the first scan
+# that setup started and queues it again. Waiting for that window and for the recovered scan keeps
+# the scan we start below from racing a dying process or answering `409` for an active scan.
+lux_wait_for_restarted_server "http://127.0.0.1:$PORT"
+
 curl -fsS -c "$COOKIE_JAR" -X POST "http://127.0.0.1:$PORT/api/v1/auth/login" \
     -H 'Content-Type: application/json' \
     -d '{"username":"admin","password":"recovery-test-password"}' >/dev/null
-CSRF="$(awk '$0 !~ /^#/ && $6 == "lux_csrf" { print $7 }' "$COOKIE_JAR")"
-if [[ -z "$CSRF" ]]; then
-    echo "login did not return a CSRF cookie" >&2
-    exit 1
-fi
 
 library_id="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/libraries" | jq -r '.libraries[0].id')"
-job_id="$(curl -fsS -b "$COOKIE_JAR" -H "X-CSRF-Token: $CSRF" \
-    -X POST "http://127.0.0.1:$PORT/api/v1/admin/libraries/$library_id/scan" \
-    | jq -r '.job.id')"
+# The restart cancelled the first scan of setup and queued it again; the recovered scan is the one
+# this drill interrupts on purpose, so its job id is looked up now instead of taken from the `201`.
+interrupted_job_id="$(lux_wait_for_active_scan_job "http://127.0.0.1:$PORT" "$library_id" -b "$COOKIE_JAR")"
 
 observed_processed=""
 observed_total=""
-for _ in $(seq 1 400); do
-    job="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/jobs/$job_id")"
+interrupted_created_at=""
+for _ in $(seq 1 1200); do
+    job="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/jobs/$interrupted_job_id")"
     status="$(jq -r '.job.status' <<<"$job")"
     processed="$(jq -r '.job.processedCount' <<<"$job")"
     total="$(jq -r '.job.totalCount' <<<"$job")"
-    if [[ "$status" == "RUNNING" && "$processed" -gt 0 && "$processed" -lt "$total" ]]; then
+    interrupted_created_at="$(jq -r '.job.createdAt' <<<"$job")"
+    if [[ "$status" == "RUNNING" && "$processed" -gt 0 && "$total" -gt 0 ]]; then
         observed_processed="$processed"
         observed_total="$total"
         break
     fi
     if [[ "$status" == "COMPLETED" || "$status" == "FAILED" ]]; then
-        echo "scan completed before the forced termination (status=$status)" >&2
+        echo "scan finished before the forced termination (status=$status)" >&2
         exit 1
     fi
     sleep 0.05
 done
 
 if [[ -z "$observed_processed" ]]; then
-    echo "did not observe a running scan after the first committed batch" >&2
+    echo "did not observe a running scan with committed discovery progress" >&2
     exit 1
 fi
 
@@ -123,37 +130,76 @@ until curl -fsS "http://127.0.0.1:$PORT/health/ready" >/dev/null; do
     sleep 0.05
 done
 
-final_status=""
-final_processed=""
-final_total=""
-for _ in $(seq 1 600); do
-    job="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/jobs/$job_id")"
-    final_status="$(jq -r '.job.status' <<<"$job")"
-    final_processed="$(jq -r '.job.processedCount' <<<"$job")"
-    final_total="$(jq -r '.job.totalCount' <<<"$job")"
-    if [[ "$final_status" == "COMPLETED" ]]; then
-        break
-    fi
-    if [[ "$final_status" == "FAILED" || "$final_status" == "CANCELLED" ]]; then
-        echo "resumed scan ended in unexpected status: $final_status" >&2
-        cat "$LOG_TWO" >&2
-        exit 1
+# A hard kill leaves the job RUNNING in the database. Startup cancels it with `SERVER_SHUTDOWN` and
+# the first-scan recovery queues a replacement, because the library was never scanned. This is the
+# contract the drill now proves: cancel, re-queue, then a successful scan that records `lastScanAt`.
+interrupted_status=""
+replacement_job_id=""
+replacement_status=""
+for _ in $(seq 1 2400); do
+    jobs="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/jobs?page=1&pageSize=100")"
+    interrupted_status="$(jq -r --arg id "$interrupted_job_id" \
+        '.jobs[] | select(.id == $id) | .status' <<<"$jobs")"
+    # The recovery runs in a background task, so right after `/health/ready` the list may still only
+    # contain the jobs that existed before the restart (including an older cancelled one). A
+    # replacement can only be newer than the interrupted scan, so older rows are not candidates and
+    # the loop keeps polling for the row the recovery is about to insert.
+    replacement_job_id="$(jq -r --arg id "$interrupted_job_id" --arg library "$library_id" \
+        --argjson created "$interrupted_created_at" \
+        '[.jobs[] | select(.libraryId == $library and .id != $id
+             and (.createdAt > $created or (.createdAt == $created and .id > $id)))]
+         | sort_by([.createdAt, .id]) | last | .id // ""' <<<"$jobs")"
+    if [[ -n "$replacement_job_id" && "$replacement_job_id" != "null" ]]; then
+        replacement_status="$(jq -r --arg id "$replacement_job_id" \
+            '.jobs[] | select(.id == $id) | .status' <<<"$jobs")"
+        if [[ "$replacement_status" == "COMPLETED" ]]; then
+            break
+        fi
+        if [[ "$replacement_status" == "FAILED" || "$replacement_status" == "CANCELLED" ]]; then
+            echo "replacement scan ended in unexpected status: $replacement_status" >&2
+            cat "$LOG_TWO" >&2
+            exit 1
+        fi
     fi
     sleep 0.1
 done
 
-if [[ "$final_status" != "COMPLETED" || "$final_processed" != "$final_total" || "$final_total" != "$observed_total" ]]; then
-    echo "scan did not complete after restart: status=$final_status processed=$final_processed total=$final_total expected=$observed_total" >&2
+if [[ "$interrupted_status" != "CANCELLED" ]]; then
+    echo "the interrupted scan was not cancelled on startup: status=$interrupted_status" >&2
+    cat "$LOG_TWO" >&2
+    exit 1
+fi
+if [[ -z "$replacement_job_id" || "$replacement_job_id" == "null" ]]; then
+    echo "the first-scan recovery did not queue a replacement scan" >&2
+    cat "$LOG_TWO" >&2
+    exit 1
+fi
+if [[ "$replacement_status" != "COMPLETED" ]]; then
+    echo "replacement scan did not complete after the restart: status=$replacement_status" >&2
+    cat "$LOG_TWO" >&2
+    exit 1
+fi
+
+last_scan_at="$(curl -fsS -b "$COOKIE_JAR" "http://127.0.0.1:$PORT/api/v1/admin/libraries" \
+    | jq -r --arg id "$library_id" '.libraries[] | select(.id == $id) | .lastScanAt')"
+if [[ -z "$last_scan_at" || "$last_scan_at" == "null" ]]; then
+    echo "the replacement scan did not record lastScanAt" >&2
     cat "$LOG_TWO" >&2
     exit 1
 fi
 
 jq -n \
     --arg architecture "$(uname -m)" \
-    --arg jobId "$job_id" \
+    --arg libraryId "$library_id" \
+    --arg interruptedJobId "$interrupted_job_id" \
     --argjson processedBeforeKill "$observed_processed" \
     --argjson totalBeforeKill "$observed_total" \
-    --arg finalStatus "$final_status" \
-    --argjson processedAfterRestart "$final_processed" \
-    --argjson totalAfterRestart "$final_total" \
-    '{architecture: $architecture, jobId: $jobId, processedBeforeKill: $processedBeforeKill, totalBeforeKill: $totalBeforeKill, finalStatus: $finalStatus, processedAfterRestart: $processedAfterRestart, totalAfterRestart: $totalAfterRestart}'
+    --arg interruptedStatus "$interrupted_status" \
+    --arg replacementJobId "$replacement_job_id" \
+    --arg replacementStatus "$replacement_status" \
+    --arg lastScanAt "$last_scan_at" \
+    '{architecture: $architecture, libraryId: $libraryId,
+      interruptedJobId: $interruptedJobId,
+      processedBeforeKill: $processedBeforeKill, totalBeforeKill: $totalBeforeKill,
+      interruptedStatus: $interruptedStatus, replacementJobId: $replacementJobId,
+      replacementStatus: $replacementStatus, lastScanAtRecorded: ($lastScanAt != "null")}'

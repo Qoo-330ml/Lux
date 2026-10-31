@@ -5,6 +5,7 @@ import { api } from "../../lib/api/client";
 import { queryKeys } from "../../lib/api/query-keys";
 import { MediaCard } from "../home/media";
 import { LibraryGrid } from "../library/LibraryGrid";
+import { LuxButton } from "../../components/ui";
 
 export function FavoritesPage() {
   const [page, setPage] = useState(1);
@@ -35,8 +36,8 @@ export function FavoritesPage() {
         <div className="lux-admin-pagination" aria-label="收藏分页">
           <span>第 {currentPage} / {Math.max(1, Math.ceil(total / pageSize))} 页</span>
           <div>
-            <button className="lux-button lux-button-secondary" type="button" disabled={!hasPrevious} onClick={() => setPage((value) => value - 1)}>上一页</button>
-            <button className="lux-button lux-button-secondary" type="button" disabled={!hasNext} onClick={() => setPage((value) => value + 1)}>下一页</button>
+            <LuxButton tone="secondary" type="button" disabled={!hasPrevious} onClick={() => setPage((value) => value - 1)}>上一页</LuxButton>
+            <LuxButton tone="secondary" type="button" disabled={!hasNext} onClick={() => setPage((value) => value + 1)}>下一页</LuxButton>
           </div>
         </div>
       ) : null}

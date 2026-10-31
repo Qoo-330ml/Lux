@@ -17,9 +17,13 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `GET /api/v1/setup/status`：返回 `initialized`。
 - `GET /api/v1/setup/database`：返回数据库选择状态；首次选择 PostgreSQL 后，`restartRequired` 为 `true`。
 - `POST /api/v1/setup/database/restart`：仅在首次初始化、数据库配置已保存且当前进程仍使用其他后端时可用。返回 202 后，Lux 优雅关闭并在同一容器进程内重新启动；页面应等待服务恢复。该接口不接受数据库凭据，也不用于已初始化实例的在线切换。
-- `POST /api/v1/setup/complete`：仅在没有用户时创建首个管理员；成功返回 201，重复或并发失败返回 `SETUP_ALREADY_COMPLETED`。
+- `POST /api/v1/setup/complete`：仅在没有用户时创建首个管理员；成功返回 201，重复或并发失败返回 `SETUP_ALREADY_COMPLETED`。201 响应体带可选布尔字段 `restarting`：`true` 表示管理员落库后已经排期重启进程（延迟约 250 ms 发出重启请求，HTTP 层先优雅排空在途请求再重新执行自身），`false` 表示当前进程没有重启句柄（嵌入式或测试构造的状态），此时 setup 本身仍然成功、需要由部署方重启；旧客户端可以忽略该字段。错误响应（含 4xx/5xx）不携带该字段。
 
-请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。
+请求体至少包含 `username` 和 `password`，可选 `displayName` 和首个媒体库信息。初始化接口不接收 TMDb 配置；TMDb API Key 在插件详情页配置。密码只以 Argon2id PHC 哈希形式写入数据库。首个媒体库的第一轮 `RECONCILE_LIBRARY` 扫描会被上述重启取消（`CANCELLED` + `SERVER_SHUTDOWN`），`201` 里的 `scanJob` 因此指向一个已被取消的任务，管理页能看到“取消 → 新任务”的链路。
+
+新进程启动时的自动补扫不是无条件的，命中全部条件才会为该库重新排队一次扫描：该库**最近一次** `RECONCILE_LIBRARY` 任务是 `CANCELLED` 且 `error = 'SERVER_SHUTDOWN'`（即确有一次被关停打断的首次扫描记录；此后若是 `FAILED` 或已 `COMPLETED`，不再重排）、媒体库仍启用、`libraries.last_scan_at` 为空（从未成功扫描过）、存在媒体根路径且该库当前没有 `PENDING`/`RUNNING` 的扫描任务。补扫前服务会**实测**该库的根路径是否可用（单根探测上限 5 秒，超时按不可用处理并记日志；同一挂载只探测一次、并发探测上限 4，避免失联挂载占满阻塞线程池、不会卡住启动）：至少一个根可用才排队，并把过期的 `library_roots.is_available` 标志修正为可用（扫描本身会丢弃标志为不可用的根，所以这一步必须做）；全部根不可用则跳过并打一条带库 ID 与原因的日志，`libraries.last_scan_at` 保持为空，下一次启动会重新探测（标志位不会被启动流程刷新，所以判定依据是实时探测而不是该列）。单次启动最多检查并排队 512 个候选库（每页 32 个翻页读取）；达到上限时日志会记录本轮排队数与仍符合上述条件、尚未处理的剩余库数（包含同一页里排在上限之后的库），这些库在下一次启动继续处理；剩余库数的统计本身以 10000 为上限，达到该上限时日志写作 `remaining_at_least`（表示“至少”，数量已被截断），不会把下界当成精确值。客户端不需要为此补触发扫描。另有尝试上限：同一库历史上被关停打断的 `RECONCILE_LIBRARY` 记录达到 3 条且 `last_scan_at` 仍为空时停止自动补扫（`OOM`/`SIGKILL` 反复杀死进程的场景），服务会打一条带库 ID 与次数的日志，需要管理员手动扫描并检查内存与日志；手动扫描成功写入 `last_scan_at` 后该库不再受影响。
+
+**不会自动补扫的情况**：setup 时扫描根本没有启动（`201` 的 `scanJob` 为 `null`，没有任何任务行作为恢复证据），例如服务在该步骤出错；这种库重启后不会自动排队，需要管理员在管理页手动触发一次扫描。
 
 ## Web 会话
 
@@ -46,9 +50,9 @@ Lux 自有 API 使用 `/api/v1`，响应字段使用 camelCase。错误统一为
 - `POST /api/v1/auth/logout`：需要有效 `lux_session` 和 `X-CSRF-Token`，成功返回 204 并撤销 session。
 - `PATCH /api/v1/auth/password`：需要当前 Web session 和 `X-CSRF-Token`，不接受用户级客户端令牌。请求体为 `{ "currentPassword": "旧密码", "newPassword": "新密码" }`；当前密码验证成功后写入新的 Argon2id 哈希，成功返回 204，当前密码错误返回 `401 INVALID_CREDENTIALS`。
 
-`lux_session` 为 `HttpOnly; Secure; SameSite=Lax; Path=/`，数据库只保存其 SHA-256 哈希。`lux_csrf` 不设置 HttpOnly，供同源 Web 客户端读取并通过 `X-CSRF-Token` header 发送；数据库保存 CSRF 哈希。session 有效期为 30 天，注销后立即失效。
+`lux_session` 为 `HttpOnly; SameSite=Lax; Path=/`，数据库只保存其 SHA-256 哈希；`Secure` 按请求的实际传输方案附加：请求声明 HTTPS（`X-Forwarded-Proto: https`，通常由反向代理注入）时带 `Secure`，明文 HTTP 时**不带**，因此局域网明文地址也能完成登录。`lux_csrf` 不设置 HttpOnly，供同源 Web 客户端读取并通过 `X-CSRF-Token` header 发送；数据库保存 CSRF 哈希。session 有效期为 30 天，注销后立即失效。
 
-当前阶段的 cookie 始终标记 `Secure`，部署时应使用 HTTPS；本机 HTTP 集成测试只验证协议和服务端行为，不代表浏览器会在不安全来源发送 Secure cookie。
+cookie 的 `Secure` 属性跟随传输方案，而不是恒为 `Secure`（实现见 `src/network.rs` 的 `is_secure_request` 与 `src/api/admin/admin_common.rs` 的 `secure_cookie_for_request`，明文 HTTP 登录断言见 `tests/web_auth.rs`）。明文 HTTP 部署可用，但凭据与会话在链路上都是明文；面向公网仍应使用 HTTPS，此时会话 cookie 与 Web 端 CSRF cookie 都会带 `Secure`（`web/src/lib/api/client.ts` 只在 `https:` 源写入带 `Secure` 的 CSRF cookie）。`X-Forwarded-Proto` 只用于该传输属性判断和展示信息，不参与认证、授权或 ACL。
 
 ## Lux 客户端令牌
 
@@ -75,8 +79,8 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `GET /api/v1/admin/libraries`：列出媒体库及其根路径。
 - `POST /api/v1/admin/libraries`：创建媒体库。请求体为 `{ "name": "Movies", "kind": "MOVIE", "realtimeWatchEnabled": false, "scraperId": "tmdb" }`，`kind` 支持 `MOVIE`、`SERIES`、`MIXED`；`realtimeWatchEnabled` 省略时默认开启。`scraperId` 可省略或为 `null`，表示不进行在线刮削，但仍读取本地 NFO 和图片。
 - `PATCH /api/v1/admin/libraries/{libraryId}`：运行时更新实时文件监控、全量校验/元数据 cron 计划、扫描/探测并发、`scraperId` 和媒体库策略覆盖。`realtimeWatchEnabled` 与 `realtimeMetadataAutoMatchEnabled` 相互独立；关闭前者会停止该媒体库根目录的实时文件监控，但不影响手动扫描、计划调和或外部刷新接口。历史 `incrementalSchedule` 字段仍会被兼容接受但始终为 `null`。字段均可省略；计划、`scraperId` 和 `mediaStrategy` 使用 `null` 清空，计划表达式必须是标准五段式 cron（分 时 日 月 周），最长 128 个字符；扫描并发范围为 1-1024，探测并发范围由探测器配置约束。设置 Docker 环境变量 `LUX_SCAN_CONCURRENCY` 后会全局覆盖媒体库的 `scanConcurrency`。例如 `{ "realtimeWatchEnabled": false, "scraperId": "tmdb", "scanConcurrency": 64, "reconciliationSchedule": "0 3 * * *", "metadataSchedule": "*/5 * * * *" }`。修改无需重启，下一次调度轮询读取最新配置；刮削器必须已安装且配置完成。
-- `DELETE /api/v1/admin/libraries/{libraryId}`：管理员异步删除媒体库。服务先持久化删除任务并立即隐藏媒体库，返回 `202` 和 `{ "job": { "id", "libraryId", "libraryName", "status", "stage", "processedCount", "errorCode" } }`。状态为 `PENDING`、`RUNNING`、`COMPLETED`、`FAILED` 或 `CANCELLED`；重复提交活动任务返回已有任务。数据库内容分批清理，原媒体文件保留。
-- `GET /api/v1/admin/library-deletion-jobs?page=1&pageSize=20&status=RUNNING`：分页查询媒体库删除任务，响应包含 `jobs`、`page`、`pageSize` 和筛选后的 `total`；页大小上限 100；`status` 可省略，或使用 `PENDING`、`RUNNING`、`COMPLETED`、`FAILED`、`CANCELLED`。
+- `DELETE /api/v1/admin/libraries/{libraryId}`：管理员异步删除媒体库。服务先持久化删除任务并立即隐藏媒体库（任务停在 `PENDING`，由后台调度轮在 15 秒内领取执行，不在请求内删数据），返回 `202` 和 `{ "job": { "id", "libraryId", "libraryName", "status", "stage", "processedCount", "errorCode" } }`。状态为 `PENDING`、`RUNNING`、`COMPLETED`、`FAILED` 或 `CANCELLED`；重复提交活动任务返回已有任务。数据库内容分批清理，原媒体文件保留。
+- `GET /api/v1/admin/library-deletion-jobs?page=1&pageSize=20&status=RUNNING`：分页查询媒体库删除任务，响应包含 `jobs`、`page`、`pageSize` 和筛选后的 `total`；页大小上限 100；`status` 可省略，或使用 `OPEN`（未完成，即除 `COMPLETED` 外的全部状态）、`PENDING`、`RUNNING`、`COMPLETED`、`FAILED`、`CANCELLED`。管理端媒体库页的“正在删除的媒体库”只请求 `OPEN`；已完成的删除记录不进入该视图，仍可按精确状态查询。
 - `POST /api/v1/admin/library-deletion-jobs/{jobId}/retry`：重试失败或服务重启后取消的任务，返回 `202` 和 `{ "job" }`，从已提交的删除状态继续。写操作需要管理员身份及 CSRF 校验。
 - `POST /api/v1/admin/libraries/{libraryId}/roots`：添加根路径。请求体为 `{ "path": "/media/movies" }`；成功后自动创建异步扫描任务并返回 `scanJob`，扫描完成后若配置刮削器会继续自动匹配元数据。
 - `PATCH /api/v1/admin/users/{userId}/libraries/{libraryId}`：将媒体库加入或移出普通用户的显式访问范围。请求体为 `{ "canView": true }`，需要管理员 Web session 和 CSRF；没有任何显式允许项时，用户默认可访问全部已启用媒体库，有显式允许项时仅能访问这些媒体库。
@@ -115,7 +119,23 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `GET/PATCH /api/v1/auth/account-preferences`：读取或更新当前登录用户跨设备同步的主题、强调色、首页区块、音轨/字幕语言、自动连播、个人媒体库顺序和自动标记已看阈值。图片优化仅由管理员全局开关控制；不再返回或接受 `optimizedImages`，旧客户端提交该字段返回 400，需刷新 Web 资源。GET 还返回 `version`（无版本化记录时为 `0`）和 `updatedAt`；版本为 `0` 时，媒体库顺序和阈值读取旧服务端设置。PATCH 需提供 `expectedVersion` 与基本偏好字段；`libraryOrder` 和 `playedPercent` 可省略以保持旧值。媒体库顺序只接受当前用户可访问的媒体库 ID，响应会过滤不可访问的 ID。所有这些字段与 `/settings`、`/library-order` 的兼容写入口共用 CAS 版本；首次写入版本为 `0`，成功响应返回递增的 `version` 和服务端 `updatedAt`。陈旧版本返回 409 `VERSION_CONFLICT`，客户端应重新读取后提示用户处理冲突；非法设置返回 400。写操作需要当前用户 Web session 和 CSRF。
 - `GET/PATCH /api/v1/auth/library-order`：读取或调整当前登录用户的媒体库顺序；写入 `{ "libraryOrder": ["<libraryId>", ...] }`，可选传 `expectedVersion`。只接受当前用户可访问的媒体库 ID，未提交的可访问媒体库稳定追加到末尾；成功响应包含 `preferencesVersion`。带陈旧版本返回 409 `VERSION_CONFLICT`；省略版本的旧客户端由服务端读取当前版本后作 CAS 写入。普通用户有效开启 `useAdminLibraryOrder` 或服务器强制项时，读取和排序消费返回管理员账号的顺序，写入不会覆盖个人顺序；否则使用当前用户自己的顺序。写操作需要当前用户 Web session 和 CSRF，或用户级客户端令牌。该有效顺序同时用于 Lux Web 和 Emby `Views`、虚拟根目录、`VirtualFolders` 及 `OrderedViews`。
 - 弹幕插件 `org.lux.danmaku` 的配置通过通用 `PUT /api/v1/admin/plugins/{pluginId}/config` 保存；除 `providerBaseUrl` 外还支持 `concurrency`（0-64，默认 2；0 表示不设插件级限制）和 `overwrite`（默认 `false`，勾选后每次运行覆盖已有同名 XML）；`providerBaseUrl` 只在插件配置响应中以脱敏值展示，主设置页不再保存弹幕配置。
+- `transcoding` 是 `GET/PATCH /api/v1/admin/settings` 中的服务端转码策略，字段为 `enabled`、`hardwareEncoder`（`NONE`、`h264_nvenc`、`h264_qsv`、`h264_vaapi`、`h264_videotoolbox`）、`remuxSessions`（封装转换与音频转码共用，0 禁用这两档）、`hardwareSessions`、`softwareSessions`、`sessionQuotaMb`（单会话，0 不限）、`globalBudgetMb`（所有 HLS 会话合计，0 不限）、`minFreeSpaceMb`（0 关闭保护）、`maxVideoBitrateKbps`（0 使用编码器默认，不会调高客户端请求的更低码率）、`softwarePreset`（`ultrafast`…`medium`）、`maxOutputHeight`（0 保持原始，否则按比例缩小、不放大）、`audioBitrateKbps`（32–512）、`hardwareDevice`（VAAPI/QSV 的 DRM 渲染节点，默认 `/dev/dri/renderD128`）和 `hardwareDecode`（默认关闭，开启后在输入前注入厂商 `-hwaccel`）。PATCH 省略该对象时保留原值；越界、未知 preset、未知编码器或非法设备路径返回 400 `服务端转码设置无效` 且不落库。保存后对新建会话生效，运行中的会话保持原参数。响应另含只读 `transcodingOptions`（`hardwareEncoders`、`softwarePresets`）与 `transcodingStatus`（`encoder`、`available`、`checkedAt`、`error`）。部署层 `LUX_HLS_HW_ENCODER` 与 `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES` 优先于此处设置。
+- `transcodingStatus` 来自硬件编码器自检：启动、保存设置和 `POST /api/v1/admin/settings/transcoding/probe` 时，用与真实转码相同的厂商参数跑一次单帧编码。`available=false` 时 Web 与 Emby 计划不会选择硬件档，改用软件转码；硬件档启动失败（进程退出、无清单或并发许可不足）会自动用软件档重启同一会话，并把会话档位更新为实际值。该自检不验证硬件解码，也不代表 4K 实时能力。
+- 关闭 `transcoding.enabled` 时，Web 播放计划对需要服务端处理的媒体返回 `UNSUPPORTED` + `reason=SERVER_TRANSCODING_DISABLED`，Emby `PlaybackInfo` 不再声明可转码也不再强制关闭直放；`.strm` 行为不变。该开关只作用于实时播放的 HLS 转码，不影响缩略图/截图、媒体信息探测、章节检测等仍由 FFmpeg/FFprobe 承担的后台任务。
 - `newUserPermissions` 是 `GET/PATCH /api/v1/admin/settings` 中的新账号默认权限快照，包含 `libraryAccessMode`（`ALL`、`SELECTED`、`NONE`）、`libraryIds`、`canDownload`、`canPlay`、`maxSimultaneousPlaybacks`、`allowRemux`、`allowAudioTranscode` 和 `allowVideoTranscode`。未配置时默认为 `NONE`、空媒体库列表、禁止下载、允许播放、同时播放上限 2，并允许封装/音频/视频转换。PATCH 提交完整对象；`SELECTED` 空列表保存为 `NONE`，`ALL/NONE` 必须使用空 `libraryIds`，指定项必须是唯一且已启用的普通媒体库 ID，播放上限不得为负。无效对象返回 400。Lux 管理 API `POST /api/v1/admin/users` 和 Emby 管理员 `POST /Users/New` 创建账号时会原子应用当前快照；Emby 显式复制选项随后按其请求覆盖对应策略或配置。设置读取失败时创建返回 503 且不创建账号。PATCH 需要管理员 Web session 和 `X-CSRF-Token`。
+- `GET /api/v1/admin/transcoding/sessions`：管理员只读接口，返回当前活动的服务端 HLS 会话（最多 24 条）与汇总
+  `summary`（`activeCount`、`hardwareCount`、`softwareCount`、`streamCopyCount`、`outputBytes`）。每个会话包含
+  用户、条目标题、档位、容器、音视频 codec、编码时间与 `progress`（`fps`、`speed`、`latestSegmentBitrateKbps`、
+  `averageBitrateKbps`、`directoryBytes`、`outTimeSeconds`、`droppedFrames`、`finished`、`updatedAt`）；
+  尚未启动 FFmpeg 的会话 `progress` 为 `null`。该接口只读取数据库与内存进度，会按会话目录统计输出字节。
+- `DELETE /api/v1/admin/transcoding/sessions/{sessionId}`：管理员停止一个活动的服务端 HLS 会话，等同该会话本人发送
+  `STOPPED`；成功 204，会话不是 `SERVER_HLS` 或已经结束返回 404。要求管理员 Web session 与 CSRF，并记录
+  `TRANSCODING_SESSION_STOPPED` 审计事件。停止前会采集 FFmpeg 快照写入历史。
+- `GET /api/v1/admin/transcoding/history?page=1&pageSize=10`：分页返回完成、失败与过期的服务端转码历史，
+  `pageSize` 上限 50。每条包含条目/用户、档位、`outcome`（`COMPLETED`、`FAILED`、`EXPIRED`）、`startedAt`、
+  `finishedAt`、`wallSeconds`、`encodedSeconds`、`averageSpeed`（编码时长 ÷ 墙钟时长）、`lastFps`、
+  `outputBytes` 与 `failureReason`。记录在会话结束/失败/过期时写入，每个会话最多一条，保留 30 天。
+- `POST /api/v1/admin/settings/transcoding/probe`：立即重新执行硬件编码器自检，需要管理员 Web session 与 CSRF；返回 `{ "transcodingStatus": { "encoder": "...", "available": true, "checkedAt": 1792888660271, "error": null } }`。检测超时上限 15 秒，失败原因只保留最后一行 FFmpeg 错误（最多 240 字符）。
 - `POST /api/v1/admin/settings/network-proxy/test`：管理员检测当前输入或已生效的网络代理；服务端只请求百度、Google 和 Cloudflare 三个固定目标，返回逐站延迟/HTTP 状态、网络出口 IP 和 Cloudflare 返回的两位国家/地区代码。具体 provider 的连通性由其插件自身的健康状态负责。需要管理员 Web session 和 CSRF；认证信息不会出现在响应或日志中。
 - `GET/PATCH /api/v1/admin/settings/registration`：管理员读取或更新注册模式，GET 返回 `{ "registrationMode": "INVITATION_ONLY", "version": 0 }`。默认邀请制；可选值仅 `INVITATION_ONLY`、`PUBLIC_EMAIL`。PATCH 使用 `{ "registrationMode": "PUBLIC_EMAIL", "version": 0 }`，必须带当前版本，成功返回新模式及递增版本；空对象不修改配置，字段显式为 null、未知字段、无效模式/版本返回 400，版本冲突返回 409 `VERSION_CONFLICT`，请求体上限 4 KiB。Web 写请求需管理员会话和 CSRF，沿用管理员 API Key 的既有授权语义。响应不包含 SMTP 配置或凭据，切换模式不改已发邀请。此设置本身不开放注册端点。
 - `GET/PUT /api/v1/admin/settings/mail`：读取或完整替换 SMTP `host`、`port`、`tlsMode`（`SMTPS` 或强制 `STARTTLS`）、`senderName`、`senderEmail` 和 `siteUrl`。GET 返回 `{ "configured": true, "credentialsConfigured": true, "settings": { ... } }`；未配置时 `settings` 为 `null`。设置响应不含 SMTP 用户名或密码，更新设置不会覆盖认证凭据。写操作需要管理员 Web session 和 CSRF。
@@ -125,10 +145,11 @@ Emby token 后上述 Lux 请求立即失效。显式携带用户令牌的请求�
 - `GET /api/v1/admin/database-diagnostics`：读取临时数据库体检状态；`WAITING`、`RUNNING`、`READY`、`FAILED` 表示状态。已有数据库配置的 Lux 启动约 5 分钟后开始只读检查，目标在启动 10 分钟内完成；仍在运行时继续采集，单次最长 15 分钟后超时。报告只存进程内存，服务重启后重新生成。PostgreSQL 返回数据库及表/索引大小、估算行数、dead tuple 和 vacuum/analyze 统计；SQLite 返回文件/WAL/page/freelist 以及 `dbstat` 可用时的表/索引页大小。PostgreSQL 另包含 `queryStatistics`：`AVAILABLE` 时列出当前数据库累计执行时间最高的 20 条 statement 的 `queryId`、调用数、总/均值/最大执行时间、行数及 shared block hit/read；报告不含 SQL 文本或参数。未预加载、未安装 extension、权限不足或查询超时会返回明确状态和空列表；SQLite 为 `NOT_APPLICABLE`。
 - `POST /api/v1/admin/database-diagnostics/run`：立即开始首次体检或重新采集；采集中重复请求返回 409。重新采集时上一份报告保持可下载，直至新报告成功替换。手动启动先于启动延迟任务时，延迟任务会跳过。
 - `GET /api/v1/admin/database-diagnostics/export`：下载最新可用 JSON 报告；首次体检未就绪时返回 409。状态、启动和导出接口接受共享管理员 `X-Lux-Api-Key` 请求头或管理员 session；使用 session 发起 POST 时还需 CSRF。该临时功能通过终端/API 调用，不在 Web 设置页展示。报告不含行数据、媒体路径或数据库连接信息。
+- `GET /api/v1/admin/performance-metrics`：返回按路由模板聚合的进程内请求指标，含每个模板的请求数、5xx 数、p50/p90/p95/p99、平均/最大耗时与最后出现时间，以及 `totalRequests`、`trackedRoutes` 和 `startedAt`/`generatedAt`（Unix 秒）。最多跟踪 256 条路由，超出与超长模板归入 `OTHER/other`；每路由只保留最近 512 个耗时样本，因此分位为近似值且服务重启后清零。响应不含实际路径参数、查询串、请求 ID、用户信息或凭据，使用 `Cache-Control: no-store, max-age=0`；只接受管理员 session 或共享 `X-Lux-Api-Key`。
 
 PostgreSQL 管理员如需启用 SQL 聚合统计，应在服务端 `shared_preload_libraries` 中加入 `pg_stat_statements` 并重启 PostgreSQL，再在 Lux 使用的数据库执行 `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;`。Lux 只读取已启用的统计，不会修改 PostgreSQL 配置或创建 extension。统计累计值受 `pg_stat_statements_reset()` 影响，报告不返回原始 SQL。
 - `GET /api/v1/admin/dashboard`：返回仪表盘聚合数据，包括 `server`（名称、Lux 版本、commit 和 schema）、`stats`（已启用媒体库中未移除的 `movieCount`、`seriesCount`，以及未禁用用户的 `userCount`）、`health`、最多 24 个 `nowPlaying` 会话和最多 24 条 `activity`。近期登录/播放活动来自配置目录文件日志；用户名称与媒体标题只从当前数据库记录补全，已删除目标显示为空。剧集目标额外返回可空的 `targetSeriesTitle`、`targetSeasonNumber` 和 `targetSeriesSeasonCount`，供管理台按剧名、（多季时）季号、集名展示。正在播放数据只返回安全的媒体/轨道摘要、可空的 `remoteIp` 客户端来源 IP，以及可空的 `remoteIpLocation`（`location`、`district`、`street`、`isp`）。归属地只读取进程内缓存；首次遇到公网 IP 时由后台异步查询 Hiofd，失败或未完成时为 `null`，不返回服务器路径、外部播放 URL 或认证信息；接口要求管理员 Web session。
-- `GET /api/v1/events`：已登录 Web 用户的同源 SSE 失效通知，无需 CSRF。首帧 `ready` 为 `{"version":1}`；`invalidate` 为 `{"scope":"home|item|library|favorites"}`，仅通知重新读取经过权限校验的 API，不携带媒体 ID、媒体库 ID、用户 ID 或业务数据。每 15 秒注释心跳；丢帧时发送 `home`，客户端应失效所有媒体展示缓存。管理员已提交修改和任务状态切换通知普通用户；高频任务进度不转发。客户端可使用可选 `itemId`/`libraryId` 收窄对应缓存，但当前服务端只发送 scope。事件连接正常时媒体页停止周期请求，断线后前台每 30 秒轮询；重连时全量失效媒体展示缓存。
+- `GET /api/v1/events`：已登录 Web 用户的同源 SSE 失效通知，无需 CSRF。首帧 `ready` 为 `{"version":1}`；`invalidate` 为 `{"scope":"home|item|library|favorites|progress"}`，仅通知重新读取经过权限校验的 API，不携带媒体库 ID、用户 ID 或业务数据。每 15 秒注释心跳；丢帧时发送 `home`，客户端应失效所有媒体展示缓存。管理员已提交修改和任务状态切换通知普通用户；高频任务进度不转发。目录级事件（扫描、元数据变化、管理员修改）广播给所有订阅；用户级事件（播放进度、收藏、已看、账户偏好）只推送给该用户自己的连接，其他用户的订阅收不到。客户端可使用可选 `itemId`/`libraryId` 收窄对应缓存；当前只有 `progress` 事件携带 `itemId`（`{"scope":"progress","itemId":"..."}`），客户端据此只刷新继续观看与该条目的播放状态，其余 scope 仍只发送 scope。事件连接正常时媒体页停止周期请求，断线后前台每 30 秒轮询；重连时全量失效媒体展示缓存。
 - `GET /api/v1/admin/events`：管理员 Web session 的 SSE 失效通知流，不要求 CSRF。响应为 `text/event-stream`、禁止缓存并关闭反向代理缓冲；首帧为 `event: ready` 与 `{"version":1}`，变更帧为 `event: invalidate` 与 `{"scope":"dashboard|jobs|libraries|plugins|users|metadata|settings|all"}`，每 15 秒发送注释心跳。广播丢帧时发送 `all`，客户端应重新读取所有管理员查询；流不传输业务数据或敏感信息。
 - `GET /api/v1/admin/logs`：返回脱敏的管理员审计和近期活动事件，与 `/api/v1/admin/audit` 兼容；只读 `/config/logs/` 活动 JSONL 与保留归档，按创建时间和 ID 倒序分页，支持 `page`、`pageSize`。LUX-316 启动迁移完成后不再查询数据库日志表。
 - `GET /api/v1/admin/logs/export?from=YYYY-MM-DD&to=YYYY-MM-DD`：管理员按 UTC 日期导出持久化 JSON 日志；单日范围返回按时间拼接的原始 JSONL，多日范围返回包含每日文件的 ZIP。不传日期时默认最近 7 个 UTC 日，日期范围最多 31 天，可读取活动日文件及 `/config/logs/archive/` 中保留的分段。
@@ -137,8 +158,8 @@ PostgreSQL 管理员如需启用 SQL 聚合统计，应在服务端 `shared_prel
 
 以下接口要求 `canManageServer`；写操作还要求 `X-CSRF-Token`：
 
-- `GET /api/v1/admin/plugin-store`：读取当前插件商店来源和默认来源。默认来源为 `https://github.com/Qoo-330ml/Lux-plugins`，GitHub 仓库地址解析为 `main/index.json`；读取需要管理员权限。
-- `PUT /api/v1/admin/plugin-store`：管理员发送 `{ "url": "https://example.com/lux/index.json" }` 保存插件目录来源，需要 CSRF。只接受无凭据、无 fragment、无控制字符且不超过 2048 个字符的 HTTPS 地址；成功返回 `url` 和 `defaultUrl`。
+- `GET /api/v1/admin/plugin-store`：读取当前插件商店来源和默认来源。`urls` 返回按顺序保存的来源数组，`url` 保留为首个来源的兼容字段；默认来源为 `https://github.com/Qoo-330ml/Lux-plugins`，GitHub 仓库地址解析为 `main/index.json`；读取需要管理员权限。
+- `PUT /api/v1/admin/plugin-store`：管理员发送 `{ "urls": ["https://example.com/lux/index.json", "https://plugins.example.com/index.json"] }` 保存最多 10 个插件目录来源，需要 CSRF。重复地址会自动去重；空数组回退默认来源。旧客户端仍可发送 `{ "url": "..." }`。每项只接受无凭据、无 fragment、无控制字符且不超过 2048 个字符的 HTTPS 地址；成功返回 `urls`、首个来源的兼容字段 `url` 和 `defaultUrl`。多个目录按插件 ID 合并，同一 ID 以最高 SemVer 版本为准。
 - `GET /api/v1/admin/plugins?page=1&pageSize=50`：分页返回当前插件商店目录和 `/config/plugins` 本地发现的插件包及 `installed`、`enabled`、`running`、`configured`、`available`、`configurable`、`configFields`、非敏感 `configValues`、`configSource`、`version`、`runtime`、`capabilities`、`status` 和脱敏 `lastError` 状态。`configFields` 包含输入类型、是否多选、默认值、数值范围和选项来源；`media-libraries` 选项由当前媒体库动态填充。敏感配置值不会返回。目录不可用时，已发现的本地插件仍可用于已安装管理页。
 - 插件 manifest 可通过 `scheduledTasks` 声明宿主计划任务。每项至少包含 `taskType`、`ownerType`、`name`、`description`、`scheduleConfigKey` 和五段式 `defaultSchedule`，还可以声明 `requiredConfigKeys` 与 `resourceLimit`；`GLOBAL` 任务使用 `global` owner，`LIBRARY` 任务必须通过 `ownerConfigKey` 指向多选媒体库配置。安装、启停、配置更新和服务启动均由 Lux 通用机制同步这些声明，不按具体插件 ID 注册任务；配置无效或插件未启用时任务记录保留但停用。
 - `POST /api/v1/admin/plugins/{pluginId}/install`：安装本地发现的插件，或下载当前插件商店目录声明的 `.zip` 包并校验大小、路径、manifest、平台入口和 SHA-256 后原子写入 `/config/plugins`，默认启用。首次安装返回 201，重复请求返回 200；下载失败或未知插件返回相应错误，不改变安装状态。
@@ -360,6 +381,12 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   服务端先检查条目/媒体库 ACL，再按 0→4 选择最低成本计划。响应包含 `sessionId`、`playSessionId`、`tier`、
   `expiresAt`、`sourceId` 和 `plan`。`plan.type` 为 `DIRECT`、`SERVER_HLS` 或 `UNSUPPORTED`；后者带稳定的
   `reason`，且不会创建播放会话或 FFmpeg 进程。
+- `DIRECT` 计划除 `url`、`proxyUrl`、`rangeUrl`（旧字段，保留一个版本）外还带有序的 `candidates`：
+  `[{ "kind": "proxy|lux|origin", "url": "..." }]`。`proxy` 是标准 Emby `/Videos/{id}/stream?MediaSourceId=...` 入口，
+  带 `PlaySessionId`、`DeviceId`、`UserId`、`static=true`，以及一个播放专用短期 `api_key`（`luxpb_{条目}_{随机串}`），
+  供前置的 302 软件回查 `Items/{id}`；该令牌绑定当前条目、有效期不超过会话到期时间（至多 12 小时），只能访问
+  `Items/{id}`、`Users/{id}/Items/{id}`、`Videos/{id}/stream|original` 与 `Auth/Keys`，会话停止后立即作废。`lux` 是
+  Lux 自己的签名入口；`origin` 是 HTTP(S) `.strm` 的目标地址，仅作最后手段。令牌无法签发（黑名单命中等）时省略 `proxy`。
 - 档位 0 是原始文件 Range 直放（客户端 HEVC/MKV fallback 仍属于此档）；档位 1 是视频/音频 copy 的
   fMP4/CMAF HLS；档位 2 是视频 copy、音频转码；档位 3 是管理员配置且运行时确认可用的硬件转码；档位 4 是
   Jellyfin FFmpeg 软件转码。服务端 HLS 只为当前会话生成临时 `index.m3u8`、`init.mp4` 和 `.m4s`，不生成永久副本。
@@ -371,6 +398,15 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   `eventId` 和 `sequence` 在会话内幂等；重复事件返回 `duplicate`，乱序事件返回 `stale`，不会倒退播放位置。
   `STOPPED` 会停止会话并回收服务端 HLS 进程和临时目录。
 - `POST /api/v1/playback/sessions/{sessionId}/heartbeat`：延长活动会话 TTL，返回新的 `expiresAt`。
+- `GET /api/v1/playback/sessions/{sessionId}/stats`：只读播放统计，供电播放信息面板使用。只允许会话所属用户，
+  他人会话、不存在或已过期会话返回 404；`GET` 不写库、不续租、不启动 FFmpeg。响应包含 `plan`、`tier`、
+  `state`、`expiresAt`、`output`（`container`、`videoCodec`、`audioCodec`、`videoBitrate`、`audioBitrate`）
+  和 `progress`。`progress` 只在服务端 HLS 有 FFmpeg 进程时非空，字段为 `fps`、`speed`、`bitrateKbps`、
+  `totalSize`、`outTimeSeconds`、`duplicatedFrames`、`droppedFrames`、`finished`、`updatedAt`（毫秒时间戳），
+  数据来自 FFmpeg `-progress pipe:1`，约每 0.5 秒刷新，不代表整段媒体的最终统计。HLS 封装下 FFmpeg 通常把
+  `bitrate`/`total_size` 报告为 `N/A`，因此同一对象还包含服务端实测的 `latestSegmentBitrateKbps`（最新一个
+  4 秒分片的实际输出码率）、`directoryBytes`（会话已输出字节，实时测量，不复用配额缓存）和
+  `averageBitrateKbps`（已输出字节 ÷ 已输出时长）。
 - `DELETE /api/v1/playback/sessions/{sessionId}`：停止当前用户的会话并回收服务端资源，成功返回 204。
 
 `.strm` 永远只允许档位 0；直连失败时返回 `UNSUPPORTED`，不进入 Remux、音频/视频转码、HLS 或媒体字节代理。

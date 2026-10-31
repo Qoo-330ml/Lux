@@ -21,6 +21,217 @@ pub(crate) enum LibraryDeletionBatch {
     ScanJobs,
 }
 
+/// Which parent table a set-based child delete is scoped through.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum DeletionParent {
+    MediaItems,
+    MediaSources,
+}
+
+/// Deepest-first child deletes for one media-item batch.
+///
+/// Deleting a library item by item makes the foreign keys run one cascade lookup per
+/// parent row. Walking the same tables set-based keeps the work identical but turns it
+/// into a fixed number of statements per batch.
+///
+/// SQLite only. Measured on the 502-rows-per-series fixture: 4.02M rows went from
+/// 38.0 s to 25.2 s. PostgreSQL moves the other way (5.69 s to 8.29 s) because its
+/// cascade triggers are already a single index probe per row and the extra statements
+/// re-scan the batch selection 37 times, so PostgreSQL keeps the cascade path.
+///
+/// Foreign keys stay enabled either way: a table missing from this list is still
+/// cleaned up by the cascade, only more slowly, so the list is an optimization rather
+/// than a correctness requirement.
+pub(crate) const MEDIA_ITEM_CHILD_DELETES: &[(&str, &str, DeletionParent)] = &[
+    // Children of media_sources first: they hold the bulk of the rows (streams and
+    // chapter markers per episode) and must go before their parent.
+    (
+        "chapter_detection_job_items",
+        "source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "chapter_detection_source_states",
+        "source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "danmaku_match_job_items",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "danmaku_tracks",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "media_chapters",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "media_info_chapters",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    (
+        "media_streams",
+        "media_source_id",
+        DeletionParent::MediaSources,
+    ),
+    // Then media_sources and the remaining children of media_items.
+    ("media_sources", "item_id", DeletionParent::MediaItems),
+    (
+        "chapter_detection_job_items",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "chapter_detection_job_items",
+        "season_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "collection_item_references",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("collection_items", "item_id", DeletionParent::MediaItems),
+    (
+        "collection_work_items",
+        "work_item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "collection_work_sources",
+        "source_item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("collections", "item_id", DeletionParent::MediaItems),
+    (
+        "emby_migration_import_records",
+        "lux_item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("item_aliases", "item_id", DeletionParent::MediaItems),
+    ("item_images", "item_id", DeletionParent::MediaItems),
+    (
+        "item_metadata_completeness",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_content_restriction_index",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_content_restriction_index_queue",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_item_nfo_cache",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("catalog_items", "item_id", DeletionParent::MediaItems),
+    (
+        "user_series_next",
+        "next_item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("user_series_next", "series_id", DeletionParent::MediaItems),
+    (
+        "media_item_provider_ids",
+        "media_item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_merge_records",
+        "merged_item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "media_merge_records",
+        "primary_item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("metadata_candidates", "item_id", DeletionParent::MediaItems),
+    (
+        "metadata_capability_attempts",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "metadata_image_attempts",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "metadata_reidentify_job_items",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("person_credits", "item_id", DeletionParent::MediaItems),
+    (
+        "person_index_item_state",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "person_match_candidates",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "playback_history_events",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("playback_sessions", "item_id", DeletionParent::MediaItems),
+    (
+        "recommendation_item_stats",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    (
+        "thumbnail_scraper_retries",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+    ("user_item_state", "item_id", DeletionParent::MediaItems),
+    (
+        "web_playback_sessions",
+        "item_id",
+        DeletionParent::MediaItems,
+    ),
+];
+
+fn media_item_child_delete_sql(table: &str, column: &str, parent: DeletionParent) -> String {
+    match parent {
+        DeletionParent::MediaItems => format!(
+            "DELETE FROM {table} WHERE {column} IN \
+             (SELECT id FROM media_items WHERE library_id = ? LIMIT ?)"
+        ),
+        DeletionParent::MediaSources => format!(
+            "DELETE FROM {table} WHERE {column} IN (SELECT id FROM media_sources \
+             WHERE item_id IN (SELECT id FROM media_items WHERE library_id = ? LIMIT ?))"
+        ),
+    }
+}
+
+fn media_item_child_deletes() -> &'static [String] {
+    static STATEMENTS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    STATEMENTS.get_or_init(|| {
+        MEDIA_ITEM_CHILD_DELETES
+            .iter()
+            .map(|(table, column, parent)| media_item_child_delete_sql(table, column, *parent))
+            .collect()
+    })
+}
+
 const LIBRARY_DELETION_JOB_COLUMNS: &str =
     "id, library_id, library_name, status, stage, processed_count, error_code,
      created_at, updated_at, started_at, finished_at";
@@ -91,6 +302,19 @@ fn deletion_restore_pragmas(backend: DatabaseBackend) -> &'static [&'static str]
     }
 }
 
+/// Translates the admin list filter into a SQL predicate and its bound parameter.
+///
+/// `OPEN` is the operations view's "still needs attention" alias: every deletion that has not
+/// finished yet. `COMPLETED` rows stay reachable by their exact status, so the history is kept
+/// without living in the default view.
+fn library_deletion_status_filter(status: Option<&str>) -> (&'static str, Option<&str>) {
+    match status {
+        Some("OPEN") => (" WHERE status <> 'COMPLETED'", None),
+        Some(status) => (" WHERE status = ?", Some(status)),
+        None => ("", None),
+    }
+}
+
 fn stored_library_deletion_job(row: sqlx::any::AnyRow) -> StoredLibraryDeletionJob {
     StoredLibraryDeletionJob {
         id: row.get("id"),
@@ -118,22 +342,12 @@ impl Database {
         library_id: &str,
         job_id: &str,
     ) -> Result<Option<StoredLibraryDeletionJob>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == DatabaseBackend::Postgres {
             self.query("SET LOCAL lock_timeout = '2s'")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
 
         let active_job = self
@@ -146,18 +360,9 @@ impl Database {
             .bind(library_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if let Some(row) = active_job {
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(Some(stored_library_deletion_job(row)));
         }
 
@@ -172,10 +377,7 @@ impl Database {
             .bind(library_id)
             .fetch_optional(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .map(|row| row.get::<String, _>("name"));
 
         let Some(library_name) = library_name else {
@@ -188,17 +390,8 @@ impl Database {
                 .bind(library_id)
                 .fetch_optional(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
-            transaction
-                .commit()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
+            transaction.commit().await.map_err(self.sqlx_err())?;
             return Ok(existing.map(stored_library_deletion_job));
         };
 
@@ -212,10 +405,7 @@ impl Database {
         .bind(library_name)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let row = self
             .query(sqlx::AssertSqlSafe(format!(
                 "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
@@ -224,17 +414,11 @@ impl Database {
             .bind(job_id)
             .fetch_one(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        // The library is now `deletion_state = 'DELETING'` and disabled, which `has_user_library_access`
+        // treats as no access for every user.
+        self.access_changes.invalidate_all();
         Ok(Some(stored_library_deletion_job(row)))
     }
 
@@ -250,10 +434,7 @@ impl Database {
         .fetch_optional(&self.pool)
         .await
         .map(|row| row.map(stored_library_deletion_job))
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn list_library_deletion_jobs(
@@ -262,32 +443,21 @@ impl Database {
         limit: i64,
         status: Option<&str>,
     ) -> Result<Vec<StoredLibraryDeletionJob>, StorageError> {
-        let rows = if let Some(status) = status {
-            self.query(sqlx::AssertSqlSafe(format!(
-                "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
-                 FROM library_deletion_jobs WHERE status = ?
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-            )))
-            .bind(status)
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
-        } else {
-            self.query(sqlx::AssertSqlSafe(format!(
-                "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
-                 FROM library_deletion_jobs
-                 ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
-            )))
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(&self.pool)
-            .await
+        let (filter, bound_status) = library_deletion_status_filter(status);
+        let mut query = self.query(sqlx::AssertSqlSafe(format!(
+            "SELECT {LIBRARY_DELETION_JOB_COLUMNS}
+             FROM library_deletion_jobs{filter}
+             ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?"
+        )));
+        if let Some(bound_status) = bound_status {
+            query = query.bind(bound_status);
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let rows = query
+            .bind(limit)
+            .bind(offset)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
         Ok(rows.into_iter().map(stored_library_deletion_job).collect())
     }
 
@@ -295,20 +465,14 @@ impl Database {
         &self,
         status: Option<&str>,
     ) -> Result<i64, StorageError> {
-        let count = if let Some(status) = status {
-            self.query_scalar("SELECT COUNT(*) FROM library_deletion_jobs WHERE status = ?")
-                .bind(status)
-                .fetch_one(&self.pool)
-                .await
-        } else {
-            self.query_scalar("SELECT COUNT(*) FROM library_deletion_jobs")
-                .fetch_one(&self.pool)
-                .await
+        let (filter, bound_status) = library_deletion_status_filter(status);
+        let mut query = self.query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM library_deletion_jobs{filter}"
+        )));
+        if let Some(bound_status) = bound_status {
+            query = query.bind(bound_status);
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        let count: i64 = query.fetch_one(&self.pool).await.map_err(self.sqlx_err())?;
         Ok(count)
     }
 
@@ -331,10 +495,7 @@ impl Database {
             .bind(job_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if result.rows_affected() == 0 {
             return self.get_library_deletion_job(job_id).await;
         }
@@ -355,10 +516,7 @@ impl Database {
             .bind(job_id)
             .execute(&self.pool)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -377,10 +535,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|result| result.rows_affected() == 1)
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     /// Best-effort WAL trimming between stages. `PASSIVE` never blocks readers, so
@@ -411,10 +566,7 @@ impl Database {
         .execute(&self.pool)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn delete_library_deletion_batch(
@@ -426,22 +578,12 @@ impl Database {
     ) -> Result<Option<u64>, StorageError> {
         // One checked-out connection per batch: the reduced-durability pragmas must
         // never be inherited by a pooled connection that a later request reuses.
-        let mut connection = self
-            .pool
-            .acquire()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut connection = self.pool.acquire().await.map_err(self.sqlx_err())?;
         for &pragma in deletion_durability_pragmas(self.backend()) {
             self.query(pragma)
                 .execute(&mut *connection)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let result = self
             .delete_library_deletion_batch_on(&mut connection, job_id, library_id, batch, limit)
@@ -462,30 +604,18 @@ impl Database {
         batch: LibraryDeletionBatch,
         limit: i64,
     ) -> Result<Option<u64>, StorageError> {
-        let mut transaction = connection
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = connection.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == DatabaseBackend::Postgres {
             // Every batch is idempotent and the job restarts from committed data,
             // so the commit fsync is not worth paying for on a multi-hour deletion.
             self.query("SET LOCAL synchronous_commit = off")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
             self.query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let running_job = self
             .query(
@@ -495,19 +625,32 @@ impl Database {
             .bind(job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if running_job.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(None);
+        }
+        if batch == LibraryDeletionBatch::MediaItems {
+            // Watch state and playback history have to be copied out before anything below removes
+            // them: the set-based child deletes on SQLite and the foreign-key cascade on PostgreSQL
+            // both take both tables with the item, and the user expects the history back when the
+            // same title is added to another library.
+            self.archive_watch_state_for_library(&mut transaction, library_id)
+                .await?;
+            self.archive_playback_history_for_library(&mut transaction, library_id)
+                .await?;
+        }
+        if batch == LibraryDeletionBatch::MediaItems && self.backend() == DatabaseBackend::Sqlite {
+            // Set-based child deletes: same rows, a fixed number of statements instead
+            // of one foreign-key cascade lookup per parent row.
+            for statement in media_item_child_deletes() {
+                self.query(sqlx::AssertSqlSafe(statement.clone()))
+                    .bind(library_id)
+                    .bind(limit)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(self.sqlx_err())?;
+            }
         }
         let result = match batch {
             LibraryDeletionBatch::MediaItems => {
@@ -764,10 +907,7 @@ impl Database {
                 .await
             }
         }
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let deleted = result.rows_affected();
         if deleted > 0 {
             self.query(
@@ -779,18 +919,9 @@ impl Database {
             .bind(job_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(deleted))
     }
 
@@ -799,22 +930,12 @@ impl Database {
         job_id: &str,
         library_id: &str,
     ) -> Result<Option<bool>, StorageError> {
-        let mut transaction = self
-            .pool
-            .begin()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        let mut transaction = self.pool.begin().await.map_err(self.sqlx_err())?;
         if self.backend() == DatabaseBackend::Postgres {
             self.query("SET LOCAL lock_timeout = '5s'")
                 .execute(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         let running_job = self
             .query(
@@ -825,18 +946,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         if running_job.rows_affected() == 0 {
-            transaction
-                .rollback()
-                .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+            transaction.rollback().await.map_err(self.sqlx_err())?;
             return Ok(None);
         }
         self.query(
@@ -846,19 +958,13 @@ impl Database {
         .bind(library_id)
         .execute(&mut *transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         let deleted = self
             .query("DELETE FROM libraries WHERE id = ? AND deletion_state = 'DELETING'")
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
             .rows_affected()
             == 1;
         if deleted {
@@ -872,18 +978,9 @@ impl Database {
             .bind(library_id)
             .execute(&mut *transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         }
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(deleted))
     }
 }

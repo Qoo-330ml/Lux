@@ -18,8 +18,10 @@
    passing change, then refactor only when the tests remain green.
 4. Keep increments small, compilable, and independently revertible. Run the narrowest relevant
    checks after every increment and commit each completed increment atomically. For Rust behavior
-   changes, run the related `cargo test --locked --test <target>` target(s), or
-   `cargo test --locked --lib <module-or-test-filter>` for library tests. Do not run
+   changes, run the related integration test group with
+   `cargo test --locked --test <group> <module>::` (see `docs/TEST-TARGETS.md` for the former
+   per-file target → group mapping), or `cargo test --locked --lib <module-or-test-filter>` for
+   library tests. Do not run
    `cargo test --locked --all-targets` during routine increments; reserve it for task completion,
    a documented phase gate, cross-cutting changes, or an explicit project-owner request.
 5. Report changed files, acceptance results, test results, and remaining risks at the end of a task.
@@ -43,9 +45,12 @@
 - Validate every external input, canonicalize media paths, and enforce the configured library root.
 - Lux may use `X-Forwarded-For` for IP/CIDR blacklist decisions only through the access-IP
   resolver: it starts from the connection peer attached by server middleware, consults explicitly
-  configured trusted-proxy CIDRs, and walks the complete chain from right to left. Raw forwarded
-  values and untrusted peers must never be used for ACL decisions. `X-Forwarded-Proto` remains
-  display/transport metadata only and must not be used for authentication, authorization, or ACLs.
+  configured trusted-proxy CIDRs plus the single container default gateway detected from
+  `/proc/net/route` when the process runs inside a container, and walks the complete chain from
+  right to left. The implicit gateway trust is limited to one host address, never the bridge
+  subnet, and is disabled outside containers. Raw forwarded values and untrusted peers must never
+  be used for ACL decisions. `X-Forwarded-Proto` remains display/transport metadata only and must
+  not be used for authentication, authorization, or ACLs.
 - Do not use `unwrap`, `expect`, or `panic` in production paths without a task-specific justification.
 - Do not execute blocking filesystem or process work on Tokio core workers.
 - Do not scan a whole library, call TMDb, parse NFO, or run `ffprobe` in a user request.
@@ -57,8 +62,10 @@
 ### AI test selection
 
 - Before testing, identify the narrowest Rust target named by the assigned task's acceptance
-  criteria or the changed behavior. Prefer one or more explicit `--test <target>` flags; do not
-  use a broad test-name filter as a substitute for selecting the target.
+  criteria or the changed behavior. Integration tests are grouped by domain: select one explicit
+  `--test <group>` flag, then narrow it with a module prefix (`--test <group> <module>::`).
+  `docs/TEST-TARGETS.md` maps every former per-file target to its group; do not use a broad
+  test-name filter as a substitute for selecting the target.
 - For a library-only change, prefer `cargo test --locked --lib <module-or-test-filter>`.
 - Run `cargo test --locked --all-targets` only at the completion or phase-gate conditions stated
   above. It remains part of the full Rust completion gate and is not waived by targeted tests.
@@ -70,6 +77,8 @@ cargo build --locked
 cargo test --locked --all-targets
 cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
+python3 scripts/check-migration-parity.py
+python3 scripts/check-backend-branches.py
 ```
 
 For Web changes also run:

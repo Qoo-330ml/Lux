@@ -3,6 +3,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=scripts/lib/wait-for-restart.sh
+source "$ROOT_DIR/scripts/lib/wait-for-restart.sh"
 cd "$ROOT_DIR"
 
 IMAGE="${LUX_IMAGE:-lux:arm64-local}"
@@ -56,6 +58,9 @@ if [[ "$started" != 1 ]]; then
     exit 1
 fi
 
+# A fresh config directory starts in the database-selection mode, so pick SQLite before setup.
+lux_select_sqlite_database "http://127.0.0.1:$PORT"
+
 setup="$(curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/setup/complete" \
     -H 'Content-Type: application/json' \
     -d '{"username":"admin","displayName":"Mount Fault Admin","password":"mount-loss-test-password","firstLibrary":{"name":"Mount Fault Movies","kind":"MOVIE","rootPath":"/media/movies"}}')"
@@ -64,6 +69,11 @@ if [[ -z "$library_id" || "$library_id" == "null" ]]; then
     echo "setup did not return the first library ID" >&2
     exit 1
 fi
+
+# The library ID survives the restart, but the `scanJob` of the response does not: the restart
+# cancels it and the recovered process queues a new one. Wait for the restart and for that scan, so
+# the reconcile below does not race the shutdown or answer `409`.
+lux_wait_for_restarted_server "http://127.0.0.1:$PORT"
 
 curl -sS -D "$COOKIE_HEADERS" -o "$WORK_DIR/login.json" \
     -X POST "http://127.0.0.1:$PORT/api/v1/auth/login" \
@@ -79,6 +89,8 @@ if [[ -z "$session_cookie" || -z "$csrf_cookie" ]]; then
 fi
 csrf_value="${csrf_cookie#lux_csrf=}"
 cookies="$session_cookie; $csrf_cookie"
+lux_wait_for_first_scan_settled "http://127.0.0.1:$PORT" "$library_id" \
+    -H "Cookie: $cookies"
 
 start_reconcile() {
     curl -fsS -X POST "http://127.0.0.1:$PORT/api/v1/admin/libraries/$library_id/reconcile" \

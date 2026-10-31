@@ -79,6 +79,61 @@ PostgreSQL 需要在引导前准备好数据库、用户和网络访问权限，
 管理员可以在“任务与日志 → 系统日志”选择 UTC 起止日期并直接下载日志；选择单日会下载原始 `.log` 文件，跨日会下载 ZIP。也可以在宿主机使用
 `docker compose logs --no-color --timestamps --since 1h lux` 查看容器 stdout。日志文件和导出内容可能包含媒体相对路径及请求诊断信息，不要公开发布；不要把 `/config` 整目录、Cookie、配置凭据或数据库文件作为日志附件发送。
 
+### SQLite 写入耐久性（LUX_SQLITE_SYNCHRONOUS）
+
+内置 SQLite 使用 WAL。每条池连接在建立时统一设置 `synchronous`，可以用部署环境变量在 `FULL` 与
+`NORMAL` 之间切换：
+
+| 选项 | 默认 | 取值 | 说明 |
+|---|---|---|---|
+| `LUX_SQLITE_SYNCHRONOUS` | `FULL` | `full`、`normal`（不区分大小写） | 每条新建连接执行一次 `PRAGMA synchronous = <FULL\|NORMAL>`；留空按默认处理，其他值回退 `FULL` 并在启动日志里留下一条告警 |
+
+`FULL` 是 SQLite 自己的默认值：每次提交都把 WAL 刷到磁盘。`NORMAL` 在 WAL 模式下不会损坏数据库，
+断电时最多丢掉最后几次已提交的事务，对小事务密集的路径（例如每 10 秒一次的播放进度上报）收益最大，
+在机械盘 NAS 上尤其明显。**默认值保持 `FULL`**；在 NAS 上做完 A/B 并确认可以接受断电丢最后几次提交
+之后，才建议把默认切换纳入决定。该变量只作用于内置 SQLite 的池连接：`Database` 只把它写进 SQLite 的
+`after_connect`；PostgreSQL 后端的连接初始化不设置 `synchronous`，扫描事务的 PostgreSQL 局部
+`synchronous_commit = off` 也保持不变。`:memory:` 只在测试里以裸池形式出现，不经过这条连接初始化路径。
+
+在 NAS 上做 A/B 的方法（两轮使用同一份数据库副本和同一组操作，交替顺序再跑一轮以抵消缓存影响）：
+
+```bash
+# 1. 停机，为每轮准备一份完整的 /config 副本（含 database.json 与 lux.db）
+docker compose stop lux
+cp -a config config-ab-full
+cp -a config config-ab-normal
+
+# 2. 每轮用独立的 /config 副本和独立容器名，避免两次运行互相污染
+docker run -d --name lux-ab \
+  -e LUX_SQLITE_SYNCHRONOUS=full \
+  -v "$PWD/config-ab-full:/config" -v "$PWD/media:/media" \
+  -p 8097:8097 -p 7359:7359/udp pdzhou/lux:latest
+# 跑完同一套操作序列（连续播放上报，混一次小库扫描）后记录墙钟、CPU、iowait、
+# 播放上报延迟与日志里的写锁等待，然后停掉容器
+docker stop lux-ab && docker rm lux-ab
+
+docker run -d --name lux-ab \
+  -e LUX_SQLITE_SYNCHRONOUS=normal \
+  -v "$PWD/config-ab-normal:/config" -v "$PWD/media:/media" \
+  -p 8097:8097 -p 7359:7359/udp pdzhou/lux:latest
+
+# 3. 确认连接实际生效：启动日志有一条“sqlite connection durability level”记录，
+#    FULL 显示 synchronous=FULL，NORMAL 显示 synchronous=NORMAL；
+#    再对比两轮的 /config/lux.db-wal 增长与 checkpoint 次数
+docker logs lux-ab 2>&1 | grep 'sqlite connection durability level'
+
+# 4. 断电恢复证据：在 NORMAL 副本上强杀容器后重启，确认数据库能打开、任务可继续
+docker kill --signal=KILL lux-ab && docker start lux-ab
+```
+
+Compose 部署若希望长期保留该设置，可在 `.env` 里写 `LUX_SQLITE_SYNCHRONOUS=normal`，
+并给 `compose.yaml` 的 `lux.environment` 加上对应转发（默认的 Compose 文件目前没有转发这一项，
+只写 `.env` 不会进入容器）；非容器部署直接作为进程环境变量设置即可。
+
+只在一台 ARM 开发机上跑出的数字不能外推到 NAS：机械盘、低功耗 x86、容器 I/O 限速都会改变 fsync
+成本。批量扫描的 A/B 数据不代表小事务，因为批量提交已经把 fsync 压到很少；要用播放上报这类小事务
+路径判断收益。
+
 ### Docker Hub 镜像
 
 `.github/workflows/dockerhub.yml` 在 Pull Request 中只构建验证；推送 `test` 分支时发布 Docker Hub `test` 标签，推送 `main` 分支时发布 `latest` 标签。两种分支都分别使用 GitHub 原生 amd64 与 ARM64 runner 构建，再合并 Docker Hub manifest；不使用 QEMU。runtime 依赖按 `RUNTIME_IMAGE_TAG` 发布到独立的 `lux-runtime` 仓库：每个架构只有在对应版本标签不存在时才构建，应用构建随后解析该架构镜像的 digest，并以 `image@digest` 引用。只有在 Debian/FFmpeg 依赖变化时才提升 `RUNTIME_IMAGE_TAG`；普通应用更新不会重新生成 runtime 层。应用镜像仍会携带 runtime 层，Docker Hub 会按 layer digest 复用它。需要在 GitHub Actions Secrets 中配置 `DOCKERHUB_USERNAME` 和 Docker Hub Access Token `DOCKERHUB_TOKEN`；应用镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux`，runtime 镜像地址为 `docker.io/<DOCKERHUB_USERNAME>/lux-runtime`。
@@ -95,13 +150,18 @@ LUX_PROXY_URL=http://192.168.1.2:7890
 
 `LUX_PROXY_URL` 可选，用于 Lux 及其外置插件的出站网络请求，例如元数据、图片和人物头像下载。支持 `http://`、`https://`、`socks4://`、`socks4a://`、`socks5://` 和 `socks5h://` 代理地址；代理 URL 可包含用户名认证信息。留空时使用标准系统代理环境变量（`HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`）；这些变量也可使用小写形式。代理地址不参与入站反向代理，也不改变 `.strm` 直交行为。包含认证信息的代理 URL 应只通过受保护的环境变量或 secrets 注入，不能写入日志。TMDb/豆瓣凭据请在各自插件的专属配置中设置，不再通过 `LUX_TMDB_*` 环境变量注入 Lux 主进程。
 
+外置插件的请求由插件子进程自己发出，宿主只通过 `LUX_PROXY_URL` 下发代理，而且插件无法读取 `NO_PROXY` 按域名绕过。需要让某个插件不经代理直连时，在 `config/plugin_proxy_bypass` 中每行写一个插件 id（也接受逗号分隔；`#` 起注释），或用 `LUX_PLUGIN_PROXY_BYPASS` 提供同样的列表；文件优先于环境变量。名单内的插件启动时不会收到 `LUX_PROXY_URL`，并会移除继承的 `HTTP_PROXY`、`HTTPS_PROXY`、`ALL_PROXY`（含小写形式）。例如某些上游按代理出口 IP 拒绝访问（Cloudflare 403），而宿主自身地址可以正常访问，就应把该章节源加入此名单，而不是放宽全局代理规则。
+
+
 本地文件索引默认使用 4 路 worker，在线元数据刮削默认使用 4 路 worker；FILL_MISSING 的进程级上限也是 4。官方 Docker 镜像和 Compose 默认注入 LUX_SCAN_CONCURRENCY=4、LUX_FFMPEG_CONCURRENCY=2；LUX_PROBE_CONCURRENCY 留空时按有效 CPU 容量自动计算进程级探测预算 ceil(CPU 核数 × 4)，上限 512，运行中活动并发按本地 ffprobe 成功完成速率自适应调整。显式 LUX_PROBE_CONCURRENCY 仍覆盖自动预算。自适应调度不读取 CPU 使用率；首页延迟或 cgroup 内存压力只用于保护性降档。
 
 LUX_BACKGROUND_CPU_BUDGET 为扫描准备、指纹、后台 NFO/图片计算、ffprobe 和缩略图 ffmpeg 提供进程级共享准入；留空时按可见 CPU 与 cgroup CPU 限额推导 max(1, min(CPU 数) - 1)，自动值上限 16，显式整数范围为 1–32，进程启动时读取。它不构成 OS CPU 配额，单个 ffprobe/ffmpeg 仍可能使用多个 CPU 线程；探测器自适应预算与后台共享预算共同限制活动工作。
 
 LUX_SCAN_CONCURRENCY 只限制同一时刻活动的文件扫描任务/扫描工作项上限，不是 Tokio runtime 使用的 OS 线程总数；LUX_PROBE_CONCURRENCY 和 LUX_FFMPEG_CONCURRENCY 独立限制 ffprobe、ffmpeg 子进程，LUX_BACKGROUND_CPU_BUDGET 再对列出的后台 CPU 工作做共享准入。LUX_SCAN_CONCURRENCY 范围为 1–1024，LUX_PROBE_CONCURRENCY 范围为 1–512，LUX_FFMPEG_CONCURRENCY 范围为 1–4。非容器部署未设置扫描环境变量时，新建媒体库索引默认 4 路；资源自适应仍可能在 CPU、内存、前台延迟或存储延迟较高时降低实际扫描并发，SQLite 批量入库保持单写者。
 
-LUX_DATABASE_MAINTENANCE 控制内置数据库维护，默认开启；设为 `0`、`false`、`off` 或 `no` 可完全关闭。维护在启动后延迟执行一次，之后按每 24 小时一轮在后台运行，并且只在没有扫描或元数据任务运行时才开始；检测到活动任务则跳过本轮。它只做三类低风险动作：对死元组达到判定阈值的表执行 `VACUUM (ANALYZE)`、刷新 `media_search` 的统计信息，以及对满足条件的热点大表写入表级 `autovacuum_*` 参数。它不会删除业务数据、删除索引、执行 `VACUUM FULL` 或 `REINDEX`，也不会修改全局 `postgresql.conf` 或重启数据库进程。SQLite 后端只在 `freelist` 同时达到最小页数和文件占比阈值时才处理。默认仍是整库 `VACUUM`：它会重写整个文件并在过程中独占写锁，受 `LUX_SQLITE_VACUUM_TIMEOUT_SECONDS`（默认 120 秒）约束，超大库通常超时并在日志里留下提示——这类库需要运维自行在停机窗口执行一次 `VACUUM`。设置 `LUX_SQLITE_AUTO_VACUUM=incremental` 后，新建数据库会在第一个表创建前写入 `auto_vacuum=INCREMENTAL`，维护轮改用 `PRAGMA incremental_vacuum` 分小步把空闲页归还文件系统，单步持锁很短，删除大型媒体库后无需重建整个库；代价是每个空闲页都要维护指针映射，实测删除路径约慢 1.7 倍（400 万行 38 秒 vs 64 秒），因此默认不开启。该开关只影响新建库，已有库切换仍需要一次整库 `VACUUM`。autovacuum 参数对 SQLite 不适用。LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS 调整轮次间隔（`0` 表示停用周期任务），LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS 调整启动后的首次延迟；非法值回退默认。 LUX_TASK_HISTORY_RETENTION_DAYS 控制已完成/失败/取消的扫描、元数据、章节、弹幕和 STRM 探测任务历史保留天数（默认 14，0 表示停用周期清理）；`metadata_candidates` 中已拒绝/过期的候选也会一并分批清理。 内置 PostgreSQL 通过 `shared_preload_libraries=pg_stat_statements` 和 `pg_stat_statements.track=all` 预加载查询统计；Lux 不会创建扩展，需管理员在业务库执行 `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;` 后，管理员数据库诊断才会返回 `queryStatistics`。外部 PostgreSQL 也需要自行预加载并安装扩展。若运行 PostgreSQL 的容器使用较小的 `/dev/shm`，并行索引清理可能因共享内存不足失败，此时可对该容器设置 `shm_size`。
+LUX_DATABASE_MAINTENANCE 控制内置数据库维护，默认开启；设为 `0`、`false`、`off` 或 `no` 可完全关闭。维护在启动后延迟执行一次，之后按每 24 小时一轮在后台运行，并且只在没有扫描或元数据任务运行时才开始；检测到活动任务则跳过本轮。它只做三类低风险动作：对死元组达到判定阈值的表执行 `VACUUM (ANALYZE)`、刷新 `media_search` 的统计信息，以及对满足条件的热点大表写入表级 `autovacuum_*` 参数。它不会删除业务数据、删除索引、执行 `VACUUM FULL` 或 `REINDEX`，也不会修改全局 `postgresql.conf` 或重启数据库进程。SQLite 后端只在 `freelist` 同时达到最小页数和文件占比阈值时才处理。默认仍是整库 `VACUUM`：它会重写整个文件并在过程中独占写锁，受 `LUX_SQLITE_VACUUM_TIMEOUT_SECONDS`（默认 120 秒）约束，超大库通常超时并在日志里留下提示——这类库需要运维自行在停机窗口执行一次 `VACUUM`。设置 `LUX_SQLITE_AUTO_VACUUM=incremental` 后，新建数据库会在第一个表创建前写入 `auto_vacuum=INCREMENTAL`，维护轮改用 `PRAGMA incremental_vacuum` 分小步把空闲页归还文件系统，单步持锁很短，删除大型媒体库后无需重建整个库；代价是每个空闲页都要维护指针映射，实测删除路径约慢 1.7 倍（400 万行 38 秒 vs 64 秒），因此默认不开启。该开关只影响新建库，已有库切换仍需要一次整库 `VACUUM`。autovacuum 参数对 SQLite 不适用。LUX_DATABASE_MAINTENANCE_INTERVAL_SECONDS 调整轮次间隔（`0` 表示停用周期任务），LUX_DATABASE_MAINTENANCE_INITIAL_DELAY_SECONDS 调整启动后的首次延迟；非法值回退默认。 LUX_TASK_HISTORY_RETENTION_DAYS 控制已完成/失败/取消的扫描、元数据、章节、弹幕和 STRM 探测任务历史保留天数（默认 14，0 表示停用周期清理）；`metadata_candidates` 中已拒绝/过期的候选也会一并分批清理。 内置 PostgreSQL 通过 `shared_preload_libraries=pg_stat_statements` 和 `pg_stat_statements.track=all` 预加载查询统计；启动后 Lux 会在后台尝试一次 `CREATE EXTENSION IF NOT EXISTS pg_stat_statements`，仅当服务器已预加载该库且业务库尚未安装时才执行；这个动作与 `LUX_DATABASE_MAINTENANCE` 无关，失败只记一条警告、不影响启动。该扩展不是 PostgreSQL 的受信任扩展，需要超级用户权限：官方 Compose 的 `postgres` profile 使用的账号是超级用户，会自动成功；外部或托管 PostgreSQL 若账号权限不足，需要管理员自行在业务库执行 `CREATE EXTENSION IF NOT EXISTS pg_stat_statements;`。服务器没有预加载时 Lux 不会创建（否则每次查询都会报错），需要先在 `postgresql.conf` 或启动命令里设置 `shared_preload_libraries=pg_stat_statements` 并重启 PostgreSQL。设置 `LUX_POSTGRES_QUERY_STATISTICS_EXTENSION=0`（也接受 `false`、`off`、`no`）可关闭自动创建，默认开启。扩展就绪后，管理员数据库诊断才会返回 `queryStatistics`。若运行 PostgreSQL 的容器使用较小的 `/dev/shm`，并行索引清理可能因共享内存不足失败，此时可对该容器设置 `shm_size`。
+
+符号链接媒体：扫描不会跟随未经许可的链接。文件链接总是解析到目标（链接名决定是否候选，目标决定大小、mtime 与身份）；目录链接由 `LUX_SYMLINK_POLICY` 决定是否进入——`none` 不进入，`root_children`（默认）只进入媒体根路径的直接子目录链接，`all` 允许任意层级的目录链接。解析后的目标必须落在所属媒体库根内，或用 `LUX_SYMLINK_TARGET_ROOTS`（冒号分隔的绝对路径）显式列出的目标根内，否则按不存在处理并记录告警。一次扫描中同一 `(设备, inode)` 目录只遍历一次，因此链接回指祖先不会形成循环，链接子树与真实子树也不会产生两份条目。删除源自链接的条目只删除链接本身，目标文件保留。需要把现有符号链接一次性转成 `.strm` 时，可使用 `python3 scripts/symlinks-to-strm.py --root /media/xxx` 先预览，确认后加 `--apply`。
 
 修改 Compose 中的该变量后需要重新创建容器，单纯执行 `docker restart lux` 不会更新容器环境变量：
 
@@ -119,6 +179,26 @@ docker inspect --format '{{range .Config.Env}}{{println .}}{{end}}' lux | grep -
 docker buildx bake --load --set app.tags=pdzhou/lux:latest app
 docker compose up -d --force-recreate lux
 ```
+
+后台“转码”页的设置只作用于实时播放的 HLS 转码（是否启用、编码器、并发、磁盘与画质）。缩略图与截图、媒体信息探测、章节检测等后台任务使用独立的 FFmpeg/FFprobe 预算（`LUX_FFMPEG_CONCURRENCY` 等），不受该开关影响。播放转码的并发上限、磁盘配额、码率与画质参数默认由管理员在后台“转码”页配置，保存在数据库 `server_settings.transcoding`，保存后对新建播放会话生效，正在播放的会话保持启动时的参数。两个部署级环境变量仍然优先于后台设置，用于设备/驱动相关的紧急覆盖：
+
+- `LUX_HLS_HW_ENCODER`：显式指定硬件编码器（`h264_nvenc`、`h264_qsv`、`h264_vaapi`、`h264_videotoolbox`）。设置后忽略后台选择的编码器；未设置时使用后台设置，后台为 `NONE` 时硬件档位不可用并降级为软件转码。
+- `LUX_HLS_GLOBAL_DISK_BUDGET_BYTES`：覆盖全局 HLS 磁盘预算；未设置时使用后台的“全局磁盘预算”（0 表示不限制）。
+
+转码临时目录位于配置目录下的 `web-playback/`，只保存当前会话的分片，会话停止、过期或服务重启后会回收。
+
+### 服务端 GPU 转码
+
+硬件编码默认关闭。选择编码器后，Lux 会在启动、保存设置和手动“重新检测”时用与真实转码相同的参数跑一次单帧自检：自检不通过时不会使用该编码器，播放自动走软件转码；硬件档启动失败或并发名额不足时，同一会话会自动降级为软件转码并更新会话档位，不再直接返回 502。自检只验证编码，不验证解码或 4K 实时能力。
+
+各家 GPU 的前置条件不同：
+
+- **Apple VideoToolbox**：仅 macOS 原生部署可用（Docker 运行在 Linux，无法使用 VideoToolbox）。
+- **NVIDIA NVENC**：宿主机需安装驱动与 `nvidia-container-toolkit`，并给容器启用 GPU（`gpus: all` 或 `runtime: nvidia`）；`compose.yaml` 已提供注释示例。驱动对并发 NVENC 会话有上限，建议把“硬件转码并发上限”保持在 2–4。
+- **Intel QSV / Intel/AMD VAAPI**：需要把 `/dev/dri` 映射进容器（`devices: - /dev/dri:/dev/dri`），且镜像内的 Jellyfin FFmpeg 能找到对应驱动。设备路径默认 `/dev/dri/renderD128`，多 GPU 或多渲染节点时可在后台改成实际节点。
+- 硬件解码默认关闭。开启后会在输入前加入厂商 `-hwaccel`；源编码不被 GPU 解码器支持时会失败并回退到软件档，生产环境建议先在后台用“重新检测”和一次实际播放确认。
+
+GPU 转码会占用宿主机 CPU 做解封装/音频编码；只开启 GPU 编码时，解码和缩放仍在 CPU。弱 NAS 上 4K HEVC 建议同时开启硬件解码并先用实际片源验证。
 
 IP 归属地解析使用内置的 Hiofd 协议字段，不需要额外配置；字段不会写入日志、数据库或 API。Hiofd 不可用时管理员仪表盘仍显示客户端 IP，但归属地为空。
 
@@ -192,6 +272,17 @@ docker compose up -d --force-recreate lux
 
 启动时会自动执行当前已选择数据库的 migrations；升级前应停止写入并同时保留 `/config` 与 `/media` 的宿主机目录。当前版本不提供应用内备份/恢复或跨数据库迁移工具，也不提供 SQLite 与 PostgreSQL 之间的数据迁移；正式 NAS 发布前必须由运维侧完成配置目录、媒体目录和（如使用）PostgreSQL 数据库的快照与恢复演练。
 
+### 数据库文件缺失时的启动保护
+
+首次成功启动后，Lux 会在配置目录写入 `server-state.json`（只有 `serverId` 与写入时间，不含凭据）。之后每次启动都会在打开数据库之前比较这两者：如果标记存在，但数据库文件缺失或其中没有 `lux_meta.server_id`，Lux 拒绝启动并打印恢复指引，而不会静默创建一个空库再跑一遍 migration。这条保护针对的正是「只恢复了 `/config`、数据卷没挂载、`lux.db` 被误删」这类故障；没有它，界面上会出现安装向导，看起来像一个新服务器，而真实数据仍在别处。
+
+处理方式：
+
+- 数据其实还在：把 `lux.db`（以及同一目录下的 `lux.db-wal`）恢复到原位置后重启。Lux 正常关闭时会截断 WAL，所以正常停止后拷贝 `lux.db` 单文件即可获得完整数据库。
+- 确实要从空库重新开始：先确认旧的数据库与备份都不再需要，删除 `/config/server-state.json` 后重启；Lux 会视为全新安装，重新生成 `serverId`，原有客户端令牌与设备绑定随之失效。
+
+标记文件损坏（非 JSON）时按「已初始化」处理并记录警告，宁可停机也不覆盖可能存在的真实数据。
+
 插件兼容性：runtime target 使用 Debian Trixie，以满足当前官方 Linux 插件包的 glibc 要求。只替换 `/config/plugins` 中的插件包不会升级容器运行时；升级到包含此修复的 Lux 镜像后，应重新创建容器并确认插件进程能够启动：
 
 ```bash
@@ -218,6 +309,22 @@ docker compose ps
 随后用真实客户端执行登录、媒体库列表、详情和一次 Range 播放。真实代理、NAS 7 天运行和发布签名仍需在目标环境单独记录，不能用本机 ARM64 结果替代。
 
 ## 本机故障注入
+
+下面这些脚本（`disk-write-fault-smoke.sh`、`mount-loss-smoke.sh`、`proxy-smoke.sh`、`probe-smoke.sh`、
+`restart-recovery-smoke.sh`）都按当前的初始化契约运行：
+
+- 全新的配置目录启动后处于**数据库选择**模式（`POST /setup/complete` 会返回 `409
+  DATABASE_CONFIGURATION_REQUIRED`），脚本先调用 `POST /api/v1/setup/database/select` 选定 SQLite。
+- `POST /api/v1/setup/complete` 成功后实例会**自己重启**（`docs/SETUP-RESTART-DESIGN.md`），脚本通过
+  `scripts/lib/wait-for-restart.sh` 观察一次连接失败再等到 `/health/ready` 恢复，而不是 `sleep` 猜时间。
+- 该重启会取消 setup 启动的首轮扫描并在重启后重排，所以脚本不再沿用 `201` 里的 `scanJob`（任务已取消；
+  `library.id` 不变）。需要自己发起或接管扫描的 4 个脚本——`mount-loss-smoke.sh`、`probe-smoke.sh`、
+  `proxy-smoke.sh`（各自 `POST .../reconcile`）与 `restart-recovery-smoke.sh`（接管重排后的任务）——都会先等
+  重排的首扫结束或先查到它，否则扫描端点会返回 `409`（已有任务运行）；`proxy-smoke.sh` 与其他脚本一样用
+  `lux_wait_for_first_scan_settled` 完成这一步。
+- `restart-recovery-smoke.sh` 因此验证的是当前的真实契约：对重排后的首扫执行 `kill -9` → 重启把该任务标为
+  `CANCELLED`/`SERVER_SHUTDOWN` → 启动恢复排入替换任务 → 替换任务完成并写入 `libraries.lastScanAt`。它不再
+  断言“同一个任务 ID 续跑”，因为没有通用的扫描续跑流程，任务会被替换。
 
 可以在本机 ARM64 Docker 环境用受限 tmpfs 演练 SQLite 写失败和恢复；脚本会创建临时管理员、填满 `/config`，验证 ready/管理员健康/新媒体库写入错误，再删除填充文件验证恢复：
 

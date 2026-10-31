@@ -282,22 +282,47 @@ pub(super) struct FileBatchWalker {
     directories: Vec<PathBuf>,
     current: Option<(PathBuf, fs::ReadDir)>,
     include_sidecars: bool,
+    canonical_root: PathBuf,
+}
+
+/// Resolves a walked link on a blocking thread.
+///
+/// The containment check canonicalizes the link target and reads its metadata, and a link may
+/// point anywhere — including a slow or unreachable network mount — so it must never run inline in
+/// the async walk. A link whose check cannot be completed is skipped, exactly like a link whose
+/// target cannot be resolved.
+async fn link_target_is_allowed(canonical_root: PathBuf, link_path: PathBuf) -> bool {
+    tokio::task::spawn_blocking(move || {
+        followed_symlink_file_is_allowed(&canonical_root, &link_path)
+    })
+    .await
+    .unwrap_or(false)
 }
 
 impl FileBatchWalker {
-    pub(super) fn new(root: &Path) -> Self {
+    /// Canonicalizes the root before the walk so symlink containment checks compare like with
+    /// like. An unresolvable root keeps its verbatim form, which then simply never matches.
+    async fn canonical_root(root: &Path) -> PathBuf {
+        fs::canonicalize(root)
+            .await
+            .unwrap_or_else(|_| root.to_owned())
+    }
+
+    pub(super) async fn new(root: &Path) -> Self {
         Self {
             directories: vec![root.to_owned()],
             current: None,
             include_sidecars: false,
+            canonical_root: Self::canonical_root(root).await,
         }
     }
 
-    pub(super) fn new_with_sidecars(root: &Path) -> Self {
+    pub(super) async fn new_with_sidecars(root: &Path) -> Self {
         Self {
             directories: vec![root.to_owned()],
             current: None,
             include_sidecars: true,
+            canonical_root: Self::canonical_root(root).await,
         }
     }
 
@@ -334,6 +359,18 @@ impl FileBatchWalker {
                         path: path.clone(),
                         source,
                     })?;
+                    if file_type.is_symlink() {
+                        let candidate = is_supported_movie_file(&path)
+                            || (self.include_sidecars
+                                && is_supported_incremental_sidecar_file(&path));
+                        if candidate
+                            && link_target_is_allowed(self.canonical_root.clone(), path.clone())
+                                .await
+                        {
+                            files.push(path);
+                        }
+                        continue;
+                    }
                     if file_type.is_file()
                         && (is_supported_movie_file(&path)
                             || (self.include_sidecars
@@ -486,7 +523,7 @@ impl LibraryScanner {
                     .update_library_root_availability(&root.id, true)
                     .await?;
             }
-            let mut walker = FileBatchWalker::new(&root_path);
+            let mut walker = FileBatchWalker::new(&root_path).await;
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 report.merge(
                     self.scan_movie_file_batch(
@@ -544,7 +581,7 @@ impl LibraryScanner {
                     .update_library_root_availability(&root.id, true)
                     .await?;
             }
-            let mut walker = FileBatchWalker::new(&root_path);
+            let mut walker = FileBatchWalker::new(&root_path).await;
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 let relative_paths = files
                     .iter()
@@ -697,7 +734,7 @@ impl LibraryScanner {
                     .update_library_root_availability(&root.id, true)
                     .await?;
             }
-            let mut walker = FileBatchWalker::new(&root_path);
+            let mut walker = FileBatchWalker::new(&root_path).await;
             while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
                 let relative_paths = files
                     .iter()
@@ -1732,7 +1769,7 @@ impl LibraryScanner {
 
         let generation = Uuid::now_v7().to_string();
         let mut report = ScanReport::default();
-        let mut walker = FileBatchWalker::new(&canonical_directory);
+        let mut walker = FileBatchWalker::new(&canonical_directory).await;
         while let Some(files) = walker.next_batch(FILE_BATCH_SIZE).await? {
             report.merge(
                 self.scan_movie_file_batch(

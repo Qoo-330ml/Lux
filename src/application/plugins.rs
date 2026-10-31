@@ -53,6 +53,7 @@ use crate::{
         plugin_runtime::{DiscoveredPlugin, PluginCatalog, PluginRuntimeError, PluginSupervisor},
         plugin_store::{
             PluginStore, PluginStoreEntry, PluginStoreError, PluginStoreIndex, is_newer_version,
+            merge_catalogs,
         },
         probe::{MediaProbeResult, MediaStreamResult, StreamType},
         schedule::{
@@ -82,6 +83,9 @@ const PLUGIN_CONFIG_DIR: &str = "plugin-config";
 const MEDIA_INFO_EXISTING_INFO_POLICY_KEY: &str = "existingInfoPolicy";
 const MEDIA_INFO_EXISTING_INFO_POLICY_SKIP: &str = "SKIP";
 const MEDIA_INFO_EXISTING_INFO_POLICY_OVERWRITE: &str = "OVERWRITE";
+/// Must exceed the plugin's own worst case (ffprobe 30s + duration ffprobe 30s + ffmpeg 60s) so the
+/// plugin reports its classified error instead of being killed mid-probe by the host.
+const MEDIA_PROBE_CALL_TIMEOUT: Duration = Duration::from_secs(130);
 const MAX_MEDIA_PROBE_THUMBNAIL_BYTES: usize = 8 * 1024 * 1024;
 pub const DEFAULT_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 30;
 pub const MIN_STRM_THUMBNAIL_POSITION_PERCENT: i64 = 1;
@@ -194,9 +198,11 @@ impl PluginService {
         let catalog = Arc::new(RwLock::new(PluginCatalog::discover(
             &config_dir.join("plugins"),
         )));
+        let proxy_bypass = crate::application::settings::read_plugin_proxy_bypass(&config_dir);
         let supervisor = PluginSupervisor::new_with_shared_catalog(catalog.clone())
             .with_config_dir(config_dir.clone())
-            .with_network_proxy_url(proxy_url.clone());
+            .with_network_proxy_url(proxy_url.clone())
+            .with_proxy_bypass(proxy_bypass);
         let store = PluginStore::new(config_dir.clone(), proxy_url).ok();
         Self {
             database,
@@ -2210,7 +2216,7 @@ impl PluginService {
         }
         let value = self
             .supervisor
-            .call_isolated(
+            .call_isolated_with_timeout(
                 MEDIA_INFO_PLUGIN_ID,
                 "media.probe",
                 serde_json::json!({
@@ -2219,6 +2225,7 @@ impl PluginService {
                     "includeThumbnail": include_thumbnail,
                     "thumbnailPositionPercent": thumbnail_position_percent,
                 }),
+                MEDIA_PROBE_CALL_TIMEOUT,
             )
             .await
             .map_err(PluginServiceError::Runtime)?;
@@ -2355,23 +2362,23 @@ impl PluginService {
         self.supervisor.stop_all().await;
     }
 
-    pub async fn plugin_store_source(&self) -> String {
+    pub async fn plugin_store_sources(&self) -> Vec<String> {
         if let Some(store) = self.store.as_ref() {
-            store.source().await
+            store.sources().await
         } else {
-            crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL.to_owned()
+            vec![crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL.to_owned()]
         }
     }
 
-    pub async fn update_plugin_store_source(
+    pub async fn update_plugin_store_sources(
         &self,
-        source: &str,
-    ) -> Result<String, PluginServiceError> {
+        sources: &[String],
+    ) -> Result<Vec<String>, PluginServiceError> {
         let Some(store) = self.store.as_ref() else {
             return Err(PluginServiceError::Store(PluginStoreError::InvalidSource));
         };
         store
-            .save_source(source)
+            .save_sources(sources)
             .await
             .map_err(PluginServiceError::Store)
     }
@@ -2387,20 +2394,26 @@ impl PluginService {
                 plugins: Vec::new(),
             };
         };
-        let source = store.source().await;
-        match store.fetch_catalog().await {
-            Ok(index) => index,
-            Err(_) if source == crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL => {
-                PluginStore::default_index().unwrap_or(PluginStoreIndex {
-                    format_version: 1,
-                    plugins: Vec::new(),
-                })
+        let results = store.fetch_catalogs().await;
+        let total = results.len();
+        let mut failed = 0;
+        let mut catalogs = Vec::with_capacity(total);
+        for (source, result) in results {
+            match result {
+                Ok(index) => catalogs.push(index),
+                Err(_) if source == crate::application::plugin_store::DEFAULT_PLUGIN_STORE_URL => {
+                    failed += 1;
+                    if let Ok(index) = PluginStore::default_index() {
+                        catalogs.push(index);
+                    }
+                }
+                Err(_) => failed += 1,
             }
-            Err(_) => PluginStoreIndex {
-                format_version: 1,
-                plugins: Vec::new(),
-            },
         }
+        if failed > 0 {
+            tracing::warn!(failed, total, "plugin store catalog fetch failed");
+        }
+        merge_catalogs(catalogs)
     }
 
     async fn install_remote_package(
@@ -2492,7 +2505,12 @@ impl PluginService {
             .map_err(PluginServiceError::ConfigIo)?
         {
             let path = entry_result.path();
-            if path.is_file()
+            // `Path::is_file` resolves links and turns errors into `false`; mirror both instead of
+            // using the dirent type, which would not resolve a linked archive.
+            let is_file = fs::metadata(&path)
+                .await
+                .is_ok_and(|metadata| metadata.is_file());
+            if is_file
                 && path.extension().is_some_and(|extension| extension == "zip")
                 && path
                     .file_name()

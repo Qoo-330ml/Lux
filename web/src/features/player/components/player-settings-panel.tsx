@@ -12,6 +12,7 @@ import type {
   PlayerFlip,
   PlayerVideoPresentation,
 } from "./player-presentation";
+import { LuxSelectField } from "../../../components/ui";
 
 type PlayerPresentationSettings = PlayerVideoPresentation & {
   onToggleLoop: () => void;
@@ -94,7 +95,7 @@ export function PlayerSettingsPanel({
       {sources.length > 0 ? (
         <div className="lux-player-settings-section">
           <label className="lux-player-settings-label" htmlFor="lux-player-source-select">播放版本</label>
-          <select
+          <LuxSelectField
             id="lux-player-source-select"
             className="lux-player-caption-select"
             aria-label="选择播放版本"
@@ -107,7 +108,7 @@ export function PlayerSettingsPanel({
                 {source.label} ({source.detail})
               </option>
             ))}
-          </select>
+          </LuxSelectField>
         </div>
       ) : null}
       <div className="lux-player-settings-section">
@@ -179,7 +180,7 @@ export function PlayerSettingsPanel({
       ) : null}
       <div className="lux-player-settings-section">
         <label className="lux-player-settings-label" htmlFor="lux-player-caption-select">字幕</label>
-        <select
+        <LuxSelectField
           id="lux-player-caption-select"
           className="lux-player-caption-select"
           aria-label="选择字幕"
@@ -201,7 +202,7 @@ export function PlayerSettingsPanel({
                 : caption.label}
             </option>
           ))}
-        </select>
+        </LuxSelectField>
         {captionHelp ? <p className="lux-player-caption-status" role="status">{captionHelp}</p> : null}
       </div>
       <div className="lux-player-settings-section">

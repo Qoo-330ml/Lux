@@ -55,7 +55,9 @@ describe("AdminUserDetailPage account preferences", () => {
     expect(panel?.textContent).toContain("海蓝");
     expect(panel?.textContent).toContain("首页");
     expect(panel?.textContent).toContain("隐藏");
-    expect(panel?.textContent).toContain("电影");
+    await act(async () => {
+      await vi.waitFor(() => expect(panel?.textContent).toContain("电影"));
+    });
     expect(panel?.textContent).toContain("剧集");
     expect(panel?.textContent).toContain("播放");
     expect(panel?.textContent).toContain("日语");

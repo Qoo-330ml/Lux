@@ -87,14 +87,10 @@ impl Database {
             for item_id in batch {
                 query = query.bind(item_id);
             }
-            for row in
-                query
-                    .fetch_all(&mut *transaction)
-                    .await
-                    .map_err(|source| StorageError::Sqlx {
-                        path: self.path.clone(),
-                        source,
-                    })?
+            for row in query
+                .fetch_all(&mut *transaction)
+                .await
+                .map_err(self.sqlx_err())?
             {
                 let id: String = row.get("id");
                 roots_by_id.insert(
@@ -139,8 +135,8 @@ impl Database {
         .await?;
 
         if primary.item_type == "MOVIE" {
-            let primary_has_default =
-                self.query_scalar::<i64>(
+            let primary_has_default = self
+                .query_scalar::<i64>(
                     // PostgreSQL returns BOOLEAN for a bare `SELECT EXISTS`, which does not decode
                     // as i64 (SQLite returns an integer); the CASE keeps one portable 0/1 value.
                     "SELECT CAST(CASE WHEN EXISTS (
@@ -151,10 +147,8 @@ impl Database {
                 .bind(primary_item_id)
                 .fetch_one(&mut *transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })? != 0;
+                .map_err(self.sqlx_err())?
+                != 0;
             self.merge_movie_sources_in_transaction(
                 &mut transaction,
                 &merged_item_ids,
@@ -195,13 +189,7 @@ impl Database {
             }
         }
 
-        transaction
-            .commit()
-            .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(StoredMediaMerge {
             primary_item_id: primary_item_id.to_owned(),
             library_id: primary.library_id.clone(),
@@ -228,10 +216,7 @@ impl Database {
         .bind(source_item_id)
         .execute(&mut **transaction)
         .await
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })?;
+        .map_err(self.sqlx_err())?;
         self.normalize_default_source_in_transaction(transaction, target_item_id)
             .await
     }
@@ -261,10 +246,7 @@ impl Database {
         query
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         self.normalize_default_source_in_transaction(transaction, target_item_id)
             .await
     }
@@ -291,10 +273,7 @@ impl Database {
             .execute(&mut **transaction)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 
     pub(super) async fn normalize_default_source_in_transaction(
@@ -318,10 +297,7 @@ impl Database {
         .execute(&mut **transaction)
         .await
         .map(|_| ())
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn merge_series_in_transaction(
@@ -380,10 +356,7 @@ impl Database {
             .bind(&source_season.id)
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
 
             let target_episodes = episodes_by_season
                 .get(&target_season_id)
@@ -521,10 +494,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         self.normalize_default_sources_in_transaction(transaction, &target_ids)
             .await
@@ -556,10 +526,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -609,10 +576,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
 
             let mut delete = self.query(sqlx::AssertSqlSafe(format!(
                 "DELETE FROM user_item_state WHERE item_id IN ({source_placeholders})"
@@ -623,10 +587,7 @@ impl Database {
             delete
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -663,10 +624,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -709,10 +667,7 @@ impl Database {
             query
                 .execute(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?;
+                .map_err(self.sqlx_err())?;
         }
         Ok(())
     }
@@ -743,10 +698,7 @@ impl Database {
                 })
                 .collect()
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn list_series_episodes_by_season_in_transaction(
@@ -790,10 +742,7 @@ impl Database {
             }
             episodes_by_season
         })
-        .map_err(|source| StorageError::Sqlx {
-            path: self.path.clone(),
-            source,
-        })
+        .map_err(self.sqlx_err())
     }
 
     async fn merge_user_item_state_in_transaction(
@@ -846,10 +795,7 @@ impl Database {
         query
             .execute(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?;
+            .map_err(self.sqlx_err())?;
         let placeholders = std::iter::repeat_n("?", source_item_ids.len())
             .collect::<Vec<_>>()
             .join(", ");
@@ -863,10 +809,7 @@ impl Database {
             .execute(&mut **transaction)
             .await
             .map(|_| ())
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })
+            .map_err(self.sqlx_err())
     }
 }
 

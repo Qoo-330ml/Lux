@@ -43,10 +43,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         } else if matches!(workflow_version, 2 | 3) && discovery_format_version == 3 {
             self.query_scalar(
                 "SELECT CASE WHEN EXISTS (
@@ -113,10 +110,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         } else if matches!(workflow_version, 2 | 3) {
             self.query_scalar(
                 "SELECT CASE WHEN EXISTS (
@@ -148,10 +142,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         } else {
             self.query_scalar(
                 "SELECT CASE WHEN EXISTS (
@@ -214,10 +205,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         };
         Ok(has_remaining_changes != 0)
     }
@@ -233,10 +221,7 @@ impl Database {
                 .bind(manifest_id)
                 .fetch_one(&mut **transaction)
                 .await
-                .map_err(|source| StorageError::Sqlx {
-                    path: self.path.clone(),
-                    source,
-                })?
+                .map_err(self.sqlx_err())?
         } else {
             self.query_scalar(
                 "SELECT COUNT(*)
@@ -266,10 +251,7 @@ impl Database {
             .bind(manifest_id)
             .fetch_one(&mut **transaction)
             .await
-            .map_err(|source| StorageError::Sqlx {
-                path: self.path.clone(),
-                source,
-            })?
+            .map_err(self.sqlx_err())?
         };
         Ok(unchanged_count)
     }
