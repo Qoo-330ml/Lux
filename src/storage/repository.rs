@@ -113,6 +113,7 @@ mod migration;
 mod notifications;
 #[path = "people.rs"]
 mod people;
+pub(crate) use people::CanonicalPersonBatch;
 #[path = "sessions.rs"]
 mod sessions;
 #[path = "user_mail_flows.rs"]
@@ -765,6 +766,11 @@ pub struct Database {
     mail_outbox_appended: Arc<tokio::sync::Notify>,
     #[cfg(test)]
     query_count: Arc<AtomicUsize>,
+    /// Commits are the metric the write-path performance work records
+    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2), so tests count the transactions
+    /// that a path opens directly instead of inferring them from statement counts.
+    #[cfg(test)]
+    metadata_write_transactions: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -1420,6 +1426,8 @@ impl Database {
             mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
             query_count: Arc::new(AtomicUsize::new(0)),
+            #[cfg(test)]
+            metadata_write_transactions: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1479,6 +1487,9 @@ impl Database {
     async fn begin_metadata_write_transaction(
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
+        #[cfg(test)]
+        self.metadata_write_transactions
+            .fetch_add(1, AtomicOrdering::Relaxed);
         let transaction = if self.backend == DatabaseBackend::Sqlite {
             self.pool.begin_with("BEGIN IMMEDIATE").await
         } else {
@@ -1910,6 +1921,23 @@ impl Database {
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
         self.query_count.load(AtomicOrdering::Relaxed)
+    }
+
+    /// How many metadata write transactions this database started (test-only).
+    ///
+    /// Write-path batches are judged by commit count, not statement count (see
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2): a path that keeps a page in one
+    /// transaction leaves this number flat while the number of actors grows.
+    #[cfg(test)]
+    pub(crate) fn metadata_write_transaction_count(&self) -> usize {
+        self.metadata_write_transactions
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reset_metadata_write_transaction_count(&self) {
+        self.metadata_write_transactions
+            .store(0, AtomicOrdering::Relaxed);
     }
 
     /// The change counters that the playback access cache stamps its entries with.

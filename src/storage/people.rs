@@ -4,6 +4,38 @@ const PERSON_MANIFEST_IDENTITY_BATCH_SIZE: usize = 100;
 const PERSON_MANIFEST_STATE_QUERY_BATCH_SIZE: usize = 100;
 const PERSON_CREDIT_REPLACEMENT_BATCH_SIZE: usize = 16;
 
+/// The identity a new canonical person is resolved for.
+///
+/// The batched page and the single-person entry point pass the same request shape; keeping it in a
+/// struct keeps the `_in_transaction` helpers within clippy's argument budget.
+#[derive(Clone, Copy)]
+pub(crate) struct CanonicalPersonRequest<'a> {
+    pub(crate) display_name: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) provider_id: &'a str,
+    pub(crate) match_method: &'a str,
+    pub(crate) confidence: Option<f64>,
+    pub(crate) evidence_json: &'a str,
+}
+
+/// One `person_match_candidates` upsert.
+#[derive(Clone, Copy)]
+pub(crate) struct PersonMatchCandidateRequest<'a> {
+    pub(crate) item_id: &'a str,
+    pub(crate) provider: &'a str,
+    pub(crate) provider_id: &'a str,
+    pub(crate) candidate_person_ids_json: &'a str,
+    pub(crate) score: Option<f64>,
+    pub(crate) evidence_json: &'a str,
+}
+
+/// Shared by the pooled and the batched person-match-candidate reads so both see the same row.
+const FIND_PERSON_MATCH_CANDIDATE_SQL: &str = "SELECT id, item_id, provider, provider_id,
+            candidate_person_ids_json, status, score,
+            evidence_json, target_person_id, previous_person_id,
+            created_at, updated_at
+     FROM person_match_candidates WHERE id = ?";
+
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct PersonCreditKey {
     person_id: String,
@@ -19,6 +51,42 @@ fn person_credit_key(credit: &NewPersonCredit) -> PersonCreditKey {
         provider: credit.provider.clone(),
         role: credit.role.clone(),
     }
+}
+
+/// Groups `people LEFT JOIN person_credits` rows into one match per canonical person.
+///
+/// Rows of the normalized-name lookup come ordered by `p.id, pc.birthday`, so a person with
+/// several credited birthdays spans several rows. Names that only normalize to the requested key
+/// are dropped, exactly like the SQL predicate intends.
+fn canonical_people_matches_by_normalized_name(
+    rows: Vec<sqlx::any::AnyRow>,
+    normalized_name: &str,
+) -> Vec<StoredCanonicalPersonMatch> {
+    let mut matches = Vec::<StoredCanonicalPersonMatch>::new();
+    for row in rows {
+        let id: String = row.get("id");
+        let display_name: String = row.get("display_name");
+        if normalize_person_name(&display_name) != normalized_name {
+            continue;
+        }
+        let birthday: Option<String> = row.try_get("birthday").ok();
+        if let Some(existing) = matches.iter_mut().find(|candidate| candidate.id == id) {
+            if let Some(birthday) = birthday.filter(|value| !value.trim().is_empty())
+                && !existing.birthdays.iter().any(|value| value == &birthday)
+            {
+                existing.birthdays.push(birthday);
+            }
+        } else {
+            matches.push(StoredCanonicalPersonMatch {
+                id,
+                birthdays: birthday
+                    .filter(|value| !value.trim().is_empty())
+                    .into_iter()
+                    .collect(),
+            });
+        }
+    }
+    matches
 }
 
 fn sql_value_changed(left: &str, right: &str) -> String {
@@ -618,8 +686,49 @@ impl Database {
         confidence: Option<f64>,
         evidence_json: &str,
     ) -> Result<StoredCanonicalPerson, StorageError> {
-        let now = current_unix_timestamp();
         let mut transaction = self.begin_metadata_write_transaction().await?;
+        let request = CanonicalPersonRequest {
+            display_name,
+            provider,
+            provider_id,
+            match_method,
+            confidence,
+            evidence_json,
+        };
+        let result = self
+            .resolve_or_create_canonical_person_in_transaction(&mut transaction, &request)
+            .await;
+        match result {
+            Ok(person) => {
+                transaction.commit().await.map_err(self.sqlx_err())?;
+                Ok(person)
+            }
+            Err(error) => {
+                Self::rollback_write_transaction(transaction, "resolve_or_create_canonical_person")
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    /// Resolves one canonical person inside a caller-owned transaction.
+    ///
+    /// [`CanonicalPersonBatch`] uses this to resolve a whole actor page in one commit; the
+    /// standalone wrapper above is the single-person entry point.
+    async fn resolve_or_create_canonical_person_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        request: &CanonicalPersonRequest<'_>,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let CanonicalPersonRequest {
+            display_name,
+            provider,
+            provider_id,
+            match_method,
+            confidence,
+            evidence_json,
+        } = *request;
+        let now = current_unix_timestamp();
 
         if let Some(person) = self
             .query(
@@ -630,26 +739,24 @@ impl Database {
             )
             .bind(provider)
             .bind(provider_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?
         {
-            let stored = stored_canonical_person(person).map_err(self.sqlx_err())?;
-            transaction.commit().await.map_err(self.sqlx_err())?;
-            return Ok(stored);
+            return stored_canonical_person(person).map_err(self.sqlx_err());
         }
 
         let person_id = loop {
             let sequence: i64 = self
                 .query_scalar("INSERT INTO person_id_sequence DEFAULT VALUES RETURNING id")
-                .fetch_one(&mut *transaction)
+                .fetch_one(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
             let candidate = format!("lux-{sequence:06}");
             let exists: Option<i64> = self
                 .query_scalar("SELECT 1 FROM people WHERE id = ?")
                 .bind(&candidate)
-                .fetch_optional(&mut *transaction)
+                .fetch_optional(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
             if exists.is_none() {
@@ -667,7 +774,7 @@ impl Database {
         .bind(normalize_person_name(display_name))
         .bind(now)
         .bind(now)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(self.sqlx_err())?;
         self.query(
@@ -685,7 +792,7 @@ impl Database {
         .bind(evidence_json)
         .bind(now)
         .bind(now)
-        .execute(&mut *transaction)
+        .execute(&mut **transaction)
         .await
         .map_err(self.sqlx_err())?;
 
@@ -698,18 +805,17 @@ impl Database {
             )
             .bind(provider)
             .bind(provider_id)
-            .fetch_one(&mut *transaction)
+            .fetch_one(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?;
         let stored = stored_canonical_person(person).map_err(self.sqlx_err())?;
         if stored.id != person_id {
             self.query("DELETE FROM people WHERE id = ?")
                 .bind(&person_id)
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
         }
-        transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(stored)
     }
 
@@ -802,31 +908,34 @@ impl Database {
             .fetch_all(&self.pool)
             .await
             .map_err(self.sqlx_err())?;
-        let mut matches = Vec::<StoredCanonicalPersonMatch>::new();
-        for row in rows {
-            let id: String = row.get("id");
-            let display_name: String = row.get("display_name");
-            if normalize_person_name(&display_name) != normalized_name {
-                continue;
-            }
-            let birthday: Option<String> = row.try_get("birthday").ok();
-            if let Some(existing) = matches.iter_mut().find(|candidate| candidate.id == id) {
-                if let Some(birthday) = birthday.filter(|value| !value.trim().is_empty())
-                    && !existing.birthdays.iter().any(|value| value == &birthday)
-                {
-                    existing.birthdays.push(birthday);
-                }
-            } else {
-                matches.push(StoredCanonicalPersonMatch {
-                    id,
-                    birthdays: birthday
-                        .filter(|value| !value.trim().is_empty())
-                        .into_iter()
-                        .collect(),
-                });
-            }
-        }
-        Ok(matches)
+        Ok(canonical_people_matches_by_normalized_name(
+            rows,
+            normalized_name,
+        ))
+    }
+
+    async fn list_canonical_people_by_normalized_name_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        normalized_name: &str,
+    ) -> Result<Vec<StoredCanonicalPersonMatch>, StorageError> {
+        let rows = self
+            .query(
+                "SELECT p.id, p.display_name, pc.birthday
+                 FROM people p
+                 LEFT JOIN person_credits pc
+                   ON pc.lux_person_id = p.id AND pc.person_type = 'Actor'
+                 WHERE p.status = 'ACTIVE' AND p.normalized_name = ?
+                 ORDER BY p.id, pc.birthday",
+            )
+            .bind(normalized_name)
+            .fetch_all(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(canonical_people_matches_by_normalized_name(
+            rows,
+            normalized_name,
+        ))
     }
 
     pub(crate) async fn enqueue_person_match_candidate(
@@ -838,6 +947,44 @@ impl Database {
         score: Option<f64>,
         evidence_json: &str,
     ) -> Result<String, StorageError> {
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let request = PersonMatchCandidateRequest {
+            item_id,
+            provider,
+            provider_id,
+            candidate_person_ids_json,
+            score,
+            evidence_json,
+        };
+        let result = self
+            .enqueue_person_match_candidate_in_transaction(&mut transaction, &request)
+            .await;
+        match result {
+            Ok(candidate_id) => {
+                transaction.commit().await.map_err(self.sqlx_err())?;
+                Ok(candidate_id)
+            }
+            Err(error) => {
+                Self::rollback_write_transaction(transaction, "enqueue_person_match_candidate")
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn enqueue_person_match_candidate_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        request: &PersonMatchCandidateRequest<'_>,
+    ) -> Result<String, StorageError> {
+        let PersonMatchCandidateRequest {
+            item_id,
+            provider,
+            provider_id,
+            candidate_person_ids_json,
+            score,
+            evidence_json,
+        } = *request;
         let now = current_unix_timestamp();
         let candidate_id = Uuid::now_v7().to_string();
         self.query(
@@ -865,7 +1012,7 @@ impl Database {
         .bind(evidence_json)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut **transaction)
         .await
         .map_err(self.sqlx_err())?;
         self.query_scalar::<String>(
@@ -875,7 +1022,7 @@ impl Database {
         .bind(item_id)
         .bind(provider)
         .bind(provider_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut **transaction)
         .await
         .map_err(self.sqlx_err())
     }
@@ -973,20 +1120,29 @@ impl Database {
         &self,
         candidate_id: &str,
     ) -> Result<Option<StoredPersonMatchCandidate>, StorageError> {
-        self.query(
-            "SELECT id, item_id, provider, provider_id,
-                    candidate_person_ids_json, status, score,
-                    evidence_json, target_person_id, previous_person_id,
-                    created_at, updated_at
-             FROM person_match_candidates WHERE id = ?",
-        )
-        .bind(candidate_id)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(self.sqlx_err())?
-        .map(stored_person_match_candidate)
-        .transpose()
-        .map_err(self.sqlx_err())
+        self.query(FIND_PERSON_MATCH_CANDIDATE_SQL)
+            .bind(candidate_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .map(stored_person_match_candidate)
+            .transpose()
+            .map_err(self.sqlx_err())
+    }
+
+    async fn find_person_match_candidate_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        candidate_id: &str,
+    ) -> Result<Option<StoredPersonMatchCandidate>, StorageError> {
+        self.query(FIND_PERSON_MATCH_CANDIDATE_SQL)
+            .bind(candidate_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?
+            .map(stored_person_match_candidate)
+            .transpose()
+            .map_err(self.sqlx_err())
     }
 
     pub(crate) async fn reject_person_match_candidate(
@@ -1717,13 +1873,45 @@ impl Database {
         confidence: Option<f64>,
         evidence_json: &str,
     ) -> Result<StoredCanonicalPerson, StorageError> {
+        let mut transaction = self.begin_metadata_write_transaction().await?;
+        let result = self
+            .attach_canonical_person_identities_in_transaction(
+                &mut transaction,
+                person_id,
+                identities,
+                match_method,
+                confidence,
+                evidence_json,
+            )
+            .await;
+        match result {
+            Ok(person) => {
+                transaction.commit().await.map_err(self.sqlx_err())?;
+                Ok(person)
+            }
+            Err(error) => {
+                Self::rollback_write_transaction(transaction, "attach_canonical_person_identities")
+                    .await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn attach_canonical_person_identities_in_transaction(
+        &self,
+        transaction: &mut sqlx::Transaction<'_, Any>,
+        person_id: &str,
+        identities: &[(String, String)],
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
         const IDENTITY_INSERT_CHUNK_SIZE: usize = 100;
         let now = current_unix_timestamp();
-        let mut transaction = self.begin_metadata_write_transaction().await?;
         let person = self
             .query("SELECT id FROM people WHERE id = ?")
             .bind(person_id)
-            .fetch_optional(&mut *transaction)
+            .fetch_optional(&mut **transaction)
             .await
             .map_err(self.sqlx_err())?
             .ok_or_else(|| {
@@ -1756,7 +1944,7 @@ impl Database {
                     .bind(now);
             }
             statement
-                .execute(&mut *transaction)
+                .execute(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
         }
@@ -1778,7 +1966,7 @@ impl Database {
                 statement = statement.bind(provider).bind(provider_id);
             }
             let rows = statement
-                .fetch_all(&mut *transaction)
+                .fetch_all(&mut **transaction)
                 .await
                 .map_err(self.sqlx_err())?;
             owners.extend(rows.into_iter().map(|row| {
@@ -1802,7 +1990,6 @@ impl Database {
             }
         }
 
-        transaction.commit().await.map_err(self.sqlx_err())?;
         stored_canonical_person(person).map_err(self.sqlx_err())
     }
 
@@ -2374,5 +2561,193 @@ impl Database {
         .fetch_one(&self.pool)
         .await
         .map_err(self.sqlx_err())
+    }
+}
+
+/// One write transaction that resolves a whole actor page.
+///
+/// `src/application/people/relations.rs` used to open a transaction per actor
+/// (`resolve_or_create_canonical_person`, plus a second one when the actor carried identities that
+/// were not attached yet), so a 100-actor entry took the SQLite write lock and committed up to 200
+/// times (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md`, M2). The batch keeps one transaction
+/// for the page. Every write still runs inside its own savepoint, so a failed storage call undoes
+/// exactly the statements it issued - the recovery the per-call transactions provided - and the
+/// actors resolved before the failure can still be committed before the error is reported.
+pub(crate) struct CanonicalPersonBatch<'a> {
+    database: &'a Database,
+    transaction: sqlx::Transaction<'a, Any>,
+    savepoints: u64,
+}
+
+impl Database {
+    /// Starts the actor-page transaction behind [`CanonicalPersonBatch`].
+    pub(crate) async fn begin_canonical_person_batch(
+        &self,
+    ) -> Result<CanonicalPersonBatch<'_>, StorageError> {
+        Ok(CanonicalPersonBatch {
+            database: self,
+            transaction: self.begin_metadata_write_transaction().await?,
+            savepoints: 0,
+        })
+    }
+}
+
+impl CanonicalPersonBatch<'_> {
+    pub(crate) async fn resolve_or_create(
+        &mut self,
+        display_name: &str,
+        provider: &str,
+        provider_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let savepoint = self.open_savepoint().await?;
+        let request = CanonicalPersonRequest {
+            display_name,
+            provider,
+            provider_id,
+            match_method,
+            confidence,
+            evidence_json,
+        };
+        let result = self
+            .database
+            .resolve_or_create_canonical_person_in_transaction(&mut self.transaction, &request)
+            .await;
+        self.finish_savepoint(&savepoint, result).await
+    }
+
+    pub(crate) async fn attach_identities(
+        &mut self,
+        person_id: &str,
+        identities: &[(String, String)],
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        let savepoint = self.open_savepoint().await?;
+        let result = self
+            .database
+            .attach_canonical_person_identities_in_transaction(
+                &mut self.transaction,
+                person_id,
+                identities,
+                match_method,
+                confidence,
+                evidence_json,
+            )
+            .await;
+        self.finish_savepoint(&savepoint, result).await
+    }
+
+    pub(crate) async fn enqueue_match_candidate(
+        &mut self,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        candidate_person_ids_json: &str,
+        score: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<String, StorageError> {
+        let savepoint = self.open_savepoint().await?;
+        let request = PersonMatchCandidateRequest {
+            item_id,
+            provider,
+            provider_id,
+            candidate_person_ids_json,
+            score,
+            evidence_json,
+        };
+        let result = self
+            .database
+            .enqueue_person_match_candidate_in_transaction(&mut self.transaction, &request)
+            .await;
+        self.finish_savepoint(&savepoint, result).await
+    }
+
+    /// Reads the name candidates inside the batch transaction.
+    ///
+    /// The actor page may have created a person moments ago, so this must see the transaction's
+    /// own writes - a pooled read would see the pre-batch snapshot.
+    pub(crate) async fn list_people_by_normalized_name(
+        &mut self,
+        normalized_name: &str,
+    ) -> Result<Vec<StoredCanonicalPersonMatch>, StorageError> {
+        self.database
+            .list_canonical_people_by_normalized_name_in_transaction(
+                &mut self.transaction,
+                normalized_name,
+            )
+            .await
+    }
+
+    pub(crate) async fn find_match_candidate(
+        &mut self,
+        candidate_id: &str,
+    ) -> Result<Option<StoredPersonMatchCandidate>, StorageError> {
+        self.database
+            .find_person_match_candidate_in_transaction(&mut self.transaction, candidate_id)
+            .await
+    }
+
+    /// Commits the whole page.
+    ///
+    /// Call it even after an actor failed: the actors resolved before the failure are only kept if
+    /// this commits, which is what the per-actor transactions did.
+    pub(crate) async fn commit(self) -> Result<(), StorageError> {
+        let Self {
+            database,
+            transaction,
+            ..
+        } = self;
+        transaction.commit().await.map_err(database.sqlx_err())
+    }
+
+    async fn open_savepoint(&mut self) -> Result<String, StorageError> {
+        self.savepoints += 1;
+        let savepoint = format!("canonical_person_{}", self.savepoints);
+        self.control_statement(format!("SAVEPOINT {savepoint}"))
+            .await?;
+        Ok(savepoint)
+    }
+
+    async fn finish_savepoint<T>(
+        &mut self,
+        savepoint: &str,
+        result: Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        match result {
+            Ok(value) => {
+                self.control_statement(format!("RELEASE SAVEPOINT {savepoint}"))
+                    .await?;
+                Ok(value)
+            }
+            Err(error) => {
+                if let Err(savepoint_error) = self
+                    .control_statement(format!("ROLLBACK TO SAVEPOINT {savepoint}"))
+                    .await
+                {
+                    tracing::warn!(
+                        %error,
+                        %savepoint_error,
+                        "could not roll back a batched canonical-person write"
+                    );
+                    return Err(savepoint_error);
+                }
+                self.control_statement(format!("RELEASE SAVEPOINT {savepoint}"))
+                    .await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn control_statement(&mut self, statement: String) -> Result<(), StorageError> {
+        self.database
+            .query(sqlx::AssertSqlSafe(statement))
+            .execute(&mut *self.transaction)
+            .await
+            .map_err(self.database.sqlx_err())?;
+        Ok(())
     }
 }

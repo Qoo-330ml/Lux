@@ -842,8 +842,8 @@ pub use repository::{
 #[allow(unused_imports)]
 pub(crate) use repository::{
     AdminUserSortField, AdminUserStatusFilter, AuthCacheEpochSnapshot, AuthCacheEpochs,
-    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, CatalogFilterQuery, CatalogSort,
-    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, CanonicalPersonBatch, CatalogFilterQuery,
+    CatalogSort, ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
     DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
     DEFAULT_PLAYED_PERCENT, DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult,
     EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,
