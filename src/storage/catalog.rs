@@ -529,6 +529,51 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of the `media_chapters` half of `list_media_chapters_by_source_ids`: the detected intro
+/// and credits markers of one source.
+#[derive(Debug, sqlx::FromRow)]
+struct MediaChapterRow {
+    media_source_id: String,
+    start_position_ticks: i64,
+    name: Option<String>,
+    marker_type: String,
+    chapter_index: i64,
+}
+
+impl From<MediaChapterRow> for StoredMediaChapter {
+    fn from(row: MediaChapterRow) -> Self {
+        Self {
+            source_id: row.media_source_id,
+            start_position_ticks: row.start_position_ticks,
+            name: row.name,
+            marker_type: row.marker_type,
+            chapter_index: row.chapter_index,
+        }
+    }
+}
+
+/// Row of the `media_info_chapters` half of `list_media_chapters_by_source_ids`: the probed
+/// chapters of one source, which are always reported with the `CHAPTER` marker type.
+#[derive(Debug, sqlx::FromRow)]
+struct MediaInfoChapterRow {
+    media_source_id: String,
+    start_position_ticks: i64,
+    name: Option<String>,
+    chapter_index: i64,
+}
+
+impl From<MediaInfoChapterRow> for StoredMediaChapter {
+    fn from(row: MediaInfoChapterRow) -> Self {
+        Self {
+            source_id: row.media_source_id,
+            start_position_ticks: row.start_position_ticks,
+            name: row.name,
+            marker_type: "CHAPTER".to_owned(),
+            chapter_index: row.chapter_index,
+        }
+    }
+}
+
 /// Row of `count_catalog_root_items_by_library`: the root MOVIE/SERIES counts of one library.
 #[derive(Debug, sqlx::FromRow)]
 struct LibraryCatalogCountRow {
@@ -3560,7 +3605,7 @@ impl Database {
                           END,
                           chapter_index, mc.id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<MediaChapterRow>(sqlx::AssertSqlSafe(query));
             for source_id in source_ids {
                 statement = statement.bind(source_id);
             }
@@ -3569,17 +3614,10 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let source_id: String = row.get("media_source_id");
                 chapters
-                    .entry(source_id.clone())
+                    .entry(row.media_source_id.clone())
                     .or_default()
-                    .push(StoredMediaChapter {
-                        source_id,
-                        start_position_ticks: row.get("start_position_ticks"),
-                        name: row.get("name"),
-                        marker_type: row.get("marker_type"),
-                        chapter_index: row.get("chapter_index"),
-                    });
+                    .push(StoredMediaChapter::from(row));
             }
         }
         for source_ids in source_ids.chunks(500) {
@@ -3594,7 +3632,7 @@ impl Database {
                  FROM media_info_chapters WHERE media_source_id IN ({placeholders})
                  ORDER BY media_source_id, start_position_ticks, chapter_index, id"
             );
-            let mut statement = self.query(sqlx::AssertSqlSafe(query));
+            let mut statement = self.query_as::<MediaInfoChapterRow>(sqlx::AssertSqlSafe(query));
             for source_id in source_ids {
                 statement = statement.bind(source_id);
             }
@@ -3603,17 +3641,10 @@ impl Database {
                 .await
                 .map_err(self.sqlx_err())?;
             for row in rows {
-                let source_id: String = row.get("media_source_id");
                 chapters
-                    .entry(source_id.clone())
+                    .entry(row.media_source_id.clone())
                     .or_default()
-                    .push(StoredMediaChapter {
-                        source_id,
-                        start_position_ticks: row.get("start_position_ticks"),
-                        name: row.get("name"),
-                        marker_type: "CHAPTER".to_owned(),
-                        chapter_index: row.get("chapter_index"),
-                    });
+                    .push(StoredMediaChapter::from(row));
             }
         }
         Ok(chapters)
@@ -12479,6 +12510,99 @@ mod catalog_count_row_decoding_tests {
             CatalogItemTypeCountRow::from_row(&row)
                 .expect_err("item count columns must not decode"),
             DashboardStatsRow::from_row(&row).expect_err("dashboard columns must not decode"),
+        ];
+        for error in errors {
+            assert!(
+                matches!(error, sqlx::Error::ColumnNotFound(_)),
+                "unexpected decode error: {error}"
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the two chapter projections of `list_media_chapters_by_source_ids`.
+#[cfg(test)]
+mod media_chapter_row_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chapter_rows_decode_detected_markers_and_probed_chapters()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind, chapter_source_id)
+                 VALUES ('chapter-lib', 'Chapters', 'SERIES', 'plugin-a');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES (
+                     'chapter-episode', 'chapter-lib', 'EPISODE', 'Episode', 'episode',
+                     'LOCAL_CONFIRMED', 1
+                 );
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, duration_ticks, is_default
+                 ) VALUES (
+                     'chapter-source', 'chapter-episode', 'LOCAL_FILE', 36000000000, 1
+                 );
+                 INSERT INTO media_chapters (
+                     id, media_source_id, start_position_ticks, name, marker_type,
+                     chapter_index, provider_id, confidence
+                 ) VALUES
+                     ('chapter-intro', 'chapter-source', 100, 'Opening', 'INTRO_START',
+                      0, 'plugin-a', 1.0),
+                     ('chapter-credits', 'chapter-source', 200, NULL, 'CREDITS_START',
+                      2, 'plugin-a', 0.9);
+                 INSERT INTO media_info_chapters (
+                     id, media_source_id, start_position_ticks, name, chapter_index
+                 ) VALUES ('chapter-info-0', 'chapter-source', 50, 'Chapter 1', 0)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let chapters = database
+            .list_media_chapters_by_source_ids(&["chapter-source".to_owned()])
+            .await?;
+        let chapters = chapters.get("chapter-source").expect("chapter rows");
+        assert_eq!(chapters.len(), 3);
+        assert_eq!(
+            chapters
+                .iter()
+                .map(|chapter| (chapter.start_position_ticks, chapter.marker_type.as_str()))
+                .collect::<Vec<_>>(),
+            [
+                (100, "INTRO_START"),
+                (200, "CREDITS_START"),
+                (50, "CHAPTER")
+            ]
+        );
+        let intro = &chapters[0];
+        assert_eq!(intro.source_id, "chapter-source");
+        assert_eq!(intro.name.as_deref(), Some("Opening"));
+        assert_eq!(intro.chapter_index, 0);
+        let credits = &chapters[1];
+        assert_eq!(credits.name, None);
+        assert_eq!(credits.chapter_index, 2);
+        let probed = &chapters[2];
+        assert_eq!(probed.name.as_deref(), Some("Chapter 1"));
+        assert_eq!(probed.chapter_index, 0);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn media_chapter_row_structs_report_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let errors = [
+            MediaChapterRow::from_row(&row).expect_err("marker columns must not decode"),
+            MediaInfoChapterRow::from_row(&row)
+                .expect_err("probed chapter columns must not decode"),
         ];
         for error in errors {
             assert!(
