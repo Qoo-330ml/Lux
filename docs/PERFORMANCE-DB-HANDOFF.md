@@ -119,7 +119,7 @@ shutdown 并接入 `shutdown_background_workers_checked`。静态估算空闲唤
 CPU **0.39 → 0.08 s/分（−79 %）**，空闲仍零写入（方法与口径见审计文档 §6.8，含噪声说明）。
 新鲜度：进程内写入由写侧 `Notify` 立即唤醒；写侧未挂 signal 的存储写路径（多数不经过 metadata 写锁的
 单语句写）最坏由 10 s 兜底覆盖。搜索请求路径本身会先 drain 队列，搜索可见性不依赖后台循环；
-读模型默认关闭（`LUX_READ_MODEL_MODE=off`）。其余要点仍是改造前的数据：
+读模型默认开启（`LUX_READ_MODEL_MODE` 缺省为 `on`，见 `ReadModelMode::from_env`；提交 `ce0d8f63` 起）。其余要点仍是改造前的数据：
 
 - 静态估算空闲唤醒约 **476 次/分**，前 4 项占 88%：本地元数据 outbox 兜底 250 ms（240 次/分）、`catalog_items` 增量 1 s、
   搜索重建 1 s、全局合集同步 1 s（各 60 次/分）。
@@ -142,7 +142,7 @@ CPU **0.39 → 0.08 s/分（−79 %）**，空闲仍零写入（方法与口径�
 
 | 线索 | 说明 |
 |---|---|
-| 读模型默认关闭 | `LUX_READ_MODEL_MODE` 默认 `off`（读取点在 `src/application/catalog.rs` 约 103 行）。读模型已实现；文档里首页读模型的 A/B 数据是 CPU 密集的主要出路。是否默认打开需要决定，并要在 NAS 上实测 |
+| 读模型默认开启（**已确认**） | `LUX_READ_MODEL_MODE` 缺省即 `on`：`ReadModelMode::from_env` 的兜底分支是 `On`（`src/application/catalog.rs`），生产接线在 `src/api/legacy.rs` 用它构造 `CatalogService`；只有显式设为 `off` / `shadow` 才改变。此前本表写“默认 off”是过期信息。NAS 上的 A/B 实测仍未做 |
 | 库页缓存刷新走慢路径？（**已确认并修复**） | 结论：**不是有意设计**。`read_model_mode: ReadModelMode::Off` 是 LUX-865（`690839e8`）给 `CatalogService` 新增该字段时，为刷新线程那个结构体字面量补的默认值；此后 `with_read_model_mode` 只改请求路径那一个实例，两边的模式必然分叉。**已实施**：库页缓存以 `AtomicU8` 持有属主的模式，`with_read_model_mode` 同时写入，后台刷新按批读取并用它构造服务（`5dfbc113` 重构、`15594afe` 修复）；`shadow` 在刷新里**有意降级为 `off`**——shadow 服务的权威页与 off 相同，只多一次对比查询，刷新结果无人对比，理由写在 `LibraryPageCache::refresh_read_model_mode` 的注释里。回归测试 `library_page_refresh_uses_the_configured_read_model_mode`（夹具里权威行与派生行标题不同，刷新后仍读派生行）与 `library_page_refresh_skips_the_shadow_comparison` |
 | 管理员批量操作的 N+1 | `user_account_preferences`、`user_permission_copy`、`user_presets` 的循环逐个查。第一轮评估后**决定不改**：循环体是读后写，需要保留每用户事务和错误隔离。若要降到常数，需新增 `storage/users.rs` 的批量读接口（`find_users_by_ids` 与偏好版本批量读） |
 | 旧身份键修复逐集查询 | `repair_legacy_identity_keys`（`src/application/scanner/library.rs` 约 426 行）首次执行 5 万条语句、约 3.4 秒，在后台跑不阻塞监听，已有完成标记，只在首次升级时付一次。可考虑批量化 |
