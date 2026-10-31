@@ -395,7 +395,7 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `reidentify.rs:2705`，只是由聚合算出来），或对列表接口改成"只在请求带 `?includePending=1` 时算"。
 - **风险**：计数列需要与候选状态变更保持同步（`select/reject/expire` 三处）。
 - **是否值得做**：**中**（管理端，但与交接 §2 的 SSE 放大是同一类问题，值得一并处理）。
-- **已实施（提交 `4c20d3c8`（后端）+ `677a7508`（前端），2026-10-31，路由保持"按需计算"，未加计数列）**：
+- **已实施（提交 `4c20d3c8`（后端）+ `677a7508`、`6a7fc66c`（前端），2026-10-31，按所有者确认走"按需计算"，未加计数列）**：
   项目所有者确认走"按需计算"，不做写侧维护的 `pending_count` 计数列（省掉 `select/reject/expire` 三处同步与迁移）。
   - **改法（后端）**：`list_metadata_reidentify_jobs` 增加 `include_pending` 参数，四条页面语句固定为
     "带/不带聚合 × 带/不带 `status` 过滤"；默认两条只扫 `metadata_reidentify_jobs`
