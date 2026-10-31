@@ -7,7 +7,10 @@ pub(super) use resume_visibility::emby_hide_from_resume;
 use crate::application::playback::{
     decision::ServerTier,
     hls::{HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions},
-    session::{AuthorizedWebPlaybackResource, CreatedWebPlaybackSession, WebPlaybackPlan},
+    session::{
+        AuthorizedWebPlaybackResource, CreatedWebPlaybackSession, PlaybackAssetAdmission,
+        WebPlaybackPlan,
+    },
 };
 use crate::storage::{
     MAX_PLAYBACK_SESSION_WINDOW_SECONDS, PlaybackAdmissionDecision, PlaybackAdmissionDenialReason,
@@ -3477,9 +3480,13 @@ async fn serve_emby_transcoding_asset(
             .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
         if method == Method::GET
             && response.status().is_success()
-            && let Err(response) =
-                admit_web_playback_request(headers, service, &session, admission_policy.as_ref())
-                    .await
+            && let Err(response) = admit_web_playback_hls_request(
+                headers,
+                service,
+                &session,
+                admission_policy.as_ref(),
+            )
+            .await
         {
             return response;
         }
@@ -3526,7 +3533,8 @@ async fn serve_emby_transcoding_asset(
     if method == Method::GET
         && response.status().is_success()
         && let Err(response) =
-            admit_web_playback_request(headers, service, &session, admission_policy.as_ref()).await
+            admit_web_playback_hls_request(headers, service, &session, admission_policy.as_ref())
+                .await
     {
         return response;
     }
@@ -3652,6 +3660,35 @@ async fn admit_web_playback_request(
         return Err(response);
     }
     Ok(())
+}
+
+/// Admits the segment or manifest request that is about to be served.
+///
+/// Unlike [`admit_web_playback_request`], which always runs the full admission, this one renews
+/// the slot the stream already holds and only re-evaluates the limits when the renewal cannot
+/// stand in for it (reclaimed slot, or an admission older than the renewal window). HLS requests
+/// arrive every few seconds, so the full admission is what has to be the exception here.
+async fn admit_web_playback_hls_request(
+    headers: &HeaderMap,
+    service: &crate::application::playback::session::WebPlaybackSessionService,
+    session: &StoredWebPlaybackSession,
+    policy: Option<&UserPlaybackPolicy>,
+) -> Result<(), Response> {
+    match service
+        .admit_playback_asset_request(&session.user_id, &session.play_session_id, policy)
+        .await
+        .map_err(|error| web_playback_error(headers, error))?
+    {
+        PlaybackAssetAdmission::Renewed => Ok(()),
+        PlaybackAssetAdmission::NotFound => Err(StatusCode::NOT_FOUND.into_response()),
+        PlaybackAssetAdmission::Evaluated(result) => {
+            if let Some(response) = playback_admission_error(headers, &result) {
+                let _ = service.stop(&session.id, &session.user_id).await;
+                return Err(response);
+            }
+            Ok(())
+        }
+    }
 }
 
 async fn create_web_playback_session_json(
@@ -4384,9 +4421,13 @@ pub(super) async fn lux_web_playback_hls(
             return StatusCode::BAD_GATEWAY.into_response();
         };
         if method == Method::GET
-            && let Err(response) =
-                admit_web_playback_request(&headers, service, &session, admission_policy.as_ref())
-                    .await
+            && let Err(response) = admit_web_playback_hls_request(
+                &headers,
+                service,
+                &session,
+                admission_policy.as_ref(),
+            )
+            .await
         {
             return response;
         }
@@ -4430,7 +4471,8 @@ pub(super) async fn lux_web_playback_hls(
     };
     if method == Method::GET
         && let Err(response) =
-            admit_web_playback_request(&headers, service, &session, admission_policy.as_ref()).await
+            admit_web_playback_hls_request(&headers, service, &session, admission_policy.as_ref())
+                .await
     {
         return response;
     }

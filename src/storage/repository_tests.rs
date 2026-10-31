@@ -18824,6 +18824,225 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
 }
 
 #[tokio::test]
+async fn playback_admission_asset_renewal_is_one_statement_inside_its_window()
+-> Result<(), Box<dyn std::error::Error>> {
+    let temp_dir = tempfile::tempdir()?;
+    let database = Database::connect(&Config {
+        http_addr: "127.0.0.1:8097".parse()?,
+        config_dir: temp_dir.path().join("config"),
+    })
+    .await?;
+    let user_id = "asset-renewal-user";
+    database
+        .insert_user(user_id, user_id, "Asset Renewal", "test", false, true)
+        .await?;
+    database
+        .update_user_playback_policy(
+            user_id,
+            UserPlaybackPolicy {
+                can_play: true,
+                max_simultaneous_playbacks: 1,
+                allow_remux: true,
+                allow_audio_transcode: true,
+                allow_video_transcode: true,
+            },
+        )
+        .await?;
+
+    let now = 1_000_000_i64;
+    let admitted = database
+        .reserve_playback_admission(user_id, "asset-renewal-session", now, None)
+        .await?
+        .expect("user exists");
+    assert_eq!(admitted.decision, PlaybackAdmissionDecision::Admitted);
+
+    database.reset_query_count();
+    assert!(
+        database
+            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 10)
+            .await?,
+        "an admission this recent is renewed"
+    );
+    assert_eq!(
+        database.query_count(),
+        1,
+        "the renewal must stay a single statement"
+    );
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
+        now + 10,
+        "the renewal moves the stamp forward"
+    );
+
+    assert!(
+        database
+            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 5,)
+            .await?,
+        "a clock that is behind still renews"
+    );
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
+        now + 10,
+        "the renewal never moves the stamp backwards"
+    );
+
+    for declined in [now + 40, now + 41] {
+        assert!(
+            !database
+                .renew_playback_admission_for_asset_request(
+                    user_id,
+                    "asset-renewal-session",
+                    declined
+                )
+                .await?,
+            "an admission at or beyond the renewal window has to run the full admission again"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
+            now + 10,
+            "a declined renewal leaves the row untouched"
+        );
+    }
+
+    assert!(
+        database
+            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 39)
+            .await?,
+        "one second inside the window still renews"
+    );
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
+        now + 39
+    );
+
+    // The heartbeat and playback-event renewals keep the wider stale window: they are the only
+    // paths that may still revive an admission the asset path would have re-admitted.
+    assert!(
+        database
+            .renew_existing_playback_admission(user_id, "asset-renewal-session", now + 55)
+            .await?,
+        "the heartbeat renewal covers the whole stale window, not just the asset window"
+    );
+    assert_eq!(
+        asset_admission_stamp(&database, user_id, "asset-renewal-session").await?,
+        now + 55
+    );
+    assert!(
+        !database
+            .renew_existing_playback_admission(user_id, "asset-renewal-session", now + 146)
+            .await?,
+        "a stale admission is not renewed by any path"
+    );
+
+    database
+        .release_playback_admission(user_id, "asset-renewal-session", now + 147)
+        .await?;
+    assert!(
+        !database
+            .renew_playback_admission_for_asset_request(user_id, "asset-renewal-session", now + 148)
+            .await?,
+        "a released slot is never renewed back to life"
+    );
+    assert!(
+        !database
+            .renew_playback_admission_for_asset_request(user_id, "unknown-session", now + 148)
+            .await?,
+        "a request without an admission row falls back to the full admission"
+    );
+    Ok(())
+}
+
+async fn asset_admission_stamp(
+    database: &Database,
+    user_id: &str,
+    play_session_id: &str,
+) -> Result<i64, Box<dyn std::error::Error>> {
+    // Goes through `Database::query_scalar` so the placeholder is adapted for both backends.
+    Ok(database
+        .query_scalar(
+            "SELECT last_seen_at FROM playback_admissions
+             WHERE user_id = ? AND play_session_id = ?",
+        )
+        .bind(user_id)
+        .bind(play_session_id)
+        .fetch_one(database.pool())
+        .await?)
+}
+
+/// Same renewal contract as the SQLite test above, on the backend that spells the stamp update
+/// with `GREATEST` instead of `MAX`.
+#[tokio::test]
+#[ignore = "requires a local PostgreSQL instance"]
+async fn postgres_playback_admission_asset_renewal_keeps_the_newest_stamp()
+-> Result<(), Box<dyn std::error::Error>> {
+    with_isolated_postgres_database(|database| async move {
+        let user_id = "postgres-asset-renewal-user";
+        database
+            .insert_user(
+                user_id,
+                user_id,
+                "Postgres Asset Renewal",
+                "test",
+                false,
+                true,
+            )
+            .await?;
+        database
+            .update_user_playback_policy(
+                user_id,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 1,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            )
+            .await?;
+        let now = 1_000_000_i64;
+        let play_session_id = "postgres-asset-renewal-session";
+        let admitted = database
+            .reserve_playback_admission(user_id, play_session_id, now, None)
+            .await?
+            .expect("user exists");
+        assert_eq!(admitted.decision, PlaybackAdmissionDecision::Admitted);
+
+        assert!(
+            database
+                .renew_playback_admission_for_asset_request(user_id, play_session_id, now + 10)
+                .await?
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now + 10
+        );
+        assert!(
+            database
+                .renew_playback_admission_for_asset_request(user_id, play_session_id, now + 5)
+                .await?,
+            "a clock that is behind still renews"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now + 10,
+            "GREATEST keeps the newer stamp"
+        );
+        assert!(
+            !database
+                .renew_playback_admission_for_asset_request(user_id, play_session_id, now + 41)
+                .await?,
+            "the renewal window applies to both backends"
+        );
+        assert_eq!(
+            asset_admission_stamp(&database, user_id, play_session_id).await?,
+            now + 10
+        );
+        Ok::<(), Box<dyn std::error::Error>>(())
+    })
+    .await
+}
+
+#[tokio::test]
 async fn new_user_playback_policy_defaults_to_two_and_updates()
 -> Result<(), Box<dyn std::error::Error>> {
     let temp_dir = tempfile::tempdir()?;
