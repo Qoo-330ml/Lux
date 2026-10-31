@@ -230,7 +230,15 @@ impl From<MetadataObjectError> for CollectionError {
 
 const GLOBAL_COLLECTION_SYNC_BATCH_SIZE: usize = 32;
 const GLOBAL_COLLECTION_REFERENCE_RECONCILIATION_BATCH_SIZE: usize = 32;
+/// How long a failed pass waits before retrying. Failures are local (a locked table, a scraper
+/// deadline) and usually clear quickly, so this stays short.
 const GLOBAL_COLLECTION_SYNC_RETRY_DELAY: Duration = Duration::from_secs(1);
+/// How long an idle worker sleeps before checking the outbox on its own.
+///
+/// Completing a write signals the worker (see `storage::OutboxSignals`), so this is not the
+/// freshness path: it only covers rows this process cannot observe, such as another process
+/// sharing the database.
+const GLOBAL_COLLECTION_SYNC_IDLE_FALLBACK: Duration = Duration::from_secs(10);
 
 #[derive(Clone)]
 pub struct GlobalCollectionSyncWorker {
@@ -240,10 +248,24 @@ pub struct GlobalCollectionSyncWorker {
 
 impl GlobalCollectionSyncWorker {
     pub fn start(database: Database) -> Self {
+        Self::start_with_timings(
+            database,
+            GLOBAL_COLLECTION_SYNC_RETRY_DELAY,
+            GLOBAL_COLLECTION_SYNC_IDLE_FALLBACK,
+        )
+    }
+
+    fn start_with_timings(
+        database: Database,
+        retry_delay: Duration,
+        idle_fallback: Duration,
+    ) -> Self {
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let task = tokio::spawn(run_global_collection_sync_worker(
             database,
             shutdown_receiver,
+            retry_delay,
+            idle_fallback,
         ));
         Self {
             shutdown_sender,
@@ -264,6 +286,8 @@ impl GlobalCollectionSyncWorker {
 async fn run_global_collection_sync_worker(
     database: Database,
     mut shutdown_receiver: watch::Receiver<bool>,
+    retry_delay: Duration,
+    idle_fallback: Duration,
 ) {
     loop {
         if *shutdown_receiver.borrow() {
@@ -273,7 +297,9 @@ async fn run_global_collection_sync_worker(
             Ok(reconciled) => reconciled,
             Err(error) => {
                 tracing::warn!(%error, "failed to reconcile pending movie NFO collection identities; will retry");
-                if wait_for_global_collection_sync_retry(&mut shutdown_receiver).await {
+                if wait_for_global_collection_sync(&database, &mut shutdown_receiver, retry_delay)
+                    .await
+                {
                     return;
                 }
                 continue;
@@ -286,7 +312,9 @@ async fn run_global_collection_sync_worker(
             Ok(pending) => pending,
             Err(error) => {
                 tracing::warn!(%error, "failed to load global collection sync jobs; will retry");
-                if wait_for_global_collection_sync_retry(&mut shutdown_receiver).await {
+                if wait_for_global_collection_sync(&database, &mut shutdown_receiver, retry_delay)
+                    .await
+                {
                     return;
                 }
                 continue;
@@ -296,7 +324,10 @@ async fn run_global_collection_sync_worker(
             if reconciled > 0 {
                 continue;
             }
-            if wait_for_global_collection_sync_retry(&mut shutdown_receiver).await {
+            // Nothing queued: wait for a write signal, not for a timer tick.
+            if wait_for_global_collection_sync(&database, &mut shutdown_receiver, idle_fallback)
+                .await
+            {
                 return;
             }
             continue;
@@ -320,9 +351,12 @@ async fn run_global_collection_sync_worker(
                 break;
             }
         }
-        if failed && wait_for_global_collection_sync_retry(&mut shutdown_receiver).await {
+        if failed
+            && wait_for_global_collection_sync(&database, &mut shutdown_receiver, retry_delay).await
+        {
             return;
         }
+        // A queued batch was processed: loop again immediately so a backlog drains continuously.
     }
 }
 
@@ -402,11 +436,19 @@ fn provider_ids_for_collection_reconciliation(
     provider_ids
 }
 
-async fn wait_for_global_collection_sync_retry(
+/// Waits for `delay`, a write signal, or shutdown; returns `true` when the worker must stop.
+async fn wait_for_global_collection_sync(
+    database: &Database,
     shutdown_receiver: &mut watch::Receiver<bool>,
+    delay: Duration,
 ) -> bool {
+    if *shutdown_receiver.borrow() {
+        return true;
+    }
+    let signals = database.outbox_signals();
     tokio::select! {
-        () = tokio::time::sleep(GLOBAL_COLLECTION_SYNC_RETRY_DELAY) => false,
+        () = signals.notified_collections() => false,
+        () = tokio::time::sleep(delay) => false,
         changed = shutdown_receiver.changed() => changed.is_err() || *shutdown_receiver.borrow(),
     }
 }
@@ -420,6 +462,134 @@ mod global_sync_worker_tests {
     };
     use std::{error::Error, time::Duration};
     use tokio::time::{sleep, timeout};
+
+    /// Long enough that a pass can only be caused by a write signal.
+    const LONG_FALLBACK: Duration = Duration::from_secs(60);
+
+    async fn pending_syncs(database: &Database) -> Result<i64, Box<dyn Error>> {
+        let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_sync_outbox")
+            .fetch_one(database.pool())
+            .await?;
+        Ok(count)
+    }
+
+    #[tokio::test]
+    async fn an_idle_worker_does_not_query_the_database() -> Result<(), Box<dyn Error>> {
+        let (_directory, database) = database_with_pending_collection().await?;
+        let worker = GlobalCollectionSyncWorker::start_with_timings(
+            database.clone(),
+            Duration::from_secs(1),
+            LONG_FALLBACK,
+        );
+        wait_for_completed_sync(&database).await?;
+        // The queue is empty now; let the worker reach its wait before measuring.
+        sleep(Duration::from_millis(200)).await;
+        let before = database.query_count();
+        sleep(Duration::from_millis(1_500)).await;
+        assert_eq!(
+            database.query_count(),
+            before,
+            "an idle worker must wait for a write signal instead of polling every second"
+        );
+        worker.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_committed_write_wakes_the_worker_without_the_fallback() -> Result<(), Box<dyn Error>>
+    {
+        let (_directory, database) = database_with_pending_collection().await?;
+        let worker = GlobalCollectionSyncWorker::start_with_timings(
+            database.clone(),
+            Duration::from_secs(1),
+            LONG_FALLBACK,
+        );
+        wait_for_completed_sync(&database).await?;
+        sleep(Duration::from_millis(200)).await;
+        assert_eq!(pending_syncs(&database).await?, 0);
+
+        // A committed write wakes the worker. The raw `removed_at` update below stands in for a
+        // writer this process cannot hook (it queues the sync through the
+        // `collection_media_item_sync_au` trigger but signals nothing); the restore that follows is
+        // an ordinary storage write, and its signal is what makes the worker look.
+        sqlx::query("UPDATE media_items SET removed_at = unixepoch() WHERE id = 'worker-movie-a'")
+            .execute(database.pool())
+            .await?;
+        database.restore_media_item("worker-movie-a").await?;
+
+        timeout(Duration::from_secs(2), async {
+            loop {
+                if pending_syncs(&database).await.unwrap_or(1) == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("the write signal must apply the queued sync long before the 60 s fallback");
+        worker.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_backlog_is_drained_by_consecutive_passes() -> Result<(), Box<dyn Error>> {
+        let (_directory, database) = database_with_pending_collection().await?;
+        // Two more collections on top of the fixture's own queued job.
+        for (collection_id, item_id) in [
+            ("worker-series-b", "worker-movie-a"),
+            ("worker-series-c", "worker-movie-b"),
+        ] {
+            sqlx::query(
+                "INSERT INTO collection_item_references (
+                     item_id, movie_provider, movie_provider_id, collection_provider,
+                     collection_provider_id, collection_title
+                 ) VALUES (?, 'tmdb', ?, 'tmdb', ?, 'Worker Series')",
+            )
+            .bind(item_id)
+            .bind(item_id)
+            .bind(collection_id)
+            .execute(database.pool())
+            .await?;
+        }
+        let worker = GlobalCollectionSyncWorker::start_with_timings(
+            database.clone(),
+            Duration::from_secs(1),
+            LONG_FALLBACK,
+        );
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if pending_syncs(&database).await.unwrap_or(1) == 0 {
+                    break;
+                }
+                sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("a queued backlog must be drained without waiting for a timer");
+        let collections: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM collections WHERE provider = 'tmdb' AND provider_id LIKE 'worker-series%'",
+        )
+        .fetch_one(database.pool())
+        .await?;
+        assert_eq!(collections, 3);
+        worker.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn shutdown_stops_the_worker_and_joins_it() -> Result<(), Box<dyn Error>> {
+        let (_directory, database) = database_with_pending_collection().await?;
+        let worker = GlobalCollectionSyncWorker::start_with_timings(
+            database.clone(),
+            Duration::from_secs(1),
+            LONG_FALLBACK,
+        );
+        wait_for_completed_sync(&database).await?;
+        timeout(Duration::from_secs(2), worker.shutdown())
+            .await
+            .expect("shutdown must not wait for the fallback");
+        Ok(())
+    }
 
     async fn database_with_pending_collection()
     -> Result<(tempfile::TempDir, Database), Box<dyn Error>> {
