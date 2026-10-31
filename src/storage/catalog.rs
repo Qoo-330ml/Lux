@@ -13144,8 +13144,6 @@ mod global_collection_row_decoding_tests {
 /// Decoding tests for the NFO cache projections (single and batched).
 #[cfg(test)]
 mod nfo_cache_row_decoding_tests {
-    use super::*;
-
     #[tokio::test]
     async fn nfo_cache_rows_decode_snapshots_and_validity_stamps()
     -> Result<(), Box<dyn std::error::Error>> {
@@ -13510,8 +13508,6 @@ mod web_session_row_decoding_tests {
 /// Decoding tests for the single-column ID pages and the per-parent episode counts.
 #[cfg(test)]
 mod catalog_id_projection_decoding_tests {
-    use super::*;
-
     #[tokio::test]
     async fn id_pages_and_episode_counts_decode_their_scalar_projections()
     -> Result<(), Box<dyn std::error::Error>> {
