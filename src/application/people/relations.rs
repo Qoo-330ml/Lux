@@ -1,6 +1,10 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::observability::resources::ResourceMetrics;
+use crate::storage::{
+    CanonicalPersonBatch, Database, StorageError, StoredCanonicalPerson,
+    StoredCanonicalPersonMatch, StoredPersonMatchCandidate,
+};
 
 use super::*;
 
@@ -12,6 +16,150 @@ struct ResolvedNfoActor {
     identities: Vec<PersonIdentity>,
     person_key: Option<String>,
     person: Option<PersonMetadata>,
+}
+
+/// Where a page of actors writes its canonical people.
+///
+/// The batched page (`persist_item_actors_with_source_locked`) resolves the whole cast inside one
+/// [`CanonicalPersonBatch`] transaction; the single-actor entry point (`resolve_person_key`) keeps
+/// the standalone per-call transactions. Both use the same SQL and the same error surface.
+enum CanonicalPersonWriter<'a, 'db> {
+    Pool(&'a Database),
+    Batch(&'a mut CanonicalPersonBatch<'db>),
+}
+
+impl CanonicalPersonWriter<'_, '_> {
+    async fn resolve_or_create(
+        &mut self,
+        display_name: &str,
+        provider: &str,
+        provider_id: &str,
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        match self {
+            Self::Pool(database) => {
+                database
+                    .resolve_or_create_canonical_person(
+                        display_name,
+                        provider,
+                        provider_id,
+                        match_method,
+                        confidence,
+                        evidence_json,
+                    )
+                    .await
+            }
+            Self::Batch(batch) => {
+                batch
+                    .resolve_or_create(
+                        display_name,
+                        provider,
+                        provider_id,
+                        match_method,
+                        confidence,
+                        evidence_json,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn attach_identities(
+        &mut self,
+        person_id: &str,
+        identities: &[(String, String)],
+        match_method: &str,
+        confidence: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<StoredCanonicalPerson, StorageError> {
+        match self {
+            Self::Pool(database) => {
+                database
+                    .attach_canonical_person_identities(
+                        person_id,
+                        identities,
+                        match_method,
+                        confidence,
+                        evidence_json,
+                    )
+                    .await
+            }
+            Self::Batch(batch) => {
+                batch
+                    .attach_identities(
+                        person_id,
+                        identities,
+                        match_method,
+                        confidence,
+                        evidence_json,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn enqueue_match_candidate(
+        &mut self,
+        item_id: &str,
+        provider: &str,
+        provider_id: &str,
+        candidate_person_ids_json: &str,
+        score: Option<f64>,
+        evidence_json: &str,
+    ) -> Result<String, StorageError> {
+        match self {
+            Self::Pool(database) => {
+                database
+                    .enqueue_person_match_candidate(
+                        item_id,
+                        provider,
+                        provider_id,
+                        candidate_person_ids_json,
+                        score,
+                        evidence_json,
+                    )
+                    .await
+            }
+            Self::Batch(batch) => {
+                batch
+                    .enqueue_match_candidate(
+                        item_id,
+                        provider,
+                        provider_id,
+                        candidate_person_ids_json,
+                        score,
+                        evidence_json,
+                    )
+                    .await
+            }
+        }
+    }
+
+    async fn list_people_by_normalized_name(
+        &mut self,
+        normalized_name: &str,
+    ) -> Result<Vec<StoredCanonicalPersonMatch>, StorageError> {
+        match self {
+            Self::Pool(database) => {
+                database
+                    .list_canonical_people_by_normalized_name(normalized_name)
+                    .await
+            }
+            Self::Batch(batch) => batch.list_people_by_normalized_name(normalized_name).await,
+        }
+    }
+
+    async fn find_match_candidate(
+        &mut self,
+        candidate_id: &str,
+    ) -> Result<Option<StoredPersonMatchCandidate>, StorageError> {
+        match self {
+            Self::Pool(database) => database.find_person_match_candidate(candidate_id).await,
+            Self::Batch(batch) => batch.find_match_candidate(candidate_id).await,
+        }
+    }
 }
 
 fn spawn_nfo_person_asset_task(
@@ -30,14 +178,31 @@ fn spawn_nfo_person_asset_task(
 }
 
 impl PeopleService {
+    /// Resolves one actor's canonical person through the standalone per-call transactions.
+    ///
+    /// The actor page resolves its cast through [`CanonicalPersonBatch`] instead; this entry point
+    /// serves single-actor callers and the actors that carry no provider identity.
     pub(super) async fn resolve_person_key(
         &self,
         actor: &ActorCredit,
         identities: &[PersonIdentity],
         bridge_person_key: Option<&str>,
     ) -> Result<Option<String>, PeopleError> {
-        self.resolve_person_key_with_mapped_identities(actor, identities, bridge_person_key, None)
-            .await
+        if identities.is_empty() {
+            return Ok(bridge_person_key.map(str::to_owned));
+        }
+        let Some(database) = &self.database else {
+            return Ok(person_key_for_identities(identities));
+        };
+        let mut writer = CanonicalPersonWriter::Pool(database);
+        self.resolve_person_key_with_mapped_identities(
+            actor,
+            identities,
+            bridge_person_key,
+            None,
+            &mut writer,
+        )
+        .await
     }
 
     async fn resolve_person_key_with_mapped_identities(
@@ -46,6 +211,7 @@ impl PeopleService {
         identities: &[PersonIdentity],
         bridge_person_key: Option<&str>,
         preloaded_identities: Option<&[(String, String, String)]>,
+        writer: &mut CanonicalPersonWriter<'_, '_>,
     ) -> Result<Option<String>, PeopleError> {
         if identities.is_empty() {
             return Ok(bridge_person_key.map(str::to_owned));
@@ -87,8 +253,8 @@ impl PeopleService {
         if mapped_person.is_none()
             && let Some(bridge_person_key) = bridge_person_key
         {
-            database
-                .attach_canonical_person_identities(
+            writer
+                .attach_identities(
                     bridge_person_key,
                     &identity_pairs,
                     "SAME_MEDIA_BRIDGE",
@@ -108,8 +274,8 @@ impl PeopleService {
                 .filter(|value| !value.trim().is_empty())
             && birthday_parts(Some(incoming_birthday)).is_some_and(|(_, _, day)| day.is_some())
         {
-            let candidates = database
-                .list_canonical_people_by_normalized_name(&normalize_person_match_text(&actor.name))
+            let candidates = writer
+                .list_people_by_normalized_name(&normalize_person_match_text(&actor.name))
                 .await
                 .map_err(|error| PeopleError::Storage(error.to_string()))?;
             let compatible = candidates
@@ -123,8 +289,8 @@ impl PeopleService {
                 .collect::<Vec<_>>();
             if compatible.len() == 1 {
                 let person_id = &compatible[0].id;
-                database
-                    .attach_canonical_person_identities(
+                writer
+                    .attach_identities(
                         person_id,
                         &identity_pairs,
                         "NAME_BIRTHDAY_UNIQUE",
@@ -145,8 +311,8 @@ impl PeopleService {
         let person_id = match mapped_person {
             Some(person_id) => person_id,
             None => {
-                database
-                    .resolve_or_create_canonical_person(
+                writer
+                    .resolve_or_create(
                         &actor.name,
                         &identity_pairs[0].0,
                         &identity_pairs[0].1,
@@ -165,8 +331,8 @@ impl PeopleService {
             .cloned()
             .collect::<Vec<_>>();
         if !identities_to_attach.is_empty() {
-            database
-                .attach_canonical_person_identities(
+            writer
+                .attach_identities(
                     &person_id,
                     &identities_to_attach,
                     "SAME_SOURCE_ID_SET",
@@ -512,152 +678,52 @@ impl PeopleService {
             );
         }
 
-        let mut resolved_actors = Vec::with_capacity(prepared_actors.len());
-        for (actor, identities, bridge_candidates) in prepared_actors {
-            let primary = identities.first();
-            let actor_id = primary
-                .map(|identity| identity.id.as_str())
-                .unwrap_or_default();
-            let actor_provider = primary
-                .map(|identity| identity.provider.as_str())
-                .unwrap_or_default();
-            if bridge_candidates.len() > 1
-                && !identities.is_empty()
-                && let Some(database) = &self.database
-            {
-                let candidate_ids = bridge_candidates
-                    .iter()
-                    .filter_map(|candidate| candidate.person_key.as_deref())
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                let evidence = serde_json::json!({
-                    "method": "same-media-ambiguous",
-                    "normalizedName": normalize_person_match_text(&actor.name),
-                    "candidateCount": candidate_ids.len(),
-                    "hasRole": actor.character.as_deref().is_some_and(|value| !value.trim().is_empty()),
-                    "hasOrder": actor.order.is_some(),
-                    "hasBirthday": actor.person.as_ref().and_then(|person| person.birthday.as_deref()).is_some(),
-                });
-                let candidate_ids_json = serde_json::to_string(&candidate_ids)
-                    .map_err(|error| PeopleError::Serialization(error.to_string()))?;
-                match database
-                    .enqueue_person_match_candidate(
-                        item_id,
-                        actor_provider,
-                        actor_id,
-                        &candidate_ids_json,
-                        Some(0.55),
-                        &evidence.to_string(),
-                    )
-                    .await
-                {
-                    Ok(candidate_id) => {
-                        let persisted = database
-                            .find_person_match_candidate(&candidate_id)
-                            .await
-                            .ok()
-                            .flatten();
-                        let snapshot = PersonMatchCandidateSnapshot {
-                            schema_version: PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION,
-                            id: candidate_id,
-                            item_id: item_id.to_owned(),
-                            provider: actor_provider.to_owned(),
-                            provider_id: actor_id.to_owned(),
-                            candidate_person_ids: candidate_ids,
-                            status: persisted
-                                .as_ref()
-                                .map(|candidate| candidate.status.clone())
-                                .unwrap_or_else(|| "PENDING".to_owned()),
-                            score: persisted
-                                .as_ref()
-                                .and_then(|candidate| candidate.score)
-                                .or(Some(0.55)),
-                            evidence: persisted
-                                .as_ref()
-                                .and_then(|candidate| {
-                                    serde_json::from_str(&candidate.evidence_json).ok()
-                                })
-                                .unwrap_or_else(|| evidence.clone()),
-                            target_person_id: persisted
-                                .as_ref()
-                                .and_then(|candidate| candidate.target_person_id.clone()),
-                            previous_person_id: persisted
-                                .as_ref()
-                                .and_then(|candidate| candidate.previous_person_id.clone()),
-                            created_at: current_people_unix_timestamp(),
-                            updated_at: current_people_unix_timestamp(),
-                            checksum: String::new(),
-                        };
-                        if let Err(error) =
-                            self.persist_person_match_candidate_snapshot(snapshot).await
-                        {
-                            tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match snapshot");
-                        }
-                    }
-                    Err(error) => {
-                        tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match");
-                    }
-                }
-            }
-            let bridge_person_key = (bridge_candidates.len() == 1)
-                .then(|| bridge_candidates[0].person_key.as_deref())
-                .flatten();
-            let primary = identities.first();
-            let actor_id = primary
-                .map(|identity| identity.id.as_str())
-                .unwrap_or_default();
-            let actor_provider = primary
-                .map(|identity| identity.provider.as_str())
-                .unwrap_or_default();
-            let mapped_identities = identities
+        // Every actor whose provider identities are already mapped resolves without a write (the
+        // preload above answers it), so an unchanged cast must not take the write lock at all. The
+        // ambiguous same-media bridge still records a match candidate, so it keeps the page
+        // transaction too.
+        let page_needs_person_writes =
+            prepared_actors
                 .iter()
-                .filter_map(|identity| {
-                    person_by_identity
-                        .get(&(identity.provider.clone(), identity.id.clone()))
-                        .map(|person_key| {
-                            (
-                                identity.provider.clone(),
-                                identity.id.clone(),
-                                person_key.clone(),
-                            )
+                .any(|(_, identities, bridge_candidates)| {
+                    (bridge_candidates.len() > 1 && !identities.is_empty())
+                        || identities.iter().any(|identity| {
+                            !person_by_identity
+                                .contains_key(&(identity.provider.clone(), identity.id.clone()))
                         })
-                })
-                .collect::<Vec<_>>();
-            let person_key = if identities.is_empty() {
-                self.resolve_person_key(actor, &identities, bridge_person_key)
-                    .await?
-            } else {
-                self.resolve_person_key_with_mapped_identities(
-                    actor,
-                    &identities,
-                    bridge_person_key,
-                    Some(&mapped_identities),
-                )
-                .await?
-            };
-            if let Some(person_key) = person_key.as_deref() {
-                for identity in &identities {
-                    person_by_identity.insert(
-                        (identity.provider.clone(), identity.id.clone()),
-                        person_key.to_owned(),
-                    );
+                });
+        let mut canonical_people_batch = match &self.database {
+            Some(database) if page_needs_person_writes => Some(
+                database
+                    .begin_canonical_person_batch()
+                    .await
+                    .map_err(|error| PeopleError::Storage(error.to_string()))?,
+            ),
+            _ => None,
+        };
+        let resolution = {
+            let mut writer = canonical_people_batch
+                .as_mut()
+                .map(CanonicalPersonWriter::Batch);
+            self.resolve_prepared_actor_keys(
+                item_id,
+                prepared_actors,
+                &mut person_by_identity,
+                writer.as_mut(),
+            )
+            .await
+        };
+        // A failed actor must not discard the actors resolved before it: commit the page first and
+        // report the failure afterwards, which is what the per-actor transactions did.
+        if let Some(batch) = canonical_people_batch {
+            if let Err(error) = batch.commit().await {
+                tracing::warn!(item_id, %error, "batched actor page could not be committed");
+                if resolution.is_ok() {
+                    return Err(PeopleError::Storage(error.to_string()));
                 }
             }
-            let person = actor.person.clone().or_else(|| {
-                bridge_candidates
-                    .first()
-                    .filter(|_| bridge_candidates.len() == 1)
-                    .and_then(|previous| previous.person.clone())
-            });
-            resolved_actors.push(ResolvedNfoActor {
-                actor: actor.clone(),
-                actor_id: actor_id.to_owned(),
-                actor_provider: actor_provider.to_owned(),
-                identities,
-                person_key,
-                person,
-            });
         }
+        let resolved_actors = resolution?;
 
         let asset_results = self
             .persist_resolved_nfo_person_assets(&resolved_actors, deferred_credits)
@@ -768,6 +834,182 @@ impl PeopleService {
             stored_count: relation.actors.len(),
             pending_assets,
         })
+    }
+
+    /// Resolves the canonical person of every prepared actor in page order.
+    ///
+    /// `writer` is the page transaction when the service has a database, so the whole cast
+    /// resolves with one commit (M2). The order, the `person_by_identity` dedup and the error
+    /// semantics stay per actor: the first failure stops the loop and is reported to the caller.
+    async fn resolve_prepared_actor_keys(
+        &self,
+        item_id: &str,
+        prepared_actors: Vec<(&ActorCredit, Vec<PersonIdentity>, Vec<&StoredActor>)>,
+        person_by_identity: &mut HashMap<(String, String), String>,
+        mut writer: Option<&mut CanonicalPersonWriter<'_, '_>>,
+    ) -> Result<Vec<ResolvedNfoActor>, PeopleError> {
+        let mut resolved_actors = Vec::with_capacity(prepared_actors.len());
+        for (actor, identities, bridge_candidates) in prepared_actors {
+            let primary = identities.first();
+            let actor_id = primary
+                .map(|identity| identity.id.as_str())
+                .unwrap_or_default();
+            let actor_provider = primary
+                .map(|identity| identity.provider.as_str())
+                .unwrap_or_default();
+            if bridge_candidates.len() > 1
+                && !identities.is_empty()
+                && let Some(writer) = writer.as_deref_mut()
+            {
+                let candidate_ids = bridge_candidates
+                    .iter()
+                    .filter_map(|candidate| candidate.person_key.as_deref())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let evidence = serde_json::json!({
+                    "method": "same-media-ambiguous",
+                    "normalizedName": normalize_person_match_text(&actor.name),
+                    "candidateCount": candidate_ids.len(),
+                    "hasRole": actor.character.as_deref().is_some_and(|value| !value.trim().is_empty()),
+                    "hasOrder": actor.order.is_some(),
+                    "hasBirthday": actor.person.as_ref().and_then(|person| person.birthday.as_deref()).is_some(),
+                });
+                let candidate_ids_json = serde_json::to_string(&candidate_ids)
+                    .map_err(|error| PeopleError::Serialization(error.to_string()))?;
+                match writer
+                    .enqueue_match_candidate(
+                        item_id,
+                        actor_provider,
+                        actor_id,
+                        &candidate_ids_json,
+                        Some(0.55),
+                        &evidence.to_string(),
+                    )
+                    .await
+                {
+                    Ok(candidate_id) => {
+                        let persisted = writer
+                            .find_match_candidate(&candidate_id)
+                            .await
+                            .ok()
+                            .flatten();
+                        let snapshot = PersonMatchCandidateSnapshot {
+                            schema_version: PERSON_MATCH_SNAPSHOT_SCHEMA_VERSION,
+                            id: candidate_id,
+                            item_id: item_id.to_owned(),
+                            provider: actor_provider.to_owned(),
+                            provider_id: actor_id.to_owned(),
+                            candidate_person_ids: candidate_ids,
+                            status: persisted
+                                .as_ref()
+                                .map(|candidate| candidate.status.clone())
+                                .unwrap_or_else(|| "PENDING".to_owned()),
+                            score: persisted
+                                .as_ref()
+                                .and_then(|candidate| candidate.score)
+                                .or(Some(0.55)),
+                            evidence: persisted
+                                .as_ref()
+                                .and_then(|candidate| {
+                                    serde_json::from_str(&candidate.evidence_json).ok()
+                                })
+                                .unwrap_or_else(|| evidence.clone()),
+                            target_person_id: persisted
+                                .as_ref()
+                                .and_then(|candidate| candidate.target_person_id.clone()),
+                            previous_person_id: persisted
+                                .as_ref()
+                                .and_then(|candidate| candidate.previous_person_id.clone()),
+                            created_at: current_people_unix_timestamp(),
+                            updated_at: current_people_unix_timestamp(),
+                            checksum: String::new(),
+                        };
+                        if let Err(error) =
+                            self.persist_person_match_candidate_snapshot(snapshot).await
+                        {
+                            tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match snapshot");
+                        }
+                    }
+                    Err(error) => {
+                        tracing::warn!(item_id, person_id = actor_id, %error, "could not persist ambiguous person match");
+                    }
+                }
+            }
+            let bridge_person_key = (bridge_candidates.len() == 1)
+                .then(|| bridge_candidates[0].person_key.as_deref())
+                .flatten();
+            let primary = identities.first();
+            let actor_id = primary
+                .map(|identity| identity.id.as_str())
+                .unwrap_or_default();
+            let actor_provider = primary
+                .map(|identity| identity.provider.as_str())
+                .unwrap_or_default();
+            let mapped_identities = identities
+                .iter()
+                .filter_map(|identity| {
+                    person_by_identity
+                        .get(&(identity.provider.clone(), identity.id.clone()))
+                        .map(|person_key| {
+                            (
+                                identity.provider.clone(),
+                                identity.id.clone(),
+                                person_key.clone(),
+                            )
+                        })
+                })
+                .collect::<Vec<_>>();
+            let person_key = if identities.is_empty() {
+                self.resolve_person_key(actor, &identities, bridge_person_key)
+                    .await?
+            } else if let Some(writer) = writer.as_deref_mut() {
+                self.resolve_person_key_with_mapped_identities(
+                    actor,
+                    &identities,
+                    bridge_person_key,
+                    Some(&mapped_identities),
+                    writer,
+                )
+                .await?
+            } else if let Some(database) = &self.database {
+                // Without a page batch (only when the service has no database) this falls back to
+                // the standalone per-call transactions.
+                let mut pool_writer = CanonicalPersonWriter::Pool(database);
+                self.resolve_person_key_with_mapped_identities(
+                    actor,
+                    &identities,
+                    bridge_person_key,
+                    Some(&mapped_identities),
+                    &mut pool_writer,
+                )
+                .await?
+            } else {
+                person_key_for_identities(&identities)
+            };
+            if let Some(person_key) = person_key.as_deref() {
+                for identity in &identities {
+                    person_by_identity.insert(
+                        (identity.provider.clone(), identity.id.clone()),
+                        person_key.to_owned(),
+                    );
+                }
+            }
+            let person = actor.person.clone().or_else(|| {
+                bridge_candidates
+                    .first()
+                    .filter(|_| bridge_candidates.len() == 1)
+                    .and_then(|previous| previous.person.clone())
+            });
+            resolved_actors.push(ResolvedNfoActor {
+                actor: actor.clone(),
+                actor_id: actor_id.to_owned(),
+                actor_provider: actor_provider.to_owned(),
+                identities,
+                person_key,
+                person,
+            });
+        }
+        Ok(resolved_actors)
     }
 
     async fn persist_resolved_nfo_person_assets(

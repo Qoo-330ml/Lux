@@ -272,11 +272,21 @@ impl Database {
         }))
     }
 
+    /// Reserves one admission slot, reusing a playback policy the caller already read.
+    ///
+    /// `known_policy` comes from the same request (resource authorization reads it to check the
+    /// HLS tier). SQLite opens this transaction with `BEGIN IMMEDIATE`, which already serializes
+    /// every writer, so reusing that snapshot cannot let two reservations pass one limit together
+    /// and the `users` row does not have to be read again. PostgreSQL opens a plain
+    /// `READ COMMITTED` transaction where the `FOR UPDATE` lock on that row is the only thing that
+    /// serializes concurrent reservations for one user, so the row is still read there and the
+    /// values it returns decide the admission.
     pub(crate) async fn reserve_playback_admission(
         &self,
         user_id: &str,
         play_session_id: &str,
         now: i64,
+        known_policy: Option<&crate::storage::UserPlaybackPolicy>,
     ) -> Result<Option<PlaybackAdmissionResult>, StorageError> {
         let mut transaction = self.begin_playback_admission_transaction().await?;
         let row_lock = if self.backend() == crate::config::DatabaseBackend::Postgres {
@@ -284,21 +294,27 @@ impl Database {
         } else {
             ""
         };
-        let policy_query = format!(
-            "SELECT can_play, max_simultaneous_playbacks FROM users WHERE id = ?{row_lock}"
-        );
-        let policy = self
-            .query_as::<PlaybackPolicyRow>(sqlx::AssertSqlSafe(policy_query))
-            .bind(user_id)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
-        let Some(policy) = policy else {
-            transaction.commit().await.map_err(self.sqlx_err())?;
-            return Ok(None);
+        let known_policy = known_policy.copied().filter(|_| row_lock.is_empty());
+        let policy = match known_policy {
+            Some(policy) => (policy.can_play, policy.max_simultaneous_playbacks),
+            None => {
+                let policy_query = format!(
+                    "SELECT can_play, max_simultaneous_playbacks FROM users WHERE id = ?{row_lock}"
+                );
+                let policy = self
+                    .query_as::<PlaybackPolicyRow>(sqlx::AssertSqlSafe(policy_query))
+                    .bind(user_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(self.sqlx_err())?;
+                let Some(policy) = policy else {
+                    transaction.commit().await.map_err(self.sqlx_err())?;
+                    return Ok(None);
+                };
+                (policy.can_play != 0, policy.max_simultaneous_playbacks)
+            }
         };
-        let can_play = policy.can_play != 0;
-        let limit = policy.max_simultaneous_playbacks;
+        let (can_play, limit) = policy;
         let now = now.max(0);
         let stale_before = now.saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
         self.query(
@@ -375,23 +391,14 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        let active_playback_count: i64 = self
-            .query_scalar(
-                "SELECT COUNT(*) FROM (
-                     SELECT play_session_id FROM playback_admissions
-                     WHERE user_id = ? AND state = 'ACTIVE' AND last_seen_at > ?
-                     UNION
-                     SELECT play_session_id FROM playback_sessions
-                     WHERE user_id = ? AND state IN ('PLAYING', 'PAUSED') AND last_event_at > ?
-                 ) active_playbacks",
-            )
-            .bind(user_id)
-            .bind(stale_before)
-            .bind(user_id)
-            .bind(stale_before)
-            .fetch_one(&mut *transaction)
-            .await
-            .map_err(self.sqlx_err())?;
+        // The count above already reports whether this play session was part of the active set, so
+        // the upsert adds exactly one row when it was not and none when it was. Recounting after the
+        // write would restate the same union and cost another scan inside the write transaction.
+        let active_playback_count = if session_is_active {
+            active_count
+        } else {
+            active_count.saturating_add(1)
+        };
         transaction.commit().await.map_err(self.sqlx_err())?;
         Ok(Some(PlaybackAdmissionResult {
             decision: PlaybackAdmissionDecision::Admitted,
@@ -1095,6 +1102,50 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// Reads one stored playback session together with the authorization device and client the
+    /// resource access-rule check needs.
+    ///
+    /// Both halves come from the same `web_playback_sessions` row, so serving an HLS manifest or
+    /// segment reads that row once instead of once for the session and once for its device/client.
+    pub(crate) async fn find_web_playback_session_with_access_context(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<(StoredWebPlaybackSession, StoredWebPlaybackAccessContext)>, StorageError>
+    {
+        let Some(row) = self
+            .query(
+                "SELECT id, user_id, item_id, media_source_id, play_session_id,
+                        tier, plan, state, temp_dir, is_admin, expires_at, last_heartbeat_at,
+                        last_sequence, video_codec, audio_codec, video_bitrate, audio_bitrate,
+                        transcoding_container, created_at, updated_at,
+                        authorization_device_id, authorization_client_name
+                 FROM web_playback_sessions
+                 WHERE id = ?",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+        else {
+            return Ok(None);
+        };
+        let device_id: Option<String> =
+            sqlx::Row::try_get(&row, "authorization_device_id").map_err(self.sqlx_err())?;
+        let client_name: Option<String> =
+            sqlx::Row::try_get(&row, "authorization_client_name").map_err(self.sqlx_err())?;
+        let session = stored_web_playback_session(row).map_err(self.sqlx_err())?;
+        let access = StoredWebPlaybackAccessContext {
+            user_id: session.user_id.clone(),
+            device_id,
+            client_name,
+        };
+        Ok(Some((session, access)))
+    }
+
+    /// Kept for the storage contract test that pins the `ACTIVE`-only access-context projection;
+    /// resource authorization reads the same columns through
+    /// [`Self::find_web_playback_session_with_access_context`].
+    #[cfg(test)]
     pub(crate) async fn find_web_playback_access_context(
         &self,
         session_id: &str,
@@ -1792,6 +1843,81 @@ mod tests {
     #[test]
     fn session_listing_bound_is_small_enough_to_stay_cheap() {
         assert!((100..=1000).contains(&MAX_LISTED_PLAYBACK_SESSIONS));
+    }
+
+    /// The reservation already knows whether the play session held an admission, so the total it
+    /// reports after the upsert is that count plus the row it just wrote. A second `UNION` scan
+    /// would only restate it.
+    #[tokio::test]
+    async fn playback_admission_derives_the_new_total_without_a_second_count()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO users (
+                 id, username_normalized, display_name, password_hash,
+                 can_play, max_simultaneous_playbacks
+             ) VALUES ('admission-user', 'admission-user', 'Admission', 'hash', 1, 2)",
+        )
+        .execute(database.pool())
+        .await?;
+
+        database.reset_query_count();
+        let reserved = database
+            .reserve_playback_admission("admission-user", "play-session-a", 1_000, None)
+            .await?
+            .ok_or("the admission user must exist")?;
+        assert_eq!(reserved.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(reserved.active_playback_count, 1);
+        assert_eq!(
+            database.query_count(),
+            4,
+            "one policy read, the stale reclaim, the active count and the upsert"
+        );
+
+        // Reserving the session that already holds an admission must not raise the total.
+        let renewed = database
+            .reserve_playback_admission("admission-user", "play-session-a", 1_001, None)
+            .await?
+            .ok_or("the admission user must exist")?;
+        assert_eq!(renewed.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(renewed.active_playback_count, 1);
+        Ok(())
+    }
+
+    /// The caller that just authorized the request already read this user's playback policy.
+    /// Reusing that snapshot on SQLite (where `BEGIN IMMEDIATE` serializes writers anyway) leaves
+    /// the quota check intact without a second read of the same `users` row.
+    #[tokio::test]
+    async fn playback_admission_reuses_the_policy_the_caller_already_read()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = test_database().await?;
+        sqlx::query(
+            "INSERT INTO users (
+                 id, username_normalized, display_name, password_hash,
+                 can_play, max_simultaneous_playbacks
+             ) VALUES ('policy-user', 'policy-user', 'Policy', 'hash', 1, 2)",
+        )
+        .execute(database.pool())
+        .await?;
+        let policy = database
+            .get_user_playback_policy("policy-user")
+            .await?
+            .ok_or("the policy user must exist")?;
+
+        database.reset_query_count();
+        let reserved = database
+            .reserve_playback_admission("policy-user", "play-session-a", 1_000, Some(&policy))
+            .await?
+            .ok_or("the policy user must exist")?;
+        assert_eq!(reserved.decision, PlaybackAdmissionDecision::Admitted);
+        assert_eq!(reserved.active_playback_count, 1);
+        assert_eq!(reserved.max_simultaneous_playbacks, 2);
+        assert_eq!(
+            database.query_count(),
+            3,
+            "the stale reclaim, the active count and the upsert"
+        );
+        Ok(())
     }
 
     /// Creates the user, library and movie that the transcoding readers join against.

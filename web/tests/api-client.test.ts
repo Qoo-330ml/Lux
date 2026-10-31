@@ -1453,6 +1453,20 @@ describe("LuxApiClient", () => {
     );
   });
 
+  it("asks for the pending count only when the caller opts in", async () => {
+    const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(JSON.stringify({ jobs: [{ id: "metadata-job-1", pendingCount: null }] }), { status: 200 }),
+    );
+
+    await expect(
+      new LuxApiClient().adminMetadataReidentifyJobs("RUNNING", { includePending: true }),
+    ).resolves.toMatchObject({ jobs: [{ id: "metadata-job-1", pendingCount: null }] });
+
+    expect(fetchMock.mock.calls[0]?.[0]).toBe(
+      "/api/v1/admin/metadata/reidentify?page=1&pageSize=50&status=RUNNING&includePending=1",
+    );
+  });
+
   it("loads, cancels, and retries STRM probe jobs through the admin API", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
       const path = String(input);

@@ -415,6 +415,27 @@ describe("AdminOperationsPage", () => {
     expect(container.textContent).not.toContain("METADATA_REIDENTIFY_STARTED");
   });
 
+  it("requests pending metadata counts only while the runtime records tab is open", async () => {
+    vi.spyOn(api, "adminScheduledTasks").mockResolvedValue({ scheduledTasks: [], total: 0 });
+    vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
+    vi.spyOn(api, "adminLogs").mockResolvedValue({ events: [] });
+    const metadataJobs = vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({ jobs: [] });
+    renderPage();
+
+    await act(async () => {
+      await vi.waitFor(() => expect(metadataJobs).toHaveBeenCalled());
+      await vi.waitFor(() => expect(container.textContent).toContain("运行记录"));
+    });
+    expect(metadataJobs.mock.calls.map(([, options]) => options?.includePending ?? false)).toEqual([false]);
+
+    act(() => container.querySelector<HTMLButtonElement>('button[role="tab"]:nth-child(2)')?.click());
+    await act(async () => {
+      await vi.waitFor(() =>
+        expect(metadataJobs.mock.calls.map(([, options]) => options?.includePending ?? false)).toContain(true),
+      );
+    });
+  });
+
   it("shows per-item metadata failure details on demand", async () => {
     vi.spyOn(api, "adminJobs").mockResolvedValue({ jobs: [] });
     vi.spyOn(api, "adminMetadataReidentifyJobs").mockResolvedValue({

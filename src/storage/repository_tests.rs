@@ -12395,8 +12395,10 @@ async fn unavailable_metadata_image_batch_uses_one_statement_and_preserves_attem
     database.close().await;
 }
 
-#[tokio::test]
-async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
+/// Job page fixture: two jobs with one item each, plus the indexes the page query and the pending
+/// aggregation seek. `metadata_candidates` is created only by the tests that need it, so the
+/// default page query cannot depend on it.
+async fn metadata_job_page_pool() -> AnyPool {
     sqlx::any::install_default_drivers();
     let pool = AnyPoolOptions::new()
         .max_connections(1)
@@ -12436,28 +12438,12 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
     .await
     .expect("create metadata job items table");
     sqlx::query(
-        "CREATE TABLE metadata_candidates (
-                item_id TEXT NOT NULL,
-                status TEXT NOT NULL
-            )",
-    )
-    .execute(&pool)
-    .await
-    .expect("create metadata candidates table");
-    sqlx::query(
         "CREATE INDEX idx_metadata_reidentify_items_status
              ON metadata_reidentify_job_items(job_id, status, item_id)",
     )
     .execute(&pool)
     .await
     .expect("create metadata job item index");
-    sqlx::query(
-        "CREATE INDEX idx_metadata_candidates_item
-             ON metadata_candidates(item_id, status)",
-    )
-    .execute(&pool)
-    .await
-    .expect("create metadata candidate index");
     for (id, created_at) in [("older", 1_i64), ("newer", 2_i64)] {
         sqlx::query(
             "INSERT INTO metadata_reidentify_jobs (
@@ -12485,16 +12471,39 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         .await
         .expect("insert metadata job item");
     }
+    pool
+}
+
+/// Adds the candidate table plus two PENDING candidates for `new-item` (distinct count 1).
+async fn metadata_job_page_candidates(pool: &AnyPool) {
+    sqlx::query(
+        "CREATE TABLE metadata_candidates (
+                item_id TEXT NOT NULL,
+                status TEXT NOT NULL
+            )",
+    )
+    .execute(pool)
+    .await
+    .expect("create metadata candidates table");
+    sqlx::query(
+        "CREATE INDEX idx_metadata_candidates_item
+             ON metadata_candidates(item_id, status)",
+    )
+    .execute(pool)
+    .await
+    .expect("create metadata candidate index");
     sqlx::query(
         "INSERT INTO metadata_candidates (item_id, status)
              VALUES ('old-item', 'PENDING'), ('new-item', 'PENDING'),
                     ('new-item', 'PENDING')",
     )
-    .execute(&pool)
+    .execute(pool)
     .await
     .expect("insert metadata candidates");
+}
 
-    let database = Database {
+fn metadata_job_page_database(pool: AnyPool) -> Database {
+    Database {
         pool,
         log_store: LogStore::new(Path::new("unused-metadata-summary-test")),
         pool_max_connections: 1,
@@ -12515,16 +12524,67 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        test_counts: Arc::new(TestCounts::default()),
-    };
+        query_count: Arc::new(AtomicUsize::new(0)),
+    }
+}
+
+#[tokio::test]
+async fn metadata_job_list_skips_the_pending_aggregation_unless_requested() {
+    let pool = metadata_job_page_pool().await;
+    let database = metadata_job_page_database(pool);
+    database.reset_query_count();
+    // The candidate table does not exist yet: a default page that joined it would fail here.
     let jobs = database
-        .list_metadata_reidentify_jobs(None, 0, 1)
+        .list_metadata_reidentify_jobs(None, 0, 1, false)
+        .await
+        .expect("the default page must not read metadata_candidates");
+    assert_eq!(database.query_count(), 1);
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, "newer");
+    assert_eq!(jobs[0].pending_count, None);
+
+    let filtered = database
+        .list_metadata_reidentify_jobs(Some("QUEUED"), 0, 10, false)
+        .await
+        .expect("the filtered page must not read metadata_candidates");
+    assert_eq!(filtered.len(), 2);
+    assert!(filtered.iter().all(|job| job.pending_count.is_none()));
+
+    // The explicit request still aggregates, so it needs the candidate table.
+    assert!(
+        database
+            .list_metadata_reidentify_jobs(None, 0, 1, true)
+            .await
+            .is_err(),
+        "explicit pending requests must aggregate metadata_candidates"
+    );
+
+    metadata_job_page_candidates(database.pool()).await;
+    let jobs = database
+        .list_metadata_reidentify_jobs(None, 0, 1, true)
+        .await
+        .expect("explicit pending request");
+    assert_eq!(jobs.len(), 1);
+    assert_eq!(jobs[0].id, "newer");
+    assert_eq!(jobs[0].pending_count, Some(1));
+    database.close().await;
+}
+
+#[tokio::test]
+async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
+    let pool = metadata_job_page_pool().await;
+    metadata_job_page_candidates(&pool).await;
+    let database = metadata_job_page_database(pool);
+    database.reset_query_count();
+    let jobs = database
+        .list_metadata_reidentify_jobs(None, 0, 1, true)
         .await
         .expect("list metadata jobs");
+    assert_eq!(database.query_count(), 1);
 
     assert_eq!(jobs.len(), 1);
     assert_eq!(jobs[0].id, "newer");
-    assert_eq!(jobs[0].pending_count, 1);
+    assert_eq!(jobs[0].pending_count, Some(1));
 
     let plan = sqlx::query(
         "EXPLAIN QUERY PLAN
@@ -15119,7 +15179,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        test_counts: Arc::new(TestCounts::default()),
+        query_count: Arc::new(AtomicUsize::new(0)),
     };
     assert!(database.probe_write().await.is_err());
     database.close().await;
@@ -15193,7 +15253,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        test_counts: Arc::new(TestCounts::default()),
+        query_count: Arc::new(AtomicUsize::new(0)),
     };
 
     assert_eq!(
@@ -15329,7 +15389,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        test_counts: Arc::new(TestCounts::default()),
+        query_count: Arc::new(AtomicUsize::new(0)),
     };
 
     let claimed = database
@@ -18402,8 +18462,8 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
 
     let now = 1_000_i64;
     let (first, second) = tokio::join!(
-        database.reserve_playback_admission(user_id, "admission-session-a", now),
-        database.reserve_playback_admission(user_id, "admission-session-b", now),
+        database.reserve_playback_admission(user_id, "admission-session-a", now, None),
+        database.reserve_playback_admission(user_id, "admission-session-b", now, None),
     );
     let first = first?.expect("user exists");
     let second = second?.expect("user exists");
@@ -18420,7 +18480,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     assert_eq!(denied.active_playback_count, 1);
 
     let renewal = database
-        .reserve_playback_admission(user_id, accepted_session, now + 1)
+        .reserve_playback_admission(user_id, accepted_session, now + 1, None)
         .await?
         .expect("user exists");
     assert_eq!(renewal.decision, PlaybackAdmissionDecision::Admitted);
@@ -18437,7 +18497,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
     );
 
     let retry = database
-        .reserve_playback_admission(user_id, "admission-session-c", now + 3)
+        .reserve_playback_admission(user_id, "admission-session-c", now + 3, None)
         .await?
         .expect("user exists");
     assert_eq!(retry.decision, PlaybackAdmissionDecision::Admitted);
@@ -18457,7 +18517,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         .await?;
     for session_id in ["admission-session-d", "admission-session-e"] {
         let unlimited = database
-            .reserve_playback_admission(user_id, session_id, now + 4)
+            .reserve_playback_admission(user_id, session_id, now + 4, None)
             .await?
             .expect("user exists");
         assert_eq!(unlimited.decision, PlaybackAdmissionDecision::Admitted);
@@ -18480,14 +18540,14 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         "admission-session-e",
     ] {
         let existing = database
-            .reserve_playback_admission(user_id, session_id, now + 5)
+            .reserve_playback_admission(user_id, session_id, now + 5, None)
             .await?
             .expect("user exists");
         assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
         assert_eq!(existing.active_playback_count, 3);
     }
     let new_session = database
-        .reserve_playback_admission(user_id, "admission-session-f", now + 6)
+        .reserve_playback_admission(user_id, "admission-session-f", now + 6, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18509,7 +18569,7 @@ async fn playback_admission_serializes_quota_and_reuses_releases_sessions()
         )
         .await?;
     let disabled = database
-        .reserve_playback_admission(user_id, "admission-session-g", now + 7)
+        .reserve_playback_admission(user_id, "admission-session-g", now + 7, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18686,8 +18746,8 @@ async fn exercise_user_management_concurrency_storage_contract(
         )
         .await?;
     let (admission_a, admission_b) = tokio::join!(
-        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000),
-        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000),
+        database.reserve_playback_admission(user_id, "concurrency-playback-a", 10_000, None),
+        database.reserve_playback_admission(user_id, "concurrency-playback-b", 10_000, None),
     );
     let admission_a = admission_a?.ok_or("playback user disappeared")?;
     let admission_b = admission_b?.ok_or("playback user disappeared")?;
@@ -18855,13 +18915,13 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
         .fetch_one(database.pool())
         .await?;
     let existing = database
-        .reserve_playback_admission(user_id, "legacy-play-session", now)
+        .reserve_playback_admission(user_id, "legacy-play-session", now, None)
         .await?
         .expect("user exists");
     assert_eq!(existing.decision, PlaybackAdmissionDecision::Admitted);
     assert_eq!(existing.active_playback_count, 1);
     let denied = database
-        .reserve_playback_admission(user_id, "new-play-session", now)
+        .reserve_playback_admission(user_id, "new-play-session", now, None)
         .await?
         .expect("user exists");
     assert_eq!(
@@ -18897,12 +18957,12 @@ async fn playback_admission_counts_legacy_sessions_and_reclaims_stale_reservatio
             .await?
     );
     let stale_admission = database
-        .reserve_playback_admission(user_id, "stale-play-session", now + 2)
+        .reserve_playback_admission(user_id, "stale-play-session", now + 2, None)
         .await?
         .expect("user exists");
     assert_eq!(stale_admission.active_playback_count, 1);
     let after_stale = database
-        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92)
+        .reserve_playback_admission(user_id, "after-stale-play-session", now + 92, None)
         .await?
         .expect("user exists");
     assert_eq!(after_stale.decision, PlaybackAdmissionDecision::Admitted);
@@ -19208,7 +19268,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        test_counts: Arc::new(TestCounts::default()),
+        query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
 
@@ -19304,7 +19364,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        test_counts: Arc::new(TestCounts::default()),
+        query_count: Arc::new(AtomicUsize::new(0)),
     };
     database.reset_query_count();
 
@@ -19812,7 +19872,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         auth_cache: Arc::new(AuthCacheEpochs::default()),
         outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
-        test_counts: Arc::new(TestCounts::default()),
+        query_count: Arc::new(AtomicUsize::new(0)),
     };
 
     let reconciled = database
@@ -36449,7 +36509,7 @@ async fn playback_event_renews_the_admission_in_its_own_transaction()
         .fetch_one(database.pool())
         .await?;
     database
-        .reserve_playback_admission(&user_id, "progress-admission-session", now)
+        .reserve_playback_admission(&user_id, "progress-admission-session", now, None)
         .await?
         .expect("user exists");
     let stale_stamp = now.saturating_sub(40);

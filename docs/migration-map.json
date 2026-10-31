@@ -879,6 +879,11 @@
       "name": "search_outbox_split",
       "sqlite": 243,
       "postgres": 245
+    },
+    {
+      "name": "metadata_candidate_expiry_index",
+      "sqlite": 244,
+      "postgres": 246
     }
   ],
   "sqlite_only": [
@@ -1231,7 +1236,7 @@
     }
   ],
   "ordering": {
-    "shared_names": 176,
+    "shared_names": 177,
     "rank_mismatches": 84,
     "note": "Migration histories evolved with different SQLite-only/PostgreSQL-only interleaving, so the shared names are not in the same relative order. New migrations must keep a pair adjacent in both directories, which keeps this count from growing."
   }

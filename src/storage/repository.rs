@@ -113,6 +113,7 @@ mod migration;
 mod notifications;
 #[path = "people.rs"]
 mod people;
+pub(crate) use people::CanonicalPersonBatch;
 #[path = "sessions.rs"]
 mod sessions;
 #[path = "user_mail_flows.rs"]
@@ -763,20 +764,8 @@ pub struct Database {
     /// falls back to a slow poll. Keeping it on the instance (rather than in a process-wide static)
     /// means two databases - and two workers in parallel tests - never steal each other's wake-ups.
     mail_outbox_appended: Arc<tokio::sync::Notify>,
-    /// Test-only statement and commit counters (see `TestCounts`).
-    ///
-    /// One `Arc` holds both counters so the test build keeps `Database` the same size as the
-    /// production build.
     #[cfg(test)]
-    test_counts: Arc<TestCounts>,
-}
-
-/// Statement and commit counters that only the test build compiles in.
-#[cfg(test)]
-#[derive(Default)]
-pub(crate) struct TestCounts {
-    queries: AtomicUsize,
-    metadata_write_transactions: AtomicUsize,
+    query_count: Arc<AtomicUsize>,
 }
 
 #[derive(Default)]
@@ -1431,7 +1420,7 @@ impl Database {
             outbox_signals: Arc::new(OutboxSignals::default()),
             mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
             #[cfg(test)]
-            test_counts: Arc::new(TestCounts::default()),
+            query_count: Arc::new(AtomicUsize::new(0)),
         })
     }
 
@@ -1492,9 +1481,7 @@ impl Database {
         &self,
     ) -> Result<sqlx::Transaction<'_, Any>, StorageError> {
         #[cfg(test)]
-        self.test_counts
-            .metadata_write_transactions
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        metadata_write_transaction_counter(&self.path).fetch_add(1, AtomicOrdering::Relaxed);
         let transaction = if self.backend == DatabaseBackend::Sqlite {
             self.pool.begin_with("BEGIN IMMEDIATE").await
         } else {
@@ -1896,7 +1883,7 @@ impl Database {
 
     #[cfg(test)]
     pub(crate) fn reset_query_count(&self) {
-        self.test_counts.queries.store(0, AtomicOrdering::Relaxed);
+        self.query_count.store(0, AtomicOrdering::Relaxed);
     }
 
     /// The invalidation epochs of the in-process authentication and access caches.
@@ -1925,24 +1912,22 @@ impl Database {
 
     #[cfg(test)]
     pub(crate) fn query_count(&self) -> usize {
-        self.test_counts.queries.load(AtomicOrdering::Relaxed)
+        self.query_count.load(AtomicOrdering::Relaxed)
     }
 
-    /// Counts the metadata write transactions (and therefore the commits) opened since the last
-    /// reset. The audit's write-amplification findings are stated in commits, not statements
-    /// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2.2).
+    /// How many metadata write transactions this database started (test-only).
+    ///
+    /// Write-path batches are judged by commit count, not statement count (see
+    /// `docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2): a path that keeps a page in one
+    /// transaction leaves this number flat while the number of actors grows.
     #[cfg(test)]
     pub(crate) fn metadata_write_transaction_count(&self) -> usize {
-        self.test_counts
-            .metadata_write_transactions
-            .load(AtomicOrdering::Relaxed)
+        metadata_write_transaction_counter(&self.path).load(AtomicOrdering::Relaxed)
     }
 
     #[cfg(test)]
     pub(crate) fn reset_metadata_write_transaction_count(&self) {
-        self.test_counts
-            .metadata_write_transactions
-            .store(0, AtomicOrdering::Relaxed);
+        metadata_write_transaction_counter(&self.path).store(0, AtomicOrdering::Relaxed);
     }
 
     /// The change counters that the playback access cache stamps its entries with.
@@ -2004,9 +1989,7 @@ impl Database {
         sql: impl AdaptSqlText,
     ) -> sqlx::query::Query<'static, sqlx::Any, sqlx::any::AnyArguments> {
         #[cfg(test)]
-        self.test_counts
-            .queries
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query(adapt_sql_for_backend(self.backend, sql))
     }
 
@@ -2018,9 +2001,7 @@ impl Database {
         O: for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
     {
         #[cfg(test)]
-        self.test_counts
-            .queries
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_as(adapt_sql_for_backend(self.backend, sql))
     }
 
@@ -2032,11 +2013,32 @@ impl Database {
         (O,): for<'r> sqlx::FromRow<'r, sqlx::any::AnyRow>,
     {
         #[cfg(test)]
-        self.test_counts
-            .queries
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        self.query_count.fetch_add(1, AtomicOrdering::Relaxed);
         sqlx::query_scalar(adapt_sql_for_backend(self.backend, sql))
     }
+}
+
+/// Per-database metadata write transaction counter for the write-path tests.
+///
+/// Commit counts are the metric the write-path performance work records
+/// (`docs/PERFORMANCE-DB-AUDIT-HLS-SCRAPE-METADATA.md` §2). The counter is keyed by the database
+/// path instead of living on [`Database`]: a test-only field would grow `Database`, and `Database`
+/// is embedded by value in `ReadyAppState`, which in test builds would tip the `AppMode` variant
+/// size lint.
+#[cfg(test)]
+fn metadata_write_transaction_counter(path: &Path) -> Arc<AtomicUsize> {
+    static COUNTERS: std::sync::OnceLock<std::sync::Mutex<HashMap<PathBuf, Arc<AtomicUsize>>>> =
+        std::sync::OnceLock::new();
+    let counters = COUNTERS.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut counters = match counters.lock() {
+        Ok(counters) => counters,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    Arc::clone(
+        counters
+            .entry(path.to_path_buf())
+            .or_insert_with(|| Arc::new(AtomicUsize::new(0))),
+    )
 }
 
 fn sqlite_migrator_with_legacy_timestamp_checksum() -> Option<Migrator> {
@@ -4191,7 +4193,8 @@ pub(crate) struct StoredMetadataReidentifyJob {
     pub(crate) cancel_requested: bool,
     pub(crate) library_id: Option<String>,
     pub(crate) job_scope: String,
-    pub(crate) pending_count: i64,
+    /// `None` when the caller did not ask for the pending aggregation.
+    pub(crate) pending_count: Option<i64>,
 }
 
 #[derive(Debug)]
@@ -4232,7 +4235,7 @@ struct StoredMetadataReidentifyJobRow {
     cancel_requested: i64,
     library_id: Option<String>,
     job_scope: String,
-    pending_count: i64,
+    pending_count: Option<i64>,
 }
 
 fn stored_metadata_reidentify_job(
@@ -7628,7 +7631,7 @@ mod stored_row_decoding_tests {
         assert_eq!(job.library_id.as_deref(), Some("reid-lib"));
         assert_eq!(job.total_count, 1);
         assert_eq!(job.processed_count, 0);
-        assert_eq!(job.pending_count, 0);
+        assert_eq!(job.pending_count, Some(0));
         assert!(!job.cancel_requested);
         assert_eq!(job.error, None);
         assert_eq!(job.started_at, None);

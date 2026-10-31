@@ -510,11 +510,22 @@ mod tests {
         )
         .execute(database.pool())
         .await?;
+        // The abort is injected on the reference INSERT, so this selection has to derive a
+        // reference that differs from the stored row; re-storing an identical reference performs
+        // no write by design and could not reach the trigger.
+        let changed_reference = GlobalMovieCollectionReference::from_scraper(
+            "tmdb",
+            "movie-599",
+            Some("1281826"),
+            Some("飞驰人生"),
+            Some(2019),
+        )
+        .ok_or("valid confirmed collection identity")?;
         assert!(
             database
                 .select_metadata_candidate_with_collection_reference(
                     selection_update(item_id, second_candidate_id, "Changed", false),
-                    Some(&reference),
+                    Some(&changed_reference),
                 )
                 .await
                 .is_err()
@@ -842,8 +853,8 @@ pub use repository::{
 #[allow(unused_imports)]
 pub(crate) use repository::{
     AdminUserSortField, AdminUserStatusFilter, AuthCacheEpochSnapshot, AuthCacheEpochs,
-    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, CatalogFilterQuery, CatalogSort,
-    ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
+    CATALOG_ITEMS_INCREMENTAL_CONSUMER, CATALOG_OUTBOX, CanonicalPersonBatch, CatalogFilterQuery,
+    CatalogSort, ChapterDetectionOutcomeUpdate, ChapterDetectionSourceStateUpdate,
     DEFAULT_MAINTENANCE_INITIAL_DELAY_SECONDS, DEFAULT_MAINTENANCE_INTERVAL_SECONDS,
     DEFAULT_PLAYED_PERCENT, DashboardStats, DatabasePoolSnapshot, DevicePairingRedeemResult,
     EmbyMigrationHandledItemBatch, EmbyMigrationImportRecordBatch, EmbyMigrationItemMatchBatch,

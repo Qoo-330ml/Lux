@@ -66,7 +66,7 @@
 | **M3** | 元数据选中无条件 `UPDATE media_items`（无"值未变则不写"） | `src/storage/metadata.rs:1742` | 每次选中/回填刷新 | 每次写触发 `catalog_outbox` 最多 5 行（见 `docs/INDEX-AUDIT.md` §7） | **中-高** |
 | **M1** | 应用选中候选的落库由 4 组独立事务组成，没有总事务 | `src/application/candidates.rs:2989` | 每条目 1 次 | 中途失败留下"图片/演员已写、候选仍 PENDING"的部分状态 | **中** |
 | **M5** | 每张图片 3 个写事务（claim → 图片行 → finish），全部串行在元数据写锁上 | `src/application/images.rs:528`、`:549` | 每条目 ~3–8 张图 → ~10–24 次提交 | 图片是刮削写放大第二来源 | **中** |
-| **S5** | 过期 PENDING 候选清理缺 `(status, expires_at)` 索引 | `src/storage/database_cleanup.rs:929` | 每批清理 | 候选积压时变成排序大范围扫描 | **中** |
+| **S5** | 过期 PENDING 候选清理缺 `(status, expires_at)` 索引 | `src/storage/database_cleanup.rs:929` | 每批清理 | 候选积压时变成排序大范围扫描 | **中（已实施 `80cd3a4b`）** |
 | **S6** | `jobs` SSE 事件每秒失效 10 个管理端查询键，其中"元数据任务列表"带 `pending_counts` 聚合 | `web/src/features/admin/useAdminEvents.ts:18`、`src/storage/jobs/metadata_reidentify/lifecycle.rs:186` | 任务运行时 ≤1 次/秒（页面打开时） | 管理端轮询放大；聚合按 job_items × candidates 规模增长 | **中** |
 | **H5** | 管理端转码页每 2 s 轮询，N 个会话 → 1+N 次查询 | `src/api/admin/admin_transcoding.rs:32`、`web/src/features/admin/AdminTranscodingPage.tsx:39` | 30 次/分 × (1+N) | 管理端观感端点，用户少 | **中** |
 | **H3** | HLS 启动路径重复读转码设置与 session 行 | `src/application/playback/session.rs:1075`、`:1104` | 每次启动 1–3 次 | 启动本身已很重 | 低-中 |
@@ -97,10 +97,12 @@
 1. **语句计数**：`Database::query_count()` 已存在（`src/storage/repository.rs:1911`，`reset_query_count` 在 `:1882`），
    但目前只在测试里用（`src/application/reidentify.rs:3540` 一带有先例）。交接第 8 节建议的"每请求计数中间件"落地前，
    可以先用 `cargo test` 里已有的 `query_count` 断言给单个用例定基线（例如"一次分片请求的语句数与写提交数"）。
-2. **写提交计数**：`Database` 已在 `begin_metadata_write_transaction` 里内置 `#[cfg(test)]` 计数器
+2. **写提交计数**：`begin_metadata_write_transaction` 里已内置 `#[cfg(test)]` 计数器
    （`metadata_write_transaction_count()` / `reset_metadata_write_transaction_count()`，`src/storage/repository.rs`），
-   只编译进测试目标，release 无开销。测试里用"reset → 执行一次操作 → 断言提交数"给单次操作定基线。
-   `begin_playback_admission_transaction` / `begin_scan_write_transaction` 仍未计数。
+   只编译进测试目标，release 无开销。计数按数据库路径键控存放在进程内注册表里，而不是 `Database` 字段上
+   （测试用字段会让 `Database` 变大，进而在测试构建里触发 `AppMode` 的变体尺寸 lint）。测试里用
+   "reset → 执行一次操作 → 断言提交数"给单次操作定基线。`begin_playback_admission_transaction` /
+   `begin_scan_write_transaction` 仍未计数。
 3. **查询计划**：在数据副本上 `ANALYZE` 后跑 `EXPLAIN QUERY PLAN`，判断是否走索引、是否 `USE TEMP B-TREE FOR ORDER BY`。
    第 6 节的缺索引结论都可以用这一条验证。
 4. **写放大**：`PRAGMA page_count` / `dbstat` 差值，以及 `catalog_outbox`/`search_outbox` 的行增量。
@@ -185,6 +187,13 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   在 `renew` 失败前会继续返回分片。按项目规则需要项目所有者确认。另一种更保守的方案是保留 `reserve` 但按
   `last_seen_at` 节流（≥30 s 才重算一次），滞后更短但仍有窗口。
 - **是否值得做**：**高**。收益最大、改动局部（4 个调用点 + 一个分支），且 `renew` 已经是现成函数。
+- **已实施（仅副产品，2026-06-11，提交 `58bf7d67`）**：删掉了 `reserve_playback_admission` 里重复的第二次计数。
+  第一次计数已经带回 `session_is_active`（该播放会话是否已在 active 集合里），UPSERT 只会在它为假时新增一行，
+  所以写入后的总数 = 第一次计数 + （`session_is_active` 为假时 1）。准入决策、拒绝原因、返回的
+  `active_playback_count` 全部不变。**准入事务内语句数 5 → 4**（策略读、陈旧名额回收、计数、UPSERT），
+  提交次数仍是 1 次 `BEGIN IMMEDIATE` + 1 次 `COMMIT`。测试：
+  `storage::repository::sessions::tests::playback_admission_derives_the_new_total_without_a_second_count`。
+  **主体（分片路径改"renew 优先"）未做**，仍等所有者确认并发上限的判定窗口（见本节"风险"）。
 
 ### H2 每请求读 6 次，含两处重复读与一次设置行读取（已读代码确认）
 
@@ -209,6 +218,29 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   3. 准入事务里的策略读改为复用第 6 步的结果（把 `UserPlaybackPolicy` 传进 `reserve_playback_admission`）。
 - **风险**：缓存失效必须即时（改可信代理、改播放策略）；第 1、3 条是纯重构无行为变化，第 2 条需要显式失效点。
 - **是否值得做**：**高**（与 H1 同批做，单请求从 ~11 条语句降到 ~3 条）。第 1、3 条可以先做，零行为变化。
+- **已实施（第 1 条，2026-06-11，提交 `0761ef3c`）**：新增
+  `Database::find_web_playback_session_with_access_context`，一条语句读出整行会话 + `authorization_device_id` /
+  `authorization_client_name`；`authorize_resource_with_ip` 改用它，`enforce_playback_access_rules` 改成接受
+  已读到的 `&StoredWebPlaybackAccessContext`。原来第二次读的 `state='ACTIVE'` 过滤已由第一次读之后的
+  `session.state != "ACTIVE"` 判断覆盖（返回同一个 `NotActive`），它的 `user_id` 一致性比较因为两半来自同一行而恒真。
+  旧的 `find_web_playback_access_context` 保留为 `#[cfg(test)]`，继续给存储层契约测试钉住"只读 ACTIVE"的投影。
+  **鉴权阶段语句数 5 → 4**（session 行、device/client 黑名单匹配、IP 规则、播放策略）。测试：
+  `application::playback::session::tests::hls_resource_authorization_reads_the_session_row_once`。
+- **已实施（第 3 条，2026-06-11，提交 `13cf680b`）**：`authorize_resource_with_ip` 返回
+  `AuthorizedWebPlaybackResource { session, policy }`，把鉴权阶段读到的 `UserPlaybackPolicy` 交给
+  `reserve_playback_admission(..., known_policy)`。**SQLite 上准入语句数 5 → 3**（陈旧名额回收、计数、UPSERT）。
+  **PostgreSQL 保留事务内那次读**：它的准入事务是普通 `READ COMMITTED` 的 `BEGIN`，同一个用户两路并发准入
+  只靠那行 `FOR UPDATE` 串行化；去掉它会让两路同时看到"还有空位"而一起进入。所以 PG 上语句数 5 → 4，
+  且由事务内读到的**最新**值决定准入。依据：`begin_playback_admission_transaction`（SQLite `BEGIN IMMEDIATE`／
+  PG 普通 `BEGIN`，`src/storage/repository.rs:1492`）。风险：SQLite 上复用的是一次请求内的策略快照，
+  管理员改上限/停播在"请求内两次读之间"的窗口内最多多放行这一路（原本也存在同样的窗口，只是短几十微秒）；
+  准入决策仍与本次请求已经通过的 tier 校验用同一份策略，不会再分叉。另一个窗口：用户在鉴权读与准入之间被
+  硬删除（`src/storage/users.rs:1514`，`playback_admissions` 有 `ON DELETE CASCADE` 外键）时，原来返回
+  "用户不存在"（404），现在会在 UPSERT 处撞外键失败（503）；两者都是错误响应，且窗口只有一条语句的间隔。测试：
+  `storage::repository::sessions::tests::playback_admission_reuses_the_policy_the_caller_already_read`。
+- **未做（第 2 条）**：`trusted_proxy_cidrs` 的进程内缓存按任务边界另行处理（涉及 `src/api/legacy.rs`）。
+- **单请求汇总（不含第 2 条）**：一个 HLS 清单/分片 GET 的存储层语句数 **10 → 7**，写提交仍是 1 次
+  （`BEGIN IMMEDIATE` + `COMMIT`，H1 主体未做）。
 
 ### H3 HLS 启动路径重复读设置与 session 行（已读代码确认）
 
@@ -220,6 +252,16 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 - **建议修法**：`start_hls_with_runtime` 把已读到的 `TranscodingSettings` 传下去；`mark_session_tier` 接受已知的 `user_id`。
 - **风险**：无（纯传参重构）。
 - **是否值得做**：**低-中**。顺手做，不单独排任务。
+- **已实施（2026-06-11，提交 `2914f407`）**：`create` 与 `start_hls_with_runtime` 合并为
+  `create_with_settings` / `start_hls_with_settings`，由调用方传入已读到的 `TranscodingSettings`：
+  Web 处理器（`src/api/playback.rs` 的 `create_web_playback_session_json`）、
+  `create_and_start_emby_hls`、`restart_with_software` 各自只读一次；`mark_session_tier` 拆出
+  `mark_known_session_tier`，Emby 降级路径（`activate_emby_hls_session`）用已持有的会话行记录 tier。
+  **每次启动的 `server_settings` 读次数 2–3 → 1**；Emby 创建+启动路径语句数 5 → 4，Web 创建+启动同样 5 → 4，
+  软件回退路径（`restart_with_software`）5 → 4（`mark_session_tier` 那一次会话行读保留，因为该路径手上没有会话行），
+  Emby 启动降级路径（`activate_emby_hls_session`）少一次会话行读。行为不变：每次启动仍把当前策略应用给
+  FFmpeg，运行中的会话继续用自己捕获的参数。
+  测试：`application::playback::session::tests::emby_hls_start_reads_the_transcoding_policy_once`。
 
 ### H4 会话生命周期里的无条件 UPDATE（已读代码确认）
 
@@ -407,6 +449,25 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 - **建议修法**：与 I1 一起加 `(status, expires_at, id)` 部分索引。
 - **风险**：候选表多一个索引，写成本略增。
 - **是否值得做**：**中**（与 I1 一起，走迁移）。
+- **已实施（提交 `80cd3a4b`，2026-10-31）**：迁移 `migrations/0244_metadata_candidate_expiry_index.sql` +
+  `migrations-postgres/0246_metadata_candidate_expiry_index.sql`（配对名 `metadata_candidate_expiry_index`，
+  `docs/migration-map.json` 已记录；两后端同一条语句，查询文本不需要改）。测试
+  `src/storage/database_cleanup.rs::task_history_retention_tests::retention_expired_pending_cleanup_orders_by_the_pending_expiry_index`
+  在 1 200 行候选（其中 300 行 PENDING）的夹具上对 `prune_sql::METADATA_CANDIDATE_EXPIRED_PENDING` 跑
+  `EXPLAIN QUERY PLAN`：加索引前是
+  `SEARCH metadata_candidates USING INDEX idx_metadata_candidates_status (status=?)` + `USE TEMP B-TREE FOR ORDER BY`，
+  加索引后是 `SEARCH metadata_candidates USING COVERING INDEX idx_metadata_candidates_pending_expiry
+  (status=? AND expires_at>? AND expires_at<?)` + `CREATE BLOOM FILTER`，排序消失。
+  **前后数字**（第 2 节口径）：清理语句数 1 → 1，写提交数 1 → 1（每批一条 `DELETE`）；变的只是计划形状——
+  加索引前排序集 = 全部 PENDING 行（夹具 300 行，生产 = 积压量），加索引后只按索引序读到 `LIMIT` 窗口
+  （加上一小时宽限窗口内的行）。写入侧成本：候选写入路径语句/提交数不变（`INSERT … ON CONFLICT` 与状态 `UPDATE`
+  各一条），只多维护一个部分索引的条目，且索引是部分索引，状态离开 `PENDING` 即删除条目。
+  负向验证：拒绝/过期扫描（`status IN ('REJECTED','EXPIRED') ORDER BY created_at`）与按条目列候选
+  （`item_id, status`）的计划在加索引前后一致；按 `status='PENDING'` 的计数改读更小的部分索引。
+  空库迁移由 `tests/storage/index_audit.rs::migrations_run_from_an_empty_database_and_settle_the_audited_indexes`
+  与本次新测试（`Database::connect` 建空库后跑迁移）共同覆盖；行为不变由
+  `storage::repository::repository_tests::cleanup_removes_expired_pending_candidates_after_grace` 保证。
+  `python3 scripts/check-migration-parity.py`、`python3 scripts/check-backend-branches.py` 均通过。
 
 ### S6 `jobs` SSE 事件的管理端放大（已读代码确认 + 频率推测）
 
@@ -423,6 +484,38 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `reidentify.rs:2705`，只是由聚合算出来），或对列表接口改成"只在请求带 `?includePending=1` 时算"。
 - **风险**：计数列需要与候选状态变更保持同步（`select/reject/expire` 三处）。
 - **是否值得做**：**中**（管理端，但与交接 §2 的 SSE 放大是同一类问题，值得一并处理）。
+- **已实施（提交 `4c20d3c8`（后端）+ `677a7508`、`6a7fc66c`（前端），2026-10-31，按所有者确认走"按需计算"，未加计数列）**：
+  项目所有者确认走"按需计算"，不做写侧维护的 `pending_count` 计数列（省掉 `select/reject/expire` 三处同步与迁移）。
+  - **改法（后端）**：`list_metadata_reidentify_jobs` 增加 `include_pending` 参数，四条页面语句固定为
+    "带/不带聚合 × 带/不带 `status` 过滤"；默认两条只扫 `metadata_reidentify_jobs`
+    （`pending_count` 取 `CAST(NULL AS BIGINT)`，SQLite 与 PostgreSQL 共用的两后端正字面量写法，无新增
+    `DatabaseBackend::` 分支，`?` 仍由 `adapt_sql_for_backend` 改写）。单作业详情
+    `find_metadata_reidentify_job` **保持聚合**（详情视图本来就展示这个数）。
+    `list_metadata_reidentify_jobs_for_activity` 也从 `0 AS pending_count` 改成 `NULL`（该字段在
+    `admin_task_activity` 里没有被消费）。HTTP：`GET /api/v1/admin/metadata/reidentify` 新增
+    `?includePending=1|true|yes|on` 开关，响应字段名不变，**未请求时 `pendingCount` 为 `null`**
+    （`StoredMetadataReidentifyJob`/`MetadataReidentifyJob.pending_count` 改为 `Option<i64>`）。
+  - **改法（前端）**：`AdminOperationsPage` 只在"运行记录"标签页（唯一渲染"低匹配 N 项"的视图）带
+    `includePending=1`，并把该选择编进查询键；切到该页时用 `keepPreviousData` 保留已有行，不退回整页加载态。
+    `useAdminEvents` 不再按固定 10 个键盲目失效，而是把每个 scope 的键对照查询缓存解析成**当前挂载页面实际订阅的
+    活跃查询**再逐个精确失效；没有观察者的页面留到它自己挂载时取数。
+  - **前后数字（静态口径 + `query_count` 断言，见第 2.2 节）**：
+    - 列表接口语句数：**1 → 1**（前后都是一条 SELECT，聚合是 CTE，不额外发语句），但默认页面的语句
+      **不再引用 `metadata_reidentify_job_items` / `metadata_candidates`**：聚合工作量
+      "选定页 ≤limit 个作业 × 每个作业的全部 `job_items` × 每行一次 `idx_metadata_candidates_item` 探测" **→ 0**。
+      断言方式：新建的表结构里**根本没有 `metadata_candidates` 表**，默认列表仍成功（`query_count() == 1`、
+      `pending_count == None`），显式请求在同库上则**必须**依赖该表（无表时返回错误）。
+    - 显式请求：语句数 **1 → 1**，数值与原来完全一致（同一 fixture：`Some(1)`；单作业详情同样 `Some(1)`）。
+    - 管理端 `jobs` 事件：每个 scope 从"固定 10 个键"变成"该视图像素上真正挂载的查询"。元数据作业运行、
+      停在"注册任务"/"日志"标签页时，`pendingCount` 的聚合**完全不进这条每秒路径**；只有切到"运行记录"
+      （真正展示该数字的视图）才会算。
+  - **风险**：
+    - `pendingCount` 未请求时是 `null` 而不是 `0`。本仓库唯一的消费者是 `AdminOperationsPage`（`?? 0` 兜底，
+      且只在展示时请求），没有外部契约依赖 `0`；若将来有消费者把"未计算"当"0 个待处理"，需要显式请求。
+    - SSE 失效范围收窄到活跃查询后，**未挂载页面**的缓存不再被每次事件标记为 stale，改为挂载时按
+      `staleTime`（默认 60 s）或该页面自己的 `refetchInterval` 刷新；已挂载页面的实时性不变（仍有 ≤1 次/秒）。
+    - 任务页自身仍订阅 8 个任务列表查询（标签徽标与"正在运行/失败记录"计数要用），所以 `jobs` 事件在该页面
+      仍然是 8 个请求/秒；要再往下压需要后端按作业种类拆分 scope 或提供轻量计数端点，**不在本任务范围**。
 
 ### S7 已确认正常、不需要改的部分
 
@@ -513,6 +606,35 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   `people.rs:642-658`），合并成一个大事务后仍然是单写者，但事务变长，会拉长其他写者的等待；
   需要确认最坏情况（100 演员、新库）的事务时长可接受。
 - **是否值得做**：**高**。建议先做方案 2（语义不变、风险低），再评估方案 1。
+- **审计口径更正（实施时复核）**：本节"即使演员已经存在也开事务"的说法与当前代码不符。`relations.rs` 的
+  `find_canonical_people_by_identities` 预加载（`relations.rs:504` 一带）已经把整页的身份映射一次读出来，演员的
+  身份全部命中时循环内**不发任何语句**（`mapped_person` 直接命中，`identities_to_attach` 为空）。真正的提交放大是
+  **新演员**：每人 `resolve_or_create_canonical_person`（1 次）+ `attach_canonical_person_identities`（1 次，即使
+  该身份刚由前者插入，也因为"未预加载命中"而再走一遍 `ON CONFLICT DO NOTHING` 的幂等写），即 2N 次；稳态
+  （整页演员都已存在）原本只有片尾 `replace_person_credits_*` 的 1 次提交。下面的前后数字按这个口径重测。
+- **已实施（方案 2）**：提交 `df1bd290`。
+  - 存储层新增 `CanonicalPersonBatch`（`src/storage/people.rs`）：`Database::begin_canonical_person_batch()` 开
+    **一个** `BEGIN IMMEDIATE`（PG 上是普通 `BEGIN`），`resolve_or_create_canonical_person` /
+    `attach_canonical_person_identities` / `enqueue_person_match_candidate` 与两处页内读（规范化名匹配、
+    match candidate 回读）都拆出 `_in_transaction` 变体，SQL 仍全部留在 `storage`。
+  - `relations.rs` 的演员循环改为：预加载身份映射 → 若整页有任一演员需要写（未映射身份，或需要记录歧义桥接
+    候选）就开一个页事务 → 循环解析 → **先提交整页，再上报失败**（保持"逐演员提交"时可观察的失败语义：失败前
+    已解析成功的演员仍然落库），失败演员自己的语句由 savepoint 回滚。
+  - 每次调用自带一个 savepoint（`SAVEPOINT` / 成功 `RELEASE` / 失败 `ROLLBACK TO … RELEASE`），因此"单个存储
+    调用要么全写要么全不写"与原来的"每次调用一个事务"完全一致；页内两处读也带 savepoint，这样 PG 上一条失败的
+    读语句不会把整页事务变成 aborted。SQLite 与 PG 用同一套语句，没有新增后端分支。
+  - 度量（§2.1 静态口径 + 测试里的提交计数）：
+    - 提交数（`persist_item_actors`，实测）：1 个新演员 **3 → 2**；12 个新演员 **25 → 2**（= 2N+1 → 2，其中 1 次是
+      片尾 `replace_person_credits_*`）；100 演员的新演员条目按 2N+1 推算 **201 → 2**。稳态（演员都已存在）
+      **1 → 1**：整页没有待写演员时不开事务，行为与改造前相同。
+    - 语句数：每个新演员 9 → 13（两个写调用各多 `SAVEPOINT` + `RELEASE` 两条，纯解析层、无 I/O、无提交）；
+      稳态页 0 → 0。
+  - 测试：`persist_item_actors_keeps_one_actor_transaction_per_page`（提交数不随演员数增长、稳态不开事务）、
+    `persist_item_actors_stores_every_cast_field_unchanged`（`people.json` 的 actors 逐字段对比）、
+    `canonical_person_batch_rolls_back_only_the_failed_write`（savepoint 只回滚失败调用，页内已解析的演员保留）。
+  - 剩余风险：事务窗口从"每演员一个短事务"变成"整页一个事务"，最坏 100 个新演员期间一直占着 SQLite 写者位
+    （含极少数歧义桥接分支里的快照文件写）。若 NAS 实测发现写者等待变长，可在页内按小批（例如 16 演员）分段提交，
+    提交数仍是 O(演员数/16)。
 
 ### M3 元数据选中无条件 `UPDATE media_items`（已读代码确认）
 
@@ -534,6 +656,29 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   另外 `rows_affected()` 在当前调用链没有被当作信号（`select_metadata_candidate_with_cache_and_collection_reference`
   只检查候选状态更新，`src/storage/metadata.rs:1823`），所以加条件本身不破坏语义。
 - **是否值得做**：**中-高**。
+- **已实施（提交 `ca9b9d6b`，2026-10-31）**：
+  - **`updated_at` 语义确认（改动前先查证）**：`media_items.updated_at` 的消费者全部把它当"这一行最后一次真实变化"：
+    Emby 详情 DTO 的 `DateLastSaved`/`DateModified`（`src/api/emby_catalog.rs:3609`）、列表 DTO 的
+    `DateModified`/`DateLastSaved`（`:3843-3857`）、Emby 增量刷新的 `MinDateLastSaved` 过滤条件
+    `mi.updated_at >= ?`（`src/storage/repository.rs:5084`），以及目录读模型把 `mi.updated_at` 原样复制到
+    `catalog_items.updated_at`（`src/storage/catalog_read_model.rs:1239`）。没有任何读模型或缓存靠"`updated_at`
+    推进"来失效：目录失效由 `catalog_outbox` 驱动，`media_items_updated_at_ai` 只补 INSERT 时 `updated_at = 0`。
+    因此**值未变时不刷新 `updated_at` 才是正确语义**，与 W3 已对 `update_media_item_metadata_in_transaction`
+    （`src/storage/catalog.rs`）、`sync_media_item_nfo_state`、`mark_media_item_metadata_checked` 采用的写法一致。
+  - **改法**：`src/storage/metadata.rs` 的选中 UPDATE 加 WHERE 条件，覆盖语句写入的每一列
+    （`title`/`sort_title`/`original_title`/`overview`/`production_year`、4 个 `COALESCE` 列按
+    `? IS NOT NULL AND col IS DISTINCT FROM ?`、`rating` 按存在标志、`provider_ids_json`、
+    `metadata_scraper_id`、`identification_status` 用与 SET 相同的 `CASE` 表达式比较、
+    `metadata_fingerprint`/`metadata_provenance_json`/`locked_fields_json`、`nfo_metadata_json IS NOT NULL`、
+    `nfo_metadata_fingerprint`、`poster_fallback_required`），`updated_at` 不参与条件。SQLite 与 PostgreSQL
+    共用同一条语句（`IS DISTINCT FROM` 两侧通用，占位符由现有适配层改写），未新增 `DatabaseBackend::` 分支。
+  - **前后数字（静态口径 + `query_count` 断言，见第 2.2 节）**：
+    - `media_items` 的 UPDATE：值全未变时 **1 条 → 0 条**（该事务仍会因候选状态更新而提交，所以**提交数不变**，
+      省下的是行写、`media_items_catalog_au` 触发与读模型重建）。
+    - `catalog_outbox`：同一场景 **最多 5 行 → 0 行**（`docs/INDEX-AUDIT.md` §7 的整行触发器不再触发）。
+    - 值真的变化时行为不变（1 行 UPDATE + 若干 outbox 行）。
+  - 测试：`src/storage/redundant_write_tests.rs::repeating_an_unchanged_metadata_selection_does_not_rewrite_the_item`
+    （相同值二次选中不改 `updated_at`、不增 `catalog_outbox`；改 `overview` 后仍写入并触发 outbox）。
 
 ### M4 未变更的 NFO 每次扫描仍重写 `collection_item_references`（已读代码确认）
 
@@ -560,6 +705,34 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
      批次（`src/application/metadata.rs:2255-2256` 的 flush），一次事务写整页。
 - **风险**：低。引用是派生数据，幂等；方案 1 不改变任何可见值。
 - **是否值得做**：**高**（改动小、频率高、与扫描写路径直接竞争）。
+- **已实施（提交 `ca9b9d6b`，2026-10-31）**（按方案 1，并额外把"完全没变化"的情况挡在写事务之前）：
+  - **改法**：`src/storage/catalog.rs` 抽出共享的 `STORED_MOVIE_COLLECTION_REFERENCE_QUERY`（沿用原来的
+    `collection_item_references` × `media_items` 单行投影）与纯比较函数 `collection_reference_is_unchanged`，
+    两个入口共用：
+    1. `replace_global_movie_collection_reference_in_transaction`（`Some` 与 `None` 两种情况都比现值，
+       相同即 `return Ok(())`）——覆盖选中/回填批量写事务里的引用更新。`Some` 时按 6 个存储列逐一比较；
+       `None` 时保留"未限定 NFO set id 且身份匹配则保留"的原语义，并新增"本来就没有行则不做 DELETE"。
+    2. `update_movie_collection_reference`（NFO 快路径的三个调用点都走它）先在池上做一次只读比较，
+       相同则**不取写锁、不开事务**直接返回。事务内会用同一函数再比较一次，所以这次预检与写入之间的
+       并发变更不会丢。
+  - **前后数字（静态口径 + `query_count`/generation 断言）**：
+    - 未变更复扫、电影属于合集（`Some`）：**1 次写事务 + 2 条写语句（DELETE+INSERT）→ 0 次事务 + 1 条读语句**；
+      `collection_item_references.updated_at` 不再被重置，`collection_sync_outbox.generation` **+2 → 0**
+      （若 5 000 部电影都有合集且都未变化，全库复扫从最多 5 000 次提交、最多 10 000 次 generation 增量降到 0）。
+    - 未变更复扫、电影没有合集（`None`）：**1 次写事务 + 1 条 0 行 DELETE → 0 次事务 + 1 条 SELECT**。
+    - 引用真的变化：**1 次事务 + 2 条语句 → 1 次事务 + 3 条语句**（事务内多一次比较读，换取并发安全），
+      写入值与 generation 语义完全不变。批量路径 `commit_local_nfo_state_batch_with_collection_references`
+      同理：每个引用更新多 1 条事务内 SELECT，无变化的不再 DELETE+INSERT（不增加提交）。
+  - **附带调整**：`src/storage/mod.rs` 的 `metadata_selection_updates_collection_reference_in_the_same_transaction`
+    用 `BEFORE INSERT` 触发器注入失败来验证事务回滚，原来第二次选中传入的是**同一个**引用；幂等跳过之后
+    INSERT 不再发生，触发器也就打不到。测试改为传入**不同的合集引用**，验证的语义（引用写失败时条目与候选一起回滚）
+    保持不变。
+  - 测试：`src/storage/redundant_write_tests.rs::repeating_an_unchanged_collection_reference_does_not_rewrite_the_reference_row`
+    （相同引用第二次只花 1 条语句、行 `updated_at` 与 `collection_sync_outbox.generation` 不变；改合集后仍写入并改 generation；
+    去掉引用仍删除）与 `::a_movie_without_a_collection_reference_does_not_open_a_write_transaction`；
+    端到端 `src/application/metadata.rs::tests::rescanning_an_unchanged_nfo_does_not_rewrite_the_collection_reference`
+    （复扫同一份未变 NFO：`nfo_skipped == 1`、引用行与 `media_items.updated_at` 的哨兵值不变、`catalog_outbox`
+    行数不增、`collection_sync_outbox.generation` 不变；改 NFO 的 `<setid>` 后仍替换引用并入队）。
 
 ### M5 每张图片 3 个写事务，串行在元数据写锁上（已读代码确认）
 
@@ -678,6 +851,10 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   （SQLite + PG 配对迁移，`scripts/check-migration-parity.py` 会校验）。
 - **风险**：多一个索引 = 候选表写成本略增（候选写入已经是批量，影响有限）。
 - **是否值得做**：**中**。
+- **已实施（提交 `80cd3a4b`，2026-10-31）**：按建议修法新增部分索引 `idx_metadata_candidates_pending_expiry`
+  （`(status, expires_at, id) WHERE status = 'PENDING'`），SQLite 侧是 `0244`、PostgreSQL 侧是配对的 `0246`。
+  计划与前后数字见 §S5 的「已实施」条目：排序消失，清理语句数 1 → 1、写提交数 1 → 1，写侧只多一个部分索引条目。
+  该索引是覆盖索引：`id` 作为第三列，`DELETE … WHERE id IN (SELECT id …)` 的子查询只读索引，不再回表。
 
 ### I2 `web_playback_sessions(state, plan, updated_at)`（已读代码确认，建议不做）
 
@@ -714,16 +891,16 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
 1. **批次 1（零行为变化，收益确定）**
    - H1 的副产品：删掉 `reserve_playback_admission` 里重复的第二次计数（`sessions.rs:378`）。
    - H2 第 1、3 条：合并 session 投影、复用策略行（`session.rs:890-934`）。
-   - M4：给 `collection_item_references` 加现值比较（`catalog.rs:7775-7853`）。
+   - M4：给 `collection_item_references` 加现值比较（`catalog.rs:7775-7853`）。**已实施（提交 `ca9b9d6b`）**。
    - M2 方案 2：演员循环放进一个事务（`src/storage/people.rs` + `relations.rs` 签名）。
    - M5 方案 1：finish 与图片行同一事务。
    - S1：候选能力写入移到循环之后。
-   - M3：`UPDATE media_items` 加 `IS DISTINCT FROM` 式条件（需要先确认 `updated_at` 语义）。
+   - M3：`UPDATE media_items` 加 `IS DISTINCT FROM` 式条件（需要先确认 `updated_at` 语义）。**已实施（提交 `ca9b9d6b`）**。
 2. **批次 2（需要所有者确认"可能改变可观察行为"）**
    - H1：分片路径改"renew 优先、失败回落 reserve"（并发上限最长滞后一个心跳周期）。
-   - S6：`pending_count` 改计数列或按需计算。
+   - S6：`pending_count` 改计数列或按需计算（所有者确认"按需计算"）。**已实施（提交 `4c20d3c8` + `677a7508`）**。
 3. **批次 3（要有实测支撑再做）**
-   - S5/I1 索引迁移（先在一份库副本上 `EXPLAIN QUERY PLAN` 对比）。
+   - S5/I1 索引迁移（先在一份库副本上 `EXPLAIN QUERY PLAN` 对比）。**已实施（提交 `80cd3a4b`，两组迁移 0244/0246，测试里带前后计划断言）**。
    - S2/S3/S4 的读复用、M8/M9、H3/H4/H5/H6（顺手做）。
 4. **不做**
    - H7/I2（加索引反而增加高频更新表的写成本）、I3。

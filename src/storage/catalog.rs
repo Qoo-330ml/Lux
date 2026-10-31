@@ -21,6 +21,77 @@ const MEDIA_METADATA_UPDATE_BATCH_SIZE: usize = 16;
 const MEDIA_STREAM_INSERT_BATCH_SIZE: usize = 75;
 const MEDIA_CHAPTER_INSERT_BATCH_SIZE: usize = 100;
 
+/// The stored collection reference of one movie: the six reference columns plus the item's
+/// provider ids, which the unqualified-NFO-set-id comparison needs.
+///
+/// `collection_item_references` allows one row per `(item_id, collection_provider,
+/// collection_provider_id)`, but every writer in `storage` deletes all rows of an item before
+/// inserting, so reading one row per item is exact.
+type StoredMovieCollectionReferenceRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    Option<i64>,
+    Option<String>,
+);
+
+/// [`StoredMovieCollectionReferenceRow`] as a single query, shared by the pre-check and the
+/// in-transaction comparison so both make the same decision.
+const STORED_MOVIE_COLLECTION_REFERENCE_QUERY: &str =
+    "SELECT reference.collection_provider_id, reference.movie_provider,
+            reference.movie_provider_id, reference.collection_provider,
+            reference.collection_title, reference.sort_order,
+            item.provider_ids_json
+     FROM collection_item_references reference
+     JOIN media_items item ON item.id = reference.item_id
+     WHERE reference.item_id = ?
+     LIMIT 1";
+
+/// Whether writing `reference` to `collection_item_references` would change nothing.
+///
+/// `reference` is the value derived from the current NFO; `unqualified_nfo_set_id` is the NFO set
+/// id without a provider namespace, which defers to an already stored qualified reference.
+fn collection_reference_is_unchanged(
+    stored: Option<&StoredMovieCollectionReferenceRow>,
+    reference: Option<&GlobalMovieCollectionReference>,
+    unqualified_nfo_set_id: Option<&str>,
+) -> bool {
+    let Some((
+        collection_provider_id,
+        movie_provider,
+        movie_provider_id,
+        collection_provider,
+        collection_title,
+        sort_order,
+        provider_ids_json,
+    )) = stored
+    else {
+        // Nothing is stored, so neither deleting nor inserting anything is a change.
+        return reference.is_none();
+    };
+    let Some(reference) = reference else {
+        return unqualified_nfo_set_id.is_some_and(|set_id| {
+            GlobalMovieCollectionReference {
+                movie_provider: movie_provider.clone(),
+                movie_provider_id: movie_provider_id.clone(),
+                collection_provider: collection_provider.clone(),
+                collection_provider_id: collection_provider_id.clone(),
+                collection_title: collection_title.clone(),
+                sort_order: *sort_order,
+            }
+            .matches_existing_nfo_identity(set_id, provider_ids_json.as_deref())
+        });
+    };
+    collection_provider_id == &reference.collection_provider_id
+        && movie_provider == &reference.movie_provider
+        && movie_provider_id == &reference.movie_provider_id
+        && collection_provider == &reference.collection_provider
+        && collection_title == &reference.collection_title
+        && *sort_order == reference.sort_order
+}
+
 /// Typed projection of the catalog detail batch: one SELECT list, so the shape can be a struct.
 #[derive(sqlx::FromRow)]
 struct CatalogDetailRow {
@@ -7717,6 +7788,22 @@ impl Database {
         reference: Option<&GlobalMovieCollectionReference>,
         unqualified_nfo_set_id: Option<&str>,
     ) -> Result<(), StorageError> {
+        // Every rescan of an unchanged NFO reaches this entry point with the reference already
+        // stored. Opening the metadata write transaction for a `DELETE` + `INSERT` that re-creates
+        // the same row is pure write amplification: it takes the single writer slot, commits, and
+        // (through the reference triggers) queues a global collection sync per scanned movie.
+        // Comparing the stored value first costs one read and no transaction. The transaction
+        // below re-checks under the write lock, so a change committed in between is still applied.
+        if self
+            .stored_movie_collection_reference_is_current(
+                item_id,
+                reference,
+                unqualified_nfo_set_id,
+            )
+            .await?
+        {
+            return Ok(());
+        }
         let _write_guard = self.acquire_metadata_write_lock().await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         self.replace_global_movie_collection_reference_in_transaction(
@@ -7727,6 +7814,26 @@ impl Database {
         )
         .await?;
         transaction.commit().await.map_err(self.sqlx_err())
+    }
+
+    /// Reads the stored reference of one movie without taking the write lock or a transaction.
+    async fn stored_movie_collection_reference_is_current(
+        &self,
+        item_id: &str,
+        reference: Option<&GlobalMovieCollectionReference>,
+        unqualified_nfo_set_id: Option<&str>,
+    ) -> Result<bool, StorageError> {
+        let stored = self
+            .query_as::<StoredMovieCollectionReferenceRow>(STORED_MOVIE_COLLECTION_REFERENCE_QUERY)
+            .bind(item_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(collection_reference_is_unchanged(
+            stored.as_ref(),
+            reference,
+            unqualified_nfo_set_id,
+        ))
     }
 
     pub(crate) async fn commit_local_nfo_state_batch(
@@ -7795,6 +7902,10 @@ impl Database {
         Ok(())
     }
 
+    /// Replaces the derived reference of one movie unless the stored row already holds it.
+    ///
+    /// A `DELETE` + `INSERT` of identical values still resets the row's `updated_at` and bumps the
+    /// `collection_sync_outbox` generation twice, so unchanged rescans must not reach the write.
     pub(crate) async fn replace_global_movie_collection_reference_in_transaction(
         &self,
         transaction: &mut sqlx::Transaction<'_, Any>,
@@ -7802,51 +7913,14 @@ impl Database {
         reference: Option<&GlobalMovieCollectionReference>,
         unqualified_nfo_set_id: Option<&str>,
     ) -> Result<(), StorageError> {
-        if reference.is_none()
-            && let Some(set_id) = unqualified_nfo_set_id
-            && let Some((
-                collection_provider_id,
-                movie_provider,
-                movie_provider_id,
-                collection_provider,
-                collection_title,
-                sort_order,
-                provider_ids_json,
-            )) = self
-                .query_as::<(
-                    String,
-                    String,
-                    String,
-                    String,
-                    String,
-                    Option<i64>,
-                    Option<String>,
-                )>(
-                    "SELECT reference.collection_provider_id, reference.movie_provider,
-                            reference.movie_provider_id, reference.collection_provider,
-                            reference.collection_title, reference.sort_order,
-                            item.provider_ids_json
-                     FROM collection_item_references reference
-                     JOIN media_items item ON item.id = reference.item_id
-                     WHERE reference.item_id = ?
-                     LIMIT 1",
-                )
-                .bind(item_id)
-                .fetch_optional(&mut **transaction)
-                .await
-                .map_err(self.sqlx_err())?
-        {
-            let existing = GlobalMovieCollectionReference {
-                movie_provider,
-                movie_provider_id,
-                collection_provider,
-                collection_provider_id,
-                collection_title,
-                sort_order,
-            };
-            if existing.matches_existing_nfo_identity(set_id, provider_ids_json.as_deref()) {
-                return Ok(());
-            }
+        let stored = self
+            .query_as::<StoredMovieCollectionReferenceRow>(STORED_MOVIE_COLLECTION_REFERENCE_QUERY)
+            .bind(item_id)
+            .fetch_optional(&mut **transaction)
+            .await
+            .map_err(self.sqlx_err())?;
+        if collection_reference_is_unchanged(stored.as_ref(), reference, unqualified_nfo_set_id) {
+            return Ok(());
         }
         self.query("DELETE FROM collection_item_references WHERE item_id = ?")
             .bind(item_id)

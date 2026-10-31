@@ -186,7 +186,7 @@ fn fill_missing_dispatch_job(id: &str, library_id: &str) -> MetadataReidentifyJo
         cancel_requested: false,
         library_id: Some(library_id.to_owned()),
         job_scope: "ITEMS".to_owned(),
-        pending_count: 0,
+        pending_count: Some(0),
     }
 }
 
@@ -775,6 +775,30 @@ async fn admin_can_start_and_poll_metadata_reidentify() -> Result<(), Box<dyn st
                 && job["libraryId"] == library.id.to_string()
         })
     }));
+    // The default page must not aggregate pending candidates: the field is null (or absent)
+    // until the caller opts in.
+    assert!(
+        listed_body["jobs"]
+            .as_array()
+            .is_some_and(|jobs| { jobs.iter().all(|job| job["pendingCount"].is_null()) })
+    );
+
+    let listed_with_pending = client
+        .get(format!(
+            "{base_url}/api/v1/admin/metadata/reidentify?page=1&pageSize=50&includePending=1"
+        ))
+        .header(COOKIE, &cookies)
+        .send()
+        .await?;
+    assert_eq!(listed_with_pending.status(), reqwest::StatusCode::OK);
+    let listed_with_pending_body: Value = listed_with_pending.json().await?;
+    assert!(
+        listed_with_pending_body["jobs"]
+            .as_array()
+            .is_some_and(|jobs| {
+                !jobs.is_empty() && jobs.iter().all(|job| job["pendingCount"].is_number())
+            })
+    );
 
     let refresh_started = client
         .post(format!(
