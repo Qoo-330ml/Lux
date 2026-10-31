@@ -529,6 +529,16 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of `media_content_restriction_classifications_for_item`: one related item of the target,
+/// its optional stored classification and one of its tags.
+#[derive(Debug, sqlx::FromRow)]
+struct ContentRestrictionClassificationRow {
+    related_item_id: String,
+    indexed_item_id: Option<String>,
+    certification_code: Option<String>,
+    tag: Option<String>,
+}
+
 /// Row of `list_global_collection_cards_page_ordered`: one global collection card plus the two
 /// poster lookups the ordering query resolves in the same statement.
 #[derive(Debug, sqlx::FromRow)]
@@ -8485,7 +8495,7 @@ impl Database {
         item_id: &str,
     ) -> Result<Vec<(Option<String>, Vec<String>, bool)>, StorageError> {
         let rows = self
-            .query(
+            .query_as::<ContentRestrictionClassificationRow>(
                 "SELECT related.id AS related_item_id,
                         restriction_index.item_id AS indexed_item_id,
                         restriction_index.certification_code,
@@ -8507,18 +8517,16 @@ impl Database {
             .map_err(self.sqlx_err())?;
         let mut classifications = BTreeMap::new();
         for row in rows {
-            let related_item_id: String = row.get("related_item_id");
-            let indexed_item_id: Option<String> = row.get("indexed_item_id");
-            let certification_code: Option<String> = row.get("certification_code");
-            let tag: Option<String> = row.get("tag");
-            let classification = classifications.entry(related_item_id).or_insert_with(|| {
-                (
-                    certification_code,
-                    Vec::<String>::new(),
-                    indexed_item_id.is_some(),
-                )
-            });
-            if let Some(tag) = tag
+            let classification = classifications
+                .entry(row.related_item_id)
+                .or_insert_with(|| {
+                    (
+                        row.certification_code,
+                        Vec::<String>::new(),
+                        row.indexed_item_id.is_some(),
+                    )
+                });
+            if let Some(tag) = row.tag
                 && !classification.1.contains(&tag)
             {
                 classification.1.push(tag);
@@ -13103,6 +13111,82 @@ mod nfo_cache_row_decoding_tests {
         assert_eq!(cached.1, None);
         assert_eq!(cached.2, 2);
         assert_eq!(cached.3, 200);
+        Ok(())
+    }
+}
+
+/// Decoding test for the content-restriction classification projection.
+#[cfg(test)]
+mod content_restriction_classification_row_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn classification_rows_decode_related_certifications_and_tags()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind) VALUES ('cr-lib', 'Restrictions', 'SERIES');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('cr-series', 'cr-lib', 'SERIES', 'Series', 'series',
+                      'LOCAL_CONFIRMED', 1),
+                     ('cr-season', 'cr-lib', 'SEASON', 'Season', 'season',
+                      'LOCAL_CONFIRMED', 1),
+                     ('cr-episode', 'cr-lib', 'EPISODE', 'Episode', 'episode',
+                      'LOCAL_CONFIRMED', 1);
+                 UPDATE media_items
+                 SET series_id = 'cr-series', season_number = 1
+                 WHERE id = 'cr-season';
+                 UPDATE media_items
+                 SET series_id = 'cr-series', parent_id = 'cr-season', season_number = 1,
+                     episode_number = 1
+                 WHERE id = 'cr-episode';
+                 INSERT INTO media_content_restriction_index (item_id, certification_code)
+                 VALUES ('cr-episode', 'R'), ('cr-season', 'PG');
+                 INSERT INTO media_content_restriction_tags (item_id, tag)
+                 VALUES ('cr-episode', 'violence'), ('cr-episode', 'gore')",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let classifications = database
+            .media_content_restriction_classifications_for_item("cr-episode")
+            .await?;
+        assert_eq!(classifications.len(), 3);
+        assert_eq!(
+            classifications[0],
+            (
+                Some("R".to_owned()),
+                vec!["gore".to_owned(), "violence".to_owned()],
+                true
+            )
+        );
+        assert_eq!(
+            classifications[1],
+            (Some("PG".to_owned()), Vec::new(), true)
+        );
+        assert_eq!(classifications[2], (None, Vec::new(), false));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn classification_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = ContentRestrictionClassificationRow::from_row(&row)
+            .expect_err("classification columns must not decode");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
         Ok(())
     }
 }
