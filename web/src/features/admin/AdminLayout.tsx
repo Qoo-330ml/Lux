@@ -2,8 +2,9 @@ import "./admin.css";
 import "./users-workspace.css";
 import { Activity, BellRing, BookOpen, Cpu, Database, FileClock, PackageOpen, Settings2, ShieldCheck, Users } from "lucide-react";
 import { useQueryClient } from "@tanstack/react-query";
-import { Suspense } from "react";
-import { NavLink, Outlet } from "react-router-dom";
+import { MoreHorizontal } from "lucide-react";
+import { Suspense, useEffect, useState } from "react";
+import { NavLink, Outlet, useLocation } from "react-router-dom";
 import { prefetchAdminPage } from "./admin-navigation";
 import { useAdminEvents } from "./useAdminEvents";
 
@@ -19,9 +20,22 @@ export const adminNav = [
   { to: "/admin/changelog", label: "更新日志", icon: BookOpen },
 ];
 
+/** Phone bottom bar shows the first entries; the rest live in the "more" sheet. */
+const primaryNavCount = 4;
+const primaryNav = adminNav.slice(0, primaryNavCount);
+const secondaryNav = adminNav.slice(primaryNavCount);
+
 export function AdminLayout() {
   const queryClient = useQueryClient();
+  const { pathname } = useLocation();
+  const [moreOpen, setMoreOpen] = useState(false);
   useAdminEvents();
+
+  useEffect(() => {
+    setMoreOpen(false);
+  }, [pathname]);
+
+  const secondaryActive = secondaryNav.some(({ to }) => pathname === to || pathname.startsWith(`${to}/`));
 
   const preload = (to: string) => {
     prefetchAdminPage(queryClient, to);
@@ -55,6 +69,48 @@ export function AdminLayout() {
           <Outlet />
         </Suspense>
       </div>
+      <nav className="lux-admin-tabbar" aria-label="管理员导航（手机）">
+        {primaryNav.map(({ to, label, icon: Icon, end }) => (
+          <NavLink
+            key={to}
+            to={to}
+            end={end}
+            className={tabClass}
+            onPointerDown={() => preload(to)}
+          >
+            <Icon size={21} strokeWidth={1.8} /><span>{label}</span>
+          </NavLink>
+        ))}
+        <button
+          type="button"
+          className={`lux-admin-tab lux-admin-tab-more${moreOpen || secondaryActive ? " is-active" : ""}`}
+          aria-expanded={moreOpen}
+          onClick={() => setMoreOpen((open) => !open)}
+        >
+          <MoreHorizontal size={21} strokeWidth={1.8} /><span>更多</span>
+        </button>
+      </nav>
+      {moreOpen ? (
+        <>
+          <div className="lux-admin-more-scrim" role="presentation" onClick={() => setMoreOpen(false)} />
+          <div className="lux-admin-more-sheet" aria-label="更多管理">
+            <span className="lux-admin-more-grab" aria-hidden="true" />
+            <h2>更多管理</h2>
+            <div className="lux-admin-more-grid">
+              {secondaryNav.map(({ to, label, icon: Icon }) => (
+                <NavLink
+                  key={to}
+                  to={to}
+                  className={({ isActive }) => (isActive ? "lux-admin-more-item is-active" : "lux-admin-more-item")}
+                  onPointerDown={() => preload(to)}
+                >
+                  <Icon size={22} strokeWidth={1.8} /><span>{label}</span>
+                </NavLink>
+              ))}
+            </div>
+          </div>
+        </>
+      ) : null}
     </section>
   );
 }
@@ -67,6 +123,10 @@ function AdminPageSkeleton() {
       <div className="lux-skeleton-row lux-admin-page-skeleton-content" aria-hidden="true" />
     </div>
   );
+}
+
+function tabClass({ isActive }: { isActive: boolean }) {
+  return isActive ? "lux-admin-tab is-active" : "lux-admin-tab";
 }
 
 function adminNavClass({ isActive }: { isActive: boolean }) {

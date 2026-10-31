@@ -2580,3 +2580,114 @@ html[data-lux-theme="light"] .lux-operations-log-row:hover { background: rgba(28
 .lux-operations-log-details li strong { min-width: 0; color: var(--lux-text); font-weight: 500; overflow-wrap: anywhere; }
 
 html[data-lux-theme="light"] .lux-operations-log-details { background: rgba(28,28,34,.04); }
+
+/* Phone admin shell: bottom tab bar + "more" sheet replace the sidebar navigation. */
+.lux-admin-tabbar,
+.lux-admin-more-scrim,
+.lux-admin-more-sheet { display: none; }
+
+@media (max-width: 900px) {
+  .lux-admin-layout { padding-bottom: calc(96px + env(safe-area-inset-bottom)); }
+  .lux-admin-sidebar { display: none; }
+  .lux-admin-content { padding-bottom: 24px; }
+
+  .lux-admin-tabbar {
+    position: fixed;
+    z-index: 40;
+    right: max(12px, env(safe-area-inset-right));
+    bottom: max(12px, env(safe-area-inset-bottom));
+    left: max(12px, env(safe-area-inset-left));
+    display: flex;
+    gap: 2px;
+    height: 64px;
+    padding: 6px;
+    border: 1px solid var(--lux-line);
+    border-radius: 26px;
+    background: color-mix(in srgb, var(--lux-surface-strong) 84%, transparent);
+    backdrop-filter: blur(22px) saturate(1.4);
+    -webkit-backdrop-filter: blur(22px) saturate(1.4);
+  }
+  .lux-admin-tab {
+    flex: 1 1 0;
+    min-width: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 3px;
+    border: 0;
+    border-radius: 20px;
+    background: transparent;
+    color: var(--lux-muted);
+    font: inherit;
+    font-size: .66rem;
+    cursor: pointer;
+    transition: color .2s ease, background .2s ease;
+  }
+  .lux-admin-tab.is-active { color: var(--lux-text); background: rgba(255,255,255,.1); }
+
+  .lux-admin-more-scrim { display: block; position: fixed; z-index: 41; inset: 0; background: rgba(0,0,0,.55); }
+  .lux-admin-more-sheet {
+    display: block;
+    position: fixed;
+    z-index: 42;
+    right: 0;
+    bottom: 0;
+    left: 0;
+    padding: 10px 16px calc(100px + env(safe-area-inset-bottom));
+    border-top: 1px solid var(--lux-line);
+    border-radius: 28px 28px 0 0;
+    background: var(--lux-surface-strong);
+    animation: lux-admin-sheet-in .35s var(--lux-ease);
+  }
+  .lux-admin-more-grab { display: block; width: 38px; height: 4px; margin: 0 auto 14px; border-radius: 9px; background: var(--lux-line); }
+  .lux-admin-more-sheet h2 { margin: 0 4px 10px; color: var(--lux-subtle); font-size: .75rem; font-weight: 500; letter-spacing: .04em; }
+  .lux-admin-more-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+  .lux-admin-more-item {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    padding: 16px 4px 12px;
+    border: 1px solid var(--lux-line-soft);
+    border-radius: 16px;
+    color: var(--lux-text);
+    background: rgba(255,255,255,.04);
+    font-size: .75rem;
+  }
+  .lux-admin-more-item svg { color: var(--lux-accent); }
+  .lux-admin-more-item.is-active { border-color: var(--lux-line); background: rgba(255,255,255,.1); }
+}
+
+@keyframes lux-admin-sheet-in { from { transform: translateY(100%); } }
+
+@media (prefers-reduced-motion: reduce) {
+  .lux-admin-more-sheet { animation: none; }
+}
+
+/* Phone dashboard: media/user counts share one row, resource cards shrink to slim rows. */
+@media (max-width: 640px) {
+  .lux-bento-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }
+  .lux-bento-card-hero,
+  .lux-bento-card-cpu,
+  .lux-bento-card-mem,
+  .lux-bento-card-storage { grid-column: span 6; }
+  .lux-bento-card-media-count,
+  .lux-bento-card-users { grid-column: span 2; min-height: 0; padding: 12px; }
+  .lux-bento-card-cpu,
+  .lux-bento-card-mem,
+  .lux-bento-card-storage,
+  .lux-bento-card-hero { min-height: 0; padding: 12px 14px; }
+  .lux-bento-card-media-count .lux-bento-card-header,
+  .lux-bento-card-users .lux-bento-card-header { margin-bottom: 0; }
+  .lux-bento-card-media-count .lux-bento-metric-body,
+  .lux-bento-card-users .lux-bento-metric-body { margin: 2px 0 0; }
+  .lux-bento-big-num { font-size: 1.3rem !important; }
+  .lux-bento-card-cpu .lux-bento-card-header,
+  .lux-bento-card-mem .lux-bento-card-header,
+  .lux-bento-card-storage .lux-bento-card-header { margin-bottom: 0; }
+  .lux-bento-card-cpu .lux-bento-metric-body,
+  .lux-bento-card-mem .lux-bento-metric-body,
+  .lux-bento-card-storage .lux-bento-metric-body { margin: 4px 0 0; }
+  .lux-bento-card:hover { transform: none; }
+}
