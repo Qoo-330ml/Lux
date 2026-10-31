@@ -1,4 +1,4 @@
-import { useQueryClient, type QueryKey } from "@tanstack/react-query";
+import { useQueryClient, type QueryClient, type QueryKey } from "@tanstack/react-query";
 import { useEffect, useRef } from "react";
 
 type AdminEventScope =
@@ -58,6 +58,26 @@ const queryKeysByScope: Record<Exclude<AdminEventScope, "all">, QueryKey[]> = {
   ],
 };
 
+/**
+ * Invalidates only the queries a mounted admin view is currently subscribed to.
+ *
+ * The scope lists above describe which data a kind of event can make stale, not which pages are
+ * open. Refreshing every listed key blindly makes the server answer requests for pages that are
+ * not on screen -- the `jobs` stream alone would touch ten keys up to once per second while a job
+ * runs. An unmounted page fetches again when it mounts, so it does not need the refresh here.
+ */
+function invalidateSubscribedQueries(queryClient: QueryClient, queryKeys: QueryKey[]) {
+  const subscribed = new Map<string, QueryKey>();
+  for (const queryKey of queryKeys) {
+    for (const query of queryClient.getQueryCache().findAll({ queryKey, type: "active" })) {
+      subscribed.set(JSON.stringify(query.queryKey), query.queryKey);
+    }
+  }
+  for (const queryKey of subscribed.values()) {
+    void queryClient.invalidateQueries({ queryKey, exact: true });
+  }
+}
+
 export function useAdminEvents() {
   const queryClient = useQueryClient();
   const pendingKeys = useRef(new Map<string, QueryKey>());
@@ -69,9 +89,7 @@ export function useAdminEvents() {
       flushTimer.current = null;
       const keys = [...pendingKeys.current.values()];
       pendingKeys.current.clear();
-      for (const queryKey of keys) {
-        void queryClient.invalidateQueries({ queryKey });
-      }
+      invalidateSubscribedQueries(queryClient, keys);
     };
     const invalidate = (scope: AdminEventScope) => {
       const keys = scope === "all" ? [adminQueryRoot] : queryKeysByScope[scope];

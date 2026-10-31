@@ -1,4 +1,4 @@
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { keepPreviousData, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   AlertTriangle,
   CalendarDays,
@@ -232,9 +232,18 @@ export function AdminOperationsPage() {
       : api.adminJobs(status || undefined),
     enabled: status !== "DEFERRED",
   });
+  // The pending aggregation only feeds the "低匹配 N 项" link on the runtime records rows, so it is
+  // requested only while that tab is on screen; the badge counts need no pending number.
+  const includePendingMetadataJobs = tab === "runs";
   const metadataJobs = useQuery({
-    queryKey: queryKeys.adminMetadataJobs(status),
-    queryFn: () => api.adminMetadataReidentifyJobs(metadataStatusFilter(status)),
+    queryKey: queryKeys.adminMetadataJobs(status, includePendingMetadataJobs),
+    queryFn: () =>
+      api.adminMetadataReidentifyJobs(metadataStatusFilter(status), {
+        includePending: includePendingMetadataJobs,
+      }),
+    // Switching to the runtime records keeps the rows already on screen while the pending
+    // counts arrive, instead of replacing them with a full loading state.
+    placeholderData: includePendingMetadataJobs ? keepPreviousData : undefined,
   });
   const strmJobs = useQuery({
     queryKey: queryKeys.adminStrmProbeJobs(status),

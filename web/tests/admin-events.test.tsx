@@ -1,9 +1,9 @@
 // @vitest-environment jsdom
 
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { AdminLayout } from "../src/features/admin/AdminLayout";
 
@@ -40,6 +40,16 @@ class FakeEventSource {
   }
 }
 
+/** Stands in for an admin page that subscribes to two of the `jobs` scope query keys. */
+function SubscribedAdminQueries() {
+  useQuery({
+    queryKey: ["admin", "metadata-jobs", "all", "base"],
+    queryFn: () => new Promise<never>(() => {}),
+  });
+  useQuery({ queryKey: ["admin", "logs"], queryFn: () => new Promise<never>(() => {}) });
+  return null;
+}
+
 describe("admin SSE events", () => {
   let container: HTMLDivElement;
   let root: Root;
@@ -59,21 +69,29 @@ describe("admin SSE events", () => {
     vi.restoreAllMocks();
   });
 
-  it("opens one authenticated stream and invalidates matching queries", async () => {
-    vi.useFakeTimers();
+  function renderAdminLayout(subscribed: boolean) {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
-    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
-
     act(() => {
       root = createRoot(container);
       root.render(
         <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
+          <MemoryRouter initialEntries={["/admin"]}>
+            <Routes>
+              <Route path="/admin" element={<AdminLayout />}>
+                <Route index element={subscribed ? <SubscribedAdminQueries /> : null} />
+              </Route>
+            </Routes>
           </MemoryRouter>
         </QueryClientProvider>,
       );
     });
+    return queryClient;
+  }
+
+  it("opens one authenticated stream and invalidates the queries the mounted view subscribes to", async () => {
+    vi.useFakeTimers();
+    const queryClient = renderAdminLayout(true);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
     await act(async () => await Promise.resolve());
 
     expect(FakeEventSource.instances).toHaveLength(1);
@@ -82,37 +100,35 @@ describe("admin SSE events", () => {
 
     act(() => source.emit("open"));
     act(() => vi.advanceTimersByTime(250));
-    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["admin"] });
+    expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
+    ]);
 
     invalidate.mockClear();
     act(() => source.emit("invalidate", JSON.stringify({ scope: "jobs" })));
     act(() => vi.advanceTimersByTime(250));
+    // The eight other job queries no mounted admin view observes are left alone instead of
+    // being refreshed (and, with the metadata list, aggregated) once per second.
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
-      { queryKey: ["admin", "jobs"] },
-      { queryKey: ["admin", "metadata-jobs"] },
-      { queryKey: ["admin", "strm-probe-jobs"] },
-      { queryKey: ["admin", "chapter-detection-jobs"] },
-      { queryKey: ["admin", "danmaku-match-jobs"] },
-      { queryKey: ["admin", "library-cover-jobs"] },
-      { queryKey: ["admin", "task-activity"] },
-      { queryKey: ["admin", "scheduled-tasks"] },
-      { queryKey: ["admin", "dashboard"] },
-      { queryKey: ["admin", "logs"] },
+      { queryKey: ["admin", "metadata-jobs", "all", "base"], exact: true },
+      { queryKey: ["admin", "logs"], exact: true },
     ]);
   });
 
+  it("does not refetch job queries no admin view is subscribed to", async () => {
+    vi.useFakeTimers();
+    const queryClient = renderAdminLayout(false);
+    const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
+    await act(async () => await Promise.resolve());
+
+    act(() => FakeEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "jobs" })));
+    act(() => vi.advanceTimersByTime(250));
+    expect(invalidate).not.toHaveBeenCalled();
+  });
+
   it("closes the stream when the admin layout unmounts", () => {
-    const queryClient = new QueryClient();
-    act(() => {
-      root = createRoot(container);
-      root.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
+    renderAdminLayout(false);
 
     const source = FakeEventSource.instances[0];
     act(() => root.unmount());
@@ -121,42 +137,20 @@ describe("admin SSE events", () => {
 
   it("does not refresh metadata jobs twice for metadata audit events", async () => {
     vi.useFakeTimers();
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = renderAdminLayout(true);
     const invalidate = vi.spyOn(queryClient, "invalidateQueries").mockResolvedValue();
-
-    act(() => {
-      root = createRoot(container);
-      root.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
     await act(async () => await Promise.resolve());
 
     act(() => FakeEventSource.instances[0].emit("invalidate", JSON.stringify({ scope: "metadata" })));
     act(() => vi.advanceTimersByTime(250));
     expect(invalidate.mock.calls.map(([options]) => options)).toEqual([
-      { queryKey: ["admin", "logs"] },
+      { queryKey: ["admin", "logs"], exact: true },
     ]);
   });
 
   it("prefetches a target page when its navigation link is activated", () => {
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const queryClient = renderAdminLayout(false);
     const prefetch = vi.spyOn(queryClient, "prefetchQuery").mockResolvedValue(undefined);
-
-    act(() => {
-      root = createRoot(container);
-      root.render(
-        <QueryClientProvider client={queryClient}>
-          <MemoryRouter>
-            <AdminLayout />
-          </MemoryRouter>
-        </QueryClientProvider>,
-      );
-    });
 
     const pluginsLink = [...container.querySelectorAll<HTMLAnchorElement>("a")]
       .find((link) => link.getAttribute("href") === "/admin/plugins");
