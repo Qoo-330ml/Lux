@@ -571,6 +571,21 @@ Web 端在创建会话时就写好 device/client（`sessions.rs:1074-1096`），
   方案 1、3 无行为变化。
 - **是否值得做**：**中**（方案 1 + 3 先做）。
 
+- **已实施：方案 1，提交 `3fb1189c`**。`download_item_image_attempt_at_index` 把自己的 attempt 身份
+  （`item_id`/`image_type`/`candidate_key`）传给 `download_item_image_impl`；成功路径改调
+  `Database::upsert_item_image_at_index_and_finish_attempt`（`src/storage/catalog.rs`，单写锁 + 单事务：
+  先 `item_images` upsert，再同一事务里把 attempt 置 `AVAILABLE`、`claimed_until = NULL`）。
+  `upsert_item_image_at_index` / `finish_metadata_image_attempt` 拆出 `*_in_transaction` 实现，对外签名与语义不变。
+  - 每张图：**3 → 2** 次提交（claim + 合并行/finish）；每条目 8 张图：**24 → 16**。
+  - 失败路径不变（claim + `record_image_attempt_failure` 的 finish，共 2 次提交），并且 claim 不会悬挂：
+    `claimed_until` 被清空、`status` 落在 `FAILED`/`UNAVAILABLE`。
+  - 正确性收益：改造前"图片行已提交、finish 未提交"会留下一个已索引图片 + 仍 `RUNNING` 的 attempt（要等
+    `IMAGE_ATTEMPT_LEASE` 过期）；现在两个写入同生共死。
+  - 测试：`application::images::tests::image_row_and_attempt_finish_commit_in_one_transaction`、
+    `application::images::tests::failed_image_download_releases_its_claim`。
+  - 未做：方案 2（内存租约，会丢重启后的去重保证）与方案 3（批量 claim，需要重排 `write_selected_images`
+    的并发下载与 claim 顺序），均留给后续批次。
+
 ### M6 NFO 写路径已有 W3 保护（已读代码确认，记录为"已覆盖"）
 
 - **位置**：`src/application/nfo.rs:3101-3133`（`write_item_movie_nfo`：1 次上下文查询 `find_movie_nfo_writeback_context`，
