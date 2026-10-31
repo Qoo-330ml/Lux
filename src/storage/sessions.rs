@@ -407,16 +407,77 @@ impl Database {
         }))
     }
 
+    /// How often a streaming session has to re-run the full admission.
+    ///
+    /// HLS segment and manifest GETs only *check* the slot, they do not write it: a request whose
+    /// admission stamp is newer than this interval verifies the row and is served, and only the
+    /// first request after the interval runs [`Self::reserve_playback_admission`], which moves the
+    /// stamp to the request time and opens the next interval. The concurrent playback limit and
+    /// `can_play` are therefore re-evaluated at most this long after a change, instead of never
+    /// while a stream keeps asking for assets.
+    pub(crate) const PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS: i64 = 30;
+
+    /// Renews a live admission so the slot does not fall out of the active set.
+    ///
+    /// Callers that must keep the stamp moving (playback events, the session heartbeat) use this:
+    /// it accepts any admission inside [`PLAYBACK_SESSION_STALE_AFTER_SECONDS`]. The asset path
+    /// deliberately does not renew, so this is what keeps a streaming slot inside the active set
+    /// between its periodic full admissions.
     pub(crate) async fn renew_existing_playback_admission(
         &self,
         user_id: &str,
         play_session_id: &str,
         now: i64,
     ) -> Result<bool, StorageError> {
-        let max_function = self.scalar_max_function();
-        let stale_before = now
+        let renew_after = now
             .max(0)
             .saturating_sub(PLAYBACK_SESSION_STALE_AFTER_SECONDS);
+        self.renew_playback_admission_after(user_id, play_session_id, now, renew_after)
+            .await
+    }
+
+    /// Whether a segment or manifest request may skip the full admission.
+    ///
+    /// One `SELECT`, no write: the slot counts as fresh only while it is active *and* was admitted
+    /// less than [`Self::PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS`] ago. `false` means the
+    /// caller has to run [`Self::reserve_playback_admission`], which also re-opens the interval.
+    pub(crate) async fn has_fresh_playback_admission(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+    ) -> Result<bool, StorageError> {
+        let not_before = now
+            .max(0)
+            .saturating_sub(Self::PLAYBACK_ADMISSION_RECHECK_INTERVAL_SECONDS);
+        let fresh = self
+            .query_scalar::<i64>(
+                "SELECT 1 FROM playback_admissions
+                 WHERE user_id = ? AND play_session_id = ? AND state = 'ACTIVE'
+                   AND last_seen_at > ?",
+            )
+            .bind(user_id)
+            .bind(play_session_id)
+            .bind(not_before)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?;
+        Ok(fresh.is_some())
+    }
+
+    /// Moves an active admission's `last_seen_at` forward when it is newer than `renew_after`.
+    ///
+    /// The window is checked inside the statement so the renewal stays a single write: a row that
+    /// is not newer than `renew_after` (or is not active) is left untouched and reported as not
+    /// renewed.
+    async fn renew_playback_admission_after(
+        &self,
+        user_id: &str,
+        play_session_id: &str,
+        now: i64,
+        renew_after: i64,
+    ) -> Result<bool, StorageError> {
+        let max_function = self.scalar_max_function();
         let query = format!(
             "UPDATE playback_admissions
              SET last_seen_at = {max_function}(last_seen_at, ?)
@@ -427,7 +488,7 @@ impl Database {
             .bind(now.max(0))
             .bind(user_id)
             .bind(play_session_id)
-            .bind(stale_before)
+            .bind(renew_after)
             .execute(&self.pool)
             .await
             .map(|result| result.rows_affected() == 1)
