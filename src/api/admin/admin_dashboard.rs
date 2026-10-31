@@ -21,6 +21,7 @@ pub(crate) async fn admin_dashboard(
             catalog: Some(state.catalog()),
             ip_location: Some(state.ip_location()),
             health_probe_cache: &state.admin_health_probe_cache,
+            playback_progress: Some(state.playback_progress()),
         },
     )
     .await

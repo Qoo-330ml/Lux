@@ -94,6 +94,14 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 **进度写合并（会改变可见行为，必须先确认）**：位置 upsert 在内存里合并，每 30 秒或状态变化时落盘。代价：崩溃最多丢约
 30 秒进度；其他设备的"继续观看"位置晚到几十秒。
 
+**状态：已实施。** `src/application/playback_progress.rs` 是有界的内存合并层，键为
+`(user_id, play_session_id)`。普通 tick 只更新内存；状态变化（开始/暂停/恢复/停止）、可能翻转
+`is_played` 的 tick、跨恢复阈值的 tick 仍然立即写；超过 30 秒（`PLAYBACK_PROGRESS_FLUSH_WINDOW`）、
+条目上限、周期后台 flush 与 shutdown drain 落盘。handler 通过该层读 `previous_session`，
+`list_playback_sessions` 与管理端仪表盘列表叠加未落盘值。失败写保留重试；会话在此期间被停止时丢弃
+合并项而不复活会话。因此 `user_item_state` 与 `playback_sessions` 的位置最多落后一个窗口，读取方
+若绕过该层直接读库（含集成测试里的直接 SQL 断言）会看到落盘前的值。
+
 ## 6. 后台任务唤醒
 
 第一轮已把这一项做成了盘点与实测，完整数据见 `docs/BACKGROUND-TASKS-AUDIT.md`。要点：

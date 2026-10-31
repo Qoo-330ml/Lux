@@ -603,7 +603,12 @@ fn normalize_person_name(value: &str) -> String {
         .collect()
 }
 
-fn playback_reached_played_threshold(
+/// True when a reported position has reached the user's played threshold.
+///
+/// [`Database::record_playback_event`] uses it to decide the played flip; the playback progress
+/// coalescer uses the same predicate to keep every tick that may flip the flag out of the merge
+/// layer, so a flip is still written the moment it happens.
+pub(crate) fn playback_reached_played_threshold(
     position_ticks: i64,
     duration_ticks: i64,
     played_percent: i64,
@@ -4205,6 +4210,21 @@ pub(crate) struct PlaybackEventEffects {
     /// ran that path for an episode, even when the episode has no series and therefore no pointer
     /// row is written. The played-state sync reuses it instead of reading the hierarchy again.
     pub(crate) container_scope: Option<PlaybackContainerScope>,
+}
+
+impl PlaybackEventEffects {
+    /// The effects of an event that has not reached the database yet.
+    ///
+    /// The playback progress coalescer only keeps a plain progress tick in memory. Such a tick
+    /// cannot flip the played flag, cannot refresh the resume pointer, and cannot cross the resume
+    /// threshold (each of those is written through), so it changes nothing beyond the position the
+    /// next flush carries.
+    pub(crate) fn unchanged() -> Self {
+        Self {
+            is_played_changed: false,
+            container_scope: None,
+        }
+    }
 }
 
 pub(crate) struct NewWebPlaybackSession<'a> {
