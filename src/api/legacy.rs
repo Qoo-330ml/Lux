@@ -98,6 +98,7 @@ use crate::{
         },
         thumbnails::ThumbnailService,
         user_avatars::{MAX_USER_AVATAR_BYTES, UserAvatarError, UserAvatarService},
+        user_cleanup::UserCleanupWorker,
         watch::LibraryWatchService,
         webhooks::{BUILTIN_WEBHOOK_PROVIDER_ID, WebhookError, WebhookEventType, WebhookService},
     },
@@ -258,6 +259,7 @@ pub struct ReadyServices {
     ip_location: IpLocationService,
     web_playback: WebPlaybackSessionService,
     playback_progress: PlaybackProgressService,
+    user_cleanup_worker: UserCleanupWorker,
 }
 
 /// Shared HTTP state: a single `Router` is mounted for both modes.
@@ -612,8 +614,8 @@ impl AppState {
         global_collection_sync_worker -> GlobalCollectionSyncWorker,
         identity_merge_worker -> IdentityMergeWorker,
         people -> PeopleService,
-        user_avatars -> UserAvatarService,
         playback_progress -> PlaybackProgressService,
+        user_cleanup_worker -> UserCleanupWorker,
     }
 
     optional_service_accessor! {
@@ -670,6 +672,10 @@ impl AppState {
         // database goes away.
         if let Some(playback_progress) = self.playback_progress() {
             playback_progress.shutdown().await;
+        }
+        // Retention purges delete rows, so they must not be mid-batch when the database closes.
+        if let Some(worker) = self.user_cleanup_worker() {
+            worker.shutdown().await;
         }
         Ok(())
     }
@@ -991,6 +997,11 @@ impl AppState {
             identity_merge_worker,
             people,
             local_nfo,
+            user_cleanup_worker: UserCleanupWorker::start(
+                database.clone(),
+                user_avatars.clone(),
+                Some(config_dir.clone()),
+            ),
             user_avatars,
             ip_location: IpLocationService::new(plugins.clone()),
             web_playback,
@@ -1137,8 +1148,7 @@ impl AppState {
     }
 
     pub async fn start_scheduled_tasks(&self) {
-        if let (Some(database), Some(avatars)) = (self.core.database.as_ref(), self.user_avatars())
-        {
+        if let Some(database) = self.core.database.as_ref() {
             crate::application::catalog_read_model::spawn_startup_catalog_read_model(
                 database.clone(),
             );
@@ -1148,11 +1158,6 @@ impl AppState {
             crate::application::catalog_read_model::spawn_search_reindex_worker(database.clone());
             crate::application::catalog_read_model::spawn_catalog_items_incremental_worker(
                 database.clone(),
-            );
-            crate::application::user_cleanup::spawn_user_cleanup_worker(
-                database.clone(),
-                avatars.clone(),
-                self.core.config_dir.clone(),
             );
         }
         if let Some(plugins) = self.plugins()
