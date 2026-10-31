@@ -35,6 +35,7 @@ use super::hls::{
     HlsError, HlsManager, HlsProgressSnapshot, HlsSegmentContainer, HlsStartOptions,
     HlsWebStartOptions,
 };
+use crate::application::transcoding::TranscodingSettings;
 
 type HmacSha256 = Hmac<Sha256>;
 
@@ -353,7 +354,7 @@ impl WebPlaybackSessionService {
     ///
     /// `known_policy` is the policy an earlier step of the same request already read; passing it
     /// keeps the admission from reading the same `users` row twice (see
-    /// [`Database::reserve_playback_admission_with_policy`]).
+    /// [`Database::reserve_playback_admission`]).
     pub(crate) async fn admit_playback_session(
         &self,
         user_id: &str,
@@ -362,12 +363,7 @@ impl WebPlaybackSessionService {
     ) -> Result<Option<PlaybackAdmissionResult>, WebPlaybackSessionError> {
         Ok(self
             .database
-            .reserve_playback_admission_with_policy(
-                user_id,
-                play_session_id,
-                unix_timestamp(),
-                known_policy,
-            )
+            .reserve_playback_admission(user_id, play_session_id, unix_timestamp(), known_policy)
             .await?)
     }
 
@@ -393,9 +389,14 @@ impl WebPlaybackSessionService {
             .await?)
     }
 
-    pub(crate) async fn create(
+    /// Creates the session with a transcoding policy the caller already read.
+    ///
+    /// The HLS start that follows a creation applies the same policy, so a caller that runs both
+    /// steps reads the `server_settings` row once instead of twice.
+    pub(crate) async fn create_with_settings(
         &self,
         input: CreateWebPlaybackSession<'_>,
+        settings: &TranscodingSettings,
     ) -> Result<CreatedWebPlaybackSession, WebPlaybackSessionError> {
         if input.user_id.is_empty() || input.item_id.is_empty() || input.media_source_id.is_empty()
         {
@@ -419,7 +420,7 @@ impl WebPlaybackSessionService {
         )?);
         // An administrator can turn server-side processing off entirely. The plan then degrades to
         // direct play (or an explicit unsupported reason) instead of starting FFmpeg.
-        let plan = if !self.transcoding_settings().await.enabled {
+        let plan = if !settings.enabled {
             match plan {
                 WebPlaybackPlan::ServerHls { .. } => WebPlaybackPlan::Unsupported {
                     reason: UnsupportedReason::ServerTranscodingDisabled,
@@ -489,12 +490,20 @@ impl WebPlaybackSessionService {
             ))
             .await;
         let user_id = input.user_id.to_owned();
-        let created = self.create(input).await?;
+        let settings = self.transcoding_settings().await;
+        let created = self.create_with_settings(input, &settings).await?;
         let WebPlaybackPlan::ServerHls { tier } = created.plan else {
             return Ok(created);
         };
         if let Err(error) = self
-            .start_emby_hls_with_runtime(&created.id, tier, media_path, video_bitrate, options)
+            .start_emby_hls_with_settings(
+                &settings,
+                &created.id,
+                tier,
+                media_path,
+                video_bitrate,
+                options,
+            )
             .await
         {
             let _ = self.fail(&created.id, &user_id, "HLS_START_FAILED").await;
@@ -1057,27 +1066,9 @@ impl WebPlaybackSessionService {
         video_bitrate: Option<i64>,
         start_time_ticks: Option<i64>,
     ) -> Result<(), WebPlaybackSessionError> {
-        self.start_hls_with_audio(
-            session_id,
-            tier,
-            input,
-            video_bitrate,
-            start_time_ticks,
-            None,
-        )
-        .await
-    }
-
-    pub(crate) async fn start_hls_with_audio(
-        &self,
-        session_id: &str,
-        tier: ServerTier,
-        input: &std::path::Path,
-        video_bitrate: Option<i64>,
-        start_time_ticks: Option<i64>,
-        audio_stream_index: Option<i64>,
-    ) -> Result<(), WebPlaybackSessionError> {
-        self.start_hls_with_runtime(
+        let settings = self.transcoding_settings().await;
+        self.start_hls_with_settings(
+            &settings,
             session_id,
             tier,
             input,
@@ -1085,10 +1076,39 @@ impl WebPlaybackSessionService {
                 video_bitrate,
                 start_time_ticks,
                 runtime_ticks: None,
-                audio_stream_index,
+                audio_stream_index: None,
             },
         )
         .await
+    }
+
+    /// Starts the Web HLS pipeline with a transcoding policy the caller already read.
+    ///
+    /// Every start re-applies the policy so a saved setting applies to the next session without a
+    /// restart, while running sessions keep their captured parameters.
+    pub(crate) async fn start_hls_with_settings(
+        &self,
+        settings: &TranscodingSettings,
+        session_id: &str,
+        tier: ServerTier,
+        input: &std::path::Path,
+        options: HlsWebStartOptions,
+    ) -> Result<(), WebPlaybackSessionError> {
+        self.hls.apply_settings(settings);
+        self.hls
+            .start_with_audio(session_id, tier, input, options)
+            .await?;
+        let directory = self.hls.session_directory(session_id).await?;
+        let now = unix_timestamp();
+        if !self
+            .database
+            .set_web_playback_temp_dir(session_id, &directory.to_string_lossy(), now)
+            .await?
+        {
+            let _ = self.hls.stop(session_id).await;
+            return Err(WebPlaybackSessionError::NotFound);
+        }
+        Ok(())
     }
 
     /// Current administrator transcoding policy; unreadable rows fall back to defaults.
@@ -1129,10 +1149,20 @@ impl WebPlaybackSessionService {
         let Some(session) = self.database.find_web_playback_session(session_id).await? else {
             return Err(WebPlaybackSessionError::NotFound);
         };
+        self.mark_known_session_tier(&session, tier).await
+    }
+
+    /// Records the tier for a session row the caller already read, avoiding a second read of the
+    /// row just to learn its owner and plan.
+    async fn mark_known_session_tier(
+        &self,
+        session: &StoredWebPlaybackSession,
+        tier: ServerTier,
+    ) -> Result<(), WebPlaybackSessionError> {
         if self
             .database
             .update_web_playback_session_tier(
-                session_id,
+                &session.id,
                 &session.user_id,
                 i64::from(tier.number()),
                 &session.plan,
@@ -1168,13 +1198,17 @@ impl WebPlaybackSessionService {
             return Err(WebPlaybackSessionError::Hls(HlsError::Limit));
         }
         let _ = self.hls.stop(session_id).await;
-        self.start_hls_with_audio(
+        self.start_hls_with_settings(
+            &settings,
             session_id,
             ServerTier::SoftwareTranscode,
             input,
-            video_bitrate,
-            start_time_ticks,
-            audio_stream_index,
+            HlsWebStartOptions {
+                video_bitrate,
+                start_time_ticks,
+                runtime_ticks: None,
+                audio_stream_index,
+            },
         )
         .await?;
         self.mark_session_tier(session_id, ServerTier::SoftwareTranscode)
@@ -1182,41 +1216,16 @@ impl WebPlaybackSessionService {
         Ok(ServerTier::SoftwareTranscode)
     }
 
-    async fn start_hls_with_runtime(
+    async fn start_emby_hls_with_settings(
         &self,
-        session_id: &str,
-        tier: ServerTier,
-        input: &std::path::Path,
-        options: HlsWebStartOptions,
-    ) -> Result<(), WebPlaybackSessionError> {
-        // Every HLS start re-reads the policy so a saved setting applies to the next session
-        // without a restart, while running sessions keep their captured parameters.
-        self.hls.apply_settings(&self.transcoding_settings().await);
-        self.hls
-            .start_with_audio(session_id, tier, input, options)
-            .await?;
-        let directory = self.hls.session_directory(session_id).await?;
-        let now = unix_timestamp();
-        if !self
-            .database
-            .set_web_playback_temp_dir(session_id, &directory.to_string_lossy(), now)
-            .await?
-        {
-            let _ = self.hls.stop(session_id).await;
-            return Err(WebPlaybackSessionError::NotFound);
-        }
-        Ok(())
-    }
-
-    async fn start_emby_hls_with_runtime(
-        &self,
+        settings: &TranscodingSettings,
         session_id: &str,
         tier: ServerTier,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
         options: HlsStartOptions,
     ) -> Result<(), WebPlaybackSessionError> {
-        self.hls.apply_settings(&self.transcoding_settings().await);
+        self.hls.apply_settings(settings);
         self.hls
             .start_emby_vod(session_id, tier, input, video_bitrate, options)
             .await?;
@@ -1348,7 +1357,7 @@ impl WebPlaybackSessionService {
             if error.is_terminal_process_failure()
                 && let Ok(Some(tier)) = self.hls.downgrade_to_software(session_id).await
             {
-                self.mark_session_tier(&session.id, tier).await?;
+                self.mark_known_session_tier(&session, tier).await?;
                 self.hls.start_for_initial_asset(session_id, asset).await?;
                 return Ok(());
             }
@@ -2805,16 +2814,20 @@ mod tests {
             hardware_transcode: false,
             software_transcode: true,
         };
+        let settings = service.transcoding_settings().await;
         let created = service
-            .create(CreateWebPlaybackSession {
-                user_id: &user_id,
-                is_admin: true,
-                item_id: &item_id,
-                media_source_id: &source_id,
-                play_session_prefix: "lux-web",
-                source_kind: PlaybackSourceKind::LocalFile,
-                capabilities: transcode_capabilities,
-            })
+            .create_with_settings(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-web",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: transcode_capabilities,
+                },
+                &settings,
+            )
             .await?;
         assert_eq!(
             created.plan,
@@ -2829,18 +2842,21 @@ mod tests {
         assert_eq!(stored, 0);
 
         let direct = service
-            .create(CreateWebPlaybackSession {
-                user_id: &user_id,
-                is_admin: true,
-                item_id: &item_id,
-                media_source_id: &source_id,
-                play_session_prefix: "lux-web",
-                source_kind: PlaybackSourceKind::LocalFile,
-                capabilities: PlaybackCapabilities {
-                    direct_play: true,
-                    ..transcode_capabilities
+            .create_with_settings(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-web",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: true,
+                        ..transcode_capabilities
+                    },
                 },
-            })
+                &settings,
+            )
             .await?;
         assert_eq!(direct.plan, WebPlaybackPlan::Direct);
         Ok(())
@@ -3014,6 +3030,117 @@ mod tests {
                 .join("web-playback/failed-manifest")
                 .exists()
         );
+        Ok(())
+    }
+
+    /// A server-side HLS start reads the transcoding policy once: `create` needs it to decide the
+    /// plan and the start step needs it to configure FFmpeg, and both run for one request.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn emby_hls_start_reads_the_transcoding_policy_once()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8099".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let user = setup.complete("Admin", "Admin", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Playback", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        let source_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Playback', 'playback', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (id, item_id, source_kind)
+             VALUES (?, ?, 'LOCAL_FILE')",
+        )
+        .bind(&source_id)
+        .bind(&item_id)
+        .execute(database.pool())
+        .await?;
+        let script = temp_dir.path().join("fake-ffmpeg-hls-start");
+        tokio::fs::write(
+            &script,
+            r##"#!/bin/sh
+set -eu
+manifest=""
+segment=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -hls_segment_filename) segment="$2"; shift 2 ;;
+    *.m3u8) manifest="$1"; shift ;;
+    *) shift ;;
+  esac
+done
+directory=$(dirname "$manifest")
+mkdir -p "$directory"
+printf '#EXTM3U\n#EXT-X-MAP:URI="init.mp4"\n#EXTINF:4,\nsegment_000000.m4s\n' > "$manifest"
+printf init > "$directory/init.mp4"
+printf segment > "$(printf '%s' "$segment" | sed 's/%06d/000000/')"
+while :; do sleep 1; done
+"##,
+        )
+        .await?;
+        let mut permissions = tokio::fs::metadata(&script).await?.permissions();
+        permissions.set_mode(0o700);
+        tokio::fs::set_permissions(&script, permissions).await?;
+        let service = WebPlaybackSessionService {
+            database: database.clone(),
+            signer: Arc::new(ResourceSigner::random()),
+            hls: HlsManager::new_for_tests(
+                config.config_dir.clone(),
+                script.to_string_lossy().into_owned(),
+            ),
+            start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
+        };
+        let user_id = user.id.to_string();
+
+        database.reset_query_count();
+        let created = service
+            .create_and_start_emby_hls(
+                CreateWebPlaybackSession {
+                    user_id: &user_id,
+                    is_admin: true,
+                    item_id: &item_id,
+                    media_source_id: &source_id,
+                    play_session_prefix: "lux-emby",
+                    source_kind: PlaybackSourceKind::LocalFile,
+                    capabilities: PlaybackCapabilities {
+                        direct_play: false,
+                        hls: true,
+                        video_copy_to_fmp4: false,
+                        audio_copy_to_fmp4: false,
+                        hardware_transcode: false,
+                        software_transcode: true,
+                    },
+                },
+                Path::new("input.mkv"),
+                Some(1_000_000),
+                HlsStartOptions {
+                    segment_container: HlsSegmentContainer::FragmentedMp4,
+                    start_time_ticks: None,
+                    runtime_ticks: Some(600 * 10_000_000),
+                },
+            )
+            .await?;
+        assert_eq!(
+            database.query_count(),
+            4,
+            "the user policy, one transcoding policy read, the session insert and the temp dir"
+        );
+        service.stop(&created.id, &user_id).await?;
         Ok(())
     }
 

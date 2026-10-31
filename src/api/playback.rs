@@ -6,7 +6,7 @@ pub(super) use resume_visibility::emby_hide_from_resume;
 
 use crate::application::playback::{
     decision::ServerTier,
-    hls::{HlsSegmentContainer, HlsStartOptions},
+    hls::{HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions},
     session::{AuthorizedWebPlaybackResource, CreatedWebPlaybackSession, WebPlaybackPlan},
 };
 use crate::storage::{
@@ -3677,16 +3677,20 @@ async fn create_web_playback_session_json(
         capabilities.direct_play = false;
     }
     let user_id = user.id.to_string();
+    let transcoding_settings = service.transcoding_settings().await;
     let mut created = service
-        .create(CreateWebPlaybackSession {
-            user_id: &user_id,
-            is_admin: user.is_admin,
-            item_id,
-            media_source_id: &source.source_id,
-            play_session_prefix: "lux-web",
-            source_kind,
-            capabilities,
-        })
+        .create_with_settings(
+            CreateWebPlaybackSession {
+                user_id: &user_id,
+                is_admin: user.is_admin,
+                item_id,
+                media_source_id: &source.source_id,
+                play_session_prefix: "lux-web",
+                source_kind,
+                capabilities,
+            },
+            &transcoding_settings,
+        )
         .await
         .map_err(|error| web_playback_error(headers, error))?;
     let mut authorization_device_id = None;
@@ -3740,13 +3744,17 @@ async fn create_web_playback_session_json(
         };
         let mut effective_tier = *tier;
         let start_failure = match service
-            .start_hls_with_audio(
+            .start_hls_with_settings(
+                &transcoding_settings,
                 &created.id,
                 effective_tier,
                 &input,
-                None,
-                None,
-                audio_stream_index,
+                HlsWebStartOptions {
+                    video_bitrate: None,
+                    start_time_ticks: None,
+                    runtime_ticks: None,
+                    audio_stream_index,
+                },
             )
             .await
         {

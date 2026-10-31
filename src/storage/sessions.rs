@@ -272,16 +272,6 @@ impl Database {
         }))
     }
 
-    pub(crate) async fn reserve_playback_admission(
-        &self,
-        user_id: &str,
-        play_session_id: &str,
-        now: i64,
-    ) -> Result<Option<PlaybackAdmissionResult>, StorageError> {
-        self.reserve_playback_admission_with_policy(user_id, play_session_id, now, None)
-            .await
-    }
-
     /// Reserves one admission slot, reusing a playback policy the caller already read.
     ///
     /// `known_policy` comes from the same request (resource authorization reads it to check the
@@ -291,7 +281,7 @@ impl Database {
     /// `READ COMMITTED` transaction where the `FOR UPDATE` lock on that row is the only thing that
     /// serializes concurrent reservations for one user, so the row is still read there and the
     /// values it returns decide the admission.
-    pub(crate) async fn reserve_playback_admission_with_policy(
+    pub(crate) async fn reserve_playback_admission(
         &self,
         user_id: &str,
         play_session_id: &str,
@@ -1873,7 +1863,7 @@ mod tests {
 
         database.reset_query_count();
         let reserved = database
-            .reserve_playback_admission("admission-user", "play-session-a", 1_000)
+            .reserve_playback_admission("admission-user", "play-session-a", 1_000, None)
             .await?
             .ok_or("the admission user must exist")?;
         assert_eq!(reserved.decision, PlaybackAdmissionDecision::Admitted);
@@ -1886,7 +1876,7 @@ mod tests {
 
         // Reserving the session that already holds an admission must not raise the total.
         let renewed = database
-            .reserve_playback_admission("admission-user", "play-session-a", 1_001)
+            .reserve_playback_admission("admission-user", "play-session-a", 1_001, None)
             .await?
             .ok_or("the admission user must exist")?;
         assert_eq!(renewed.decision, PlaybackAdmissionDecision::Admitted);
@@ -1916,12 +1906,7 @@ mod tests {
 
         database.reset_query_count();
         let reserved = database
-            .reserve_playback_admission_with_policy(
-                "policy-user",
-                "play-session-a",
-                1_000,
-                Some(&policy),
-            )
+            .reserve_playback_admission("policy-user", "play-session-a", 1_000, Some(&policy))
             .await?
             .ok_or("the policy user must exist")?;
         assert_eq!(reserved.decision, PlaybackAdmissionDecision::Admitted);
