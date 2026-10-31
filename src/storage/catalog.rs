@@ -529,6 +529,31 @@ impl From<DanmakuMatchItemRow> for StoredDanmakuMatchItem {
     }
 }
 
+/// Row of `list_series_metadata_sources_page` and its incremental-scan twin: one episode source
+/// with the series/season identity and the file path the metadata worker needs.
+#[derive(Debug, sqlx::FromRow)]
+struct SeriesMetadataSourceRow {
+    series_id: String,
+    season_id: String,
+    episode_id: String,
+    season_number: Option<i64>,
+    root_path: String,
+    relative_path: String,
+}
+
+impl From<SeriesMetadataSourceRow> for StoredSeriesMetadataSource {
+    fn from(row: SeriesMetadataSourceRow) -> Self {
+        Self {
+            series_id: row.series_id,
+            season_id: row.season_id,
+            episode_id: row.episode_id,
+            season_number: row.season_number,
+            root_path: row.root_path,
+            relative_path: row.relative_path,
+        }
+    }
+}
+
 /// Row of the `media_chapters` half of `list_media_chapters_by_source_ids`: the detected intro
 /// and credits markers of one source.
 #[derive(Debug, sqlx::FromRow)]
@@ -5654,7 +5679,7 @@ impl Database {
         limit: i64,
         offset: i64,
     ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
-        self.query(
+        self.query_as::<SeriesMetadataSourceRow>(
             "SELECT series.id AS series_id, season.id AS season_id,
                     episode.id AS episode_id, season.season_number,
                     lr.canonical_path AS root_path, fe.relative_path
@@ -5680,14 +5705,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredSeriesMetadataSource {
-                    series_id: row.get("series_id"),
-                    season_id: row.get("season_id"),
-                    episode_id: row.get("episode_id"),
-                    season_number: row.get("season_number"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
+                .map(StoredSeriesMetadataSource::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -5697,7 +5715,7 @@ impl Database {
         &self,
         scan_job_id: &str,
     ) -> Result<Vec<StoredSeriesMetadataSource>, StorageError> {
-        self.query(sqlx::AssertSqlSafe(
+        self.query_as::<SeriesMetadataSourceRow>(sqlx::AssertSqlSafe(
             "SELECT series.id AS series_id, season.id AS season_id,
                     episode.id AS episode_id, season.season_number,
                     lr.canonical_path AS root_path, fe.relative_path
@@ -5722,14 +5740,7 @@ impl Database {
         .await
         .map(|rows| {
             rows.into_iter()
-                .map(|row| StoredSeriesMetadataSource {
-                    series_id: row.get("series_id"),
-                    season_id: row.get("season_id"),
-                    episode_id: row.get("episode_id"),
-                    season_number: row.get("season_number"),
-                    root_path: row.get("root_path"),
-                    relative_path: row.get("relative_path"),
-                })
+                .map(StoredSeriesMetadataSource::from)
                 .collect()
         })
         .map_err(self.sqlx_err())
@@ -12610,6 +12621,83 @@ mod media_chapter_row_decoding_tests {
                 "unexpected decode error: {error}"
             );
         }
+        Ok(())
+    }
+}
+
+/// Decoding tests for the series metadata source projection shared by the library page and the
+/// incremental-scan page.
+#[cfg(test)]
+mod series_metadata_source_row_decoding_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn series_metadata_source_rows_decode_the_page_projection()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        database
+            .query(
+                "INSERT INTO libraries (id, name, kind)
+                 VALUES ('sms-lib', 'Series', 'SERIES');
+                 INSERT INTO library_roots (
+                     id, library_id, canonical_path, display_path, is_available, is_writable
+                 ) VALUES ('sms-root', 'sms-lib', '/sms', '/sms', 1, 1);
+                 INSERT INTO filesystem_entries (
+                     id, library_root_id, relative_path, entry_kind, size, modified_at,
+                     last_seen_generation
+                 ) VALUES ('sms-file', 'sms-root', 'Season 1/episode.mkv', 'FILE', 10, 10, 'gen');
+                 INSERT INTO media_items (
+                     id, library_id, item_type, title, sort_title, identification_status,
+                     has_available_source
+                 ) VALUES
+                     ('sms-series', 'sms-lib', 'SERIES', 'Series', 'series',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sms-season', 'sms-lib', 'SEASON', 'Season 1', 'season 1',
+                      'LOCAL_CONFIRMED', 1),
+                     ('sms-episode', 'sms-lib', 'EPISODE', 'Episode 1', 'episode 1',
+                      'LOCAL_CONFIRMED', 1);
+                 UPDATE media_items
+                 SET series_id = 'sms-series', season_number = 1
+                 WHERE id = 'sms-season';
+                 UPDATE media_items
+                 SET series_id = 'sms-series', parent_id = 'sms-season', season_number = 1
+                 WHERE id = 'sms-episode';
+                 INSERT INTO media_sources (
+                     id, item_id, source_kind, filesystem_entry_id, is_default
+                 ) VALUES ('sms-source', 'sms-episode', 'LOCAL_FILE', 'sms-file', 1)",
+            )
+            .execute(database.pool())
+            .await?;
+
+        let sources = database
+            .list_series_metadata_sources_page("sms-lib", 10, 0)
+            .await?;
+        assert_eq!(sources.len(), 1);
+        let source = &sources[0];
+        assert_eq!(source.series_id, "sms-series");
+        assert_eq!(source.season_id, "sms-season");
+        assert_eq!(source.episode_id, "sms-episode");
+        assert_eq!(source.season_number, Some(1));
+        assert_eq!(source.root_path, "/sms");
+        assert_eq!(source.relative_path, "Season 1/episode.mkv");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn series_metadata_source_row_reports_a_missing_column_instead_of_panicking()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use sqlx::FromRow;
+
+        let (_temp_dir, database) = crate::storage::test_database().await?;
+        let row = sqlx::query("SELECT 1 AS other")
+            .fetch_one(database.pool())
+            .await?;
+        let error = SeriesMetadataSourceRow::from_row(&row)
+            .expect_err("series metadata columns must not decode");
+        assert!(
+            matches!(error, sqlx::Error::ColumnNotFound(_)),
+            "unexpected decode error: {error}"
+        );
         Ok(())
     }
 }
