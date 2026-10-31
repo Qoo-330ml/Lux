@@ -44,7 +44,13 @@ pub const WEB_PLAYBACK_SESSION_TTL_SECONDS: i64 = 15 * 60;
 pub const WEB_PLAYBACK_RESOURCE_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub const EMBY_DIRECT_STREAM_TTL_SECONDS: i64 = 12 * 60 * 60;
 pub(crate) const EMBY_DIRECT_STREAM_TICKET_VERSION: &str = "2";
-const WEB_PLAYBACK_CLEANUP_INTERVAL: Duration = Duration::from_secs(5);
+/// Idle fallback for the session reaper.
+///
+/// The reaper sleeps until the nearest session deadline (`expires_at` or
+/// `last_heartbeat_at + WEB_PLAYBACK_STALE_AFTER_SECONDS`) and is woken when a session is created,
+/// so this only bounds how long a row written without a wake-up (there is no such production path;
+/// every session is created through [`WebPlaybackSessionService::create`]) could go unnoticed.
+const WEB_PLAYBACK_IDLE_FALLBACK: Duration = Duration::from_secs(60);
 const WEB_PLAYBACK_STALE_AFTER_SECONDS: i64 = 90;
 const EMBY_DIRECT_STREAM_SESSION_ID: &str = "emby-direct-stream";
 
@@ -188,12 +194,26 @@ impl From<HlsError> for WebPlaybackSessionError {
     }
 }
 
+#[derive(Clone, Default)]
+struct WebPlaybackSessionCleanup {
+    /// Wakes the reaper so it recomputes the next deadline.
+    wake: Arc<tokio::sync::Notify>,
+    /// The stop handle of the reaper; `None` when the process has no runtime to run it.
+    worker: Arc<std::sync::Mutex<Option<crate::application::background_loop::BackgroundLoop>>>,
+}
+
 #[derive(Clone)]
 pub struct WebPlaybackSessionService {
     database: Database,
     signer: Arc<ResourceSigner>,
     hls: HlsManager,
     start_locks: SessionStartLocks,
+    cleanup: WebPlaybackSessionCleanup,
+}
+
+/// Wakes the reaper after a session was created, which is when the next deadline can move closer.
+fn notify_web_playback_sessions_changed(service: &WebPlaybackSessionService) {
+    service.cleanup.wake.notify_one();
 }
 
 /// Upper bound for the per-source start locks kept in memory.
@@ -232,57 +252,49 @@ fn emby_hls_start_key(user_id: &str, item_id: &str, media_source_id: &str) -> St
 impl WebPlaybackSessionService {
     pub(crate) fn new(database: Database, config_dir: std::path::PathBuf) -> Self {
         let hls = HlsManager::new(config_dir);
-        let cleanup = hls.clone();
-        let database_cleanup = database.clone();
-        tokio::spawn(async move {
-            if let Err(error) = cleanup.cleanup_orphans().await {
-                tracing::warn!(%error, "failed to clean orphaned Web HLS directories");
+        let wake = Arc::new(tokio::sync::Notify::new());
+        // The reaper used to be a bare `tokio::spawn` with a dropped handle: a shutdown could not
+        // stop it while it was stopping HLS sessions.
+        let worker = match tokio::runtime::Handle::try_current() {
+            Ok(_) => {
+                let reaper_database = database.clone();
+                let reaper_hls = hls.clone();
+                let reaper_wake = Arc::clone(&wake);
+                Some(crate::application::background_loop::BackgroundLoop::spawn(
+                    "web_playback_cleanup",
+                    move |shutdown| {
+                        let database = reaper_database.clone();
+                        let hls = reaper_hls.clone();
+                        let wake = Arc::clone(&reaper_wake);
+                        async move { run_web_playback_cleanup(database, hls, wake, shutdown).await }
+                    },
+                ))
             }
-            let mut interval = tokio::time::interval(WEB_PLAYBACK_CLEANUP_INTERVAL);
-            loop {
-                interval.tick().await;
-                let now = unix_timestamp();
-                match database_cleanup
-                    .take_inactive_web_playback_sessions(now, WEB_PLAYBACK_STALE_AFTER_SECONDS)
-                    .await
-                {
-                    Ok(sessions) => {
-                        record_and_stop_hls_sessions(
-                            &database_cleanup,
-                            &cleanup,
-                            sessions,
-                            TranscodingOutcome::Expired,
-                        )
-                        .await
-                    }
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to reap inactive Web HLS sessions")
-                    }
-                }
-                let sessions = match database_cleanup
-                    .take_expired_web_playback_sessions(now)
-                    .await
-                {
-                    Ok(sessions) => sessions,
-                    Err(error) => {
-                        tracing::warn!(%error, "failed to expire Web playback sessions");
-                        continue;
-                    }
-                };
-                record_and_stop_hls_sessions(
-                    &database_cleanup,
-                    &cleanup,
-                    sessions,
-                    TranscodingOutcome::Expired,
-                )
-                .await;
-            }
-        });
+            // Without a runtime (checkout-style construction in tests) there is nothing to stop.
+            Err(_) => None,
+        };
         Self {
             database,
             signer: Arc::new(ResourceSigner::random()),
             hls,
             start_locks: SessionStartLocks::default(),
+            cleanup: WebPlaybackSessionCleanup {
+                wake,
+                worker: Arc::new(std::sync::Mutex::new(worker)),
+            },
+        }
+    }
+
+    /// Stops the session reaper and waits for the current pass to finish.
+    pub(crate) async fn shutdown(&self) {
+        let worker = self
+            .cleanup
+            .worker
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(worker) = worker {
+            worker.shutdown().await;
         }
     }
 
@@ -415,6 +427,9 @@ impl WebPlaybackSessionService {
                     now,
                 })
                 .await?;
+            // A new session can be the earliest deadline, so let the reaper recompute it instead of
+            // waiting for its idle fallback.
+            notify_web_playback_sessions_changed(self);
             return Ok(CreatedWebPlaybackSession {
                 id,
                 user_id: input.user_id.to_owned(),
@@ -1693,6 +1708,87 @@ async fn record_transcoding_snapshot(
         .await;
 }
 
+/// Reaps inactive and expired Web playback sessions.
+///
+/// The pass itself is unchanged; what changed is when it runs. Instead of an unconditional 5 s
+/// tick (two queries per tick with nothing to reap), the loop reaps, then sleeps until the earliest
+/// moment a live session can become reapable, and is woken early when a session is created. With no
+/// active session the deadline is empty and the loop parks on its idle fallback.
+async fn run_web_playback_cleanup(
+    database: Database,
+    hls: HlsManager,
+    wake: std::sync::Arc<tokio::sync::Notify>,
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) {
+    if let Err(error) = hls.cleanup_orphans().await {
+        tracing::warn!(%error, "failed to clean orphaned Web HLS directories");
+    }
+    loop {
+        if *shutdown.borrow() {
+            return;
+        }
+        reap_web_playback_sessions(&database, &hls).await;
+        let wait = next_cleanup_wait(&database, unix_timestamp()).await;
+        if crate::application::background_loop::wait_for_wake_or_shutdown(
+            &mut shutdown,
+            &wake,
+            wait,
+        )
+        .await
+        {
+            return;
+        }
+    }
+}
+
+async fn reap_web_playback_sessions(database: &Database, hls: &HlsManager) {
+    let now = unix_timestamp();
+    match database
+        .take_inactive_web_playback_sessions(now, WEB_PLAYBACK_STALE_AFTER_SECONDS)
+        .await
+    {
+        Ok(sessions) => {
+            record_and_stop_hls_sessions(database, hls, sessions, TranscodingOutcome::Expired)
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to reap inactive Web HLS sessions");
+        }
+    }
+    match database.take_expired_web_playback_sessions(now).await {
+        Ok(sessions) => {
+            record_and_stop_hls_sessions(database, hls, sessions, TranscodingOutcome::Expired)
+                .await;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to expire Web playback sessions");
+        }
+    }
+}
+
+/// How long the reaper may sleep: the nearest session deadline, bounded by the idle fallback.
+///
+/// A deadline is inclusive (`expires_at < now`), so one extra second guarantees the next pass sees
+/// the session as reapable; the lower bound keeps it out of a tight spin if a deadline ever lies in
+/// the past.
+async fn next_cleanup_wait(database: &Database, now: i64) -> Duration {
+    match database
+        .next_web_playback_session_deadline(WEB_PLAYBACK_STALE_AFTER_SECONDS)
+        .await
+    {
+        Ok(Some(deadline)) => {
+            let seconds = deadline.saturating_sub(now).saturating_add(1);
+            Duration::from_secs(u64::try_from(seconds).unwrap_or(1).max(1))
+                .min(WEB_PLAYBACK_IDLE_FALLBACK)
+        }
+        Ok(None) => WEB_PLAYBACK_IDLE_FALLBACK,
+        Err(error) => {
+            tracing::warn!(%error, "failed to compute the next Web playback session deadline");
+            WEB_PLAYBACK_IDLE_FALLBACK
+        }
+    }
+}
+
 async fn record_and_stop_hls_sessions(
     database: &Database,
     hls: &HlsManager,
@@ -2341,6 +2437,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         service.stop("session-a", &owner_id).await?;
 
@@ -2393,6 +2490,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let owner_id = owner.id.to_string();
         service
@@ -2460,6 +2558,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let owner_id = owner.id.to_string();
         let now = unix_timestamp();
@@ -2653,6 +2752,7 @@ mod tests {
                 script.to_string_lossy().into_owned(),
             ),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         service
@@ -2730,6 +2830,7 @@ mod tests {
             signer: Arc::new(ResourceSigner::random()),
             hls: HlsManager::new_for_tests(config.config_dir.clone(), "/usr/bin/false".to_owned()),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         let now = unix_timestamp();
@@ -2854,6 +2955,7 @@ while :; do sleep 1; done
                 script.to_string_lossy().into_owned(),
             ),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         let created = service
@@ -3002,6 +3104,7 @@ while :; do sleep 1; done
                 script.to_string_lossy().into_owned(),
             ),
             start_locks: SessionStartLocks::default(),
+            cleanup: Default::default(),
         };
         let user_id = user.id.to_string();
         let capabilities = PlaybackCapabilities {
@@ -3095,6 +3198,191 @@ while :; do sleep 1; done
                 .exists()
         );
 
+        Ok(())
+    }
+
+    /// Builds a database with one user, one movie and a session row the reaper must observe.
+    async fn cleanup_fixture() -> Result<
+        (
+            tempfile::TempDir,
+            Config,
+            crate::storage::Database,
+            String,
+            String,
+        ),
+        Box<dyn std::error::Error>,
+    > {
+        let temp_dir = tempfile::tempdir()?;
+        let config = Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: temp_dir.path().join("config"),
+        };
+        let database = crate::storage::Database::connect(&config).await?;
+        let setup = SetupService::new(database.clone())?;
+        let owner = setup.complete("Owner", "Owner", "correct password").await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Cleanup", LibraryKind::Movie, false)
+            .await?;
+        let item_id = Uuid::now_v7().to_string();
+        sqlx::query(
+            "INSERT INTO media_items (
+                id, library_id, item_type, title, sort_title, identification_status
+             ) VALUES (?, ?, 'MOVIE', 'Cleanup', 'cleanup', 'LOCAL_CONFIRMED')",
+        )
+        .bind(&item_id)
+        .bind(library.id.to_string())
+        .execute(database.pool())
+        .await?;
+        Ok((temp_dir, config, database, owner.id.to_string(), item_id))
+    }
+
+    async fn insert_cleanup_session(
+        database: &crate::storage::Database,
+        user_id: &str,
+        item_id: &str,
+        session_id: &str,
+        expires_at: i64,
+        last_heartbeat_at: i64,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        database
+            .insert_web_playback_session(NewWebPlaybackSession {
+                id: session_id,
+                user_id,
+                item_id,
+                media_source_id: None,
+                play_session_id: &format!("lux-web:{session_id}"),
+                tier: i64::from(ServerTier::Remux.number()),
+                plan: "SERVER_HLS",
+                temp_dir: None,
+                is_admin: false,
+                expires_at,
+                now: unix_timestamp(),
+            })
+            .await?;
+        // The insert stamps the current heartbeat, so the test rewinds it to make the session
+        // reapable.
+        sqlx::query("UPDATE web_playback_sessions SET last_heartbeat_at = ? WHERE id = ?")
+            .bind(last_heartbeat_at)
+            .bind(session_id)
+            .execute(database.pool())
+            .await?;
+        Ok(())
+    }
+
+    async fn session_state(
+        database: &crate::storage::Database,
+        session_id: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        Ok(
+            sqlx::query_scalar("SELECT state FROM web_playback_sessions WHERE id = ?")
+                .bind(session_id)
+                .fetch_one(database.pool())
+                .await?,
+        )
+    }
+
+    /// An idle reaper must not run a reaping pass before its fallback: the old loop ran two
+    /// queries every five seconds with no session to look at.
+    #[tokio::test]
+    async fn an_idle_reaper_does_not_poll() -> Result<(), Box<dyn std::error::Error>> {
+        assert!(
+            super::WEB_PLAYBACK_IDLE_FALLBACK >= std::time::Duration::from_secs(30),
+            "the idle fallback must stay far above the old 5 s poll"
+        );
+        let (_temp_dir, config, database, _user_id, _item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database.clone(), config.config_dir.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        database.reset_query_count();
+        // Strictly longer than the five second tick this loop used to run.
+        tokio::time::sleep(std::time::Duration::from_millis(5_500)).await;
+        assert_eq!(
+            database.query_count(),
+            0,
+            "an idle reaper must not query sessions before the idle fallback"
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop an idle reaper");
+        Ok(())
+    }
+
+    /// An expired session is reaped as soon as its deadline is reached, not on a fixed tick.
+    #[tokio::test]
+    async fn a_session_is_reaped_at_its_deadline() -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, config, database, user_id, item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database.clone(), config.config_dir.clone());
+        // Let the first pass find nothing and compute an empty deadline.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let now = unix_timestamp();
+        insert_cleanup_session(
+            &database,
+            &user_id,
+            &item_id,
+            "deadline-session",
+            now + 1,
+            now,
+        )
+        .await?;
+        // The session was created outside the service, so the enqueue wake-up has to stand in.
+        super::notify_web_playback_sessions_changed(&service);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(4);
+        while session_state(&database, "deadline-session").await? == "ACTIVE" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the session must be stopped once its deadline passed"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the reaper");
+        Ok(())
+    }
+
+    /// A stale session found while the reaper sleeps is reaped as soon as the producer wakes it,
+    /// instead of waiting for the idle fallback.
+    #[tokio::test]
+    async fn a_wake_up_reaps_a_stale_session_immediately() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let (_temp_dir, config, database, user_id, item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database.clone(), config.config_dir.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        let now = unix_timestamp();
+        insert_cleanup_session(
+            &database,
+            &user_id,
+            &item_id,
+            "stale-session",
+            now + 900,
+            now - super::WEB_PLAYBACK_STALE_AFTER_SECONDS - 10,
+        )
+        .await?;
+        super::notify_web_playback_sessions_changed(&service);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while session_state(&database, "stale-session").await? == "ACTIVE" {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "a wake-up must reap a stale session without waiting for the fallback"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the reaper");
+        Ok(())
+    }
+
+    /// Shutdown must not wait for the idle fallback.
+    #[tokio::test]
+    async fn shutdown_stops_the_reaper_without_waiting_for_the_fallback()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_temp_dir, config, database, _user_id, _item_id) = cleanup_fixture().await?;
+        let service = WebPlaybackSessionService::new(database, config.config_dir.clone());
+        tokio::time::timeout(std::time::Duration::from_secs(2), service.shutdown())
+            .await
+            .expect("shutdown must stop the idle reaper");
         Ok(())
     }
 }

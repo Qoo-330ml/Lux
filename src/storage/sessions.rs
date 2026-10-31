@@ -1475,6 +1475,29 @@ impl Database {
         .map_err(self.sqlx_err())
     }
 
+    /// The earliest moment at which one of the active Web playback sessions becomes reapable.
+    ///
+    /// A session is reapable once it expired (`expires_at`) or once it stopped heartbeating for
+    /// `inactive_after_seconds` (server HLS sessions only). The reaper sleeps until this moment
+    /// instead of polling on a fixed tick, so an idle server with no playback never wakes up for it.
+    pub(crate) async fn next_web_playback_session_deadline(
+        &self,
+        inactive_after_seconds: i64,
+    ) -> Result<Option<i64>, StorageError> {
+        self.query_scalar::<Option<i64>>(
+            "SELECT MIN(deadline) FROM (
+                 SELECT expires_at AS deadline FROM web_playback_sessions WHERE state = 'ACTIVE'
+                 UNION ALL
+                 SELECT last_heartbeat_at + ? AS deadline FROM web_playback_sessions
+                 WHERE state = 'ACTIVE' AND plan = 'SERVER_HLS'
+             ) deadlines",
+        )
+        .bind(inactive_after_seconds.max(0))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(self.sqlx_err())
+    }
+
     pub(crate) async fn take_expired_web_playback_sessions(
         &self,
         now: i64,

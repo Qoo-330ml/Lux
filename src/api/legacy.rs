@@ -616,6 +616,7 @@ impl AppState {
         people -> PeopleService,
         playback_progress -> PlaybackProgressService,
         user_cleanup_worker -> UserCleanupWorker,
+        web_playback -> WebPlaybackSessionService,
     }
 
     optional_service_accessor! {
@@ -676,6 +677,11 @@ impl AppState {
         // Retention purges delete rows, so they must not be mid-batch when the database closes.
         if let Some(worker) = self.user_cleanup_worker() {
             worker.shutdown().await;
+        }
+        // The session reaper stops HLS sessions, so it must finish before the HLS directories and
+        // the database go away.
+        if let Some(web_playback) = self.web_playback() {
+            web_playback.shutdown().await;
         }
         Ok(())
     }
