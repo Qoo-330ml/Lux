@@ -1325,6 +1325,7 @@ impl Database {
         .bind(job_id)
         .execute(&self.pool)
         .await
+        .map(|result| self.signal_outbox_consumers_if_changed(result.rows_affected()))
         .map_err(self.sqlx_err())?;
         self.query(
             "UPDATE scan_job_targets

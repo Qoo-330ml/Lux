@@ -3,7 +3,9 @@
 本文盘点 `src/**` 非测试代码中**长期运行的后台循环**，量化空闲状态下的周期性唤醒与数据库访问，
 并在本机 arm64 上做一次实测，最后按 A/B/C 分级给出建议。
 
-**本任务只做盘点与量化，不改任何 `src/**`。** 是否把分散的轮询收敛到统一调度器，由后续任务决定。
+**本文最初只做盘点与量化，不改任何 `src/**`。** 后续任务（2026-10-31）已按 §7 的 A 类把空闲唤醒最密集的
+4 个循环改成事件驱动并补上关停，结果见 §5.2 的"改造后"列与 §6.8 的复测；是否把分散的轮询收敛到统一调度器，
+仍由后续任务决定。
 
 ---
 
@@ -57,10 +59,10 @@
 
 | # | 文件:行 | 用途 | 周期（常量 = 值） | 空闲唤醒 | 空闲时 DB/磁盘 | 关停方式 | 可事件驱动化 |
 | --- | --- | --- | --- | --- | --- | --- | --- |
-| 1 | `src/application/scanner/jobs/local_metadata.rs:889`（循环）/`:1053`（等待） | 扫描本地元数据 outbox 消费 + NFO 回填页 | `SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK` = **250 ms**（`:17`）+ 同一 `Notify` 双路等待 | **是，4 次/秒** | **是**：每轮 2 次 claim 查询（outbox、backfill） | `background_loop::supervise_with_restart`（`:1570`），**没有 shutdown 信号**，handle 被丢弃，只能靠进程退出 | 可：空闲只 `await notify`，跨进程写入用低频兜底（≥10 s）或 DB 通知 |
-| 2 | `src/application/collections.rs:264`（循环）/`:405`（等待） | 全局合集同步 + 电影 NFO 合集引用对账 | `GLOBAL_COLLECTION_SYNC_RETRY_DELAY` = **1 s**（`:233`），纯轮询、无 `Notify` | **是，60 次/分** | **是**：每轮 ≥2 查询（对账候选、待同步作业） | `GlobalCollectionSyncWorker`（`:239`，`watch` + `JoinHandle`），纳入 `shutdown_background_workers_checked` | 可：`enqueue` 时 `notify_one` |
-| 3 | `src/application/catalog_read_model.rs:162`（循环）/`:158`（ticker） | `catalog_items` outbox 增量消费（读模型） | `CATALOG_ITEMS_INCREMENTAL_INTERVAL` = **1 s**（`:147`） | **是，60 次/分** | **是**：`catalog_consumer` 查询 + `drain` + 周期性 `trim`/统计重建 | 裸 `tokio::spawn`（`:157`），handle 丢弃，**无关停** | 可：outbox `seq` + `Notify`，写侧在同一进程内 |
-| 4 | `src/application/catalog_read_model.rs:228`（循环）/`:226`（ticker） | 搜索重建索引 outbox 消费（FTS） | `SEARCH_REINDEX_INTERVAL` = **1 s**（`:141`） | **是，60 次/分** | **是**：`drain_search_reindex` + `trim` | 裸 `tokio::spawn`（`:225`），**无关停** | 可：同上 |
+| 1 | `src/application/scanner/jobs/local_metadata.rs`（循环 `run_scan_local_metadata_outbox_worker`/等待 `wait_for_scan_local_metadata_work`） | 扫描本地元数据 outbox 消费 + NFO 回填页 | `SCAN_LOCAL_METADATA_OUTBOX_IDLE_FALLBACK` = **10 s**（原 250 ms）+ `local_metadata_outbox_notify`；失败重试 `SCAN_LOCAL_METADATA_OUTBOX_ERROR_RETRY` = 1 s | 否（空闲阻塞在 `Notify`），仅 6 次/分的兜底 | 否（只有兜底那一次各 2 条 claim） | `background_loop::BackgroundLoop`（`watch` + `JoinHandle`），纳入 `shutdown_background_workers_checked` | **已实现** |
+| 2 | `src/application/collections.rs`（循环 `run_global_collection_sync_worker`/等待 `wait_for_global_collection_sync`） | 全局合集同步 + 电影 NFO 合集引用对账 | `GLOBAL_COLLECTION_SYNC_IDLE_FALLBACK` = **10 s**（新增）+ 写侧 `Notify`；失败重试 `GLOBAL_COLLECTION_SYNC_RETRY_DELAY` 仍为 1 s | 否（空闲阻塞在 `Notify`），仅 6 次/分的兜底 | 否（只有兜底那一次 ≥2 查询） | `GlobalCollectionSyncWorker`（`watch` + `JoinHandle`），纳入 `shutdown_background_workers_checked` | **已实现** |
+| 3 | `src/application/catalog_read_model.rs`（循环 `run_catalog_items_incremental_worker`） | `catalog_items` outbox 增量消费（读模型） | `OUTBOX_IDLE_FALLBACK` = **10 s**（原 1 s ticker）+ 写侧 `Notify` | 否（空闲阻塞在 `Notify`），仅 6 次/分的兜底 | 否（只有兜底那一次 consumer/drain/trim） | `CatalogOutboxWorkers`（`watch` + `JoinHandle`），纳入 `shutdown_background_workers_checked` | **已实现** |
+| 4 | `src/application/catalog_read_model.rs`（循环 `run_search_reindex_worker`） | 搜索重建索引 outbox 消费（FTS） | `OUTBOX_IDLE_FALLBACK` = **10 s**（原 1 s ticker）+ 写侧 `Notify` | 否（空闲阻塞在 `Notify`），仅 6 次/分的兜底 | 否（只有兜底那一次 drain/trim） | 同上（同一个 `CatalogOutboxWorkers`） | **已实现** |
 | 5 | `src/application/playback/session.rs:242`（循环）/`:241`（interval） | 回收失活/过期 Web 播放会话并停 HLS | `WEB_PLAYBACK_CLEANUP_INTERVAL` = **5 s**（`:47`） | **是，12 次/分** | **是**：`take_inactive_web_playback_sessions` + `take_expired_web_playback_sessions` | 裸 `tokio::spawn`（`:237`），**无关停** | 可：只在有活动会话时跑，或改由会话心跳驱动 |
 | 6 | `src/application/webhooks.rs:160`（循环）/`:170`（等待） | webhook 投递轮询 + 历史保留期清理 | `DELIVERY_POLL_INTERVAL` = **5 s**（`:39`）；`HISTORY_RETENTION_INTERVAL` = **1 h**（`:40`） | **是，12 次/分** | **是**：`process_ready_deliveries` 查询；每小时一次 `DELETE` | `BackgroundLoop`（`:629`），纳入 shutdown | 可：投递入队时 `notify` |
 | 7 | `src/application/mail_worker.rs:106`（循环）/`:135`（等待） | 邮件 outbox 轮询（SMTP） | `MAIL_QUEUE_POLL_INTERVAL` = **5 s**（`:26`） | **是，12 次/分** | **是**：`claim_mail_outbox` | 自有 `watch` + `JoinHandle`，`main.rs:265` 显式 `mail_worker.shutdown().await` | 可：入队 `notify` |
@@ -98,34 +100,37 @@
 
 ### 2.3 关停路径汇总（现状）
 
-`shutdown_background_workers_checked`（`src/api/legacy.rs:242`）只排空 7 类 worker：内容限制索引
-（`content_restriction_index_worker`）、身份合并（`identity_merge_worker`）、探测运行时、元数据重识别、
-全局合集同步（`global_collection_sync_worker`）、webhook、计划任务。`main.rs` 另外显式排空
+`shutdown_background_workers_checked`（`src/api/legacy.rs`）排空 10 类 worker：内容限制索引
+（`content_restriction_index_worker`）、身份合并（`identity_merge_worker`）、本地元数据 outbox
+（`scan_jobs.shutdown_local_metadata_outbox_worker`）、探测运行时、元数据重识别、
+全局合集同步（`global_collection_sync_worker`）、派生数据 outbox 消费（`catalog_outbox_workers`：
+`catalog_items` 增量 + 搜索重建）、webhook、计划任务、播放进度。`main.rs` 另外显式排空
 LAN 发现与邮件 worker。
 
-**没有被排空（handle 丢弃、只能靠进程退出）的常驻循环**有 8 个：
+**没有被排空（handle 丢弃、只能靠进程退出）的常驻循环**从 8 个降到 5 个：
 
-| 循环 | 位置 | 影响 | 任务 B 后 |
+| 循环 | 位置 | 影响 | 合并后 |
 | --- | --- | --- | --- |
-| 本地元数据 outbox | `scanner/jobs/local_metadata.rs:1570` | 优雅停机的 `cancel_incomplete_jobs_for_shutdown` 之后仍可能再 claim 一个新批次 | 仍缺失（任务 A 范围） |
-| `catalog_items` 增量消费 | `catalog_read_model.rs:157` | 停机瞬间可能正在写读模型 | 仍缺失（任务 A 范围） |
-| 搜索重建索引 | `catalog_read_model.rs:225` | 同上 | 仍缺失（任务 A 范围） |
-| Web 播放会话回收 | `playback/session.rs:237` | 停机瞬间可能正在停 HLS | **已接入**：`WebPlaybackSessionService::shutdown`（`BackgroundLoop`），排在 `shutdown_background_workers_checked` |
-| 用户清理 | `user_cleanup.rs:31` | 停机瞬间可能正在删数据 | **已接入**：`UserCleanupWorker`，同上 |
-| 登录背景图刷新 | `plugins.rs:250` | 停机瞬间可能在读插件 | **已接入**：`PluginService::shutdown`，同上 |
-| 游离状态重挂 | `watch_state_archive.rs:496` | 停机瞬间可能在写观看状态 | **已接入**：`DetachedStateReconcileWorker`，`main.rs` 在其它后台 worker 排空后 `await` |
-| 库根目录监听刷新 | `watch.rs:226`（`spawn()` 的 `JoinHandle` 被丢弃） | `notify` crate 的每个根目录监听线程在停机后随进程退出 | **已接入**：`LibraryWatchService::spawn_managed` + `shutdown`（`BackgroundLoop`）；`spawn()` 仍返回 `JoinHandle` 供冻结测试 `abort()` |
+| 本地元数据 outbox | `scanner/jobs/local_metadata.rs` | 优雅停机的 `cancel_incomplete_jobs_for_shutdown` 之后仍可能再 claim 一个新批次 | **已接入（任务 A）**：`ScanJobService::shutdown_local_metadata_outbox_worker` |
+| `catalog_items` 增量消费 | `catalog_read_model.rs` | 停机瞬间可能正在写读模型 | **已接入（任务 A）**：`CatalogOutboxWorkers::shutdown` |
+| 搜索重建索引 | `catalog_read_model.rs` | 同上 | **已接入（任务 A）**：同上 |
+| Web 播放会话回收 | `playback/session.rs` | 停机瞬间可能正在停 HLS | **已接入（任务 B）**：`WebPlaybackSessionService::shutdown`（`BackgroundLoop`） |
+| 用户清理 | `user_cleanup.rs` | 停机瞬间可能正在删数据 | **已接入（任务 B）**：`UserCleanupWorker` |
+| 登录背景图刷新 | `plugins.rs` | 停机瞬间可能在读插件 | **已接入（任务 B）**：`PluginService::shutdown` |
+| 游离状态重挂 | `watch_state_archive.rs` | 停机瞬间可能在写观看状态 | **已接入（任务 B）**：`DetachedStateReconcileWorker`，`main.rs` 在其它后台 worker 排空后 `await` |
+| 库根目录监听刷新 | `watch.rs`（`spawn()` 的 `JoinHandle` 被丢弃） | `notify` crate 的每个根目录监听线程在停机后随进程退出 | **已接入（任务 B）**：`LibraryWatchService::spawn_managed` + `shutdown`（`BackgroundLoop`）；`spawn()` 仍返回 `JoinHandle` 供冻结测试 `abort()` |
 
-这不是本任务的修复范围（属于后续"统一调度/关停"设计），但记录在此：**空闲唤醒最密集的 4 个循环
-（250 ms / 1 s / 1 s / 5 s）全部属于"无 `watch` 信号、无 shutdown"的那一类**。
+前三行（本地元数据 outbox、`catalog_items` 增量、搜索重建）已在后续任务里补上 `watch` 信号与
+`JoinHandle` 并接入排空序列；剩下的 5 个仍属于后续"统一调度/关停"设计。
 
 ### 2.4 常驻循环数量小结
 
 - 常驻后台循环：**27 个**（§2.1 的 18 个周期性 + §2.2 的 9 个事件/工作驱动）。
-- 其中空闲时会周期性唤醒的：**15 个**（§2.1 第 1–15 项；第 17–18 项是天级，第 16 项是刻钟级，
-  都不构成空闲功耗问题）。
-- 这 15 个里关停路径缺失的：**8 个**（§2.3 表格）。任务 B 之后只剩 3 个（本地元数据 outbox、
-  `catalog_items` 增量消费、搜索重建索引），全部属于任务 A 的范围。
+- 其中空闲时会周期性唤醒的：改造前 **15 个**（§2.1 第 1–15 项；第 17–18 项是天级，第 16 项是刻钟级，
+  都不构成空闲功耗问题）。任务 A 把第 1–4 项改成写侧信号 + 10 s 兜底，任务 B 把第 5、6、7、9、11、12
+  项改成事件驱动 + 低频兜底（第 14、15 项只补关停）；合并后仍按固定周期唤醒的只有第 8（10 s）、
+  10（15 s）、13（120 s）项。
+- 关停路径：§2.3 表格里改造前缺失的 **8 个**全部接入（任务 A 3 个、任务 B 5 个）。
 
 ### 2.5 任务 B 收敛后的周期与关停（已实施）
 
@@ -136,10 +141,10 @@ LAN 发现与邮件 worker。
 | --- | --- | --- | --- | --- | --- | --- |
 | 5 | `application/playback/session.rs` | 5 s 固定 tick | 睡到"最近会话到期时间"，无会话时 `WEB_PLAYBACK_IDLE_FALLBACK` = **60 s** | 12 → **1** | 会话创建时 `Notify`；有会话时按 `expires_at` / `last_heartbeat_at + 90 s` 精确定时 | `WebPlaybackSessionService::shutdown`（`BackgroundLoop`） |
 | 6 | `application/webhooks.rs` | 5 s | `DELIVERY_POLL_INTERVAL` = **30 s**；最后一次投递尝试后 60 s 内仍按 5 s 轮询（`DELIVERY_RETRY_INTERVAL` + `DELIVERY_RETRY_WINDOW`），待投递队列非空时连续排空不等待 | 12 → **2** | `publish()` 提交投递行后 `notify_one` | 已有 `BackgroundLoop` |
-| 7 | `application/mail_worker.rs` | 5 s | `MAIL_QUEUE_POLL_INTERVAL` = **30 s**；`Deferred` 后仍 5 s（`MAIL_QUEUE_RETRY_INTERVAL`） | 12 → **2** | 五个入队路径（注册/注册重发/邀请/邀请重发/改邮箱）提交后 `notify_mail_outbox_appended()` | 已有（`main.rs` 显式 `shutdown`） |
+| 7 | `application/mail_worker.rs` | 5 s | `MAIL_QUEUE_POLL_INTERVAL` = **30 s**；`Deferred` 后仍 5 s（`MAIL_QUEUE_RETRY_INTERVAL`） | 12 → **2** | 五个入队路径（注册/注册重发/邀请/邀请重发/改邮箱）提交后 `Database::notify_mail_outbox_appended()` | 已有（`main.rs` 显式 `shutdown`） |
 | 9 | `application/scan_fingerprint_migration.rs` | 10 s（迁移完成后仍继续） | 所有库都有 `completed_at` 后转休眠：`LIBRARY_LIST_FALLBACK_INTERVAL` = **600 s** | 6 → **0.1** | 只剩库列表兜底（一次性迁移，新库扫描直接写 v2 指纹） | 已有（`ShutdownReason` `watch`） |
 | 11 | `application/watch.rs` | 30 s | `LIBRARY_ROOT_REFRESH_INTERVAL` = **300 s** | 2 → **0.2** | 已有 `LibraryChangeNotifier` 事件（库/根目录变更） | `LibraryWatchService::spawn_managed` + `shutdown` |
-| 12 | `application/user_cleanup.rs` | 60 s | `USER_CLEANUP_INTERVAL` = **3600 s** | 1 → **0.017** | 纯定时（保留期是天级） | `UserCleanupWorker::shutdown` |
+| 12 | `application/user_cleanup.rs` | 60 s（每次一批） | `USER_CLEANUP_INTERVAL` = **3600 s**，首轮在启动后 60 s，单 pass 循环清理直到批次不满 | 1 → **0.017** | 纯定时（保留期是天级） | `UserCleanupWorker::shutdown` |
 | 14 | `application/plugins.rs` | 300 s | 300 s（不变） | 0.2 → **0.2** | 已有 `login_background_refresh_notify` | `PluginService::shutdown` |
 | 15 | `storage/watch_state_archive.rs` | 300 s | 300 s（不变） | 0.2 → **0.2** | 纯定时（保持） | `DetachedStateReconcileWorker::shutdown` |
 
@@ -153,7 +158,7 @@ LAN 发现与邮件 worker。
   即不晚于改造前，唯一额外风险是"某条会话行没通知到"（当前没有这种写入路径）。
 - 扫描指纹迁移：一次性迁移完成前行为不变（10 s）；完成后每 10 分钟看一次库列表。
 - 用户清理：保留期语义不变（仍按 `retention_days`、`deletion_purge_at` 等阈值判定），只是探测频率从
-  分钟级降到小时级。
+  分钟级降到小时级；单 pass 会把积压清空，周期放大不影响吞吐。
 
 ---
 
@@ -204,51 +209,54 @@ LAN 发现与邮件 worker。
 
 ### 5.2 空闲唤醒总次数与贡献排名
 
-| 排名 | 循环 | 周期 | 唤醒/分钟 | 占总量 |
-| --- | --- | --- | --- | --- |
-| 1 | 本地元数据 outbox 兜底（§2.1-1） | 250 ms | **240** | 50.4 % |
-| 2 | `catalog_items` 增量消费（§2.1-3） | 1 s | **60** | 12.6 % |
-| 3 | 搜索重建索引（§2.1-4） | 1 s | **60** | 12.6 % |
-| 4 | 全局合集同步（§2.1-2） | 1 s | **60** | 12.6 % |
-| 5 | Web 播放会话回收（§2.1-5） | 5 s | 12 | 2.5 % |
-| 6 | webhook 投递轮询（§2.1-6） | 5 s | 12 | 2.5 % |
-| 7 | 邮件 outbox 轮询（§2.1-7） | 5 s | 12 | 2.5 % |
-| 8 | 内容限制索引（§2.1-8） | 10 s | 6 | 1.3 % |
-| 9 | 扫描指纹迁移（§2.1-9） | 10 s | 6 | 1.3 % |
-| 10 | 计划任务调度（§2.1-10） | 15 s | 4 | 0.8 % |
-| 11 | 媒体库根目录刷新（§2.1-11） | 30 s | 2 | 0.4 % |
-| 12 | 用户清理（§2.1-12） | 60 s | 1 | 0.2 % |
-| 13 | 身份合并兜底（§2.1-13） | 120 s | 0.5 | 0.1 % |
-| 14 | 登录背景图刷新（§2.1-14） | 300 s | 0.2 | <0.1 % |
-| 15 | 游离状态重挂（§2.1-15） | 300 s | 0.2 | <0.1 % |
-| 16 | 查询统计刷新（§2.1-16） | 900 s | 0.07 | <0.1 % |
-| 17 | 空间回收维护（§2.1-17） | 86 400 s | 0.0007 | ≈0 |
-| 18 | 任务历史保留（§2.1-18） | 86 400 s | 0.0007 | ≈0 |
-| | **合计** | | **≈ 476 次/分（≈ 7.9 次/秒）** | 100 % |
+| 排名 | 循环 | 周期（改造前 → 改造后） | 唤醒/分钟（前） | 唤醒/分钟（后） | 占总量（前） |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 本地元数据 outbox 兜底（§2.1-1） | 250 ms → 仅写侧 `Notify` + 10 s 兜底 | **240** | **6** | 50.4 % |
+| 2 | `catalog_items` 增量消费（§2.1-3） | 1 s → 仅写侧 `Notify` + 10 s 兜底 | **60** | **6** | 12.6 % |
+| 3 | 搜索重建索引（§2.1-4） | 1 s → 仅写侧 `Notify` + 10 s 兜底 | **60** | **6** | 12.6 % |
+| 4 | 全局合集同步（§2.1-2） | 1 s → 仅写侧 `Notify` + 10 s 兜底 | **60** | **6** | 12.6 % |
+| 5 | Web 播放会话回收（§2.1-5） | 5 s | 12 | 12 | 2.5 % |
+| 6 | webhook 投递轮询（§2.1-6） | 5 s | 12 | 12 | 2.5 % |
+| 7 | 邮件 outbox 轮询（§2.1-7） | 5 s | 12 | 12 | 2.5 % |
+| 8 | 内容限制索引（§2.1-8） | 10 s | 6 | 6 | 1.3 % |
+| 9 | 扫描指纹迁移（§2.1-9） | 10 s | 6 | 6 | 1.3 % |
+| 10 | 计划任务调度（§2.1-10） | 15 s | 4 | 4 | 0.8 % |
+| 11 | 媒体库根目录刷新（§2.1-11） | 30 s | 2 | 2 | 0.4 % |
+| 12 | 用户清理（§2.1-12） | 60 s | 1 | 1 | 0.2 % |
+| 13 | 身份合并兜底（§2.1-13） | 120 s | 0.5 | 0.5 | 0.1 % |
+| 14 | 登录背景图刷新（§2.1-14） | 300 s | 0.2 | 0.2 | <0.1 % |
+| 15 | 游离状态重挂（§2.1-15） | 300 s | 0.2 | 0.2 | <0.1 % |
+| 16 | 查询统计刷新（§2.1-16） | 900 s | 0.07 | 0.07 | <0.1 % |
+| 17 | 空间回收维护（§2.1-17） | 86 400 s | 0.0007 | 0.0007 | ≈0 |
+| 18 | 任务历史保留（§2.1-18） | 86 400 s | 0.0007 | 0.0007 | ≈0 |
+| | **合计** | | **≈ 476 次/分（≈ 7.9 次/秒）** | **≈ 80 次/分（≈ 1.3 次/秒）** | 100 % |
 
-**前 4 项（250 ms + 三个 1 s）合计 420 次/分，占 88%。** 只把前 4 项改成事件驱动，就能把空闲唤醒
-压到约 56 次/分。
+**前 4 项（250 ms + 三个 1 s）改造前合计 420 次/分，占 88%，改造后合计 24 次/分，
+空闲唤醒总量降到约 80 次/分（−83%）**，其中 24 次只是 10 s 兜底。
 
 ### 5.3 空闲状态下的数据库访问量估算
 
 空闲时真正落到磁盘的只有**读**（实测一分钟内没有任何写入，见 §6.4）。按每次唤醒的查询条数折算：
 
-| 循环 | 每轮查询数（空闲路径） | 查询/分钟 |
-| --- | --- | --- |
-| 本地元数据 outbox | 2（outbox claim、backfill claim） | 480 |
-| `catalog_items` 增量 | 3（consumer 水位、drain、trim） | 180 |
-| 搜索重建索引 | 2（drain、trim） | 120 |
-| 全局合集同步 | 2（NFO 引用对账、待同步作业） | 120 |
-| Web 播放会话回收 | 2（失活、过期） | 24 |
-| webhook 投递 | 1 | 12 |
-| 邮件 outbox | 1 | 12 |
-| 计划任务 | 3（推荐统计、计划、配置） | 12 |
-| 内容限制索引 | 1 | 6 |
-| 扫描指纹迁移 | 1（空库时的库列表） | 6 |
-| 用户清理 | 3 | 3 |
-| 媒体库根目录刷新 | 1 | 2 |
-| 身份合并 / 游离状态重挂 | 1 / 2 | 0.5 / 0.4 |
-| **合计** | | **≈ 980 条/分（≈ 16 条/秒）** |
+| 循环 | 每轮查询数（空闲路径） | 查询/分钟（前） | 查询/分钟（后） |
+| --- | --- | --- | --- |
+| 本地元数据 outbox | 2（outbox claim、backfill claim） | 480 | 12 |
+| `catalog_items` 增量 | 3（consumer 水位、drain、trim） | 180 | 18 |
+| 搜索重建索引 | 2（drain、trim） | 120 | 12 |
+| 全局合集同步 | 2（NFO 引用对账、待同步作业） | 120 | 12 |
+| Web 播放会话回收 | 2（失活、过期） | 24 | 24 |
+| webhook 投递 | 1 | 12 | 12 |
+| 邮件 outbox | 1 | 12 | 12 |
+| 计划任务 | 3（推荐统计、计划、配置） | 12 | 12 |
+| 内容限制索引 | 1 | 6 | 6 |
+| 扫描指纹迁移 | 1（空库时的库列表） | 6 | 6 |
+| 用户清理 | 3 | 3 | 3 |
+| 媒体库根目录刷新 | 1 | 2 | 2 |
+| 身份合并 / 游离状态重挂 | 1 / 2 | 0.5 / 0.4 | 0.5 / 0.4 |
+| **合计** | | **≈ 980 条/分（≈ 16 条/秒）** | **≈ 132 条/分（≈ 2.2 条/秒）** |
+
+改造后前 4 项的空闲查询从 900 条/分降到 54 条/分，合计约 **≈ 132 条/分**（−87%）：
+空闲时只剩 10 s 兜底那一次查询。
 
 在机械盘 NAS 上，每秒约 16 次读查询（命中页缓存时是纯 CPU，冷页时才触碰磁盘）本身未必让磁盘转起来，
 但**它使 SQLite 连接池、WAL 调度和 tokio 运行时始终保持活跃**，这正是"空闲也无法进入低功耗状态"的机制。
@@ -370,6 +378,33 @@ per-process idle wakeups——本机 `powermetrics` 需要 root，而 `sudo` 需
 - 空库启动时 `catalog_items` / 用户"下一集"重建各耗时 34 ms / 20 ms（一次性）。
 - 空闲 RSS 68–88 MB，线程 21 个（10 tokio worker + 8 sqlite worker + 主线程 + 日志写入 + 其他）。
 
+### 6.8 改造后的空闲复测（2026-10-31，同一台机器、同一方法）
+
+改造（§7 的 A1–A3）落地后用同样的方法复测：`cargo build --locked` 的 debug 产物、
+`LUX_CONFIG_DIR=<mktemp -d>/config`（`database.json` = `{"backend":"SQLITE"}`）、空库、无客户端、
+`RUST_LOG=luxd=info`、21 线程；启动后约 100 s 进入稳态，用 `top -l 4 -s 60 -pid <pid> -stats pid,csw,cpu,time`
+取 3 个 60 s 窗口。
+
+| 窗口（60 s） | 上下文切换增量 | CPU 时间增量 |
+| --- | --- | --- |
+| 第 1 分钟 | +3 238 | +0.09 s |
+| 第 2 分钟 | +3 085 | +0.08 s |
+| 第 3 分钟 | +2 875 | +0.07 s |
+| **平均** | **≈ +3 066 次/分** | **≈ 0.08 s/分** |
+
+对照 §6.2 的改造前基线（≈ +16 051 次/分、≈ 0.39 s CPU/分）：**上下文切换 −81%，CPU 时间 −79%**。
+同期 `lux.db`、`lux.db-wal`、`lux.db-shm` 的 mtime 与大小在 60 s 内完全不变，空闲仍然零写入。
+
+口径说明：
+
+- 上下文切换是反推量，不是直接的空闲唤醒计数；`powermetrics` 仍需要 root，本机做不了。
+- 复测时同一台机器上还有另一个 worktree 的 `luxd` 测试进程在跑，属噪声；`csw` 是 per-process 计数，
+  量级结论不受影响，但不宜当精确值引用。
+- §6.5 里"实测是静态估算的 20–40 倍、约 1/3 无法归因"的结论因此有了新的方向：改造后
+  csw 降到约 3 000 次/分，与静态估算的 80 次/分仍差一个量级，说明**还有静态清单之外的周期活动**
+  （sqlx/Tokio 定时器、连接池、日志写入等），这仍然指向后面的 B5（迭代计数器）或 NAS 上的
+  `powermetrics`，而不是"这 4 个循环没改干净"。
+
 ---
 
 ## 7. 分级建议
@@ -378,18 +413,23 @@ per-process idle wakeups——本机 `powermetrics` 需要 root，而 `sudo` 需
 
 ### A 类：零风险，直接改（事件驱动或加长周期）
 
+A1–A3 已实施（2026-10-31，见 §5.2 的"后"列、§6.8 的复测与 §2.1/§2.3 的现状）：前 4 项由
+250 ms + 三个 1 s 改成"写侧 `Notify` + 10 s 兜底"，空闲唤醒 420 → 24 次/分，空闲查询 900 → 54 条/分；
+3 个缺关停的循环（本地元数据 outbox、`catalog_items` 增量、搜索重建）也补上了 `watch` 信号与
+`JoinHandle`。其余条目仍未实施。
+
 | 编号 | 对象 | 改动 | 预期收益 | 风险 |
 | --- | --- | --- | --- | --- |
-| **A1** | 本地元数据 outbox（`scanner/jobs/local_metadata.rs:1053`） | 空闲兜底 250 ms → 5–10 s，保留 `Notify` 快路径 | **−234 次/分**（占总量 −49 %），并减少约 470 条空闲查询/分 | 极低。进程内入队已有 `notify_one`（`:1346`），只有"其它路径/其它进程直接写 outbox 表"的行最多延迟 10 s 被拾取。需确认没有依赖"250 ms 内必然被拾取"的测试 |
-| **A2** | `catalog_items` 增量 + 搜索重建索引（`catalog_read_model.rs:158`、`:226`） | 1 s → 5 s，或改为写侧 `Notify`（同进程写的 outbox） | **−96 次/分**，−240 条查询/分 | 低。读模型/搜索索引新鲜度从 ~1 s 变 ~5 s；代码注释自己写的是"一个 tick 内可见"，改成 5 s 只是把语义放宽，不影响正确性 |
-| **A3** | 全局合集同步（`collections.rs:233`） | 1 s → 5 s，并复用已有 `watch` 加 `Notify` | **−48 次/分**，−96 条查询/分 | 低。合集元数据延迟 5 s；无正确性依赖 |
+| **A1** ✅ | 本地元数据 outbox（`scanner/jobs/local_metadata.rs`） | 已实施：空闲兜底 250 ms → 10 s，保留 `Notify` 快路径；失败重试单列 1 s | **−234 次/分**（占总量 −49 %），并减少约 470 条空闲查询/分 | 写侧 notification 覆盖所有进程内 outbox 写入点（manifest discovery 提交）。跨进程写入最多延迟 10 s |
+| **A2** ✅ | `catalog_items` 增量 + 搜索重建索引（`catalog_read_model.rs`） | 已实施：写侧 `Notify` + 10 s 兜底，不再按 tick 轮询 | **−96 次/分**，−240 条查询/分 | 搜索请求路径本身仍会先 drain 队列（search-on-read），所以搜索可见性不依赖后台循环；读模型默认关闭（`LUX_READ_MODEL_MODE=off`），开启时未挂 signal 的写路径最坏 10 s 后才进派生表 |
+| **A3** ✅ | 全局合集同步（`collections.rs`） | 已实施：`Notify` + 10 s 兜底，失败重试仍 1 s | **−48 次/分**，−96 条查询/分 | 合集元数据在未挂 signal 的写路径上最坏 10 s 后开始同步 |
 | **A4** | Web 播放会话回收（`playback/session.rs:241`） | 5 s → 由会话心跳/停止事件驱动，保留 30 s 兜底 | **−10 次/分** | 中低。正在播放的客户端心跳会驱动它；兜底 30 s 意味着异常断开的会话最多多占 30 s 配额 |
 | **A5** | 邮件 / webhook 轮询（`mail_worker.rs:135`、`webhooks.rs:170`） | 入队时 `notify`，兜底 5 s → 60 s | **−22 次/分** | 低。两个入队点都在进程内、都可加 notify；兜底 60 s 只影响"跨进程入队"的场景（当前不存在） |
 | **A6** | 用户清理（`user_cleanup.rs:33`） | 60 s → 3600 s | −1 次/分（但每次 3 条查询） | 极低。保留期是天级，分钟级探测没有意义 |
 | **A7** | 扫描指纹迁移（`scan_fingerprint_migration.rs:50`） | 所有库 `completed_at` 齐了之后**退出循环**；未完成时空闲间隔 10 s → 60 s | −6 次/分，并停止每 10 s 的库列表查询 | 低。新建媒体库时需要一次显式唤醒（可由库创建路径发 `notify`），否则要等下一轮 |
 
-**A 类全部实施后：空闲唤醒 ≈ 476 → 约 60 次/分（−87 %），空闲查询 ≈ 980 → 约 130 条/分（−87 %）。**
-且 A1–A3 是纯参数/通知改动，不改变任何数据语义。
+**A 类里的 A1–A3 实施后：空闲唤醒 ≈ 476 → 约 80 次/分（−83 %），空闲查询 ≈ 980 → 约 132 条/分（−87 %）。**
+三者的可见行为要么不变（进程内写入立即唤醒），要么只在"本进程观察不到的写入"上退化为 10 s 兜底。
 
 > **实施状态**：A4–A7 以及 A5 涉及的邮件/webhook 循环已由任务 B 实施，周期与关停见 §2.5
 > （这八项合计 45.4 → 5.7 次/分）。A1–A3 属于任务 A 的范围，本文不改。
@@ -420,6 +460,8 @@ per-process idle wakeups——本机 `powermetrics` 需要 root，而 `sudo` 需
 
 1. 空闲唤醒高度集中：**4 个循环（250 ms outbox + 三个 1 s 消费者）占 88 %**。这 4 个都是"纯轮询的
    outbox/同步消费者"，且其中 2 个已经具备 in-process `Notify`，改成事件驱动在结构上可行。
+   2026-10-31 已按此实施：写侧提交后发 `Notify`，空闲阻塞在通知上，10 s 低频兜底只服务
+   本进程观察不到的写入。空闲唤醒 476 → 约 80 次/分，实测上下文切换 −81 %、CPU 时间 −79 %（§6.8）。
 2. 静态估算的空闲唤醒是 **476 次/分**，空闲查询约 **980 条/分**；实测（debug 构建、M4）空闲 CPU 为
    **0.28–0.49 s/分（0.5–0.8 % 单核）**，一分钟内**零写入**。
 3. 用上下文切换校准后反推，实测空闲活跃度是静态估算的 **20–40 倍**，其中约 2/3 可以用"每次查询的
@@ -427,5 +469,6 @@ per-process idle wakeups——本机 `powermetrics` 需要 root，而 `sudo` 需
    才能定论。
 4. `top` 的 `IDLEW` 在这台开发机上不可用（深度空闲不发生），已用 `SIGSTOP` 验证计数器语义并用对照
    进程证明该列恒为 0；因此本文改用 CPU 时间 + 上下文切换（含校准）+ 文件写入三个可复现指标。
-5. 建议顺序：**先做 A 类（零风险、可独立提交、合计 −87 % 空闲唤醒），再决定 B1/B2**；
-   B3（统一调度器）应在 A 类完成且 B5 提供了度量之后再评估。
+5. A 类的前 3 项（占 88 % 的 4 个循环）已经实施，见 §2.1、§5.2、§6.8。**剩余建议顺序：先做
+   A4–A7，再决定 B1/B2**；B3（统一调度器）应在 A 类完成且 B5 提供了度量之后再评估——注意改造后
+   csw 与静态估算仍差一个量级，"合并定时器"未必是剩余活跃度的主因。

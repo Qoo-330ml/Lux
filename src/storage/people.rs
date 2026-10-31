@@ -381,8 +381,12 @@ impl Database {
         }
         for replacement_chunk in replacements.chunks(PERSON_CREDIT_REPLACEMENT_BATCH_SIZE) {
             let _metadata_write_guard = self.acquire_metadata_write_lock().await;
-            let _write_guard =
-                acquire_write_lock(&self.person_credits_write_lock, "person_credits").await;
+            let _write_guard = acquire_write_lock(
+                &self.person_credits_write_lock,
+                "person_credits",
+                self.outbox_signals(),
+            )
+            .await;
             let mut transaction = self.begin_metadata_write_transaction().await?;
             for (item_id, credits, source_fingerprint, relation_checksum) in replacement_chunk {
                 self.replace_person_credits_in_transaction(
@@ -583,8 +587,12 @@ impl Database {
 
     pub(crate) async fn clear_person_credits(&self, item_id: &str) -> Result<u64, StorageError> {
         let _metadata_write_guard = self.acquire_metadata_write_lock().await;
-        let _write_guard =
-            acquire_write_lock(&self.person_credits_write_lock, "person_credits").await;
+        let _write_guard = acquire_write_lock(
+            &self.person_credits_write_lock,
+            "person_credits",
+            self.outbox_signals(),
+        )
+        .await;
         let mut transaction = self.begin_metadata_write_transaction().await?;
         let result = self
             .query("DELETE FROM person_credits WHERE item_id = ?")

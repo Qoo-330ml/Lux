@@ -267,7 +267,10 @@ impl Database {
         .execute(&mut *transaction)
         .await
         .map_err(self.sqlx_err())?;
-        transaction.commit().await.map_err(self.sqlx_err())
+        transaction.commit().await.map_err(self.sqlx_err())?;
+        // Finishing a job can reset a source's probe status, which the read model derives.
+        self.signal_outbox_consumers();
+        Ok(())
     }
 }
 

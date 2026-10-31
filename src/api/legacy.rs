@@ -251,6 +251,7 @@ pub struct ReadyServices {
     scraper: ScraperProvider,
     collections: CollectionService,
     global_collection_sync_worker: GlobalCollectionSyncWorker,
+    catalog_outbox_workers: crate::application::catalog_read_model::CatalogOutboxWorkers,
     content_restriction_index_worker: Option<ContentRestrictionIndexWorker>,
     identity_merge_worker: IdentityMergeWorker,
     people: PeopleService,
@@ -613,6 +614,7 @@ impl AppState {
         scheduled_tasks -> ScheduledTaskService,
         plugins -> PluginService,
         global_collection_sync_worker -> GlobalCollectionSyncWorker,
+        catalog_outbox_workers -> crate::application::catalog_read_model::CatalogOutboxWorkers,
         identity_merge_worker -> IdentityMergeWorker,
         people -> PeopleService,
         playback_progress -> PlaybackProgressService,
@@ -656,6 +658,9 @@ impl AppState {
         if let Some(worker) = self.identity_merge_worker() {
             worker.shutdown().await;
         }
+        if let Some(scan_jobs) = self.scan_jobs() {
+            scan_jobs.shutdown_local_metadata_outbox_worker().await;
+        }
         // A failed probe drain must not leave the workers below running: it is reported after they
         // were stopped, so the database is never closed under an active worker.
         let probe_shutdown_error = crate::application::probe::shutdown_probe_runtime()
@@ -667,6 +672,9 @@ impl AppState {
         }
         if let Some(worker) = self.global_collection_sync_worker() {
             worker.shutdown().await;
+        }
+        if let Some(workers) = self.catalog_outbox_workers() {
+            workers.shutdown().await;
         }
         if let Some(webhooks) = self.webhooks() {
             webhooks.shutdown().await;
@@ -931,6 +939,8 @@ impl AppState {
             ),
         );
         let global_collection_sync_worker = GlobalCollectionSyncWorker::start(database.clone());
+        let catalog_outbox_workers =
+            crate::application::catalog_read_model::CatalogOutboxWorkers::start(database.clone());
         let identity_merge_worker = IdentityMergeWorker::start(
             database.clone(),
             Some(home.clone()),
@@ -1022,6 +1032,7 @@ impl AppState {
             scraper,
             collections,
             global_collection_sync_worker,
+            catalog_outbox_workers,
             content_restriction_index_worker: None,
             identity_merge_worker,
             people,
@@ -1169,10 +1180,6 @@ impl AppState {
                 database.clone(),
             );
             crate::application::catalog_read_model::spawn_startup_user_series_next(
-                database.clone(),
-            );
-            crate::application::catalog_read_model::spawn_search_reindex_worker(database.clone());
-            crate::application::catalog_read_model::spawn_catalog_items_incremental_worker(
                 database.clone(),
             );
         }

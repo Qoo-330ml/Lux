@@ -29,7 +29,10 @@
 - `admin_settings::transcoding_settings_are_admin_only_validated_and_persisted` 与
   `web_playback::broken_hardware_encoder_falls_back_to_software_transcoding`：对 `transcodingStatus.available` 的期望互相
   矛盾，在装了 VideoToolbox 的开发机上必有一个失败，与优化无关。
-- `web_static::*`：需要先 `pnpm --dir web build` 生成 `web/dist`。
+- `web_static::*`：需要先 `pnpm --dir web build` 生成 `web/dist`（本机未构建，实测为 404 → 400/200 断言失败）。
+- `api_web` 的 `remote::forwarded_headers_are_only_honoured_for_trusted_proxies`：2026-10-31 在本机
+  单独串行也是失败（`X-Forwarded-For` 未被采信，落库仍是 peer `127.0.0.1`），并在**未改动的 `test`
+  基线**（`7cf5f223`）上复现，属既有失败，与本轮后台唤醒改造无关；查明原因前不要当成回归。
 - 并发高负载时会随机失败，**单独串行跑稳定通过**：登录请求超时（argon2 在负载下）、`danmaku::…`、
   `image_writer::manual_scraper…`、`media_info_config_api::…`。
 
@@ -106,7 +109,17 @@ Emby 客户端与 Lux Web 播放器每 10 秒上报一次进度（`web/src/featu
 
 ## 6. 后台任务唤醒
 
-第一轮已把这一项做成了盘点与实测，完整数据见 `docs/BACKGROUND-TASKS-AUDIT.md`。要点：
+第一轮已把这一项做成了盘点与实测，完整数据见 `docs/BACKGROUND-TASKS-AUDIT.md`。
+
+**状态（2026-10-31，第三轮任务 A 已实施）**：前 4 项（占 88% 的 250 ms 本地元数据 outbox 兜底 +
+`catalog_items` 增量 + 搜索重建 + 全局合集同步）已改成"写侧 `Notify` 事件驱动 + 10 s 低频兜底"，
+其中 3 个原本没有 `watch` 信号的循环（本地元数据 outbox、`catalog_items` 增量、搜索重建）同时补上了
+shutdown 并接入 `shutdown_background_workers_checked`。静态估算空闲唤醒 **476 → 约 80 次/分**，
+空闲查询 **980 → 约 132 条/分**；本机 arm64 复测上下文切换 **16 051 → 约 3 066 次/分（−81 %）**、
+CPU **0.39 → 0.08 s/分（−79 %）**，空闲仍零写入（方法与口径见审计文档 §6.8，含噪声说明）。
+新鲜度：进程内写入由写侧 `Notify` 立即唤醒；写侧未挂 signal 的存储写路径（多数不经过 metadata 写锁的
+单语句写）最坏由 10 s 兜底覆盖。搜索请求路径本身会先 drain 队列，搜索可见性不依赖后台循环；
+读模型默认关闭（`LUX_READ_MODEL_MODE=off`）。其余要点仍是改造前的数据：
 
 - 静态估算空闲唤醒约 **476 次/分**，前 4 项占 88%：本地元数据 outbox 兜底 250 ms（240 次/分）、`catalog_items` 增量 1 s、
   搜索重建 1 s、全局合集同步 1 s（各 60 次/分）。

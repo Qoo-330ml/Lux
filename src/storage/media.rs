@@ -3258,6 +3258,7 @@ impl Database {
         .await
         .map_err(self.sqlx_err())?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.signal_outbox_consumers();
         Ok(true)
     }
 
@@ -3326,6 +3327,7 @@ impl Database {
             .map_err(self.sqlx_err())?;
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.signal_outbox_consumers();
         Ok(true)
     }
 
@@ -3746,6 +3748,7 @@ impl Database {
             member_count += result.rows_affected() as usize;
         }
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.signal_outbox_consumers();
         Ok(StoredCollectionRefresh {
             collection_item_id: item_id,
             member_count,
@@ -3928,6 +3931,7 @@ impl Database {
         )
         .await?;
         transaction.commit().await.map_err(self.sqlx_err())?;
+        self.signal_outbox_consumers();
         Ok(Some(StoredEmbyCollection {
             collection_item_id,
             library_id,

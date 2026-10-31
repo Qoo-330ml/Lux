@@ -12418,6 +12418,7 @@ async fn metadata_job_list_counts_only_pending_items_on_the_requested_page() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -15021,6 +15022,7 @@ async fn write_probe_reports_a_query_only_sqlite_connection() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -15094,6 +15096,7 @@ async fn metadata_jobs_process_series_before_seasons_and_episodes() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -15229,6 +15232,7 @@ async fn metadata_jobs_claim_items_in_priority_order_as_a_batch() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -19107,6 +19111,7 @@ async fn metadata_attempt_state_loads_both_attempt_tables_with_one_query() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -19202,6 +19207,7 @@ async fn item_media_strategy_settings_use_one_query_and_require_an_active_item()
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -19709,6 +19715,7 @@ async fn metadata_jobs_reconcile_items_left_running_by_workers() {
         filesystem_path_templates: Arc::new(SqlTemplateCache::default()),
         access_changes: Arc::new(AccessChangeEpochs::default()),
         auth_cache: Arc::new(AuthCacheEpochs::default()),
+        outbox_signals: Arc::new(OutboxSignals::default()),
         mail_outbox_appended: Arc::new(tokio::sync::Notify::new()),
         query_count: Arc::new(AtomicUsize::new(0)),
     };
@@ -35085,6 +35092,7 @@ async fn write_lock_waits_for_the_current_writer_instead_of_failing() {
         "test",
         Duration::from_millis(1),
         std::panic::Location::caller(),
+        Arc::new(OutboxSignals::default()),
     )
     .await;
     let waited = started.elapsed();

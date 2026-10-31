@@ -1366,6 +1366,8 @@ impl Database {
             if count == 0 {
                 break;
             }
+            // The delete cascades into the catalog/search outboxes; derived rows must follow.
+            self.signal_outbox_consumers();
             purged = purged.saturating_add(count);
             if !pause.is_zero() {
                 tokio::time::sleep(pause).await;
@@ -1512,6 +1514,9 @@ impl Database {
         }
         self.mark_startup_repair_completed(MEDIA_SOURCE_DEFAULT_REPAIR_MARKER)
             .await?;
+        if repaired > 0 {
+            self.signal_outbox_consumers();
+        }
         Ok(repaired)
     }
 
