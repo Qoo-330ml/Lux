@@ -1685,13 +1685,9 @@ async fn web_playback_uses_signed_direct_urls_and_monotonic_events()
         Some(&uuid::Uuid::new_v4().to_string()),
     )
     .await?;
-    sqlx::query(
-        "INSERT INTO server_settings (key, value)
-         VALUES ('trusted_proxy_cidrs', 'invalid-json')
-         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-    )
-    .execute(database.pool())
-    .await?;
+    database
+        .set_trusted_proxy_cidrs_json("invalid-json")
+        .await?;
     // Without a forwarded chain the peer is the client and the trusted-proxy settings are never
     // read. Send a chain so the resolver must consult the (now invalid) configuration.
     let proxy_settings_error = peer_client
