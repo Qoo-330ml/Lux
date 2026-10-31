@@ -21,6 +21,7 @@ use crate::storage::{
     UserPlaybackPolicy, WebPlaybackEventClaim, WebPlaybackTranscodingDetails,
 };
 
+use crate::application::transcoding::TranscodingSettings;
 use crate::application::user_access_rules::{
     IpBlacklistEvaluationError, MAX_ACTIVE_IP_BLACKLIST_RULES_PER_REQUEST,
     UserAccessBlacklistRuleType, ip_blacklist_rules_match_address,
@@ -35,7 +36,6 @@ use super::hls::{
     HlsError, HlsManager, HlsProgressSnapshot, HlsSegmentContainer, HlsStartOptions,
     HlsWebStartOptions,
 };
-use crate::application::transcoding::TranscodingSettings;
 
 type HmacSha256 = Hmac<Sha256>;
 
