@@ -35946,3 +35946,77 @@ async fn first_watch_enters_continue_watching_when_the_position_crosses_the_resu
     );
     Ok(())
 }
+
+#[test]
+fn sqlite_synchronous_setting_defaults_to_full_and_parses_overrides() {
+    use super::{SqliteSynchronous, parse_sqlite_synchronous_request};
+
+    let unset = parse_sqlite_synchronous_request(None);
+    assert_eq!(
+        unset.synchronous,
+        SqliteSynchronous::Full,
+        "the default must stay FULL until the owner accepts the NAS A/B result"
+    );
+    assert!(unset.rejected.is_none());
+
+    for blank in ["", "   "] {
+        let parsed = parse_sqlite_synchronous_request(Some(blank));
+        assert_eq!(parsed.synchronous, SqliteSynchronous::Full);
+        assert!(
+            parsed.rejected.is_none(),
+            "blank input means unset, not invalid"
+        );
+    }
+
+    for normal in ["normal", "NORMAL", " Normal "] {
+        let parsed = parse_sqlite_synchronous_request(Some(normal));
+        assert_eq!(parsed.synchronous, SqliteSynchronous::Normal);
+        assert!(parsed.rejected.is_none());
+    }
+
+    for full in ["full", "FULL", " full "] {
+        let parsed = parse_sqlite_synchronous_request(Some(full));
+        assert_eq!(parsed.synchronous, SqliteSynchronous::Full);
+        assert!(parsed.rejected.is_none());
+    }
+
+    let invalid = parse_sqlite_synchronous_request(Some(" fastish "));
+    assert_eq!(
+        invalid.synchronous,
+        SqliteSynchronous::Full,
+        "an unparseable value falls back to FULL"
+    );
+    assert_eq!(invalid.rejected.as_deref(), Some("fastish"));
+}
+
+#[tokio::test]
+async fn sqlite_synchronous_level_reaches_the_connection_pragma()
+-> Result<(), Box<dyn std::error::Error>> {
+    use super::{DatabaseConfiguration, SqliteSynchronous};
+    use crate::config::Config;
+
+    // SQLite's numeric `synchronous` levels: 1 = NORMAL, 2 = FULL.
+    for (level, expected) in [
+        (SqliteSynchronous::Full, 2_i64),
+        (SqliteSynchronous::Normal, 1_i64),
+    ] {
+        let temp_dir = tempfile::tempdir()?;
+        let database = Database::connect_with_sqlite_synchronous(
+            &Config {
+                http_addr: "127.0.0.1:8097".parse()?,
+                config_dir: temp_dir.path().join("config"),
+            },
+            &DatabaseConfiguration::Sqlite,
+            level,
+        )
+        .await?;
+        let applied: i64 = sqlx::query_scalar("PRAGMA synchronous")
+            .fetch_one(database.pool())
+            .await?;
+        assert_eq!(
+            applied, expected,
+            "every pooled connection must apply the configured synchronous level"
+        );
+    }
+    Ok(())
+}

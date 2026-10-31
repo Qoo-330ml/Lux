@@ -418,6 +418,94 @@ fn parse_sqlite_auto_vacuum_request(configured: Option<&str>) -> bool {
         .unwrap_or(false)
 }
 
+/// Deployment override for the SQLite `synchronous` PRAGMA applied to every pooled
+/// connection.
+///
+/// The default stays `FULL`, which is also SQLite's own default: in WAL mode `NORMAL`
+/// cannot corrupt the database, it only allows a power loss to drop the last few
+/// committed transactions, and the small-transaction write paths that would benefit most
+/// (playback progress) still need a NAS A/B before the owner changes the default.
+const SQLITE_SYNCHRONOUS_ENV: &str = "LUX_SQLITE_SYNCHRONOUS";
+
+/// Durability level requested for the SQLite `synchronous` PRAGMA.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum SqliteSynchronous {
+    /// `FULL` (default): every commit fsyncs the write-ahead log.
+    Full,
+    /// `NORMAL`: commits no longer fsync; WAL recovery stays consistent, but a power
+    /// loss may drop the last few committed transactions.
+    Normal,
+}
+
+impl SqliteSynchronous {
+    /// The PRAGMA keyword, which is also how the setting is documented.
+    fn pragma_name(self) -> &'static str {
+        match self {
+            Self::Full => "FULL",
+            Self::Normal => "NORMAL",
+        }
+    }
+}
+
+/// A parsed request plus the rejected text, if any, so the caller can warn exactly once.
+struct SqliteSynchronousRequest {
+    synchronous: SqliteSynchronous,
+    rejected: Option<String>,
+}
+
+fn parse_sqlite_synchronous_request(configured: Option<&str>) -> SqliteSynchronousRequest {
+    let Some(configured) = configured
+        .map(str::trim)
+        .filter(|configured| !configured.is_empty())
+    else {
+        return SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Full,
+            rejected: None,
+        };
+    };
+    match configured.to_ascii_lowercase().as_str() {
+        "full" => SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Full,
+            rejected: None,
+        },
+        "normal" => SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Normal,
+            rejected: None,
+        },
+        _ => SqliteSynchronousRequest {
+            synchronous: SqliteSynchronous::Full,
+            rejected: Some(configured.to_owned()),
+        },
+    }
+}
+
+fn sqlite_synchronous() -> SqliteSynchronous {
+    sqlite_synchronous_for(std::env::var(SQLITE_SYNCHRONOUS_ENV).ok().as_deref())
+}
+
+fn sqlite_synchronous_for(configured: Option<&str>) -> SqliteSynchronous {
+    let request = parse_sqlite_synchronous_request(configured);
+    if let Some(rejected) = request.rejected {
+        // Environment input only: no credentials, paths, or user data are logged.
+        tracing::warn!(
+            env = SQLITE_SYNCHRONOUS_ENV,
+            value = %rejected,
+            fallback = request.synchronous.pragma_name(),
+            "ignoring an invalid SQLite synchronous setting"
+        );
+    }
+    request.synchronous
+}
+
+fn sqlite_after_connect_sql(synchronous: SqliteSynchronous) -> String {
+    format!(
+        "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;
+         PRAGMA synchronous = {}; PRAGMA busy_timeout = 5000;
+         PRAGMA journal_size_limit = 67108864;",
+        synchronous.pragma_name()
+    )
+}
+
 /// SQLite only honors `auto_vacuum` when it is set before the first table exists, so
 /// a brand-new database reserves incremental-vacuum mode here. Incremental mode lets
 /// a later large deletion return pages to the filesystem in bounded steps instead of
@@ -1119,6 +1207,18 @@ impl Database {
         config: &Config,
         configuration: &DatabaseConfiguration,
     ) -> Result<Self, StorageError> {
+        Self::connect_with_sqlite_synchronous(config, configuration, sqlite_synchronous()).await
+    }
+
+    /// Opens the database with an explicit SQLite `synchronous` level.
+    ///
+    /// Split out from [`Database::connect_with_configuration`] so the pragma wiring can be
+    /// tested without mutating the process environment.
+    async fn connect_with_sqlite_synchronous(
+        config: &Config,
+        configuration: &DatabaseConfiguration,
+        sqlite_synchronous: SqliteSynchronous,
+    ) -> Result<Self, StorageError> {
         configuration
             .validate()
             .map_err(StorageError::Configuration)?;
@@ -1164,23 +1264,30 @@ impl Database {
             })?;
         let after_connect_sql = match backend {
             DatabaseBackend::Sqlite => {
-                "PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;
-                 PRAGMA busy_timeout = 5000;
-                 PRAGMA journal_size_limit = 67108864;"
+                // The level is connection state and never stored in the file, so this line is
+                // how an A/B run confirms which level the running process applied.
+                tracing::info!(
+                    synchronous = sqlite_synchronous.pragma_name(),
+                    "sqlite connection durability level"
+                );
+                sqlite_after_connect_sql(sqlite_synchronous)
             }
-            DatabaseBackend::Postgres => {
-                "SET TIME ZONE 'UTC';
+            DatabaseBackend::Postgres => "SET TIME ZONE 'UTC';
                  SET idle_in_transaction_session_timeout = '60s';
                  SET work_mem = '16MB';
                  SET jit = off;
                  SET max_parallel_workers_per_gather = 1;
                  SET statement_timeout = '1800s'"
-            }
+                .to_owned(),
         };
         let pool = database_pool_options(pool_max_connections)
             .after_connect(move |connection, _| {
+                // The only interpolated value is the pragma keyword from `SqliteSynchronous`.
+                let after_connect_sql = after_connect_sql.clone();
                 Box::pin(async move {
-                    connection.execute(after_connect_sql).await?;
+                    connection
+                        .execute(sqlx::query(sqlx::AssertSqlSafe(after_connect_sql)))
+                        .await?;
                     if backend == DatabaseBackend::Postgres {
                         connection.execute("SET application_name = 'lux'").await?;
                     }
