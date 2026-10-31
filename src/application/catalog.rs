@@ -3457,7 +3457,11 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use crate::application::recommendations::daily_recommendation_items;
+    use crate::{
+        application::access::AccessPrincipal,
+        application::recommendations::daily_recommendation_items,
+        storage::Database,
+    };
 
     use super::{
         CatalogItem, CatalogSource, MAX_LIBRARY_PAGE_REFRESH_ENTRIES, SearchFlightHandle,
@@ -6251,6 +6255,170 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some("1920"),
             "the read-model full page keeps details_json"
+        );
+        Ok(())
+    }
+
+    /// One movie in one library with a built read model and the consumer watermark advanced.
+    ///
+    /// The authoritative row and the derived row carry different titles, so a page that renders
+    /// one of them names the source it was read from.
+    async fn read_model_library_page_fixture()
+    -> Result<(tempfile::TempDir, Database, AccessPrincipal, String), Box<dyn std::error::Error>>
+    {
+        use crate::{
+            application::libraries::LibraryService, auth::users::UserStore, config::Config,
+            library::LibraryKind,
+        };
+
+        let directory = tempfile::tempdir()?;
+        let database = Database::connect(&Config {
+            http_addr: "127.0.0.1:8097".parse()?,
+            config_dir: directory.path().join("config"),
+        })
+        .await?;
+        let user = UserStore::new(database.clone())?
+            .create_user(
+                "refresh-mode-viewer",
+                "Refresh Mode Viewer",
+                "test password",
+                false,
+            )
+            .await?;
+        let library = LibraryService::new(database.clone())
+            .create_library("Refresh mode", LibraryKind::Movie, false)
+            .await?;
+        let user_id = user.id.to_string();
+        let library_id = library.id.to_string();
+        database
+            .set_user_library_access(&user_id, &library_id, true)
+            .await?;
+        sqlx::query(
+            "INSERT INTO library_roots (
+                 id, library_id, canonical_path, display_path, is_available, is_writable
+             ) VALUES ('refresh-mode-root', ?, '/refresh', '/refresh', 1, 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO filesystem_entries (
+                 id, library_root_id, relative_path, entry_kind, size, modified_at,
+                 device, inode, fingerprint, last_seen_generation, last_seen_change_kind
+             ) VALUES ('refresh-mode-fe', 'refresh-mode-root', 'Refresh.mkv', 'FILE', 1, 1,
+                       1, 1, X'00', 'g1', 'NEW')",
+        )
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_items (
+                 id, library_id, item_type, title, sort_title, added_at, runtime_ticks,
+                 identification_status, has_available_source
+             ) VALUES ('refresh-mode-item', ?, 'MOVIE', 'Authoritative title', 'refresh mode',
+                       10, 7200000000, 'LOCAL_CONFIRMED', 1)",
+        )
+        .bind(&library_id)
+        .execute(database.pool())
+        .await?;
+        sqlx::query(
+            "INSERT INTO media_sources (
+                 id, item_id, source_kind, filesystem_entry_id, quality_label, container,
+                 size, bitrate, duration_ticks, is_default, probe_status
+             ) VALUES ('refresh-mode-source', 'refresh-mode-item', 'LOCAL_FILE',
+                       'refresh-mode-fe', '1080p', 'mkv', 1000, 8000000, 7200000000, 1, 'READY')",
+        )
+        .execute(database.pool())
+        .await?;
+        database.rebuild_catalog_items_batch(None, 100).await?;
+        // The `on` switch only serves the derived page once the consumer watermark exists.
+        database
+            .advance_catalog_consumer(
+                &crate::application::catalog_read_model::catalog_items_consumer(),
+                0,
+            )
+            .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived title'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+        Ok((
+            directory,
+            database,
+            AccessPrincipal::new(user.id, false),
+            library_id,
+        ))
+    }
+
+    fn refresh_mode_filter() -> super::CatalogFilter {
+        super::CatalogFilter {
+            sort_by: super::CatalogSort::Name,
+            include_total: false,
+            ..super::CatalogFilter::default()
+        }
+    }
+
+    /// The library page cache warms pages from a service of its own. That service has to run with
+    /// the mode its owner was configured with, otherwise `LUX_READ_MODEL_MODE=on` serves the
+    /// derived page on the request path and then quietly replaces it with the authoritative page
+    /// on the next background refresh.
+    #[tokio::test]
+    async fn library_page_refresh_uses_the_configured_read_model_mode()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let (_directory, database, principal, library_id) = read_model_library_page_fixture().await?;
+        let catalog = super::CatalogService::new(
+            database.clone(),
+            crate::application::access::MediaAccessService::new(database.clone()),
+        )
+        .with_read_model_mode(super::ReadModelMode::On);
+        let cache = catalog.library_page_cache.clone();
+        let filter = refresh_mode_filter();
+
+        let seeded = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            seeded.items[0].title, "Derived title",
+            "the request path must serve the read-model page"
+        );
+
+        // Rename both sources so the refreshed page names the source it was read from.
+        sqlx::query("UPDATE media_items SET title = 'Authoritative v2' WHERE id = 'refresh-mode-item'")
+            .execute(database.pool())
+            .await?;
+        sqlx::query(
+            "UPDATE catalog_items SET title = 'Derived v2'
+             WHERE item_id = 'refresh-mode-item'",
+        )
+        .execute(database.pool())
+        .await?;
+
+        catalog.invalidate_library_pages();
+        cache.refresh_all().await;
+
+        let refreshed = catalog
+            .list_library_items_in_scope_with_projection(
+                principal,
+                &library_id,
+                &filter,
+                None,
+                0,
+                10,
+                super::CatalogItemProjection::Full,
+            )
+            .await?;
+        assert_eq!(
+            refreshed.items[0].title, "Derived v2",
+            "the background refresh must keep reading the read model when the service runs with mode=on"
         );
         Ok(())
     }
