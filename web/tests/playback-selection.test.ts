@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 
 import { describe, expect, it, vi } from "vitest";
-import { canUseClientMkvCaptionPipeline, canUseRemoteMkvCaptionSidecar, clientDecodeRequiresServerFallback, hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, isRemoteHttpStrmSource, resolveClientDecode, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
+import { canUseClientMkvCaptionPipeline, canUseRemoteMkvCaptionSidecar, clientDecodeRequiresServerFallback, hasClientHevcCandidate, hasClientMkvCandidate, hasClientMkvHevcRuntime, isNativeMkvVideoCodec, isRemoteHttpStrmSource, resolveClientDecode, shouldUseClientHevc, shouldUseClientMkv } from "../src/features/player/playback-selection";
 
 describe("playback selection", () => {
   const source = {
@@ -399,10 +399,47 @@ describe("client decode realtime gate", () => {
     expect(await resolveClientDecode(mkv, video)).toEqual({ engine: "client-mkv", rejected: null });
   });
 
-  it("reports no client candidate for codecs the client path never handled", async () => {
+  it("refuses the native Matroska path for a video codec outside the whitelist", async () => {
+    // Chromium answers “maybe” for a Matroska whose video track is MPEG-4 Part 2 and then plays only
+    // the audio track, so the element's own answer cannot be trusted for an unknown codec.
     const mpeg4 = {
       id: "source-mpeg4",
       container: "mkv",
+      sourceKind: "LOCAL_FILE",
+      streams: [
+        { index: 0, type: "VIDEO", codec: "mpeg4" },
+        { index: 1, type: "AUDIO", codec: "mp3" },
+      ],
+    };
+    const video = stubRuntime(() => false);
+    vi.spyOn(video, "canPlayType").mockReturnValue("probably");
+
+    expect(await resolveClientDecode(mpeg4, video)).toEqual({ engine: null, rejected: "native-codec-unsupported" });
+    expect(clientDecodeRequiresServerFallback({ engine: null, rejected: "native-codec-unsupported" })).toBe(true);
+  });
+
+  it("leaves a remote STRM Matroska with an unknown codec to the element", async () => {
+    // A remote `.strm` source has no server plan to fall back to, so it must keep whatever the
+    // element does instead of turning into a failure.
+    const remote = {
+      id: "source-mpeg4-remote",
+      container: "mkv",
+      sourceKind: "STRM_URL",
+      externalUrl: "https://media.example.test/video.mkv",
+      streams: [
+        { index: 0, type: "VIDEO", codec: "mpeg4" },
+        { index: 1, type: "AUDIO", codec: "mp3" },
+      ],
+    };
+    const video = stubRuntime(() => false);
+
+    expect(await resolveClientDecode(remote, video)).toEqual({ engine: null, rejected: "no-candidate" });
+  });
+
+  it("reports no client candidate for a non-Matroska source the client path never handled", async () => {
+    const mpeg4 = {
+      id: "source-mpeg4-mp4",
+      container: "mov,mp4,m4a,3gp,3g2,mj2",
       sourceKind: "LOCAL_FILE",
       streams: [{ index: 0, type: "VIDEO", codec: "mpeg4" }],
     };
@@ -410,5 +447,43 @@ describe("client decode realtime gate", () => {
 
     expect(await resolveClientDecode(mpeg4, video)).toEqual({ engine: null, rejected: "no-candidate" });
     expect(clientDecodeRequiresServerFallback({ engine: null, rejected: "no-candidate" })).toBe(false);
+  });
+
+  it("never hints an unknown Matroska video codec as avc1", async () => {
+    // `hvc1` without a profile suffix is in the remux candidate list but has no MSE string; the old
+    // fallback asked the element about `codecs="avc1"` and let an HEVC remux through as native.
+    const mkv = {
+      id: "source-hvc1",
+      container: "mkv",
+      sourceKind: "LOCAL_FILE",
+      streams: [
+        { index: 0, type: "VIDEO", codec: "hvc1" },
+        { index: 1, type: "AUDIO", codec: "AAC" },
+      ],
+    };
+    const video = stubRuntime(() => false);
+    const asked: string[] = [];
+    vi.spyOn(video, "canPlayType").mockImplementation((mime: string) => {
+      asked.push(mime);
+      return "maybe";
+    });
+
+    const decision = await resolveClientDecode(mkv, video);
+
+    expect(asked.filter((mime) => mime.includes("avc1"))).toEqual([]);
+    expect(decision).toEqual({ engine: null, rejected: "client-codec-unsupported" });
+  });
+});
+
+describe("native Matroska video whitelist", () => {
+  it("trusts only h264, hevc, vp9 and av1", () => {
+    for (const codec of ["h264", "H264", "avc", "avc1", "avc1.640028", "hevc", "h265", "hvc1.2.4.L120.B0", "hev1.1.6.L120.B0", "vp9", "vp09.00.10.08", "av1", "av01.0.04M.08"]) {
+      expect(isNativeMkvVideoCodec(codec), codec).toBe(true);
+    }
+    for (const codec of ["mpeg4", "mpeg2video", "msmpeg4v3", "vc1", "wmv3", "mjpeg", "theora", "hvc1", "dvh1.05.06", ""]) {
+      expect(isNativeMkvVideoCodec(codec), codec).toBe(false);
+    }
+    expect(isNativeMkvVideoCodec(null)).toBe(false);
+    expect(isNativeMkvVideoCodec(undefined)).toBe(false);
   });
 });

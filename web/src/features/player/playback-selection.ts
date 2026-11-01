@@ -1,5 +1,6 @@
 import type { MediaSource, MediaStream } from "../../lib/api/types";
 import {
+  codecFamily,
   DEFAULT_VIDEO_HEIGHT,
   DEFAULT_VIDEO_WIDTH,
   hevcMseCodecCandidates,
@@ -34,6 +35,11 @@ export type ClientDecodeRejection =
   | "no-candidate"
   /** The element plays the original container/codec itself, so no client engine is needed. */
   | "native-playback"
+  /**
+   * The container is one the element *claims* to open, but the video codec is outside the
+   * native whitelist (MPEG-4 Part 2, VC-1, ...), so its `canPlayType` answer cannot be trusted.
+   */
+  | "native-codec-unsupported"
   /** The browser cannot decode the source's real bit depth/level through MSE or WebCodecs. */
   | "client-codec-unsupported"
   /** Only the CPU-bound WASM soft decoder is left, and the source is above its realtime cap. */
@@ -56,7 +62,8 @@ const CLIENT_HEVC: ClientDecodeDecision = { engine: "client-hevc", rejected: nul
 export function clientDecodeRequiresServerFallback(decision: ClientDecodeDecision) {
   return decision.engine === null
     && (
-      decision.rejected === "client-codec-unsupported"
+      decision.rejected === "native-codec-unsupported"
+      || decision.rejected === "client-codec-unsupported"
       || decision.rejected === "client-resolution-too-high"
       || decision.rejected === "client-runtime-missing"
     );
@@ -91,6 +98,34 @@ function isMatroskaContainer(container: string | null | undefined) {
     .toLowerCase()
     .split(",")
     .some((part) => ["mkv", "matroska", "webm"].includes(part.trim()));
+}
+
+/**
+ * The video codecs whose native Matroska playback Lux trusts the element's own answer for.
+ *
+ * A browser answers `canPlayType('video/x-matroska; codecs="…"')` for the *container plus one
+ * codec string*, and Chromium answers “maybe” for a Matroska whose video track is MPEG-4 Part 2 and
+ * then decodes only the audio track. Native Matroska playback is therefore limited to the codecs the
+ * player can also gate through the remux path; anything else is handed to server transcoding.
+ */
+export function isNativeMkvVideoCodec(codec: string | null | undefined) {
+  const normalized = (codec ?? "").trim().toLowerCase();
+  return normalized !== "" && codecFamily(normalized) !== "other";
+}
+
+function hasNativeMkvVideoCodec(source: MediaSource) {
+  return isNativeMkvVideoCodec(videoStreamOf(source)?.codec);
+}
+
+/**
+ * A local Matroska whose video codec is outside the native whitelist must not be played by the
+ * element: the source is re-requested as server transcoding. Remote `.strm` sources stay exempt —
+ * they have no server plan and can only play whatever the element manages.
+ */
+function refusesNativeMatroska(codecHolder: MediaSource) {
+  return isMatroskaContainer(codecHolder.container)
+    && !isRemoteHttpStrmSource(codecHolder)
+    && !hasNativeMkvVideoCodec(codecHolder);
 }
 
 function videoStreamOf(source: MediaSource | undefined): MediaStream | undefined {
@@ -134,7 +169,11 @@ export async function resolveClientDecode(
   if (!source) return REJECTED("no-candidate");
   const mkvCandidate = hasClientMkvCandidate(source);
   const hevcCandidate = hasClientHevcCandidate(source);
-  if (!mkvCandidate && !hevcCandidate) return REJECTED("no-candidate");
+  if (!mkvCandidate && !hevcCandidate) {
+    // A Matroska whose video codec Lux does not gate natively (MPEG-4 Part 2, VC-1, ...) must not
+    // fall through to the element: Chromium accepts the container and plays only the audio track.
+    return REJECTED(refusesNativeMatroska(source) ? "native-codec-unsupported" : "no-candidate");
+  }
 
   const facts = videoStreamFacts(videoStreamOf(source));
   const requireCaptionPipeline = options.requireCaptionPipeline === true;
@@ -153,7 +192,9 @@ async function decideMatroska(
 ): Promise<ClientDecodeDecision> {
   // A 10-bit source must be hinted with its real profile: `codecs="avc1"` describes the 8-bit
   // sibling the browser may support, which is how a High 10 file used to reach the remux worker.
-  const nativeMatroska = video.canPlayType(`video/x-matroska; codecs="${matroskaCodecHint(facts)}"`) !== "";
+  const codecHint = matroskaCodecHint(facts);
+  const nativeMatroska = codecHint !== null
+    && video.canPlayType(`video/x-matroska; codecs="${codecHint}"`) !== "";
   if (!requireCaptionPipeline && nativeMatroska) return REJECTED("native-playback");
 
   if (facts.family !== "hevc") {
@@ -208,8 +249,13 @@ function decideMatroskaRemux(source: MediaSource, facts: VideoStreamFacts): Clie
     : REJECTED("client-codec-unsupported");
 }
 
-function matroskaCodecHint(facts: VideoStreamFacts) {
-  return mseVideoCodecString(facts) ?? (facts.family === "hevc" ? "hvc1" : "avc1");
+/**
+ * The MSE codec string the native Matroska probe asks about, or `null` when the source's codec has
+ * no trusted string. It must never fall back to `"avc1"`: that generic hint is what let a Matroska
+ * with an undecodable video track be treated as natively playable (`nativeMatroska` above).
+ */
+function matroskaCodecHint(facts: VideoStreamFacts): string | null {
+  return mseVideoCodecString(facts);
 }
 
 function mseAudioCodec(source: MediaSource) {
