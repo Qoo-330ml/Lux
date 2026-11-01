@@ -405,10 +405,11 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   `GET /api/v1/playback/sessions/{sessionId}/stats` 的 `output.videoBitrate` 与之一致。
 - `resolution` 描述分辨率上限实际生效的决策：`sourceHeight`（源视频高度，来自已落库的 `media_streams.details_json`
   里第一条视频流的 `Height`，未探测为 `null`）、`maxHeight`（请求的上限，未提供为 `null`）、`targetHeight`（实际输出
-  高度：源高度、请求上限与管理员 `encoding.max_output_height` 三者已知值中的最小值；未发生重编码时管理员上限不参与，
-  因为拷贝视频的档位保持源画面）、`limited`（是否因本字段真正发生了缩放/升级；源高度未知、源不高于上限或最终为
-  `UNSUPPORTED` 时都是 `false`）。`stats.output` 的 `videoWidth`/`videoHeight` 描述同一画面，按运行中会话捕获的缩放
-  上限折算；`videoWidth` 由 `scale=-2` 的等比规则推导，可能与 FFmpeg 的实际取整差一步。
+  高度：重编码档位取源高度、请求上限与管理员 `encoding.max_output_height` 三者已知值中的最小值；Direct/Remux/音频
+  转码保持源画面，因此就是源高度；`UNSUPPORTED` 不产生画面，为 `null`）、`limited`（是否因本字段真正发生了
+  缩放/升级；源高度未知、源不高于上限或最终为 `UNSUPPORTED` 时都是 `false`）。`stats.output` 的
+  `videoWidth`/`videoHeight` 描述同一画面，按运行中会话捕获的缩放上限折算；`videoWidth` 由 `scale=-2` 的等比规则
+  推导，可能与 FFmpeg 的实际取整差一步。
 - `POST /api/v1/playback/bootstrap` 接受与创建会话相同的 `maxBitrate` 与 `maxHeight`，语义一致。
 - `DIRECT` 计划除 `url`、`proxyUrl`、`rangeUrl`（旧字段，保留一个版本）外还带有序的 `candidates`：
   `[{ "kind": "proxy|lux|origin", "url": "..." }]`。`proxy` 是标准 Emby `/Videos/{id}/stream?MediaSourceId=...` 入口，
