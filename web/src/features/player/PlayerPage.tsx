@@ -58,6 +58,7 @@ import {
   playerFailure,
   type PlayerFailure,
 } from "./components/player-diagnostics";
+import { playbackNoticeFor, playbackNoticeSummary } from "./playback-notices";
 import { usePlayerPlatform } from "./components/player-platform";
 import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
@@ -291,6 +292,7 @@ export function PlayerPage() {
     playbackKey,
     source,
     requestedAudioStreamIndex,
+    playbackPlan,
     searchParams,
     setSearchParams,
     streamUrl,
@@ -407,18 +409,24 @@ export function PlayerPage() {
     setNativeCaptionTracks,
   });
 
-  const requestServerFallback = useCallback(async (reason?: unknown) => {
+  /**
+   * Reacts to a failed Direct Play attempt. Returns true only when this same
+   * episode is reloaded (next candidate, or the server fallback session); every
+   * terminal path shows the failure instead and returns false, so callers can drop
+   * state that must not leak into a later session.
+   */
+  const requestServerFallback = useCallback(async (reason?: unknown): Promise<boolean> => {
     if (playbackPlan?.type === "DIRECT" && hasNextCandidate) {
       if (candidate && candidate.kind === rememberedCandidate()) clearRememberedCandidate();
       setCandidateOffset((offset) => offset + 1);
       setFailedStreamUrl(null);
       setPlaybackFailure(null);
-      return;
+      return true;
     }
     if (remoteHttpSource) {
       setFailedStreamUrl(streamUrl || null);
       setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
+      return false;
     }
     if (
       playbackAttempt !== 0 ||
@@ -427,13 +435,13 @@ export function PlayerPage() {
     ) {
       setFailedStreamUrl(streamUrl || null);
       setPlaybackFailure(classifyPlayerEngineFailure(reason));
-      return;
+      return false;
     }
     fallbackRequestedRef.current = true;
     const sessionId = playbackSessionIdRef.current;
     const fallbackGeneration = fallbackGenerationRef.current;
     if (sessionId) await stopActiveSession(sessionId);
-    if (fallbackGeneration !== fallbackGenerationRef.current) return;
+    if (fallbackGeneration !== fallbackGenerationRef.current) return false;
     if (playbackSessionIdRef.current === sessionId) {
       playbackSessionIdRef.current = null;
       resetSequence();
@@ -441,6 +449,7 @@ export function PlayerPage() {
     setPlaybackFailure(null);
     setFailedStreamUrl(null);
     setPlaybackAttempt(1);
+    return true;
   }, [candidate, hasNextCandidate, playbackAttempt, playbackPlan?.type, remoteHttpSource, resetSequence, stopActiveSession, streamUrl]);
 
   useEffect(() => {
@@ -501,7 +510,7 @@ export function PlayerPage() {
     onPlaybackEnded: handlePlaybackEnded,
     onPlaybackInterrupted: interruptAutoPlayNext,
     autoStartPlayback,
-    requestServerFallback: requestServerFallback as (reason?: unknown) => Promise<void>,
+    requestServerFallback,
     setCurrentTime,
     setDuration,
     setBufferedEnd,
@@ -583,30 +592,47 @@ export function PlayerPage() {
   }
 
   if (useLegacyPlaybackQueries && webPlaybackSession.error) {
-    const sessionFailure = webPlaybackSession.error instanceof ApiError
-      && [401, 403, 410].includes(webPlaybackSession.error.status)
-      ? classifyPlayerEngineFailure(webPlaybackSession.error, webPlaybackSession.error.status)
-      : playerFailure("SERVER_PLAN_FAILED");
+    // A rejected session is a blocking notice too: the same reason copy explains a 403 policy
+    // denial or a 502 transcode-slot exhaustion here and inside the player surface.
+    const sessionError = webPlaybackSession.error;
+    const sessionNotice = sessionError instanceof ApiError
+      ? playbackNoticeFor({ status: sessionError.status, errorCode: sessionError.code })
+      : null;
+    // Every status this page can name (401/403/404/410/502/503/400) already produces a notice, so
+    // an unknown rejection is the only case that still needs the generic plan-failure copy.
+    const sessionFailure = sessionNotice ? null : playerFailure("SERVER_PLAN_FAILED");
     return (
       <PlayerErrorState
-        title={sessionFailure.title}
-        message={sessionFailure.message}
+        title={sessionNotice?.title ?? sessionFailure?.title ?? ""}
+        message={sessionNotice ? playbackNoticeSummary(sessionNotice) : sessionFailure?.message ?? ""}
         onBack={handleBack}
+        onRetry={() => window.location.reload()}
       />
     );
   }
 
   const subtitleInfo = getSubtitleInfo(media);
-  const planFailure = playbackPlan?.type === "UNSUPPORTED"
-    ? playerFailure("BROWSER_UNSUPPORTED")
-    : null;
+  // A failed bootstrap or session only describes the current playback when no plan won; otherwise
+  // a recovered second request would show a stale failure over a playable stream.
+  const sessionError = playbackPlan ? null : playbackBootstrap.error ?? webPlaybackSession.error;
+  // One mapping for the plan, its UNSUPPORTED reason, the transcode tier and a rejected session;
+  // a track/quality switch clears the plan on purpose, so it must not flash a notice.
+  const playbackNotice = switchingSession
+    ? null
+    : playbackNoticeFor({
+      planType: playbackPlan?.type ?? null,
+      reason: playbackPlan?.type === "UNSUPPORTED" ? playbackPlan.reason : null,
+      tier: playbackSession?.tier ?? null,
+      status: sessionError instanceof ApiError ? sessionError.status : null,
+      errorCode: sessionError instanceof ApiError ? sessionError.code : null,
+      degraded: playbackAttempt !== 0,
+    });
   // A track switch intentionally clears the session plan while the replacement
   // session starts; keep the existing surface mounted without a failure layer.
   const surfaceFailure = switchingSession
     ? null
     : playbackFailure
-      ?? planFailure
-      ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
+      ?? (!streamUrl && !playbackNotice?.blocking ? playerFailure("SERVER_PLAN_FAILED") : null);
   const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
@@ -670,6 +696,8 @@ export function PlayerPage() {
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
         failure={surfaceFailure}
+        notice={playbackNotice}
+        noticeLifecycleKey={playbackKey}
         showError={!switchingSession && (failedStreamUrl === streamUrl || !streamUrl)}
         onRetry={() => window.location.reload()}
         onBack={handleBack}

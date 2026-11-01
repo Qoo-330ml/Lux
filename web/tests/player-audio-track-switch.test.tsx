@@ -101,17 +101,26 @@ describe("PlayerPage audio track switching", () => {
       selection,
     ) => {
       const audio = selection?.audioStreamIndex ?? "default";
+      const sessionId = `web-${sourceId}-${audio}`;
       lifecycle.push(`create:${sourceId}:${audio}`);
+      // 真实后端对本地文件带 audioStreamIndex 的请求关闭直连，改用服务端会话固定音轨。
+      const plan = selection?.audioStreamIndex === undefined
+        ? {
+          type: "DIRECT" as const,
+          url: `/api/v1/playback/sessions/${sessionId}/direct?expires=1900000000&signature=test`,
+        }
+        : {
+          type: "SERVER_HLS" as const,
+          manifestUrl: `/api/v1/playback/sessions/${sessionId}/manifest.m3u8?expires=1900000000&signature=test`,
+          tier: 2,
+        };
       return {
-        sessionId: `web-${sourceId}-${audio}`,
-        playSessionId: `lux-web:web-${sourceId}-${audio}`,
+        sessionId,
+        playSessionId: `lux-web:${sessionId}`,
         sourceId,
-        tier: 0,
+        tier: selection?.audioStreamIndex === undefined ? 0 : 2,
         expiresAt: 1_900_000_000,
-        plan: {
-          type: "DIRECT",
-          url: `/api/v1/playback/sessions/web-${sourceId}-${audio}/direct?expires=1900000000&signature=test`,
-        },
+        plan,
       };
     });
     vi.spyOn(api, "stopWebPlaybackSession").mockImplementation(async (sessionId) => {
@@ -120,6 +129,9 @@ describe("PlayerPage audio track switching", () => {
     vi.spyOn(api, "webPlaybackEvent").mockResolvedValue({ accepted: true, duplicate: false, stale: false });
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    // jsdom 没有 MSE，按原生 HLS 可播放处理，让服务端会话走正常的 manifest 加载路径。
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType")
+      .mockImplementation((type) => (type === "application/vnd.apple.mpegurl" ? "maybe" : ""));
     play = vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(async () => undefined);
   });
 
@@ -476,7 +488,7 @@ describe("PlayerPage audio track switching", () => {
     expect(play).not.toHaveBeenCalled();
   });
 
-  it("creates a fresh session when switching back to the first audio track", async () => {
+  it("returns to the canonical URL when a server session switches back to its first audio track", async () => {
     await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
 
     const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
@@ -499,6 +511,7 @@ describe("PlayerPage audio track switching", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    // 服务端会话已按 0:a:0 复用第一条音轨，切回它时参数被删掉而不是写成 1。
     expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
       .toBe("/watch/movie-audio?subtitleStreamIndex=7");
     expect(bootstrapSelections).toEqual([
@@ -513,6 +526,87 @@ describe("PlayerPage audio track switching", () => {
       "stop:web-source-audio-2",
       "create:source-audio:default",
     ]);
+    // 回到直连后不再有被确认的音轨。
+    expect(container?.textContent).not.toContain("（当前）");
+  });
+
+  it("selects the first audio track explicitly from an unconfirmed Direct Play session", async () => {
+    await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
+
+    const firstVideo = container?.querySelector<HTMLVideoElement>("video");
+    if (!firstVideo) throw new Error("video element was not rendered");
+    primeVideo(firstVideo);
+
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+
+    // 直连且未显式选择：不声称任何音轨是当前音轨。
+    expect(luxSelectValue(container!, "选择音轨")).toBe("1");
+    expect(container?.textContent).not.toContain("（当前）");
+
+    await chooseLuxOptionByValue(container!, "选择音轨", "1");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-audio?subtitleStreamIndex=7&audioStreamIndex=1");
+    expect(bootstrapSelections).toEqual([
+      { audio: undefined, subtitle: 7 },
+      { audio: 1, subtitle: 7 },
+    ]);
+    expect(lifecycle).toEqual([
+      "create:source-audio:default",
+      "stop:web-source-audio-default",
+      "create:source-audio:1",
+    ]);
+    // 显式选择后才有确认的当前音轨（服务端会话固定了它）。
+    expect(container?.textContent).toContain("（当前）");
+  });
+
+  it("ignores a click on the first audio track a server session already maps", async () => {
+    vi.mocked(api.createWebPlaybackSession).mockImplementation(async (_itemId, sourceId) => {
+      lifecycle.push(`create:${sourceId}:server`);
+      return {
+        sessionId: "web-source-audio-server",
+        playSessionId: "lux-web:web-source-audio-server",
+        sourceId,
+        tier: 2,
+        expiresAt: 1_900_000_000,
+        plan: {
+          type: "SERVER_HLS" as const,
+          manifestUrl: "/api/v1/playback/sessions/web-source-audio-server/manifest.m3u8?expires=1900000000&signature=test",
+          tier: 2,
+        },
+      };
+    });
+    await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
+
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+
+    // 服务端会话固定 0:a:0，第一条音轨就是被确认的当前音轨。
+    expect(luxSelectValue(container!, "选择音轨")).toBe("1");
+    expect(container?.textContent).toContain("（当前）");
+
+    await chooseLuxOptionByValue(container!, "选择音轨", "1");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // URL 参数不变即视为重复选择：不重建会话、不进入切换中。
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-audio?subtitleStreamIndex=7");
+    expect(lifecycle).toEqual(["create:source-audio:server"]);
+    expect(container?.textContent).not.toContain("正在切换音轨");
   });
 
   it("hides the audio selector for a single-track source", async () => {

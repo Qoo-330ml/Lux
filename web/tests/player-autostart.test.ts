@@ -5,6 +5,7 @@ import {
   autoStartPlaybackState,
   createAutoStartPlaybackGate,
   requestsAutoStartPlayback,
+  settleAutoStartPlaybackAfterFailure,
 } from "../src/features/player/player-autostart";
 
 describe("LuxPlayer auto start playback marker", () => {
@@ -43,6 +44,18 @@ describe("LuxPlayer auto start playback marker", () => {
     expect(primed.consume()).toBe(true);
     expect(primed.consume()).toBe(false);
   });
+
+  it("peeks at a pending request without consuming it", () => {
+    const gate = createAutoStartPlaybackGate(false);
+    expect(gate.peek()).toBe(false);
+
+    gate.request();
+    gate.request();
+    expect(gate.peek()).toBe(true);
+    expect(gate.peek()).toBe(true);
+    expect(gate.consume()).toBe(true);
+    expect(gate.peek()).toBe(false);
+  });
 });
 
 describe("LuxPlayer auto start attempt", () => {
@@ -72,5 +85,41 @@ describe("LuxPlayer auto start attempt", () => {
       .rejects.toBe(unsupported);
     await expect(attemptAutoStartPlayback(vi.fn().mockRejectedValue(new Error("媒体源不可用"))))
       .rejects.toThrow("媒体源不可用");
+  });
+});
+
+describe("LuxPlayer one-shot auto start settlement", () => {
+  it("keeps the request when the same episode reloads", () => {
+    const gate = createAutoStartPlaybackGate(true);
+
+    settleAutoStartPlaybackAfterFailure(gate, true);
+
+    // 回退重载后的会话仍应自动起播一次。
+    expect(gate.peek()).toBe(true);
+    expect(gate.consume()).toBe(true);
+  });
+
+  it("clears the request on a terminal failure", () => {
+    for (const gate of [
+      createAutoStartPlaybackGate(true),
+      (() => {
+        const primed = createAutoStartPlaybackGate(false);
+        primed.request();
+        return primed;
+      })(),
+    ]) {
+      settleAutoStartPlaybackAfterFailure(gate, false);
+      // 终态失败后，手动下一集/切音轨/切画质的新会话不得继承这个请求。
+      expect(gate.peek()).toBe(false);
+      expect(gate.consume()).toBe(false);
+    }
+  });
+
+  it("is harmless without a pending request", () => {
+    const gate = createAutoStartPlaybackGate(false);
+
+    settleAutoStartPlaybackAfterFailure(gate, false);
+
+    expect(gate.peek()).toBe(false);
   });
 });

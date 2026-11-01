@@ -19,6 +19,7 @@ import { createPlaybackTimelineScheduler } from "./player-timeline-scheduler";
 import {
   attemptAutoStartPlayback,
   createAutoStartPlaybackGate,
+  settleAutoStartPlaybackAfterFailure,
 } from "./player-autostart";
 import { TICKS_PER_SECOND, isMatroskaSource, useClientEngine } from "./player-page-helpers";
 import type { PlaybackReporting } from "./usePlaybackReporting";
@@ -71,7 +72,8 @@ type PlaybackRuntimeOptions = {
   autoStartPlayback?: boolean;
   /** The viewer resumed playback or moved the playhead inside this episode. */
   onPlaybackInterrupted?: () => void;
-  requestServerFallback: (reason?: unknown) => Promise<void>;
+  /** True when this same episode reloads (server fallback or candidate retry). */
+  requestServerFallback: (reason?: unknown) => Promise<boolean>;
   setCurrentTime: (value: number) => void;
   setDuration: (value: number) => void;
   setBufferedEnd: (value: number) => void;
@@ -379,11 +381,14 @@ export function usePlaybackRuntime({
           },
         );
         if (!cancelled) await restoreEngineHandoff();
-        if (!cancelled && autoStartGateRef.current.consume()) {
-          // A browser autoplay policy rejection leaves the player paused on the
-          // normal play affordance; any other error is rethrown into the existing
-          // playback failure handling of this load() call.
+        if (!cancelled && autoStartGateRef.current.peek()) {
+          // The viewer's one-shot request is finished once playback started or once
+          // the browser policy rejected it. A real error propagates to the failure
+          // handling below, which decides whether the request survives for a
+          // same-episode reload (see settleAutoStartPlaybackAfterFailure). A policy
+          // rejection leaves the player paused on the normal play affordance.
           await attemptAutoStartPlayback(() => runtime.play());
+          autoStartGateRef.current.consume();
         }
         if (!cancelled && activeEngine.performance)
           handlePerformance(
@@ -393,10 +398,19 @@ export function usePlaybackRuntime({
           );
       } catch (cause) {
         if (!cancelled) {
-          if (runtime.state.status === "FAILED") return;
+          if (runtime.state.status === "FAILED") {
+            settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, false);
+            return;
+          }
           if (playbackPlan?.type === "DIRECT") {
-            requestServerFallback(cause);
+            // `true` means this same episode reloads (server fallback or candidate
+            // retry); the one-shot auto start then belongs to the reloaded session.
+            const reloadPending = await requestServerFallback(cause);
+            if (!cancelled) {
+              settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
+            }
           } else {
+            settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, false);
             setFailedStreamUrl(streamUrl);
             setPlaybackFailure(classifyPlayerEngineFailure(cause));
           }

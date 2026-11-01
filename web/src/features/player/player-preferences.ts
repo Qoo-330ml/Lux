@@ -47,6 +47,24 @@ export function writeAutoPlayNextEpisodePreference(
  * runs, so an offline account API keeps the local choice and only skips the
  * server round-trip. Concurrent toggles are queued so the newest value wins and
  * a version conflict re-reads once before giving up.
+ *
+ * Failure policy: offline, and a 409 that survives that single retry, both end as
+ * `null` — nothing is thrown, nothing is rolled back, and no new player UI is
+ * added. That is a deliberate divergence from the account page
+ * (`AccountPage.tsx`, LUX-658), which blocks further saves on a version conflict
+ * and asks the viewer to refresh before retrying: the account page owns the whole
+ * preference object and is where a human can actually resolve the conflict, while
+ * the player only owns this one switch and must not grow a competing conflict
+ * prompt. Keeping the local value also means this browser may show a value the
+ * server does not have yet; that divergence is one-sided on purpose:
+ * - a failed sync never overwrites a newer server version. The next authoritative
+ *   read — the account page refetching and saving (which writes the server
+ *   snapshot back through `saveAccountSettings`), or this browser losing its local
+ *   copy — seeds from the server, so "server wins when it has a newer version"
+ *   stays the rule;
+ * - retries never resurrect an abandoned local value on their own: the queue only
+ *   sends values the viewer picked, and a conflict re-read is discarded instead of
+ *   being written into the local copy.
  */
 let preferenceSyncQueue: Promise<unknown> = Promise.resolve();
 
@@ -65,6 +83,8 @@ export function syncAutoPlayNextEpisodePreference(
 async function syncAutoPlayNextEpisodePreferenceOnce(
   enabled: boolean,
 ): Promise<AccountPreferences | null> {
+  // Never rejects: the caller already applied the local value, so every failure is
+  // reported as `null` ("server copy left alone") per the tradeoff note above.
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
       const preferences = await api.accountPreferences();

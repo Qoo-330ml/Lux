@@ -22,13 +22,27 @@ function audioStreams(source: MediaSource | undefined): MediaStream[] {
 }
 
 /**
- * The index the player is actually using. Without an explicit `audioStreamIndex`
- * the server maps the first audio stream (`0:a:0`), not the stream flagged as
- * default, so the first audio stream is the fallback instead of `isDefault`.
+ * Who decides which audio stream the viewer actually hears.
+ *
+ * - `"browser"`: a Direct Play session hands the original container to the
+ *   browser, which follows the container's own default track — not necessarily
+ *   the first audio stream — so nothing is confirmed until the URL carries an
+ *   explicit `audioStreamIndex`.
+ * - `"server"`: a server-side session muxes exactly one audio stream, so the
+ *   explicit index (when valid) or the first audio stream (`0:a:0`) is what plays.
  */
-export function resolveSelectedAudioTrackIndex(
+export type AudioTrackOwner = "browser" | "server";
+
+/**
+ * The index the player can prove is audible. Without an explicit
+ * `audioStreamIndex` a server-side session maps the first audio stream (`0:a:0`),
+ * not the stream flagged as default, so that first stream is the confirmation
+ * fallback there; a Direct Play session confirms nothing on its own.
+ */
+export function resolveConfirmedAudioTrackIndex(
   source: MediaSource | undefined,
   requestedIndex: string | null | undefined,
+  owner: AudioTrackOwner,
 ): string | null {
   const streams = audioStreams(source);
   if (streams.length === 0) return null;
@@ -36,7 +50,7 @@ export function resolveSelectedAudioTrackIndex(
   if (requested && streams.some((stream) => String(stream.index) === requested)) {
     return requested;
   }
-  return String(streams[0].index);
+  return owner === "server" ? String(streams[0].index) : null;
 }
 
 export function audioTrackLabel(stream: MediaStream, position: number): string {
@@ -48,11 +62,17 @@ export function audioTrackLabel(stream: MediaStream, position: number): string {
   return parts.join(" · ");
 }
 
+/**
+ * Lists the audio streams for the switcher. `confirmedIndex` must come from
+ * `resolveConfirmedAudioTrackIndex`, so "（当前）" only marks a track the player can
+ * prove: an explicit choice, or the server-side session's own mapping. An
+ * unconfirmed Direct Play track stays unmarked.
+ */
 export function audioTrackOptions(
   source: MediaSource | undefined,
-  selectedIndex: string | null | undefined,
+  confirmedIndex: string | null | undefined,
 ): AudioTrackOption[] {
-  const selected = selectedIndex?.trim() || null;
+  const selected = confirmedIndex?.trim() || null;
   return audioStreams(source).map((stream, position) => {
     const index = String(stream.index);
     return {
@@ -87,18 +107,24 @@ export function supportsAudioTrackSwitching(source: MediaSource | undefined): bo
 
 /**
  * Returns a copy of the current URL parameters with the new audio selection.
- * The first audio stream is the server-side default, so it is represented by an
- * absent parameter; every other stream is written explicitly.
+ *
+ * A server-side session already maps the first audio stream when the parameter is
+ * absent, so that choice is represented by an absent parameter and the URL stays
+ * canonical. Direct Play cannot be steered that way: the browser follows the
+ * container's own default track, so choosing the first audio stream has to be
+ * written out explicitly. Without it the first track can never be selected, and
+ * the request would not ask the server for the session that fixes the track.
  */
 export function audioTrackSwitchParams(
   current: URLSearchParams,
   nextIndex: string | null,
   source: MediaSource | undefined,
+  owner: AudioTrackOwner,
 ): URLSearchParams {
   const next = new URLSearchParams(current);
   const streams = audioStreams(source);
   const firstIndex = streams.length > 0 ? String(streams[0].index) : null;
-  if (nextIndex === null || nextIndex === firstIndex) {
+  if (nextIndex === null || (owner === "server" && nextIndex === firstIndex)) {
     next.delete("audioStreamIndex");
   } else {
     next.set("audioStreamIndex", nextIndex);

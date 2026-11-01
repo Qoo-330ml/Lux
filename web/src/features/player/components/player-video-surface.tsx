@@ -7,6 +7,11 @@ import type {
   SyntheticEvent,
 } from "react";
 import type { PlayerFailure } from "./player-diagnostics";
+import {
+  PlayerPlaybackNoticeBanner,
+  PlayerPlaybackNoticeLayer,
+} from "./player-playback-notice";
+import type { PlaybackNotice } from "../playback-notices";
 import { usePlayerSurfaceGestures } from "./player-gestures";
 import {
   readPlayerRuntimeCaptionTracks,
@@ -56,6 +61,10 @@ type PlayerVideoSurfaceProps = {
   errorMessage: string | null;
   failure?: PlayerFailure | null;
   showError: boolean;
+  /** Plan/reason/transcode state mapped by `playbackNoticeFor`; replaces the generic error layer. */
+  notice?: PlaybackNotice | null;
+  /** Changes per playback session so a dismissed banner does not leak into the next one. */
+  noticeLifecycleKey?: string;
   onRetry: () => void;
   onBack: () => void;
   gestureOptions?: {
@@ -105,10 +114,13 @@ export function PlayerVideoSurface({
   errorMessage,
   failure,
   showError,
+  notice = null,
+  noticeLifecycleKey = "",
   onRetry,
   onBack,
   gestureOptions,
 }: PlayerVideoSurfaceProps) {
+  const blockingNotice = notice?.blocking ? notice : null;
   const frameRef = useRef<HTMLDivElement>(null);
   const videoElementRef = useRef<HTMLVideoElement | null>(null);
   const captionTrackRef = useRef<HTMLTrackElement>(null);
@@ -319,7 +331,7 @@ export function PlayerVideoSurface({
         </video>
       ) : null}
 
-      {!playing && streamUrl && !fallbackLoading && !showError ? (
+      {!playing && streamUrl && !fallbackLoading && !showError && !blockingNotice ? (
         <button
           type="button"
           className="lux-player-center-play"
@@ -355,7 +367,13 @@ export function PlayerVideoSurface({
         </div>
       ) : null}
 
-      {showError ? (
+      {!showError && notice && !notice.blocking ? (
+        <PlayerPlaybackNoticeBanner notice={notice} lifecycleKey={noticeLifecycleKey} />
+      ) : null}
+
+      {blockingNotice ? (
+        <PlayerPlaybackNoticeLayer notice={blockingNotice} onRetry={onRetry} onBack={onBack} />
+      ) : showError ? (
         <div className="lux-player-error-modal" role="alert">
           <div className="lux-player-error-card">
             <AlertCircle size={36} className="lux-player-error-icon" aria-hidden="true" />

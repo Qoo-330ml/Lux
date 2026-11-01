@@ -116,16 +116,24 @@ describe("PlayerPage quality switching", () => {
       const variant = `${selection?.audioStreamIndex ?? "default"}-${selection?.maxBitrate ?? "auto"}`;
       lifecycle.push(`create:${variant}`);
       const maxBitrate = selection?.maxBitrate ?? null;
+      // 真实后端对本地文件带 audioStreamIndex 的请求关闭直连，改用服务端会话固定音轨。
+      const audioSelected = selection?.audioStreamIndex !== undefined;
       return {
         sessionId: `web-${variant}`,
         playSessionId: `lux-web:web-${variant}`,
         sourceId,
-        tier: 0,
+        tier: audioSelected ? 2 : 0,
         expiresAt: 1_900_000_000,
-        plan: {
-          type: "DIRECT" as const,
-          url: `/api/v1/playback/sessions/web-${variant}/direct?expires=1900000000&signature=test`,
-        },
+        plan: audioSelected
+          ? {
+            type: "SERVER_HLS" as const,
+            manifestUrl: `/api/v1/playback/sessions/web-${variant}/manifest.m3u8?expires=1900000000&signature=test`,
+            tier: 2,
+          }
+          : {
+            type: "DIRECT" as const,
+            url: `/api/v1/playback/sessions/web-${variant}/direct?expires=1900000000&signature=test`,
+          },
         bitrate: {
           sourceBitrate: 12_000_000,
           maxBitrate,
@@ -140,6 +148,9 @@ describe("PlayerPage quality switching", () => {
     vi.spyOn(api, "webPlaybackEvent").mockResolvedValue({ accepted: true, duplicate: false, stale: false });
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    // jsdom 没有 MSE，按原生 HLS 可播放处理，让带音轨参数的服务端会话正常加载 manifest。
+    vi.spyOn(HTMLMediaElement.prototype, "canPlayType")
+      .mockImplementation((type) => (type === "application/vnd.apple.mpegurl" ? "maybe" : ""));
     play = vi.spyOn(HTMLMediaElement.prototype, "play").mockImplementation(async () => undefined);
   });
 
@@ -295,6 +306,7 @@ describe("PlayerPage quality switching", () => {
 
     expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
       .toBe("/watch/movie-quality?maxBitrate=2000000");
+    // 服务端会话已按 0:a:0 复用第一条音轨，切回它时参数被删掉。
     expect(bootstrapSelections.at(-1)).toEqual({ audio: undefined, subtitle: undefined, maxBitrate: 2_000_000 });
     const audioVideo = await settleReplacement("web-default-2000000");
     expect(audioVideo.currentTime).toBe(12);
