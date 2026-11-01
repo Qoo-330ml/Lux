@@ -510,6 +510,64 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
 隐私字段。`target` 是通知器投递所需的目标信息，`url` 为空时由通知器根据自身配置决定目标；
 `allowPrivateNetwork` 是 Lux 已批准的私网策略，通知器必须继续执行危险保留地址检查且不得自行放宽策略。
 `config` 只能保存非秘密目标设置；密码、Token、API Key 等必须放入受控的 `secret` 字段。
+
+通知器把需要管理员填写的凭据声明为唯一的 `secret` 配置字段：
+
+```json
+{
+  "key": "secret",
+  "label": "设备密钥",
+  "type": "password",
+  "required": true,
+  "sensitive": true,
+  "description": "在 Bark App 首页查看"
+}
+```
+
+约束与宿主语义：
+
+- 只有 `type: "notification"` 插件可以声明 `secret` 字段，且最多一个；该字段必须是 `sensitive: true` 的
+  `password` 字段，不能声明 `defaultValue`。
+- 声明后，创建通知目标必须由管理员提交 `secret`，更新时留空表示不修改，`rotate-secret` 用请求体里的新值
+  覆盖旧值。宿主不会为第三方渠道生成随机凭据。
+- 该值走通知目标 secret 存储：不进入 `config`/`providerConfig`，不出现在普通列表、事件 payload、投递记录或
+  日志中，只在创建和轮换的响应里返回一次。
+- 通知器的其它 `configFields` 属于**每条通知目标**，不是插件安装级配置；`required` 由创建/更新目标时校验，
+  未创建任何目标不会让 provider 变成不可用。
+- 宿主把凭据声明通过 `GET /api/v1/admin/notification-providers` 的 `secretField` 元数据交给 Web 控制台，
+  插件自身不需要读取任何配置文件。
+
+### 通知器 SDK
+
+`luxd::application::notifier_plugin_sdk` 提供通知插件共用的进程外壳，渠道插件只需实现上游认证和请求：
+
+- `run_notifier(|request| async { ... })`：读取 stdin 的逐行 `PluginRequest`，把 `notification.send` 分发到
+  处理器，写出 `PluginResponse`，并在 `plugin.shutdown` 后退出；无效请求行和未知方法返回错误响应但不会
+  终止循环。需要自定义流时使用 `run_notifier_session(reader, writer, handler)`。
+- `outbound_http_client(proxy_url)` / `outbound_http_client_from_env()`：统一的出站 client，读取 Lux 代理配置
+  （`LUX_PROXY_URL`），10 秒超时且不跟随重定向。
+- `classify_http_status(status)` 与 `result_from_http_status(status, retry_after_seconds)`：与宿主一致的
+  `DELIVERED`/`RETRYABLE`/`FAILED` 分类（`2xx` 成功，`408`、`425`、`429` 和 `5xx` 可重试，其余永久失败）；
+  `delivered()`、`retryable(code)`、`failed(code)` 用于非 HTTP 渠道。
+- `render_event_text(&event)`：返回中文 `(title, body)`。优先原样转发核心生成的 `data.title`/`data.content`
+  （插件不得重写通知正文）；缺失时按事件白名单渲染回退文本，且不会带出远程地址、本地路径或完整外部 URL。
+
+插件二进制建议只做如下接线：
+
+```rust
+let client = luxd::application::notifier_plugin_sdk::outbound_http_client_from_env()?;
+luxd::application::notifier_plugin_sdk::run_notifier(|request| {
+    let client = client.clone();
+    async move { deliver(&client, request).await }
+})
+.await?;
+```
+
+通知器插件包使用 `scripts/package-notifier-plugin.sh <插件目录名> [target]` 打包：脚本从
+`plugins/<目录名>/manifest.json` 读取 ID、版本、入口和声明文件，拒绝非 `notification` 或缺少
+`notification.send` 的 manifest，构建入口对应的 cargo bin，并输出
+`dist/plugins/<id>-<version>-<platform>-<arch>.zip`。
+
 插件必须返回 `DELIVERED`、`RETRYABLE` 或 `FAILED`，可选返回 provider 请求 ID、重试秒数和稳定错误码：
 
 ```json

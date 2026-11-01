@@ -180,10 +180,16 @@ PostgreSQL 管理员如需启用 SQL 聚合统计，应在服务端 `shared_prel
 ## 通知器插件（LUX-183）
 
 - `GET /api/v1/admin/notification-providers?page=1&pageSize=50`：分页返回已发现的
-  `type: "notification"` 插件及其安装、启用、可用状态和配置字段。
+  `type: "notification"` 插件及其安装、启用、可用状态和配置字段。`configFields` 是每条通知目标自己的设置；
+  provider 声明 manifest `secret` 字段时，该字段不进入 `configFields`/`configValues`，而是以
+  `secretField`（`key`、`label`、`type`、`required`、`sensitive`、`description`）单独返回。
 - `GET/POST/PATCH/DELETE /api/v1/admin/notification-destinations`：继续兼容原有 Webhook 目标；创建或更新时可
-  传 `providerPluginId` 和非秘密 `providerConfig`。省略时使用 `builtin.webhook`。外部 provider 不需要 URL，
-  但 `secret` 仍只在创建/轮换响应中返回，不写入事件或普通列表。
+  传 `providerPluginId` 和非秘密 `providerConfig`。省略时使用 `builtin.webhook`。外部 provider 不需要 URL。
+  声明了 `secret` 字段的 provider 在创建时必须提供 `secret`，更新时 `secret` 为空或省略表示不修改；该值只
+  写入目标 secret，不进入 `providerConfig`、事件、普通列表或日志。
+- `POST /api/v1/admin/notification-destinations/{id}/rotate-secret`：`builtin.webhook` 生成新的 HMAC secret；
+  声明了 `secret` 字段的 provider 用请求体 `{ "secret": "..." }` 覆盖已保存的凭据，缺少该值时返回 400。
+  `secret` 只在创建和轮换响应中返回一次。
 - 通知插件必须声明 `notification.send`，宿主通过独立进程 RPC 投递；插件结果 `DELIVERED`、`RETRYABLE`、
   `FAILED` 由统一 outbox worker 处理超时、退避、恢复和失败记录。
 
