@@ -493,6 +493,21 @@ export type WebPlaybackBitrate = {
   limited: boolean;
 };
 
+/**
+ * What the server actually decided about the caller's resolution ceiling
+ * (`docs/API.md`, Web 播放会话). `sourceHeight` comes from ffprobe and is `null`
+ * when the source was never probed; `targetHeight` is the height the server
+ * really emits, so a video-copy path can report the source height unchanged.
+ * Every field may be `null` when the server cannot prove it.
+ */
+export type WebPlaybackResolution = {
+  sourceHeight: number | null;
+  maxHeight: number | null;
+  targetHeight: number | null;
+  /** `true` only when the server actually transcoded down to `maxHeight`. */
+  limited: boolean;
+};
+
 export type WebPlaybackSession = {
   sessionId: string | null;
   playSessionId: string | null;
@@ -502,6 +517,8 @@ export type WebPlaybackSession = {
   plan: WebPlaybackPlan;
   /** Absent on responses from servers that do not report the bitrate decision yet. */
   bitrate?: WebPlaybackBitrate;
+  /** Absent on responses from servers that do not report the resolution decision yet. */
+  resolution?: WebPlaybackResolution;
 };
 
 /** Live `ffmpeg -progress` values for a running server-side HLS transcode. */
@@ -548,11 +565,15 @@ export type WebPlaybackTrackSelection = {
 };
 
 /**
- * Optional request fields shared by session creation and bootstrap. `maxBitrate`
- * is the manual quality ceiling in bps; the rest of the contract lives in
- * `docs/API.md`. `.strm` sources ignore it server-side.
+ * Optional request fields shared by session creation and bootstrap. `maxHeight`
+ * is the manual resolution ceiling in pixels (144–4320); the rest of the
+ * contract lives in `docs/API.md`. `.strm` sources ignore it server-side.
+ *
+ * `maxBitrate` (bps) stays in the API contract for compatibility but the player
+ * UI no longer offers it and never sends it.
  */
 export type WebPlaybackRequestSelection = WebPlaybackTrackSelection & {
+  maxHeight?: number;
   maxBitrate?: number;
 };
 

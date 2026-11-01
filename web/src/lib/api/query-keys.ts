@@ -32,15 +32,15 @@ export const queryKeys = {
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,
   playback: (itemId: string) => ["playback", itemId] as const,
   // Key layout: prefix, item, source, audioStreamIndex, subtitleStreamIndex,
-  // maxBitrate, attempt. Helpers reading a single slot live next to the feature
-  // that owns it (`audioParamFromQueryKey`, `bitrateParamFromQueryKey`).
+  // maxHeight, attempt. Helpers reading a single slot live next to the feature
+  // that owns it (`audioParamFromQueryKey`, `maxHeightParamFromQueryKey`).
   playbackBootstrap: (
     itemId: string,
     sourceId?: string | null,
     attempt = 0,
     audioStreamIndex?: string | null,
     subtitleStreamIndex?: string | null,
-    maxBitrate?: number | string | null,
+    maxHeight?: number | string | null,
   ) =>
     [
       "playback-bootstrap",
@@ -48,7 +48,7 @@ export const queryKeys = {
       sourceId ?? "default",
       audioStreamIndex ?? "default",
       subtitleStreamIndex ?? "default",
-      maxBitrate === null || maxBitrate === undefined ? "default" : String(maxBitrate),
+      maxHeight === null || maxHeight === undefined ? "default" : String(maxHeight),
       attempt,
     ] as const,
   webPlaybackSession: (
@@ -57,7 +57,7 @@ export const queryKeys = {
     attempt: number,
     audioStreamIndex?: string | null,
     subtitleStreamIndex?: string | null,
-    maxBitrate?: number | string | null,
+    maxHeight?: number | string | null,
   ) =>
     [
       "web-playback-session",
@@ -65,7 +65,7 @@ export const queryKeys = {
       sourceId,
       audioStreamIndex ?? "default",
       subtitleStreamIndex ?? "default",
-      maxBitrate === null || maxBitrate === undefined ? "default" : String(maxBitrate),
+      maxHeight === null || maxHeight === undefined ? "default" : String(maxHeight),
       attempt,
     ] as const,
   webPlaybackStats: (sessionId: string) => ["web-playback-stats", sessionId] as const,

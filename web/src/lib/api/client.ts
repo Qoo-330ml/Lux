@@ -894,8 +894,10 @@ export class LuxApiClient {
   /**
    * `selection` carries the optional request fields the player controls:
    * `audioStreamIndex`, `subtitleStreamIndex` and the manual quality ceiling
-   * `maxBitrate` (bps, 100000–200000000). It is spread into the body as-is, so
-   * the field names mirror `docs/API.md` rather than being remapped here.
+   * `maxHeight` (pixels, 144–4320). It is spread into the body as-is, so the
+   * field names mirror `docs/API.md` rather than being remapped here. The legacy
+   * `maxBitrate` field is still part of the API contract but the player no longer
+   * sends it.
    */
   createWebPlaybackSession(
     itemId: string,
@@ -911,7 +913,7 @@ export class LuxApiClient {
     });
   }
 
-  /** Same optional `selection` fields as `createWebPlaybackSession`, including `maxBitrate`. */
+  /** Same optional `selection` fields as `createWebPlaybackSession`, including `maxHeight`. */
   createWebPlaybackBootstrap(
     itemId: string,
     sourceId: string | undefined,
