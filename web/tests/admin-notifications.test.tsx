@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
 import { AdminNotificationsPage } from "../src/features/admin/AdminNotificationsPage";
 import { api } from "../src/lib/api/client";
+import { chooseLuxOptionByValue } from "./lux-select-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
 
@@ -225,6 +226,123 @@ describe("AdminNotificationsPage", () => {
     expect(container.textContent).toContain("通知内容");
     expect(container.textContent).toContain("通知器配置");
     expect(container.querySelector('button[aria-label="重试投递 delivery-1"]')).toBeTruthy();
+  });
+
+  it("requires the credential again when the edit form switches notification providers", async () => {
+    vi.mocked(api.adminWebhookDestinations).mockResolvedValueOnce({
+      destinations: [{
+        id: "destination-1",
+        name: "本地接收器",
+        url: "http://127.0.0.1:8787/hooks",
+        payloadFormat: "LUX",
+        providerPluginId: "builtin.webhook",
+        providerConfig: {},
+        enabled: true,
+        allowPrivateNetwork: true,
+        eventTypes: [],
+        secretConfigured: true,
+        createdAt: 1_700_000_000,
+        updatedAt: 1_700_000_100,
+      }],
+      page: 1,
+      pageSize: 50,
+    });
+    vi.mocked(api.adminNotificationProviders).mockResolvedValueOnce({
+      plugins: [{
+        id: "builtin.webhook",
+        name: "内置 Webhook",
+        description: "Lux 内置签名投递",
+        category: "NOTIFICATION",
+        version: "1.0.0",
+        runtime: "process",
+        capabilities: ["notification.send"],
+        status: "READY",
+        running: true,
+        installed: true,
+        enabled: true,
+        configured: true,
+        available: true,
+        configurable: false,
+        configFields: [],
+        configSource: "NONE",
+      }, {
+        id: "org.lux.bark",
+        name: "Bark 通知器",
+        description: "推送到 Bark",
+        category: "NOTIFICATION",
+        version: "0.1.0",
+        runtime: "process",
+        capabilities: ["notification.send"],
+        status: "READY",
+        running: true,
+        installed: true,
+        enabled: true,
+        configured: true,
+        available: true,
+        configurable: true,
+        secretField: { key: "secret", label: "设备密钥", type: "password", required: true, sensitive: true },
+        configFields: [{
+          key: "serverUrl",
+          label: "服务地址",
+          type: "text",
+          required: true,
+          sensitive: false,
+          defaultValue: "https://api.day.app",
+        }],
+        configSource: "PLUGIN_DEFAULT",
+      }],
+      total: 2,
+      page: 1,
+      pageSize: 50,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+    const editButton = [...container.querySelectorAll("button")].find((button) => button.textContent?.includes("编辑"));
+    expect(editButton).toBeTruthy();
+    await act(async () => {
+      editButton!.click();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(container.querySelector('input[type="password"]')).toBeNull();
+
+    await chooseLuxOptionByValue(container, "编辑通知器", "org.lux.bark");
+
+    const secretInput = container.querySelector<HTMLInputElement>('input[type="password"]');
+    expect(secretInput).toBeTruthy();
+    expect(secretInput?.hasAttribute("required")).toBe(true);
+    expect(secretInput?.getAttribute("placeholder")).toBe("更换通知器后必须重新填写");
+    expect(container.textContent).not.toContain("留空表示不修改");
+    expect(container.textContent).toContain("更换通知器后旧凭据不会被沿用");
+    expect(container.querySelector<HTMLButtonElement>(".lux-notification-edit-form button[type=\"submit\"]")?.disabled).toBe(true);
+
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(secretInput, "bark-device-key");
+      secretInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.querySelector<HTMLButtonElement>(".lux-notification-edit-form button[type=\"submit\"]")?.disabled).toBe(false);
+
+    await act(async () => {
+      container.querySelector<HTMLFormElement>(".lux-notification-edit-form")!.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+    });
+
+    expect(api.updateAdminWebhookDestination).toHaveBeenCalledWith(
+      "destination-1",
+      expect.objectContaining({
+        providerPluginId: "org.lux.bark",
+        secret: "bark-device-key",
+      }),
+    );
   });
 
   it("asks for the credential a notification provider declares", async () => {

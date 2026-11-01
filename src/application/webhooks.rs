@@ -498,17 +498,37 @@ impl WebhookService {
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
         let normalized_payload_format = payload_format.map(normalize_payload_format).transpose()?;
         let provider_config_json = provider_config.map(provider_config_json).transpose()?;
-        let normalized_secret = secret
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| {
-                if self.secret_is_generated(next_provider_id) {
-                    normalize_or_generate_secret(Some(value))
-                } else {
-                    normalize_provider_credential(value)
-                }
-            })
-            .transpose()?;
+        let submitted_secret = secret.map(str::trim).filter(|value| !value.is_empty());
+        let secret_change = if provider_changed {
+            if self.secret_is_generated(next_provider_id) {
+                // The host owns the built-in HMAC secret, so a browser switch can regenerate it.
+                Some(SecretChange::Set(match submitted_secret {
+                    Some(value) => normalize_or_generate_secret(Some(value))?,
+                    None => generate_secret()?,
+                }))
+            } else if self.provider_declares_secret(next_provider_id).await? {
+                let value = submitted_secret.ok_or_else(|| {
+                    WebhookError::Invalid(
+                        "changing the notification provider requires its credential".to_owned(),
+                    )
+                })?;
+                Some(SecretChange::Set(normalize_provider_credential(value)?))
+            } else {
+                // The new provider never declared this credential, so it must not receive it.
+                Some(SecretChange::Clear)
+            }
+        } else {
+            submitted_secret
+                .map(|value| {
+                    if self.secret_is_generated(next_provider_id) {
+                        normalize_or_generate_secret(Some(value))
+                    } else {
+                        normalize_provider_credential(value)
+                    }
+                    .map(SecretChange::Set)
+                })
+                .transpose()?
+        };
         self.database
             .notifications()
             .update_notification_destination(
@@ -528,8 +548,10 @@ impl WebhookService {
                 },
             )
             .await?;
-        if let Some(secret) = &normalized_secret {
-            self.set_secret(id, Some(secret)).await?;
+        match &secret_change {
+            Some(SecretChange::Set(secret)) => self.set_secret(id, Some(secret)).await?,
+            Some(SecretChange::Clear) => self.set_secret(id, None).await?,
+            None => {}
         }
         self.view_by_id(id).await?.ok_or(WebhookError::NotFound)
     }
@@ -1095,6 +1117,16 @@ pub enum WebhookEventType {
     PlaybackPaused,
     PlaybackProgress,
     PlaybackStopped,
+}
+
+/// A pending change of the destination secret.
+///
+/// A credential belongs to exactly one provider, so switching providers either replaces or drops
+/// the stored value instead of reusing it for the new provider.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SecretChange {
+    Set(String),
+    Clear,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -2612,14 +2644,38 @@ mod tests {
         );
     }
 
-    /// Seeds a notification provider that declares a per-destination credential.
+    /// Seeds notification providers; `true` declares a per-destination credential.
+    async fn notification_provider_service_with(
+        temp_dir: &tempfile::TempDir,
+        providers: &[(&str, bool)],
+    ) -> Result<super::WebhookService, Box<dyn std::error::Error>> {
+        let config_dir = test_config_dir(temp_dir);
+        let database = test_database(temp_dir).await?;
+        for (plugin_id, declares_secret) in providers {
+            seed_notification_provider(&config_dir, plugin_id, *declares_secret).await?;
+            database.install_plugin(plugin_id).await?;
+        }
+        let plugins = crate::application::plugins::PluginService::
+            new_without_login_background_worker_for_test(database.clone(), config_dir.clone());
+        let service = super::WebhookService::new(database, config_dir)?.with_plugins(plugins);
+        Ok(service)
+    }
+
+    /// Seeds one notification provider that may declare a per-destination credential.
     async fn notification_provider_service(
         temp_dir: &tempfile::TempDir,
         declares_secret: bool,
     ) -> Result<super::WebhookService, Box<dyn std::error::Error>> {
-        const PLUGIN_ID: &str = "org.lux.test-notifier";
-        let config_dir = test_config_dir(temp_dir);
-        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
+        notification_provider_service_with(temp_dir, &[("org.lux.test-notifier", declares_secret)])
+            .await
+    }
+
+    async fn seed_notification_provider(
+        config_dir: &std::path::Path,
+        plugin_id: &str,
+        declares_secret: bool,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let plugin_dir = config_dir.join(format!("plugins/{plugin_id}/binaries"));
         tokio::fs::create_dir_all(&plugin_dir).await?;
         tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
         let mut config_fields = vec![
@@ -2658,11 +2714,11 @@ mod tests {
             }));
         }
         tokio::fs::write(
-            config_dir.join(format!("plugins/{PLUGIN_ID}/manifest.json")),
+            config_dir.join(format!("plugins/{plugin_id}/manifest.json")),
             serde_json::to_vec_pretty(&json!({
                 "formatVersion": 1,
-                "id": PLUGIN_ID,
-                "name": "Test notifier",
+                "id": plugin_id,
+                "name": format!("Test notifier {plugin_id}"),
                 "version": "1.0.0",
                 "apiVersion": 1,
                 "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
@@ -2675,13 +2731,7 @@ mod tests {
             }))?,
         )
         .await?;
-
-        let database = test_database(temp_dir).await?;
-        database.install_plugin(PLUGIN_ID).await?;
-        let plugins = crate::application::plugins::PluginService::
-            new_without_login_background_worker_for_test(database.clone(), config_dir.clone());
-        let service = super::WebhookService::new(database, config_dir)?.with_plugins(plugins);
-        Ok(service)
+        Ok(())
     }
 
     async fn stored_secret(
@@ -3010,6 +3060,171 @@ mod tests {
             stored_secret(&service, &destination.id).await.as_deref(),
             Some("device-key-1"),
             "a config-only update must keep the credential"
+        );
+        Ok(())
+    }
+
+    /// A credential belongs to exactly one provider: switching the provider never reuses the
+    /// stored value, because the new provider would silently receive another service's secret.
+    #[tokio::test]
+    async fn switching_to_a_secret_provider_requires_a_new_credential()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, generated) = service
+            .create_destination(
+                "local",
+                "http://127.0.0.1:8787/hooks",
+                true,
+                true,
+                &[],
+                None,
+            )
+            .await?;
+        assert!(generated.starts_with("lux_wh_"));
+        let config = json!({"serverUrl": "https://bark.example.invalid"});
+
+        let rejected = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(PLUGIN_ID),
+                Some(&config),
+                None,
+            )
+            .await;
+        assert!(
+            matches!(rejected, Err(super::WebhookError::Invalid(_))),
+            "switching providers must not reuse the previous credential"
+        );
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some(generated.as_str()),
+            "a rejected provider change must keep the old destination unchanged"
+        );
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(PLUGIN_ID),
+                Some(&config),
+                Some("device-key-9"),
+            )
+            .await?;
+        assert_eq!(updated.provider_plugin_id, PLUGIN_ID);
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-9")
+        );
+        Ok(())
+    }
+
+    /// Switching back to the built-in webhook host generates a fresh HMAC secret instead of
+    /// keeping the previous provider's credential.
+    #[tokio::test]
+    async fn switching_to_the_builtin_webhook_regenerates_the_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                Some("http://127.0.0.1:8787/hooks"),
+                None,
+                Some(true),
+                None,
+                None,
+                Some(super::BUILTIN_WEBHOOK_PROVIDER_ID),
+                Some(&json!({})),
+                None,
+            )
+            .await?;
+        assert_eq!(
+            updated.provider_plugin_id,
+            super::BUILTIN_WEBHOOK_PROVIDER_ID
+        );
+        let secret = stored_secret(&service, &destination.id)
+            .await
+            .expect("the built-in provider must always own a secret");
+        assert!(secret.starts_with("lux_wh_"), "unexpected secret {secret}");
+        assert_ne!(secret, "device-key-1");
+        Ok(())
+    }
+
+    /// A provider without a declared credential cannot use the previous provider's secret, so the
+    /// stored value is dropped instead of being forwarded to it.
+    #[tokio::test]
+    async fn switching_to_a_provider_without_a_credential_clears_the_old_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const SECRET_PLUGIN_ID: &str = "org.lux.test-notifier";
+        const PLAIN_PLUGIN_ID: &str = "org.lux.test-plain-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service_with(
+            &temp_dir,
+            &[(SECRET_PLUGIN_ID, true), (PLAIN_PLUGIN_ID, false)],
+        )
+        .await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                SECRET_PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(PLAIN_PLUGIN_ID),
+                Some(&json!({"serverUrl": "https://plain.example.invalid"})),
+                None,
+            )
+            .await?;
+        assert_eq!(updated.provider_plugin_id, PLAIN_PLUGIN_ID);
+        assert!(!updated.secret_configured);
+        assert!(
+            stored_secret(&service, &destination.id).await.is_none(),
+            "the previous provider's credential must not survive the switch"
         );
         Ok(())
     }
