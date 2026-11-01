@@ -476,7 +476,7 @@ describe("PlayerPage audio track switching", () => {
     expect(play).not.toHaveBeenCalled();
   });
 
-  it("creates a fresh session when switching back to the first audio track", async () => {
+  it("writes an explicit first audio stream when switching back to it in Direct Play", async () => {
     await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
 
     const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
@@ -499,20 +499,59 @@ describe("PlayerPage audio track switching", () => {
       await new Promise((resolve) => setTimeout(resolve, 0));
     });
 
+    // 直连会话里浏览器按容器默认轨播放，第一条音轨必须显式写入才能真的选中。
     expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
-      .toBe("/watch/movie-audio?subtitleStreamIndex=7");
+      .toBe("/watch/movie-audio?subtitleStreamIndex=7&audioStreamIndex=1");
     expect(bootstrapSelections).toEqual([
       { audio: undefined, subtitle: 7 },
       { audio: 2, subtitle: 7 },
-      { audio: undefined, subtitle: 7 },
+      { audio: 1, subtitle: 7 },
     ]);
     expect(lifecycle).toEqual([
       "create:source-audio:default",
       "stop:web-source-audio-default",
       "create:source-audio:2",
       "stop:web-source-audio-2",
-      "create:source-audio:default",
+      "create:source-audio:1",
     ]);
+  });
+
+  it("selects the first audio track explicitly from an unconfirmed Direct Play session", async () => {
+    await renderPlayer("/watch/movie-audio?subtitleStreamIndex=7");
+
+    const firstVideo = container?.querySelector<HTMLVideoElement>("video");
+    if (!firstVideo) throw new Error("video element was not rendered");
+    primeVideo(firstVideo);
+
+    const settings = container?.querySelector<HTMLButtonElement>('[aria-label="播放器设置"]');
+    if (!settings) throw new Error("settings control was not rendered");
+    await act(async () => settings.click());
+
+    // 直连且未显式选择：不声称任何音轨是当前音轨。
+    expect(luxSelectValue(container!, "选择音轨")).toBe("1");
+    expect(container?.textContent).not.toContain("（当前）");
+
+    await chooseLuxOptionByValue(container!, "选择音轨", "1");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-audio?subtitleStreamIndex=7&audioStreamIndex=1");
+    expect(bootstrapSelections).toEqual([
+      { audio: undefined, subtitle: 7 },
+      { audio: 1, subtitle: 7 },
+    ]);
+    expect(lifecycle).toEqual([
+      "create:source-audio:default",
+      "stop:web-source-audio-default",
+      "create:source-audio:1",
+    ]);
+    // 显式选择后才有确认的当前音轨。
+    expect(container?.textContent).toContain("（当前）");
   });
 
   it("hides the audio selector for a single-track source", async () => {

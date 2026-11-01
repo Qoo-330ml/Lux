@@ -1,11 +1,12 @@
 import { useCallback, useMemo } from "react";
-import type { MediaSource } from "../../lib/api/types";
+import type { MediaSource, WebPlaybackPlan } from "../../lib/api/types";
 import {
   audioParamFromQueryKey,
   audioTrackOptions,
   audioTrackSwitchParams,
-  resolveSelectedAudioTrackIndex,
+  resolveConfirmedAudioTrackIndex,
   supportsAudioTrackSwitching,
+  type AudioTrackOwner,
 } from "./audio-track-selection";
 import { usePlaybackVariantSwitch } from "./usePlaybackVariantSwitch";
 import type { PlaybackReporting } from "./usePlaybackReporting";
@@ -15,6 +16,8 @@ type AudioTrackSwitchOptions = {
   playbackKey: string;
   source: MediaSource | undefined;
   requestedAudioStreamIndex: string | null;
+  /** The plan of the current session: it decides who owns the audible track. */
+  playbackPlan: WebPlaybackPlan | undefined;
   searchParams: URLSearchParams;
   setSearchParams: (next: URLSearchParams) => void;
   streamUrl: string;
@@ -53,6 +56,7 @@ export function useAudioTrackSwitch({
   playbackKey,
   source,
   requestedAudioStreamIndex,
+  playbackPlan,
   searchParams,
   setSearchParams,
   streamUrl,
@@ -64,15 +68,23 @@ export function useAudioTrackSwitch({
   resetControlsTimeout,
 }: AudioTrackSwitchOptions): AudioTrackSwitch {
   const explicitAudioStreamIndex = requestedAudioStreamIndex?.trim() || null;
-  const selectedAudioStreamIndex = resolveSelectedAudioTrackIndex(source, explicitAudioStreamIndex);
+  // A server-side session fixes the audio stream it muxes, so it confirms the
+  // explicit index or the first audio stream. Direct Play leaves the choice to the
+  // browser container, so the URL selection is the only proof there.
+  const audioTrackOwner: AudioTrackOwner =
+    playbackPlan?.type === "SERVER_HLS" ? "server" : "browser";
+  const selectedAudioStreamIndex = resolveConfirmedAudioTrackIndex(
+    source,
+    explicitAudioStreamIndex,
+    audioTrackOwner,
+  );
   // Direct Play cannot select a non-first STRM audio stream, so those sources
-  // never expose the track switcher. Without an explicit URL selection the
-  // browser may pick any Direct Play track, so no option is marked "current".
+  // never expose the track switcher. Only a confirmed index is marked "当前".
   const audioTracks = useMemo(
     () => supportsAudioTrackSwitching(source)
-      ? audioTrackOptions(source, explicitAudioStreamIndex)
+      ? audioTrackOptions(source, selectedAudioStreamIndex)
       : [],
-    [explicitAudioStreamIndex, source],
+    [selectedAudioStreamIndex, source],
   );
 
   const { switching, notice, beginSwitch } = usePlaybackVariantSwitch({
@@ -96,13 +108,16 @@ export function useAudioTrackSwitch({
   const switchAudioTrack = useCallback((index: string) => {
     const targetIndex = index.trim();
     if (!source || !supportsAudioTrackSwitching(source)) return;
-    if (switching || !targetIndex || targetIndex === selectedAudioStreamIndex) return;
+    // Only the explicit URL selection can make this a no-op. Without one the
+    // audible track is unproven, so choosing the first audio stream must still
+    // rebuild the session: Direct Play needs the explicit index to pin it.
+    if (switching || !targetIndex || targetIndex === explicitAudioStreamIndex) return;
     const isAudioTrack = (source.streams ?? []).some(
       (stream) => (stream.type ?? "").toUpperCase() === "AUDIO" && String(stream.index) === targetIndex,
     );
     if (!isAudioTrack) return;
-    beginSwitch(audioTrackSwitchParams(searchParams, targetIndex, source));
-  }, [beginSwitch, searchParams, selectedAudioStreamIndex, source, switching]);
+    beginSwitch(audioTrackSwitchParams(searchParams, targetIndex, source, audioTrackOwner));
+  }, [audioTrackOwner, beginSwitch, explicitAudioStreamIndex, searchParams, source, switching]);
 
   return {
     audioTracks,

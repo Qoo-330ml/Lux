@@ -294,9 +294,10 @@ describe("PlayerPage quality switching", () => {
     });
 
     expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
-      .toBe("/watch/movie-quality?maxBitrate=2000000");
-    expect(bootstrapSelections.at(-1)).toEqual({ audio: undefined, subtitle: undefined, maxBitrate: 2_000_000 });
-    const audioVideo = await settleReplacement("web-default-2000000");
+      .toBe("/watch/movie-quality?audioStreamIndex=1&maxBitrate=2000000");
+    // 直连会话里显式选回第一条音轨，参数保留而不是退回默认。
+    expect(bootstrapSelections.at(-1)).toEqual({ audio: 1, subtitle: undefined, maxBitrate: 2_000_000 });
+    const audioVideo = await settleReplacement("web-1-2000000");
     expect(audioVideo.currentTime).toBe(12);
     expect(luxSelectValue(container!, "选择画质")).toBe("2000000");
   });

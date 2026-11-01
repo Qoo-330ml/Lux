@@ -289,6 +289,7 @@ export function PlayerPage() {
     playbackKey,
     source,
     requestedAudioStreamIndex,
+    playbackPlan,
     searchParams,
     setSearchParams,
     streamUrl,
