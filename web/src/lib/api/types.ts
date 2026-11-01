@@ -1112,6 +1112,7 @@ export type AdminHealth = {
       source: string;
       usedBytes: number | null;
       limitBytes: number | null;
+      hostTotalBytes: number | null;
       usagePercent: number | null;
     };
     mediaStorage: {

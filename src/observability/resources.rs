@@ -558,6 +558,9 @@ pub struct MemorySnapshot {
     pub used_bytes: Option<u64>,
     #[serde(rename = "limitBytes")]
     pub limit_bytes: Option<u64>,
+    /// Physical memory of the host (`/proc/meminfo`), shown as the capacity when no cgroup limit is set.
+    #[serde(rename = "hostTotalBytes")]
+    pub host_total_bytes: Option<u64>,
     #[serde(rename = "usagePercent")]
     pub usage_percent: Option<f64>,
 }
@@ -675,11 +678,17 @@ async fn memory_snapshot() -> MemorySnapshot {
         (current, limit)
     };
 
+    let host_total = tokio::fs::read_to_string("/proc/meminfo")
+        .await
+        .ok()
+        .and_then(|meminfo| parse_meminfo_total_bytes(&meminfo));
+
     MemorySnapshot {
         available: current.is_some(),
         source: "cgroup",
         used_bytes: current,
         limit_bytes: limit,
+        host_total_bytes: host_total,
         usage_percent: current.and_then(|used| memory_usage_percent(used, limit)),
     }
 }
@@ -788,6 +797,14 @@ fn parse_keyed_value(input: &str, key: &str) -> Option<u64> {
         let value = fields.next()?;
         (current_key == key).then(|| parse_unsigned(value))?
     })
+}
+
+fn parse_meminfo_total_bytes(meminfo: &str) -> Option<u64> {
+    let kib = meminfo.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        (fields.next()? == "MemTotal:").then(|| fields.next()?.parse::<u64>().ok())?
+    })?;
+    kib.checked_mul(1024).filter(|bytes| *bytes > 0)
 }
 
 fn parse_unsigned(input: &str) -> Option<u64> {
@@ -932,8 +949,8 @@ mod tests {
     use super::{
         CachedProbeMemory, HomeLatencySample, ResourceMetrics, calculate_cpu_usage_cores,
         calculate_cpu_usage_percent, memory_usage_percent, parse_cgroup_limit,
-        parse_media_storage_values, process_is_member, recommended_background_concurrency,
-        recommended_metadata_concurrency, select_cpu_capacity,
+        parse_media_storage_values, parse_meminfo_total_bytes, process_is_member,
+        recommended_background_concurrency, recommended_metadata_concurrency, select_cpu_capacity,
     };
     use std::time::{Duration, Instant};
 
@@ -941,6 +958,15 @@ mod tests {
     fn cgroup_max_is_an_unlimited_container_limit() {
         assert_eq!(parse_cgroup_limit("max\n"), None);
         assert_eq!(parse_cgroup_limit("1048576\n"), Some(1_048_576));
+    }
+
+    #[test]
+    fn meminfo_total_is_reported_in_bytes() {
+        let meminfo = "MemTotal:       16384000 kB\nMemFree:         1000 kB\n";
+        assert_eq!(parse_meminfo_total_bytes(meminfo), Some(16_384_000 * 1024));
+        assert_eq!(parse_meminfo_total_bytes("MemFree: 1 kB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal: nope kB\n"), None);
+        assert_eq!(parse_meminfo_total_bytes("MemTotal: 0 kB\n"), None);
     }
 
     #[test]

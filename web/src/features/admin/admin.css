@@ -779,6 +779,10 @@ html[data-lux-theme="light"] .lux-library-override-modes label { background: rgb
   background: linear-gradient(90deg, color-mix(in srgb, var(--lux-overview-cpu) 86%, #10b981), var(--lux-overview-cpu));
 }
 
+.lux-bento-progress-fill.is-memory {
+  background: linear-gradient(90deg, color-mix(in srgb, var(--lux-overview-memory) 80%, #3b82f6), var(--lux-overview-memory));
+}
+
 .lux-bento-progress-fill.is-storage {
   background: linear-gradient(90deg, #8b5cf6, var(--lux-overview-storage));
 }
@@ -789,6 +793,17 @@ html[data-lux-theme="light"] .lux-library-override-modes label { background: rgb
   border-radius: 999px;
   background: color-mix(in srgb, var(--lux-overview-cpu) 12%, transparent);
   color: var(--lux-overview-cpu);
+  font-size: 0.7rem;
+  font-weight: 650;
+  font-family: ui-monospace, monospace;
+}
+
+.lux-bento-badge-info {
+  padding: 2px 7px;
+  border: 1px solid color-mix(in srgb, var(--lux-overview-memory) 20%, transparent);
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--lux-overview-memory) 12%, transparent);
+  color: var(--lux-overview-memory);
   font-size: 0.7rem;
   font-weight: 650;
   font-family: ui-monospace, monospace;

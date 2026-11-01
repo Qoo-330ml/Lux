@@ -20,7 +20,7 @@ const dashboard: AdminDashboard = {
     runtime: { seconds: 90_061 },
     resources: {
       cpu: { available: true, source: "cgroup", usageCores: 0.75, capacityCores: 2, usagePercent: 37.5, limitCores: 2 },
-      memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: 4_294_967_296, usagePercent: 25 },
+      memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: 4_294_967_296, hostTotalBytes: 17_179_869_184, usagePercent: 25 },
       mediaStorage: { available: true, source: "container-filesystem", path: "/media", totalBytes: 107_374_182_400, usedBytes: 10_737_418_240, availableBytes: 96_636_764_160, usagePercent: 10 },
     },
     database: { status: "ok", backend: "SQLITE", journalMode: "wal", writable: true },
@@ -150,7 +150,7 @@ describe("AdminDashboardPage", () => {
     expect(overview?.querySelector(".lux-bento-hero-footer")).toBeNull();
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-value")).toHaveLength(6);
     expect(overview?.querySelectorAll(".lux-admin-overview-metric-icon")).toHaveLength(0);
-    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "0.8 / 2.0 核", "1.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    expect([...overview?.querySelectorAll(".lux-admin-overview-metric-value") ?? []].map((value) => value.textContent)).toEqual(["42", "7", "3", "0.8 / 2.0 核", "1.0 GiB / 4.0 GiB", "10.0 GiB / 100.0 GiB"]);
     expect(overview?.querySelector(".lux-bento-version strong")?.textContent).toBe("v0.2.7");
     expect(overview?.querySelectorAll(".lux-bento-icon-tile")).toHaveLength(4);
     expect(overview?.querySelector(".lux-bento-icon-tile.is-storage")).not.toBeNull();
@@ -245,7 +245,7 @@ describe("AdminDashboardPage", () => {
         ...dashboard.health,
         resources: {
           cpu: { available: false, source: "cgroup", usageCores: null, capacityCores: null, usagePercent: null, limitCores: null },
-          memory: { available: false, source: "cgroup", usedBytes: null, limitBytes: null, usagePercent: null },
+          memory: { available: false, source: "cgroup", usedBytes: null, limitBytes: null, hostTotalBytes: null, usagePercent: null },
           mediaStorage: { available: false, source: "container-filesystem", path: "/media", totalBytes: null, usedBytes: null, availableBytes: null, usagePercent: null },
         },
       },
@@ -279,7 +279,7 @@ describe("AdminDashboardPage", () => {
         resources: {
           ...dashboard.health.resources,
           cpu: { available: true, source: "cgroup", usageCores: 1.8, capacityCores: 8, usagePercent: 22.5, limitCores: null },
-          memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: null, usagePercent: null },
+          memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: null, hostTotalBytes: 17_179_869_184, usagePercent: null },
         },
       },
     };
@@ -301,9 +301,43 @@ describe("AdminDashboardPage", () => {
       await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-card")).not.toBeNull());
     });
     const values = [...container.querySelectorAll(".lux-admin-overview-metric-value")].map((value) => value.textContent);
-    expect(values.slice(3)).toEqual(["1.8 / 8.0 核", "1.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    expect(values.slice(3)).toEqual(["1.8 / 8.0 核", "1.0 GiB / 16.0 GiB", "10.0 GiB / 100.0 GiB"]);
+    const memoryBar = container.querySelector('[aria-label="内存使用率"]');
+    expect(memoryBar?.getAttribute("aria-valuenow")).toBe("6.25");
     expect(container.textContent).not.toContain("容器可见容量");
     expect(container.textContent).not.toContain("未设置容器上限");
+  });
+
+  it("shows used memory only when neither a limit nor the host total is known", async () => {
+    const noTotalDashboard: AdminDashboard = {
+      ...dashboard,
+      health: {
+        ...dashboard.health,
+        resources: {
+          ...dashboard.health.resources,
+          memory: { available: true, source: "cgroup", usedBytes: 1_073_741_824, limitBytes: null, hostTotalBytes: null, usagePercent: null },
+        },
+      },
+    };
+    vi.spyOn(api, "adminDashboard").mockResolvedValue(noTotalDashboard);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    act(() => {
+      root.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter>
+            <AdminDashboardPage />
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+
+    await act(async () => {
+      await vi.waitFor(() => expect(container.querySelector(".lux-admin-overview-card")).not.toBeNull());
+    });
+    const values = [...container.querySelectorAll(".lux-admin-overview-metric-value")].map((value) => value.textContent);
+    expect(values[4]).toBe("1.0 GiB");
+    expect(container.querySelector('[aria-label="内存使用率"]')).toBeNull();
   });
 
   it("does not expose database implementation details on the dashboard", async () => {

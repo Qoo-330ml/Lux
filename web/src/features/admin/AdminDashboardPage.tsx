@@ -69,6 +69,7 @@ export function AdminDashboardPage() {
 
   const { health, server, stats, nowPlaying, activity } = dashboard.data;
   const status = health.status === "ok";
+  const memoryPercent = memoryUsagePercent(health.resources.memory);
   const recentPlaybackActivity = activity
     .filter((event) => event.eventType !== "AUTH_LOGIN")
     .slice(0, 10);
@@ -161,7 +162,13 @@ export function AdminDashboardPage() {
               <ResourceMeter
                 title="内存占用"
                 tile={<span className="lux-bento-icon-tile is-memory" aria-hidden="true"><MemoryStick size={14} strokeWidth={1.8} /></span>}
+                badge={memoryPercent !== null
+                  ? <span className="lux-bento-badge-info">{memoryPercent.toFixed(1)}%</span>
+                  : null}
                 value={formatMemory(health.resources.memory)}
+                percent={memoryPercent}
+                fillClass="is-memory"
+                progressLabel="内存使用率"
               />
               <ResourceMeter
                 title="存储空间"
@@ -276,9 +283,24 @@ function formatCpu(cpu: AdminDashboard["health"]["resources"]["cpu"]) {
   return `${cpu.usageCores.toFixed(1)} / ${cpu.capacityCores.toFixed(1)} 核`;
 }
 
-function formatMemory(memory: AdminDashboard["health"]["resources"]["memory"]) {
+type MemoryResource = AdminDashboard["health"]["resources"]["memory"];
+
+/** The container limit wins; without one the host's physical memory is the capacity. */
+function memoryCapacityBytes(memory: MemoryResource) {
+  const capacity = memory.limitBytes ?? memory.hostTotalBytes;
+  return capacity !== null && capacity > 0 ? capacity : null;
+}
+
+function memoryUsagePercent(memory: MemoryResource) {
+  const capacity = memoryCapacityBytes(memory);
+  if (!memory.available || memory.usedBytes === null || capacity === null) return null;
+  return Math.min(100, (memory.usedBytes * 100) / capacity);
+}
+
+function formatMemory(memory: MemoryResource) {
   if (!memory.available || memory.usedBytes === null) return "不可用";
-  return formatBytes(memory.usedBytes);
+  const capacity = memoryCapacityBytes(memory);
+  return capacity === null ? formatBytes(memory.usedBytes) : `${formatBytes(memory.usedBytes)} / ${formatBytes(capacity)}`;
 }
 
 function formatStorage(storage: AdminDashboard["health"]["resources"]["mediaStorage"]) {
