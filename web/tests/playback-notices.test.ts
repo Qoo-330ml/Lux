@@ -47,7 +47,9 @@ describe("playbackNoticeFor: UNSUPPORTED reasons", () => {
       title: "没有可用的服务端转码档位",
     });
     expect(result.hint).toContain("管理员");
-    expect(result.hint).toContain("画质上限");
+    expect(result.hint).toContain("调高画质（分辨率）");
+    expect(result.hint).toContain("返回详情页选择其他版本");
+    expect(result.hint).not.toContain("画质上限");
   });
 
   it("explains that an administrator turned server transcoding off", () => {
@@ -67,7 +69,7 @@ describe("playbackNoticeFor: UNSUPPORTED reasons", () => {
 
     expect(result).toMatchObject({ key: "unsupported-unknown", severity: "warning", blocking: true });
     expect(result.message).toContain("FUTURE_REASON");
-    expect(result.hint).toContain("其他版本");
+    expect(result.hint).toContain("返回详情页选择其他版本");
   });
 
   it("does not invent a reason code when the server omitted it", () => {
@@ -91,9 +93,9 @@ describe("playbackNoticeFor: UNSUPPORTED reasons", () => {
 
   it("suggests another version for the STRM and browser-capability reasons", () => {
     expect(notice({ planType: "UNSUPPORTED", reason: "STRM_REQUIRES_DIRECT_PLAY" }).hint)
-      .toContain("其他版本");
+      .toContain("返回详情页选择其他版本");
     expect(notice({ planType: "UNSUPPORTED", reason: "BROWSER_CANNOT_CONSUME_HLS" }).hint)
-      .toContain("其他版本");
+      .toContain("返回详情页选择其他版本");
   });
 });
 

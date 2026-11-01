@@ -379,7 +379,7 @@ export function PlayerVideoSurface({
             <AlertCircle size={36} className="lux-player-error-icon" aria-hidden="true" />
             {failure ? <h2>{failure.title}</h2> : null}
             <p className="lux-player-error">
-              {failure?.message ?? errorMessage ?? "浏览器无法播放这个媒体源。请尝试其他版本或使用支持该格式的客户端。"}
+              {failure?.message ?? errorMessage ?? "浏览器无法播放这个媒体源。请返回详情页选择其他版本或使用支持该格式的客户端。"}
             </p>
             <div className="lux-player-error-actions">
               <button

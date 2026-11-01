@@ -102,7 +102,7 @@ const STRM_REQUIRES_DIRECT_PLAY: NoticeCopy = {
   severity: "error",
   title: "STRM 源只能直连播放",
   message: ".strm 远程源在 Lux 中只支持直连播放，不代理媒体字节、也不交给服务端转码，而当前浏览器无法直接播放它的编码或容器格式。",
-  hint: "尝试选择其他版本；改用原生客户端（Infuse、VidHub 等）播放，或请管理员换一个浏览器可以直接播放的版本。",
+  hint: "返回详情页选择其他版本；改用原生客户端（Infuse、VidHub 等）播放，或请管理员换一个浏览器可以直接播放的版本。",
 };
 
 const BROWSER_CANNOT_CONSUME_HLS: NoticeCopy = {
@@ -110,7 +110,7 @@ const BROWSER_CANNOT_CONSUME_HLS: NoticeCopy = {
   severity: "error",
   title: "当前浏览器无法播放服务端 HLS",
   message: "浏览器没有声明支持 HLS/MSE，服务端因此无法用分片转码的方式输出这段媒体。",
-  hint: "尝试选择其他版本，或换用支持 MSE 的现代浏览器（新版 Chrome、Edge、Firefox 或 Safari）、原生客户端。",
+  hint: "返回详情页选择其他版本，或换用支持 MSE 的现代浏览器（新版 Chrome、Edge、Firefox 或 Safari）、原生客户端。",
 };
 
 const NO_COMPATIBLE_SERVER_PLAN: NoticeCopy = {
@@ -118,7 +118,7 @@ const NO_COMPATIBLE_SERVER_PLAN: NoticeCopy = {
   severity: "error",
   title: "没有可用的服务端转码档位",
   message: "Lux 找不到既能输出浏览器可解码的格式、又符合当前画质上限与并发配置的转码档位。",
-  hint: "调高画质上限或选择其他版本再试；如果仍然失败，请联系管理员检查转码设置（硬件编码器是否可用、是否允许软件转码）。",
+  hint: "调高画质（分辨率），或返回详情页选择其他版本再试；如果仍然失败，请联系管理员检查转码设置（硬件编码器是否可用、是否允许软件转码）。",
 };
 
 const SERVER_TRANSCODING_DISABLED: NoticeCopy = {
@@ -209,7 +209,7 @@ function unsupportedNotice(reason: string | null | undefined): PlaybackNotice {
     message: code
       ? `服务端拒绝为该媒体生成播放计划（原因码：${code}），网页端无法回退到其他播放方式。`
       : "服务端拒绝为该媒体生成播放计划，但没有给出原因码，网页端无法回退到其他播放方式。",
-    hint: "重试可能恢复；如果一直失败，请选择其他版本、改用原生客户端，或联系管理员。",
+    hint: "重试可能恢复；如果一直失败，请返回详情页选择其他版本、改用原生客户端，或联系管理员。",
   });
 }
 
