@@ -27,6 +27,7 @@ import {
 } from "./client-decode-watchdog";
 import {
   clientDecodeFallbackDiagnostic,
+  playbackFallbackDiagnostic,
   type ClientDecodeFallbackReason,
 } from "./client-decode-fallback";
 import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
@@ -42,6 +43,15 @@ import { TICKS_PER_SECOND, useClientEngine } from "./player-page-helpers";
 import type { PlaybackReporting } from "./usePlaybackReporting";
 
 export const TIMELINE_UI_UPDATE_INTERVAL_MS = 100;
+
+/** Engine failures arrive as `Error` or as the runtime's `{ code, message }` error payload. */
+function playbackFailureDetail(cause: unknown) {
+  if (cause instanceof Error) return cause.message;
+  if (cause && typeof cause === "object" && typeof (cause as { message?: unknown }).message === "string") {
+    return (cause as { message: string }).message;
+  }
+  return typeof cause === "string" ? cause : undefined;
+}
 
 const HEVC_RUNTIME_ASSETS = {
   workerUrl: "/hevc/transcode-worker.js",
@@ -312,8 +322,13 @@ export function usePlaybackRuntime({
           break;
         }
         case "ERROR":
-          if (activeEngine.kind === "native" && playbackPlan?.type === "DIRECT") {
-            void requestServerFallback(event.error.message);
+          if (playbackPlan?.type === "DIRECT") {
+            // Both engines land here: a native media error, and a client engine that reported a
+            // failed MSE append or remux worker error after playback started.
+            void requestDirectFallback(
+              event.error,
+              useClientEngine(activeEngine) ? "unviable" : undefined,
+            ).catch(() => undefined);
           } else {
             setFailedStreamUrl(streamUrl);
             setPlaybackFailure(classifyPlayerEngineFailure(event.error));
@@ -363,16 +378,34 @@ export function usePlaybackRuntime({
     let clientWatchdog: ClientDecodeWatchdog | null = null;
     let firstSegmentTimeout: number | undefined;
     let fallbackRequested = false;
-    const requestClientDecodeFallback = (reason: ClientDecodeFallbackReason, detail?: string) => {
-      if (cancelled || fallbackRequested) return;
+    /**
+     * One server-side retry per load. Any engine failure on a `DIRECT` plan (native media error,
+     * client MSE append rejection, remux worker error, first-segment timeout) asks the server for a
+     * transcoding session; only a refused fallback ends in the engine-failure screen.
+     */
+    const requestDirectFallback = async (
+      cause: unknown,
+      reason?: ClientDecodeFallbackReason,
+      detail?: string,
+    ) => {
+      if (cancelled || fallbackRequested) return false;
       fallbackRequested = true;
       window.clearTimeout(firstSegmentTimeout);
-      // Web Inspector has no other trace of this decision; the copy never carries media URLs.
-      console.warn(clientDecodeFallbackDiagnostic(reason, detail));
-      void requestServerFallback(new Error(`client decode fallback: ${reason}`), reason)
-        .then((reloadPending) => {
-          if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
-        })
+      window.clearTimeout(nativeStallTimeout);
+      const message = detail ?? playbackFailureDetail(cause);
+      // Web Inspector has no other trace of this decision; the copy never carries media URLs. Remote
+      // `.strm` sources only rotate Direct Play candidates, so they must not claim a transcode.
+      if (!remoteHttpSource) {
+        console.warn(reason
+          ? clientDecodeFallbackDiagnostic(reason, message)
+          : playbackFallbackDiagnostic(message));
+      }
+      const reloadPending = await requestServerFallback(cause, reason);
+      if (!cancelled) settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
+      return reloadPending;
+    };
+    const requestClientDecodeFallback = (reason: ClientDecodeFallbackReason, detail?: string) => {
+      void requestDirectFallback(new Error(`client decode fallback: ${reason}`), reason, detail)
         .catch(() => undefined);
     };
     const startClientWatchdog = () => {
@@ -486,20 +519,18 @@ export function usePlaybackRuntime({
             }),
           );
       } catch (cause) {
-        if (!cancelled) {
-          if (runtime.state.status === "FAILED") {
-            settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, false);
-            return;
-          }
-          if (playbackPlan?.type === "DIRECT") {
-            // `true` means this same episode reloads (server fallback or candidate
-            // retry); the one-shot auto start then belongs to the reloaded session.
-            const reloadPending = await requestServerFallback(cause);
-            if (!cancelled) {
-              settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, reloadPending);
-            }
-          } else {
-            settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, false);
+        // A rejected engine (MSE append failure, `isTypeSupported` rejection, worker error) on a
+        // Direct Play plan is retried once server-side instead of stopping on the engine-failure
+        // screen. `requestDirectFallback` is idempotent, so a prior ERROR event or watchdog cannot
+        // double-request; the fallback itself settles the one-shot auto start.
+        if (playbackPlan?.type === "DIRECT") {
+          await requestDirectFallback(
+            cause,
+            useClientEngine(activeEngine) ? "unviable" : undefined,
+          );
+        } else if (!cancelled) {
+          settleAutoStartPlaybackAfterFailure(autoStartGateRef.current, false);
+          if (!fallbackRequested) {
             setFailedStreamUrl(streamUrl);
             setPlaybackFailure(classifyPlayerEngineFailure(cause));
           }

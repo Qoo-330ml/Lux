@@ -18,7 +18,7 @@ export type ClientDecodeFallbackReason =
 export const CLIENT_DECODE_FALLBACK_NOTICE: Record<ClientDecodeFallbackReason, string> = {
   stalled: "客户端解码长时间没有产出可播放画面，已切换为服务器转码。",
   slow: "客户端解码过慢，已切换为服务器转码。",
-  unviable: "这个源无法在浏览器里实时客户端解码（10-bit 或超过 1080p 的软解），已切换为服务器转码。",
+  unviable: "客户端解码无法播放这个源，已切换为服务器转码。",
 };
 
 /**
@@ -28,6 +28,14 @@ export const CLIENT_DECODE_FALLBACK_NOTICE: Record<ClientDecodeFallbackReason, s
  * a rejection reason code.
  */
 export function clientDecodeFallbackDiagnostic(reason: ClientDecodeFallbackReason, detail?: string) {
-  const suffix = detail ? `（${detail}）` : "";
-  return `[Lux 播放器] 客户端解码回退为服务端转码：${reason}${suffix}`;
+  return `[Lux 播放器] 客户端解码回退为服务端转码：${reason}${diagnosticDetail(detail)}`;
+}
+
+/** Web Inspector diagnostic for a Direct Play failure that is being retried server-side. */
+export function playbackFallbackDiagnostic(detail?: string) {
+  return `[Lux 播放器] 直连播放失败，已回退为服务端转码${diagnosticDetail(detail)}`;
+}
+
+function diagnosticDetail(detail?: string) {
+  return detail ? `（${detail}）` : "";
 }

@@ -230,7 +230,7 @@ describe("playbackNoticeFor: server transcode banners", () => {
 
     expect(slow.message).toContain("客户端解码过慢，已切换为服务器转码");
     expect(stalled.message).toContain("长时间没有产出可播放画面");
-    expect(unviable.message).toContain("10-bit");
+    expect(unviable.message).toContain("客户端解码无法播放这个源");
     expect(slow.blocking).toBe(false);
     // The old degradation copy is still there after the reason sentence.
     expect(slow.message).toContain("Lux 已自动改用服务端 HLS 输出");

@@ -20,6 +20,8 @@ const engineState = vi.hoisted(() => ({
   mkvEngines: 0,
   hevcEngines: 0,
   hlsEngines: 0,
+  /** Reproduces the Chrome/MSE rejection seen on the NAS test instance. */
+  mkvAppendFailure: false,
 }));
 
 vi.mock("../src/features/player/mkv-playback-engine", () => ({
@@ -28,7 +30,11 @@ vi.mock("../src/features/player/mkv-playback-engine", () => ({
     readonly error = null;
     readonly performance = null;
     constructor(readonly element: HTMLVideoElement) { engineState.mkvEngines += 1; }
-    setSource() { return Promise.resolve(); }
+    setSource() {
+      return engineState.mkvAppendFailure
+        ? Promise.reject(new Error("MKV MSE SourceBuffer append failed"))
+        : Promise.resolve();
+    }
     destroy() {}
     play() { return Promise.resolve(); }
     pause() {}
@@ -99,6 +105,7 @@ describe("PlayerPage client decode gate", () => {
     engineState.mkvEngines = 0;
     engineState.hevcEngines = 0;
     engineState.hlsEngines = 0;
+    engineState.mkvAppendFailure = false;
     mockPlaybackBootstrap();
     warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
@@ -213,6 +220,36 @@ describe("PlayerPage client decode gate", () => {
     expect(session).toHaveBeenCalledTimes(2);
     expect(container?.textContent).toContain("已切换为服务器转码");
     expect(warn).toHaveBeenCalledWith(expect.stringContaining("client-codec-unsupported"));
+  });
+
+  it("retries a client MSE append failure server-side instead of stopping on the engine error", async () => {
+    // 8-bit 1080p H.264 Matroska passes the gate, so the client remux engine starts and its first
+    // SourceBuffer append fails the way Chromium reported it on the NAS test instance.
+    vi.stubGlobal("MediaSource", { isTypeSupported: (mime: string) => mime.includes("avc1") });
+    vi.stubGlobal("Worker", class Worker {});
+    vi.stubGlobal("VideoEncoder", class VideoEncoder {
+      static isConfigSupported() { return Promise.resolve({ supported: true }); }
+    });
+    engineState.mkvAppendFailure = true;
+    const session = firstSessionDirectThenServerHls();
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "movie-append-failure",
+      title: "MKV append 失败",
+      itemType: "MOVIE",
+      mediaSources: [matroskaSource([
+        { index: 0, type: "VIDEO", codec: "h264", details: { Width: 1920, Height: 1080, PixelFormat: "yuv420p" } },
+        { index: 1, type: "AUDIO", codec: "AAC" },
+      ])],
+    });
+
+    await renderPlayer("movie-append-failure");
+
+    expect(engineState.mkvEngines).toBeGreaterThanOrEqual(1);
+    expect(session).toHaveBeenCalledTimes(2);
+    expect(engineState.hlsEngines).toBe(1);
+    expect(container?.textContent).not.toContain("播放器引擎失败");
+    expect(container?.textContent).toContain("已切换为服务器转码");
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining("MKV MSE SourceBuffer append failed"));
   });
 
   it("leaves an 8-bit 1080p H.264 MP4 on native Direct Play", async () => {

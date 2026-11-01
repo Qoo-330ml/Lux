@@ -729,7 +729,7 @@ describe("PlayerPage client fallback status", () => {
     expect(container.textContent).not.toContain("播放器引擎失败");
   });
 
-  it("shows safe Lux guidance instead of the fallback engine reason", async () => {
+  it("retries a Direct Play engine failure once server-side before the safe guidance", async () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
@@ -753,6 +753,18 @@ describe("PlayerPage client fallback status", () => {
     const video = container.querySelector<HTMLVideoElement>("video");
     expect(video).not.toBeNull();
     await act(async () => video?.dispatchEvent(new Event("error")));
+    // A Direct Play engine failure now retries once server-side, so the failure screen must not
+    // appear after the first error.
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
+    expect(container?.textContent).not.toContain("播放器引擎失败");
+    // The mocked server keeps planning Direct Play, so the second error has no fallback left.
+    const retriedVideo = container.querySelector<HTMLVideoElement>("video");
+    await act(async () => retriedVideo?.dispatchEvent(new Event("error")));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 40));
+    });
 
     expect(container?.textContent).toContain("播放器引擎失败");
     expect(container?.textContent).not.toContain("MSE SourceBuffer append failed");
