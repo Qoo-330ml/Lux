@@ -341,6 +341,9 @@ struct PlaybackSourceRow {
     external_url: Option<String>,
     /// Container bitrate from the last probe; `None` until the source was probed.
     bitrate: Option<i64>,
+    /// `details_json` of the first video stream; the height is read out of it in Rust so the query
+    /// stays portable across both database backends.
+    video_stream_details_json: Option<String>,
     root_path: String,
     relative_path: String,
 }
@@ -353,10 +356,34 @@ impl From<PlaybackSourceRow> for StoredPlaybackSource {
             container: row.container,
             external_url: row.external_url,
             bitrate: row.bitrate,
+            video_height: stream_detail_integer(
+                row.video_stream_details_json.as_deref(),
+                STREAM_HEIGHT_DETAIL,
+            ),
             root_path: row.root_path,
             relative_path: row.relative_path,
         }
     }
+}
+
+/// Probe detail key that carries a video stream's height in pixels.
+const STREAM_HEIGHT_DETAIL: &str = "Height";
+
+/// Probe detail key that carries a video stream's width in pixels.
+const STREAM_WIDTH_DETAIL: &str = "Width";
+
+/// Reads one integer video dimension out of a stored stream `details_json`.
+///
+/// ffprobe results store the value as a JSON number, while NFO sidecars and older rows may carry it
+/// as a string, so both are accepted. Missing, malformed or non-numeric values are simply unknown.
+fn stream_detail_integer(details_json: Option<&str>, field: &str) -> Option<i64> {
+    let details =
+        serde_json::from_str::<serde_json::Map<String, serde_json::Value>>(details_json?).ok()?;
+    let value = details.get(field)?;
+    value
+        .as_i64()
+        .or_else(|| value.as_str()?.trim().parse::<i64>().ok())
+        .filter(|value| *value > 0)
 }
 
 /// Row of `find_media_item_kind`: the item kind plus the season number only seasons carry.
@@ -5659,7 +5686,12 @@ impl Database {
         };
         let query = format!(
             "SELECT ms.id AS source_id, ms.source_kind, ms.container, ms.external_url,
-                    ms.bitrate, lr.canonical_path AS root_path, fe.relative_path
+                    ms.bitrate,
+                    (SELECT vs.details_json FROM media_streams vs
+                      WHERE vs.media_source_id = ms.id AND vs.stream_type = 'VIDEO'
+                      ORDER BY vs.stream_index
+                      LIMIT 1) AS video_stream_details_json,
+                    lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1
@@ -5684,6 +5716,34 @@ impl Database {
             .await
             .map(|row| row.map(StoredPlaybackSource::from))
             .map_err(self.sqlx_err())
+    }
+
+    /// Pixel dimensions of one media source's first video stream, from its stored probe details.
+    ///
+    /// Playback statistics report the picture the session works with, so the read must not run a
+    /// probe: an unprobed source simply reports no dimensions.
+    pub(crate) async fn find_media_source_video_dimensions(
+        &self,
+        source_id: &str,
+    ) -> Result<Option<StoredVideoDimensions>, StorageError> {
+        let details = self
+            .query_scalar::<Option<String>>(
+                "SELECT details_json FROM media_streams
+                 WHERE media_source_id = ? AND stream_type = 'VIDEO'
+                 ORDER BY stream_index
+                 LIMIT 1",
+            )
+            .bind(source_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(self.sqlx_err())?
+            .flatten();
+        let details = details.as_deref();
+        let dimensions = StoredVideoDimensions {
+            width: stream_detail_integer(details, STREAM_WIDTH_DETAIL),
+            height: stream_detail_integer(details, STREAM_HEIGHT_DETAIL),
+        };
+        Ok((dimensions.width.is_some() || dimensions.height.is_some()).then_some(dimensions))
     }
 
     pub(crate) async fn find_download_source_by_id(
@@ -12570,6 +12630,89 @@ mod tests {
             .expect("item kind");
         assert_eq!(kind.item_type, "MOVIE");
         assert_eq!(kind.season_number, None);
+        Ok(())
+    }
+
+    /// Playback reads the video height from the stored stream details so a resolution ceiling can be
+    /// honoured without running ffprobe inside a user request.
+    #[tokio::test]
+    async fn playback_and_stats_read_the_probed_video_height()
+    -> Result<(), Box<dyn std::error::Error>> {
+        use crate::storage::test_database;
+
+        let (_temp, database) = test_database().await?;
+        seed_media_source_fixture(&database).await?;
+        sqlx::query(
+            "INSERT INTO media_streams (
+                 id, media_source_id, stream_index, stream_type, codec, details_json
+             ) VALUES
+                 ('path-audio', 'path-source', 1, 'AUDIO', 'aac',
+                  '{\"Height\":100,\"Width\":50}'),
+                 ('path-video', 'path-source', 0, 'VIDEO', 'hevc',
+                  '{\"Height\":2160,\"Width\":3840}')",
+        )
+        .execute(database.pool())
+        .await?;
+
+        let playback = database
+            .find_authorized_playback_source("path-movie", None, "admin", true)
+            .await?
+            .expect("playback source");
+        assert_eq!(
+            playback.video_height,
+            Some(2160),
+            "the first video stream's height comes from details_json"
+        );
+        let dimensions = database
+            .find_media_source_video_dimensions("path-source")
+            .await?
+            .expect("probed dimensions");
+        assert_eq!(dimensions.width, Some(3840));
+        assert_eq!(dimensions.height, Some(2160));
+        assert_eq!(
+            database
+                .find_media_source_video_dimensions("unknown-source")
+                .await?,
+            None
+        );
+
+        // NFO sidecars and older rows store the dimension as a string; that still counts.
+        sqlx::query(
+            "UPDATE media_streams SET details_json = '{\"Height\":\"1080\",\"Width\":\"1920\"}'
+             WHERE id = 'path-video'",
+        )
+        .execute(database.pool())
+        .await?;
+        assert_eq!(
+            database
+                .find_media_source_video_dimensions("path-source")
+                .await?,
+            Some(crate::storage::StoredVideoDimensions {
+                width: Some(1920),
+                height: Some(1080),
+            })
+        );
+        assert_eq!(
+            database
+                .find_authorized_playback_source("path-movie", None, "admin", true)
+                .await?
+                .expect("playback source")
+                .video_height,
+            Some(1080)
+        );
+
+        // A source without a probed video stream reports no height instead of guessing one.
+        sqlx::query("DELETE FROM media_streams WHERE media_source_id = 'path-source'")
+            .execute(database.pool())
+            .await?;
+        assert_eq!(
+            database
+                .find_authorized_playback_source("path-movie", None, "admin", true)
+                .await?
+                .expect("playback source")
+                .video_height,
+            None
+        );
         Ok(())
     }
 
