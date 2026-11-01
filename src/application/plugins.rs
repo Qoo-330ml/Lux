@@ -1071,6 +1071,25 @@ impl PluginService {
         Ok(value)
     }
 
+    /// Whether a notification provider declares a per-destination credential.
+    ///
+    /// A provider that declares the `secret` config field receives the target credential from the
+    /// administrator; the host stores it as the destination secret instead of inventing a value.
+    pub async fn notification_provider_declares_secret(
+        &self,
+        plugin_id: &str,
+    ) -> Result<bool, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_notification_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        Ok(plugin.manifest.secret_config_field().is_some())
+    }
+
     pub async fn validate_notification_provider(
         &self,
         plugin_id: &str,

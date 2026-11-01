@@ -58,6 +58,16 @@ pub(crate) struct WebhookDestinationUpdateRequest {
     pub(crate) payload_format: Option<String>,
     pub(crate) provider_plugin_id: Option<String>,
     pub(crate) provider_config: Option<Value>,
+    /// A new credential for a notification provider that declares a secret field. Empty or absent
+    /// leaves the stored credential untouched.
+    pub(crate) secret: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct WebhookSecretRotateRequest {
+    /// Required for providers that declare a secret field; ignored for the built-in webhook.
+    pub(crate) secret: Option<String>,
 }
 
 const fn default_enabled() -> bool {
@@ -212,6 +222,7 @@ pub(crate) async fn admin_update_webhook_destination(
             request.payload_format.as_deref(),
             request.provider_plugin_id.as_deref(),
             request.provider_config.as_ref(),
+            request.secret.as_deref(),
         )
         .await
     {
@@ -270,6 +281,7 @@ pub(crate) async fn admin_rotate_webhook_secret(
     headers: HeaderMap,
     Path(destination_id): Path<String>,
     State(state): State<ReadyAppState>,
+    body: Option<Json<WebhookSecretRotateRequest>>,
 ) -> Response {
     if let Err(response) = require_admin(&headers, &state, true).await {
         return response;
@@ -283,7 +295,11 @@ pub(crate) async fn admin_rotate_webhook_secret(
         )
         .into_response();
     };
-    match service.rotate_secret(&destination_id).await {
+    let requested = body.and_then(|Json(request)| request.secret);
+    match service
+        .rotate_secret(&destination_id, requested.as_deref())
+        .await
+    {
         Ok(secret) => Json(json!({ "secret": secret })).into_response(),
         Err(error) => webhook_error_response(&headers, error),
     }

@@ -312,6 +312,25 @@ async fn webhook_destination_api_publishes_signed_events_and_hides_secret()
         "Updated receiver"
     );
 
+    // A submitted secret replaces the stored one, and the response never echoes it.
+    let patched_secret = client
+        .patch(format!(
+            "http://{lux_address}/api/v1/admin/notification-destinations/{destination_id}"
+        ))
+        .header(COOKIE, &cookies)
+        .header("X-CSRF-Token", &csrf)
+        .json(&json!({ "secret": "webhook-patched-secret-1234" }))
+        .send()
+        .await?;
+    assert_eq!(patched_secret.status(), reqwest::StatusCode::OK);
+    let patched_secret_body: Value = patched_secret.json().await?;
+    assert_eq!(patched_secret_body["destination"]["secretConfigured"], true);
+    assert!(
+        !patched_secret_body
+            .to_string()
+            .contains("webhook-patched-secret-1234")
+    );
+
     let rotated = client
         .post(format!(
             "http://{lux_address}/api/v1/admin/notification-destinations/{destination_id}/rotate-secret"

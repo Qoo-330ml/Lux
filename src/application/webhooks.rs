@@ -33,6 +33,7 @@ pub const WEBHOOK_SECRET_FILE: &str = "lux_webhook_secrets.json";
 const MAX_NAME_LENGTH: usize = 128;
 const MAX_URL_LENGTH: usize = 2048;
 const MAX_EVENT_PAYLOAD_BYTES: usize = 256 * 1024;
+const MAX_PROVIDER_CREDENTIAL_CHARS: usize = 4_096;
 const MAX_DELIVERY_ATTEMPTS: i64 = 8;
 const MAX_RETRY_DELAY_SECONDS: i64 = 7_200;
 const DELIVERY_LEASE_SECONDS: i64 = 60;
@@ -302,7 +303,13 @@ impl WebhookService {
         let event_types = normalize_event_types(event_types)?;
         let payload_format = normalize_payload_format(payload_format)?;
         let provider_config_json = provider_config_json(provider_config)?;
-        let secret = normalize_or_generate_secret(secret)?;
+        let secret = if self.provider_declares_secret(provider_plugin_id).await? {
+            normalize_provider_credential(secret.ok_or_else(|| {
+                WebhookError::Invalid("notification provider credential is required".to_owned())
+            })?)?
+        } else {
+            normalize_or_generate_secret(secret)?
+        };
         let id = uuid::Uuid::now_v7().to_string();
         self.set_secret(&id, Some(&secret)).await?;
         let event_types_json = serde_json::to_string(&event_types)
@@ -426,6 +433,7 @@ impl WebhookService {
             payload_format,
             None,
             None,
+            None,
         )
         .await
     }
@@ -442,6 +450,7 @@ impl WebhookService {
         payload_format: Option<&str>,
         provider_plugin_id: Option<&str>,
         provider_config: Option<&Value>,
+        secret: Option<&str>,
     ) -> Result<WebhookDestinationView, WebhookError> {
         let current = self
             .database
@@ -482,6 +491,17 @@ impl WebhookService {
             .map_err(|error| WebhookError::Serialization(error.to_string()))?;
         let normalized_payload_format = payload_format.map(normalize_payload_format).transpose()?;
         let provider_config_json = provider_config.map(provider_config_json).transpose()?;
+        let normalized_secret = secret
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                if self.secret_is_generated(next_provider_id) {
+                    normalize_or_generate_secret(Some(value))
+                } else {
+                    normalize_provider_credential(value)
+                }
+            })
+            .transpose()?;
         self.database
             .notifications()
             .update_notification_destination(
@@ -501,6 +521,9 @@ impl WebhookService {
                 },
             )
             .await?;
+        if let Some(secret) = &normalized_secret {
+            self.set_secret(id, Some(secret)).await?;
+        }
         self.view_by_id(id).await?.ok_or(WebhookError::NotFound)
     }
 
@@ -516,17 +539,37 @@ impl WebhookService {
         self.set_secret(id, None).await
     }
 
-    pub async fn rotate_secret(&self, id: &str) -> Result<String, WebhookError> {
-        if self
+    /// Rotates the target secret.
+    ///
+    /// The built-in webhook provider generates a fresh HMAC secret. A provider that declares a
+    /// `secret` config field receives its credential from the administrator, so rotating it means
+    /// overwriting the stored value with the submitted one.
+    pub async fn rotate_secret(
+        &self,
+        id: &str,
+        new_secret: Option<&str>,
+    ) -> Result<String, WebhookError> {
+        let destination = self
             .database
             .notifications()
             .find_notification_destination(id)
             .await?
-            .is_none()
+            .ok_or(WebhookError::NotFound)?;
+        if !self
+            .provider_declares_secret(&destination.provider_plugin_id)
+            .await?
         {
-            return Err(WebhookError::NotFound);
+            let secret = generate_secret()?;
+            self.set_secret(id, Some(&secret)).await?;
+            return Ok(secret);
         }
-        let secret = generate_secret()?;
+        let submitted = new_secret
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                WebhookError::Invalid("notification provider credential is required".to_owned())
+            })?;
+        let secret = normalize_provider_credential(submitted)?;
         self.set_secret(id, Some(&secret)).await?;
         Ok(secret)
     }
@@ -988,6 +1031,28 @@ impl WebhookService {
         )?))
     }
 
+    /// Whether the built-in webhook provider owns the generated HMAC secret.
+    fn secret_is_generated(&self, provider_plugin_id: &str) -> bool {
+        provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID
+    }
+
+    /// Whether the provider declared a per-destination credential in its manifest.
+    async fn provider_declares_secret(
+        &self,
+        provider_plugin_id: &str,
+    ) -> Result<bool, WebhookError> {
+        if self.secret_is_generated(provider_plugin_id) {
+            return Ok(false);
+        }
+        let plugins = self.plugins.as_ref().ok_or_else(|| {
+            WebhookError::Plugin("notification plugin service is unavailable".to_owned())
+        })?;
+        plugins
+            .notification_provider_declares_secret(provider_plugin_id)
+            .await
+            .map_err(|error| WebhookError::Plugin(error.to_string()))
+    }
+
     async fn read_secrets(&self) -> Result<BTreeMap<String, String>, WebhookError> {
         read_secret_map(&self.secret_path()).await
     }
@@ -1319,6 +1384,31 @@ fn normalize_or_generate_secret(value: Option<&str>) -> Result<String, WebhookEr
         return Ok(value.to_owned());
     }
     generate_secret()
+}
+
+/// Normalizes a third-party credential submitted by an administrator.
+///
+/// Channel credentials (Bark device keys, WeCom corp secrets, bot webhook keys, SMTP passwords) are
+/// issued by the provider, so the host must not impose the webhook HMAC length rule; it only
+/// rejects values that cannot be forwarded safely.
+fn normalize_provider_credential(value: &str) -> Result<String, WebhookError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(WebhookError::Invalid(
+            "notification provider credential is required".to_owned(),
+        ));
+    }
+    if value.chars().count() > MAX_PROVIDER_CREDENTIAL_CHARS {
+        return Err(WebhookError::Invalid(
+            "notification provider credential is too long".to_owned(),
+        ));
+    }
+    if value.chars().any(char::is_control) {
+        return Err(WebhookError::Invalid(
+            "notification provider credential must not contain control characters".to_owned(),
+        ));
+    }
+    Ok(value.to_owned())
 }
 
 fn generate_secret() -> Result<String, WebhookError> {
@@ -2398,5 +2488,286 @@ mod tests {
         assert!(
             validate_optional_provider_url("http://192.168.10.50:5401/notify", false,).is_err()
         );
+    }
+
+    /// Seeds a notification provider that declares a per-destination credential.
+    async fn notification_provider_service(
+        temp_dir: &tempfile::TempDir,
+        declares_secret: bool,
+    ) -> Result<super::WebhookService, Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let config_dir = test_config_dir(temp_dir);
+        let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
+        tokio::fs::create_dir_all(&plugin_dir).await?;
+        tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
+        let mut config_fields = vec![json!({
+            "key": "serverUrl",
+            "label": "服务地址",
+            "type": "text",
+            "required": true
+        })];
+        if declares_secret {
+            config_fields.push(json!({
+                "key": "secret",
+                "label": "设备密钥",
+                "type": "password",
+                "required": true,
+                "sensitive": true
+            }));
+        }
+        tokio::fs::write(
+            config_dir.join(format!("plugins/{PLUGIN_ID}/manifest.json")),
+            serde_json::to_vec_pretty(&json!({
+                "formatVersion": 1,
+                "id": PLUGIN_ID,
+                "name": "Test notifier",
+                "version": "1.0.0",
+                "apiVersion": 1,
+                "runtime": {"kind": "process", "entrypoint": "binaries/plugin"},
+                "type": "notification",
+                "category": "NOTIFICATION",
+                "capabilities": ["notification.send"],
+                "configFields": config_fields,
+                "permissions": {"network": [], "filesystem": []},
+                "files": []
+            }))?,
+        )
+        .await?;
+
+        let database = test_database(temp_dir).await?;
+        database.install_plugin(PLUGIN_ID).await?;
+        let plugins = crate::application::plugins::PluginService::
+            new_without_login_background_worker_for_test(database.clone(), config_dir.clone());
+        let service = super::WebhookService::new(database, config_dir)?.with_plugins(plugins);
+        Ok(service)
+    }
+
+    async fn stored_secret(
+        service: &super::WebhookService,
+        destination_id: &str,
+    ) -> Option<String> {
+        super::read_secret_map(&service.secret_path())
+            .await
+            .expect("the secret store must be readable")
+            .get(destination_id)
+            .cloned()
+    }
+
+    /// A notifier that declares `secret` keeps the administrator's credential as the target
+    /// secret: it never reaches `providerConfig`, the destination view or the delivery payload.
+    #[tokio::test]
+    async fn a_declared_secret_field_is_stored_outside_the_provider_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+
+        let (destination, secret) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        assert_eq!(secret, "device-key-1");
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-1")
+        );
+        assert!(
+            destination.provider_config.get("secret").is_none(),
+            "the credential must not enter the provider config"
+        );
+        assert!(destination.secret_configured);
+
+        let listed = service.list_destinations(0, 10).await?;
+        assert_eq!(listed.len(), 1);
+        assert!(listed[0].secret_configured);
+        let serialized = serde_json::to_string(&listed)?;
+        assert!(
+            !serialized.contains("device-key-1"),
+            "no destination response may contain the credential"
+        );
+
+        let stored_config = service
+            .database
+            .notifications()
+            .find_notification_destination(&destination.id)
+            .await?
+            .expect("the destination must exist")
+            .provider_config_json;
+        assert!(!stored_config.contains("device-key-1"));
+        Ok(())
+    }
+
+    /// Updating with an empty credential keeps the stored one; a new value replaces it.
+    #[tokio::test]
+    async fn updating_a_declared_secret_only_changes_it_when_a_value_is_submitted()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        service
+            .update_destination_with_provider(
+                &destination.id,
+                Some("bark renamed"),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({"serverUrl": "https://bark.example.invalid"})),
+                Some(""),
+            )
+            .await?;
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-1"),
+            "an empty update must keep the stored credential"
+        );
+
+        service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("device-key-2"),
+            )
+            .await?;
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-2")
+        );
+        Ok(())
+    }
+
+    /// A channel credential must be submitted: the host must not invent one for a third party.
+    #[tokio::test]
+    async fn creating_a_declared_secret_provider_requires_the_credential()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let config = json!({"serverUrl": "https://bark.example.invalid"});
+
+        for secret in [None, Some(""), Some("   ")] {
+            let result = service
+                .create_destination_with_provider(
+                    "bark",
+                    "",
+                    true,
+                    false,
+                    &[],
+                    secret,
+                    "LUX",
+                    PLUGIN_ID,
+                    &config,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(super::WebhookError::Invalid(_))),
+                "creating a declared-secret provider without a credential must fail"
+            );
+        }
+        assert!(service.list_destinations(0, 10).await?.is_empty());
+        Ok(())
+    }
+
+    /// Rotating a declared-secret provider overwrites it with the submitted value.
+    #[tokio::test]
+    async fn rotating_a_declared_secret_provider_overwrites_it()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        assert!(
+            matches!(
+                service.rotate_secret(&destination.id, None).await,
+                Err(super::WebhookError::Invalid(_))
+            ),
+            "a declared-secret provider must not rotate to a generated value"
+        );
+        assert_eq!(
+            service
+                .rotate_secret(&destination.id, Some("device-key-3"))
+                .await?,
+            "device-key-3"
+        );
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-3")
+        );
+        Ok(())
+    }
+
+    /// The built-in webhook provider keeps generating its own HMAC secret.
+    #[tokio::test]
+    async fn the_builtin_webhook_provider_still_generates_and_rotates_its_secret()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temp_dir = tempfile::tempdir()?;
+        let database = test_database(&temp_dir).await?;
+        let service = super::WebhookService::new(database, test_config_dir(&temp_dir))?;
+        let (destination, secret) = service
+            .create_destination(
+                "local",
+                "http://127.0.0.1:8787/hooks",
+                true,
+                true,
+                &[],
+                None,
+            )
+            .await?;
+        assert!(secret.starts_with("lux_wh_"), "unexpected secret {secret}");
+
+        let rotated = service.rotate_secret(&destination.id, None).await?;
+        assert!(rotated.starts_with("lux_wh_"));
+        assert_ne!(rotated, secret);
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some(rotated.as_str())
+        );
+        Ok(())
     }
 }
