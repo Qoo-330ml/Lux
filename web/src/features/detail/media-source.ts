@@ -137,6 +137,17 @@ type SourceBadge = {
   title?: string;
 };
 
+/** Channel layout shown for an audio stream, e.g. `5.1`; unknown layouts return undefined. */
+export function audioChannelLabel(stream?: MediaStream) {
+  if (!stream) return undefined;
+  const rawChannels = stream.details?.Channels;
+  const channels = typeof rawChannels === "number" ? rawChannels : Number(rawChannels);
+  if (channels === 8) return "7.1";
+  if (channels === 6) return "5.1";
+  if (channels === 2) return "2.0";
+  return undefined;
+}
+
 function audioBadgeLabel(stream?: MediaStream) {
   if (!stream) return undefined;
   const codec = stream.codec?.trim().toUpperCase();
@@ -144,9 +155,7 @@ function audioBadgeLabel(stream?: MediaStream) {
   if (/atmos/i.test(title)) {
     return "Atmos";
   }
-  const rawChannels = stream.details?.Channels;
-  const channels = typeof rawChannels === "number" ? rawChannels : Number(rawChannels);
-  const channelText = channels === 8 ? "7.1" : channels === 6 ? "5.1" : channels === 2 ? "2.0" : undefined;
+  const channelText = audioChannelLabel(stream);
 
   if (codec === "TRUEHD") return channelText ? `TrueHD ${channelText}` : "TrueHD";
   if (codec === "DTS" || codec === "DCA") {
