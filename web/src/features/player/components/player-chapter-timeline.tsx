@@ -1,4 +1,5 @@
 import type { PlayerChapterSegment, PlayerIntroRange } from "../player-chapters";
+import { creditsSkipAction, shouldShowSkipCredits } from "../player-autoplay";
 
 type PlayerChapterTimelineProps = {
   segments: readonly PlayerChapterSegment[];
@@ -53,6 +54,42 @@ export function PlayerIntroSkip({ currentTime, introSkip, onSkip }: PlayerIntroS
       onClick={() => onSkip(introSkip.end)}
     >
       跳过片头
+    </button>
+  );
+}
+
+type PlayerSkipCreditsProps = {
+  currentTime: number;
+  duration: number;
+  creditsStart: number | null;
+  hasNextEpisode: boolean;
+  onSkip: () => void;
+};
+
+/**
+ * Skip credits shares the skip intro slot: both markers never overlap in time,
+ * so one position is enough. The action itself (next episode or finish the
+ * media) is decided by the page through the pure helper.
+ */
+export function PlayerSkipCredits({
+  currentTime,
+  duration,
+  creditsStart,
+  hasNextEpisode,
+  onSkip,
+}: PlayerSkipCreditsProps) {
+  if (!shouldShowSkipCredits({ creditsStart, currentTime, duration })) return null;
+  if (!creditsSkipAction({ creditsStart, duration, hasNextEpisode })) return null;
+
+  return (
+    <button
+      type="button"
+      className="lux-player-skip-credits"
+      aria-label="跳过片尾"
+      title={hasNextEpisode ? "跳过片尾并播放下一集" : "跳到结尾"}
+      onClick={onSkip}
+    >
+      跳过片尾
     </button>
   );
 }

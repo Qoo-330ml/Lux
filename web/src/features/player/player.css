@@ -80,6 +80,31 @@
 
 .lux-player-skip-intro:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
 
+/* 跳过片尾复用跳过片头的锚点位置：片头区间与片尾章节在时间上互斥，不会同时出现。 */
+.lux-player-skip-credits { position: absolute; right: 0; bottom: calc(73px + env(safe-area-inset-bottom)); z-index: 3; padding: 7px 12px; border: 1px solid rgba(255,255,255,.24); border-radius: 7px; color: #fff; background: rgba(18,18,24,.8); backdrop-filter: blur(12px); font-size: .76rem; font-weight: 600; cursor: pointer; }
+
+.lux-player-skip-credits:hover, .lux-player-skip-credits:focus-visible { border-color: var(--lux-accent); background: rgba(30,30,40,.94); }
+
+.lux-player-skip-credits:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+
+.lux-player-auto-next { position: absolute; right: calc(2% + env(safe-area-inset-right)); bottom: calc(96px + env(safe-area-inset-bottom)); z-index: 16; display: flex; flex-direction: column; gap: 12px; width: min(320px, calc(100vw - 24px - env(safe-area-inset-left) - env(safe-area-inset-right))); padding: 14px 16px; border: 1px solid rgba(255,255,255,.16); border-radius: 14px; color: #fff; background: rgba(18,18,26,.88); backdrop-filter: blur(20px); -webkit-backdrop-filter: blur(20px); box-shadow: 0 18px 40px rgba(0,0,0,.5); }
+
+.lux-player-auto-next-text { margin: 0; font-size: .85rem; font-weight: 600; line-height: 1.35; }
+
+.lux-player-auto-next-actions { display: flex; flex-wrap: wrap; gap: 8px; justify-content: flex-end; }
+
+.lux-player-auto-next-play, .lux-player-auto-next-cancel { padding: 7px 14px; border-radius: 8px; font-size: .8rem; font-weight: 600; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease; }
+
+.lux-player-auto-next-play { border: 1px solid var(--lux-accent); color: var(--lux-accent-foreground); background: var(--lux-accent); }
+
+.lux-player-auto-next-play:hover, .lux-player-auto-next-play:focus-visible { filter: brightness(1.08); }
+
+.lux-player-auto-next-cancel { border: 1px solid rgba(255,255,255,.24); color: #fff; background: rgba(30,30,40,.9); }
+
+.lux-player-auto-next-cancel:hover, .lux-player-auto-next-cancel:focus-visible { border-color: rgba(255,255,255,.4); background: rgba(44,44,56,.96); }
+
+.lux-player-auto-next-play:focus-visible, .lux-player-auto-next-cancel:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+
 .lux-player-timeline-row { display: flex; align-items: center; gap: 10px; width: 100%; min-width: 0; }
 
 .lux-player-timeline { position: relative; flex: 1 1 auto; width: auto; min-width: 0; height: 21px; padding: 10px 0 5px; display: flex; align-items: center; touch-action: none; }
