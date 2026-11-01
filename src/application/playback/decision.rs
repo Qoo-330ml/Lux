@@ -144,13 +144,18 @@ pub const fn valid_max_height(value: i64) -> bool {
 /// 12 Mbit/s for 1440p and 20 Mbit/s for anything above that. The result is still narrowed by
 /// the source bitrate, the caller's explicit ceiling and the administrator cap.
 pub const fn height_band_video_bitrate_bps(height: i64) -> i64 {
-    match height {
-        ..=360 => 1_000_000,
-        ..=480 => 2_000_000,
-        ..=720 => 4_000_000,
-        ..=1080 => 8_000_000,
-        ..=1440 => 12_000_000,
-        _ => 20_000_000,
+    if height <= 360 {
+        1_000_000
+    } else if height <= 480 {
+        2_000_000
+    } else if height <= 720 {
+        4_000_000
+    } else if height <= 1_080 {
+        8_000_000
+    } else if height <= 1_440 {
+        12_000_000
+    } else {
+        20_000_000
     }
 }
 

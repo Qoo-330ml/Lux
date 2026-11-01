@@ -6,8 +6,9 @@ pub(super) use resume_visibility::emby_hide_from_resume;
 
 use crate::application::playback::{
     decision::{
-        MAX_MAX_BITRATE_BPS, MIN_MAX_BITRATE_BPS, PlaybackBitrateLimit, ServerTier,
-        valid_max_bitrate_bps,
+        MAX_MAX_BITRATE_BPS, MAX_MAX_HEIGHT, MIN_MAX_BITRATE_BPS, MIN_MAX_HEIGHT,
+        PlaybackBitrateLimit, PlaybackResolutionLimit, ServerTier, valid_max_bitrate_bps,
+        valid_max_height,
     },
     hls::{HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions, effective_video_bitrate},
     session::{
@@ -1104,6 +1105,7 @@ async fn create_emby_transcoding_session(
                     .request
                     .playback_capabilities_for_source(Some(source)),
                 bitrate: PlaybackBitrateLimit::NONE,
+                resolution: PlaybackResolutionLimit::NONE,
             },
             &input,
             video_bitrate,
@@ -2699,6 +2701,9 @@ pub(super) struct WebPlaybackSessionRequest {
     /// Optional user-selected output ceiling in bits per second.
     #[serde(default)]
     max_bitrate: Option<i64>,
+    /// Optional user-selected output height ceiling in pixels.
+    #[serde(default)]
+    max_height: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3735,6 +3740,7 @@ async fn create_web_playback_session_json(
     mut capabilities: PlaybackCapabilities,
     audio_stream_index: Option<i64>,
     max_bitrate_bps: Option<i64>,
+    max_height: Option<i64>,
 ) -> Result<Value, Response> {
     let source_kind = match source.source_kind.as_str() {
         "LOCAL_FILE" => PlaybackSourceKind::LocalFile,
@@ -3750,10 +3756,15 @@ async fn create_web_playback_session_json(
         capabilities.direct_play = false;
     }
     let user_id = user.id.to_string();
-    // The ceiling applies to the measured container bitrate of the source this request plays.
+    // The ceilings apply to the measured container bitrate and picture of the source this request
+    // plays; an unprobed source simply leaves both sides unknown and changes nothing.
     let bitrate = PlaybackBitrateLimit {
         source_bitrate_bps: source.bitrate,
         max_bitrate_bps,
+    };
+    let resolution = PlaybackResolutionLimit {
+        source_height: source.video_height,
+        max_height,
     };
     let transcoding_settings = service.transcoding_settings().await;
     // The administrator cap is applied by the encoder itself; the response must report the same
@@ -3761,6 +3772,7 @@ async fn create_web_playback_session_json(
     let admin_video_bitrate_cap = transcoding_settings
         .max_video_bitrate_kbps
         .saturating_mul(1_000);
+    let admin_max_height = transcoding_settings.max_output_height;
     let mut created = service
         .create_with_settings(
             CreateWebPlaybackSession {
@@ -3772,6 +3784,7 @@ async fn create_web_playback_session_json(
                 source_kind,
                 capabilities,
                 bitrate,
+                resolution,
             },
             &transcoding_settings,
         )
@@ -3835,7 +3848,7 @@ async fn create_web_playback_session_json(
                 &input,
                 HlsWebStartOptions {
                     video_bitrate: created.target_video_bitrate_bps,
-                    video_height: None,
+                    video_height: output_scale_height(created.target_video_height),
                     start_time_ticks: None,
                     runtime_ticks: None,
                     audio_stream_index,
@@ -3868,6 +3881,7 @@ async fn create_web_playback_session_json(
                     &created.id,
                     &input,
                     created.target_video_bitrate_bps,
+                    output_scale_height(created.target_video_height),
                     None,
                     audio_stream_index,
                 )
@@ -3979,6 +3993,15 @@ async fn create_web_playback_session_json(
         created.target_video_bitrate_bps,
         admin_video_bitrate_cap,
     );
+    // What the server actually decided about the caller's resolution ceiling. A copied track keeps
+    // the source picture, so the administrator's global cap only narrows a re-encode.
+    let video_re_encoded = matches!(
+        created.plan,
+        WebPlaybackPlan::ServerHls {
+            tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode
+        }
+    );
+    let output_height = resolution.output_height(admin_max_height, video_re_encoded);
     Ok(json!({
         "sessionId": (!created.id.is_empty()).then_some(created.id),
         "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),
@@ -3992,7 +4015,18 @@ async fn create_web_playback_session_json(
             "targetBitrate": target_video_bitrate_bps,
             "limited": target_video_bitrate_bps.is_some(),
         },
+        "resolution": {
+            "sourceHeight": source.video_height,
+            "maxHeight": max_height,
+            "targetHeight": output_height,
+            "limited": resolution.requires_scale(),
+        },
     }))
+}
+
+/// The scale cap one HLS start receives, from the height the decision committed to.
+fn output_scale_height(target_video_height: Option<i64>) -> Option<u32> {
+    target_video_height.and_then(|height| u32::try_from(height).ok())
 }
 
 /// Ordered Direct Play candidates: `proxy` is the standard Emby stream URL a 302 proxy intercepts
@@ -4107,6 +4141,28 @@ fn web_playback_max_bitrate(
     Ok(Some(value))
 }
 
+/// Validates the optional user-selected resolution ceiling at the protocol boundary.
+///
+/// A height outside the accepted range is a malformed request, not an unsupported playback, so it
+/// is refused with the standard Lux error body instead of reaching the decision.
+fn web_playback_max_height(
+    headers: &HeaderMap,
+    requested: Option<i64>,
+) -> Result<Option<i64>, (StatusCode, Json<Value>)> {
+    let Some(value) = requested else {
+        return Ok(None);
+    };
+    if !valid_max_height(value) {
+        return Err(api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &format!("分辨率上限必须在 {MIN_MAX_HEIGHT}p 到 {MAX_MAX_HEIGHT}p 之间"),
+        ));
+    }
+    Ok(Some(value))
+}
+
 async fn validate_web_audio_stream(
     state: &ReadyAppState,
     principal: AccessPrincipal,
@@ -4175,6 +4231,10 @@ pub(super) async fn lux_create_web_playback_session(
         Ok(max_bitrate_bps) => max_bitrate_bps,
         Err(error) => return error.into_response(),
     };
+    let max_height = match web_playback_max_height(&headers, request.max_height) {
+        Ok(max_height) => max_height,
+        Err(error) => return error.into_response(),
+    };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
         principal,
@@ -4196,6 +4256,7 @@ pub(super) async fn lux_create_web_playback_session(
         request.capabilities.into(),
         audio_stream_index,
         max_bitrate_bps,
+        max_height,
     )
     .await
     {
@@ -4216,6 +4277,9 @@ pub(super) struct WebPlaybackBootstrapRequest {
     /// Optional user-selected output ceiling in bits per second.
     #[serde(default)]
     max_bitrate: Option<i64>,
+    /// Optional user-selected output height ceiling in pixels.
+    #[serde(default)]
+    max_height: Option<i64>,
 }
 
 pub(super) async fn lux_create_web_playback_bootstrap(
@@ -4272,6 +4336,10 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         Ok(max_bitrate_bps) => max_bitrate_bps,
         Err(error) => return error.into_response(),
     };
+    let max_height = match web_playback_max_height(&headers, request.max_height) {
+        Ok(max_height) => max_height,
+        Err(error) => return error.into_response(),
+    };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
         principal,
@@ -4293,6 +4361,7 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         request.capabilities.into(),
         audio_stream_index,
         max_bitrate_bps,
+        max_height,
     )
     .await
     {
@@ -4911,6 +4980,10 @@ pub(super) fn web_playback_stats_json(
             "audioCodec": session.audio_codec,
             "videoBitrate": session.video_bitrate,
             "audioBitrate": session.audio_bitrate,
+            // The stored plan does not carry dimensions, so they come from the source probe and
+            // the encoder's captured scale cap; both are `null` for an unprobed source.
+            "videoWidth": stats.video_width,
+            "videoHeight": stats.video_height,
         },
         "progress": stats.progress.as_ref().map(|progress| json!({
             "generation": progress.generation,

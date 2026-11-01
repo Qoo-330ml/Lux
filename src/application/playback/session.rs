@@ -31,8 +31,8 @@ use crate::application::user_access_rules::{
 
 use super::decision::{
     PlaybackBitrateLimit, PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan,
-    PlaybackSourceKind, ServerTier, UnsupportedReason, choose_plan_with_bitrate,
-    valid_max_bitrate_bps,
+    PlaybackResolutionLimit, PlaybackSourceKind, ServerTier, UnsupportedReason,
+    choose_plan_with_limits, reencode_video_bitrate_bps, valid_max_bitrate_bps, valid_max_height,
 };
 use super::hls::{
     HlsError, HlsManager, HlsProgressSnapshot, HlsSegmentContainer, HlsStartOptions,
@@ -101,6 +101,8 @@ pub struct CreateWebPlaybackSession<'a> {
     pub capabilities: PlaybackCapabilities,
     /// The user-selected output ceiling and the source bitrate it applies to.
     pub bitrate: PlaybackBitrateLimit,
+    /// The user-selected resolution ceiling and the source height it applies to.
+    pub resolution: PlaybackResolutionLimit,
 }
 
 pub(crate) struct WebPlaybackEvent<'a> {
@@ -122,11 +124,16 @@ pub struct CreatedWebPlaybackSession {
     pub play_session_id: String,
     pub plan: WebPlaybackPlan,
     pub expires_at: i64,
-    /// Video bitrate the plan has to encode to, when the user's ceiling forced a re-encode.
+    /// Video bitrate the plan has to encode to, when the user's ceilings forced a re-encode.
     ///
     /// `None` means no ceiling was applied: the output either plays the original bytes or copies
     /// the source video track, so there is no target bitrate of its own.
     pub target_video_bitrate_bps: Option<i64>,
+    /// Output height the plan has to scale to, when the user's resolution ceiling forced it.
+    ///
+    /// `None` means the picture is not scaled by this request; the administrator's global cap is
+    /// still applied by the encoder when one is configured.
+    pub target_video_height: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -169,6 +176,14 @@ pub(crate) struct WebPlaybackStats {
     pub(crate) latest_segment_bitrate_kbps: Option<f64>,
     /// Total bytes written by this session, from the quota cache when it is fresh.
     pub(crate) directory_bytes: Option<u64>,
+    /// Width in pixels of what the session hands the browser.
+    ///
+    /// Derived from the source picture and the encoder's scale cap: a scaled output takes the
+    /// proportional `scale=-2` width, so it can differ from the real value by one rounding step.
+    pub(crate) video_width: Option<i64>,
+    /// Height in pixels of what the session hands the browser; the source height unless the
+    /// encoder was started with a smaller cap.
+    pub(crate) video_height: Option<i64>,
 }
 
 /// One active server-side transcode as the admin panel renders it.
@@ -504,9 +519,10 @@ impl WebPlaybackSessionService {
                 "playback session identifiers must not be empty".to_owned(),
             ));
         }
-        // Handlers validate the same range at the protocol boundary; keeping the check here means
-        // no other caller can bypass it and silently lose the ceiling.
+        // Handlers validate the same ranges at the protocol boundary; keeping the checks here
+        // means no other caller can bypass them and silently lose a ceiling.
         validate_bitrate_limit(input.bitrate)?;
+        validate_resolution_limit(input.resolution)?;
         let policy = self
             .database
             .get_user_playback_policy(input.user_id)
@@ -520,15 +536,26 @@ impl WebPlaybackSessionService {
                 capabilities,
             },
             input.bitrate,
+            input.resolution,
             policy,
         )?);
-        // The ceiling only exists when the chosen plan actually re-encodes video; a copied track
-        // keeps the source bitrate and has no target of its own.
-        let target_video_bitrate_bps = match plan {
+        // A ceiling only exists when the chosen plan actually re-encodes video; a copied track
+        // keeps the source bitrate and picture and has no target of its own.
+        let re_encodes_video = matches!(
+            plan,
             WebPlaybackPlan::ServerHls {
                 tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode,
-            } => input.bitrate.target_video_bitrate_bps(),
-            _ => None,
+            }
+        );
+        let target_video_bitrate_bps = re_encodes_video
+            .then(|| reencode_video_bitrate_bps(input.bitrate, input.resolution))
+            .flatten();
+        // The scale filter is only added when this request actually narrowed the picture; the
+        // administrator's global cap is applied by the encoder on top of it.
+        let target_video_height = if re_encodes_video && input.resolution.requires_scale() {
+            input.resolution.scaled_height()
+        } else {
+            None
         };
         // An administrator can turn server-side processing off entirely. The plan then degrades to
         // direct play (or an explicit unsupported reason) instead of starting FFmpeg.
@@ -574,6 +601,7 @@ impl WebPlaybackSessionService {
                 plan,
                 expires_at,
                 target_video_bitrate_bps,
+                target_video_height,
             });
         };
         Ok(CreatedWebPlaybackSession {
@@ -585,6 +613,7 @@ impl WebPlaybackSessionService {
             plan,
             expires_at: unix_timestamp(),
             target_video_bitrate_bps: None,
+            target_video_height: None,
         })
     }
 
@@ -1305,6 +1334,7 @@ impl WebPlaybackSessionService {
         session_id: &str,
         input: &std::path::Path,
         video_bitrate: Option<i64>,
+        video_height: Option<u32>,
         start_time_ticks: Option<i64>,
         audio_stream_index: Option<i64>,
     ) -> Result<ServerTier, WebPlaybackSessionError> {
@@ -1320,7 +1350,7 @@ impl WebPlaybackSessionService {
             input,
             HlsWebStartOptions {
                 video_bitrate,
-                video_height: None,
+                video_height,
                 start_time_ticks,
                 runtime_ticks: None,
                 audio_stream_index,
@@ -1532,12 +1562,51 @@ impl WebPlaybackSessionService {
             } else {
                 (None, None, None)
             };
+        let (video_width, video_height) = self.output_picture(&session).await;
         Ok(WebPlaybackStats {
             session,
             progress,
             latest_segment_bitrate_kbps,
             directory_bytes,
+            video_width,
+            video_height,
         })
+    }
+
+    /// The picture one session hands the browser, from the source probe and the encoder's cap.
+    ///
+    /// Nothing is probed here: the dimensions come from the stored stream details, and the cap
+    /// from the parameters the running FFmpeg was started with. A session that copies the video
+    /// track keeps the source picture, so only tiers 3 and 4 can be scaled down.
+    async fn output_picture(
+        &self,
+        session: &StoredWebPlaybackSession,
+    ) -> (Option<i64>, Option<i64>) {
+        let Some(source_id) = session.media_source_id.as_deref() else {
+            return (None, None);
+        };
+        let dimensions = self
+            .database
+            .find_media_source_video_dimensions(source_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let scales_video = session.plan == "SERVER_HLS" && session.tier >= 3;
+        let cap = if scales_video {
+            self.hls.output_height_cap(&session.id).await
+        } else {
+            None
+        };
+        match (dimensions.height, cap.map(i64::from).filter(|cap| *cap > 0)) {
+            (Some(source_height), Some(cap)) if cap < source_height => (
+                dimensions
+                    .width
+                    .and_then(|width| scaled_output_width(width, source_height, cap)),
+                Some(cap),
+            ),
+            _ => (dimensions.width, dimensions.height),
+        }
     }
 
     /// Active server-side transcodes with their live FFmpeg snapshot, for the admin page.
@@ -2012,6 +2081,18 @@ fn apply_server_capabilities(
     capabilities
 }
 
+/// Width FFmpeg's `scale=-2` produces for a proportional downscale to `output_height`.
+///
+/// `-2` keeps the aspect ratio and makes the width divisible by two; the value can differ from
+/// FFmpeg's own rounding by one step, which is why it only appears in the statistics readout.
+fn scaled_output_width(source_width: i64, source_height: i64, output_height: i64) -> Option<i64> {
+    if source_width <= 0 || source_height <= 0 || output_height <= 0 {
+        return None;
+    }
+    let width = source_width.saturating_mul(output_height) / source_height;
+    Some(width - width % 2)
+}
+
 /// Rejects a ceiling outside the range a browser can decode, before any database work.
 fn validate_bitrate_limit(limit: PlaybackBitrateLimit) -> Result<(), WebPlaybackSessionError> {
     match limit.max_bitrate_bps {
@@ -2024,12 +2105,25 @@ fn validate_bitrate_limit(limit: PlaybackBitrateLimit) -> Result<(), WebPlayback
     }
 }
 
+/// Rejects a resolution ceiling outside the range the Web ladder offers, before any database work.
+fn validate_resolution_limit(
+    limit: PlaybackResolutionLimit,
+) -> Result<(), WebPlaybackSessionError> {
+    match limit.max_height {
+        Some(max_height) if !valid_max_height(max_height) => Err(WebPlaybackSessionError::Invalid(
+            "max_height is outside the accepted range".to_owned(),
+        )),
+        _ => Ok(()),
+    }
+}
+
 fn choose_plan_for_policy(
     input: PlaybackDecisionInput,
     bitrate: PlaybackBitrateLimit,
+    resolution: PlaybackResolutionLimit,
     policy: UserPlaybackPolicy,
 ) -> Result<PlaybackPlan, WebPlaybackSessionError> {
-    let plan = choose_plan_with_bitrate(input, bitrate);
+    let plan = choose_plan_with_limits(input, bitrate, resolution);
     if input.source_kind == PlaybackSourceKind::Strm
         || !matches!(plan, PlaybackPlan::ServerHls { .. })
     {
@@ -2075,13 +2169,14 @@ fn choose_plan_for_policy(
             ServerTier::SoftwareTranscode,
         ),
     ];
-    let candidates: &[(bool, bool, ServerTier)] = if bitrate.requires_video_transcode() {
-        // Remux and audio transcode would keep the original video bitrate, so a ceiling the
-        // source exceeds rules them out even when the user policy allows them.
-        &re_encode_tiers
-    } else {
-        &copy_tiers
-    };
+    let candidates: &[(bool, bool, ServerTier)] =
+        if bitrate.requires_video_transcode() || resolution.requires_scale() {
+            // Remux and audio transcode would keep the original video bitrate and picture, so a
+            // ceiling the source exceeds rules them out even when the user policy allows them.
+            &re_encode_tiers
+        } else {
+            &copy_tiers
+        };
     if let Some((_, _, tier)) = candidates
         .iter()
         .find(|(available, allowed, _)| *available && *allowed)
@@ -2205,7 +2300,7 @@ mod tests {
 
     use super::{
         EMBY_DIRECT_STREAM_TTL_SECONDS, PlaybackAssetAdmission, ResourceSigner, SessionStartLocks,
-        apply_server_capabilities, choose_plan_for_policy, emby_hls_start_key, unix_timestamp,
+        apply_server_capabilities, emby_hls_start_key, unix_timestamp,
     };
     use crate::{
         application::{
@@ -2213,7 +2308,8 @@ mod tests {
             playback::{
                 decision::{
                     PlaybackBitrateLimit, PlaybackCapabilities, PlaybackDecisionInput,
-                    PlaybackPlan, PlaybackSourceKind, ServerTier, UnsupportedReason,
+                    PlaybackPlan, PlaybackResolutionLimit, PlaybackSourceKind, ServerTier,
+                    UnsupportedReason,
                 },
                 hls::{HlsManager, HlsSegmentContainer, HlsStartOptions},
                 session::{
@@ -2231,6 +2327,18 @@ mod tests {
         },
     };
     use uuid::Uuid;
+
+    /// The policy decision with no resolution ceiling.
+    ///
+    /// The call sites below predate `maxHeight` and keep their three-argument shape; the
+    /// resolution-aware cases call [`super::choose_plan_for_policy`] directly.
+    fn choose_plan_for_policy(
+        input: PlaybackDecisionInput,
+        bitrate: PlaybackBitrateLimit,
+        policy: UserPlaybackPolicy,
+    ) -> Result<PlaybackPlan, super::WebPlaybackSessionError> {
+        super::choose_plan_for_policy(input, bitrate, PlaybackResolutionLimit::NONE, policy)
+    }
 
     #[tokio::test]
     async fn session_start_locks_serialize_one_source_without_blocking_others() {
@@ -2577,6 +2685,118 @@ mod tests {
                 "{rejected} bps must be rejected at the service boundary"
             );
         }
+    }
+
+    #[test]
+    fn a_resolution_ceiling_outside_the_accepted_range_is_invalid() {
+        let accepted = PlaybackResolutionLimit {
+            source_height: Some(2_160),
+            max_height: Some(1_080),
+        };
+        assert!(super::validate_resolution_limit(accepted).is_ok());
+        assert!(super::validate_resolution_limit(PlaybackResolutionLimit::NONE).is_ok());
+        for rejected in [143, 4_321, 0, -1] {
+            assert!(
+                matches!(
+                    super::validate_resolution_limit(PlaybackResolutionLimit {
+                        source_height: Some(2_160),
+                        max_height: Some(rejected),
+                    }),
+                    Err(super::WebPlaybackSessionError::Invalid(_))
+                ),
+                "{rejected}p must be rejected at the service boundary"
+            );
+        }
+    }
+
+    #[test]
+    fn a_resolution_ceiling_the_source_exceeds_skips_copy_tiers() {
+        let input = PlaybackDecisionInput {
+            source_kind: PlaybackSourceKind::LocalFile,
+            capabilities: PlaybackCapabilities {
+                direct_play: true,
+                hls: true,
+                video_copy_to_fmp4: true,
+                audio_copy_to_fmp4: true,
+                hardware_transcode: true,
+                software_transcode: true,
+            },
+        };
+        let resolution = PlaybackResolutionLimit {
+            source_height: Some(2_160),
+            max_height: Some(1_080),
+        };
+
+        assert!(matches!(
+            super::choose_plan_for_policy(
+                input,
+                PlaybackBitrateLimit::NONE,
+                resolution,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 2,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            ),
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode
+            })
+        ));
+        assert!(
+            matches!(
+                super::choose_plan_for_policy(
+                    input,
+                    PlaybackBitrateLimit::NONE,
+                    resolution,
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+            ),
+            "a copy cannot shrink the picture, so the policy is asked for a re-encode"
+        );
+        assert!(
+            matches!(
+                super::choose_plan_for_policy(
+                    input,
+                    PlaybackBitrateLimit::NONE,
+                    PlaybackResolutionLimit {
+                        source_height: Some(720),
+                        max_height: Some(1_080),
+                    },
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Ok(PlaybackPlan::Direct)
+            ),
+            "a source inside its ceiling keeps the plain decision"
+        );
+    }
+
+    #[test]
+    fn the_statistics_width_follows_the_proportional_scale_rule() {
+        assert_eq!(super::scaled_output_width(3_840, 2_160, 1_080), Some(1_920));
+        assert_eq!(super::scaled_output_width(1_920, 1_080, 720), Some(1_280));
+        assert_eq!(
+            super::scaled_output_width(1_920, 1_080, 721),
+            Some(1_280),
+            "the derived width is rounded down to an even number"
+        );
+        assert_eq!(super::scaled_output_width(0, 1_080, 720), None);
+        assert_eq!(super::scaled_output_width(1_920, 0, 720), None);
+        assert_eq!(super::scaled_output_width(1_920, 1_080, 0), None);
     }
 
     #[test]
@@ -3646,6 +3866,7 @@ mod tests {
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities: transcode_capabilities,
                     bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 &settings,
             )
@@ -3676,6 +3897,7 @@ mod tests {
                         ..transcode_capabilities
                     },
                     bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 &settings,
             )
@@ -3948,6 +4170,7 @@ while :; do sleep 1; done
                         software_transcode: true,
                     },
                     bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -4063,6 +4286,7 @@ while :; do sleep 1; done
                         software_transcode: true,
                     },
                     bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -4112,6 +4336,7 @@ while :; do sleep 1; done
                         software_transcode: true,
                     },
                     bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -4215,6 +4440,7 @@ while :; do sleep 1; done
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
                     bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -4244,6 +4470,7 @@ while :; do sleep 1; done
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
                     bitrate: PlaybackBitrateLimit::NONE,
+                    resolution: PlaybackResolutionLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(2_000_000),
