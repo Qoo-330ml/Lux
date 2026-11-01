@@ -292,6 +292,59 @@ describe("LuxPlayer auto play next preference hook", () => {
       .toBe(3);
   });
 
+  it("drops the first server read when the viewer toggled while it was in flight", async () => {
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient.setQueryData(queryKeys.me, session("user-1"));
+    let releaseRead: ((preferences: AccountPreferences) => void) | undefined;
+    const pendingRead = new Promise<AccountPreferences>((resolve) => {
+      releaseRead = resolve;
+    });
+    let reads = 0;
+    vi.spyOn(api, "accountPreferences").mockImplementation(async () => {
+      reads += 1;
+      // 首次读取仍在进行；之后的同步读取看到的是切换后的服务端值。
+      return reads === 1 ? pendingRead : { ...PREFERENCES, autoPlayNextEpisode: false, version: 5 };
+    });
+    vi.spyOn(api, "updateAccountPreferences").mockResolvedValue({
+      ...PREFERENCES,
+      autoPlayNextEpisode: false,
+      version: 5,
+    });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    await act(async () => root?.render(
+      <QueryClientProvider client={queryClient}>
+        <Probe />
+      </QueryClientProvider>,
+    ));
+
+    const toggle = container.querySelector<HTMLButtonElement>("[data-testid='toggle']");
+    expect(toggle?.dataset.enabled).toBe("true");
+
+    // 用户在首次服务端读取返回前手动关闭自动连播。
+    await act(async () => toggle?.click());
+    expect(toggle?.dataset.enabled).toBe("false");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    // 迟到的首次读取报告旧值（开启），不得覆盖用户的最新选择与缓存版本。
+    await act(async () => {
+      releaseRead?.({ ...PREFERENCES, autoPlayNextEpisode: true, version: 4 });
+      await pendingRead;
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(toggle?.dataset.enabled).toBe("false");
+    expect(readAccountSettings("user-1").autoPlayNextEpisode).toBe(false);
+    expect(
+      queryClient.getQueryData<AccountPreferences>(queryKeys.accountPreferences("user-1"))
+        ?.autoPlayNextEpisode,
+    ).toBe(false);
+  });
+
   it("keeps a stored local preference instead of loading it again", async () => {
     const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     queryClient.setQueryData(queryKeys.me, session("user-1"));
