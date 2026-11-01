@@ -57,6 +57,7 @@ import {
   playerFailure,
   type PlayerFailure,
 } from "./components/player-diagnostics";
+import { playbackNoticeFor, playbackNoticeSummary } from "./playback-notices";
 import { usePlayerPlatform } from "./components/player-platform";
 import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
@@ -579,30 +580,47 @@ export function PlayerPage() {
   }
 
   if (useLegacyPlaybackQueries && webPlaybackSession.error) {
-    const sessionFailure = webPlaybackSession.error instanceof ApiError
-      && [401, 403, 410].includes(webPlaybackSession.error.status)
-      ? classifyPlayerEngineFailure(webPlaybackSession.error, webPlaybackSession.error.status)
-      : playerFailure("SERVER_PLAN_FAILED");
+    // A rejected session is a blocking notice too: the same reason copy explains a 403 policy
+    // denial or a 502 transcode-slot exhaustion here and inside the player surface.
+    const sessionError = webPlaybackSession.error;
+    const sessionNotice = sessionError instanceof ApiError
+      ? playbackNoticeFor({ status: sessionError.status, errorCode: sessionError.code })
+      : null;
+    const sessionFailure = sessionNotice
+      ? null
+      : sessionError instanceof ApiError && [401, 403, 410].includes(sessionError.status)
+        ? classifyPlayerEngineFailure(sessionError, sessionError.status)
+        : playerFailure("SERVER_PLAN_FAILED");
     return (
       <PlayerErrorState
-        title={sessionFailure.title}
-        message={sessionFailure.message}
+        title={sessionNotice?.title ?? sessionFailure?.title ?? ""}
+        message={sessionNotice ? playbackNoticeSummary(sessionNotice) : sessionFailure?.message ?? ""}
         onBack={handleBack}
+        onRetry={() => window.location.reload()}
       />
     );
   }
 
   const subtitleInfo = getSubtitleInfo(media);
-  const planFailure = playbackPlan?.type === "UNSUPPORTED"
-    ? playerFailure("BROWSER_UNSUPPORTED")
-    : null;
+  const sessionError = playbackBootstrap.error ?? webPlaybackSession.error;
+  // One mapping for the plan, its UNSUPPORTED reason, the transcode tier and a rejected session;
+  // a track/quality switch clears the plan on purpose, so it must not flash a notice.
+  const playbackNotice = switchingSession
+    ? null
+    : playbackNoticeFor({
+      planType: playbackPlan?.type ?? null,
+      reason: playbackPlan?.type === "UNSUPPORTED" ? playbackPlan.reason : null,
+      tier: playbackSession?.tier ?? null,
+      status: sessionError instanceof ApiError ? sessionError.status : null,
+      errorCode: sessionError instanceof ApiError ? sessionError.code : null,
+      degraded: playbackAttempt !== 0,
+    });
   // A track switch intentionally clears the session plan while the replacement
   // session starts; keep the existing surface mounted without a failure layer.
   const surfaceFailure = switchingSession
     ? null
     : playbackFailure
-      ?? planFailure
-      ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
+      ?? (!streamUrl && !playbackNotice?.blocking ? playerFailure("SERVER_PLAN_FAILED") : null);
   const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
@@ -666,6 +684,8 @@ export function PlayerPage() {
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
         failure={surfaceFailure}
+        notice={playbackNotice}
+        noticeLifecycleKey={playbackKey}
         showError={!switchingSession && (failedStreamUrl === streamUrl || !streamUrl)}
         onRetry={() => window.location.reload()}
         onBack={handleBack}
