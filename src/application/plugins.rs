@@ -1090,6 +1090,32 @@ impl PluginService {
         Ok(plugin.manifest.secret_config_field().is_some())
     }
 
+    /// The per-destination config fields a notification provider declares.
+    ///
+    /// A notification plugin's `configFields` describe one destination instead of the plugin
+    /// installation. The `secret` field is excluded: the host stores that credential as the target
+    /// secret and never forwards it through the non-secret provider config.
+    pub async fn notification_provider_config_fields(
+        &self,
+        plugin_id: &str,
+    ) -> Result<Vec<PluginConfigField>, PluginServiceError> {
+        let catalog = self.catalog_snapshot().await;
+        let plugin_id = self.canonical_plugin_id(plugin_id, &catalog);
+        let plugin = catalog
+            .get(&plugin_id)
+            .ok_or_else(|| PluginServiceError::UnknownPlugin(plugin_id.clone()))?;
+        if !is_notification_plugin(plugin) {
+            return Err(PluginServiceError::Unavailable(plugin_id));
+        }
+        Ok(plugin
+            .manifest
+            .config_fields
+            .iter()
+            .filter(|field| field.key != SECRET_CONFIG_FIELD_KEY)
+            .cloned()
+            .collect())
+    }
+
     pub async fn validate_notification_provider(
         &self,
         plugin_id: &str,

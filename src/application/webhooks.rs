@@ -19,7 +19,7 @@ use url::{Host, Url};
 
 use crate::application::{
     notification_template,
-    plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus},
+    plugin_protocol::{NotificationSendRpcRequest, NotificationSendStatus, PluginConfigField},
     plugins::PluginService,
 };
 use crate::storage::{
@@ -294,7 +294,7 @@ impl WebhookService {
     ) -> Result<(WebhookDestinationView, String), WebhookError> {
         let name = validate_name(name)?;
         let provider_plugin_id = validate_provider_id(provider_plugin_id)?;
-        validate_provider(self, provider_plugin_id, provider_config).await?;
+        validate_provider(self, provider_plugin_id, provider_config, true).await?;
         let url = if provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
             validate_destination(url, allow_private_network).map(Some)?
         } else {
@@ -470,7 +470,14 @@ impl WebhookService {
             Value::Null
         };
         let next_provider_config = provider_config.unwrap_or(&current_provider_config);
-        validate_provider(self, next_provider_id, next_provider_config).await?;
+        let provider_changed = next_provider_id != current.provider_plugin_id;
+        validate_provider(
+            self,
+            next_provider_id,
+            next_provider_config,
+            provider_config.is_some() || provider_changed,
+        )
+        .await?;
         let validated_url = url
             .map(|value| {
                 if next_provider_id == BUILTIN_WEBHOOK_PROVIDER_ID {
@@ -1781,6 +1788,7 @@ async fn validate_provider(
     service: &WebhookService,
     provider_plugin_id: &str,
     config: &Value,
+    validate_values: bool,
 ) -> Result<(), WebhookError> {
     provider_config_json(config)?;
     if provider_plugin_id == BUILTIN_WEBHOOK_PROVIDER_ID {
@@ -1792,7 +1800,121 @@ async fn validate_provider(
     plugins
         .validate_notification_provider(provider_plugin_id)
         .await
-        .map_err(|error| WebhookError::Plugin(error.to_string()))
+        .map_err(|error| WebhookError::Plugin(error.to_string()))?;
+    if !validate_values {
+        return Ok(());
+    }
+    let fields = plugins
+        .notification_provider_config_fields(provider_plugin_id)
+        .await
+        .map_err(|error| WebhookError::Plugin(error.to_string()))?;
+    validate_provider_config_values(&fields, config)
+}
+
+/// Validates a notification target config against the fields the provider declared.
+///
+/// The config reaches the plugin verbatim, so a value the manifest does not describe (an unknown
+/// key, a wrong type, an invalid option, a missing required field) is rejected here instead of
+/// being silently forwarded.
+fn validate_provider_config_values(
+    fields: &[PluginConfigField],
+    config: &Value,
+) -> Result<(), WebhookError> {
+    let Some(object) = config.as_object() else {
+        return Err(WebhookError::Invalid(
+            "notification provider config must be an object".to_owned(),
+        ));
+    };
+    if let Some(unknown) = object
+        .keys()
+        .find(|key| !fields.iter().any(|field| field.key == **key))
+    {
+        return Err(WebhookError::Invalid(format!(
+            "unknown notification provider config field: {unknown}"
+        )));
+    }
+    for field in fields {
+        match object.get(&field.key) {
+            None => {
+                if field.required {
+                    return Err(WebhookError::Invalid(format!(
+                        "notification provider config field is required: {}",
+                        field.key
+                    )));
+                }
+            }
+            Some(value) => validate_provider_config_value(field, value)?,
+        }
+    }
+    Ok(())
+}
+
+fn validate_provider_config_value(
+    field: &PluginConfigField,
+    value: &Value,
+) -> Result<(), WebhookError> {
+    let invalid = || {
+        WebhookError::Invalid(format!(
+            "notification provider config field is invalid: {}",
+            field.key
+        ))
+    };
+    match field.input_type.as_str() {
+        "text" | "textarea" | "password" => {
+            let Some(text) = value.as_str() else {
+                return Err(invalid());
+            };
+            if text.chars().count() > 4096 || (field.required && text.trim().is_empty()) {
+                return Err(invalid());
+            }
+        }
+        "toggle" => {
+            if !value.is_boolean() {
+                return Err(invalid());
+            }
+        }
+        "number" => {
+            let Some(number) = value.as_i64() else {
+                return Err(invalid());
+            };
+            if field.minimum.is_some_and(|minimum| number < minimum)
+                || field.maximum.is_some_and(|maximum| number > maximum)
+            {
+                return Err(invalid());
+            }
+        }
+        "select" => {
+            if field.multiple {
+                let Some(values) = value.as_array() else {
+                    return Err(invalid());
+                };
+                if field.required && values.is_empty() {
+                    return Err(invalid());
+                }
+                if values
+                    .iter()
+                    .any(|value| !provider_config_option_is_valid(field, value))
+                {
+                    return Err(invalid());
+                }
+            } else if !provider_config_option_is_valid(field, value) {
+                return Err(invalid());
+            }
+        }
+        // Notification providers cannot declare image fields, and an unknown type is already
+        // rejected when the manifest is validated.
+        _ => return Err(invalid()),
+    }
+    Ok(())
+}
+
+fn provider_config_option_is_valid(field: &PluginConfigField, value: &Value) -> bool {
+    let Some(candidate) = value.as_str() else {
+        return false;
+    };
+    // Dynamic options (for example media library IDs) cannot be resolved for a notification
+    // target here, so the value is only checked for shape.
+    field.options_source.is_some() || field.options.iter().any(|option| option.value == candidate)
 }
 
 fn delivery_view(delivery: StoredNotificationDelivery) -> WebhookDeliveryView {
@@ -2500,12 +2622,32 @@ mod tests {
         let plugin_dir = config_dir.join(format!("plugins/{PLUGIN_ID}/binaries"));
         tokio::fs::create_dir_all(&plugin_dir).await?;
         tokio::fs::write(plugin_dir.join("plugin"), b"placeholder").await?;
-        let mut config_fields = vec![json!({
-            "key": "serverUrl",
-            "label": "服务地址",
-            "type": "text",
-            "required": true
-        })];
+        let mut config_fields = vec![
+            json!({
+                "key": "serverUrl",
+                "label": "服务地址",
+                "type": "text",
+                "required": true
+            }),
+            json!({
+                "key": "sound",
+                "label": "铃声",
+                "type": "select",
+                "required": false,
+                "options": [
+                    {"value": "default", "label": "默认"},
+                    {"value": "alarm", "label": "警报"}
+                ]
+            }),
+            json!({
+                "key": "volume",
+                "label": "音量",
+                "type": "number",
+                "required": false,
+                "minimum": 1,
+                "maximum": 15
+            }),
+        ];
         if declares_secret {
             config_fields.push(json!({
                 "key": "secret",
@@ -2738,6 +2880,136 @@ mod tests {
         assert_eq!(
             stored_secret(&service, &destination.id).await.as_deref(),
             Some("device-key-3")
+        );
+        Ok(())
+    }
+
+    /// A provider declares its per-destination settings, so the host rejects a config the plugin
+    /// cannot receive: a missing required value, an unknown key, a wrong type or an invalid option.
+    #[tokio::test]
+    async fn provider_config_is_validated_against_the_provider_manifest()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+
+        let rejected = [
+            json!({}),
+            json!({"serverUrl": "   "}),
+            json!({"serverUrl": "https://bark.example.invalid", "unknownKey": 1}),
+            json!({"serverUrl": 42}),
+            json!({"serverUrl": "https://bark.example.invalid", "sound": "airhorn"}),
+            json!({"serverUrl": "https://bark.example.invalid", "volume": 99}),
+            json!({"serverUrl": "https://bark.example.invalid", "volume": "loud"}),
+        ];
+        for config in rejected {
+            let result = service
+                .create_destination_with_provider(
+                    "bark",
+                    "",
+                    true,
+                    false,
+                    &[],
+                    Some("device-key-1"),
+                    "LUX",
+                    PLUGIN_ID,
+                    &config,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(super::WebhookError::Invalid(_))),
+                "provider config {config} should be rejected"
+            );
+        }
+        assert!(service.list_destinations(0, 10).await?.is_empty());
+
+        service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({
+                    "serverUrl": "https://bark.example.invalid",
+                    "sound": "alarm",
+                    "volume": 8
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// The same field contract applies when an administrator edits a destination.
+    #[tokio::test]
+    async fn updating_a_destination_validates_the_submitted_provider_config()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const PLUGIN_ID: &str = "org.lux.test-notifier";
+        let temp_dir = tempfile::tempdir()?;
+        let service = notification_provider_service(&temp_dir, true).await?;
+        let (destination, _) = service
+            .create_destination_with_provider(
+                "bark",
+                "",
+                true,
+                false,
+                &[],
+                Some("device-key-1"),
+                "LUX",
+                PLUGIN_ID,
+                &json!({"serverUrl": "https://bark.example.invalid"}),
+            )
+            .await?;
+
+        for config in [
+            json!({}),
+            json!({"serverUrl": "https://bark.example.invalid", "volume": 0}),
+        ] {
+            let result = service
+                .update_destination_with_provider(
+                    &destination.id,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    Some(&config),
+                    None,
+                )
+                .await;
+            assert!(
+                matches!(result, Err(super::WebhookError::Invalid(_))),
+                "provider config {config} should be rejected on update"
+            );
+        }
+
+        let updated = service
+            .update_destination_with_provider(
+                &destination.id,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some(&json!({
+                    "serverUrl": "https://bark.example.invalid",
+                    "volume": 15
+                })),
+                None,
+            )
+            .await?;
+        assert_eq!(updated.provider_config["volume"], 15);
+        assert_eq!(
+            stored_secret(&service, &destination.id).await.as_deref(),
+            Some("device-key-1"),
+            "a config-only update must keep the credential"
         );
         Ok(())
     }
