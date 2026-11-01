@@ -663,6 +663,8 @@ export type AdminPlugin = {
   unavailableReason?: string | null;
   configurable: boolean;
   configFields: AdminPluginConfigField[];
+  /** Present when a notification provider declares a per-destination credential field. */
+  secretField?: AdminPluginConfigField | null;
   configValues?: Record<string, unknown>;
   configSource: "PLUGIN_DEFAULT" | "CUSTOM" | "ENVIRONMENT" | "READ_ACCESS_TOKEN" | "NONE" | string;
   latestVersion?: string | null;

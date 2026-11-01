@@ -1183,6 +1183,8 @@ export class LuxApiClient {
     payloadFormat?: "LUX" | "EMBY";
     providerPluginId?: string;
     providerConfig?: Record<string, unknown>;
+    /** A new credential for a provider that declares a secret field; empty leaves it unchanged. */
+    secret?: string;
   }) {
     return this.request<{ destination: AdminWebhookDestination }>(
       `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}`,
@@ -1204,10 +1206,10 @@ export class LuxApiClient {
     );
   }
 
-  rotateAdminWebhookSecret(destinationId: string) {
+  rotateAdminWebhookSecret(destinationId: string, secret?: string) {
     return this.request<{ secret: string }>(
       `/api/v1/admin/notification-destinations/${encodeURIComponent(destinationId)}/rotate-secret`,
-      { method: "POST" },
+      secret ? { method: "POST", body: JSON.stringify({ secret }) } : { method: "POST" },
     );
   }
 

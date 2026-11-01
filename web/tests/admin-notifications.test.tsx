@@ -226,4 +226,88 @@ describe("AdminNotificationsPage", () => {
     expect(container.textContent).toContain("通知器配置");
     expect(container.querySelector('button[aria-label="重试投递 delivery-1"]')).toBeTruthy();
   });
+
+  it("asks for the credential a notification provider declares", async () => {
+    vi.mocked(api.adminNotificationProviders).mockResolvedValueOnce({
+      plugins: [{
+        id: "org.lux.bark",
+        name: "Bark 通知器",
+        description: "推送到 Bark",
+        category: "NOTIFICATION",
+        version: "0.1.0",
+        runtime: "process",
+        capabilities: ["notification.send"],
+        status: "READY",
+        running: true,
+        installed: true,
+        enabled: true,
+        configured: true,
+        available: true,
+        configurable: true,
+        secretField: {
+          key: "secret",
+          label: "设备密钥",
+          type: "password",
+          required: true,
+          sensitive: true,
+          description: "在 Bark App 首页查看",
+        },
+        configFields: [{
+          key: "serverUrl",
+          label: "服务地址",
+          type: "text",
+          required: true,
+          sensitive: false,
+          defaultValue: "https://api.day.app",
+        }],
+        configSource: "PLUGIN_DEFAULT",
+      }],
+      total: 1,
+      page: 1,
+      pageSize: 50,
+    });
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root.render(createElement(
+        QueryClientProvider,
+        { client: queryClient },
+        createElement(MemoryRouter, null, createElement(AdminNotificationsPage)),
+      ));
+    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
+    await act(async () => {
+      (container.querySelector('button[aria-label="新建通知"]') as HTMLButtonElement).click();
+    });
+
+    const secretInput = container.querySelector<HTMLInputElement>('input[name="notification-secret"]');
+    expect(secretInput).toBeTruthy();
+    expect(secretInput?.getAttribute("type")).toBe("password");
+    expect(container.textContent).toContain("设备密钥");
+    expect(container.textContent).toContain("在 Bark App 首页查看");
+    expect(container.querySelector('[name="notification-config-secret"]')).toBeNull();
+    expect(container.querySelector('input[name="notification-config-serverUrl"]')).toBeTruthy();
+
+    const submit = container.querySelector<HTMLButtonElement>('button[type="submit"]');
+    expect(submit?.disabled).toBe(true);
+
+    await act(async () => {
+      Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")?.set?.call(secretInput, "bark-device-key");
+      secretInput!.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+    expect(container.querySelector<HTMLButtonElement>('button[type="submit"]')?.disabled).toBe(false);
+
+    await act(async () => {
+      container.querySelector<HTMLFormElement>(".lux-notification-form")!.dispatchEvent(
+        new Event("submit", { bubbles: true, cancelable: true }),
+      );
+    });
+
+    expect(api.createAdminWebhookDestination).toHaveBeenCalledWith(
+      expect.objectContaining({
+        providerPluginId: "org.lux.bark",
+        secret: "bark-device-key",
+        providerConfig: { serverUrl: "https://api.day.app" },
+      }),
+    );
+  });
 });
