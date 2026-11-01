@@ -45,7 +45,9 @@ import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
 import { usePlayerAirPlay } from "./components/player-airplay";
 import { PlayerMiniProgressBar } from "./components/player-mini-progress";
+import { PlayerAutoNextCard } from "./components/player-auto-next-card";
 import { normalizePlayerChapters } from "./player-chapters";
+import { creditsSkipAction, creditsStartSeconds } from "./player-autoplay";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -56,6 +58,8 @@ import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
 import { useRuntimeCaptionReader } from "./useRuntimeCaptionReader";
 import { usePlaybackRuntime } from "./usePlaybackRuntime";
+import { useAutoPlayNextPreference } from "./useAutoPlayNextPreference";
+import { useAutoPlayNext } from "./useAutoPlayNext";
 import {
   getSubtitleInfo,
   isMatroskaSource,
@@ -190,6 +194,10 @@ export function PlayerPage() {
   const activeIntroRange = chapterTimeline.introRanges.find(
     (range) => currentTime >= range.start && currentTime < range.end,
   ) ?? null;
+  const creditsStart = useMemo(
+    () => creditsStartSeconds(chapterTimeline.segments),
+    [chapterTimeline.segments],
+  );
 
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -253,6 +261,39 @@ export function PlayerPage() {
     setIsPointerInteracting,
     resetControlsTimeout,
   });
+
+  const nextEpisodeId = episodeNavigation?.nextEpisodeId ?? null;
+  const { autoPlayEnabled, setAutoPlayEnabled } = useAutoPlayNextPreference();
+  const { handleBack, navigateToEpisode } = usePlayerNavigation({
+    itemId,
+    navigate: (to) => navigate(to as never),
+    setShowSettings,
+  });
+  const {
+    countdown: autoPlayNextCountdown,
+    handleEnded: handlePlaybackEnded,
+    playNow: playNextEpisodeNow,
+    cancel: cancelAutoPlayNext,
+  } = useAutoPlayNext({
+    playbackKey,
+    nextEpisodeId,
+    enabled: autoPlayEnabled,
+    onNavigateNextEpisode: navigateToEpisode,
+  });
+
+  const handleSkipCredits = useCallback(() => {
+    const action = creditsSkipAction({
+      creditsStart,
+      duration,
+      hasNextEpisode: Boolean(nextEpisodeId),
+    });
+    if (!action) return;
+    if (action.kind === "next-episode") {
+      if (nextEpisodeId) navigateToEpisode(nextEpisodeId);
+      return;
+    }
+    seekTo(action.seconds);
+  }, [creditsStart, duration, navigateToEpisode, nextEpisodeId, seekTo]);
 
   const { infoGroups } = usePlayerInfoPanel({
     playbackSessionId,
@@ -388,6 +429,7 @@ export function PlayerPage() {
     reportPlayback,
     stopActiveSession,
     markStarted,
+    onPlaybackEnded: handlePlaybackEnded,
     requestServerFallback: requestServerFallback as (reason?: unknown) => Promise<void>,
     setCurrentTime,
     setDuration,
@@ -444,12 +486,6 @@ export function PlayerPage() {
   });
 
   const { screenshotStatus, takeScreenshot } = usePlayerScreenshot({ videoRef, media });
-
-  const { handleBack, navigateToEpisode } = usePlayerNavigation({
-    itemId,
-    navigate: (to) => navigate(to as never),
-    setShowSettings,
-  });
 
   if (playbackBootstrap.isPending || (useLegacyPlaybackQueries && item.isPending)) {
     return <PlayerLoadingState message="正在准备播放器…" />;
@@ -622,6 +658,10 @@ export function PlayerPage() {
           onSelectCaption={selectCaption}
           captionOffset={captionOffset}
           onChangeCaptionOffset={changeCaptionOffset}
+          autoPlay={{
+            enabled: autoPlayEnabled,
+            onToggle: () => setAutoPlayEnabled(!autoPlayEnabled),
+          }}
           onClose={() => setShowSettings(false)}
         />
       ) : null}
@@ -631,6 +671,14 @@ export function PlayerPage() {
           groups={infoGroups}
           copyText={playerInfoCopyText(infoGroups)}
           onClose={() => setShowInfo(false)}
+        />
+      ) : null}
+
+      {autoPlayNextCountdown ? (
+        <PlayerAutoNextCard
+          secondsLeft={autoPlayNextCountdown.secondsLeft}
+          onPlayNow={playNextEpisodeNow}
+          onCancel={cancelAutoPlayNext}
         />
       ) : null}
 
@@ -654,6 +702,8 @@ export function PlayerPage() {
         airPlayAvailable={airPlay.available}
         chapters={chapterTimeline.segments}
         introSkip={activeIntroRange}
+        creditsStart={creditsStart}
+        hasNextEpisode={Boolean(nextEpisodeId)}
         settingsOpen={showSettings}
         infoOpen={showInfo}
         remainingTime={isRemainingTime}
@@ -679,6 +729,7 @@ export function PlayerPage() {
         onAirPlay={airPlay.showPicker}
         onChapterSeek={seekTo}
         onSkipIntro={seekTo}
+        onSkipCredits={handleSkipCredits}
         onTakeScreenshot={takeScreenshot}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
         onToggleInfo={() => setShowInfo((visible) => !visible)}

@@ -61,6 +61,8 @@ type PlaybackRuntimeOptions = {
   reportPlayback: PlaybackReporting["reportPlayback"];
   stopActiveSession: PlaybackReporting["stopActiveSession"];
   markStarted: () => void;
+  /** Playback reached the media end without looping; the page decides what is next. */
+  onPlaybackEnded?: () => void;
   requestServerFallback: (reason?: unknown) => Promise<void>;
   setCurrentTime: (value: number) => void;
   setDuration: (value: number) => void;
@@ -105,6 +107,7 @@ export function usePlaybackRuntime({
   reportPlayback,
   stopActiveSession,
   markStarted,
+  onPlaybackEnded,
   requestServerFallback,
   setCurrentTime,
   setDuration,
@@ -119,6 +122,13 @@ export function usePlaybackRuntime({
   setClientEngineActive,
 }: PlaybackRuntimeOptions) {
   const playbackEngineHandoffRef = useRef<PlaybackEngineHandoff | null>(null);
+  // The ended callback is read through a ref so a changing page callback never
+  // re-runs the engine loading effect below.
+  const onPlaybackEndedRef = useRef(onPlaybackEnded);
+
+  useEffect(() => {
+    onPlaybackEndedRef.current = onPlaybackEnded;
+  }, [onPlaybackEnded]);
 
   const restorePlaybackPosition = useCallback(() => {
     if (hasRestoredPositionRef.current) return;
@@ -252,6 +262,7 @@ export function usePlaybackRuntime({
           const sessionId = playbackSessionIdRef.current;
           void reportPlayback("STOPPED", true, false, initialEngine.element, sessionId);
           void stopActiveSession(sessionId);
+          onPlaybackEndedRef.current?.();
           break;
         }
         case "ERROR":
