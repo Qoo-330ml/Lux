@@ -4019,7 +4019,9 @@ async fn create_web_playback_session_json(
             "sourceHeight": source.video_height,
             "maxHeight": max_height,
             "targetHeight": output_height,
-            "limited": resolution.requires_scale(),
+            // Only a plan the server actually re-encoded can be scaled: an unsupported decision
+            // scales nothing, so the ceiling changed nothing either.
+            "limited": video_re_encoded && resolution.requires_scale(),
         },
     }))
 }
