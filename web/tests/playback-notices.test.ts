@@ -128,6 +128,14 @@ describe("playbackNoticeFor: session failures", () => {
     expect(result.hint).not.toContain("管理员");
   });
 
+  it("never reads an unknown 403 code as a transcode policy denial", () => {
+    const result = notice({ status: 403, errorCode: "AUTHENTICATION_REQUIRED" });
+
+    expect(result.key).toBe("playback-request-stale");
+    expect(result.message).not.toContain("播放策略");
+    expect(result.hint).toContain("刷新页面");
+  });
+
   it("explains a 502 as exhausted server transcode capacity", () => {
     const result = notice({ status: 502 });
 

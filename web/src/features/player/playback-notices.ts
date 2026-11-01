@@ -176,6 +176,8 @@ function playbackFailureNotice({ status, errorCode }: PlaybackNoticeInput): Play
   // A stale CSRF/session check is not a transcode policy denial: the plan may be perfectly legal.
   if (code === "CSRF_FAILED") return blocking(REQUEST_STALE);
   if (code === "PERMISSION_DENIED" || (status === 403 && !code)) return blocking(POLICY_DENIED);
+  // Any other 403 code is an authorization or request-state problem the viewer can retry after a
+  // refresh; it must never read as "your playback policy forbids transcoding".
   if (status === 403) return blocking(REQUEST_STALE);
   if (status === 502) return blocking(TRANSCODE_CAPACITY);
   if (code === "DATABASE_UNAVAILABLE" || status === 503) return blocking(PLAYBACK_UNAVAILABLE);
