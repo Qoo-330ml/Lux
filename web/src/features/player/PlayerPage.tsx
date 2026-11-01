@@ -602,7 +602,9 @@ export function PlayerPage() {
   }
 
   const subtitleInfo = getSubtitleInfo(media);
-  const sessionError = playbackBootstrap.error ?? webPlaybackSession.error;
+  // A failed bootstrap or session only describes the current playback when no plan won; otherwise
+  // a recovered second request would show a stale failure over a playable stream.
+  const sessionError = playbackPlan ? null : playbackBootstrap.error ?? webPlaybackSession.error;
   // One mapping for the plan, its UNSUPPORTED reason, the transcode tier and a rejected session;
   // a track/quality switch clears the plan on purpose, so it must not flash a notice.
   const playbackNotice = switchingSession

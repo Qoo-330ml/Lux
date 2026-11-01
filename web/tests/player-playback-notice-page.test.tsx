@@ -118,4 +118,28 @@ describe("PlayerPage unified playback notices", () => {
     expect(rendered.textContent).toContain("服务端播放计划失败");
     expect(rendered.textContent).not.toContain("转码并发");
   });
+
+  it("does not keep a stale bootstrap failure over a recovered plan", async () => {
+    vi.spyOn(api, "createWebPlaybackBootstrap").mockRejectedValue(
+      new ApiError("服务端 HLS 暂时不可用", { status: 502, code: "INTERNAL" }),
+    );
+    vi.spyOn(api, "createWebPlaybackSession").mockResolvedValue({
+      sessionId: "web-recovered",
+      playSessionId: "lux-web:web-recovered",
+      sourceId: "source-notice",
+      tier: 0,
+      expiresAt: 1_900_000_000,
+      plan: {
+        type: "DIRECT",
+        url: "/api/v1/playback/sessions/web-recovered/direct?expires=1900000000&signature=test",
+      },
+    });
+
+    const rendered = await renderPlayer();
+
+    expect(rendered.querySelector(".lux-player-notice-layer")).toBeNull();
+    expect(rendered.textContent).not.toContain("服务端转码暂时不可用");
+    expect(rendered.querySelector<HTMLVideoElement>("video")?.getAttribute("src"))
+      .toContain("/api/v1/playback/sessions/web-recovered/direct");
+  });
 });
