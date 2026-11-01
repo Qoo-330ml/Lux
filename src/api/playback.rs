@@ -3835,6 +3835,7 @@ async fn create_web_playback_session_json(
                 &input,
                 HlsWebStartOptions {
                     video_bitrate: created.target_video_bitrate_bps,
+                    video_height: None,
                     start_time_ticks: None,
                     runtime_ticks: None,
                     audio_stream_index,

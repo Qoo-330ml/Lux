@@ -1188,6 +1188,7 @@ impl WebPlaybackSessionService {
             input,
             HlsWebStartOptions {
                 video_bitrate,
+                video_height: None,
                 start_time_ticks,
                 runtime_ticks: None,
                 audio_stream_index: None,
@@ -1319,6 +1320,7 @@ impl WebPlaybackSessionService {
             input,
             HlsWebStartOptions {
                 video_bitrate,
+                video_height: None,
                 start_time_ticks,
                 runtime_ticks: None,
                 audio_stream_index,
