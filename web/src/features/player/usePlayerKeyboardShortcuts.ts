@@ -181,11 +181,16 @@ export function usePlayerKeyboardShortcuts(options: PlayerKeyboardShortcutOption
       const action = playerShortcutActionForEventKey(e.key);
       if (!action) return;
 
-      // The help panel is modal: while it is open only Escape acts, and every
-      // other player shortcut is swallowed instead of reaching the video.
+      // The help panel is modal: while it is open only its own toggle and Escape
+      // act, and every other player shortcut is swallowed instead of reaching
+      // the video behind it.
       if (shortcutHelpOpen) {
         e.preventDefault();
-        if (action === "closeOverlay") setShortcutHelpOpen?.(false);
+        if (action === "toggleShortcutHelp") {
+          setShortcutHelpOpen?.((open) => !open);
+        } else if (action === "closeOverlay") {
+          setShortcutHelpOpen?.(false);
+        }
         return;
       }
 

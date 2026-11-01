@@ -289,6 +289,50 @@
   .lux-player-info-row { grid-template-columns: 76px minmax(0, 1fr); }
 }
 
+/* Keyboard shortcut reference ("?" or the control-bar entry). It is modal, so it sits above
+   the settings popover and the info panel. */
+.lux-player-shortcut-help { position: absolute; top: 50%; left: 50%; z-index: 28; display: flex; flex-direction: column; width: min(460px, calc(100vw - 32px - env(safe-area-inset-left) - env(safe-area-inset-right))); max-height: calc(100vh - 120px); max-height: calc(100dvh - 120px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); overflow: hidden; transform: translate(-50%, -50%); border: 1px solid rgba(255,255,255,.15); border-radius: 16px; background: rgba(12,14,18,.94); backdrop-filter: blur(24px); -webkit-backdrop-filter: blur(24px); box-shadow: 0 24px 60px rgba(0,0,0,.6); color: #fff; font-size: .8rem; animation: lux-popover-in .16s var(--lux-ease); }
+
+.lux-player-shortcut-help:focus-visible { outline: 2px solid rgba(255,255,255,.72); outline-offset: 3px; }
+
+.lux-player-shortcut-help-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; padding: 14px 16px 10px; border-bottom: 1px solid rgba(255,255,255,.1); }
+
+.lux-player-shortcut-help-head h2 { margin: 0; font-size: .92rem; font-weight: 600; letter-spacing: .02em; }
+
+.lux-player-shortcut-help-hint { margin: 4px 0 0; color: rgba(255,255,255,.55); font-size: .7rem; line-height: 1.45; }
+
+.lux-player-shortcut-help-close { display: inline-flex; flex: 0 0 auto; align-items: center; justify-content: center; width: 26px; height: 26px; padding: 0; border: 1px solid rgba(255,255,255,.12); border-radius: 7px; color: rgba(255,255,255,.8); background: rgba(255,255,255,.06); cursor: pointer; }
+
+.lux-player-shortcut-help-close:hover { color: #fff; background: rgba(255,255,255,.16); }
+
+.lux-player-shortcut-help-close:focus-visible { outline: 2px solid rgba(255,255,255,.82); outline-offset: 2px; }
+
+.lux-player-shortcut-help-body { padding: 8px 16px 14px; overflow-y: auto; overscroll-behavior: contain; scrollbar-gutter: stable; }
+
+.lux-player-shortcut-help-group + .lux-player-shortcut-help-group { margin-top: 10px; padding-top: 8px; border-top: 1px dashed rgba(255,255,255,.1); }
+
+.lux-player-shortcut-help-group h3 { margin: 0 0 5px; color: rgba(255,255,255,.55); font-size: .68rem; font-weight: 600; letter-spacing: .08em; }
+
+.lux-player-shortcut-help-group dl { margin: 0; }
+
+.lux-player-shortcut-help-row { display: grid; grid-template-columns: 106px minmax(0, 1fr); gap: 10px; align-items: baseline; padding: 3px 0; }
+
+.lux-player-shortcut-help-row dt { display: flex; flex-wrap: wrap; gap: 4px; margin: 0; }
+
+.lux-player-shortcut-help-row dd { margin: 0; min-width: 0; color: rgba(255,255,255,.92); line-height: 1.45; }
+
+.lux-player-shortcut-help-row kbd { display: inline-block; min-width: 20px; padding: 1px 5px; border: 1px solid rgba(255,255,255,.22); border-bottom-width: 2px; border-radius: 5px; color: #fff; background: rgba(255,255,255,.09); font-family: inherit; font-size: .72rem; line-height: 1.4; text-align: center; }
+
+@media (max-width: 560px) {
+  .lux-player-shortcut-help { width: calc(100vw - 20px - env(safe-area-inset-left) - env(safe-area-inset-right)); max-height: calc(100vh - 96px); max-height: calc(100dvh - 96px - env(safe-area-inset-top) - env(safe-area-inset-bottom)); }
+  .lux-player-shortcut-help-row { grid-template-columns: 92px minmax(0, 1fr); }
+}
+
+/* 触屏设备没有实体键盘，控制条不强制展示快捷键入口。 */
+@media (pointer: coarse) {
+  .lux-player-controls .lux-player-shortcut-help-btn { display: none; }
+}
+
 @media (max-width: 560px) {
   .lux-player-topbar { top: calc(14px + env(safe-area-inset-top)); }
   .lux-player-controls-wrap { right: calc(10px + env(safe-area-inset-right)); bottom: calc(6px + env(safe-area-inset-bottom)); left: calc(10px + env(safe-area-inset-left)); }
