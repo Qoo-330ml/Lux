@@ -1399,3 +1399,25 @@ DTO 与对外数据模型不变。
   `search_outbox`。**PostgreSQL 旧二进制不会重建函数**，触发器仍写 `search_outbox` 而旧消费者读
   `catalog_outbox`，回退后全文索引会停止更新；PostgreSQL 请向前发布修复版本而不是回退。
 - 已膨胀部署的清理步骤见 `docs/RUNBOOK-OUTBOX-BLOAT.md`。
+
+## Web 播放：客户端解码回退与原生直放门控（2026-11-01）
+
+背景：在 FNOS/x86_64 测试实例（Docker，`luxd` 0.7.5，本机 `test` 分支构建，6 种编码的 10 秒样本）上，
+用户在 macOS Safari 与 Win11 Edge、本机 macOS Chrome 无头模式实测发现以下问题，均已在前端修复；后端未改。
+
+| 现象 | 根因 | 修复 |
+|---|---|---|
+| 4K HEVC mkv 停在「正在准备客户端解码…」/ `MKV MSE SourceBuffer append failed` | 解封装库的 Buffer 视图被 MP4Box 按偏移 0 拷贝，init 分段里 `hvcC` 载荷是 EBML 头字节 | `matroska-demuxer.ts` 新增 `copyBytes`，remux/transcode 全部改用独立数组；`tests/mkv-remux-worker.test.ts` 逐字节断言 |
+| 上述失败不触发服务端转码 | `ERROR` 事件仅在原生引擎时回退，`load()` 的 catch 遇 `FAILED` 直接返回 | 统一 `requestDirectFallback()`，DIRECT 计划下客户端引擎任何失败只回退一次 |
+| 360p MPEG-4 mkv 有声音无画面（Chrome/Edge） | `matroskaCodecHint()` 对未知编码默认 `avc1`，走了原生 mkv，`videoWidth=0` | 原生 mkv 仅限 h264/hevc/vp9/av1；`videoWidth===0` 看门狗回退 |
+| 10-bit H.264 + ac3 在 Edge 无声 | Edge 无 Dolby 扩展却可能谎报 ac-3 可用 | 音频解码字节为 0 看门狗回退；回退请求把 ac-3/ec-3/mpeg4 视为不可复制 |
+
+规则变更：客户端 WASM 软解 HEVC 仅用于 ≤1080p（更高分辨率走服务端转码，原生 HEVC remux 路径不受限）；这取代了上文
+“4K HEVC 客户端 fallback”作为默认路径的描述，该节的 `speedX≈0.37` 结果仍是历史性能证据，不代表当前默认行为。
+
+验证：Web 冻结安装、`pnpm --dir web test`（150 个文件 / 1273 个测试）、`pnpm --dir web build` 通过。本机 arm64 Chrome
+无头实测 4K HEVC（3840×2160）、AV1 480p、10-bit H.264+ac3 起播并播放到结尾，MPEG-4 360p 回退服务端转码后有画面；
+Safari 的 4K HEVC 与 Edge 的 720p VP9、480p AV1、4K HEVC、10-bit H.264（ac3 有声）由项目所有者在同一测试实例上确认可播。
+
+未覆盖：Firefox、iOS Safari、真实 GPU 硬件转码、长时间 HLS 稳定性、B 帧 HEVC 在 remux 模式下的时间戳回序（remux
+把 Matroska PTS 同时当 dts/cts）。测试实例对“同时播放数”有上限（超出返回 429 `RateLimited`），自动化脚本异常退出后会话需等待过期。

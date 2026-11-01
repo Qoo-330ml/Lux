@@ -8,7 +8,20 @@ Lux 的版本变更记录，从 `0.1.0` 开始按版本倒序排列。
 
 ## [Unreleased]
 
-（暂无记录；下一个版本从这里开始累积）
+### Added
+
+- **播放器自动连播下一集**：一集播完后显示 10 秒倒计时卡（可「立即播放」或取消），结束后跳转下一集并自动起播；设置面板新增「自动连播下一集」开关，复用账户偏好 `autoPlayNextEpisode`。进入 `CREDITS_START` 章节后出现「跳过片尾」按钮。
+- **播放页内切换音轨**：设置面板新增「音轨」选择，按当前位置重建会话，保留暂停状态、倍速与字幕选择，失败时回退并提示。
+- **手动画质上限**：`POST /api/v1/playback/sessions` 与 `/playback/bootstrap` 新增可选 `maxBitrate`（100 kbps–200 Mbps），源码率超过上限时按 0–4 档位升级到可重编码档位；响应新增 `bitrate`（`sourceBitrate`/`maxBitrate`/`targetBitrate`/`limited`），`targetBitrate` 与 FFmpeg 实际 `-b:v` 一致（计入管理员码率上限）。播放设置面板新增「画质」选项，`.strm` 不显示。
+- **播放不可用与降级提示**：`.strm`、`UNSUPPORTED`、策略拒绝、转码并发占满、请求状态失效（`CSRF_FAILED`）等情形统一映射为中文提示；降级到服务端转码时显示可关闭的非阻塞横幅。
+- **播放器快捷键帮助**：按 `?` 或点击控制条按钮打开快捷键帮助浮层；快捷键定义收敛为单一数据源。
+
+### Fixed
+
+- **4K HEVC 等 MKV 在浏览器端重新封装失败（`MKV MSE SourceBuffer append failed`）**：解封装库返回的是 Buffer 视图，MP4Box 写入时忽略 `byteOffset`，导致 `hvcC`/`avcC`/`vpcC`/`av1C` 与样本数据错位。现在统一拷贝为独立数组，并加回归测试。
+- **客户端解码路径卡死不回退**：DIRECT 计划下任何客户端引擎失败（MSE append 失败、编码串不被支持、worker 错误、12 秒无首段、持续低于 0.5× 实时）都先回退一次服务端转码；原生直放 20 秒无 `readyState≥2` 同样回退。
+- **原生 MKV 直放的静默失败**：只有 h264/hevc/vp9/av1 才允许原生 MKV 直放（此前未知编码默认当 `avc1`，MPEG-4 视频会“有声音无画面”）；有视频流但 `videoWidth===0`、有音频流但浏览器报告音频解码字节为 0 时自动回退服务端转码，回退请求不再信任浏览器对 ac-3/ec-3/mpeg4 的“可播放”回答。
+- 10-bit H.264/VP9/AV1 使用真实位深编码串探测；浏览器端 WASM 软解 HEVC 仅用于 ≤1080p。
 
 ## [0.7.5] - 2026-11-01
 
