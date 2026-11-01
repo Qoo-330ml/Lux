@@ -60,7 +60,7 @@
 | 29 | `/api/v1/items/{item_id}/stream` | GET, HEAD | `lux_stream` | (c) | 媒体流（含 Range） | — |
 | 30 | `/api/v1/items/{item_id}/playback` | GET | `lux_get_playback` | (b) | 播放状态 `json!` | `PlaybackState` |
 | 31 | `/api/v1/items/{item_id}/progress` | POST | `lux_post_progress` | 204 | — | `void` |
-| 32 | `/api/v1/playback/sessions` | POST | `lux_create_web_playback_session` | (b) | `create_web_playback_session_json`（`playback.rs:3645`）返回 `Value` | `WebPlaybackSession` |
+| 32 | `/api/v1/playback/sessions` | POST | `lux_create_web_playback_session` | (b) | `create_web_playback_session_json`（`playback.rs:3645`）返回 `Value` | `WebPlaybackSession`（含 `bitrate`，见「手工镜像补充」） |
 | 33 | `/api/v1/playback/bootstrap` | POST | `lux_create_web_playback_bootstrap` | (b) | `{playback,session}` 等 `json!` | `WebPlaybackBootstrap` |
 | 34 | `/api/v1/playback/sessions/{session_id}/events` | POST | `lux_web_playback_event` | (b) | `{accepted,duplicate,stale}` | 内联 `{accepted,duplicate,stale}` |
 | 35 | `/api/v1/playback/sessions/{session_id}/heartbeat` | POST | `lux_web_playback_heartbeat` | (b) | `{sessionId,expiresAt}` | 内联 `{sessionId,expiresAt}` |
@@ -297,6 +297,31 @@ scripts/check-api-types.sh          # 只跑这一项
 
 已验证：`TS_RS_IMPORT_EXTENSION=.js TS_RS_LARGE_INT=bigint scripts/generate-api-types.sh` 生成的产物
 与提交内容完全一致。
+
+## 手工镜像补充：手动码率上限（`maxBitrate`）
+
+手动画质上限没有走 ts-rs 试点（`bitrate` 仍由 `web_playback_session_json` 的 `json!` 拼装），
+前端按本文件约定继续手工镜像，本次新增如下对应关系：
+
+| Rust（`src/api/playback.rs`） | 位置 | `types.ts` | 说明 |
+| --- | --- | --- | --- |
+| 请求体 `max_bitrate: Option<i64>` | `WebPlaybackSessionRequest` / `WebPlaybackBootstrapRequest` | `WebPlaybackRequestSelection.maxBitrate?: number` | 可选，bps，100000–200000000；`client.ts` 把 `selection` 原样展开进请求体，不做字段重命名 |
+| 响应 `bitrate.sourceBitrate` | `web_playback_session_json` | `WebPlaybackBitrate.sourceBitrate: number \| null` | 源码率（`media_sources.bitrate`），未探测为 `null` |
+| 响应 `bitrate.maxBitrate` | 同上 | `WebPlaybackBitrate.maxBitrate: number \| null` | 请求里的用户上限回显，未提供为 `null` |
+| 响应 `bitrate.targetBitrate` | 同上 | `WebPlaybackBitrate.targetBitrate: number \| null` | 实际 `-b:v`；拷贝视频的档位为 `null` |
+| 响应 `bitrate.limited` | 同上 | `WebPlaybackBitrate.limited: boolean` | `targetBitrate !== null` 的服务端判定 |
+| 响应 `bitrate` 键本身 | 同上 | `WebPlaybackSession.bitrate?: WebPlaybackBitrate` | **可选**：旧服务端不带该键，前端回落到「原画（自动）」文案 |
+
+约定：
+
+- **`bitrate` 保持可选**，与 `WebPlaybackPlan.candidates`、`MediaSource.bitrate` 的既有写法一致：这是读路径上的放宽，
+  不会让旧响应的测试夹具全部失效；真正的必填化应等 G-Playback 改造成结构体时一次完成。
+- **query key 增加 `maxBitrate` 槽位**（缓存按码率变体隔离，切换画质才能触发新会话）：
+  `["playback-bootstrap" | "web-playback-session", itemId, sourceId, audioStreamIndex, subtitleStreamIndex, maxBitrate, attempt]`。
+  读取单个槽位的 helper 跟着各自的 feature 走：`audioParamFromQueryKey`（`audio-track-selection.ts`，下标 3）、
+  `bitrateParamFromQueryKey`（`playback-quality.ts`，下标 5）。后续若要改成具名对象键，两处 helper 与
+  `usePlaybackReporting` 的 `queryKey[0]` 判断需要一起改。
+- 档位生成、URL 参数与文案都在 `web/src/features/player/playback-quality.ts`（纯函数，有单测），不参与类型生成。
 
 ## 如何扩展到更多路由
 
