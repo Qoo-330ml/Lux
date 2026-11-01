@@ -54,7 +54,8 @@
 - Do not use `unwrap`, `expect`, or `panic` in production paths without a task-specific justification.
 - Do not execute blocking filesystem or process work on Tokio core workers.
 - Do not scan a whole library, call TMDb, parse NFO, or run `ffprobe` in a user request.
-- Do not add transcoding, proxying for `.strm`, public registration, backup/restore, or unrelated
+- Do not add transcoding beyond the bounded 0–4 tier Web playback defined by ADR-004/ADR-026,
+  proxying for `.strm` (which stays Direct-only), public registration, backup/restore, or unrelated
   Emby endpoints outside the assigned task.
 
 ## Required checks
