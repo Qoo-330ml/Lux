@@ -339,6 +339,8 @@ struct PlaybackSourceRow {
     source_kind: String,
     container: Option<String>,
     external_url: Option<String>,
+    /// Container bitrate from the last probe; `None` until the source was probed.
+    bitrate: Option<i64>,
     root_path: String,
     relative_path: String,
 }
@@ -350,6 +352,7 @@ impl From<PlaybackSourceRow> for StoredPlaybackSource {
             source_kind: row.source_kind,
             container: row.container,
             external_url: row.external_url,
+            bitrate: row.bitrate,
             root_path: row.root_path,
             relative_path: row.relative_path,
         }
@@ -5656,7 +5659,7 @@ impl Database {
         };
         let query = format!(
             "SELECT ms.id AS source_id, ms.source_kind, ms.container, ms.external_url,
-                    lr.canonical_path AS root_path, fe.relative_path
+                    ms.bitrate, lr.canonical_path AS root_path, fe.relative_path
              FROM media_sources ms
              JOIN media_items mi ON mi.id = ms.item_id
              JOIN libraries l ON l.id = mi.library_id AND l.is_enabled = 1

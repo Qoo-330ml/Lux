@@ -5565,6 +5565,11 @@ pub(crate) struct StoredPlaybackSource {
     pub(crate) source_kind: String,
     pub(crate) container: Option<String>,
     pub(crate) external_url: Option<String>,
+    /// Container bitrate measured by the last probe, in bits per second.
+    ///
+    /// `None` until the source was probed. Playback uses it to decide whether a caller's output
+    /// ceiling can still be met by Direct Play or a copy tier.
+    pub(crate) bitrate: Option<i64>,
     pub(crate) root_path: String,
     pub(crate) relative_path: String,
 }

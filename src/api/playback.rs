@@ -5,7 +5,10 @@ mod resume_visibility;
 pub(super) use resume_visibility::emby_hide_from_resume;
 
 use crate::application::playback::{
-    decision::ServerTier,
+    decision::{
+        MAX_MAX_BITRATE_BPS, MIN_MAX_BITRATE_BPS, PlaybackBitrateLimit, ServerTier,
+        valid_max_bitrate_bps,
+    },
     hls::{HlsSegmentContainer, HlsStartOptions, HlsWebStartOptions},
     session::{
         AuthorizedWebPlaybackResource, CreatedWebPlaybackSession, PlaybackAssetAdmission,
@@ -1100,6 +1103,7 @@ async fn create_emby_transcoding_session(
                 capabilities: options
                     .request
                     .playback_capabilities_for_source(Some(source)),
+                bitrate: PlaybackBitrateLimit::NONE,
             },
             &input,
             video_bitrate,
@@ -2692,6 +2696,9 @@ pub(super) struct WebPlaybackSessionRequest {
     capabilities: WebPlaybackCapabilitiesRequest,
     #[serde(default)]
     audio_stream_index: Option<i64>,
+    /// Optional user-selected output ceiling in bits per second.
+    #[serde(default)]
+    max_bitrate: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -3096,6 +3103,7 @@ fn emby_transcoding_audio_bitrate(
 fn web_transcoding_output(
     tier: ServerTier,
     segment_container: HlsSegmentContainer,
+    target_video_bitrate_bps: Option<i64>,
 ) -> WebPlaybackTranscodingDetails {
     let video_transcoded = matches!(
         tier,
@@ -3108,7 +3116,14 @@ fn web_transcoding_output(
     WebPlaybackTranscodingDetails {
         video_codec: video_transcoded.then(|| "h264".to_owned()),
         audio_codec: audio_transcoded.then(|| "aac".to_owned()),
-        video_bitrate: None,
+        // Only a ceiling the server had to honour states an output bitrate; a transcode without
+        // one keeps the previous behaviour of leaving it unset, and a copied track keeps the
+        // source bitrate instead of a target of its own.
+        video_bitrate: if video_transcoded {
+            target_video_bitrate_bps
+        } else {
+            None
+        },
         audio_bitrate: audio_transcoded.then_some(192_000),
         transcoding_container: Some(segment_container.emby_container().to_owned()),
     }
@@ -3693,6 +3708,7 @@ async fn admit_web_playback_hls_request(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn create_web_playback_session_json(
     headers: &HeaderMap,
     state: &ReadyAppState,
@@ -3701,6 +3717,7 @@ async fn create_web_playback_session_json(
     source: &crate::storage::StoredPlaybackSource,
     mut capabilities: PlaybackCapabilities,
     audio_stream_index: Option<i64>,
+    max_bitrate_bps: Option<i64>,
 ) -> Result<Value, Response> {
     let source_kind = match source.source_kind.as_str() {
         "LOCAL_FILE" => PlaybackSourceKind::LocalFile,
@@ -3716,6 +3733,11 @@ async fn create_web_playback_session_json(
         capabilities.direct_play = false;
     }
     let user_id = user.id.to_string();
+    // The ceiling applies to the measured container bitrate of the source this request plays.
+    let bitrate = PlaybackBitrateLimit {
+        source_bitrate_bps: source.bitrate,
+        max_bitrate_bps,
+    };
     let transcoding_settings = service.transcoding_settings().await;
     let mut created = service
         .create_with_settings(
@@ -3727,6 +3749,7 @@ async fn create_web_playback_session_json(
                 play_session_prefix: "lux-web",
                 source_kind,
                 capabilities,
+                bitrate,
             },
             &transcoding_settings,
         )
@@ -3789,7 +3812,7 @@ async fn create_web_playback_session_json(
                 effective_tier,
                 &input,
                 HlsWebStartOptions {
-                    video_bitrate: None,
+                    video_bitrate: created.target_video_bitrate_bps,
                     start_time_ticks: None,
                     runtime_ticks: None,
                     audio_stream_index,
@@ -3818,7 +3841,13 @@ async fn create_web_playback_session_json(
                 return Err(web_playback_error(headers, error));
             }
             match service
-                .restart_with_software(&created.id, &input, None, None, audio_stream_index)
+                .restart_with_software(
+                    &created.id,
+                    &input,
+                    created.target_video_bitrate_bps,
+                    None,
+                    audio_stream_index,
+                )
                 .await
             {
                 Ok(tier) => effective_tier = tier,
@@ -3835,7 +3864,11 @@ async fn create_web_playback_session_json(
         };
         // Persist what the server actually produces so the admin dashboard and the player's
         // information panel describe the same session instead of guessing.
-        let output = web_transcoding_output(effective_tier, HlsSegmentContainer::FragmentedMp4);
+        let output = web_transcoding_output(
+            effective_tier,
+            HlsSegmentContainer::FragmentedMp4,
+            created.target_video_bitrate_bps,
+        );
         if let Err(error) = service
             .set_transcoding_details(&created.id, &user_id, &output)
             .await
@@ -3911,6 +3944,11 @@ async fn create_web_playback_session_json(
             "reason": reason.to_string(),
         }),
     };
+    // What the server actually decided about the caller's ceiling. Copy paths and Direct Play keep
+    // the source bitrate, so only a re-encode reports a target the player can show as "limited".
+    let target_video_bitrate_bps = created
+        .target_video_bitrate_bps
+        .filter(|_| matches!(created.plan, WebPlaybackPlan::ServerHls { .. }));
     Ok(json!({
         "sessionId": (!created.id.is_empty()).then_some(created.id),
         "playSessionId": (!created.play_session_id.is_empty()).then_some(created.play_session_id),
@@ -3918,6 +3956,12 @@ async fn create_web_playback_session_json(
         "expiresAt": created.expires_at,
         "plan": plan,
         "sourceId": created.media_source_id,
+        "bitrate": {
+            "sourceBitrate": source.bitrate,
+            "maxBitrate": max_bitrate_bps,
+            "targetBitrate": target_video_bitrate_bps,
+            "limited": target_video_bitrate_bps.is_some(),
+        },
     }))
 }
 
@@ -4007,6 +4051,33 @@ async fn web_proxy_candidate_url(
     )
 }
 
+/// Validates the optional user-selected output ceiling at the protocol boundary.
+///
+/// A ceiling outside the accepted range is a malformed request, not an unsupported playback, so it
+/// is refused before any ACL work with the standard Lux error body.
+async fn web_playback_max_bitrate(
+    headers: &HeaderMap,
+    requested: Option<i64>,
+) -> Result<Option<i64>, Response> {
+    let Some(value) = requested else {
+        return Ok(None);
+    };
+    if !valid_max_bitrate_bps(value) {
+        return Err(api_error(
+            headers,
+            StatusCode::BAD_REQUEST,
+            lux::ApiErrorCode::InvalidRequest,
+            &format!(
+                "码率上限必须在 {} kbps 到 {} kbps 之间",
+                MIN_MAX_BITRATE_BPS / 1_000,
+                MAX_MAX_BITRATE_BPS / 1_000
+            ),
+        )
+        .into_response());
+    }
+    Ok(Some(value))
+}
+
 async fn validate_web_audio_stream(
     state: &ReadyAppState,
     principal: AccessPrincipal,
@@ -4071,6 +4142,10 @@ pub(super) async fn lux_create_web_playback_session(
         Ok(None) => return StatusCode::NOT_FOUND.into_response(),
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate).await {
+        Ok(max_bitrate_bps) => max_bitrate_bps,
+        Err(response) => return response,
+    };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
         principal,
@@ -4091,6 +4166,7 @@ pub(super) async fn lux_create_web_playback_session(
         &source,
         request.capabilities.into(),
         audio_stream_index,
+        max_bitrate_bps,
     )
     .await
     {
@@ -4108,6 +4184,9 @@ pub(super) struct WebPlaybackBootstrapRequest {
     capabilities: WebPlaybackCapabilitiesRequest,
     #[serde(default)]
     audio_stream_index: Option<i64>,
+    /// Optional user-selected output ceiling in bits per second.
+    #[serde(default)]
+    max_bitrate: Option<i64>,
 }
 
 pub(super) async fn lux_create_web_playback_bootstrap(
@@ -4160,6 +4239,10 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         Ok(session) => session,
         Err(_) => return StatusCode::SERVICE_UNAVAILABLE.into_response(),
     };
+    let max_bitrate_bps = match web_playback_max_bitrate(&headers, request.max_bitrate).await {
+        Ok(max_bitrate_bps) => max_bitrate_bps,
+        Err(response) => return response,
+    };
     let audio_stream_index = match validate_web_audio_stream(
         &state,
         principal,
@@ -4180,6 +4263,7 @@ pub(super) async fn lux_create_web_playback_bootstrap(
         &source,
         request.capabilities.into(),
         audio_stream_index,
+        max_bitrate_bps,
     )
     .await
     {

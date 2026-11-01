@@ -30,8 +30,9 @@ use crate::application::user_access_rules::{
 };
 
 use super::decision::{
-    PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind, ServerTier,
-    UnsupportedReason, choose_plan,
+    PlaybackBitrateLimit, PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan,
+    PlaybackSourceKind, ServerTier, UnsupportedReason, choose_plan_with_bitrate,
+    valid_max_bitrate_bps,
 };
 use super::hls::{
     HlsError, HlsManager, HlsProgressSnapshot, HlsSegmentContainer, HlsStartOptions,
@@ -98,6 +99,8 @@ pub struct CreateWebPlaybackSession<'a> {
     pub play_session_prefix: &'a str,
     pub source_kind: PlaybackSourceKind,
     pub capabilities: PlaybackCapabilities,
+    /// The user-selected output ceiling and the source bitrate it applies to.
+    pub bitrate: PlaybackBitrateLimit,
 }
 
 pub(crate) struct WebPlaybackEvent<'a> {
@@ -119,6 +122,11 @@ pub struct CreatedWebPlaybackSession {
     pub play_session_id: String,
     pub plan: WebPlaybackPlan,
     pub expires_at: i64,
+    /// Video bitrate the plan has to encode to, when the user's ceiling forced a re-encode.
+    ///
+    /// `None` means no ceiling was applied: the output either plays the original bytes or copies
+    /// the source video track, so there is no target bitrate of its own.
+    pub target_video_bitrate_bps: Option<i64>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -496,6 +504,9 @@ impl WebPlaybackSessionService {
                 "playback session identifiers must not be empty".to_owned(),
             ));
         }
+        // Handlers validate the same range at the protocol boundary; keeping the check here means
+        // no other caller can bypass it and silently lose the ceiling.
+        validate_bitrate_limit(input.bitrate)?;
         let policy = self
             .database
             .get_user_playback_policy(input.user_id)
@@ -508,8 +519,17 @@ impl WebPlaybackSessionService {
                 source_kind: input.source_kind,
                 capabilities,
             },
+            input.bitrate,
             policy,
         )?);
+        // The ceiling only exists when the chosen plan actually re-encodes video; a copied track
+        // keeps the source bitrate and has no target of its own.
+        let target_video_bitrate_bps = match plan {
+            WebPlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode | ServerTier::SoftwareTranscode,
+            } => input.bitrate.target_video_bitrate_bps(),
+            _ => None,
+        };
         // An administrator can turn server-side processing off entirely. The plan then degrades to
         // direct play (or an explicit unsupported reason) instead of starting FFmpeg.
         let plan = if !settings.enabled {
@@ -553,6 +573,7 @@ impl WebPlaybackSessionService {
                 play_session_id,
                 plan,
                 expires_at,
+                target_video_bitrate_bps,
             });
         };
         Ok(CreatedWebPlaybackSession {
@@ -563,6 +584,7 @@ impl WebPlaybackSessionService {
             play_session_id: String::new(),
             plan,
             expires_at: unix_timestamp(),
+            target_video_bitrate_bps: None,
         })
     }
 
@@ -1988,20 +2010,47 @@ fn apply_server_capabilities(
     capabilities
 }
 
+/// Rejects a ceiling outside the range a browser can decode, before any database work.
+fn validate_bitrate_limit(limit: PlaybackBitrateLimit) -> Result<(), WebPlaybackSessionError> {
+    match limit.max_bitrate_bps {
+        Some(max_bitrate_bps) if !valid_max_bitrate_bps(max_bitrate_bps) => {
+            Err(WebPlaybackSessionError::Invalid(
+                "max_bitrate_bps is outside the accepted range".to_owned(),
+            ))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn choose_plan_for_policy(
     input: PlaybackDecisionInput,
+    bitrate: PlaybackBitrateLimit,
     policy: UserPlaybackPolicy,
 ) -> Result<PlaybackPlan, WebPlaybackSessionError> {
-    let unrestricted_plan = choose_plan(input);
+    let plan = choose_plan_with_bitrate(input, bitrate);
     if input.source_kind == PlaybackSourceKind::Strm
-        || input.capabilities.direct_play
-        || !matches!(unrestricted_plan, PlaybackPlan::ServerHls { .. })
+        || !matches!(plan, PlaybackPlan::ServerHls { .. })
     {
-        return Ok(unrestricted_plan);
+        return Ok(plan);
     }
 
     let capabilities = input.capabilities;
-    let candidates = [
+    let video_transcode_allowed = policy.allow_video_transcode && policy.allow_audio_transcode;
+    // Tiers that re-encode video, lowest cost first.
+    let re_encode_tiers = [
+        (
+            capabilities.hardware_transcode,
+            video_transcode_allowed,
+            ServerTier::HardwareTranscode,
+        ),
+        (
+            capabilities.software_transcode,
+            video_transcode_allowed,
+            ServerTier::SoftwareTranscode,
+        ),
+    ];
+    // Tiers that may copy the video track; only usable while the ceiling needs no re-encode.
+    let copy_tiers = [
         (
             capabilities.video_copy_to_fmp4 && capabilities.audio_copy_to_fmp4,
             policy.allow_remux,
@@ -2015,20 +2064,27 @@ fn choose_plan_for_policy(
         ),
         (
             capabilities.hardware_transcode,
-            policy.allow_video_transcode && policy.allow_audio_transcode,
+            video_transcode_allowed,
             ServerTier::HardwareTranscode,
         ),
         (
             capabilities.software_transcode,
-            policy.allow_video_transcode && policy.allow_audio_transcode,
+            video_transcode_allowed,
             ServerTier::SoftwareTranscode,
         ),
     ];
+    let candidates: &[(bool, bool, ServerTier)] = if bitrate.requires_video_transcode() {
+        // Remux and audio transcode would keep the original video bitrate, so a ceiling the
+        // source exceeds rules them out even when the user policy allows them.
+        &re_encode_tiers
+    } else {
+        &copy_tiers
+    };
     if let Some((_, _, tier)) = candidates
-        .into_iter()
+        .iter()
         .find(|(available, allowed, _)| *available && *allowed)
     {
-        return Ok(PlaybackPlan::ServerHls { tier });
+        return Ok(PlaybackPlan::ServerHls { tier: *tier });
     }
 
     Err(WebPlaybackSessionError::PlaybackPolicyDenied)
@@ -2154,8 +2210,8 @@ mod tests {
             libraries::LibraryService,
             playback::{
                 decision::{
-                    PlaybackCapabilities, PlaybackDecisionInput, PlaybackPlan, PlaybackSourceKind,
-                    ServerTier, UnsupportedReason,
+                    PlaybackBitrateLimit, PlaybackCapabilities, PlaybackDecisionInput,
+                    PlaybackPlan, PlaybackSourceKind, ServerTier, UnsupportedReason,
                 },
                 hls::{HlsManager, HlsSegmentContainer, HlsStartOptions},
                 session::{
@@ -2376,6 +2432,7 @@ mod tests {
                     software_transcode: true,
                 },
             },
+            PlaybackBitrateLimit::NONE,
             UserPlaybackPolicy {
                 can_play: true,
                 max_simultaneous_playbacks: 2,
@@ -2407,6 +2464,7 @@ mod tests {
                     software_transcode: true,
                 },
             },
+            PlaybackBitrateLimit::NONE,
             UserPlaybackPolicy {
                 can_play: true,
                 max_simultaneous_playbacks: 2,
@@ -2422,6 +2480,101 @@ mod tests {
                 tier: ServerTier::HardwareTranscode
             })
         ));
+    }
+
+    #[test]
+    fn a_ceiling_the_source_exceeds_skips_copy_tiers_even_when_they_are_allowed() {
+        let input = PlaybackDecisionInput {
+            source_kind: PlaybackSourceKind::LocalFile,
+            capabilities: PlaybackCapabilities {
+                direct_play: true,
+                hls: true,
+                video_copy_to_fmp4: true,
+                audio_copy_to_fmp4: true,
+                hardware_transcode: true,
+                software_transcode: true,
+            },
+        };
+        let ceiling = PlaybackBitrateLimit {
+            source_bitrate_bps: Some(20_000_000),
+            max_bitrate_bps: Some(4_000_000),
+        };
+
+        assert!(matches!(
+            choose_plan_for_policy(
+                input,
+                ceiling,
+                UserPlaybackPolicy {
+                    can_play: true,
+                    max_simultaneous_playbacks: 2,
+                    allow_remux: true,
+                    allow_audio_transcode: true,
+                    allow_video_transcode: true,
+                },
+            ),
+            Ok(PlaybackPlan::ServerHls {
+                tier: ServerTier::HardwareTranscode
+            })
+        ));
+        assert!(
+            matches!(
+                choose_plan_for_policy(
+                    input,
+                    ceiling,
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
+            ),
+            "a remux cannot honour the ceiling, so the policy is asked for a re-encode"
+        );
+        assert!(
+            matches!(
+                choose_plan_for_policy(
+                    input,
+                    PlaybackBitrateLimit {
+                        source_bitrate_bps: Some(2_000_000),
+                        max_bitrate_bps: Some(4_000_000),
+                    },
+                    UserPlaybackPolicy {
+                        can_play: true,
+                        max_simultaneous_playbacks: 2,
+                        allow_remux: true,
+                        allow_audio_transcode: true,
+                        allow_video_transcode: false,
+                    },
+                ),
+                Ok(PlaybackPlan::Direct)
+            ),
+            "a source already inside the ceiling keeps Direct Play"
+        );
+    }
+
+    #[test]
+    fn a_ceiling_outside_the_accepted_range_is_invalid() {
+        let accepted = PlaybackBitrateLimit {
+            source_bitrate_bps: None,
+            max_bitrate_bps: Some(4_000_000),
+        };
+        assert!(super::validate_bitrate_limit(accepted).is_ok());
+        assert!(super::validate_bitrate_limit(PlaybackBitrateLimit::NONE).is_ok());
+        for rejected in [99_999, 200_000_001, 0, -4_000_000] {
+            assert!(
+                matches!(
+                    super::validate_bitrate_limit(PlaybackBitrateLimit {
+                        source_bitrate_bps: None,
+                        max_bitrate_bps: Some(rejected),
+                    }),
+                    Err(super::WebPlaybackSessionError::Invalid(_))
+                ),
+                "{rejected} bps must be rejected at the service boundary"
+            );
+        }
     }
 
     #[test]
@@ -2448,6 +2601,7 @@ mod tests {
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
                 },
+                PlaybackBitrateLimit::NONE,
                 policy,
             ),
             Err(super::WebPlaybackSessionError::PlaybackPolicyDenied)
@@ -2461,6 +2615,7 @@ mod tests {
                         ..capabilities
                     },
                 },
+                PlaybackBitrateLimit::NONE,
                 policy,
             ),
             Ok(PlaybackPlan::Direct)
@@ -2471,6 +2626,7 @@ mod tests {
                     source_kind: PlaybackSourceKind::Strm,
                     capabilities,
                 },
+                PlaybackBitrateLimit::NONE,
                 policy,
             ),
             Ok(PlaybackPlan::Unsupported {
@@ -2487,6 +2643,7 @@ mod tests {
                         ..capabilities
                     },
                 },
+                PlaybackBitrateLimit::NONE,
                 UserPlaybackPolicy {
                     allow_remux: false,
                     allow_audio_transcode: false,
@@ -2503,6 +2660,7 @@ mod tests {
                         source_kind: PlaybackSourceKind::LocalFile,
                         capabilities,
                     },
+                    PlaybackBitrateLimit::NONE,
                     UserPlaybackPolicy {
                         allow_remux: false,
                         allow_audio_transcode: false,
@@ -3485,6 +3643,7 @@ mod tests {
                     play_session_prefix: "lux-web",
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities: transcode_capabilities,
+                    bitrate: PlaybackBitrateLimit::NONE,
                 },
                 &settings,
             )
@@ -3514,6 +3673,7 @@ mod tests {
                         direct_play: true,
                         ..transcode_capabilities
                     },
+                    bitrate: PlaybackBitrateLimit::NONE,
                 },
                 &settings,
             )
@@ -3785,6 +3945,7 @@ while :; do sleep 1; done
                         hardware_transcode: false,
                         software_transcode: true,
                     },
+                    bitrate: PlaybackBitrateLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -3899,6 +4060,7 @@ while :; do sleep 1; done
                         hardware_transcode: false,
                         software_transcode: true,
                     },
+                    bitrate: PlaybackBitrateLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -3947,6 +4109,7 @@ while :; do sleep 1; done
                         hardware_transcode: false,
                         software_transcode: true,
                     },
+                    bitrate: PlaybackBitrateLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -4049,6 +4212,7 @@ while :; do sleep 1; done
                     play_session_prefix: "lux-emby",
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
+                    bitrate: PlaybackBitrateLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(1_000_000),
@@ -4077,6 +4241,7 @@ while :; do sleep 1; done
                     play_session_prefix: "lux-emby",
                     source_kind: PlaybackSourceKind::LocalFile,
                     capabilities,
+                    bitrate: PlaybackBitrateLimit::NONE,
                 },
                 Path::new("input.mkv"),
                 Some(2_000_000),
