@@ -136,7 +136,7 @@ import type {
   AdminTranscodingStatus,
   AdminTranscodingSessions,
   AdminTranscodingHistoryPage,
-  WebPlaybackTrackSelection,
+  WebPlaybackRequestSelection,
   WebDanmakuInfo,
   SetupStatus,
   SetupDatabaseBackend,
@@ -891,12 +891,18 @@ export class LuxApiClient {
     );
   }
 
+  /**
+   * `selection` carries the optional request fields the player controls:
+   * `audioStreamIndex`, `subtitleStreamIndex` and the manual quality ceiling
+   * `maxBitrate` (bps, 100000–200000000). It is spread into the body as-is, so
+   * the field names mirror `docs/API.md` rather than being remapped here.
+   */
   createWebPlaybackSession(
     itemId: string,
     sourceId: string,
     capabilities: WebPlaybackCapabilities,
     signal?: AbortSignal,
-    selection?: WebPlaybackTrackSelection,
+    selection?: WebPlaybackRequestSelection,
   ) {
     return this.request<WebPlaybackSession>("/api/v1/playback/sessions", {
       method: "POST",
@@ -905,12 +911,13 @@ export class LuxApiClient {
     });
   }
 
+  /** Same optional `selection` fields as `createWebPlaybackSession`, including `maxBitrate`. */
   createWebPlaybackBootstrap(
     itemId: string,
     sourceId: string | undefined,
     capabilities: WebPlaybackCapabilities,
     signal?: AbortSignal,
-    selection?: WebPlaybackTrackSelection,
+    selection?: WebPlaybackRequestSelection,
   ) {
     return this.request<WebPlaybackBootstrap>("/api/v1/playback/bootstrap", {
       method: "POST",

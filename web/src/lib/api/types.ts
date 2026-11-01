@@ -479,6 +479,20 @@ export type WebPlaybackPlan =
   | { type: "SERVER_HLS"; manifestUrl: string; tier: number }
   | { type: "UNSUPPORTED"; reason: string };
 
+/**
+ * What the server actually decided about the caller's bitrate ceiling
+ * (`docs/API.md`, Web 播放会话). `sourceBitrate` comes from ffprobe and is `null`
+ * when the source was never probed; `targetBitrate` is the video bitrate the
+ * encoder really uses, so it is `null` on every video-copy path (Direct, Remux,
+ * audio-only transcode) even when a ceiling was requested.
+ */
+export type WebPlaybackBitrate = {
+  sourceBitrate: number | null;
+  maxBitrate: number | null;
+  targetBitrate: number | null;
+  limited: boolean;
+};
+
 export type WebPlaybackSession = {
   sessionId: string | null;
   playSessionId: string | null;
@@ -486,6 +500,8 @@ export type WebPlaybackSession = {
   tier: number;
   expiresAt: number;
   plan: WebPlaybackPlan;
+  /** Absent on responses from servers that do not report the bitrate decision yet. */
+  bitrate?: WebPlaybackBitrate;
 };
 
 /** Live `ffmpeg -progress` values for a running server-side HLS transcode. */
@@ -529,6 +545,15 @@ export type WebPlaybackSessionStats = {
 export type WebPlaybackTrackSelection = {
   audioStreamIndex?: number;
   subtitleStreamIndex?: number;
+};
+
+/**
+ * Optional request fields shared by session creation and bootstrap. `maxBitrate`
+ * is the manual quality ceiling in bps; the rest of the contract lives in
+ * `docs/API.md`. `.strm` sources ignore it server-side.
+ */
+export type WebPlaybackRequestSelection = WebPlaybackTrackSelection & {
+  maxBitrate?: number;
 };
 
 export type WebPlaybackBootstrap = {

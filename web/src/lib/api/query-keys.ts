@@ -31,10 +31,43 @@ export const queryKeys = {
   children: (itemId: string, itemType?: string, seasonId?: string) =>
     ["children", itemId, itemType ?? "default", seasonId ?? "all"] as const,
   playback: (itemId: string) => ["playback", itemId] as const,
-  playbackBootstrap: (itemId: string, sourceId?: string | null, attempt = 0, audioStreamIndex?: string | null, subtitleStreamIndex?: string | null) =>
-    ["playback-bootstrap", itemId, sourceId ?? "default", audioStreamIndex ?? "default", subtitleStreamIndex ?? "default", attempt] as const,
-  webPlaybackSession: (itemId: string, sourceId: string, attempt: number, audioStreamIndex?: string | null, subtitleStreamIndex?: string | null) =>
-    ["web-playback-session", itemId, sourceId, audioStreamIndex ?? "default", subtitleStreamIndex ?? "default", attempt] as const,
+  // Key layout: prefix, item, source, audioStreamIndex, subtitleStreamIndex,
+  // maxBitrate, attempt. Helpers reading a single slot live next to the feature
+  // that owns it (`audioParamFromQueryKey`, `bitrateParamFromQueryKey`).
+  playbackBootstrap: (
+    itemId: string,
+    sourceId?: string | null,
+    attempt = 0,
+    audioStreamIndex?: string | null,
+    subtitleStreamIndex?: string | null,
+    maxBitrate?: number | string | null,
+  ) =>
+    [
+      "playback-bootstrap",
+      itemId,
+      sourceId ?? "default",
+      audioStreamIndex ?? "default",
+      subtitleStreamIndex ?? "default",
+      maxBitrate === null || maxBitrate === undefined ? "default" : String(maxBitrate),
+      attempt,
+    ] as const,
+  webPlaybackSession: (
+    itemId: string,
+    sourceId: string,
+    attempt: number,
+    audioStreamIndex?: string | null,
+    subtitleStreamIndex?: string | null,
+    maxBitrate?: number | string | null,
+  ) =>
+    [
+      "web-playback-session",
+      itemId,
+      sourceId,
+      audioStreamIndex ?? "default",
+      subtitleStreamIndex ?? "default",
+      maxBitrate === null || maxBitrate === undefined ? "default" : String(maxBitrate),
+      attempt,
+    ] as const,
   webPlaybackStats: (sessionId: string) => ["web-playback-stats", sessionId] as const,
   adminDashboard: ["admin", "dashboard"] as const,
   adminHealth: ["admin", "health"] as const,
