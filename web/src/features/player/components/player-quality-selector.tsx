@@ -19,12 +19,12 @@ export type PlayerQualitySection = {
 };
 
 /**
- * Independent 画质 (bitrate ceiling) slot for the player settings panel. Like
+ * Independent 画质 (resolution ceiling) slot for the player settings panel. Like
  * the audio track slot it owns no playback state: the player passes the
- * generated tiers, the current choice, the effective status and the switch
- * callback.
+ * generated resolution tiers, the current choice, the effective status and the
+ * switch callback.
  *
- * `.strm` sources are Direct-only and the API ignores `maxBitrate` for them, so
+ * `.strm` sources are Direct-only and the API ignores `maxHeight` for them, so
  * `qualityOptions` returns only the automatic choice and this renders nothing.
  */
 export function PlayerQualitySelector({
@@ -53,7 +53,7 @@ export function PlayerQualitySelector({
       >
         {options.map((option) => (
           <option key={option.value || "auto"} value={option.value}>
-            {option.label}
+            {option.height !== null && option.isCurrent ? `${option.label}（当前）` : option.label}
           </option>
         ))}
       </LuxSelectField>

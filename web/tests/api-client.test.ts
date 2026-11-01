@@ -2519,6 +2519,57 @@ describe("LuxApiClient", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
+  it("forwards the maxHeight selection into session and bootstrap bodies", async () => {
+    const bodies: Record<string, unknown>[] = [];
+    vi.spyOn(globalThis, "fetch").mockImplementation(async (_input, init) => {
+      bodies.push(JSON.parse(String(init?.body)) as Record<string, unknown>);
+      return new Response(JSON.stringify({
+        item: { id: "item-1", mediaSources: [{ id: "source-1", isDefault: true }] },
+        playback: { itemId: "item-1", positionTicks: 0, isPlayed: false },
+        session: {
+          sessionId: "session-1",
+          playSessionId: "lux-web:session-1",
+          sourceId: "source-1",
+          tier: 0,
+          expiresAt: 1_900_000_000,
+          plan: { type: "DIRECT", url: "/api/v1/playback/sessions/session-1/direct" },
+        },
+      }), { status: 200 });
+    });
+    Object.defineProperty(globalThis, "document", {
+      configurable: true,
+      value: { cookie: "lux_csrf=csrf-token" },
+    });
+    const capabilities = {
+      directPlay: true,
+      hls: true,
+      videoCopyToFmp4: true,
+      audioCopyToFmp4: true,
+      hardwareTranscode: false,
+      softwareTranscode: true,
+    };
+
+    const client = new LuxApiClient();
+    await client.createWebPlaybackSession("item-1", "source-1", capabilities, undefined, {
+      maxHeight: 720,
+      audioStreamIndex: 2,
+    });
+    await client.createWebPlaybackBootstrap("item-1", "source-1", capabilities, undefined, {
+      maxHeight: 1080,
+    });
+
+    expect(bodies[0]).toMatchObject({
+      itemId: "item-1",
+      sourceId: "source-1",
+      maxHeight: 720,
+      audioStreamIndex: 2,
+    });
+    expect(bodies[1]).toMatchObject({ itemId: "item-1", sourceId: "source-1", maxHeight: 1080 });
+    // The legacy bitrate ceiling is no longer part of the player's request.
+    expect(bodies[0]).not.toHaveProperty("maxBitrate");
+    expect(bodies[1]).not.toHaveProperty("maxBitrate");
+  });
+
   it("forwards cancellation to playback bootstrap requests", async () => {
     const fetchMock = vi.spyOn(globalThis, "fetch").mockResolvedValue(
       new Response(JSON.stringify({

@@ -60,7 +60,7 @@
 | 29 | `/api/v1/items/{item_id}/stream` | GET, HEAD | `lux_stream` | (c) | 媒体流（含 Range） | — |
 | 30 | `/api/v1/items/{item_id}/playback` | GET | `lux_get_playback` | (b) | 播放状态 `json!` | `PlaybackState` |
 | 31 | `/api/v1/items/{item_id}/progress` | POST | `lux_post_progress` | 204 | — | `void` |
-| 32 | `/api/v1/playback/sessions` | POST | `lux_create_web_playback_session` | (b) | `create_web_playback_session_json`（`playback.rs:3645`）返回 `Value` | `WebPlaybackSession`（含 `bitrate`，见「手工镜像补充」） |
+| 32 | `/api/v1/playback/sessions` | POST | `lux_create_web_playback_session` | (b) | `create_web_playback_session_json`（`playback.rs:3645`）返回 `Value` | `WebPlaybackSession`（含 `bitrate` / `resolution`，见「手工镜像补充」） |
 | 33 | `/api/v1/playback/bootstrap` | POST | `lux_create_web_playback_bootstrap` | (b) | `{playback,session}` 等 `json!` | `WebPlaybackBootstrap` |
 | 34 | `/api/v1/playback/sessions/{session_id}/events` | POST | `lux_web_playback_event` | (b) | `{accepted,duplicate,stale}` | 内联 `{accepted,duplicate,stale}` |
 | 35 | `/api/v1/playback/sessions/{session_id}/heartbeat` | POST | `lux_web_playback_heartbeat` | (b) | `{sessionId,expiresAt}` | 内联 `{sessionId,expiresAt}` |
@@ -298,30 +298,36 @@ scripts/check-api-types.sh          # 只跑这一项
 已验证：`TS_RS_IMPORT_EXTENSION=.js TS_RS_LARGE_INT=bigint scripts/generate-api-types.sh` 生成的产物
 与提交内容完全一致。
 
-## 手工镜像补充：手动码率上限（`maxBitrate`）
+## 手工镜像补充：手动分辨率上限（`maxHeight`）
 
-手动画质上限没有走 ts-rs 试点（`bitrate` 仍由 `web_playback_session_json` 的 `json!` 拼装），
-前端按本文件约定继续手工镜像，本次新增如下对应关系：
+手动画质上限没有走 ts-rs 试点（`bitrate` / `resolution` 仍由 `web_playback_session_json` 的 `json!` 拼装），
+前端按本文件约定继续手工镜像。播放页的「画质」已从码率上限改为分辨率上限，对应关系如下：
 
 | Rust（`src/api/playback.rs`） | 位置 | `types.ts` | 说明 |
 | --- | --- | --- | --- |
-| 请求体 `max_bitrate: Option<i64>` | `WebPlaybackSessionRequest` / `WebPlaybackBootstrapRequest` | `WebPlaybackRequestSelection.maxBitrate?: number` | 可选，bps，100000–200000000；`client.ts` 把 `selection` 原样展开进请求体，不做字段重命名 |
-| 响应 `bitrate.sourceBitrate` | `web_playback_session_json` | `WebPlaybackBitrate.sourceBitrate: number \| null` | 源码率（`media_sources.bitrate`），未探测为 `null` |
-| 响应 `bitrate.maxBitrate` | 同上 | `WebPlaybackBitrate.maxBitrate: number \| null` | 请求里的用户上限回显，未提供为 `null` |
-| 响应 `bitrate.targetBitrate` | 同上 | `WebPlaybackBitrate.targetBitrate: number \| null` | 实际 `-b:v`；拷贝视频的档位为 `null` |
-| 响应 `bitrate.limited` | 同上 | `WebPlaybackBitrate.limited: boolean` | `targetBitrate !== null` 的服务端判定 |
-| 响应 `bitrate` 键本身 | 同上 | `WebPlaybackSession.bitrate?: WebPlaybackBitrate` | **可选**：旧服务端不带该键，前端回落到「原画（自动）」文案 |
+| 请求体 `max_height: Option<i64>` | `WebPlaybackSessionRequest` / `WebPlaybackBootstrapRequest` | `WebPlaybackRequestSelection.maxHeight?: number` | 可选，像素，144–4320；`client.ts` 把 `selection` 原样展开进请求体，不做字段重命名 |
+| 响应 `resolution.sourceHeight` | `web_playback_session_json` | `WebPlaybackResolution.sourceHeight: number \| null` | 源视频高度（ffprobe `Height`），未探测为 `null` |
+| 响应 `resolution.maxHeight` | 同上 | `WebPlaybackResolution.maxHeight: number \| null` | 请求里的用户上限回显，未提供为 `null` |
+| 响应 `resolution.targetHeight` | 同上 | `WebPlaybackResolution.targetHeight: number \| null` | 实际输出高度；无法确定时为 `null` |
+| 响应 `resolution.limited` | 同上 | `WebPlaybackResolution.limited: boolean` | 仅当源高度 > `maxHeight`、服务端真的转码缩放时为 `true` |
+| 响应 `resolution` 键本身 | 同上 | `WebPlaybackSession.resolution?: WebPlaybackResolution` | **可选**：旧服务端不带该键，前端回落到中性文案「原画（自动）」 |
+| 请求体 `max_bitrate: Option<i64>` | 同上 | `WebPlaybackRequestSelection.maxBitrate?: number` | **仅保留在 API 类型中**：UI 不再提供码率档位，播放页不再读取/写入 `maxBitrate` URL 参数 |
+| 响应 `bitrate.*` / `bitrate` 键 | 同上 | `WebPlaybackBitrate` / `WebPlaybackSession.bitrate?` | 继续保留（其它读路径仍可能使用），但播放页的画质文案已改用 `resolution` |
 
 约定：
 
-- **`bitrate` 保持可选**，与 `WebPlaybackPlan.candidates`、`MediaSource.bitrate` 的既有写法一致：这是读路径上的放宽，
-  不会让旧响应的测试夹具全部失效；真正的必填化应等 G-Playback 改造成结构体时一次完成。
-- **query key 增加 `maxBitrate` 槽位**（缓存按码率变体隔离，切换画质才能触发新会话）：
-  `["playback-bootstrap" | "web-playback-session", itemId, sourceId, audioStreamIndex, subtitleStreamIndex, maxBitrate, attempt]`。
+- **`resolution` 与 `bitrate` 都保持可选**，与 `WebPlaybackPlan.candidates`、`MediaSource.bitrate` 的既有写法一致：
+  这是读路径上的放宽，不会让旧响应的测试夹具全部失效；真正的必填化应等 G-Playback 改造成结构体时一次完成。
+- **语义**：源高度 > `maxHeight` 时服务端转码并缩放到 `maxHeight`；否则不变（`limited: false`）。
+  前端不自行断言服务端没有报告的结论：`resolution` 缺失或 `targetHeight/sourceHeight` 均为 `null` 时只显示「原画（自动）」。
+- **query key 槽位改为 `maxHeight`**（缓存按分辨率变体隔离，切换画质才能触发新会话）：
+  `["playback-bootstrap" | "web-playback-session", itemId, sourceId, audioStreamIndex, subtitleStreamIndex, maxHeight, attempt]`。
   读取单个槽位的 helper 跟着各自的 feature 走：`audioParamFromQueryKey`（`audio-track-selection.ts`，下标 3）、
-  `bitrateParamFromQueryKey`（`playback-quality.ts`，下标 5）。后续若要改成具名对象键，两处 helper 与
+  `maxHeightParamFromQueryKey`（`playback-quality.ts`，下标 5）。后续若要改成具名对象键，两处 helper 与
   `usePlaybackReporting` 的 `queryKey[0]` 判断需要一起改。
-- 档位生成、URL 参数与文案都在 `web/src/features/player/playback-quality.ts`（纯函数，有单测），不参与类型生成。
+- **URL 参数**：`maxHeight` 是唯一画质参数；旧的 `maxBitrate` 参数不再读取/写入（手写 URL 会被忽略），
+  切换片源时保留规范化后的 `maxHeight`，音轨/字幕索引则随旧片源一起丢弃。
+- 档位生成、URL 参数、状态文案都在 `web/src/features/player/playback-quality.ts`（纯函数，有单测），不参与类型生成。
 
 ## 如何扩展到更多路由
 

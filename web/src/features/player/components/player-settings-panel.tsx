@@ -48,7 +48,7 @@ type PlayerSettingsPanelProps = {
   onSourceChange?: (sourceId: string) => void;
   /** Independent audio-track slot; omitted when the player has no track data. */
   audioTracks?: PlayerAudioTrackSection;
-  /** Independent quality (bitrate ceiling) slot; omitted for Direct-only sources. */
+  /** Independent quality (resolution ceiling) slot; omitted for Direct-only sources. */
   quality?: PlayerQualitySection;
   captions?: readonly PlayerCaptionOption[];
   selectedCaptionId?: string | null;

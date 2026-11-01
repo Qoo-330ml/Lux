@@ -8,18 +8,21 @@ import { PlayerSettingsPanel } from "../src/features/player/components/player-se
 const source: MediaSource = {
   id: "source-1",
   sourceKind: "LOCAL_FILE",
-  bitrate: 12_000_000,
+  streams: [
+    { index: 0, type: "VIDEO", codec: "hevc", details: { Height: 2160 } },
+    { index: 1, type: "AUDIO", codec: "aac" },
+  ],
 };
 
-const options = qualityOptions(source, 4_000_000);
+const options = qualityOptions(source, 720);
 
 describe("PlayerQualitySelector", () => {
-  it("renders the tiers, the automatic choice and the effective status", () => {
+  it("renders the resolution tiers, the current choice and the effective status", () => {
     const markup = renderToStaticMarkup(
       <PlayerQualitySelector
         options={options}
-        selectedValue="4000000"
-        status="已限制到 4 Mbps"
+        selectedValue="720"
+        status="已缩放到 720p"
         onSelect={() => undefined}
       />,
     );
@@ -29,14 +32,48 @@ describe("PlayerQualitySelector", () => {
     expect(markup).toContain("画质");
     // The trigger shows the current tier; the option list itself is a portal
     // menu and is covered by the integration test.
-    expect(markup).toContain('data-value="4000000"');
-    expect(markup).toContain("4 Mbps");
+    expect(markup).toContain('data-value="720"');
+    expect(markup).toContain("720p（当前）");
     expect(markup).toContain('role="status"');
-    expect(markup).toContain("已限制到 4 Mbps");
+    expect(markup).toContain("已缩放到 720p");
     expect(markup).toContain("切换画质会以当前位置重建播放会话");
   });
 
-  it("stays hidden when the source cannot be capped", () => {
+  it("keeps the automatic label clean when no ceiling is selected", () => {
+    const markup = renderToStaticMarkup(
+      <PlayerQualitySelector
+        options={qualityOptions(source, null)}
+        selectedValue=""
+        status="原画 2160p"
+        onSelect={() => undefined}
+      />,
+    );
+
+    // 「（当前）」 marks a resolution tier only; the automatic choice already
+    // reads as 原画（自动）.
+    expect(markup).toContain("原画（自动）");
+    expect(markup).not.toContain("（当前）");
+    expect(markup).toContain("原画 2160p");
+  });
+
+  it("stays hidden when the source has no lower tier", () => {
+    const smallOptions = qualityOptions({
+      ...source,
+      streams: [{ index: 0, type: "VIDEO", details: { Height: 360 } }],
+    }, null);
+    const markup = renderToStaticMarkup(
+      <PlayerQualitySelector
+        options={smallOptions}
+        selectedValue=""
+        status="原画 360p"
+        onSelect={() => undefined}
+      />,
+    );
+
+    expect(markup).toBe("");
+  });
+
+  it("stays hidden for STRM sources", () => {
     const strmOptions = qualityOptions({ ...source, sourceKind: "STRM_URL" }, null);
     const markup = renderToStaticMarkup(
       <PlayerQualitySelector
@@ -54,7 +91,7 @@ describe("PlayerQualitySelector", () => {
     const markup = renderToStaticMarkup(
       <PlayerQualitySelector
         options={options}
-        selectedValue="4000000"
+        selectedValue="720"
         switching
         status="原画（自动）"
         onSelect={() => undefined}
@@ -70,9 +107,9 @@ describe("PlayerQualitySelector", () => {
     const markup = renderToStaticMarkup(
       <PlayerQualitySelector
         options={options}
-        selectedValue="4000000"
+        selectedValue="720"
         disabled
-        status="已限制到 4 Mbps"
+        status="已缩放到 720p"
         onSelect={() => undefined}
       />,
     );
@@ -101,8 +138,8 @@ describe("PlayerQualitySelector", () => {
     renderToStaticMarkup(
       <PlayerQualitySelector
         options={options}
-        selectedValue="4000000"
-        status="已限制到 4 Mbps"
+        selectedValue="720"
+        status="已缩放到 720p"
         onSelect={onSelect}
       />,
     );
@@ -119,8 +156,8 @@ describe("PlayerSettingsPanel quality slot", () => {
         onChangeRate={() => undefined}
         quality={{
           options,
-          selectedValue: "4000000",
-          status: "已限制到 4 Mbps",
+          selectedValue: "720",
+          status: "已缩放到 720p",
           onSelect: () => undefined,
         }}
         onClose={() => undefined}

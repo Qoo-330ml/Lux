@@ -34,7 +34,7 @@ export type PlaybackVariantSwitchMessages = {
 export type PlaybackVariantSwitchOptions = {
   itemId: string;
   playbackKey: string;
-  /** URL parameter selecting this variant, e.g. `audioStreamIndex` or `maxBitrate`. */
+  /** URL parameter selecting this variant, e.g. `audioStreamIndex` or `maxHeight`. */
   param: string;
   /** Current URL value of `param` (raw, may be whitespace); `null` when absent. */
   requestedValue: string | null;
@@ -42,9 +42,9 @@ export type PlaybackVariantSwitchOptions = {
    * Reduces a raw URL value to the exact form the playback query keys store, so
    * cache predicates compare like with like. Variants stored verbatim after a
    * trim (stream indexes) keep the default; variants stored as a parsed number
-   * (the bitrate ceiling) pass their own canonicalizer, otherwise a URL such as
-   * `maxBitrate=1e7` would look like "another variant" and evict the session
-   * currently on screen.
+   * (the resolution ceiling) pass their own canonicalizer, otherwise a URL such
+   * as `maxHeight=1.08e3` would look like "another variant" and evict the
+   * session currently on screen.
    */
   canonicalValue?: (value: string | null) => string | null;
   /** Reads the same variant from a playback query key, used for cache invalidation. */

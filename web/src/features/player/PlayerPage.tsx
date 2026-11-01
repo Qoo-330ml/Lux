@@ -122,7 +122,7 @@ export function PlayerPage() {
   const requestedSourceId = searchParams.get("sourceId");
   const requestedAudioStreamIndex = searchParams.get("audioStreamIndex");
   const requestedSubtitleStreamIndex = searchParams.get("subtitleStreamIndex");
-  const requestedMaxBitrate = searchParams.get("maxBitrate");
+  const requestedMaxHeight = searchParams.get("maxHeight");
   const {
     playbackBootstrap,
     item,
@@ -145,7 +145,7 @@ export function PlayerPage() {
     requestedSourceId,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
-    requestedMaxBitrate,
+    requestedMaxHeight,
     playbackAttempt,
     forceAudioTranscode,
   });
@@ -319,8 +319,8 @@ export function PlayerPage() {
     itemId,
     playbackKey,
     source,
-    requestedMaxBitrate,
-    playbackBitrate: playbackSession?.bitrate,
+    requestedMaxHeight,
+    playbackResolution: playbackSession?.resolution,
     searchParams,
     setSearchParams,
     streamUrl,
@@ -485,7 +485,7 @@ export function PlayerPage() {
     setCurrentTime(0);
     setDuration(0);
     setBufferedEnd(0);
-  }, [itemId, requestedAudioStreamIndex, requestedMaxBitrate, requestedSourceId]);
+  }, [itemId, requestedAudioStreamIndex, requestedMaxHeight, requestedSourceId]);
 
   usePlaybackSessionGate({
     playbackKey,

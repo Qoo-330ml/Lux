@@ -1,141 +1,147 @@
-import type { MediaSource, WebPlaybackBitrate } from "../../lib/api/types";
+import type { MediaSource, WebPlaybackResolution } from "../../lib/api/types";
 
 /**
- * Pure model for the player's manual quality (bitrate ceiling) selector.
+ * Pure model for the player's manual quality (resolution ceiling) selector.
  *
- * The backend accepts an optional `maxBitrate` (bps) on the playback session and
- * bootstrap requests and answers with a `bitrate` summary describing what it
- * actually decided. Everything here is display/URL derivation only: it never
+ * The backend accepts an optional `maxHeight` (pixels) on the playback session
+ * and bootstrap requests and answers with a `resolution` summary describing what
+ * it actually decided. Everything here is display/URL derivation only: it never
  * decides whether a source must be transcoded, it just proposes ceilings the
- * server is allowed to reject.
+ * server is allowed to reject (and no ceiling above the source can change the
+ * output).
  */
 
 /** Same inclusive range the API validates (`400 INVALID_REQUEST` outside it). */
-export const MAX_BITRATE_MIN = 100_000;
-export const MAX_BITRATE_MAX = 200_000_000;
+export const MAX_HEIGHT_MIN = 144;
+export const MAX_HEIGHT_MAX = 4320;
 
-/** Ceilings offered in the panel, highest first. */
-export const QUALITY_TIER_BPS = [
-  20_000_000,
-  8_000_000,
-  4_000_000,
-  2_000_000,
-  1_000_000,
-] as const;
+/** Resolution tiers offered in the panel, highest first. */
+export const QUALITY_RESOLUTION_TIERS = [2160, 1440, 1080, 720, 480, 360] as const;
 
 export type QualityOption = {
   /**
-   * Value written to the `maxBitrate` URL parameter. The empty string is the
+   * Value written to the `maxHeight` URL parameter. The empty string is the
    * automatic choice, which is expressed by an absent parameter.
    */
   value: string;
   label: string;
   /** `null` for the automatic choice. */
-  bitrate: number | null;
+  height: number | null;
   isCurrent: boolean;
 };
 
-/** Human readable rate; whole megabits drop the decimal so tiers read "4 Mbps". */
-export function qualityRateLabel(bitsPerSecond: number | null | undefined): string | null {
-  if (typeof bitsPerSecond !== "number" || !Number.isFinite(bitsPerSecond) || bitsPerSecond <= 0) {
-    return null;
-  }
-  if (bitsPerSecond < 1_000_000) return `${Math.round(bitsPerSecond / 1_000)} kbps`;
-  const megabits = bitsPerSecond / 1_000_000;
-  return Number.isInteger(megabits) ? `${megabits} Mbps` : `${megabits.toFixed(1)} Mbps`;
+/** Whole pixels; the 2160 tier is the familiar "4K" name, the rest read as `720p`. */
+export function resolutionLabel(height: number): string {
+  const rounded = Math.round(height);
+  return rounded >= 2160 ? `${rounded}p（4K）` : `${rounded}p`;
 }
 
-export function isValidMaxBitrate(value: number): boolean {
-  return Number.isInteger(value) && value >= MAX_BITRATE_MIN && value <= MAX_BITRATE_MAX;
+export function isValidMaxHeight(value: number): boolean {
+  return Number.isInteger(value) && value >= MAX_HEIGHT_MIN && value <= MAX_HEIGHT_MAX;
 }
 
 /**
- * Parses a `maxBitrate` URL value. An absent, blank or out-of-contract value is
+ * Parses a `maxHeight` URL value. An absent, blank or out-of-contract value is
  * treated as "no ceiling" so a hand-edited URL can never make the player send a
  * request the API would reject with 400.
  */
-export function parseMaxBitrateParam(value: string | null | undefined): number | null {
+export function parseMaxHeightParam(value: string | null | undefined): number | null {
   const trimmed = value?.trim();
   if (!trimmed) return null;
   const parsed = Number(trimmed);
-  return isValidMaxBitrate(parsed) ? parsed : null;
+  return isValidMaxHeight(parsed) ? parsed : null;
 }
 
 /**
  * Canonical URL form of a ceiling: an absent/blank/out-of-contract value is
- * `null` (no parameter), everything else is the decimal bps the API accepts.
- * The player's query keys and its cache predicates both use this form, so a
- * hand-written `maxBitrate=1e7` or `maxBitrate=%20100000%20` URL still matches
+ * `null` (no parameter), everything else is the decimal pixel height the API
+ * accepts. The player's query keys and its cache predicates both use this form,
+ * so a hand-written `maxHeight=1.08e3` or `maxHeight=%20720%20` URL still matches
  * the "current variant" slot instead of being mistaken for another variant.
  */
-export function canonicalMaxBitrateParam(value: string | null | undefined): string | null {
-  const parsed = parseMaxBitrateParam(value);
+export function canonicalMaxHeightParam(value: string | null | undefined): string | null {
+  const parsed = parseMaxHeightParam(value);
   return parsed === null ? null : String(parsed);
 }
 
 /**
- * STRM sources are Direct Play only; the API ignores `maxBitrate` for them, so
+ * STRM sources are Direct Play only; the API ignores `maxHeight` for them, so
  * the selector must not pretend the choice would change anything.
  */
 export function supportsQualitySelection(source: MediaSource | undefined): boolean {
   return source?.sourceKind !== "STRM_URL";
 }
 
-function sourceBitrateOf(source: MediaSource | undefined): number | null {
-  const bitrate = source?.bitrate;
-  return typeof bitrate === "number" && Number.isFinite(bitrate) && bitrate > 0 ? bitrate : null;
+/**
+ * The video stream height ffprobe recorded for `source`, or `null` when the
+ * probe never reported one. The Rust probe serializes ffprobe fields as-is
+ * (`details.Height`); a lower-case spelling is accepted for older payloads.
+ */
+export function sourceVideoHeight(source: MediaSource | undefined): number | null {
+  const video = source?.streams?.find((stream) => (stream.type ?? "").toUpperCase() === "VIDEO");
+  const raw = video?.details?.Height ?? video?.details?.height;
+  if (raw === undefined || raw === null || raw === "") return null;
+  const height = typeof raw === "number" ? raw : Number(raw);
+  return Number.isInteger(height) && height > 0 ? height : null;
+}
+
+function offeredTiers(sourceHeight: number | null): number[] {
+  return QUALITY_RESOLUTION_TIERS.filter(
+    (height) => sourceHeight === null || height < sourceHeight,
+  );
 }
 
 /**
- * Ceilings to offer for `source`. A known source bitrate only shows ceilings that
- * are actually lower, because capping above the source can never change the
- * output. An unknown (unprobed) source bitrate shows every tier — the server does
+ * Tiers to offer for `source`. A known source height only shows tiers that are
+ * actually lower, because capping at or above the source can never change the
+ * output. An unknown (unprobed) source height shows every tier — the server does
  * not upgrade either, but the choice is preserved for when it is probed.
  *
- * A previously selected ceiling is always kept selectable, even when it is above
- * the current source bitrate, so switching versions cannot silently rewrite the
- * user's URL choice.
+ * A selection the current source cannot offer (a saved ceiling above a newly
+ * switched, smaller source) is not rendered as a tier; `isCurrent` then falls
+ * back to the automatic choice, while the URL keeps the saved parameter until
+ * the user picks another option.
  */
 export function qualityOptions(
   source: MediaSource | undefined,
-  selectedMaxBitrate: number | null,
+  selectedMaxHeight: number | null,
 ): QualityOption[] {
-  const selected = selectedMaxBitrate !== null && isValidMaxBitrate(selectedMaxBitrate)
-    ? selectedMaxBitrate
+  const selected = selectedMaxHeight !== null && isValidMaxHeight(selectedMaxHeight)
+    ? selectedMaxHeight
     : null;
-  const automatic: QualityOption = {
-    value: "",
-    label: "原画（自动）",
-    bitrate: null,
-    isCurrent: selected === null,
-  };
-  if (!supportsQualitySelection(source)) return [automatic];
-  const sourceBitrate = sourceBitrateOf(source);
-  const tiers: number[] = QUALITY_TIER_BPS.filter(
-    (bitrate) => sourceBitrate === null || bitrate < sourceBitrate,
-  );
-  if (selected !== null && !tiers.includes(selected)) {
-    tiers.push(selected);
-    tiers.sort((left, right) => right - left);
+  if (!supportsQualitySelection(source)) {
+    return [{
+      value: "",
+      label: "原画（自动）",
+      height: null,
+      isCurrent: selected === null,
+    }];
   }
+  const tiers = offeredTiers(sourceVideoHeight(source));
+  const selectedIsOffered = selected !== null && tiers.includes(selected);
   return [
-    automatic,
-    ...tiers.map((bitrate) => ({
-      value: String(bitrate),
-      label: qualityRateLabel(bitrate) ?? String(bitrate),
-      bitrate,
-      isCurrent: bitrate === selected,
+    {
+      value: "",
+      label: "原画（自动）",
+      height: null,
+      isCurrent: !selectedIsOffered,
+    },
+    ...tiers.map((height) => ({
+      value: String(height),
+      label: resolutionLabel(height),
+      height,
+      isCurrent: height === selected,
     })),
   ];
 }
 
-/** A source with no ceiling below it has nothing to select besides "automatic". */
+/** A source with no lower tier has nothing to select besides "automatic". */
 export function shouldShowQualitySelector(options: readonly QualityOption[]): boolean {
-  return options.some((option) => option.bitrate !== null);
+  return options.some((option) => option.height !== null);
 }
 
-/** Position of the bitrate ceiling in the playback query keys. */
-export function bitrateParamFromQueryKey(key: readonly unknown[]): string {
+/** Position of the resolution ceiling in the playback query keys. */
+export function maxHeightParamFromQueryKey(key: readonly unknown[]): string {
   const value = key[5];
   return typeof value === "string" ? value : "default";
 }
@@ -143,55 +149,55 @@ export function bitrateParamFromQueryKey(key: readonly unknown[]): string {
 /**
  * Returns a copy of the current URL parameters with the new ceiling. The
  * automatic choice is represented by an absent parameter, so a refresh keeps
- * whichever option the user picked without a second source of truth.
+ * whichever option the user picked without a second source of truth. The legacy
+ * `maxBitrate` parameter is not read or written.
  */
 export function qualitySwitchParams(
   current: URLSearchParams,
-  maxBitrate: number | null,
+  maxHeight: number | null,
 ): URLSearchParams {
   const next = new URLSearchParams(current);
-  if (maxBitrate === null || !isValidMaxBitrate(maxBitrate)) next.delete("maxBitrate");
-  else next.set("maxBitrate", String(maxBitrate));
+  if (maxHeight === null || !isValidMaxHeight(maxHeight)) next.delete("maxHeight");
+  else next.set("maxHeight", String(maxHeight));
   return next;
 }
 
 /**
- * What the current session is actually doing, from the response `bitrate`
- * summary: `targetBitrate` is the video bitrate the server encodes at, so a
- * non-null target is the only honest "limited" claim.
+ * What the current session is actually doing, from the response `resolution`
+ * summary: a limited session reports the height it was scaled to, an unlimited
+ * one reports the source height. Without the block (or without a height) the
+ * player knows nothing about the effective output, so it stays neutral instead
+ * of claiming the ceiling was accepted.
  */
 export function qualityStatusText(
-  bitrate: WebPlaybackBitrate | null | undefined,
-  selectedMaxBitrate: number | null,
+  resolution: WebPlaybackResolution | null | undefined,
 ): string {
-  // Without the response block the player knows nothing about the effective
-  // output, not even that the ceiling was accepted: stay neutral instead of
-  // claiming the source rate is below it.
-  if (!bitrate) return "原画（自动）";
-  const target = qualityRateLabel(bitrate.targetBitrate);
-  if (bitrate.limited && target) return `已限制到 ${target}`;
-  if (selectedMaxBitrate !== null) {
-    // The server never upgrades an unprobed source, so the ceiling cannot have
-    // been exceeded — but saying "not exceeded" would claim knowledge we lack.
-    return bitrate.sourceBitrate === null
-      ? "原画（源码率未知，未触发限制）"
-      : "原画（源码率未超过所选上限）";
+  if (!resolution) return "原画（自动）";
+  if (resolution.limited) {
+    // The server says it scaled, so the target height is the only honest claim;
+    // without it the player must not fall back to the source height.
+    return resolution.targetHeight !== null
+      ? `已缩放到 ${resolution.targetHeight}p`
+      : "原画（自动）";
   }
-  return "原画（自动）";
+  const height = resolution.sourceHeight ?? resolution.targetHeight;
+  if (height === null) return "原画（自动）";
+  return `原画 ${height}p`;
 }
 
 /**
  * URL parameters for switching the played version: the manual ceiling is a
  * user-wide preference and survives the change, while per-source track choices
  * (`audioStreamIndex`, `subtitleStreamIndex`) do not, because stream indexes
- * belong to the media source that is being replaced.
+ * belong to the media source that is being replaced. The legacy `maxBitrate`
+ * parameter is dropped with them because the player no longer reads it.
  */
 export function sourceSwitchParams(
   sourceId: string,
   current: URLSearchParams,
 ): URLSearchParams {
   const next = new URLSearchParams({ sourceId });
-  const maxBitrate = canonicalMaxBitrateParam(current.get("maxBitrate"));
-  if (maxBitrate !== null) next.set("maxBitrate", maxBitrate);
+  const maxHeight = canonicalMaxHeightParam(current.get("maxHeight"));
+  if (maxHeight !== null) next.set("maxHeight", maxHeight);
   return next;
 }

@@ -1,136 +1,162 @@
 import { describe, expect, it } from "vitest";
-import type { MediaSource, WebPlaybackBitrate } from "../src/lib/api/types";
+import type { MediaSource, WebPlaybackResolution } from "../src/lib/api/types";
 import {
-  bitrateParamFromQueryKey,
-  canonicalMaxBitrateParam,
-  parseMaxBitrateParam,
+  canonicalMaxHeightParam,
+  maxHeightParamFromQueryKey,
+  parseMaxHeightParam,
   qualityOptions,
-  qualityRateLabel,
   qualityStatusText,
   qualitySwitchParams,
   shouldShowQualitySelector,
   sourceSwitchParams,
+  sourceVideoHeight,
   supportsQualitySelection,
 } from "../src/features/player/playback-quality";
 
-function source(bitrate: number | null | undefined, sourceKind = "LOCAL_FILE"): MediaSource {
-  return { id: "source-1", sourceKind, bitrate };
+function source(
+  height: number | string | null | undefined,
+  sourceKind = "LOCAL_FILE",
+): MediaSource {
+  return {
+    id: "source-1",
+    sourceKind,
+    streams: [
+      {
+        index: 0,
+        type: "VIDEO",
+        details: height === null || height === undefined ? {} : { Height: height },
+      },
+      { index: 1, type: "AUDIO", codec: "aac" },
+    ],
+  };
 }
 
-function bitrate(overrides: Partial<WebPlaybackBitrate> = {}): WebPlaybackBitrate {
+function resolution(overrides: Partial<WebPlaybackResolution> = {}): WebPlaybackResolution {
   return {
-    sourceBitrate: 12_000_000,
-    maxBitrate: null,
-    targetBitrate: null,
+    sourceHeight: 2160,
+    maxHeight: null,
+    targetHeight: null,
     limited: false,
     ...overrides,
   };
 }
 
-describe("player quality tiers", () => {
-  it("offers every tier when the source bitrate is unknown", () => {
-    const options = qualityOptions(source(null), 4_000_000);
+describe("player resolution tiers", () => {
+  it("offers every tier when the source height is unknown", () => {
+    const options = qualityOptions(source(null), 720);
 
     expect(options.map((option) => option.value)).toEqual([
       "",
-      "20000000",
-      "8000000",
-      "4000000",
-      "2000000",
-      "1000000",
+      "2160",
+      "1440",
+      "1080",
+      "720",
+      "480",
+      "360",
     ]);
-    expect(options[0]).toMatchObject({ label: "原画（自动）", bitrate: null, isCurrent: false });
-    expect(options[3]).toMatchObject({ label: "4 Mbps", bitrate: 4_000_000, isCurrent: true });
+    expect(options[0]).toMatchObject({ label: "原画（自动）", height: null, isCurrent: false });
+    expect(options[4]).toMatchObject({ label: "720p", height: 720, isCurrent: true });
+    expect(options[1]?.label).toBe("2160p（4K）");
   });
 
-  it("only offers tiers below a known source bitrate", () => {
-    expect(qualityOptions(source(12_000_000), null).map((option) => option.label))
-      .toEqual(["原画（自动）", "8 Mbps", "4 Mbps", "2 Mbps", "1 Mbps"]);
-    expect(qualityOptions(source(25_000_000), null).map((option) => option.label))
-      .toEqual(["原画（自动）", "20 Mbps", "8 Mbps", "4 Mbps", "2 Mbps", "1 Mbps"]);
-    expect(qualityOptions(source(4_000_000), null).map((option) => option.label))
-      .toEqual(["原画（自动）", "2 Mbps", "1 Mbps"]);
+  it("only offers tiers strictly below a known source height", () => {
+    expect(qualityOptions(source(2160), null).map((option) => option.label))
+      .toEqual(["原画（自动）", "1440p", "1080p", "720p", "480p", "360p"]);
+    expect(qualityOptions(source(1080), null).map((option) => option.label))
+      .toEqual(["原画（自动）", "720p", "480p", "360p"]);
+    expect(qualityOptions(source("720"), null).map((option) => option.label))
+      .toEqual(["原画（自动）", "480p", "360p"]);
   });
 
-  it("marks the automatic choice and keeps a stale selection visible", () => {
-    expect(qualityOptions(source(12_000_000), null)[0]?.isCurrent).toBe(true);
-    // A saved 8 Mbps choice stays selectable even if the current source is 4 Mbps:
-    // silently dropping it would rewrite the URL out from under the user.
-    const options = qualityOptions(source(4_000_000), 8_000_000);
-    expect(options.map((option) => option.value)).toContain("8000000");
-    expect(options.find((option) => option.value === "8000000")?.isCurrent).toBe(true);
+  it("marks the automatic choice and the selected tier", () => {
+    expect(qualityOptions(source(2160), null)[0]?.isCurrent).toBe(true);
+    const options = qualityOptions(source(2160), 720);
+    expect(options[0]?.isCurrent).toBe(false);
+    expect(options.find((option) => option.value === "720")?.isCurrent).toBe(true);
   });
 
-  it("never offers a higher tier than the source already delivers", () => {
-    const options = qualityOptions(source(5_000_000), null);
-    expect(options.some((option) => (option.bitrate ?? 0) >= 5_000_000)).toBe(false);
+  it("never offers the source height itself or anything above it", () => {
+    const options = qualityOptions(source(1080), null);
+    expect(options.some((option) => (option.height ?? 0) >= 1080)).toBe(false);
   });
 
-  it("hides the selector when there is nothing to cap", () => {
-    // 800 kbps source: every tier is above it, so only the automatic choice remains.
-    expect(qualityOptions(source(800_000), null).map((option) => option.label)).toEqual(["原画（自动）"]);
-    expect(shouldShowQualitySelector(qualityOptions(source(800_000), null))).toBe(false);
-    expect(shouldShowQualitySelector(qualityOptions(source(12_000_000), null))).toBe(true);
+  it("hides the selector when the source has no lower tier", () => {
+    expect(qualityOptions(source(360), null).map((option) => option.label)).toEqual(["原画（自动）"]);
+    expect(shouldShowQualitySelector(qualityOptions(source(360), null))).toBe(false);
+    expect(shouldShowQualitySelector(qualityOptions(source(1080), null))).toBe(true);
+    expect(shouldShowQualitySelector(qualityOptions(source(null), null))).toBe(true);
   });
 
-  it("formats rates without trailing zeros", () => {
-    expect(qualityRateLabel(20_000_000)).toBe("20 Mbps");
-    expect(qualityRateLabel(4_000_000)).toBe("4 Mbps");
-    expect(qualityRateLabel(3_500_000)).toBe("3.5 Mbps");
-    expect(qualityRateLabel(800_000)).toBe("800 kbps");
-    expect(qualityRateLabel(null)).toBeNull();
-    expect(qualityRateLabel(0)).toBeNull();
-    expect(qualityRateLabel(Number.NaN)).toBeNull();
+  it("reads the video stream height from the probe details", () => {
+    expect(sourceVideoHeight(source(2160))).toBe(2160);
+    expect(sourceVideoHeight(source("1080"))).toBe(1080);
+    expect(sourceVideoHeight({ ...source(720), streams: [{ index: 0, type: "VIDEO" }] })).toBeNull();
+    expect(sourceVideoHeight(source(0))).toBeNull();
+    expect(sourceVideoHeight(source("abc"))).toBeNull();
+    expect(sourceVideoHeight(undefined)).toBeNull();
   });
 });
 
-describe("player maxBitrate parameter", () => {
+describe("player maxHeight parameter", () => {
   it("accepts only the range the API validates", () => {
-    expect(parseMaxBitrateParam("4000000")).toBe(4_000_000);
-    expect(parseMaxBitrateParam(" 100000 ")).toBe(100_000);
-    expect(parseMaxBitrateParam("200000000")).toBe(200_000_000);
-    expect(parseMaxBitrateParam("")).toBeNull();
-    expect(parseMaxBitrateParam(null)).toBeNull();
-    expect(parseMaxBitrateParam("99999")).toBeNull();
-    expect(parseMaxBitrateParam("200000001")).toBeNull();
-    expect(parseMaxBitrateParam("4.5")).toBeNull();
-    expect(parseMaxBitrateParam("abc")).toBeNull();
+    expect(parseMaxHeightParam("720")).toBe(720);
+    expect(parseMaxHeightParam(" 144 ")).toBe(144);
+    expect(parseMaxHeightParam("4320")).toBe(4320);
+    expect(parseMaxHeightParam("")).toBeNull();
+    expect(parseMaxHeightParam(null)).toBeNull();
+    expect(parseMaxHeightParam("143")).toBeNull();
+    expect(parseMaxHeightParam("4321")).toBeNull();
+    expect(parseMaxHeightParam("1080.5")).toBeNull();
+    expect(parseMaxHeightParam("abc")).toBeNull();
   });
 
-  it("writes the cap to the URL and removes it for the automatic choice", () => {
+  it("writes the ceiling to the URL and removes it for the automatic choice", () => {
     const current = new URLSearchParams({ sourceId: "source-1", audioStreamIndex: "2" });
 
-    const capped = qualitySwitchParams(current, 4_000_000);
-    expect(capped.get("maxBitrate")).toBe("4000000");
+    const capped = qualitySwitchParams(current, 720);
+    expect(capped.get("maxHeight")).toBe("720");
     expect(capped.get("sourceId")).toBe("source-1");
     expect(capped.get("audioStreamIndex")).toBe("2");
     // The input parameters are not mutated.
-    expect(current.get("maxBitrate")).toBeNull();
+    expect(current.get("maxHeight")).toBeNull();
 
     const automatic = qualitySwitchParams(capped, null);
-    expect(automatic.get("maxBitrate")).toBeNull();
+    expect(automatic.get("maxHeight")).toBeNull();
     expect(automatic.get("audioStreamIndex")).toBe("2");
+  });
+
+  it("does not read or write the legacy maxBitrate parameter", () => {
+    const current = new URLSearchParams({ sourceId: "source-1", maxBitrate: "4000000" });
+
+    // The legacy parameter is ignored: it is neither rewritten nor removed here.
+    expect(qualitySwitchParams(current, 720).get("maxBitrate")).toBe("4000000");
+    expect(qualitySwitchParams(current, 720).get("maxHeight")).toBe("720");
+
+    const switched = sourceSwitchParams("source-2", current);
+    expect(switched.get("maxHeight")).toBeNull();
+    // A fresh source URL never carries the legacy ceiling.
+    expect(switched.get("maxBitrate")).toBeNull();
   });
 
   it("canonicalizes hand-written URL forms for cache variant matching", () => {
     // Query keys store the parsed number, so padded or exponent notation must be
     // reduced to the same string or the current variant looks like "another" one.
-    expect(canonicalMaxBitrateParam(" 100000 ")).toBe("100000");
-    expect(canonicalMaxBitrateParam("1e7")).toBe("10000000");
-    expect(canonicalMaxBitrateParam("+4000000")).toBe("4000000");
-    expect(canonicalMaxBitrateParam("100000.0")).toBe("100000");
-    expect(canonicalMaxBitrateParam("")).toBeNull();
-    expect(canonicalMaxBitrateParam(null)).toBeNull();
-    expect(canonicalMaxBitrateParam("1e9")).toBeNull();
-    expect(canonicalMaxBitrateParam("abc")).toBeNull();
+    expect(canonicalMaxHeightParam(" 720 ")).toBe("720");
+    expect(canonicalMaxHeightParam("1.08e3")).toBe("1080");
+    expect(canonicalMaxHeightParam("+480")).toBe("480");
+    expect(canonicalMaxHeightParam("720.0")).toBe("720");
+    expect(canonicalMaxHeightParam("")).toBeNull();
+    expect(canonicalMaxHeightParam(null)).toBeNull();
+    expect(canonicalMaxHeightParam("1e9")).toBeNull();
+    expect(canonicalMaxHeightParam("abc")).toBeNull();
   });
 
-  it("keeps the ceiling when switching the played version", () => {
+  it("keeps the resolution ceiling when switching the played version", () => {
     const current = new URLSearchParams({
       sourceId: "source-a",
       audioStreamIndex: "2",
       subtitleStreamIndex: "7",
-      maxBitrate: "1e7",
+      maxHeight: "1.08e3",
     });
 
     const switched = sourceSwitchParams("source-b", current);
@@ -138,59 +164,57 @@ describe("player maxBitrate parameter", () => {
     // Stream indexes belong to the source being replaced; the ceiling does not.
     expect(switched.get("audioStreamIndex")).toBeNull();
     expect(switched.get("subtitleStreamIndex")).toBeNull();
-    expect(switched.get("maxBitrate")).toBe("10000000");
-
-    expect(sourceSwitchParams("source-b", new URLSearchParams()).get("maxBitrate")).toBeNull();
+    expect(switched.get("maxHeight")).toBe("1080");
   });
 
-  it("reads the cap from both playback query key layouts", () => {
-    expect(bitrateParamFromQueryKey(
-      ["playback-bootstrap", "item", "source", "2", "7", "4000000", 0],
-    )).toBe("4000000");
-    expect(bitrateParamFromQueryKey(
-      ["web-playback-session", "item", "source", "2", "7", "4000000", 1],
-    )).toBe("4000000");
-    expect(bitrateParamFromQueryKey(
+  it("reads the ceiling from both playback query key layouts", () => {
+    expect(maxHeightParamFromQueryKey(
+      ["playback-bootstrap", "item", "source", "2", "7", "720", 0],
+    )).toBe("720");
+    expect(maxHeightParamFromQueryKey(
+      ["web-playback-session", "item", "source", "2", "7", "720", 1],
+    )).toBe("720");
+    expect(maxHeightParamFromQueryKey(
       ["web-playback-session", "item", "source", "2", "7", "default", 1],
     )).toBe("default");
   });
 });
 
 describe("player quality status", () => {
-  it("reports the effective limit from the session response", () => {
-    expect(qualityStatusText(bitrate({ maxBitrate: 4_000_000, targetBitrate: 4_000_000, limited: true }), 4_000_000))
-      .toBe("已限制到 4 Mbps");
-    expect(qualityStatusText(bitrate({ targetBitrate: 3_500_000, limited: true }), 4_000_000))
-      .toBe("已限制到 3.5 Mbps");
-    // The administrator cap limits the output even without a user choice.
-    expect(qualityStatusText(bitrate({ maxBitrate: null, targetBitrate: 8_000_000, limited: true }), null))
-      .toBe("已限制到 8 Mbps");
+  it("reports the effective downscale from the session response", () => {
+    expect(qualityStatusText(resolution({ maxHeight: 720, targetHeight: 720, limited: true })))
+      .toBe("已缩放到 720p");
+    expect(qualityStatusText(resolution({ maxHeight: 1080, targetHeight: 1080, limited: true })))
+      .toBe("已缩放到 1080p");
   });
 
-  it("stays neutral when the server does not report a bitrate block", () => {
-    // An older server sends no `bitrate` at all: the player cannot claim the
-    // ceiling was accepted or that the source rate is below it.
-    expect(qualityStatusText(undefined, 4_000_000)).toBe("原画（自动）");
-    expect(qualityStatusText(null, 2_000_000)).toBe("原画（自动）");
+  it("reports the original stream when nothing was scaled", () => {
+    expect(qualityStatusText(resolution({ sourceHeight: 1080 }))).toBe("原画 1080p");
+    expect(qualityStatusText(resolution({ sourceHeight: 2160, targetHeight: 2160 })))
+      .toBe("原画 2160p");
   });
 
-  it("reports the original stream when nothing is capped", () => {
-    expect(qualityStatusText(bitrate(), null)).toBe("原画（自动）");
-    expect(qualityStatusText(undefined, null)).toBe("原画（自动）");
-    expect(qualityStatusText(bitrate({ maxBitrate: 4_000_000 }), 4_000_000))
-      .toBe("原画（源码率未超过所选上限）");
-    // An unprobed source never triggers an upgrade, so the ceiling is not
-    // exceeded — and the wording must not claim the source rate is known.
-    expect(qualityStatusText(bitrate({ sourceBitrate: null, maxBitrate: 4_000_000 }), 4_000_000))
-      .toBe("原画（源码率未知，未触发限制）");
+  it("stays neutral when the server does not report a resolution block", () => {
+    // An older server sends no `resolution` at all: the player cannot claim the
+    // ceiling was accepted or which height is playing.
+    expect(qualityStatusText(undefined)).toBe("原画（自动）");
+    expect(qualityStatusText(null)).toBe("原画（自动）");
+    // Individual fields can be null too; without a height there is nothing to claim.
+    expect(qualityStatusText(resolution({ sourceHeight: null, targetHeight: null })))
+      .toBe("原画（自动）");
+    expect(qualityStatusText(resolution({ sourceHeight: null, maxHeight: 720, limited: true })))
+      .toBe("原画（自动）");
+    // `limited` without a target height must not be reported as "原画 <source>".
+    expect(qualityStatusText(resolution({ sourceHeight: 2160, maxHeight: 720, limited: true })))
+      .toBe("原画（自动）");
   });
 });
 
 describe("player quality availability", () => {
-  it("does not offer a cap for STRM sources", () => {
-    expect(supportsQualitySelection(source(12_000_000))).toBe(true);
-    expect(supportsQualitySelection(source(12_000_000, "STRM_URL"))).toBe(false);
+  it("does not offer a resolution ceiling for STRM sources", () => {
+    expect(supportsQualitySelection(source(2160))).toBe(true);
+    expect(supportsQualitySelection(source(2160, "STRM_URL"))).toBe(false);
     expect(supportsQualitySelection(undefined)).toBe(true);
-    expect(shouldShowQualitySelector(qualityOptions(source(12_000_000, "STRM_URL"), null))).toBe(false);
+    expect(shouldShowQualitySelector(qualityOptions(source(2160, "STRM_URL"), null))).toBe(false);
   });
 });

@@ -9,7 +9,7 @@ import type {
   WebPlaybackRequestSelection,
   WebPlaybackSession,
 } from "../../lib/api/types";
-import { parseMaxBitrateParam } from "./playback-quality";
+import { parseMaxHeightParam } from "./playback-quality";
 import { webPlaybackCapabilities } from "./playback-capabilities";
 import { episodeNavigationFor } from "./player-page-helpers";
 import type { PlayerEpisodeNavigation } from "./components/player-controls";
@@ -19,7 +19,7 @@ type PlayerPlaybackSessionOptions = {
   requestedSourceId: string | null;
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
-  requestedMaxBitrate: string | null;
+  requestedMaxHeight: string | null;
   playbackAttempt: number;
   /**
    * The previous native Direct Play attempt decoded no audio at all, so the fallback request must
@@ -60,25 +60,25 @@ export function usePlayerPlaybackSession({
   requestedSourceId,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
-  requestedMaxBitrate,
+  requestedMaxHeight,
   playbackAttempt,
   forceAudioTranscode = false,
 }: PlayerPlaybackSessionOptions): PlayerPlaybackSession {
   // Out-of-contract URL values are dropped instead of being sent: the API
   // rejects them with 400 and the player would have no recoverable UI state.
-  const maxBitrate = parseMaxBitrateParam(requestedMaxBitrate);
+  const maxHeight = parseMaxHeightParam(requestedMaxHeight);
   const requestSelection = useMemo<WebPlaybackRequestSelection | undefined>(() => {
     const audioStreamIndex = requestedAudioStreamIndex?.trim() ? Number(requestedAudioStreamIndex) : undefined;
     const subtitleStreamIndex = requestedSubtitleStreamIndex?.trim() ? Number(requestedSubtitleStreamIndex) : undefined;
-    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex) || maxBitrate !== null
+    return Number.isInteger(audioStreamIndex) || Number.isInteger(subtitleStreamIndex) || maxHeight !== null
       ? {
         ...(Number.isInteger(audioStreamIndex) ? { audioStreamIndex } : {}),
         ...(Number.isInteger(subtitleStreamIndex) ? { subtitleStreamIndex } : {}),
-        ...(maxBitrate !== null ? { maxBitrate } : {}),
+        ...(maxHeight !== null ? { maxHeight } : {}),
       }
       : undefined;
-  }, [maxBitrate, requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
-  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${maxBitrate ?? ""}:${playbackAttempt}`;
+  }, [maxHeight, requestedAudioStreamIndex, requestedSubtitleStreamIndex]);
+  const bootstrapKey = `${itemId}:${requestedSourceId ?? ""}:${requestedAudioStreamIndex ?? ""}:${maxHeight ?? ""}:${playbackAttempt}`;
   const [sessionGateKey, setSessionGateKey] = useState(bootstrapKey);
 
   const playbackBootstrap = usePlaybackBootstrapQuery({
@@ -86,7 +86,7 @@ export function usePlayerPlaybackSession({
     requestedSourceId,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
-    maxBitrate,
+    maxHeight,
     playbackAttempt,
     requestSelection,
     bootstrapKey,
@@ -126,7 +126,7 @@ export function usePlayerPlaybackSession({
   const playbackKeySourceId = playbackAttempt === 0 && !requestedSourceId
     ? ""
     : source?.id ?? requestedSourceId ?? "";
-  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${maxBitrate ?? ""}:${playbackAttempt}`;
+  const playbackKey = `${itemId}:${playbackKeySourceId}:${requestedAudioStreamIndex ?? ""}:${maxHeight ?? ""}:${playbackAttempt}`;
   const sessionStartedRef = useRef(false);
   const playbackSessionIdRef = useRef<string | null>(null);
   const webPlaybackSession = useWebPlaybackSessionQuery({
@@ -135,7 +135,7 @@ export function usePlayerPlaybackSession({
     playbackAttempt,
     requestedAudioStreamIndex,
     requestedSubtitleStreamIndex,
-    maxBitrate,
+    maxHeight,
     requestSelection,
     useLegacyPlaybackQueries,
     playbackKey,
@@ -172,8 +172,8 @@ export function usePlayerPlaybackSession({
   };
 }
 
-type BootstrapQueryOptions = Omit<PlayerPlaybackSessionOptions, "requestedMaxBitrate"> & {
-  maxBitrate: number | null;
+type BootstrapQueryOptions = Omit<PlayerPlaybackSessionOptions, "requestedMaxHeight"> & {
+  maxHeight: number | null;
   requestSelection: WebPlaybackRequestSelection | undefined;
   bootstrapKey: string;
   sessionGateKey: string;
@@ -184,7 +184,7 @@ function usePlaybackBootstrapQuery({
   requestedSourceId,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
-  maxBitrate,
+  maxHeight,
   playbackAttempt,
   requestSelection,
   bootstrapKey,
@@ -198,7 +198,7 @@ function usePlaybackBootstrapQuery({
       playbackAttempt,
       requestedAudioStreamIndex,
       requestedSubtitleStreamIndex,
-      maxBitrate,
+      maxHeight,
     ),
     queryFn: ({ signal }) => api.createWebPlaybackBootstrap(
       itemId,
@@ -236,7 +236,7 @@ type WebPlaybackSessionQueryOptions = {
   playbackAttempt: number;
   requestedAudioStreamIndex: string | null;
   requestedSubtitleStreamIndex: string | null;
-  maxBitrate: number | null;
+  maxHeight: number | null;
   requestSelection: WebPlaybackRequestSelection | undefined;
   useLegacyPlaybackQueries: boolean;
   playbackKey: string;
@@ -252,7 +252,7 @@ function useWebPlaybackSessionQuery({
   playbackAttempt,
   requestedAudioStreamIndex,
   requestedSubtitleStreamIndex,
-  maxBitrate,
+  maxHeight,
   requestSelection,
   useLegacyPlaybackQueries,
   playbackKey,
@@ -271,7 +271,7 @@ function useWebPlaybackSessionQuery({
       playbackAttempt,
       requestedAudioStreamIndex,
       requestedSubtitleStreamIndex,
-      maxBitrate,
+      maxHeight,
     ),
     queryFn: ({ signal }) => api.createWebPlaybackSession(
       itemId,
