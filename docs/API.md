@@ -377,9 +377,9 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
 签名只绑定当前会话、资源名称和过期时间，不能被改用于其他会话、媒体源或路径。
 
 - `POST /api/v1/playback/sessions`：创建一次播放计划。请求体为
-  `{ "itemId": "...", "sourceId": "...", "maxBitrate": 4000000, "capabilities": { "directPlay": true, "hls": true, "videoCopyToFmp4": true, "audioCopyToFmp4": true, "hardwareTranscode": false, "softwareTranscode": true } }`。
+  `{ "itemId": "...", "sourceId": "...", "maxBitrate": 4000000, "maxHeight": 1080, "capabilities": { "directPlay": true, "hls": true, "videoCopyToFmp4": true, "audioCopyToFmp4": true, "hardwareTranscode": false, "softwareTranscode": true } }`。
   服务端先检查条目/媒体库 ACL，再按 0→4 选择最低成本计划。响应包含 `sessionId`、`playSessionId`、`tier`、
-  `expiresAt`、`sourceId`、`bitrate` 和 `plan`。`plan.type` 为 `DIRECT`、`SERVER_HLS` 或 `UNSUPPORTED`；后者带稳定的
+  `expiresAt`、`sourceId`、`bitrate`、`resolution` 和 `plan`。`plan.type` 为 `DIRECT`、`SERVER_HLS` 或 `UNSUPPORTED`；后者带稳定的
   `reason`，且不会创建播放会话或 FFmpeg 进程。
 - `maxBitrate`（可选，单位 bps，允许 100000～200000000）：用户选择的单路输出码率上限。缺省表示不限制。
   源码率（`media_sources.bitrate`，由 ffprobe 记录）不超过上限时决策与原来完全一致；超过上限时 Direct Play、
@@ -388,13 +388,28 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
   `UNSUPPORTED` 规则返回：不可用 HLS 为 `BROWSER_CANNOT_CONSUME_HLS`，没有可用的重编码档位为
   `NO_COMPATIBLE_SERVER_PLAN`；用户策略禁止所需档位时返回 403 `PERMISSION_DENIED`。`.strm` 继续只允许 Direct
   Play，该字段被忽略。值越界返回 400 `INVALID_REQUEST`。
+- `maxHeight`（可选，单位像素，允许 144～4320）：用户选择的分辨率上限，通常对应前端画质菜单里的 `360p`/`480p`/
+  `720p`/`1080p`/`1440p` 等选项。源视频高度已知且高于上限时，Direct Play、Remux 和音频转码都会升级为可重编码的
+  最低成本档位（优先档位 3，其次档位 4），并以 `scale=-2:min(ih\,maxHeight)` 输出；该值与管理员
+  `encoding.max_output_height` 取较小者，硬件转码路径把它放在 hwupload 之前组合成一个滤镜链。源高度未知（未探测）
+  或不高于上限时决策与原来完全一致，绝不因分辨率而升级。`maxBitrate` 保持兼容，可与 `maxHeight` 同时给出，
+  两者取更严格者。只按分辨率限制时，服务端按目标高度推导 `-b:v`：≤360→1 Mbps、≤480→2 Mbps、≤720→4 Mbps、
+  ≤1080→8 Mbps、≤1440→12 Mbps、其余→20 Mbps，再与源码率（不得高于源）、管理员码率上限和显式 `maxBitrate`
+  取最小。上限无法满足时按既有 `UNSUPPORTED` 原因返回，用户策略禁止所需档位时返回 403 `PERMISSION_DENIED`。
+  `.strm` 继续只允许 Direct Play，该字段被忽略。值越界返回 400 `INVALID_REQUEST`。
 - 响应中的 `bitrate` 描述实际生效的决策：`sourceBitrate`（源码率，未探测为 `null`）、`maxBitrate`（请求的上限，
   未提供为 `null`）、`targetBitrate`（服务端实际编码的视频码率，Direct/Remux/音频转码等拷贝视频的档位为
   `null`）、`limited`（输出是否受码率上限约束）。`targetBitrate` 就是 FFmpeg 实际使用的 `-b:v`：用户上限与
   管理员配置的码率上限取较小值，没有用户上限时只受管理员上限约束（此时 `maxBitrate` 为 `null` 但
   `targetBitrate` 仍有值），两者都没有时为空。前端据此显示「原画」或「已限制到 X」。同一值写入会话输出描述，
   `GET /api/v1/playback/sessions/{sessionId}/stats` 的 `output.videoBitrate` 与之一致。
-- `POST /api/v1/playback/bootstrap` 接受与创建会话相同的 `maxBitrate`，语义一致。
+- `resolution` 描述分辨率上限实际生效的决策：`sourceHeight`（源视频高度，来自已落库的 `media_streams.details_json`
+  里第一条视频流的 `Height`，未探测为 `null`）、`maxHeight`（请求的上限，未提供为 `null`）、`targetHeight`（实际输出
+  高度：源高度、请求上限与管理员 `encoding.max_output_height` 三者已知值中的最小值；未发生重编码时管理员上限不参与，
+  因为拷贝视频的档位保持源画面）、`limited`（是否因本字段真正发生了缩放/升级；源高度未知、源不高于上限或最终为
+  `UNSUPPORTED` 时都是 `false`）。`stats.output` 的 `videoWidth`/`videoHeight` 描述同一画面，按运行中会话捕获的缩放
+  上限折算；`videoWidth` 由 `scale=-2` 的等比规则推导，可能与 FFmpeg 的实际取整差一步。
+- `POST /api/v1/playback/bootstrap` 接受与创建会话相同的 `maxBitrate` 与 `maxHeight`，语义一致。
 - `DIRECT` 计划除 `url`、`proxyUrl`、`rangeUrl`（旧字段，保留一个版本）外还带有序的 `candidates`：
   `[{ "kind": "proxy|lux|origin", "url": "..." }]`。`proxy` 是标准 Emby `/Videos/{id}/stream?MediaSourceId=...` 入口，
   带 `PlaySessionId`、`DeviceId`、`UserId`、`static=true`，以及一个播放专用短期 `api_key`（`luxpb_{条目}_{随机串}`），
@@ -414,7 +429,8 @@ Web 播放使用独立于 Emby 的播放会话 API。创建和状态写入接口
 - `POST /api/v1/playback/sessions/{sessionId}/heartbeat`：延长活动会话 TTL，返回新的 `expiresAt`。
 - `GET /api/v1/playback/sessions/{sessionId}/stats`：只读播放统计，供电播放信息面板使用。只允许会话所属用户，
   他人会话、不存在或已过期会话返回 404；`GET` 不写库、不续租、不启动 FFmpeg。响应包含 `plan`、`tier`、
-  `state`、`expiresAt`、`output`（`container`、`videoCodec`、`audioCodec`、`videoBitrate`、`audioBitrate`）
+  `state`、`expiresAt`、`output`（`container`、`videoCodec`、`audioCodec`、`videoBitrate`、`audioBitrate`、
+  `videoWidth`、`videoHeight`）
   和 `progress`。`progress` 只在服务端 HLS 有 FFmpeg 进程时非空，字段为 `fps`、`speed`、`bitrateKbps`、
   `totalSize`、`outTimeSeconds`、`duplicatedFrames`、`droppedFrames`、`finished`、`updatedAt`（毫秒时间戳），
   数据来自 FFmpeg `-progress pipe:1`，约每 0.5 秒刷新，不代表整段媒体的最终统计。HLS 封装下 FFmpeg 通常把
