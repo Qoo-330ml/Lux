@@ -586,11 +586,9 @@ export function PlayerPage() {
     const sessionNotice = sessionError instanceof ApiError
       ? playbackNoticeFor({ status: sessionError.status, errorCode: sessionError.code })
       : null;
-    const sessionFailure = sessionNotice
-      ? null
-      : sessionError instanceof ApiError && [401, 403, 410].includes(sessionError.status)
-        ? classifyPlayerEngineFailure(sessionError, sessionError.status)
-        : playerFailure("SERVER_PLAN_FAILED");
+    // Every status this page can name (401/403/404/410/502/503/400) already produces a notice, so
+    // an unknown rejection is the only case that still needs the generic plan-failure copy.
+    const sessionFailure = sessionNotice ? null : playerFailure("SERVER_PLAN_FAILED");
     return (
       <PlayerErrorState
         title={sessionNotice?.title ?? sessionFailure?.title ?? ""}
