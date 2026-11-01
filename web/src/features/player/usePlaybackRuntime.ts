@@ -16,6 +16,10 @@ import { LegacyPlaybackEngineAdapter } from "./core/legacy-engine-adapter";
 import { LuxPlayerRuntime } from "./core/player-runtime";
 import { classifyPlayerEngineFailure } from "./components/player-diagnostics";
 import { createPlaybackTimelineScheduler } from "./player-timeline-scheduler";
+import {
+  attemptAutoStartPlayback,
+  createAutoStartPlaybackGate,
+} from "./player-autostart";
 import { TICKS_PER_SECOND, isMatroskaSource, useClientEngine } from "./player-page-helpers";
 import type { PlaybackReporting } from "./usePlaybackReporting";
 
@@ -63,6 +67,8 @@ type PlaybackRuntimeOptions = {
   markStarted: () => void;
   /** Playback reached the media end without looping; the page decides what is next. */
   onPlaybackEnded?: () => void;
+  /** One-shot request: start playing once this session finished loading. */
+  autoStartPlayback?: boolean;
   requestServerFallback: (reason?: unknown) => Promise<void>;
   setCurrentTime: (value: number) => void;
   setDuration: (value: number) => void;
@@ -108,6 +114,7 @@ export function usePlaybackRuntime({
   stopActiveSession,
   markStarted,
   onPlaybackEnded,
+  autoStartPlayback,
   requestServerFallback,
   setCurrentTime,
   setDuration,
@@ -125,10 +132,17 @@ export function usePlaybackRuntime({
   // The ended callback is read through a ref so a changing page callback never
   // re-runs the engine loading effect below.
   const onPlaybackEndedRef = useRef(onPlaybackEnded);
+  // The auto start request survives the page stripping the router marker right
+  // after mount, and is consumed once so a source switch does not replay it.
+  const autoStartGateRef = useRef(createAutoStartPlaybackGate(autoStartPlayback === true));
 
   useEffect(() => {
     onPlaybackEndedRef.current = onPlaybackEnded;
   }, [onPlaybackEnded]);
+
+  useEffect(() => {
+    if (autoStartPlayback) autoStartGateRef.current.request();
+  }, [autoStartPlayback]);
 
   const restorePlaybackPosition = useCallback(() => {
     if (hasRestoredPositionRef.current) return;
@@ -355,6 +369,11 @@ export function usePlaybackRuntime({
           },
         );
         if (!cancelled) await restoreEngineHandoff();
+        if (!cancelled && autoStartGateRef.current.consume()) {
+          // A rejected play() (browser autoplay policy) leaves the player paused on
+          // the normal play affordance instead of surfacing a playback failure.
+          await attemptAutoStartPlayback(() => runtime.play());
+        }
         if (!cancelled && activeEngine.performance)
           handlePerformance(
             new CustomEvent(PLAYBACK_PERFORMANCE_EVENT, {

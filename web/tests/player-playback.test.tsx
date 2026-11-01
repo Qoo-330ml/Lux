@@ -33,6 +33,11 @@ function CurrentPath() {
   return <output data-testid="current-path">{useLocation().pathname}</output>;
 }
 
+function RouteStateProbe() {
+  const location = useLocation();
+  return <output data-testid="route-state">{location.state ? "present" : "cleared"}</output>;
+}
+
 describe("PlayerPage playback synchronization", () => {
   let container: HTMLDivElement | undefined;
   let root: Root | undefined;
@@ -57,6 +62,7 @@ describe("PlayerPage playback synchronization", () => {
     vi.spyOn(api, "stopWebPlaybackSession").mockResolvedValue(undefined);
     vi.spyOn(HTMLMediaElement.prototype, "load").mockImplementation(() => undefined);
     vi.spyOn(HTMLMediaElement.prototype, "pause").mockImplementation(() => undefined);
+    vi.spyOn(HTMLMediaElement.prototype, "play").mockResolvedValue(undefined);
   });
 
   afterEach(() => {
@@ -1291,6 +1297,11 @@ describe("PlayerPage playback synchronization", () => {
     if (!playNow) throw new Error("auto play next card was not rendered");
     await act(async () => playNow.click());
     expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/episode-2");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    // The countdown jump carries the one-shot marker, so the next episode starts by itself.
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
   });
 
   it("keeps a movie without a next episode free of the countdown card", async () => {
@@ -1408,6 +1419,10 @@ describe("PlayerPage playback synchronization", () => {
     if (!skipCredits) throw new Error("skip credits control was not rendered");
     await act(async () => skipCredits.click());
     expect(container.querySelector('[data-testid="current-path"]')?.textContent).toBe("/watch/credits-episode-2");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
 
     await act(async () => root?.unmount());
     root = undefined;
@@ -1446,5 +1461,131 @@ describe("PlayerPage playback synchronization", () => {
     if (!movieSkip) throw new Error("movie skip credits control was not rendered");
     await act(async () => movieSkip.click());
     expect(movieVideo.currentTime).toBe(119);
+  });
+
+  it("auto starts playback when the route carries the one-shot marker", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-auto-1",
+      title: "自动起播第一集",
+      itemType: "EPISODE",
+      seriesId: "series-auto",
+      parentId: "season-auto",
+      indexNumber: 1,
+      mediaSources: [{ id: "auto-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/episode-auto-1",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<><PlayerPage /><RouteStateProbe /></>} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+    expect(container.querySelector('[data-testid="route-state"]')?.textContent).toBe("cleared");
+  });
+
+  it("does not start playback without the marker", async () => {
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-manual-1",
+      title: "手动起播第一集",
+      itemType: "EPISODE",
+      seriesId: "series-manual",
+      parentId: "season-manual",
+      indexNumber: 1,
+      mediaSources: [{ id: "manual-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter initialEntries={["/watch/episode-manual-1"]}>
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).not.toHaveBeenCalled();
+    expect(container.querySelector('[aria-label="播放"]')).not.toBeNull();
+  });
+
+  it("keeps a paused, manually playable player when the browser blocks auto start", async () => {
+    vi.mocked(HTMLMediaElement.prototype.play).mockRejectedValue(
+      new DOMException("play() failed because the user didn't interact", "NotAllowedError"),
+    );
+    vi.spyOn(api, "item").mockResolvedValue({
+      id: "episode-blocked-1",
+      title: "被拦截自动起播",
+      itemType: "EPISODE",
+      seriesId: "series-blocked",
+      parentId: "season-blocked",
+      indexNumber: 1,
+      mediaSources: [{ id: "blocked-source-1", isDefault: true }],
+    });
+    vi.spyOn(api, "playback").mockResolvedValue({ positionTicks: 0, isPlayed: false, state: null, isPaused: false });
+    vi.spyOn(api, "children").mockResolvedValue({ items: [] });
+
+    container = document.createElement("div");
+    document.body.append(container);
+    root = createRoot(container);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    await act(async () => {
+      root?.render(
+        <QueryClientProvider client={queryClient}>
+          <MemoryRouter
+            initialEntries={[{
+              pathname: "/watch/episode-blocked-1",
+              state: { luxAutoStartPlayback: true },
+            }]}
+          >
+            <Routes>
+              <Route path="watch/:itemId" element={<PlayerPage />} />
+            </Routes>
+          </MemoryRouter>
+        </QueryClientProvider>,
+      );
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalled();
+    expect(container.querySelector('[role="alert"]')).toBeNull();
+    const manualPlay = container.querySelector<HTMLButtonElement>('[aria-label="播放"]');
+    expect(manualPlay).not.toBeNull();
+    vi.mocked(HTMLMediaElement.prototype.play).mockResolvedValue(undefined);
+    await act(async () => manualPlay?.click());
+    expect(HTMLMediaElement.prototype.play).toHaveBeenCalledTimes(2);
   });
 });

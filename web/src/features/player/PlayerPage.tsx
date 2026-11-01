@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError } from "../../lib/api/client";
 import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
@@ -48,6 +48,7 @@ import { PlayerMiniProgressBar } from "./components/player-mini-progress";
 import { PlayerAutoNextCard } from "./components/player-auto-next-card";
 import { normalizePlayerChapters } from "./player-chapters";
 import { creditsSkipAction, creditsStartSeconds } from "./player-autoplay";
+import { requestsAutoStartPlayback } from "./player-autostart";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -71,6 +72,7 @@ export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const [playing, setPlaying] = useState(false);
   const [playbackAttempt, setPlaybackAttempt] = useState(0);
@@ -98,6 +100,14 @@ export function PlayerPage() {
   const durationRef = useRef(0);
   const bufferedEndRef = useRef(0);
   const engineRef = useRef<PlaybackEngine | null>(null);
+
+  // The automatic episode jumps carry a one-shot marker. It is stripped right
+  // after mount so a refresh or a later source switch cannot replay it.
+  const autoStartPlayback = requestsAutoStartPlayback(location.state);
+  useEffect(() => {
+    if (!autoStartPlayback) return;
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [autoStartPlayback, location.pathname, location.search, navigate]);
 
   const requestedSourceId = searchParams.get("sourceId");
   const requestedAudioStreamIndex = searchParams.get("audioStreamIndex");
@@ -266,7 +276,7 @@ export function PlayerPage() {
   const { autoPlayEnabled, setAutoPlayEnabled } = useAutoPlayNextPreference();
   const { handleBack, navigateToEpisode } = usePlayerNavigation({
     itemId,
-    navigate: (to) => navigate(to as never),
+    navigate: (to, options) => navigate(to as never, options as never),
     setShowSettings,
   });
   const {
@@ -278,7 +288,7 @@ export function PlayerPage() {
     playbackKey,
     nextEpisodeId,
     enabled: autoPlayEnabled,
-    onNavigateNextEpisode: navigateToEpisode,
+    onNavigateNextEpisode: (episodeId) => navigateToEpisode(episodeId, { autoStart: true }),
   });
 
   const handleSkipCredits = useCallback(() => {
@@ -289,7 +299,7 @@ export function PlayerPage() {
     });
     if (!action) return;
     if (action.kind === "next-episode") {
-      if (nextEpisodeId) navigateToEpisode(nextEpisodeId);
+      if (nextEpisodeId) navigateToEpisode(nextEpisodeId, { autoStart: true });
       return;
     }
     seekTo(action.seconds);
@@ -430,6 +440,7 @@ export function PlayerPage() {
     stopActiveSession,
     markStarted,
     onPlaybackEnded: handlePlaybackEnded,
+    autoStartPlayback,
     requestServerFallback: requestServerFallback as (reason?: unknown) => Promise<void>,
     setCurrentTime,
     setDuration,
