@@ -6,7 +6,7 @@ import {
   useRef,
   useState,
 } from "react";
-import { useNavigate, useParams, useSearchParams } from "react-router-dom";
+import { useLocation, useNavigate, useParams, useSearchParams } from "react-router-dom";
 import { ApiError } from "../../lib/api/client";
 import { imageUrl, mediaTitle } from "../home/media";
 import { usePlayerPlaybackControls } from "./usePlayerPlaybackControls";
@@ -15,6 +15,7 @@ import { usePlayerKeyboardShortcuts } from "./usePlayerKeyboardShortcuts";
 import { usePlayerScreenshot } from "./usePlayerScreenshot";
 import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
+import { useAudioTrackSwitch } from "./useAudioTrackSwitch";
 import { usePlayerVideoElement } from "./usePlayerVideoElement";
 import { usePlayerNavigation } from "./usePlayerNavigation";
 import { usePlaybackSessionGate } from "./usePlaybackSessionGate";
@@ -45,7 +46,10 @@ import { PlayerCaptionOverlay } from "./components/player-caption-overlay";
 import { PlayerDanmakuOverlay } from "./components/player-danmaku-overlay";
 import { usePlayerAirPlay } from "./components/player-airplay";
 import { PlayerMiniProgressBar } from "./components/player-mini-progress";
+import { PlayerAutoNextCard } from "./components/player-auto-next-card";
 import { normalizePlayerChapters } from "./player-chapters";
+import { creditsSkipAction, creditsStartSeconds } from "./player-autoplay";
+import { requestsAutoStartPlayback } from "./player-autostart";
 import {
   classifyPlayerEngineFailure,
   playerFailure,
@@ -56,6 +60,8 @@ import { usePlaybackReporting } from "./usePlaybackReporting";
 import { useCaptionSelection } from "./useCaptionSelection";
 import { useRuntimeCaptionReader } from "./useRuntimeCaptionReader";
 import { usePlaybackRuntime } from "./usePlaybackRuntime";
+import { useAutoPlayNextPreference } from "./useAutoPlayNextPreference";
+import { useAutoPlayNext } from "./useAutoPlayNext";
 import {
   getSubtitleInfo,
   isMatroskaSource,
@@ -67,6 +73,7 @@ export function PlayerPage() {
   const { itemId = "" } = useParams();
   const [searchParams, setSearchParams] = useSearchParams();
   const navigate = useNavigate();
+  const location = useLocation();
 
   const [playing, setPlaying] = useState(false);
   const [playbackAttempt, setPlaybackAttempt] = useState(0);
@@ -94,6 +101,14 @@ export function PlayerPage() {
   const durationRef = useRef(0);
   const bufferedEndRef = useRef(0);
   const engineRef = useRef<PlaybackEngine | null>(null);
+
+  // The automatic episode jumps carry a one-shot marker. It is stripped right
+  // after mount so a refresh or a later source switch cannot replay it.
+  const autoStartPlayback = requestsAutoStartPlayback(location.state);
+  useEffect(() => {
+    if (!autoStartPlayback) return;
+    navigate(`${location.pathname}${location.search}`, { replace: true, state: null });
+  }, [autoStartPlayback, location.pathname, location.search, navigate]);
 
   const requestedSourceId = searchParams.get("sourceId");
   const requestedAudioStreamIndex = searchParams.get("audioStreamIndex");
@@ -190,6 +205,10 @@ export function PlayerPage() {
   const activeIntroRange = chapterTimeline.introRanges.find(
     (range) => currentTime >= range.start && currentTime < range.end,
   ) ?? null;
+  const creditsStart = useMemo(
+    () => creditsStartSeconds(chapterTimeline.segments),
+    [chapterTimeline.segments],
+  );
 
   const playerContainerRef = useRef<HTMLDivElement>(null);
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -253,6 +272,63 @@ export function PlayerPage() {
     setIsPointerInteracting,
     resetControlsTimeout,
   });
+
+  const {
+    audioTracks,
+    selectedAudioStreamIndex,
+    switching: switchingAudioTrack,
+    notice: audioTrackNotice,
+    switchAudioTrack,
+  } = useAudioTrackSwitch({
+    itemId,
+    playbackKey,
+    source,
+    requestedAudioStreamIndex,
+    searchParams,
+    setSearchParams,
+    streamUrl,
+    playing,
+    playbackRate,
+    sessionFailed: Boolean(playbackBootstrap.error || webPlaybackSession.error)
+      || playbackPlan?.type === "UNSUPPORTED",
+    videoRef,
+    reportPlayback,
+    resetControlsTimeout,
+  });
+
+  const nextEpisodeId = episodeNavigation?.nextEpisodeId ?? null;
+  const { autoPlayEnabled, setAutoPlayEnabled } = useAutoPlayNextPreference();
+  const { handleBack, navigateToEpisode } = usePlayerNavigation({
+    itemId,
+    navigate: (to, options) => navigate(to as never, options as never),
+    setShowSettings,
+  });
+  const {
+    countdown: autoPlayNextCountdown,
+    handleEnded: handlePlaybackEnded,
+    playNow: playNextEpisodeNow,
+    cancel: cancelAutoPlayNext,
+    interrupt: interruptAutoPlayNext,
+  } = useAutoPlayNext({
+    playbackKey,
+    nextEpisodeId,
+    enabled: autoPlayEnabled,
+    onNavigateNextEpisode: (episodeId) => navigateToEpisode(episodeId, { autoStart: true }),
+  });
+
+  const handleSkipCredits = useCallback(() => {
+    const action = creditsSkipAction({
+      creditsStart,
+      duration,
+      hasNextEpisode: Boolean(nextEpisodeId),
+    });
+    if (!action) return;
+    if (action.kind === "next-episode") {
+      if (nextEpisodeId) navigateToEpisode(nextEpisodeId, { autoStart: true });
+      return;
+    }
+    seekTo(action.seconds);
+  }, [creditsStart, duration, navigateToEpisode, nextEpisodeId, seekTo]);
 
   const { infoGroups } = usePlayerInfoPanel({
     playbackSessionId,
@@ -388,6 +464,9 @@ export function PlayerPage() {
     reportPlayback,
     stopActiveSession,
     markStarted,
+    onPlaybackEnded: handlePlaybackEnded,
+    onPlaybackInterrupted: interruptAutoPlayNext,
+    autoStartPlayback,
     requestServerFallback: requestServerFallback as (reason?: unknown) => Promise<void>,
     setCurrentTime,
     setDuration,
@@ -445,12 +524,6 @@ export function PlayerPage() {
 
   const { screenshotStatus, takeScreenshot } = usePlayerScreenshot({ videoRef, media });
 
-  const { handleBack, navigateToEpisode } = usePlayerNavigation({
-    itemId,
-    navigate: (to) => navigate(to as never),
-    setShowSettings,
-  });
-
   if (playbackBootstrap.isPending || (useLegacyPlaybackQueries && item.isPending)) {
     return <PlayerLoadingState message="正在准备播放器…" />;
   }
@@ -493,9 +566,13 @@ export function PlayerPage() {
   const planFailure = playbackPlan?.type === "UNSUPPORTED"
     ? playerFailure("BROWSER_UNSUPPORTED")
     : null;
-  const surfaceFailure = playbackFailure
-    ?? planFailure
-    ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
+  // A track switch intentionally clears the session plan while the replacement
+  // session starts; keep the existing surface mounted without a failure layer.
+  const surfaceFailure = switchingAudioTrack
+    ? null
+    : playbackFailure
+      ?? planFailure
+      ?? (!streamUrl ? playerFailure("SERVER_PLAN_FAILED") : null);
   const sourceOptions: PlayerSettingsSourceOption[] = (media.mediaSources ?? []).map((entry, index) => ({
     id: entry.id,
     label: entry.qualityLabel || `版本 ${index + 1}`,
@@ -517,6 +594,7 @@ export function PlayerPage() {
     >
       <PlayerVideoSurface
         streamUrl={streamUrl}
+        keepVideoMounted={switchingAudioTrack}
         deferNativeSource={isMatroskaSource(source) && !remoteHttpSource}
         corsEnabled={source?.sourceKind !== "STRM_URL"}
         poster={poster}
@@ -558,7 +636,7 @@ export function PlayerPage() {
         onCaptionTrackError={() => setCaptionStatus("字幕加载失败")}
         errorMessage={null}
         failure={surfaceFailure}
-        showError={failedStreamUrl === streamUrl || !streamUrl}
+        showError={!switchingAudioTrack && (failedStreamUrl === streamUrl || !streamUrl)}
         onRetry={() => window.location.reload()}
         onBack={handleBack}
       />
@@ -608,6 +686,13 @@ export function PlayerPage() {
           sources={sourceOptions}
           selectedSourceId={source?.id ?? ""}
           onSourceChange={(sourceId) => setSearchParams({ sourceId })}
+          audioTracks={{
+            tracks: audioTracks,
+            selectedIndex: selectedAudioStreamIndex,
+            switching: switchingAudioTrack,
+            notice: audioTrackNotice,
+            onSelect: switchAudioTrack,
+          }}
           presentation={{
             loop: loopPlayback,
             aspectRatio,
@@ -622,6 +707,10 @@ export function PlayerPage() {
           onSelectCaption={selectCaption}
           captionOffset={captionOffset}
           onChangeCaptionOffset={changeCaptionOffset}
+          autoPlay={{
+            enabled: autoPlayEnabled,
+            onToggle: () => setAutoPlayEnabled(!autoPlayEnabled),
+          }}
           onClose={() => setShowSettings(false)}
         />
       ) : null}
@@ -631,6 +720,14 @@ export function PlayerPage() {
           groups={infoGroups}
           copyText={playerInfoCopyText(infoGroups)}
           onClose={() => setShowInfo(false)}
+        />
+      ) : null}
+
+      {autoPlayNextCountdown ? (
+        <PlayerAutoNextCard
+          secondsLeft={autoPlayNextCountdown.secondsLeft}
+          onPlayNow={playNextEpisodeNow}
+          onCancel={cancelAutoPlayNext}
         />
       ) : null}
 
@@ -654,6 +751,8 @@ export function PlayerPage() {
         airPlayAvailable={airPlay.available}
         chapters={chapterTimeline.segments}
         introSkip={activeIntroRange}
+        creditsStart={creditsStart}
+        hasNextEpisode={Boolean(nextEpisodeId)}
         settingsOpen={showSettings}
         infoOpen={showInfo}
         remainingTime={isRemainingTime}
@@ -679,6 +778,7 @@ export function PlayerPage() {
         onAirPlay={airPlay.showPicker}
         onChapterSeek={seekTo}
         onSkipIntro={seekTo}
+        onSkipCredits={handleSkipCredits}
         onTakeScreenshot={takeScreenshot}
         onToggleSettings={() => setShowSettings((visible) => !visible)}
         onToggleInfo={() => setShowInfo((visible) => !visible)}

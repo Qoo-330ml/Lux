@@ -12,12 +12,21 @@ import type {
   PlayerFlip,
   PlayerVideoPresentation,
 } from "./player-presentation";
+import {
+  PlayerAudioTrackSelector,
+  type PlayerAudioTrackSection,
+} from "./player-audio-track-selector";
 import { LuxSelectField } from "../../../components/ui";
 
 type PlayerPresentationSettings = PlayerVideoPresentation & {
   onToggleLoop: () => void;
   onChangeAspectRatio: (aspectRatio: PlayerAspectRatio) => void;
   onChangeFlip: (flip: PlayerFlip) => void;
+};
+
+type PlayerAutoPlaySettings = {
+  enabled: boolean;
+  onToggle: () => void;
 };
 
 export type PlayerSettingsSourceOption = {
@@ -33,6 +42,8 @@ type PlayerSettingsPanelProps = {
   sources?: readonly PlayerSettingsSourceOption[];
   selectedSourceId?: string;
   onSourceChange?: (sourceId: string) => void;
+  /** Independent audio-track slot; omitted when the player has no track data. */
+  audioTracks?: PlayerAudioTrackSection;
   captions?: readonly PlayerCaptionOption[];
   selectedCaptionId?: string | null;
   captionStatus?: string | null;
@@ -40,6 +51,7 @@ type PlayerSettingsPanelProps = {
   captionOffset?: number;
   onChangeCaptionOffset?: (offset: number) => void;
   presentation?: PlayerPresentationSettings;
+  autoPlay?: PlayerAutoPlaySettings;
   onClose: () => void;
 };
 
@@ -62,6 +74,7 @@ export function PlayerSettingsPanel({
   sources = [],
   selectedSourceId = "",
   onSourceChange = () => undefined,
+  audioTracks,
   captions = [],
   selectedCaptionId = null,
   captionStatus = null,
@@ -69,6 +82,7 @@ export function PlayerSettingsPanel({
   captionOffset = 0,
   onChangeCaptionOffset = () => undefined,
   presentation,
+  autoPlay,
   onClose,
 }: PlayerSettingsPanelProps) {
   const captionHelp = captionStatus
@@ -111,6 +125,7 @@ export function PlayerSettingsPanel({
           </LuxSelectField>
         </div>
       ) : null}
+      {audioTracks ? <PlayerAudioTrackSelector {...audioTracks} /> : null}
       <div className="lux-player-settings-section">
         <span className="lux-player-settings-label" id="lux-player-speed-label">播放速度</span>
         <div className="lux-player-speed-grid" aria-labelledby="lux-player-speed-label">
@@ -128,6 +143,24 @@ export function PlayerSettingsPanel({
           ))}
         </div>
       </div>
+      {autoPlay ? (
+        <div className="lux-player-settings-section">
+          <span className="lux-player-settings-label" id="lux-player-auto-play-label">
+            自动连播下一集
+          </span>
+          <button
+            type="button"
+            className={`lux-player-speed-pill ${autoPlay.enabled ? "is-active" : ""}`}
+            role="switch"
+            aria-label="自动连播下一集"
+            aria-checked={autoPlay.enabled}
+            onClick={autoPlay.onToggle}
+          >
+            {autoPlay.enabled ? "已开启" : "已关闭"}
+            {autoPlay.enabled ? <Check size={14} aria-hidden="true" /> : null}
+          </button>
+        </div>
+      ) : null}
       {presentation ? (
         <>
           <div className="lux-player-settings-section">

@@ -1,4 +1,5 @@
 import type { PlayerChapterSegment, PlayerIntroRange } from "../player-chapters";
+import { introSkipVisible, resolveChapterSkipActions } from "../player-autoplay";
 
 type PlayerChapterTimelineProps = {
   segments: readonly PlayerChapterSegment[];
@@ -38,12 +39,7 @@ type PlayerIntroSkipProps = {
 };
 
 export function PlayerIntroSkip({ currentTime, introSkip, onSkip }: PlayerIntroSkipProps) {
-  if (
-    !introSkip
-    || !Number.isFinite(currentTime)
-    || currentTime < introSkip.start
-    || currentTime >= introSkip.end
-  ) return null;
+  if (!introSkip || !introSkipVisible({ currentTime, introRange: introSkip })) return null;
 
   return (
     <button
@@ -53,6 +49,51 @@ export function PlayerIntroSkip({ currentTime, introSkip, onSkip }: PlayerIntroS
       onClick={() => onSkip(introSkip.end)}
     >
       跳过片头
+    </button>
+  );
+}
+
+type PlayerSkipCreditsProps = {
+  currentTime: number;
+  duration: number;
+  creditsStart: number | null;
+  /** Needed for the shared skip slot: the intro button wins when both apply. */
+  introRange: PlayerIntroRange | null;
+  hasNextEpisode: boolean;
+  onSkip: () => void;
+};
+
+/**
+ * Skip credits shares the skip intro slot: both markers never overlap in time,
+ * so one position is enough. The action itself (next episode or finish the
+ * media) is decided by the page through the pure helper.
+ */
+export function PlayerSkipCredits({
+  currentTime,
+  duration,
+  creditsStart,
+  introRange,
+  hasNextEpisode,
+  onSkip,
+}: PlayerSkipCreditsProps) {
+  const skipActions = resolveChapterSkipActions({
+    introRange,
+    creditsStart,
+    currentTime,
+    duration,
+    hasNextEpisode,
+  });
+  if (!skipActions.credits) return null;
+
+  return (
+    <button
+      type="button"
+      className="lux-player-skip-credits"
+      aria-label="跳过片尾"
+      title={hasNextEpisode ? "跳过片尾并播放下一集" : "跳到结尾"}
+      onClick={onSkip}
+    >
+      跳过片尾
     </button>
   );
 }
