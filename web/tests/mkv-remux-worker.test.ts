@@ -243,3 +243,144 @@ describe("MKV remux worker (hevc-remux mode)", () => {
     });
   }
 });
+
+type Box = { type: string; start: number; size: number; bodyStart: number; bodyEnd: number };
+
+function readBoxes(data: Uint8Array, start = 0, end = data.byteLength): Box[] {
+  const boxes: Box[] = [];
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = start;
+  while (offset + 8 <= end) {
+    let size = view.getUint32(offset);
+    const type = new TextDecoder("latin1").decode(data.subarray(offset + 4, offset + 8));
+    let header = 8;
+    if (size === 1) {
+      size = Number(view.getBigUint64(offset + 8));
+      header = 16;
+    } else if (size === 0) {
+      size = end - offset;
+    }
+    if (size < header || offset + size > end) break;
+    boxes.push({ type, start: offset, size, bodyStart: offset + header, bodyEnd: offset + size });
+    offset += size;
+  }
+  return boxes;
+}
+
+function child(data: Uint8Array, parent: Box, type: string) {
+  return readBoxes(data, parent.bodyStart, parent.bodyEnd).find((box) => box.type === type) ?? null;
+}
+
+/** Skip the fixed `stsd` header and return every sample entry box. */
+function sampleEntries(data: Uint8Array, stsd: Box) {
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const count = view.getUint32(stsd.bodyStart + 4);
+  const entries: Box[] = [];
+  let offset = stsd.bodyStart + 8;
+  for (let index = 0; index < count; index += 1) {
+    const size = view.getUint32(offset);
+    const type = new TextDecoder("latin1").decode(data.subarray(offset + 4, offset + 8));
+    // VisualSampleEntry (70 bytes) and AudioSampleEntry (20 bytes) follow the 8-byte SampleEntry
+    // fields, and the child boxes start after them.
+    const fixed = /^(hvc1|hev1|avc1|av01|vp09)$/.test(type) ? 78 : 28;
+    entries.push({
+      type,
+      start: offset,
+      size,
+      bodyStart: offset + 8 + fixed,
+      bodyEnd: offset + size,
+    });
+    offset += size;
+  }
+  return entries;
+}
+
+/** Walks the documented `moov`/`trak`/`mdia`/`minf`/`stbl`/`stsd` path, then the sample entries. */
+function sampleEntryChild(data: Uint8Array, moov: Box, type: string) {
+  for (const trak of readBoxes(data, moov.bodyStart, moov.bodyEnd).filter((box) => box.type === "trak")) {
+    const stsd = findBoxDeep(data, trak, "stsd");
+    if (!stsd) continue;
+    for (const entry of sampleEntries(data, stsd)) {
+      const found = readBoxes(data, entry.bodyStart, entry.bodyEnd).find((box) => box.type === type);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+function findBoxDeep(data: Uint8Array, box: Box, type: string): Box | null {
+  const direct = child(data, box, type);
+  if (direct) return direct;
+  for (const nested of readBoxes(data, box.bodyStart, box.bodyEnd)) {
+    const found = findBoxDeep(data, nested, type);
+    if (found) return found;
+  }
+  return null;
+}
+
+describe("MKV remux worker fMP4 structure", () => {
+  afterEach(() => {
+    scope.postMessage = undefined;
+    vi.restoreAllMocks();
+  });
+
+  it("writes a fragment Chromium can hand to a 4K HEVC SourceBuffer", async () => {
+    const posted = await remux(matroskaFixture({
+      codecId: "V_MPEGH/ISO/HEVC",
+      codecPrivate: main10HvcC(),
+      width: 3840,
+      height: 2160,
+      sample: "nal",
+    }));
+    const init = posted.find((message) => message.type === "init") as Extract<WorkerMessage, { type: "init" }>;
+    const segment = posted.find((message) => message.type === "segment") as Extract<WorkerMessage, { type: "segment" }>;
+
+    const initBytes = new Uint8Array(init.initSegment);
+    const initBoxes = readBoxes(initBytes);
+    expect(initBoxes.map((box) => box.type)).toEqual(["ftyp", "moov"]);
+    const moov = initBoxes.find((box) => box.type === "moov")!;
+    const hvcC = sampleEntryChild(initBytes, moov, "hvcC");
+    expect(hvcC).not.toBeNull();
+    // The sample description must carry the untouched hvcC, and the codec string must describe the
+    // same profile/level the box declares.
+    expect([...initBytes.subarray(hvcC!.bodyStart, hvcC!.bodyEnd)]).toEqual([...main10HvcC()]);
+    expect(init.codec.startsWith(`hvc1.${main10HvcC()[1] & 0x1f}.`)).toBe(true);
+    expect(init.codec).toContain(`L${main10HvcC()[12]}.`);
+    const mvex = child(initBytes, moov, "mvex");
+    expect(mvex).not.toBeNull();
+    const trex = child(initBytes, mvex!, "trex");
+    expect(trex).not.toBeNull();
+
+    const segmentBytes = new Uint8Array(segment.mediaSegment);
+    const segmentBoxes = readBoxes(segmentBytes);
+    expect(segmentBoxes.map((box) => box.type)).toEqual(["moof", "mdat"]);
+    const moof = segmentBoxes[0];
+    const traf = child(segmentBytes, moof, "traf")!;
+    const tfdt = child(segmentBytes, traf, "tfdt")!;
+    const trun = child(segmentBytes, traf, "trun")!;
+    const tfhd = child(segmentBytes, traf, "tfhd")!;
+    expect(tfdt).not.toBeNull();
+    expect(trun).not.toBeNull();
+    expect(tfhd).not.toBeNull();
+
+    const trunView = new DataView(segmentBytes.buffer, segmentBytes.byteOffset);
+    const trunFlags = trunView.getUint32(trun.bodyStart) & 0xffffff;
+    const sampleCount = trunView.getUint32(trun.bodyStart + 4);
+    // `tr_flags` bits: 0x001 data-offset, 0x004 first-sample-flags, 0x100 duration, 0x200 size,
+    // 0x400 sample-flags, 0x800 composition offset.
+    const dataOffset = (trunFlags & 0x000001) ? trunView.getInt32(trun.bodyStart + 8) : 0;
+    const entryStart = trun.bodyStart + 8 + (trunFlags & 0x000001 ? 4 : 0) + (trunFlags & 0x000004 ? 4 : 0);
+    const firstSampleFlags = (trunFlags & 0x000004)
+      ? trunView.getUint32(trun.bodyStart + 8 + (trunFlags & 0x000001 ? 4 : 0))
+      : (trunFlags & 0x000400)
+        ? trunView.getUint32(entryStart + (trunFlags & 0x000100 ? 4 : 0) + (trunFlags & 0x000200 ? 4 : 0))
+        : 0;
+    // The first sample of a fragment must be a sync sample, otherwise a decoder never starts.
+    expect(firstSampleFlags & 0x0001_0000).toBe(0);
+    expect(sampleCount).toBeGreaterThan(0);
+    // `data_offset` is relative to the start of `moof` and must land on the `mdat` payload.
+    const mdat = segmentBoxes[1];
+    expect(dataOffset).toBeGreaterThan(0);
+    expect(moof.start + dataOffset).toBe(mdat.bodyStart);
+  });
+});

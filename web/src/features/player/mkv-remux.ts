@@ -1,5 +1,5 @@
 import { Box, createFile } from "mp4box";
-import type { MatroskaTrack } from "./matroska-demuxer";
+import { copyBytes, type MatroskaTrack } from "./matroska-demuxer";
 
 type RemuxFile = ReturnType<typeof createFile>;
 
@@ -17,7 +17,7 @@ export function addHevcTrack(file: RemuxFile, codecPrivate: Uint8Array, width: n
   if (!sampleEntry) throw new Error("MKV fMP4 remux 缺少视频样本描述");
   const hvcC = new Box();
   hvcC.type = "hvcC";
-  hvcC.data = codecPrivate.slice();
+  hvcC.data = copyBytes(codecPrivate);
   sampleEntry.addBox(hvcC);
   return trackId;
 }
@@ -31,7 +31,7 @@ export function addMatroskaVideoTrack(file: RemuxFile, track: Pick<MatroskaTrack
   if (!entry) throw new Error("MKV fMP4 缺少视频样本描述");
   const description = new Box();
   description.type = type === "avc1" ? "avcC" : type === "hvc1" ? "hvcC" : type === "vp09" ? "vpcC" : "av1C";
-  description.data = track.codecPrivate.slice();
+  description.data = copyBytes(track.codecPrivate);
   entry.addBox(description);
   return trackId;
 }

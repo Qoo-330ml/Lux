@@ -1,4 +1,4 @@
-import type { MatroskaTrack } from "./matroska-demuxer";
+import { copyBytes, type MatroskaTrack } from "./matroska-demuxer";
 
 export type MatroskaSampleRoute = "subtitle" | "remux" | "decode";
 
@@ -36,7 +36,7 @@ export function matroskaAudioConfig(track: Pick<MatroskaTrack, "codecId" | "code
   if (!track.sampleRate || !track.channels) return null;
   const codec = track.codecId.toUpperCase();
   if (codec.startsWith("A_AAC") && isSupportedMatroskaAudio(track)) {
-    return { codec: "mp4a.40.2", asc: track.codecPrivate.slice(), sampleRate: track.sampleRate, channels: track.channels };
+    return { codec: "mp4a.40.2", asc: copyBytes(track.codecPrivate), sampleRate: track.sampleRate, channels: track.channels };
   }
   const dac3 = codec === "A_AC3" ? parseAc3Config(track.codecPrivate) : null;
   if (dac3) return { codec: "ac-3", dac3, sampleRate: track.sampleRate, channels: track.channels };
