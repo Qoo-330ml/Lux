@@ -122,6 +122,18 @@ describe("LuxPlayer auto play next preference storage", () => {
     expect(await syncAutoPlayNextEpisodePreference(false, "user-1")).toBeNull();
   });
 
+  it("keeps the local preference without throwing when the version conflict survives the retry", async () => {
+    const conflict = () => new ApiError("版本冲突", { code: "VERSION_CONFLICT", status: 409 });
+    const get = vi.spyOn(api, "accountPreferences")
+      .mockRejectedValueOnce(conflict())
+      .mockRejectedValueOnce(conflict());
+    const update = vi.spyOn(api, "updateAccountPreferences");
+
+    await expect(syncAutoPlayNextEpisodePreference(false, "user-1")).resolves.toBeNull();
+    expect(get).toHaveBeenCalledTimes(2);
+    expect(update).not.toHaveBeenCalled();
+  });
+
   it("re-reads once and retries when another device bumped the preference version", async () => {
     const conflict = new ApiError("版本冲突", { code: "VERSION_CONFLICT", status: 409 });
     const get = vi.spyOn(api, "accountPreferences")

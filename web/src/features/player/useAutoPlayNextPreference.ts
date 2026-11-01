@@ -83,6 +83,10 @@ export function useAutoPlayNextPreference(): {
     writeAutoPlayNextEpisodePreference(enabled, userId);
     if (!userId) return;
     void syncAutoPlayNextEpisodePreference(enabled, userId).then((saved) => {
+      // `null` means the account API was offline or still in conflict: the local
+      // value stays as the viewer left it and the cached server snapshot is left
+      // untouched, so a later authoritative read still wins (see the tradeoff note
+      // on syncAutoPlayNextEpisodePreference).
       if (!saved) return;
       queryClient.setQueryData<AccountPreferences>(
         queryKeys.accountPreferences(userId),
