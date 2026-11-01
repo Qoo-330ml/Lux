@@ -17,6 +17,7 @@ import { usePlayerInfoPanel } from "./usePlayerInfoPanel";
 import { usePlayerPlaybackSession } from "./usePlayerPlaybackSession";
 import { useAudioTrackSwitch } from "./useAudioTrackSwitch";
 import { useQualitySwitch } from "./useQualitySwitch";
+import { sourceSwitchParams } from "./playback-quality";
 import { usePlayerVideoElement } from "./usePlayerVideoElement";
 import { usePlayerNavigation } from "./usePlayerNavigation";
 import { usePlaybackSessionGate } from "./usePlaybackSessionGate";
@@ -714,7 +715,7 @@ export function PlayerPage() {
           onChangeRate={changePlaybackRate}
           sources={sourceOptions}
           selectedSourceId={source?.id ?? ""}
-          onSourceChange={(sourceId) => setSearchParams({ sourceId })}
+          onSourceChange={(sourceId) => setSearchParams(sourceSwitchParams(sourceId, searchParams))}
           audioTracks={{
             tracks: audioTracks,
             selectedIndex: selectedAudioStreamIndex,

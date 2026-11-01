@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import type { MediaSource, WebPlaybackBitrate } from "../src/lib/api/types";
 import {
   bitrateParamFromQueryKey,
+  canonicalMaxBitrateParam,
   parseMaxBitrateParam,
   qualityOptions,
   qualityRateLabel,
   qualityStatusText,
   qualitySwitchParams,
   shouldShowQualitySelector,
+  sourceSwitchParams,
   supportsQualitySelection,
 } from "../src/features/player/playback-quality";
 
@@ -110,6 +112,37 @@ describe("player maxBitrate parameter", () => {
     expect(automatic.get("audioStreamIndex")).toBe("2");
   });
 
+  it("canonicalizes hand-written URL forms for cache variant matching", () => {
+    // Query keys store the parsed number, so padded or exponent notation must be
+    // reduced to the same string or the current variant looks like "another" one.
+    expect(canonicalMaxBitrateParam(" 100000 ")).toBe("100000");
+    expect(canonicalMaxBitrateParam("1e7")).toBe("10000000");
+    expect(canonicalMaxBitrateParam("+4000000")).toBe("4000000");
+    expect(canonicalMaxBitrateParam("100000.0")).toBe("100000");
+    expect(canonicalMaxBitrateParam("")).toBeNull();
+    expect(canonicalMaxBitrateParam(null)).toBeNull();
+    expect(canonicalMaxBitrateParam("1e9")).toBeNull();
+    expect(canonicalMaxBitrateParam("abc")).toBeNull();
+  });
+
+  it("keeps the ceiling when switching the played version", () => {
+    const current = new URLSearchParams({
+      sourceId: "source-a",
+      audioStreamIndex: "2",
+      subtitleStreamIndex: "7",
+      maxBitrate: "1e7",
+    });
+
+    const switched = sourceSwitchParams("source-b", current);
+    expect(switched.get("sourceId")).toBe("source-b");
+    // Stream indexes belong to the source being replaced; the ceiling does not.
+    expect(switched.get("audioStreamIndex")).toBeNull();
+    expect(switched.get("subtitleStreamIndex")).toBeNull();
+    expect(switched.get("maxBitrate")).toBe("10000000");
+
+    expect(sourceSwitchParams("source-b", new URLSearchParams()).get("maxBitrate")).toBeNull();
+  });
+
   it("reads the cap from both playback query key layouts", () => {
     expect(bitrateParamFromQueryKey(
       ["playback-bootstrap", "item", "source", "2", "7", "4000000", 0],
@@ -132,6 +165,13 @@ describe("player quality status", () => {
     // The administrator cap limits the output even without a user choice.
     expect(qualityStatusText(bitrate({ maxBitrate: null, targetBitrate: 8_000_000, limited: true }), null))
       .toBe("已限制到 8 Mbps");
+  });
+
+  it("stays neutral when the server does not report a bitrate block", () => {
+    // An older server sends no `bitrate` at all: the player cannot claim the
+    // ceiling was accepted or that the source rate is below it.
+    expect(qualityStatusText(undefined, 4_000_000)).toBe("原画（自动）");
+    expect(qualityStatusText(null, 2_000_000)).toBe("原画（自动）");
   });
 
   it("reports the original stream when nothing is capped", () => {

@@ -2,6 +2,7 @@ import { useCallback, useMemo } from "react";
 import type { MediaSource, WebPlaybackBitrate } from "../../lib/api/types";
 import {
   bitrateParamFromQueryKey,
+  canonicalMaxBitrateParam,
   parseMaxBitrateParam,
   qualityOptions,
   qualityStatusText,
@@ -83,7 +84,10 @@ export function useQualitySwitch({
     itemId,
     playbackKey,
     param: "maxBitrate",
-    requestedValue: requestedMaxBitrate,
+    // Query keys store the parsed bps, so every cache predicate must compare
+    // against the same canonical text instead of the raw URL value.
+    requestedValue: selectedMaxBitrate === null ? null : String(selectedMaxBitrate),
+    canonicalValue: canonicalMaxBitrateParam,
     queryVariant: bitrateParamFromQueryKey,
     searchParams,
     setSearchParams,

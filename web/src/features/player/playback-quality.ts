@@ -62,6 +62,18 @@ export function parseMaxBitrateParam(value: string | null | undefined): number |
 }
 
 /**
+ * Canonical URL form of a ceiling: an absent/blank/out-of-contract value is
+ * `null` (no parameter), everything else is the decimal bps the API accepts.
+ * The player's query keys and its cache predicates both use this form, so a
+ * hand-written `maxBitrate=1e7` or `maxBitrate=%20100000%20` URL still matches
+ * the "current variant" slot instead of being mistaken for another variant.
+ */
+export function canonicalMaxBitrateParam(value: string | null | undefined): string | null {
+  const parsed = parseMaxBitrateParam(value);
+  return parsed === null ? null : String(parsed);
+}
+
+/**
  * STRM sources are Direct Play only; the API ignores `maxBitrate` for them, so
  * the selector must not pretend the choice would change anything.
  */
@@ -152,14 +164,34 @@ export function qualityStatusText(
   bitrate: WebPlaybackBitrate | null | undefined,
   selectedMaxBitrate: number | null,
 ): string {
-  const target = qualityRateLabel(bitrate?.targetBitrate);
-  if (bitrate?.limited && target) return `已限制到 ${target}`;
+  // Without the response block the player knows nothing about the effective
+  // output, not even that the ceiling was accepted: stay neutral instead of
+  // claiming the source rate is below it.
+  if (!bitrate) return "原画（自动）";
+  const target = qualityRateLabel(bitrate.targetBitrate);
+  if (bitrate.limited && target) return `已限制到 ${target}`;
   if (selectedMaxBitrate !== null) {
     // The server never upgrades an unprobed source, so the ceiling cannot have
     // been exceeded — but saying "not exceeded" would claim knowledge we lack.
-    return bitrate && bitrate.sourceBitrate === null
+    return bitrate.sourceBitrate === null
       ? "原画（源码率未知，未触发限制）"
       : "原画（源码率未超过所选上限）";
   }
   return "原画（自动）";
+}
+
+/**
+ * URL parameters for switching the played version: the manual ceiling is a
+ * user-wide preference and survives the change, while per-source track choices
+ * (`audioStreamIndex`, `subtitleStreamIndex`) do not, because stream indexes
+ * belong to the media source that is being replaced.
+ */
+export function sourceSwitchParams(
+  sourceId: string,
+  current: URLSearchParams,
+): URLSearchParams {
+  const next = new URLSearchParams({ sourceId });
+  const maxBitrate = canonicalMaxBitrateParam(current.get("maxBitrate"));
+  if (maxBitrate !== null) next.set("maxBitrate", maxBitrate);
+  return next;
 }

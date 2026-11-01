@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { PlayerPage } from "../src/features/player/PlayerPage";
 import { api } from "../src/lib/api/client";
+import { queryKeys } from "../src/lib/api/query-keys";
 import { chooseLuxOptionByValue, luxOptions, luxSelectValue } from "./lux-select-helpers";
 
 (globalThis as typeof globalThis & { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
@@ -45,6 +46,15 @@ const item = {
       },
       { index: 7, type: "SUBTITLE", language: "chi", codec: "srt" },
     ],
+  }, {
+    id: "source-quality-b",
+    sourceKind: "LOCAL_FILE",
+    durationTicks: 1_200_000_000,
+    bitrate: 6_000_000,
+    streams: [
+      { index: 0, type: "VIDEO", codec: "h264" },
+      { index: 1, type: "AUDIO", codec: "aac" },
+    ],
   }],
 };
 
@@ -55,6 +65,7 @@ describe("PlayerPage quality switching", () => {
   let root: Root | undefined;
   let bootstrapSelections: SessionSelection[] = [];
   let lifecycle: string[] = [];
+  let queryClient: QueryClient;
   let play: ReturnType<typeof vi.spyOn>;
 
   beforeEach(() => {
@@ -143,7 +154,7 @@ describe("PlayerPage quality switching", () => {
     container = document.createElement("div");
     document.body.append(container);
     root = createRoot(container);
-    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     await act(async () => {
       root?.render(
         <QueryClientProvider client={queryClient}>
@@ -351,6 +362,103 @@ describe("PlayerPage quality switching", () => {
     expect(select?.getAttribute("disabled")).toBeNull();
     expect(vi.mocked(api.createWebPlaybackBootstrap).mock.calls
       .filter((call) => call[4]?.maxBitrate === 4_000_000)).toHaveLength(1);
+  });
+
+  it("keeps the playing variant cached when the URL uses another notation", async () => {
+    // `1e7` parses to 10 Mbps, but the query key slot is "10000000". Treating
+    // the raw text as the current variant would drop the session that is on
+    // screen and look like a source change.
+    await renderPlayer("/watch/movie-quality?maxBitrate=1e7");
+    expect(bootstrapSelections).toEqual([
+      { audio: undefined, subtitle: undefined, maxBitrate: 10_000_000 },
+    ]);
+    const otherVariant = queryKeys.playbackBootstrap(
+      "movie-quality",
+      undefined,
+      0,
+      undefined,
+      undefined,
+      8_000_000,
+    );
+    queryClient.setQueryData(otherVariant, { marker: "other" });
+
+    await openSettings();
+    await chooseLuxOptionByValue(container!, "选择画质", "4000000");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    const cachedVariants = queryClient
+      .getQueryCache()
+      .findAll({ queryKey: ["playback-bootstrap", "movie-quality"] })
+      .map((query) => query.queryKey[5]);
+    expect(cachedVariants).not.toContain("8000000");
+    // The variant that was playing is not "some other variant": it must survive
+    // the switch, otherwise the replaced session is recreated behind the scenes.
+    expect(cachedVariants).toContain("10000000");
+    expect(bootstrapSelections.filter((entry) => entry.maxBitrate === 10_000_000)).toHaveLength(1);
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-quality?maxBitrate=4000000");
+  });
+
+  it("rolls back to the canonical ceiling when the URL used padding", async () => {
+    vi.mocked(api.createWebPlaybackSession).mockImplementation(async (
+      _itemId,
+      sourceId,
+      _capabilities,
+      _signal,
+      selection,
+    ) => {
+      if (selection?.maxBitrate === 4_000_000) throw new Error("quality session failed");
+      return {
+        sessionId: "web-default-auto",
+        playSessionId: "lux-web:web-default-auto",
+        sourceId,
+        tier: 0,
+        expiresAt: 1_900_000_000,
+        plan: {
+          type: "DIRECT" as const,
+          url: "/api/v1/playback/sessions/web-default-auto/direct?expires=1900000000&signature=test",
+        },
+        bitrate: {
+          sourceBitrate: 12_000_000,
+          maxBitrate: 100_000,
+          targetBitrate: 100_000,
+          limited: true,
+        },
+      };
+    });
+    await renderPlayer("/watch/movie-quality?maxBitrate=%20100000%20");
+    expect(bootstrapSelections).toEqual([
+      { audio: undefined, subtitle: undefined, maxBitrate: 100_000 },
+    ]);
+
+    await openSettings();
+    await chooseLuxOptionByValue(container!, "选择画质", "4000000");
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 30));
+    });
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    });
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-quality?maxBitrate=100000");
+    expect(container?.textContent).toContain("画质切换失败，已恢复原画。");
+  });
+
+  it("keeps the ceiling when switching the played version", async () => {
+    await renderPlayer(
+      "/watch/movie-quality?audioStreamIndex=2&subtitleStreamIndex=7&maxBitrate=2000000",
+    );
+    await openSettings();
+    await chooseLuxOptionByValue(container!, "选择播放版本", "source-quality-b");
+
+    expect(container?.querySelector('[data-testid="current-location"]')?.textContent)
+      .toBe("/watch/movie-quality?sourceId=source-quality-b&maxBitrate=2000000");
   });
 
   it("does not offer a ceiling for STRM sources", async () => {

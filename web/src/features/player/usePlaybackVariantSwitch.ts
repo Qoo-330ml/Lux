@@ -38,6 +38,15 @@ export type PlaybackVariantSwitchOptions = {
   param: string;
   /** Current URL value of `param` (raw, may be whitespace); `null` when absent. */
   requestedValue: string | null;
+  /**
+   * Reduces a raw URL value to the exact form the playback query keys store, so
+   * cache predicates compare like with like. Variants stored verbatim after a
+   * trim (stream indexes) keep the default; variants stored as a parsed number
+   * (the bitrate ceiling) pass their own canonicalizer, otherwise a URL such as
+   * `maxBitrate=1e7` would look like "another variant" and evict the session
+   * currently on screen.
+   */
+  canonicalValue?: (value: string | null) => string | null;
   /** Reads the same variant from a playback query key, used for cache invalidation. */
   queryVariant: (key: readonly unknown[]) => string;
   searchParams: URLSearchParams;
@@ -92,6 +101,7 @@ export function usePlaybackVariantSwitch({
   playbackKey,
   param,
   requestedValue,
+  canonicalValue,
   queryVariant,
   searchParams,
   setSearchParams,
@@ -105,6 +115,7 @@ export function usePlaybackVariantSwitch({
   messages,
 }: PlaybackVariantSwitchOptions): PlaybackVariantSwitch {
   const queryClient = useQueryClient();
+  const canonicalize = canonicalValue ?? normalizeParam;
   const [switching, setSwitching] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
   const pendingRef = useRef<PendingResume | null>(null);
@@ -147,7 +158,7 @@ export function usePlaybackVariantSwitch({
   }, [param, queryClient, queryVariant, searchParams, setSearchParams]);
   const beginSwitch = useCallback((nextParams: URLSearchParams) => {
     if (switching) return;
-    const currentParam = normalizeParam(searchParams.get(param));
+    const currentParam = canonicalize(searchParams.get(param));
     // Cached bootstrap/session entries for other variants reference sessions
     // that were stopped when this player left them. Dropping them forces a
     // fresh session when the user later switches back.
@@ -169,7 +180,7 @@ export function usePlaybackVariantSwitch({
     pendingRef.current = {
       sequence,
       itemId,
-      targetParam: normalizeParam(nextParams.get(param)),
+      targetParam: canonicalize(nextParams.get(param)),
       position,
       playbackRate,
       volume,
@@ -197,6 +208,7 @@ export function usePlaybackVariantSwitch({
       apply();
     }
   }, [
+    canonicalize,
     itemId,
     param,
     playbackRate,
@@ -219,7 +231,7 @@ export function usePlaybackVariantSwitch({
       cancelSwitch();
       return;
     }
-    if (normalizeParam(requestedValue) !== pending.targetParam) {
+    if (canonicalize(requestedValue) !== pending.targetParam) {
       // The URL moved away from this switch (source/episode change), so the
       // captured position and rollback parameters belong to another media.
       cancelSwitch();
@@ -230,14 +242,14 @@ export function usePlaybackVariantSwitch({
     } else if (pending.appliedPlaybackKey !== playbackKey) {
       cancelSwitch();
     }
-  }, [cancelSwitch, itemId, playbackKey, requestedValue]);
+  }, [cancelSwitch, canonicalize, itemId, playbackKey, requestedValue]);
 
   useEffect(() => {
     const pending = pendingRef.current;
     if (!pending || sessionFailed) return undefined;
     if (pending.itemId !== itemId) return undefined;
     if (pending.appliedPlaybackKey !== playbackKey) return undefined;
-    if (normalizeParam(requestedValue) !== pending.targetParam) return undefined;
+    if (canonicalize(requestedValue) !== pending.targetParam) return undefined;
     // Wait until the replacement session actually produced a different stream;
     // a legacy placeholder can still expose the previous URL for one render.
     if (!streamUrl || streamUrl === pending.originStreamUrl) return undefined;
@@ -285,7 +297,16 @@ export function usePlaybackVariantSwitch({
       video.removeEventListener("canplay", apply);
       video.removeEventListener("loadeddata", apply);
     };
-  }, [itemId, messages.autoplayBlocked, playbackKey, requestedValue, sessionFailed, streamUrl, videoRef]);
+  }, [
+    canonicalize,
+    itemId,
+    messages.autoplayBlocked,
+    playbackKey,
+    requestedValue,
+    sessionFailed,
+    streamUrl,
+    videoRef,
+  ]);
 
   useEffect(() => {
     if (!switching) return undefined;
