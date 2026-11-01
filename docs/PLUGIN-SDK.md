@@ -532,8 +532,14 @@ Lux 在发送请求前执行协议、主机和地址策略校验，并在收到�
   覆盖旧值。宿主不会为第三方渠道生成随机凭据。
 - 该值走通知目标 secret 存储：不进入 `config`/`providerConfig`，不出现在普通列表、事件 payload、投递记录或
   日志中，只在创建和轮换的响应里返回一次。
+- 凭据属于一个 provider：更换通知器时宿主不会沿用旧凭据。新 provider 声明了 `secret` 字段时必须在同一次更新
+  里重新提交，否则返回校验错误；切换到 `builtin.webhook` 由宿主重新生成 HMAC secret；切换到未声明该字段的
+  provider 时旧值会被清除。
 - 通知器的其它 `configFields` 属于**每条通知目标**，不是插件安装级配置；`required` 由创建/更新目标时校验，
-  未创建任何目标不会让 provider 变成不可用。
+  未创建任何目标不会让 provider 变成不可用。除 `secret` 外，通知器不得把任何字段声明为 `sensitive: true` 或
+  `type: "password"`：这些字段走非秘密 `providerConfig`，声明成秘密字段会承诺宿主并未提供的保护。
+- 目标 `providerConfig` 由宿主按 manifest 的 `configFields` 校验：未知键、缺少 required 值、类型不匹配、
+  非法选项和超出范围的数值都在创建/更新时返回 400，不会原样转发给插件。
 - 宿主把凭据声明通过 `GET /api/v1/admin/notification-providers` 的 `secretField` 元数据交给 Web 控制台，
   插件自身不需要读取任何配置文件。
 
