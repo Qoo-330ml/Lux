@@ -114,6 +114,15 @@ export function playerShortcutActionForEventKey(key: string): PlayerShortcutActi
   return actionByEventKey.get(key) ?? null;
 }
 
+/** 帮助浮层对话框节点上的标记；键盘处理器据此把对话框内部的按键放行。 */
+export const PLAYER_SHORTCUT_DIALOG_ATTRIBUTE = "data-player-shortcut-help";
+
+/** 判断按键是否来自帮助浮层内部（Space 激活按钮、方向键滚动列表等）。 */
+export function isPlayerShortcutDialogTarget(target: EventTarget | null): boolean {
+  if (typeof Element === "undefined" || !(target instanceof Element)) return false;
+  return target.closest(`[${PLAYER_SHORTCUT_DIALOG_ATTRIBUTE}]`) !== null;
+}
+
 type PlayerKeyboardShortcutOptions = {
   itemId: string;
   volume: number;
@@ -181,10 +190,15 @@ export function usePlayerKeyboardShortcuts(options: PlayerKeyboardShortcutOption
       const action = playerShortcutActionForEventKey(e.key);
       if (!action) return;
 
-      // The help panel is modal: while it is open only its own toggle and Escape
-      // act, and every other player shortcut is swallowed instead of reaching
-      // the video behind it.
+      // The help panel is modal: shortcuts pressed on the player behind it are
+      // swallowed instead of reaching the video. Keys typed inside the dialog
+      // stay untouched though — Space must activate its buttons and the arrow /
+      // page keys must scroll the list — except for the dialog's own "?".
       if (shortcutHelpOpen) {
+        if (isPlayerShortcutDialogTarget(target)) {
+          if (action === "toggleShortcutHelp") setShortcutHelpOpen?.((open) => !open);
+          return;
+        }
         e.preventDefault();
         if (action === "toggleShortcutHelp") {
           setShortcutHelpOpen?.((open) => !open);

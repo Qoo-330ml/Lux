@@ -4,6 +4,7 @@ import { act, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  isPlayerShortcutDialogTarget,
   PLAYER_SHORTCUTS,
   usePlayerKeyboardShortcuts,
   type PlayerShortcutAction,
@@ -236,6 +237,26 @@ describe("player shortcut help panel", () => {
     expect(spies.toggleMute).not.toHaveBeenCalled();
   });
 
+  it("lets keys pressed inside the dialog keep their native behaviour", () => {
+    const { spies, element } = mountHelpHarness();
+    keydown("?");
+    const closeButton = element.querySelector<HTMLButtonElement>('button[aria-label="关闭键盘快捷键"]');
+    if (!closeButton) throw new Error("close control was not rendered");
+
+    for (const key of [" ", "ArrowLeft", "ArrowRight", "ArrowUp", "ArrowDown", "PageDown", "PageUp"]) {
+      resetSpies(spies);
+      const event = new KeyboardEvent("keydown", { key, bubbles: true, cancelable: true });
+      act(() => {
+        closeButton.dispatchEvent(event);
+      });
+      // Space must be able to activate the focused button, arrow/page keys must scroll the list.
+      expect(event.defaultPrevented, `${key} inside the dialog must not be prevented`).toBe(false);
+      expect(spies.togglePlayPause).not.toHaveBeenCalled();
+      expect(spies.seekRelative).not.toHaveBeenCalled();
+      expect(spies.changeVolume).not.toHaveBeenCalled();
+    }
+  });
+
   it("ignores ? while a text field has focus", () => {
     const { state } = mountHelpHarness();
     const input = document.createElement("input");
@@ -340,6 +361,49 @@ describe("PlayerShortcutHelp", () => {
       helpDialog(element)?.dispatchEvent(new MouseEvent("click", { bubbles: true }));
     });
     expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops clicks, double clicks and context menus on the layer from bubbling", () => {
+    const onClose = vi.fn();
+    const { element } = renderHelp(onClose);
+    const layer = element.querySelector<HTMLElement>(".lux-player-shortcut-help-layer");
+    if (!layer) throw new Error("layer was not rendered");
+
+    const documentClick = vi.fn();
+    const documentDoubleClick = vi.fn();
+    const documentContextMenu = vi.fn();
+    document.addEventListener("click", documentClick);
+    document.addEventListener("dblclick", documentDoubleClick);
+    document.addEventListener("contextmenu", documentContextMenu);
+    try {
+      act(() => {
+        layer.dispatchEvent(new MouseEvent("click", { bubbles: true, cancelable: true }));
+      });
+      act(() => {
+        layer.dispatchEvent(new MouseEvent("dblclick", { bubbles: true, cancelable: true }));
+      });
+      act(() => {
+        layer.dispatchEvent(new MouseEvent("contextmenu", { bubbles: true, cancelable: true }));
+      });
+    } finally {
+      document.removeEventListener("click", documentClick);
+      document.removeEventListener("dblclick", documentDoubleClick);
+      document.removeEventListener("contextmenu", documentContextMenu);
+    }
+
+    expect(onClose).toHaveBeenCalledTimes(1);
+    expect(documentClick).not.toHaveBeenCalled();
+    expect(documentDoubleClick).not.toHaveBeenCalled();
+    expect(documentContextMenu).not.toHaveBeenCalled();
+  });
+
+  it("marks the dialog with the attribute the key handler recognises", () => {
+    const { element } = renderHelp();
+    const dialog = helpDialog(element);
+    expect(isPlayerShortcutDialogTarget(dialog)).toBe(true);
+    expect(isPlayerShortcutDialogTarget(element?.querySelector(".lux-player-shortcut-help-close") ?? null)).toBe(true);
+    expect(isPlayerShortcutDialogTarget(element?.querySelector(".lux-player-shortcut-help-layer") ?? null)).toBe(false);
+    expect(isPlayerShortcutDialogTarget(document.body)).toBe(false);
   });
 
   it("keeps Tab inside the dialog", () => {

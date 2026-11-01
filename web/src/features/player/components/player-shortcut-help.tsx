@@ -106,8 +106,13 @@ export function PlayerShortcutHelp({ onClose, shortcuts = PLAYER_SHORTCUTS }: Pl
       className="lux-player-shortcut-help-layer"
       onClick={(event) => {
         // 点击浮层外部（视频、控制条等）只关闭浮层，不把点击继续交给播放器。
+        event.stopPropagation();
         if (event.target === event.currentTarget) onCloseRef.current();
       }}
+      // 双击关闭时，两次点击都停在遮罩上，不能落到视频的播放/全屏处理器。
+      onDoubleClick={(event) => event.stopPropagation()}
+      // 右键不切换遮罩背后的播放信息面板。
+      onContextMenu={(event) => event.stopPropagation()}
     >
       <div
         ref={panelRef}
